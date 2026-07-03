@@ -1,6 +1,6 @@
 [package]
 name = "trouve"
-version = "0.1.0"
+version = "1.0.0"
 edition = "2021"
 description = "Fast and accurate code search for agents. Rust port of MinishLab/semble with incremental, branch- and worktree-aware indexing."
 license = "MIT"
