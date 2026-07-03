@@ -1,9 +1,11 @@
 name: Bench
 
 # Benchmarks with regression gating: every run is compared against the
-# baseline recorded from the last push to main (kept in the actions cache),
-# and the job fails when a benchmark regresses past the alert threshold.
-# PRs only compare; pushes to main update the baseline.
+# baseline from the last push to main, and the job fails when a benchmark
+# regresses past the alert threshold. Baselines live on the gh-pages branch
+# (dev/bench/data.js, one dashboard for both suites), so history persists
+# and is browsable via GitHub Pages. PRs only compare; pushes to main append
+# to the data and push it.
 
 on:
   push:
@@ -13,8 +15,11 @@ on:
 env:
   CARGO_TERM_COLOR: always
 
-# Serialize baseline updates on main so concurrent pushes cannot race the
-# benchmark cache.
+permissions:
+  # Push benchmark data to the gh-pages branch (main runs only; PRs never
+  # push, and fork PRs get a read-only token regardless).
+  contents: write
+
 concurrency:
   group: bench-${{ github.ref }}
   cancel-in-progress: false
@@ -34,30 +39,19 @@ jobs:
         run: rm -rf target/criterion && cargo bench --bench index_and_search
       - name: Convert criterion estimates to benchmark JSON
         run: python3 benchmarks/to_gha_bench.py --criterion target/criterion > micro.json
-      - name: Restore baseline
-        uses: actions/cache/restore@v4
-        with:
-          path: bench-baseline
-          key: bench-micro-${{ github.sha }}
-          restore-keys: bench-micro-
       - name: Compare against baseline
         uses: benchmark-action/github-action-benchmark@v1
         with:
           name: micro-benchmarks
           tool: customSmallerIsBetter
           output-file-path: micro.json
-          external-data-json-path: bench-baseline/micro.json
+          github-token: ${{ secrets.GITHUB_TOKEN }}
           fail-on-alert: true
           alert-threshold: "150%"
           summary-always: true
           save-data-file: ${{ github.ref == 'refs/heads/main' }}
-          max-items-in-chart: 50
-      - name: Save baseline (main only)
-        if: github.ref == 'refs/heads/main'
-        uses: actions/cache/save@v4
-        with:
-          path: bench-baseline
-          key: bench-micro-${{ github.sha }}
+          auto-push: ${{ github.ref == 'refs/heads/main' }}
+          max-items-in-chart: 200
 
   # End-to-end CLI benchmarks on a pinned flask checkout: cold index, warm
   # query, incremental reindex, and the non-git (filesystem manifest) warm
@@ -80,27 +74,16 @@ jobs:
         run: cargo build --release
       - name: Run end-to-end benchmarks
         run: benchmarks/run_ci_bench.sh bench-out
-      - name: Restore baseline
-        uses: actions/cache/restore@v4
-        with:
-          path: bench-baseline
-          key: bench-e2e-${{ github.sha }}
-          restore-keys: bench-e2e-
       - name: Compare against baseline
         uses: benchmark-action/github-action-benchmark@v1
         with:
           name: e2e-benchmarks
           tool: customSmallerIsBetter
           output-file-path: bench-out/e2e.json
-          external-data-json-path: bench-baseline/e2e.json
+          github-token: ${{ secrets.GITHUB_TOKEN }}
           fail-on-alert: true
           alert-threshold: "175%"
           summary-always: true
           save-data-file: ${{ github.ref == 'refs/heads/main' }}
-          max-items-in-chart: 50
-      - name: Save baseline (main only)
-        if: github.ref == 'refs/heads/main'
-        uses: actions/cache/save@v4
-        with:
-          path: bench-baseline
-          key: bench-e2e-${{ github.sha }}
+          auto-push: ${{ github.ref == 'refs/heads/main' }}
+          max-items-in-chart: 200

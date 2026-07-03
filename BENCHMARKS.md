@@ -224,12 +224,17 @@ main:
   reindex, and the non-git warm path — gated at 175% (wall-clock times on
   shared runners are noisier).
 
-Each run is compared against the baseline recorded on the last push to main
-(kept in the actions cache via
-[github-action-benchmark](https://github.com/benchmark-action/github-action-benchmark));
-a benchmark that regresses past its threshold fails the job. PRs only
-compare, pushes to main update the baseline, and comparisons use medians
+Each run is compared against the baseline from the last push to main; a
+benchmark that regresses past its threshold fails the job. PRs only compare,
+pushes to main append the new results and push, and comparisons use medians
 (`benchmarks/to_gha_bench.py`) to shrug off single slow outliers.
+
+Benchmark history is persisted by
+[github-action-benchmark](https://github.com/benchmark-action/github-action-benchmark)
+on the `gh-pages` branch under `dev/bench/` — full history in `data.js` plus
+an interactive chart dashboard in `index.html` (served at
+`https://<owner>.github.io/trouve/dev/bench/` once GitHub Pages is enabled
+for the `gh-pages` branch).
 
 ## Reproducing
 
