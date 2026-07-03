@@ -15,10 +15,10 @@ startup and model load.
 
 | Scenario | Rust | Python | Speedup |
 | --- | --- | --- | --- |
-| Cold index + query | 115 ms ± 3 ms | 1.22 s ± 0.03 s | 10.6x |
-| Warm query (cached) | 69 ms ± 6 ms | 734 ms ± 54 ms | 10.6x |
-| Incremental (1 file touched) | 78 ms ± 4 ms | 1.27 s ± 0.06 s | 16.3x |
-| Branch switch (3.1.0 <-> 3.0.0) | 93 ms ± 5 ms | 1.26 s ± 0.02 s | 13.5x |
+| Cold index + query | 93 ms ± 8 ms | 1.26 s ± 0.03 s | 13.5x |
+| Warm query (cached) | 73 ms ± 5 ms | 764 ms ± 25 ms | 10.5x |
+| Incremental (1 file touched) | 77 ms ± 5 ms | 1.27 s ± 0.05 s | 16.4x |
+| Branch switch (3.1.0 <-> 3.0.0) | 79 ms ± 8 ms | 1.26 s ± 0.01 s | 16.0x |
 
 On a small repo Python's incremental and branch-switch times are dominated by a
 full re-index (its cache is all-or-nothing), while the Rust store recomputes
@@ -30,9 +30,9 @@ Single timed runs (the effect sizes dwarf run-to-run noise):
 
 | Scenario | Rust | Python | Speedup |
 | --- | --- | --- | --- |
-| Cold index + query | 6.6 s | 2 m 59 s | 27.1x |
-| Warm query (snapshot mmap) | 0.53 s | 7.2 s | 13.5x |
-| Incremental (1 file touched) | 0.84 s | 3 m 2 s | 216x |
+| Cold index + query | 3.3 s | 2 m 59 s | 54x |
+| Warm query (snapshot mmap) | 0.55 s | 7.2 s | 13.1x |
+| Incremental (1 file touched) | 0.86 s | 3 m 2 s | 212x |
 | Worktree first query (flask, other branch) | 0.34 s | n/a (full rebuild) | — |
 
 This is the headline result: touching a single file in a 30k-file repo costs
@@ -69,9 +69,17 @@ One deliberate difference from upstream: texts are never padded, so
 embeddings do not depend on batch composition (upstream mean-pools `[PAD]`
 rows, making its vectors vary with batching); retrieval quality is unchanged.
 
+The rest of the cold path is engineered around allocation traffic: BM25
+tokens live in flat arenas (`TokenDocs`: one byte blob + offset arrays
+instead of tens of millions of heap `String`s) end to end — in store
+entries, through assembly, and into the BM25 builder, which hashes byte
+slices and sorts `(term, doc, tf)` triples in parallel. Chunk line numbers
+are computed with a single forward newline scan per file, and fresh
+embeddings are written straight into one flat buffer.
+
 Cold-path phase breakdown on kubernetes (`SEMBLE_TIMING=1`): chunk+tokenize
-2.5 s, BM25 build 1.2 s, embedding 0.6 s, everything else under 0.25 s each —
-the remaining cold cost is now tree-sitter parsing, not model inference.
+1.3 s (mostly tree-sitter parsing), embedding 0.5 s, BM25 build 0.46 s,
+everything else under 0.25 s each.
 
 ## Retrieval quality (NDCG@10)
 

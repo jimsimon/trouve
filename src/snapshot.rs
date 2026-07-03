@@ -541,9 +541,10 @@ pub fn patch(old: &RawSnapshot, files: &[PatchFile<'_>]) -> Result<LoadedSnapsho
     let mut vectors: Vec<f32> = Vec::new();
     let mut doc_lengths: Vec<u32> = Vec::new();
     let mut old_to_new: Vec<u32> = vec![u32::MAX; old_records.len()];
-    // (doc, term, tf) triples for fresh rows.
-    let mut fresh_tfs: Vec<(u32, &str, u32)> = Vec::new();
-    let mut fresh_token_storage: Vec<(u32, Vec<String>)> = Vec::new();
+    // Flat token storage for fresh rows (one doc per fresh chunk) plus the
+    // new-index doc id of each fresh doc.
+    let mut fresh_tokens = crate::tokens::TokenDocs::default();
+    let mut fresh_doc_ids: Vec<u32> = Vec::new();
 
     for file in files {
         match &file.source {
@@ -583,26 +584,33 @@ pub fn patch(old: &RawSnapshot, files: &[PatchFile<'_>]) -> Result<LoadedSnapsho
                     }
                     crate::dense::normalize(&mut vectors[row_start..]);
 
-                    let mut doc: Vec<String> = entry
-                        .token_lists
-                        .get(i)
-                        .cloned()
-                        .unwrap_or_else(|| crate::tokens::tokenize(&stored.content));
-                    doc.extend(path_tokens.iter().cloned());
-                    doc_lengths.push(doc.len() as u32);
-                    fresh_token_storage.push((doc_id, doc));
+                    if i < entry.tokens.n_docs() {
+                        for tok in entry.tokens.doc_tokens(i) {
+                            fresh_tokens.push_token_bytes(tok);
+                        }
+                    } else {
+                        fresh_tokens.push_text(&stored.content);
+                    }
+                    for tok in &path_tokens {
+                        fresh_tokens.push_token_bytes(tok.as_bytes());
+                    }
+                    fresh_tokens.finish_doc();
+                    doc_lengths.push(fresh_tokens.doc_len(fresh_tokens.n_docs() - 1) as u32);
+                    fresh_doc_ids.push(doc_id);
                 }
             }
         }
     }
 
-    for (doc_id, doc) in &fresh_token_storage {
-        let mut tf: HashMap<&str, u32> = HashMap::with_capacity(doc.len());
-        for tok in doc {
-            *tf.entry(tok.as_str()).or_insert(0) += 1;
+    // (doc, term, tf) triples for fresh rows.
+    let mut fresh_tfs: Vec<(u32, &[u8], u32)> = Vec::new();
+    for (d, &doc_id) in fresh_doc_ids.iter().enumerate() {
+        let mut tf: HashMap<&[u8], u32> = HashMap::with_capacity(fresh_tokens.doc_len(d));
+        for tok in fresh_tokens.doc_tokens(d) {
+            *tf.entry(tok).or_insert(0) += 1;
         }
         for (term, count) in tf {
-            fresh_tfs.push((*doc_id, term, count));
+            fresh_tfs.push((doc_id, term, count));
         }
     }
 
@@ -622,7 +630,7 @@ pub fn patch(old: &RawSnapshot, files: &[PatchFile<'_>]) -> Result<LoadedSnapsho
     while old_i < n_old_terms || fresh_i < fresh_tfs.len() {
         // Next term is the smaller of the old term and the fresh term.
         let old_term = (old_i < n_old_terms).then(|| old.term_bytes(old_i));
-        let fresh_term = (fresh_i < fresh_tfs.len()).then(|| fresh_tfs[fresh_i].1.as_bytes());
+        let fresh_term = (fresh_i < fresh_tfs.len()).then(|| fresh_tfs[fresh_i].1);
         let term: &[u8] = match (old_term, fresh_term) {
             (Some(o), Some(f)) => {
                 if o <= f {
@@ -649,7 +657,7 @@ pub fn patch(old: &RawSnapshot, files: &[PatchFile<'_>]) -> Result<LoadedSnapsho
         };
         let fresh_start = fresh_i;
         if fresh_term == Some(term) {
-            while fresh_i < fresh_tfs.len() && fresh_tfs[fresh_i].1.as_bytes() == term {
+            while fresh_i < fresh_tfs.len() && fresh_tfs[fresh_i].1 == term {
                 fresh_i += 1;
             }
         }

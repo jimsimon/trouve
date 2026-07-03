@@ -230,6 +230,16 @@ pub fn chunk_source(source: &str, file_path: &str, language: Option<&str>) -> Ve
 
     let bytes = source.as_bytes();
     let mut chunks = Vec::with_capacity(boundaries.len());
+    // Boundaries are sorted and non-overlapping, so newlines are counted with
+    // a single forward cursor instead of rescanning from 0 per boundary.
+    let mut cursor = 0usize;
+    let mut newlines_at_cursor = 0usize;
+    let count_to = |pos: usize, cursor: &mut usize, newlines: &mut usize| {
+        debug_assert!(pos >= *cursor);
+        *newlines += count_newlines(&bytes[*cursor..pos]);
+        *cursor = pos;
+        *newlines
+    };
     for boundary in boundaries {
         let (start, end) = (boundary.start, boundary.end.min(bytes.len()));
         // Clamp so zero-length boundaries take a single character (upstream
@@ -247,8 +257,8 @@ pub fn chunk_source(source: &str, file_path: &str, language: Option<&str>) -> Ve
                 &source[start..char_end.min(bytes.len())]
             }
         };
-        let start_line = count_newlines(&bytes[..start]) as u32 + 1;
-        let newlines_to_end = count_newlines(&bytes[..end]);
+        let start_line = count_to(start, &mut cursor, &mut newlines_at_cursor) as u32 + 1;
+        let newlines_to_end = count_to(end, &mut cursor, &mut newlines_at_cursor);
         let last_is_newline = end > start && bytes[end - 1] == b'\n';
         let end_line = (newlines_to_end - usize::from(last_is_newline)) as u32 + 1;
         chunks.push(Chunk {

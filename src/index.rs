@@ -25,7 +25,7 @@ use crate::search;
 use crate::snapshot;
 use crate::stats::save_search_stats;
 use crate::store::{ChunkStore, FileEntry, StoredChunk};
-use crate::tokens::tokenize;
+use crate::tokens::{tokenize, TokenDocs};
 use crate::types::{CallType, Chunk, ContentType, IndexStats, SearchResult};
 
 /// How the index build went: total files and how many needed fresh computation.
@@ -229,7 +229,7 @@ impl SembleIndex {
             content_key: String,
             chunks: Vec<Chunk>,
             vectors: Vec<f32>,
-            docs: Vec<Vec<String>>,
+            tokens: TokenDocs,
         }
         let parts: Vec<FilePart> = per_file
             .into_par_iter()
@@ -240,16 +240,21 @@ impl SembleIndex {
                 let n = entry.chunks.len();
                 let mut chunks = Vec::with_capacity(n);
                 let mut vectors = Vec::with_capacity(n * dim);
-                let mut docs = Vec::with_capacity(n);
-                let mut token_lists = entry.token_lists;
+                // One doc per chunk: stored content tokens + path tokens.
+                let mut tokens = TokenDocs::default();
+                let entry_tokens = entry.tokens;
                 for (i, stored) in entry.chunks.into_iter().enumerate() {
-                    let mut doc = if i < token_lists.len() {
-                        std::mem::take(&mut token_lists[i])
+                    if i < entry_tokens.n_docs() {
+                        for tok in entry_tokens.doc_tokens(i) {
+                            tokens.push_token_bytes(tok);
+                        }
                     } else {
-                        tokenize(&stored.content)
-                    };
-                    doc.extend(path_tokens.iter().cloned());
-                    docs.push(doc);
+                        tokens.push_text(&stored.content);
+                    }
+                    for tok in &path_tokens {
+                        tokens.push_token_bytes(tok.as_bytes());
+                    }
+                    tokens.finish_doc();
                     if entry_dim == dim && entry.embeddings.len() >= (i + 1) * dim {
                         vectors.extend_from_slice(&entry.embeddings[i * dim..(i + 1) * dim]);
                     } else {
@@ -268,7 +273,7 @@ impl SembleIndex {
                     content_key: record.content_key,
                     chunks,
                     vectors,
-                    docs,
+                    tokens,
                 }
             })
             .collect();
@@ -276,7 +281,7 @@ impl SembleIndex {
         let total_chunks: usize = parts.iter().map(|p| p.chunks.len()).sum();
         let mut chunks: Vec<Chunk> = Vec::with_capacity(total_chunks);
         let mut vectors: Vec<f32> = Vec::with_capacity(total_chunks * dim);
-        let mut docs: Vec<Vec<String>> = Vec::with_capacity(total_chunks);
+        let mut docs = TokenDocs::default();
         let mut manifest_entries: Vec<snapshot::ManifestEntry> = Vec::with_capacity(parts.len());
         for part in parts {
             manifest_entries.push(snapshot::ManifestEntry {
@@ -287,7 +292,7 @@ impl SembleIndex {
             });
             chunks.extend(part.chunks);
             vectors.extend_from_slice(&part.vectors);
-            docs.extend(part.docs);
+            docs.append(&part.tokens);
         }
 
         if chunks.is_empty() {
@@ -301,7 +306,8 @@ impl SembleIndex {
                 assemble_start.elapsed().as_secs_f64() * 1e3
             );
         }
-        let bm25 = crate::utils::timed("bm25 build", || Bm25Index::build(&docs));
+        let bm25 = crate::utils::timed("bm25 build", || Bm25Index::build_flat(&docs));
+        drop(docs); // three flat buffers; freeing is trivial
         let dense = crate::utils::timed("dense build", || {
             DenseIndex::from_unnormalized_flat(vectors, dim, chunks_total)
         });
@@ -628,8 +634,9 @@ fn compute_file_entries(
     model: &Arc<EmbeddingModel>,
     store: &ChunkStore,
 ) -> Vec<(FileRecord, String, FileEntry)> {
-    // Parse + chunk + tokenize in parallel.
-    let mut computed: Vec<(FileRecord, String, FileEntry, Vec<String>)> =
+    // Parse + chunk + tokenize in parallel. Chunk contents are moved (not
+    // cloned) into the stored entries; embedding reads them by reference.
+    let mut computed: Vec<(FileRecord, String, FileEntry)> =
         crate::utils::timed("chunk+tokenize", || {
             misses
                 .into_par_iter()
@@ -640,68 +647,65 @@ fn compute_file_entries(
                             let source = String::from_utf8_lossy(&bytes);
                             let language = detect_language(Path::new(&record.rel_path));
                             let chunks = chunk_source(&source, &record.rel_path, language);
-                            let token_lists: Vec<Vec<String>> =
-                                chunks.iter().map(|c| tokenize(&c.content)).collect();
+                            let mut tokens = TokenDocs::default();
+                            for c in &chunks {
+                                tokens.push_text(&c.content);
+                                tokens.finish_doc();
+                            }
                             FileEntry {
                                 chunks: chunks
-                                    .iter()
+                                    .into_iter()
                                     .map(|c| StoredChunk {
-                                        content: c.content.clone(),
+                                        content: c.content,
                                         start_line: c.start_line,
                                         end_line: c.end_line,
                                     })
                                     .collect(),
                                 embeddings: Vec::new(),
                                 dim: 0,
-                                token_lists,
+                                tokens,
                             }
                         }
                         // Too large or empty: store an empty entry so the
                         // file is never re-read on subsequent builds.
                         _ => FileEntry::default(),
                     };
-                    let chunk_texts: Vec<String> =
-                        entry.chunks.iter().map(|c| c.content.clone()).collect();
-                    Some((record, key, entry, chunk_texts))
+                    Some((record, key, entry))
                 })
                 .collect()
         });
 
-    // Embed all fresh chunks in large parallel batches.
-    let all_texts: Vec<String> = computed
-        .iter()
-        .flat_map(|(_, _, _, texts)| texts.iter().cloned())
-        .collect();
-    let embeddings = crate::utils::timed("embed", || model.embed_texts(&all_texts));
-    let dim = embeddings.first().map(|r| r.len()).unwrap_or(0);
+    // Embed all fresh chunks in one large parallel pass, straight into a
+    // flat row-major buffer (no per-chunk vector allocations).
+    let (embeddings, dim) = {
+        let all_texts: Vec<&str> = computed
+            .iter()
+            .flat_map(|(_, _, entry)| entry.chunks.iter().map(|c| c.content.as_str()))
+            .collect();
+        let flat = crate::utils::timed("embed", || model.embed_refs_flat(&all_texts));
+        (flat, if all_texts.is_empty() { 0 } else { model.dim() })
+    };
 
     // Scatter embedding rows back to entries and persist, in parallel.
     let mut offsets: Vec<usize> = Vec::with_capacity(computed.len());
     let mut cursor = 0usize;
-    for (_, _, _, texts) in &computed {
+    for (_, _, entry) in &computed {
         offsets.push(cursor);
-        cursor += texts.len();
+        cursor += entry.chunks.len();
     }
     crate::utils::timed("store writes", || {
         computed
             .par_iter_mut()
             .zip(offsets)
-            .for_each(|((_, key, entry, texts), start)| {
-                let n = texts.len();
-                let mut flat = Vec::with_capacity(n * dim);
-                for row in &embeddings[start..start + n] {
-                    flat.extend_from_slice(row);
-                }
-                entry.embeddings = flat;
+            .for_each(|((_, key, entry), start)| {
+                let n = entry.chunks.len();
+                entry.embeddings = embeddings[start * dim..(start + n) * dim].to_vec();
                 entry.dim = dim as u32;
                 let _ = store.put(key, entry);
             });
     });
 
     computed
-        .into_iter()
-        .map(|(record, key, entry, _)| (record, key, entry))
-        .collect()
 }
 
 /// Digest of everything that determines the assembled index: the set of

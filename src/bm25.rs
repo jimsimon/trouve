@@ -4,12 +4,15 @@
 //! "lucene" scoring variant with k1=1.5, b=0.75, plus `enrich_for_bm25`
 //! from `semble/index/sparse.py`.
 
-use std::collections::HashMap;
 use std::path::Path;
 
 use rayon::prelude::*;
 
+type FastMap<K, V> = std::collections::HashMap<K, V, ahash::RandomState>;
+type FastSet<K> = std::collections::HashSet<K, ahash::RandomState>;
+
 use crate::snapshot::{Buf, Posting};
+use crate::tokens::TokenDocs;
 use crate::types::Chunk;
 
 const K1: f64 = 1.5;
@@ -66,33 +69,45 @@ pub struct Bm25Index {
 }
 
 impl Bm25Index {
-    /// Build an index from tokenized documents (parallel).
+    /// Build an index from nested tokenized documents (test/debug helper).
     pub fn build(docs: &[Vec<String>]) -> Bm25Index {
-        let doc_lengths: Vec<u32> = docs.par_iter().map(|d| d.len() as u32).collect();
+        Self::build_flat(&TokenDocs::from_nested(docs))
+    }
+
+    /// Build an index from flat tokenized documents (parallel).
+    pub fn build_flat(docs: &TokenDocs) -> Bm25Index {
+        let n_docs = docs.n_docs();
+        let doc_lengths: Vec<u32> = (0..n_docs)
+            .into_par_iter()
+            .map(|d| docs.doc_len(d) as u32)
+            .collect();
 
         // Per-document term frequencies, in parallel.
-        let doc_tfs: Vec<Vec<(&str, u32)>> = docs
-            .par_iter()
-            .map(|doc| {
-                let mut tf: HashMap<&str, u32> = HashMap::with_capacity(doc.len());
-                for tok in doc {
-                    *tf.entry(tok.as_str()).or_insert(0) += 1;
+        let doc_tfs: Vec<Vec<(&[u8], u32)>> = (0..n_docs)
+            .into_par_iter()
+            .map(|d| {
+                let mut tf: FastMap<&[u8], u32> =
+                    FastMap::with_capacity_and_hasher(docs.doc_len(d), Default::default());
+                for tok in docs.doc_tokens(d) {
+                    *tf.entry(tok).or_insert(0) += 1;
                 }
                 tf.into_iter().collect()
             })
             .collect();
 
         // Global sorted vocabulary: parallel per-shard uniquing, then merge.
-        let mut terms: Vec<&str> = doc_tfs
+        let mut terms: Vec<&[u8]> = doc_tfs
             .par_iter()
-            .fold(
-                std::collections::HashSet::new,
-                |mut set: std::collections::HashSet<&str>, tf| {
-                    set.extend(tf.iter().map(|(t, _)| *t));
-                    set
-                },
-            )
-            .reduce(std::collections::HashSet::new, |mut a, b| {
+            .fold(FastSet::default, |mut set: FastSet<&[u8]>, tf| {
+                set.extend(tf.iter().map(|(t, _)| *t));
+                set
+            })
+            .reduce(FastSet::default, |mut a, b| {
+                if a.len() < b.len() {
+                    let mut b = b;
+                    b.extend(a);
+                    return b;
+                }
                 a.extend(b);
                 a
             })
@@ -100,7 +115,7 @@ impl Bm25Index {
             .collect();
         terms.par_sort_unstable();
 
-        let term_ids: HashMap<&str, u32> = terms
+        let term_ids: FastMap<&[u8], u32> = terms
             .iter()
             .enumerate()
             .map(|(i, t)| (*t, i as u32))
@@ -109,7 +124,7 @@ impl Bm25Index {
         let mut term_offsets: Vec<u32> = Vec::with_capacity(terms.len() + 1);
         term_offsets.push(0);
         for term in &terms {
-            term_blob.extend_from_slice(term.as_bytes());
+            term_blob.extend_from_slice(term);
             term_offsets.push(term_blob.len() as u32);
         }
 
@@ -126,16 +141,16 @@ impl Bm25Index {
             .collect();
         triples.par_sort_unstable();
 
-        let mut posting_offsets: Vec<u64> = vec![0; terms.len() + 1];
-        let mut postings: Vec<Posting> = Vec::with_capacity(triples.len());
-        for (term_id, doc, tf) in triples {
-            postings.push(Posting { doc, tf });
-            posting_offsets[term_id as usize + 1] = postings.len() as u64;
-        }
-        // Terms with no postings inherit the previous boundary.
-        for i in 1..posting_offsets.len() {
-            posting_offsets[i] = posting_offsets[i].max(posting_offsets[i - 1]);
-        }
+        let postings: Vec<Posting> = triples
+            .par_iter()
+            .map(|&(_, doc, tf)| Posting { doc, tf })
+            .collect();
+        // Each term's postings range is found by binary search over the
+        // sorted triples; terms with no postings get an empty range.
+        let posting_offsets: Vec<u64> = (0..=terms.len())
+            .into_par_iter()
+            .map(|t| triples.partition_point(|&(id, _, _)| (id as usize) < t) as u64)
+            .collect();
 
         Bm25Index {
             term_blob: term_blob.into(),

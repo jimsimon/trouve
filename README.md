@@ -38,9 +38,9 @@ the previous snapshot — splicing unchanged rows out of the old mapping — so
 its cost is proportional to the edit, not the repository.
 
 Measured results ([BENCHMARKS.md](BENCHMARKS.md)) on kubernetes/kubernetes
-(30k files): cold indexing drops from ~3 minutes to 6.6 s (27x), an
-incremental reindex after touching one file from ~3 minutes to 0.84 s (200x+),
-and a fully warm query from ~7 s to 0.53 s (13x). Retrieval quality is
+(30k files): cold indexing drops from ~3 minutes to 3.3 s (54x), an
+incremental reindex after touching one file from ~3 minutes to 0.86 s (200x+),
+and a fully warm query from ~7 s to 0.55 s (13x). Retrieval quality is
 identical — mean NDCG@10 matches upstream to within 0.0002 on the upstream
 annotated benchmark, with identical chunk boundaries and BM25 scores.
 

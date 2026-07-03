@@ -13,9 +13,10 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
-/// Bump when the chunking algorithm, tokenizer, or embedding semantics
-/// change incompatibly. v2: padding-free (batch-independent) embeddings.
-pub const STORE_VERSION: u32 = 2;
+/// Bump when the chunking algorithm, tokenizer, embedding semantics, or
+/// entry layout change incompatibly. v2: padding-free (batch-independent)
+/// embeddings. v3: flat token storage in entries.
+pub const STORE_VERSION: u32 = 3;
 
 /// Resolve the semble cache folder, respecting `SEMBLE_CACHE_LOCATION`
 /// (highest precedence) and platform conventions (XDG on Linux).
@@ -57,7 +58,8 @@ pub struct FileEntry {
     /// Flattened row-major embeddings, `chunks.len() * dim` values.
     pub embeddings: Vec<f32>,
     pub dim: u32,
-    pub token_lists: Vec<Vec<String>>,
+    /// One token document per chunk (flat storage).
+    pub tokens: crate::tokens::TokenDocs,
 }
 
 /// A content-addressed store rooted in the semble cache folder, one per
@@ -196,7 +198,7 @@ mod tests {
             }],
             embeddings: vec![0.1, 0.2, 0.3],
             dim: 3,
-            token_lists: vec![vec!["fn".into(), "main".into()]],
+            tokens: crate::tokens::TokenDocs::from_nested(&[vec!["fn".into(), "main".into()]]),
         };
         let key = ChunkStore::entry_key("b3:abc", Some("rust"), "model-x");
         assert!(store.get(&key).is_none());

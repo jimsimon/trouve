@@ -373,17 +373,31 @@ impl EmbeddingModel {
     /// Embed chunk contents in parallel across all cores.
     pub fn embed_chunks(&self, chunks: &[Chunk]) -> Vec<Vec<f32>> {
         let contents: Vec<&str> = chunks.iter().map(|c| c.content.as_str()).collect();
-        self.embed_strs(&contents)
+        self.embed_refs(&contents)
     }
 
     /// Embed arbitrary texts in parallel across all cores.
     pub fn embed_texts(&self, texts: &[String]) -> Vec<Vec<f32>> {
         let refs: Vec<&str> = texts.iter().map(String::as_str).collect();
-        self.embed_strs(&refs)
+        self.embed_refs(&refs)
     }
 
-    fn embed_strs(&self, texts: &[&str]) -> Vec<Vec<f32>> {
+    /// Embed borrowed texts in parallel across all cores.
+    pub fn embed_refs(&self, texts: &[&str]) -> Vec<Vec<f32>> {
         texts.par_iter().map(|t| self.encode_one(t)).collect()
+    }
+
+    /// Embed borrowed texts in parallel into one flat row-major buffer,
+    /// avoiding one small allocation per text.
+    pub fn embed_refs_flat(&self, texts: &[&str]) -> Vec<f32> {
+        let mut out = vec![0.0f32; texts.len() * self.dim];
+        out.par_chunks_mut(self.dim)
+            .zip(texts.par_iter())
+            .for_each(|(row, t)| {
+                let ids = self.token_ids(t);
+                self.pool_into(&ids, row);
+            });
+        out
     }
 }
 
