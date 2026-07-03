@@ -22,6 +22,17 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   inheritance; `.trouveignore` wins where patterns conflict).
 - **`.semble/` directories** are now skipped during walks, alongside
   `.trouve/`, matching upstream's default ignore list.
+- **Native OpenCode custom tools**: `trouve install` offers a new opt-in
+  "Native tool" integration that writes
+  `~/.config/opencode/tools/trouve.ts`, exposing `trouve_search` and
+  `trouve_find_related` as native OpenCode tools. An alternative to the MCP
+  integration (which remains available and selected by default): it avoids
+  the MCP transport, sidesteps JSONC config files the installer has to
+  skip, and defaults `repo` to the session worktree.
+- Instruction blocks are now written with the tool names the selected
+  integrations expose (`trouve_search`/`trouve_find_related` when the
+  native tool file is installed, `mcp__trouve__search`/
+  `mcp__trouve__find_related` otherwise).
 - **23 new tree-sitter grammars** (~50 languages total): CMake, D, Dart, Elm,
   ERB/EJS embedded templates, Erlang, Fortran, Gleam, GraphQL, Groovy,
   HCL/Terraform, Julia, Make, Nix, Objective-C, Perl, PowerShell, Protocol

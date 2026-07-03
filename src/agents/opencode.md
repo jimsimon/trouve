@@ -7,6 +7,8 @@ permission:
   read: allow
 ---
 
+Prefer the trouve tools when they are available — `mcp__trouve__search`/`mcp__trouve__find_related` (MCP) or `trouve_search`/`trouve_find_related` (native custom tools), depending on which integration is installed. Otherwise use the `trouve` CLI via bash.
+
 Use `trouve search` to find code by describing what it does or naming a symbol/identifier, instead of grep:
 
 ```bash

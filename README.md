@@ -86,7 +86,7 @@ combining them shows the model duplicates.
 | Aspect | Plugin: OpenCode / Kilo | Plugin: Claude Code / Codex | `trouve install` | CLI only |
 | --- | --- | --- | --- | --- |
 | Agents | OpenCode, Kilo Code | Claude Code, Codex | 14 agents (Cursor, Gemini, Copilot, VS Code, Windsurf, Zed, …) | anything with a shell |
-| Tool surface | native `trouve_search` / `trouve_find_related` | MCP (`mcp__trouve__*`) | MCP (`mcp__trouve__*`) | `trouve` CLI via bash |
+| Tool surface | native `trouve_search` / `trouve_find_related` | MCP (`mcp__trouve__*`) | MCP (`mcp__trouve__*`); opt-in native tool file for OpenCode | `trouve` CLI via bash |
 | trouve process | one persistent server per session | one MCP server per session | one MCP server per session | one process per call |
 | In-session index cache (incl. remote URLs) | yes | yes | yes | disk store only |
 | Index warmed at session start | yes, + re-warm on idle turns | Claude: yes (hook) · Codex: no | no | no |
@@ -105,10 +105,15 @@ How to choose:
 - **Use `trouve install` for everything else.** The interactive installer
   covers a much wider set of agents by editing their config files directly
   (an MCP entry, an instructions block, and a `trouve-search` sub-agent per
-  agent, each selectable). The trade-off is that it writes into your
-  existing configs — files with JSONC comments are skipped and reported —
-  and updates mean re-running it. `trouve uninstall` reverses everything it
-  wrote.
+  agent, each selectable). For OpenCode it also offers an opt-in "Native
+  tool" integration — a custom-tool file at
+  `~/.config/opencode/tools/trouve.ts` exposing `trouve_search` /
+  `trouve_find_related` with no MCP server process and no JSON config
+  edits; it provides the same capabilities as the MCP entry under
+  different tool names, so enable one or the other. The installer's
+  trade-off is that it writes into your existing configs — files with
+  JSONC comments are skipped and reported — and updates mean re-running
+  it. `trouve uninstall` reverses everything it wrote.
 - **The CLI needs no setup at all** and is what sub-agents without tool
   access fall back to; every approach above shares the same on-disk index
   store, so mixing CLI use with any other route costs nothing.
