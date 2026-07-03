@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1783101517880,
+  "lastUpdate": 1783101559588,
   "repoUrl": "https://github.com/jimsimon/trouve",
   "entries": {
     "e2e-benchmarks": [
@@ -241,6 +241,54 @@ window.BENCHMARK_DATA = {
             "name": "dense_query_20k_rows",
             "value": 1529569.7038398692,
             "range": "± 11718",
+            "unit": "ns"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "jim.j.simon@gmail.com",
+            "name": "Jim Simon",
+            "username": "jimsimon"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "7117bbc09c7dc497bac1c19bffd1d206b5411395",
+          "message": "Fix new stable clippy lint manual_is_multiple_of (#3)\n\n* Fix new stable clippy lint manual_is_multiple_of\n\nCurrent stable clippy (-D warnings in lint CI) flags the manual modulo\nchecks in embed.rs and tests/embed_parity.rs. Use usize::is_multiple_of\nand raise the advertised MSRV to 1.87, where it was stabilized.\n\nCo-authored-by: Jim Simon <jimsimon@users.noreply.github.com>\n\n* Remove clone_cache.rs committed by mistake\n\nThe file belongs to the separate clone-caching branch; it was untracked\nand slipped into the previous commit via git add -A.\n\nCo-authored-by: Jim Simon <jimsimon@users.noreply.github.com>\n\n---------\n\nCo-authored-by: Cursor Agent <cursoragent@cursor.com>\nCo-authored-by: Jim Simon <jimsimon@users.noreply.github.com>",
+          "timestamp": "2026-07-03T13:55:24-04:00",
+          "tree_id": "0ea316d52639cfd8ec54abe1489580c9c927c3eb",
+          "url": "https://github.com/jimsimon/trouve/commit/7117bbc09c7dc497bac1c19bffd1d206b5411395"
+        },
+        "date": 1783101558748,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "bm25_build_5k_docs",
+            "value": 4824395.35,
+            "range": "± 9922",
+            "unit": "ns"
+          },
+          {
+            "name": "bm25_query_5k_docs",
+            "value": 37213.31794380587,
+            "range": "± 29",
+            "unit": "ns"
+          },
+          {
+            "name": "chunk_python_200_functions",
+            "value": 3056787.029411765,
+            "range": "± 1658",
+            "unit": "ns"
+          },
+          {
+            "name": "dense_query_20k_rows",
+            "value": 1374890.5306856188,
+            "range": "± 8512",
             "unit": "ns"
           }
         ]
