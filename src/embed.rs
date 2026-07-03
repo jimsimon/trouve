@@ -479,7 +479,7 @@ fn embedding_buf(
     let data = tensor.data();
     if tensor.dtype() == safetensors::tensor::Dtype::F32 {
         let offset = data.as_ptr() as usize - map.as_ptr() as usize;
-        if offset % std::mem::align_of::<f32>() == 0 {
+        if offset.is_multiple_of(std::mem::align_of::<f32>()) {
             return Ok(Buf::mapped(map, offset, len));
         }
     }

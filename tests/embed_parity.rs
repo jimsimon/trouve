@@ -87,7 +87,7 @@ fn write_bert_model(dir: &std::path::Path) {
     .to_string();
     // Pad header so tensor data is 8-byte aligned (safetensors convention).
     let mut header = header.into_bytes();
-    while (8 + header.len()) % 8 != 0 {
+    while !(8 + header.len()).is_multiple_of(8) {
         header.push(b' ');
     }
 
