@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1783117379201,
+  "lastUpdate": 1783117431240,
   "repoUrl": "https://github.com/jimsimon/trouve",
   "entries": {
     "e2e-benchmarks": [
@@ -817,6 +817,54 @@ window.BENCHMARK_DATA = {
             "name": "dense_query_20k_rows",
             "value": 1342083.738310709,
             "range": "± 7993",
+            "unit": "ns"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "jim.j.simon@gmail.com",
+            "name": "Jim Simon",
+            "username": "jimsimon"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "134c8e48abbdbec99793f0c76e327ed03cf5cd60",
+          "message": "Add native OpenCode custom tools as an opt-in alternative to MCP (#6)\n\ntrouve install gains a fourth, opt-in integration (\"Native tool\")\nthat writes ~/.config/opencode/tools/trouve.ts: exports surface to the\nmodel as trouve_search and trouve_find_related, run the trouve CLI via\nBun.spawn with a 10-minute watchdog (SIGTERM, then SIGKILL after 5s)\nand a catch on the stream await so every failure path returns tool\noutput, default repo to the session worktree, and support a content\nargument. MCP remains the default integration and is never touched by\nthe tool file; instruction blocks render whichever tool names the\nselected integrations expose. Documented in the README's Agent\nintegrations grid.\n\nRebased onto main (post-#4/#11) as a single commit with all review\nfixes.\n\nCo-authored-by: Cursor Agent <cursoragent@cursor.com>\nCo-authored-by: Jim Simon <jimsimon@users.noreply.github.com>",
+          "timestamp": "2026-07-03T18:21:46-04:00",
+          "tree_id": "2e99cc8b211f50fd466ffb86c3ae3f15c336ee77",
+          "url": "https://github.com/jimsimon/trouve/commit/134c8e48abbdbec99793f0c76e327ed03cf5cd60"
+        },
+        "date": 1783117430922,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "bm25_build_5k_docs",
+            "value": 5167545.75,
+            "range": "± 13863",
+            "unit": "ns"
+          },
+          {
+            "name": "bm25_query_5k_docs",
+            "value": 36375.539863445374,
+            "range": "± 6",
+            "unit": "ns"
+          },
+          {
+            "name": "chunk_python_200_functions",
+            "value": 2805324.25,
+            "range": "± 3210",
+            "unit": "ns"
+          },
+          {
+            "name": "dense_query_20k_rows",
+            "value": 1528145.2828407225,
+            "range": "± 8369",
             "unit": "ns"
           }
         ]
