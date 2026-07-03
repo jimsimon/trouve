@@ -31,9 +31,28 @@ use crate::types::{CallType, Chunk, ContentType, IndexStats, SearchResult};
 #[derive(Debug, Clone, Default)]
 pub struct BuildStats {
     pub files_total: usize,
+    /// Files whose entries were read from the content-addressed store.
     pub files_from_store: usize,
+    /// Files spliced zero-copy out of a previous snapshot (exact-match load
+    /// or patch copies) without touching the store.
+    pub files_from_snapshot: usize,
     pub files_computed: usize,
     pub chunks_total: usize,
+}
+
+impl BuildStats {
+    /// Files reused from any cache layer instead of being recomputed.
+    pub fn files_reused(&self) -> usize {
+        self.files_from_store + self.files_from_snapshot
+    }
+
+    /// Fraction of files served from a cache layer, in `[0, 1]`.
+    pub fn cache_hit_rate(&self) -> f64 {
+        if self.files_total == 0 {
+            return 0.0;
+        }
+        self.files_reused() as f64 / self.files_total as f64
+    }
 }
 
 pub struct TrouveIndex {
@@ -125,7 +144,8 @@ impl TrouveIndex {
         if let Some(snap) = snapshot::load(&snapshot_dir, &manifest_hash, &model.model_id) {
             let stats = BuildStats {
                 files_total: manifest.len(),
-                files_from_store: manifest.len(),
+                files_from_store: 0,
+                files_from_snapshot: manifest.len(),
                 files_computed: 0,
                 chunks_total: snap.chunks.len(),
             };
@@ -305,6 +325,7 @@ impl TrouveIndex {
         let stats = BuildStats {
             files_total,
             files_from_store,
+            files_from_snapshot: 0,
             files_computed,
             chunks_total,
         };
@@ -396,6 +417,9 @@ impl TrouveIndex {
                     })
                     .collect()
             });
+        // Everything not fetched from the store below is spliced from the
+        // old snapshot (Plan::Copy).
+        let files_from_snapshot = manifest.len() - fetched.len();
         let mut entries: HashMap<&str, FileEntry> = HashMap::new();
         let mut misses: Vec<(FileRecord, String)> = Vec::new();
         for (record, key, cached) in fetched {
@@ -406,6 +430,7 @@ impl TrouveIndex {
                 None => misses.push(((*record).clone(), key)),
             }
         }
+        let files_from_store = entries.len();
         let files_computed = misses.len();
         for (record, _, entry) in compute_file_entries(misses, model, store) {
             // Keys the borrowed map by the manifest's copy of the path.
@@ -480,7 +505,8 @@ impl TrouveIndex {
 
         let stats = BuildStats {
             files_total: manifest.len(),
-            files_from_store: manifest.len() - files_computed,
+            files_from_store,
+            files_from_snapshot,
             files_computed,
             chunks_total: snap.chunks.len(),
         };

@@ -251,8 +251,12 @@ fn run_stats(path: &str, content: &[ContentType]) -> ExitCode {
         "languages": stats.languages,
         "build": {
             "files_total": build.files_total,
+            "files_from_snapshot": build.files_from_snapshot,
             "files_from_store": build.files_from_store,
             "files_computed": build.files_computed,
+            // Documented in the subcommand help: fraction of files served
+            // from a cache layer (snapshot splice or store) this build.
+            "cache_hit_rate": (build.cache_hit_rate() * 1000.0).round() / 1000.0,
         },
     });
     println!("{}", serde_json::to_string_pretty(&out).unwrap());
