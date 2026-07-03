@@ -77,6 +77,15 @@ trouve                           # run as an MCP stdio server
 `--content` selects what to index: `code` (default), `docs`, `config`, or
 `all`.
 
+For [Claude Code](https://code.claude.com) there is also a
+[plugin](plugins/claude) bundling the MCP server, a `trouve-search`
+sub-agent, and a workflow skill — installable as one unit:
+
+```
+/plugin marketplace add jimsimon/trouve
+/plugin install trouve@trouve
+```
+
 ## Chunking
 
 Tree-sitter grammars are compiled in for ~28 mainstream languages (Rust,

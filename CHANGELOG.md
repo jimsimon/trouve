@@ -4,6 +4,17 @@ All notable changes to this project are documented in this file. The format
 is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this
 project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **Claude Code plugin** (`plugins/claude`): bundles the trouve MCP server,
+  the `trouve-search` sub-agent, and a workflow skill as one installable
+  unit, distributed via a marketplace catalog at the repository root
+  (`/plugin marketplace add jimsimon/trouve`, then
+  `/plugin install trouve@trouve`). Both manifests pass
+  `claude plugin validate --strict`.
+
 ## [1.0.0] - 2026-07-03
 
 First stable release. trouve is a Rust port of

@@ -1,0 +1,14 @@
+{
+  "name": "trouve",
+  "description": "Official plugin marketplace for trouve: fast, accurate code search for agents.",
+  "owner": {
+    "name": "Jim Simon"
+  },
+  "plugins": [
+    {
+      "name": "trouve",
+      "source": "./plugins/claude",
+      "description": "Fast, accurate code search: hybrid semantic + BM25 search over any local or remote git repository, with incremental branch-aware indexing. Requires the trouve binary on PATH (cargo install trouve)."
+    }
+  ]
+}
