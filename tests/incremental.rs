@@ -379,3 +379,68 @@ fn empty_dir_errors() {
     let err = TrouveIndex::from_path(dir.path(), CODE, Some(model));
     assert!(err.is_err());
 }
+
+#[test]
+fn from_git_reuses_persistent_clone_and_store() {
+    let model = test_env();
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("source");
+    std::fs::create_dir_all(&source).unwrap();
+    sample_files(&source);
+    git(&source, &["init", "-q"]);
+    git(&source, &["add", "."]);
+    git(&source, &["commit", "-qm", "initial"]);
+    let url = format!("file://{}", source.canonicalize().unwrap().display());
+
+    // The cache dir is shared by the whole test binary, so identify this
+    // URL's clone by diffing the clone set around the first build instead
+    // of assuming exclusivity.
+    let clones_dir =
+        std::path::PathBuf::from(std::env::var("TROUVE_CACHE_LOCATION").unwrap()).join("clones");
+    let list_clones = |dir: &std::path::Path| -> std::collections::HashSet<std::ffi::OsString> {
+        std::fs::read_dir(dir)
+            .map(|entries| {
+                entries
+                    .flatten()
+                    .filter(|e| e.path().is_dir())
+                    .map(|e| e.file_name())
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    let before = list_clones(&clones_dir);
+
+    let index = TrouveIndex::from_git(&url, None, CODE, Some(model)).unwrap();
+    assert_eq!(index.build_stats.files_total, 3);
+    assert_eq!(index.build_stats.files_computed, 3);
+    assert!(!index
+        .search("authentication", 3, None, None, None, None, None)
+        .is_empty());
+
+    // Exactly one new persistent clone appeared for this URL.
+    let new_clones: Vec<_> = list_clones(&clones_dir)
+        .difference(&before)
+        .cloned()
+        .collect();
+    assert_eq!(new_clones.len(), 1, "one clone created for this URL");
+    let key = new_clones[0].to_string_lossy().into_owned();
+
+    // Second build: no re-clone (within TTL), everything from the store.
+    let index = TrouveIndex::from_git(&url, None, CODE, Some(model)).unwrap();
+    assert_eq!(index.build_stats.files_from_store, 3);
+    assert_eq!(index.build_stats.files_computed, 0);
+
+    // Commit an edit upstream and force a refresh by expiring only this
+    // clone's freshness stamp: the fetch pulls the new content, and only
+    // that file recomputes.
+    write_file(
+        &source,
+        "src/auth.py",
+        "def authenticate(user, password, token):\n    return login(user, password, token)\n",
+    );
+    git(&source, &["commit", "-qam", "update"]);
+    std::fs::remove_file(clones_dir.join(format!("{key}.fetched"))).unwrap();
+    let index = TrouveIndex::from_git(&url, None, CODE, Some(model)).unwrap();
+    assert_eq!(index.build_stats.files_computed, 1);
+    assert_eq!(index.build_stats.files_from_store, 2);
+}

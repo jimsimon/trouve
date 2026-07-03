@@ -8,11 +8,10 @@
 //! every assembly (cheap relative to embedding).
 
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::path::Path;
 use std::sync::Arc;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{bail, Result};
 use rayon::prelude::*;
 
 use crate::bm25::Bm25Index;
@@ -49,12 +48,6 @@ pub struct TrouveIndex {
     pub build_stats: BuildStats,
 }
 
-fn git_clone_timeout() -> u64 {
-    crate::utils::env_var_compat("TROUVE_CLONE_TIMEOUT", "SEMBLE_CLONE_TIMEOUT")
-        .and_then(|(_, v)| v.parse().ok())
-        .unwrap_or(60)
-}
-
 impl TrouveIndex {
     /// Create and index a TrouveIndex from a directory.
     pub fn from_path(
@@ -79,44 +72,26 @@ impl TrouveIndex {
         )
     }
 
-    /// Clone a git repository (shallow) into a temp directory and index it.
+    /// Index a remote git repository via a persistently cached shallow clone.
     ///
-    /// The store identity is derived from the URL (and optional ref), so
-    /// repeated calls share cached chunks even though the clone directory
-    /// changes every time.
+    /// The clone lives in the trouve cache dir keyed by URL (and optional
+    /// ref) and is refreshed with a cheap `git fetch` once its freshness
+    /// window elapses, so repeat queries skip the network entirely (see
+    /// `crate::clone_cache`). The store identity is derived from the URL,
+    /// so cached chunks survive even a full re-clone.
     pub fn from_git(
         url: &str,
         git_ref: Option<&str>,
         content: &[ContentType],
         model_id: Option<&str>,
     ) -> Result<TrouveIndex> {
-        let tmp = tempdir_for_clone()?;
-        let tmp_path = tmp.path().to_path_buf();
-        let mut cmd = Command::new("git");
-        cmd.arg("clone").arg("--depth").arg("1");
-        if let Some(r) = git_ref {
-            cmd.arg("--branch").arg(r);
-        }
-        // `--` prevents `url` from being interpreted as a git option.
-        cmd.arg("--").arg(url).arg(&tmp_path);
-        cmd.env("GIT_HTTP_LOW_SPEED_TIME", git_clone_timeout().to_string())
-            .env("GIT_HTTP_LOW_SPEED_LIMIT", "1000");
-        let output = cmd
-            .stdin(std::process::Stdio::null())
-            .output()
-            .context("git is not installed or not on PATH")?;
-        if !output.status.success() {
-            bail!(
-                "git clone failed for {url:?}:\n{}",
-                String::from_utf8_lossy(&output.stderr).trim()
-            );
-        }
+        let clone = crate::clone_cache::cached_clone(url, git_ref)?;
         let identity_key = match git_ref {
             Some(r) => format!("git-url:{url}@{r}"),
             None => format!("git-url:{url}"),
         };
-        let identity = detect_repo_identity(&tmp_path);
-        Self::build(&tmp_path, identity_key, &identity, content, model_id)
+        let identity = detect_repo_identity(clone.path());
+        Self::build(clone.path(), identity_key, &identity, content, model_id)
     }
 
     fn build(
@@ -775,34 +750,4 @@ fn populate_mappings(
             .push(i);
     }
     (file_mapping, language_mapping)
-}
-
-struct TempDir {
-    path: PathBuf,
-}
-
-impl TempDir {
-    fn path(&self) -> &Path {
-        &self.path
-    }
-}
-
-impl Drop for TempDir {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.path);
-    }
-}
-
-fn tempdir_for_clone() -> Result<TempDir> {
-    let base = std::env::temp_dir();
-    let path = base.join(format!(
-        "trouve-clone-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0)
-    ));
-    std::fs::create_dir_all(&path)?;
-    Ok(TempDir { path })
 }

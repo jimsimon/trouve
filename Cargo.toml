@@ -7,8 +7,9 @@ license = "MIT"
 repository = "https://github.com/jimsimon/trouve"
 keywords = ["code-search", "semantic-search", "mcp", "agent", "embeddings"]
 categories = ["command-line-utilities", "development-tools"]
-# 1.87 for `usize::is_multiple_of`.
-rust-version = "1.87"
+# 1.89 for std file locking (`File::lock`), used by the clone cache
+# (1.87 was already required for `usize::is_multiple_of`).
+rust-version = "1.89"
 
 [lib]
 name = "trouve"
@@ -93,6 +94,7 @@ libc = "0.2.186"
 
 [dev-dependencies]
 criterion = "0.8.2"
+filetime = "0.2"
 model2vec-rs = "0.2.1"
 proptest = "1.11.0"
 tempfile = "3.27.0"

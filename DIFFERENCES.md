@@ -122,12 +122,24 @@ dominated the cold path at this speed.
 ### 9. MCP server details
 
 Same tool surface, plus: the in-process index cache holds up to 10 indexes
-(LRU by canonicalized repo path) and re-validates local paths after a
-cooldown proportional to build time, which the fast incremental rebuild makes
-cheap. The CLI adds a `stats` subcommand (index size, cache hit rate).
+(LRU by canonicalized repo path) and re-validates repos after a cooldown
+proportional to build time, which the fast incremental rebuild makes cheap.
+The CLI adds a `stats` subcommand (index size, cache hit rate).
 
 **Why:** the revalidation policy leans on rebuilds being sub-second; upstream
 cannot re-validate cheaply, so it caches more conservatively.
+
+### 10. Persistent clone cache for remote repositories
+
+Upstream (and trouve before 1.1) shallow-cloned a git URL into a throwaway
+temp directory on every call. Clones now persist in the trouve cache dir
+keyed by URL (and optional ref), guarded by advisory file locks, refreshed
+with a `git fetch` at most once per freshness window (`TROUVE_CLONE_TTL`),
+and evicted after a week idle.
+
+**Why:** the content-addressed store already made re-indexing an unchanged
+remote repo nearly free — the network-bound re-clone was the only repeated
+cost left. A warm remote query now costs the same as a local one.
 
 ## What did *not* change
 

@@ -8,21 +8,20 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Persistent clone cache**: remote git URLs are cloned once into
+  `<cache>/clones` and refreshed with a cheap `git fetch` at most once per
+  freshness window (`TROUVE_CLONE_TTL` seconds, default 300) instead of
+  re-cloned per query. Clones are lock-protected against concurrent trouve
+  processes, evicted after a week idle, and removed by `trouve clear index`.
+  A stale clone is served (with a warning) when the remote is unreachable.
+- The MCP server now re-validates git URLs after the same cooldown as local
+  paths — a revalidation is now a TTL-gated fetch plus an incremental
+  rebuild, not a re-clone.
 - **`.trouveignore` files**: exclude files from indexing without git-ignoring
   them, replacing upstream's `.sembleignore` (same syntax, same per-directory
   inheritance; `.trouveignore` wins where patterns conflict).
 - **`.semble/` directories** are now skipped during walks, alongside
   `.trouve/`, matching upstream's default ignore list.
-
-### Deprecated
-
-- **`.sembleignore` files**: still honoured, but log a warning and will be
-  removed in a future release. Rename to `.trouveignore`.
-- **`SEMBLE_CACHE_LOCATION`, `SEMBLE_MODEL_NAME`, `SEMBLE_CLONE_TIMEOUT`**:
-  now honoured as fallbacks when the `TROUVE_*` equivalent is unset, but log
-  a warning and will be removed in a future release. Use
-  `TROUVE_CACHE_LOCATION`, `TROUVE_MODEL_NAME`, and `TROUVE_CLONE_TIMEOUT`.
-
 - **23 new tree-sitter grammars** (~50 languages total): CMake, D, Dart, Elm,
   ERB/EJS embedded templates, Erlang, Fortran, Gleam, GraphQL, Groovy,
   HCL/Terraform, Julia, Make, Nix, Objective-C, Perl, PowerShell, Protocol
@@ -45,6 +44,19 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   the index build and later searches absorb the agent's own edits
   (`"warm": false` disables). The Claude Code bundle ships an equivalent
   `SessionStart` hook running `trouve stats` in the background.
+
+### Changed
+
+- MSRV raised from 1.87 to 1.89 (std file locking for the clone cache).
+
+### Deprecated
+
+- **`.sembleignore` files**: still honoured, but log a warning and will be
+  removed in a future release. Rename to `.trouveignore`.
+- **`SEMBLE_CACHE_LOCATION`, `SEMBLE_MODEL_NAME`, `SEMBLE_CLONE_TIMEOUT`**:
+  now honoured as fallbacks when the `TROUVE_*` equivalent is unset, but log
+  a warning and will be removed in a future release. Use
+  `TROUVE_CACHE_LOCATION`, `TROUVE_MODEL_NAME`, and `TROUVE_CLONE_TIMEOUT`.
 
 ## [1.0.0] - 2026-07-03
 
