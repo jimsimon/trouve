@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1783113782196,
+  "lastUpdate": 1783114786650,
   "repoUrl": "https://github.com/jimsimon/trouve",
   "entries": {
     "e2e-benchmarks": [
@@ -287,6 +287,54 @@ window.BENCHMARK_DATA = {
             "name": "non-git warm query",
             "value": 58.375656920000004,
             "range": "± 1.5",
+            "unit": "ms"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "jim.j.simon@gmail.com",
+            "name": "Jim Simon",
+            "username": "jimsimon"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "bb36045e50014ccd97a4e394d3552b90cb557f5c",
+          "message": "Keep crate, plugin, and package versions in sync — enforced in CI and releases (#11)\n\nscripts/sync_versions.py treats the crate version in Cargo.toml\n(parsed with tomllib) as the single source of truth and rewrites every\npublished manifest to match: plugins/*/package.json, package-lock.json\n(both version records), and Claude Code / Codex plugin.json manifests.\nLint CI runs it with --check so any drift fails the build.\n\nThe release workflow gains a verify-versions job (sync check + tag ==\ncrate version assertion, before any build) and a publish-npm job that\npublishes every plugins/*/package.json package at the same version\nafter the GitHub release — idempotent, and skipped cleanly when no npm\npackages exist or NPM_TOKEN is not configured. New checkout steps set\npersist-credentials: false.\n\nWith the unified plugin (#12) on main, the sync check now covers\nplugins/trouve. Rebased onto main as a single commit with all review\nfixes.\n\nCo-authored-by: Cursor Agent <cursoragent@cursor.com>\nCo-authored-by: Jim Simon <jimsimon@users.noreply.github.com>",
+          "timestamp": "2026-07-03T17:38:25-04:00",
+          "tree_id": "8f1adfb5bd3765e3db2792f5b4cd9abda4d2b44f",
+          "url": "https://github.com/jimsimon/trouve/commit/bb36045e50014ccd97a4e394d3552b90cb557f5c"
+        },
+        "date": 1783114785817,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "cold index + query",
+            "value": 116.92929120000001,
+            "range": "± 5",
+            "unit": "ms"
+          },
+          {
+            "name": "warm query",
+            "value": 57.500692560000005,
+            "range": "± 2.9",
+            "unit": "ms"
+          },
+          {
+            "name": "incremental (1 file modified)",
+            "value": 67.6127314,
+            "range": "± 1.6",
+            "unit": "ms"
+          },
+          {
+            "name": "non-git warm query",
+            "value": 56.352596240000004,
+            "range": "± 1.4",
             "unit": "ms"
           }
         ]
