@@ -29,6 +29,22 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   Buffers, R, Solidity, SQL, Svelte, and XML (incl. DTD). Files in these
   languages now get syntax-aware chunk boundaries instead of the line-based
   fallback.
+- **Unified agent plugin** (`plugins/trouve`): one package serving four
+  harnesses. As the npm package `trouve-plugin` it exposes `trouve_search`
+  and `trouve_find_related` as native tools in OpenCode and Kilo Code,
+  backed by a single persistent `trouve` server process per session
+  (preserving the in-process index cache, including for remote git URLs).
+  The same directory carries the Claude Code plugin bundle (MCP server +
+  `trouve-search` sub-agent + workflow skill, installed via the marketplace
+  catalog at `.claude-plugin/marketplace.json`) and the Codex plugin bundle
+  (MCP server + skill, via `.agents/plugins/marketplace.json`). All
+  manifests pass their official validators and ship at the crate version.
+- **Session-start index warming**: the OpenCode/Kilo plugin builds or
+  refreshes the project index in the background when it loads and
+  (throttled) on every `session.idle` event, so the first search never pays
+  the index build and later searches absorb the agent's own edits
+  (`"warm": false` disables). The Claude Code bundle ships an equivalent
+  `SessionStart` hook running `trouve stats` in the background.
 
 ## [1.0.0] - 2026-07-03
 
