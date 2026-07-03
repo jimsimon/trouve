@@ -1,8 +1,10 @@
 //! Interactive installer: configure trouve across coding agents.
 //!
-//! Port of `semble/installer/*`. Three integrations per agent: an MCP server
-//! entry, a marked instructions block in the agent's config markdown, and a
-//! dedicated `trouve-search` sub-agent file.
+//! Port of `semble/installer/*`. Four integrations per agent: an MCP server
+//! entry, an optional native custom-tool file (an MCP alternative for
+//! agents that load tool definitions directly, like OpenCode), a marked
+//! instructions block in the agent's config markdown, and a dedicated
+//! `trouve-search` sub-agent file.
 //!
 //! Deviation from upstream: JSON config edits use strict JSON round-tripping
 //! (key order preserved) instead of a tree-sitter JSON5 grammar. Files that
@@ -55,20 +57,20 @@ impl fmt::Display for Action {
     }
 }
 
-fn instructions_block() -> String {
+fn instructions_block(intro: &str, search_tool: &str, related_tool: &str) -> String {
     format!(
         r#"{TROUVE_START}
 ## Trouve Code Search
 
-A `trouve` MCP server is available with two tools:
-- `mcp__trouve__search` — search the codebase with a natural-language or code query.
-- `mcp__trouve__find_related` — find code similar to a specific file and line.
+{intro}
+- `{search_tool}` — search the codebase with a natural-language or code query.
+- `{related_tool}` — find code similar to a specific file and line.
 
-Use `mcp__trouve__search` to find where something is implemented — instead of using Grep or Glob to discover files. After trouve returns the file and line, navigate there directly and read that file. Do not grep for the same content again.
+Use `{search_tool}` to find where something is implemented — instead of using Grep or Glob to discover files. After trouve returns the file and line, navigate there directly and read that file. Do not grep for the same content again.
 
 Pass `--content docs` to search documentation and prose, `--content config` for config files, or `--content all` to search code, docs, and config together.
 
-For CLI fallback or sub-agents without MCP access, use:
+For CLI fallback or sub-agents without tool access, use:
 
 ```bash
 trouve search "authentication flow" ./my-project --max-snippet-lines 10
@@ -82,15 +84,34 @@ The index is built on first run and cached automatically; updates are incrementa
 
 ### Workflow
 
-1. Call `mcp__trouve__search` with a query describing what the code does or its name. The tool returns results with 10 lines of context each (function/class signature + first body lines, enough to confirm the location).
+1. Call `{search_tool}` with a query describing what the code does or its name. The tool returns results with 10 lines of context each (function/class signature + first body lines, enough to confirm the location).
 2. Navigate directly to the top result's file and line. Read only the function or class at that location.
 3. Make the edit. Do not re-search or grep for the same content.
 4. Use `--content docs` for documentation, `--content config` for config files, or `--content all` for everything.
-5. Optionally use `mcp__trouve__find_related` with `file_path` and `line` to discover similar code elsewhere.
+5. Optionally use `{related_tool}` with `file_path` and `line` to discover similar code elsewhere.
 6. Use Grep only when you need every occurrence of a literal string across the whole repo (e.g., all callers of a renamed function).
 {TROUVE_END}
 "#
     )
+}
+
+/// The instructions block for one agent, using the tool names its selected
+/// integrations expose: native tool-file names when the custom-tool file is
+/// being installed for this agent, MCP-prefixed names otherwise.
+fn instructions_block_for(agent: &AgentTarget, native_tool: bool) -> String {
+    if native_tool && agent.tool_file.is_some() {
+        instructions_block(
+            "Trouve code search is available as native custom tools:",
+            "trouve_search",
+            "trouve_find_related",
+        )
+    } else {
+        instructions_block(
+            "A `trouve` MCP server is available with two tools:",
+            "mcp__trouve__search",
+            "mcp__trouve__find_related",
+        )
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -107,6 +128,15 @@ struct McpConfig {
     format: McpFormat,
 }
 
+/// A native custom-tool file (agents whose runtime loads tool definitions
+/// directly). Offered alongside MCP as an alternative integration; the two
+/// expose the same tools, so users typically enable one or the other.
+#[derive(Debug, Clone)]
+struct ToolFileConfig {
+    path: PathBuf,
+    asset: &'static str,
+}
+
 #[derive(Debug, Clone)]
 pub struct AgentTarget {
     /// Stable identifier, matching upstream agent ids.
@@ -116,6 +146,8 @@ pub struct AgentTarget {
     binary: Option<&'static str>,
     config_dir: Option<PathBuf>,
     mcp: Option<McpConfig>,
+    /// Optional native custom-tool file, offered as an MCP alternative.
+    tool_file: Option<ToolFileConfig>,
     instructions_path: Option<PathBuf>,
     subagent_path: Option<PathBuf>,
     subagent_asset: Option<&'static str>,
@@ -196,6 +228,7 @@ pub fn agents() -> Vec<AgentTarget> {
                 entry: stdio_config(),
                 format: McpFormat::Json,
             }),
+            tool_file: None,
             instructions_path: Some(home.join(".claude").join("CLAUDE.md")),
             subagent_path: Some(home.join(".claude").join("agents").join("trouve-search.md")),
             subagent_asset: Some(include_str!("agents/claude.md")),
@@ -211,6 +244,7 @@ pub fn agents() -> Vec<AgentTarget> {
                 entry: stdio_config(),
                 format: McpFormat::Json,
             }),
+            tool_file: None,
             instructions_path: None,
             subagent_path: Some(home.join(".cursor").join("agents").join("trouve-search.md")),
             subagent_asset: Some(include_str!("agents/cursor.md")),
@@ -226,6 +260,7 @@ pub fn agents() -> Vec<AgentTarget> {
                 entry: stdio_config(),
                 format: McpFormat::Json,
             }),
+            tool_file: None,
             instructions_path: Some(home.join(".gemini").join("GEMINI.md")),
             subagent_path: Some(home.join(".gemini").join("agents").join("trouve-search.md")),
             subagent_asset: Some(include_str!("agents/gemini.md")),
@@ -241,6 +276,7 @@ pub fn agents() -> Vec<AgentTarget> {
                 entry: stdio_config(),
                 format: McpFormat::Json,
             }),
+            tool_file: None,
             instructions_path: Some(home.join(".kiro").join("steering").join("trouve.md")),
             subagent_path: Some(home.join(".kiro").join("agents").join("trouve-search.md")),
             subagent_asset: Some(include_str!("agents/kiro.md")),
@@ -255,6 +291,14 @@ pub fn agents() -> Vec<AgentTarget> {
                 key: "mcp",
                 entry: opencode_config(),
                 format: McpFormat::Json,
+            }),
+            tool_file: Some(ToolFileConfig {
+                path: home
+                    .join(".config")
+                    .join("opencode")
+                    .join("tools")
+                    .join("trouve.ts"),
+                asset: include_str!("agents/opencode-tool.ts"),
             }),
             instructions_path: Some(home.join(".config").join("opencode").join("AGENTS.md")),
             subagent_path: Some(
@@ -276,6 +320,7 @@ pub fn agents() -> Vec<AgentTarget> {
                 entry: bare_stdio_config(),
                 format: McpFormat::Json,
             }),
+            tool_file: None,
             instructions_path: None,
             subagent_path: Some(
                 home.join(".copilot")
@@ -295,6 +340,7 @@ pub fn agents() -> Vec<AgentTarget> {
                 entry: stdio_config(),
                 format: McpFormat::Toml,
             }),
+            tool_file: None,
             instructions_path: Some(home.join(".codex").join("AGENTS.md")),
             subagent_path: Some(
                 home.join(".codex")
@@ -314,6 +360,7 @@ pub fn agents() -> Vec<AgentTarget> {
                 entry: stdio_config(),
                 format: McpFormat::Json,
             }),
+            tool_file: None,
             instructions_path: None,
             subagent_path: None,
             subagent_asset: None,
@@ -332,6 +379,7 @@ pub fn agents() -> Vec<AgentTarget> {
                 entry: bare_stdio_config(),
                 format: McpFormat::Json,
             }),
+            tool_file: None,
             instructions_path: None,
             subagent_path: None,
             subagent_asset: None,
@@ -347,6 +395,7 @@ pub fn agents() -> Vec<AgentTarget> {
                 entry: zed_config(),
                 format: McpFormat::Json,
             }),
+            tool_file: None,
             instructions_path: None,
             subagent_path: None,
             subagent_asset: None,
@@ -362,6 +411,7 @@ pub fn agents() -> Vec<AgentTarget> {
                 entry: bare_stdio_config(),
                 format: McpFormat::Json,
             }),
+            tool_file: None,
             instructions_path: Some(home.join(".config").join("reasonix").join("REASONIX.md")),
             subagent_path: Some(
                 home.join(".reasonix")
@@ -381,6 +431,7 @@ pub fn agents() -> Vec<AgentTarget> {
                 entry: bare_stdio_config(),
                 format: McpFormat::Json,
             }),
+            tool_file: None,
             instructions_path: None,
             subagent_path: Some(home.join(".pi").join("agents").join("trouve-search.md")),
             subagent_asset: Some(include_str!("agents/pi.md")),
@@ -396,6 +447,7 @@ pub fn agents() -> Vec<AgentTarget> {
                 entry: bare_stdio_config(),
                 format: McpFormat::Json,
             }),
+            tool_file: None,
             instructions_path: Some(home.join(".commandcode").join("AGENTS.md")),
             subagent_path: Some(
                 home.join(".commandcode")
@@ -415,6 +467,7 @@ pub fn agents() -> Vec<AgentTarget> {
                 entry: stdio_config(),
                 format: McpFormat::Json,
             }),
+            tool_file: None,
             instructions_path: Some(home.join(".gemini").join("GEMINI.md")),
             subagent_path: Some(
                 home.join(".gemini")
@@ -720,10 +773,24 @@ fn apply_mcp(agent: &AgentTarget, mode: Mode) -> Option<WriteResult> {
     })
 }
 
-fn apply_instructions(agent: &AgentTarget, mode: Mode) -> Option<WriteResult> {
+fn apply_tool_file(agent: &AgentTarget, mode: Mode) -> Option<WriteResult> {
+    let tool = agent.tool_file.as_ref()?;
+    let action = match mode {
+        Mode::Install => write_asset(&tool.path, tool.asset),
+        Mode::Uninstall => remove_asset(&tool.path),
+    };
+    Some(WriteResult {
+        path: tool.path.clone(),
+        action,
+    })
+}
+
+fn apply_instructions(agent: &AgentTarget, mode: Mode, native_tool: bool) -> Option<WriteResult> {
     let path = agent.instructions_path.as_ref()?;
     let action = match mode {
-        Mode::Install => replace_or_append_marked(path, &instructions_block()),
+        Mode::Install => {
+            replace_or_append_marked(path, &instructions_block_for(agent, native_tool))
+        }
         Mode::Uninstall => remove_marked(path),
     };
     Some(WriteResult {
@@ -732,33 +799,13 @@ fn apply_instructions(agent: &AgentTarget, mode: Mode) -> Option<WriteResult> {
     })
 }
 
-fn apply_subagent(agent: &AgentTarget, mode: Mode) -> Option<WriteResult> {
-    let dest = agent.subagent_path.as_ref()?;
-    let asset = agent.subagent_asset?;
-    if mode == Mode::Uninstall {
-        if !dest.exists() {
-            return Some(WriteResult {
-                path: dest.clone(),
-                action: Action::NotFound,
-            });
-        }
-        let action = match std::fs::remove_file(dest) {
-            Ok(()) => Action::Removed,
-            Err(_) => Action::Error,
-        };
-        return Some(WriteResult {
-            path: dest.clone(),
-            action,
-        });
-    }
+/// Write an embedded asset file, creating parent directories.
+fn write_asset(dest: &Path, asset: &str) -> Action {
     let existed = dest.exists();
     if std::fs::create_dir_all(dest.parent().unwrap_or(Path::new("."))).is_err() {
-        return Some(WriteResult {
-            path: dest.clone(),
-            action: Action::Error,
-        });
+        return Action::Error;
     }
-    let action = match std::fs::write(dest, asset) {
+    match std::fs::write(dest, asset) {
         Ok(()) => {
             if existed {
                 Action::Updated
@@ -767,6 +814,25 @@ fn apply_subagent(agent: &AgentTarget, mode: Mode) -> Option<WriteResult> {
             }
         }
         Err(_) => Action::Error,
+    }
+}
+
+fn remove_asset(dest: &Path) -> Action {
+    if !dest.exists() {
+        return Action::NotFound;
+    }
+    match std::fs::remove_file(dest) {
+        Ok(()) => Action::Removed,
+        Err(_) => Action::Error,
+    }
+}
+
+fn apply_subagent(agent: &AgentTarget, mode: Mode) -> Option<WriteResult> {
+    let dest = agent.subagent_path.as_ref()?;
+    let asset = agent.subagent_asset?;
+    let action = match mode {
+        Mode::Install => write_asset(dest, asset),
+        Mode::Uninstall => remove_asset(dest),
     };
     Some(WriteResult {
         path: dest.clone(),
@@ -777,6 +843,7 @@ fn apply_subagent(agent: &AgentTarget, mode: Mode) -> Option<WriteResult> {
 #[derive(Clone, Copy, PartialEq)]
 enum Integration {
     Mcp,
+    Tool,
     Instructions,
     Subagent,
 }
@@ -785,6 +852,7 @@ impl Integration {
     fn label(&self) -> &'static str {
         match self {
             Integration::Mcp => "MCP server",
+            Integration::Tool => "Native tool",
             Integration::Instructions => "Instructions",
             Integration::Subagent => "Sub-agent",
         }
@@ -793,6 +861,9 @@ impl Integration {
     fn desc(&self) -> &'static str {
         match self {
             Integration::Mcp => "lets the agent call trouve directly as a tool",
+            Integration::Tool => {
+                "custom-tool file, an MCP alternative (Opencode) — enable one of the two"
+            }
             Integration::Instructions => "adds CLI usage guidance to AGENTS.md / CLAUDE.md",
             Integration::Subagent => "installs a dedicated trouve-search sub-agent",
         }
@@ -801,15 +872,17 @@ impl Integration {
     fn plan_path(&self, agent: &AgentTarget) -> Option<PathBuf> {
         match self {
             Integration::Mcp => agent.mcp.as_ref().map(|m| m.path.clone()),
+            Integration::Tool => agent.tool_file.as_ref().map(|t| t.path.clone()),
             Integration::Instructions => agent.instructions_path.clone(),
             Integration::Subagent => agent.subagent_path.clone(),
         }
     }
 
-    fn apply(&self, agent: &AgentTarget, mode: Mode) -> Option<WriteResult> {
+    fn apply(&self, agent: &AgentTarget, mode: Mode, native_tool: bool) -> Option<WriteResult> {
         match self {
             Integration::Mcp => apply_mcp(agent, mode),
-            Integration::Instructions => apply_instructions(agent, mode),
+            Integration::Tool => apply_tool_file(agent, mode),
+            Integration::Instructions => apply_instructions(agent, mode, native_tool),
             Integration::Subagent => apply_subagent(agent, mode),
         }
     }
@@ -866,6 +939,7 @@ pub fn run(mode: Mode) -> ExitCode {
 
     let integrations = [
         Integration::Mcp,
+        Integration::Tool,
         Integration::Instructions,
         Integration::Subagent,
     ];
@@ -873,6 +947,13 @@ pub fn run(mode: Mode) -> ExitCode {
         .iter()
         .map(|i| format!("{:<13}  —  {}", i.label(), i.desc()))
         .collect();
+    // The native tool file duplicates the MCP tools, so it is opt-in on
+    // install; uninstall defaults to removing everything found.
+    let integ_defaults = if install {
+        [true, false, true, true]
+    } else {
+        [true, true, true, true]
+    };
     let Ok(chosen_integ) = MultiSelect::new()
         .with_prompt(if install {
             "Select integrations to enable:"
@@ -880,7 +961,7 @@ pub fn run(mode: Mode) -> ExitCode {
             "Select integrations to remove:"
         })
         .items(&integ_labels)
-        .defaults(&[true, true, true])
+        .defaults(&integ_defaults)
         .interact()
     else {
         println!("Nothing selected. Exiting.");
@@ -892,6 +973,7 @@ pub fn run(mode: Mode) -> ExitCode {
     }
     let chosen_integrations: Vec<Integration> =
         chosen_integ.iter().map(|i| integrations[*i]).collect();
+    let native_tool = chosen_integrations.contains(&Integration::Tool);
 
     println!("\n  Plan:\n");
     for agent in &chosen_agents {
@@ -924,7 +1006,7 @@ pub fn run(mode: Mode) -> ExitCode {
     for agent in &chosen_agents {
         println!("  {}", agent.display_name);
         for integ in &chosen_integrations {
-            match integ.apply(agent, mode) {
+            match integ.apply(agent, mode, native_tool) {
                 None => println!("    - {}: not supported", integ.label()),
                 Some(result) => {
                     let detail = match result.action {
@@ -1039,13 +1121,21 @@ mod tests {
         assert!(!text.contains(CODEX_MCP_HEADER));
     }
 
+    fn mcp_instructions() -> String {
+        instructions_block(
+            "A `trouve` MCP server is available with two tools:",
+            "mcp__trouve__search",
+            "mcp__trouve__find_related",
+        )
+    }
+
     #[test]
     fn marked_block_roundtrip() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("AGENTS.md");
         std::fs::write(&path, "# My instructions\n").unwrap();
         assert_eq!(
-            replace_or_append_marked(&path, &instructions_block()),
+            replace_or_append_marked(&path, &mcp_instructions()),
             Action::Updated
         );
         let text = std::fs::read_to_string(&path).unwrap();
@@ -1053,7 +1143,7 @@ mod tests {
         assert!(text.contains(TROUVE_START));
         // Re-applying replaces in place, not duplicates.
         assert_eq!(
-            replace_or_append_marked(&path, &instructions_block()),
+            replace_or_append_marked(&path, &mcp_instructions()),
             Action::Unchanged
         );
         assert_eq!(text.matches(TROUVE_START).count(), 1);
@@ -1061,6 +1151,102 @@ mod tests {
         let text = std::fs::read_to_string(&path).unwrap();
         assert!(!text.contains(TROUVE_START));
         assert!(text.contains("# My instructions"));
+    }
+
+    fn opencode_target(dir: &Path) -> AgentTarget {
+        AgentTarget {
+            id: "opencode",
+            display_name: "Opencode",
+            binary: None,
+            config_dir: Some(dir.to_path_buf()),
+            mcp: Some(McpConfig {
+                path: dir.join("opencode.json"),
+                key: "mcp",
+                entry: opencode_config(),
+                format: McpFormat::Json,
+            }),
+            tool_file: Some(ToolFileConfig {
+                path: dir.join("tools").join("trouve.ts"),
+                asset: include_str!("agents/opencode-tool.ts"),
+            }),
+            instructions_path: Some(dir.join("AGENTS.md")),
+            subagent_path: None,
+            subagent_asset: None,
+        }
+    }
+
+    #[test]
+    fn tool_file_install_and_uninstall() {
+        let dir = tempfile::tempdir().unwrap();
+        let agent = opencode_target(dir.path());
+        let tool_path = dir.path().join("tools").join("trouve.ts");
+
+        let result = apply_tool_file(&agent, Mode::Install).unwrap();
+        assert_eq!(result.action, Action::Created);
+        assert_eq!(result.path, tool_path);
+        let text = std::fs::read_to_string(&tool_path).unwrap();
+        assert!(text.contains("export const search"));
+        assert!(text.contains("export const find_related"));
+
+        assert_eq!(
+            apply_tool_file(&agent, Mode::Install).unwrap().action,
+            Action::Updated
+        );
+        assert_eq!(
+            apply_tool_file(&agent, Mode::Uninstall).unwrap().action,
+            Action::Removed
+        );
+        assert!(!tool_path.exists());
+    }
+
+    #[test]
+    fn tool_file_does_not_touch_mcp_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let agent = opencode_target(dir.path());
+        // An existing MCP entry stays exactly as it is: MCP and the native
+        // tool file are independent integrations.
+        let config = r#"{"mcp": {"trouve": {"command": ["trouve"]}, "other": {"command": ["x"]}}}"#;
+        std::fs::write(dir.path().join("opencode.json"), config).unwrap();
+
+        apply_tool_file(&agent, Mode::Install).unwrap();
+        apply_tool_file(&agent, Mode::Uninstall).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("opencode.json")).unwrap(),
+            config
+        );
+
+        // And MCP install/uninstall works for opencode as for other agents.
+        assert_eq!(
+            apply_mcp(&agent, Mode::Uninstall).unwrap().action,
+            Action::Removed
+        );
+        let parsed: Value = serde_json::from_str(
+            &std::fs::read_to_string(dir.path().join("opencode.json")).unwrap(),
+        )
+        .unwrap();
+        assert!(parsed["mcp"].get("trouve").is_none());
+        assert_eq!(parsed["mcp"]["other"]["command"][0], "x", "others kept");
+    }
+
+    #[test]
+    fn instructions_use_native_tool_names_only_when_tool_selected() {
+        let dir = tempfile::tempdir().unwrap();
+        let agent = opencode_target(dir.path());
+
+        let block = instructions_block_for(&agent, true);
+        assert!(block.contains("`trouve_search`"));
+        assert!(block.contains("`trouve_find_related`"));
+        assert!(!block.contains("mcp__trouve__"));
+
+        // Tool integration not selected: MCP names, even for opencode.
+        let block = instructions_block_for(&agent, false);
+        assert!(block.contains("`mcp__trouve__search`"));
+
+        // Agents without a tool file always get MCP names.
+        let mut mcp_only = agent.clone();
+        mcp_only.tool_file = None;
+        let block = instructions_block_for(&mcp_only, true);
+        assert!(block.contains("`mcp__trouve__search`"));
     }
 
     #[test]
