@@ -1,0 +1,6 @@
+/target
+/reference
+*.tmp.*
+.venv
+__pycache__/
+/benchmarks/repos

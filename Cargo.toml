@@ -1,0 +1,73 @@
+[package]
+name = "semble"
+version = "0.1.0"
+edition = "2021"
+description = "Fast and accurate code search for agents. Rust port of MinishLab/semble with incremental, branch- and worktree-aware indexing."
+license = "MIT"
+repository = "https://github.com/jimsimon/semble-rs"
+keywords = ["code-search", "semantic-search", "mcp", "agent", "embeddings"]
+categories = ["command-line-utilities", "development-tools"]
+rust-version = "1.85"
+
+[lib]
+name = "semble"
+path = "src/lib.rs"
+
+[[bin]]
+name = "semble"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1.0.103"
+bincode = { version = "2", features = ["serde"] }
+blake3 = "1.8.5"
+clap = { version = "4.6.1", features = ["derive"] }
+dialoguer = "0.12.0"
+dirs = "6.0.0"
+ignore = "0.4.27"
+libc = "0.2.186"
+model2vec-rs = "0.2.1"
+rayon = "1.12.0"
+regex = "1.12.4"
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = { version = "1.0.150", features = ["preserve_order"] }
+tree-sitter = "0.26.10"
+tree-sitter-bash = "0.25.1"
+tree-sitter-c = "0.24.2"
+tree-sitter-c-sharp = "0.23.5"
+tree-sitter-cpp = "0.23.4"
+tree-sitter-css = "0.25.0"
+tree-sitter-elixir = "0.3.5"
+tree-sitter-go = "0.25.0"
+tree-sitter-haskell = "0.23.1"
+tree-sitter-html = "0.23.2"
+tree-sitter-java = "0.23.5"
+tree-sitter-javascript = "0.25.0"
+tree-sitter-json = "0.24.8"
+tree-sitter-kotlin-ng = "1.1.0"
+tree-sitter-lua = "0.5.0"
+tree-sitter-md = "0.5.3"
+tree-sitter-ocaml = "0.25.0"
+tree-sitter-php = "0.24.2"
+tree-sitter-python = "0.25.0"
+tree-sitter-ruby = "0.23.1"
+tree-sitter-rust = "0.24.2"
+tree-sitter-scala = "0.26.0"
+tree-sitter-swift = "0.7.3"
+tree-sitter-toml-ng = "0.7.0"
+tree-sitter-typescript = "0.23.2"
+tree-sitter-yaml = "0.7.2"
+tree-sitter-zig = "1.1.2"
+
+[dev-dependencies]
+criterion = "0.8.2"
+proptest = "1.11.0"
+tempfile = "3.27.0"
+
+[[bench]]
+name = "index_and_search"
+harness = false
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
