@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1783113744997,
+  "lastUpdate": 1783113782196,
   "repoUrl": "https://github.com/jimsimon/trouve",
   "entries": {
     "e2e-benchmarks": [
@@ -529,6 +529,54 @@ window.BENCHMARK_DATA = {
             "name": "dense_query_20k_rows",
             "value": 1490320.6433483372,
             "range": "± 10255",
+            "unit": "ns"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "jim.j.simon@gmail.com",
+            "name": "Jim Simon",
+            "username": "jimsimon"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "93ea488b5d6edce49a23796bb4f7286707ef6472",
+          "message": "Consolidate all agent plugins into one trouve-plugin package (#12)\n\n* Consolidate all agent plugins into one trouve-plugin package\n\nplugins/trouve is simultaneously the npm package trouve-plugin for\nOpenCode and Kilo Code (native tools backed by one persistent trouve\nstdio server per session), the Claude Code plugin bundle (MCP server,\nsub-agent, workflow skill, SessionStart index-warming hook; marketplace\nat .claude-plugin/marketplace.json), and the Codex plugin bundle (MCP\nserver + skill; marketplace at .agents/plugins/marketplace.json).\n\nThe OpenCode/Kilo plugin warms the project index at load and on\nsession.idle (throttled; warm:false disables). README gains an Agent\nintegrations feature grid comparing every install route.\n\nRebased onto main as a single commit, folding in all review fixes.\n\nCo-authored-by: Jim Simon <jimsimon@users.noreply.github.com>\n\n* Address review: request timeouts, stderr capture, visible failures\n\n- request() now takes a per-request timeout (30s for the initialize\n  handshake, 10 minutes for tools/call to cover cold index builds of\n  huge repos). On timeout the pending request is rejected with an\n  actionable message and the server is killed so the next call starts\n  fresh — a stalled-but-alive server can no longer hang an agent turn.\n- The server's stderr is captured (last 2KB) and included in the\n  rejection message when the process exits unexpectedly.\n- The Claude SessionStart hook now fails visibly with an install hint\n  when the trouve binary is missing, instead of masking it with exit 0;\n  the warm itself still runs backgrounded via nohup.\n- Invalid content plugin-option values are reported via console.warn\n  instead of being silently dropped.\n\nCo-authored-by: Jim Simon <jimsimon@users.noreply.github.com>\n\n---------\n\nCo-authored-by: Cursor Agent <cursoragent@cursor.com>\nCo-authored-by: Jim Simon <jimsimon@users.noreply.github.com>",
+          "timestamp": "2026-07-03T17:21:03-04:00",
+          "tree_id": "06ce1231852c1c9a4feede5fe15470ec8978f9f6",
+          "url": "https://github.com/jimsimon/trouve/commit/93ea488b5d6edce49a23796bb4f7286707ef6472"
+        },
+        "date": 1783113781933,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "bm25_build_5k_docs",
+            "value": 4773579.954545455,
+            "range": "± 7855",
+            "unit": "ns"
+          },
+          {
+            "name": "bm25_query_5k_docs",
+            "value": 36758.75185185185,
+            "range": "± 29",
+            "unit": "ns"
+          },
+          {
+            "name": "chunk_python_200_functions",
+            "value": 2935443.794117647,
+            "range": "± 1741",
+            "unit": "ns"
+          },
+          {
+            "name": "dense_query_20k_rows",
+            "value": 1353331.826388889,
+            "range": "± 7278",
             "unit": "ns"
           }
         ]
