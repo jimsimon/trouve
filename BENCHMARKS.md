@@ -94,10 +94,10 @@ cache, hyperfine mean ± σ:
 
 | Scenario | git | non-git | Delta |
 | --- | --- | --- | --- |
-| Cold index + query (3 runs) | 8.78 s ± 0.55 s | 8.70 s ± 0.23 s | tie |
-| Warm query (9 runs) | 509 ms ± 24 ms | 604 ms ± 27 ms | git 1.19x |
-| Incremental, 1 file modified (3 runs) | 1.44 s ± 0.18 s | 1.67 s ± 0.06 s | git 1.16x |
-| Touch-only, mtime bumped (3 runs) | 457 ms ± 26 ms | 589 ms ± 23 ms | git 1.29x |
+| Cold index + query (3 runs) | 9.99 s ± 0.80 s | 10.40 s ± 0.60 s | tie (1.04x) |
+| Warm query (9 runs) | 548 ms ± 13 ms | 673 ms ± 25 ms | git 1.23x |
+| Incremental, 1 file modified (3 runs) | 574 ms ± 21 ms | 661 ms ± 13 ms | git 1.15x |
+| Touch-only, mtime bumped (3 runs) | 537 ms ± 7 ms | 681 ms ± 17 ms | git 1.27x |
 
 The whole difference is the manifest phase (`TROUVE_TIMING=1`); everything
 downstream — store hits, snapshot patching, query — is identical:
@@ -117,7 +117,7 @@ mtime fast path: a bumped mtime re-hashes one file, hits the store, and pays
 only the manifest walk. What a non-git root gives up is the branch/worktree
 store sharing (identity is the folder path, not the git common dir) and the
 no-read manifest for clean files — on kubernetes scale that costs roughly
-100–230 ms per invocation.
+90–150 ms per invocation.
 
 ## Resource usage
 
