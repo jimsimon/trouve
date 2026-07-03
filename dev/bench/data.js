@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1783116795598,
+  "lastUpdate": 1783116838302,
   "repoUrl": "https://github.com/jimsimon/trouve",
   "entries": {
     "e2e-benchmarks": [
@@ -721,6 +721,54 @@ window.BENCHMARK_DATA = {
             "name": "dense_query_20k_rows",
             "value": 1348077.005952381,
             "range": "± 7466",
+            "unit": "ns"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "jim.j.simon@gmail.com",
+            "name": "Jim Simon",
+            "username": "jimsimon"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "6b52916408d70e9c364e43cb3e7933573b43ccad",
+          "message": "Cache shallow clones of remote repositories persistently (#4)\n\n* Cache shallow clones of remote repositories persistently\n\nfrom_git used to clone into a throwaway temp directory on every call,\nmaking the network-bound clone the dominant repeated cost of querying a\nremote repo (chunks and embeddings were already cached by the store).\n\nClones now persist under <cache>/clones keyed by URL (and optional\nref): refreshed via git fetch --depth 1 + hard reset at most once per\nfreshness window (TROUVE_CLONE_TTL seconds, default 300; the stamp\nadvances even on failed fetches so unreachable remotes are retried once\nper window), guarded by advisory file locks held for the whole index\nbuild, with stale clones served (with a warning) when the remote is\nunreachable. Idle clones and orphaned partials are evicted after a\nweek; trouve clear index reclaims per key while honouring locks and\nreports skipped in-use clones. Refs pass after --end-of-options.\n\nThe MCP server now re-validates git URLs after the same cooldown as\nlocal paths. Clone timeout honours the deprecated SEMBLE_CLONE_TIMEOUT\nfallback. MSRV rises to 1.89 for std file locking.\n\nRebased onto main (post-#12) as a single commit with all review fixes.\n\nCo-authored-by: Jim Simon <jimsimon@users.noreply.github.com>\n\n* Retrigger review of the rebased head\n\nCodeRabbit's rate limiter skipped the review of the previous push;\nall feedback from its last review round is addressed in that commit\n(clear_clones honours locks, failed refreshes advance the TTL stamp,\nchangelog conflict markers removed, test isolated to its own clone).\n\nCo-authored-by: Jim Simon <jimsimon@users.noreply.github.com>\n\n---------\n\nCo-authored-by: Cursor Agent <cursoragent@cursor.com>\nCo-authored-by: Jim Simon <jimsimon@users.noreply.github.com>",
+          "timestamp": "2026-07-03T18:11:53-04:00",
+          "tree_id": "c2f2c758dfec558d69085f35c7e8466d9e7d10b0",
+          "url": "https://github.com/jimsimon/trouve/commit/6b52916408d70e9c364e43cb3e7933573b43ccad"
+        },
+        "date": 1783116837545,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "bm25_build_5k_docs",
+            "value": 4853027.090909091,
+            "range": "± 7578",
+            "unit": "ns"
+          },
+          {
+            "name": "bm25_query_5k_docs",
+            "value": 37115.97875948237,
+            "range": "± 32",
+            "unit": "ns"
+          },
+          {
+            "name": "chunk_python_200_functions",
+            "value": 2951606.0588235296,
+            "range": "± 1081",
+            "unit": "ns"
+          },
+          {
+            "name": "dense_query_20k_rows",
+            "value": 1342083.738310709,
+            "range": "± 7993",
             "unit": "ns"
           }
         ]
