@@ -45,6 +45,12 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   the index build and later searches absorb the agent's own edits
   (`"warm": false` disables). The Claude Code bundle ships an equivalent
   `SessionStart` hook running `trouve stats` in the background.
+- **Version sync tooling**: `scripts/sync_versions.py` keeps every published
+  artifact (npm plugin packages, Claude Code and Codex plugin manifests) on
+  the exact crate version from `Cargo.toml`, and lint CI fails when anything
+  drifts (`--check`). The release workflow refuses tags that don't match the
+  crate version and publishes all npm plugin packages at the crate version
+  alongside the crates.io publish (skipped until `NPM_TOKEN` is configured).
 
 ## [1.0.0] - 2026-07-03
 

@@ -196,6 +196,14 @@ python3 tests/parity/run_parity.py --binary target/release/trouve
 ./benchmarks/run_benchmarks.sh    # hyperfine comparison vs Python semble
 ```
 
+Releases version everything together: the crate version in `Cargo.toml` is
+the single source of truth, and every published plugin/package manifest must
+match it exactly (enforced in CI). After bumping `Cargo.toml`, run:
+
+```bash
+python3 scripts/sync_versions.py  # rewrite all plugin manifests to match
+```
+
 ## Acknowledgements
 
 trouve exists because of [Semble](https://github.com/MinishLab/semble) by
