@@ -1,0 +1,94 @@
+name: Bench
+
+# Benchmarks with regression gating: every run is compared against the
+# baseline from the last push to main, and the job fails when a benchmark
+# regresses past the alert threshold. Baselines live on the gh-pages branch
+# (dev/bench/data.js, one dashboard for both suites), so history persists
+# and is browsable via GitHub Pages. PRs only compare; pushes to main append
+# to the data and push it.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+# Push benchmark data to the gh-pages branch. Only main runs push; PR runs
+# use persist-credentials: false checkouts so benchmarked code never sees a
+# token, and fork PRs get a read-only token regardless.
+permissions:
+  contents: write
+
+concurrency:
+  group: bench-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  # Criterion micro-benchmarks: chunking, BM25 build/query, dense query.
+  # The least noisy signal, so it gets the tighter threshold.
+  micro:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - name: Run criterion benchmarks
+        # Clear stale criterion state (rust-cache persists ./target) so the
+        # converter only sees estimates from this run.
+        run: rm -rf target/criterion && cargo bench --bench index_and_search
+      - name: Convert criterion estimates to benchmark JSON
+        run: python3 benchmarks/to_gha_bench.py --criterion target/criterion > micro.json
+      - name: Compare against baseline
+        uses: benchmark-action/github-action-benchmark@52576c92bccf6ac60c8223ec7eb2565637cae9ba # v1
+        with:
+          name: micro-benchmarks
+          tool: customSmallerIsBetter
+          output-file-path: micro.json
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          fail-on-alert: true
+          alert-threshold: "150%"
+          summary-always: true
+          save-data-file: ${{ github.ref == 'refs/heads/main' }}
+          auto-push: ${{ github.ref == 'refs/heads/main' }}
+          max-items-in-chart: 200
+
+  # End-to-end CLI benchmarks on a pinned flask checkout: cold index, warm
+  # query, incremental reindex, and the non-git (filesystem manifest) warm
+  # path. Wall-clock times on shared runners are noisier, hence the looser
+  # threshold and median-based comparison.
+  e2e:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - name: Install hyperfine
+        run: sudo apt-get update && sudo apt-get install -y hyperfine
+      - name: Cache embedding model
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: ~/.cache/huggingface
+          key: hf-potion-code-16m
+      - name: Build release binary
+        run: cargo build --release
+      - name: Run end-to-end benchmarks
+        run: benchmarks/run_ci_bench.sh bench-out
+      - name: Compare against baseline
+        uses: benchmark-action/github-action-benchmark@52576c92bccf6ac60c8223ec7eb2565637cae9ba # v1
+        with:
+          name: e2e-benchmarks
+          tool: customSmallerIsBetter
+          output-file-path: bench-out/e2e.json
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          fail-on-alert: true
+          alert-threshold: "175%"
+          summary-always: true
+          save-data-file: ${{ github.ref == 'refs/heads/main' }}
+          auto-push: ${{ github.ref == 'refs/heads/main' }}
+          max-items-in-chart: 200

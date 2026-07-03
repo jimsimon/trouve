@@ -105,10 +105,12 @@ fn write_bert_model(dir: &std::path::Path) {
 }
 
 fn bert_model_dir() -> PathBuf {
+    // Several tests share this directory and the harness runs them on
+    // parallel threads; Once prevents one test reading a half-written model
+    // while another is creating it.
+    static INIT: std::sync::Once = std::sync::Once::new();
     let dir = std::env::temp_dir().join(format!("trouve-bert-parity-{}", std::process::id()));
-    if !dir.join("config.json").exists() {
-        write_bert_model(&dir);
-    }
+    INIT.call_once(|| write_bert_model(&dir));
     dir
 }
 

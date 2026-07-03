@@ -81,6 +81,44 @@ Cold-path phase breakdown on kubernetes (`TROUVE_TIMING=1`): chunk+tokenize
 1.3 s (mostly tree-sitter parsing), embedding 0.5 s, BM25 build 0.46 s,
 everything else under 0.25 s each.
 
+## Git vs non-git roots
+
+trouve does not require git: a plain folder falls back to a filesystem
+manifest (walk + BLAKE3 content hash, with an mtime+size fast path persisted
+in the store) instead of the git manifest (`git ls-files` blob OIDs +
+`git status`). `benchmarks/run_git_vs_nogit.sh` indexes the same kubernetes
+tree both ways — once as the git checkout, once as an identical copy with
+`.git` removed. Measured on a 4-vCPU cloud VM (so absolute times are ~2.5x
+the 16-core numbers above; the comparison is what matters), warm OS page
+cache, hyperfine mean ± σ:
+
+| Scenario | git | non-git | Delta |
+| --- | --- | --- | --- |
+| Cold index + query (3 runs) | 9.99 s ± 0.80 s | 10.40 s ± 0.60 s | tie (1.04x) |
+| Warm query (9 runs) | 548 ms ± 13 ms | 673 ms ± 25 ms | git 1.23x |
+| Incremental, 1 file modified (3 runs) | 574 ms ± 21 ms | 661 ms ± 13 ms | git 1.15x |
+| Touch-only, mtime bumped (3 runs) | 537 ms ± 7 ms | 681 ms ± 17 ms | git 1.27x |
+
+The whole difference is the manifest phase (`TROUVE_TIMING=1`); everything
+downstream — store hits, snapshot patching, query — is identical:
+
+- **Cold**: git manifest 1.10 s (`git ls-files` + `git status` over 30k
+  files) vs non-git 0.41 s (parallel walk + hash of every file). Hashing is
+  actually *cheaper* than shelling out to git on a warm page cache, and
+  either way it is noise against the ~7 s of chunking and embedding.
+- **Warm**: git manifest 133 ms vs non-git 271 ms. The non-git side walks
+  and stats all ~17.7k indexed files to check the mtime+size fast path; git
+  gets the same answer from `git status`. This fixed ~140 ms gap is the
+  entire delta in the warm, incremental, and touch-only rows.
+
+Both variants index the same file set (the walker honours `.gitignore`
+directly) and return the same results, and the touch-only row confirms the
+mtime fast path: a bumped mtime re-hashes one file, hits the store, and pays
+only the manifest walk. What a non-git root gives up is the branch/worktree
+store sharing (identity is the folder path, not the git common dir) and the
+no-read manifest for clean files — on kubernetes scale that costs roughly
+90–150 ms per invocation.
+
 ## Resource usage
 
 Peak resident memory (`/usr/bin/time -v`, full CLI invocation) and on-disk
@@ -175,6 +213,29 @@ Delta +0.0001 — well within the 1% parity target. The parity harness
 
 HTML reports land in `target/criterion/`.
 
+## CI regression gating
+
+`.github/workflows/bench.yml` runs two gated suites on every PR and push to
+main:
+
+- **micro**: the criterion benchmarks above, gated at 150%.
+- **e2e**: full CLI invocations on a pinned flask 3.1.0 checkout
+  (`benchmarks/run_ci_bench.sh`) — cold index, warm query, incremental
+  reindex, and the non-git warm path — gated at 175% (wall-clock times on
+  shared runners are noisier).
+
+Each run is compared against the baseline from the last push to main; a
+benchmark that regresses past its threshold fails the job. PRs only compare,
+pushes to main append the new results and push, and comparisons use medians
+(`benchmarks/to_gha_bench.py`) to shrug off single slow outliers.
+
+Benchmark history is persisted by
+[github-action-benchmark](https://github.com/benchmark-action/github-action-benchmark)
+on the `gh-pages` branch under `dev/bench/` — full history in `data.js` plus
+an interactive chart dashboard in `index.html` (served at
+`https://<owner>.github.io/trouve/dev/bench/` once GitHub Pages is enabled
+for the `gh-pages` branch).
+
 ## Reproducing
 
 ```bash
@@ -186,6 +247,9 @@ cargo install hyperfine
 
 # speed suite (flask by default; pass any git repo dir)
 benchmarks/run_benchmarks.sh
+
+# git vs non-git roots (kubernetes by default; pass any git repo dir)
+benchmarks/run_git_vs_nogit.sh
 
 # quality suite
 (cd reference/semble && PYTHONPATH=. ../../.venv/bin/python benchmarks/sync_repos.py \
