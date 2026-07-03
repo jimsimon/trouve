@@ -79,11 +79,37 @@ trouve                           # run as an MCP stdio server
 
 ## Chunking
 
-Tree-sitter grammars are compiled in for ~28 mainstream languages (Rust,
-Python, JS/TS/TSX, Java, C, C++, C#, Go, Ruby, PHP, Swift, Kotlin, Scala,
-Haskell, OCaml, Elixir, Lua, Zig, Bash, HTML, CSS, JSON, YAML, TOML, Markdown,
-…). Files in any other supported language fall back to line-based chunking
-with the same target chunk length, so everything remains searchable.
+Files are split into chunks of ~750 bytes. How the boundaries are chosen
+depends on the file's language, detected from its extension:
+
+1. **Native (tree-sitter) chunking.** For the languages below, a tree-sitter
+   grammar is compiled into the binary and chunk boundaries follow the syntax
+   tree, so chunks align with functions, classes, and blocks rather than
+   arbitrary line ranges.
+2. **Line-based fallback.** Files in any other recognized language (250+
+   extensions, including COBOL, Ada, Clojure, Nim, Vim script, …) are chunked
+   by merging whole lines up to the same target length. They are fully
+   indexed and searchable; only the boundary placement is less
+   syntax-aware.
+3. **Unrecognized extensions** are not indexed.
+
+Natively supported languages:
+
+| | |
+| --- | --- |
+| Systems | C, C++, D, Fortran, Objective-C, Rust, Swift, Zig |
+| Managed / JVM | C#, Groovy, Java, Kotlin, Scala |
+| Scripting | Bash, Lua, Perl, PHP, PowerShell, Python, R, Ruby |
+| Web | CSS, HTML, JavaScript/JSX, Svelte, TSX, TypeScript |
+| Functional | Elixir, Elm, Erlang, Gleam, Haskell, OCaml (incl. `.mli`) |
+| Mobile / other | Dart, Julia, Solidity, SQL |
+| Config / IaC | CMake, HCL/Terraform, Make, Nix, TOML, YAML |
+| Data / markup | GraphQL, JSON, Markdown, Protocol Buffers, XML (incl. DTD) |
+| Templates | ERB/EJS (embedded templates) |
+
+Grammars are chosen for maintained crates.io releases; adding one is a
+two-line change (a dependency in `Cargo.toml` and a match arm in
+`src/chunk.rs`).
 
 ## Cache location
 

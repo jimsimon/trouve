@@ -133,7 +133,9 @@ cannot re-validate cheaply, so it caches more conservatively.
 
 - The embedding model (`potion-code-16M`) and its semantics.
 - Chunking: same tree-sitter merge algorithm, same 750-byte target, same
-  line-based fallback, identical boundaries.
+  line-based fallback, identical boundaries. (trouve bundles grammars for
+  more languages than upstream ships; for languages both support, boundaries
+  are identical.)
 - BM25: same Lucene variant (k1=1.5, b=0.75), same identifier tokenization,
   same path/filename enrichment.
 - Hybrid fusion: same RRF (k=60), same alpha resolution.
