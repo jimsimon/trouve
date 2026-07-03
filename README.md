@@ -77,6 +77,15 @@ trouve                           # run as an MCP stdio server
 `--content` selects what to index: `code` (default), `docs`, `config`, or
 `all`.
 
+For [Kilo Code](https://kilo.ai) there is also a native plugin,
+[`kilocode-trouve`](plugins/kilocode), which exposes `trouve_search` and
+`trouve_find_related` as first-class tools backed by a persistent trouve
+server process — no MCP configuration needed:
+
+```bash
+kilo plugin kilocode-trouve --global
+```
+
 ## Chunking
 
 Tree-sitter grammars are compiled in for ~28 mainstream languages (Rust,

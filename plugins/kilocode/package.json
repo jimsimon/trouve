@@ -1,0 +1,38 @@
+{
+  "name": "kilocode-trouve",
+  "version": "0.1.0",
+  "description": "Kilo Code plugin exposing trouve code search as native tools, backed by a persistent trouve server process.",
+  "type": "module",
+  "main": "./src/server.ts",
+  "exports": {
+    "./server": {
+      "import": "./src/server.ts"
+    }
+  },
+  "files": [
+    "src"
+  ],
+  "keywords": [
+    "kilocode",
+    "kilo",
+    "code-search",
+    "semantic-search",
+    "trouve"
+  ],
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/jimsimon/trouve.git",
+    "directory": "plugins/kilocode"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@kilocode/plugin": "^7.4.1"
+  },
+  "devDependencies": {
+    "@types/bun": "^1.2.0",
+    "typescript": "^5.6.0"
+  }
+}
