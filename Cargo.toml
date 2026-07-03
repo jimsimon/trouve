@@ -7,7 +7,8 @@ license = "MIT"
 repository = "https://github.com/jimsimon/trouve"
 keywords = ["code-search", "semantic-search", "mcp", "agent", "embeddings"]
 categories = ["command-line-utilities", "development-tools"]
-rust-version = "1.85"
+# 1.87 for `usize::is_multiple_of`.
+rust-version = "1.87"
 
 [lib]
 name = "trouve"
