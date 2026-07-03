@@ -44,7 +44,9 @@ NOGIT_CACHE="$WORK/cache-nogit"
 GIT_CMD="TROUVE_CACHE_LOCATION='$GIT_CACHE' '$RUST_BIN' search '$QUERY' '$REPO' $ARGS > /dev/null"
 NOGIT_CMD="TROUVE_CACHE_LOCATION='$NOGIT_CACHE' '$RUST_BIN' search '$QUERY' '$NOGIT' $ARGS > /dev/null"
 
-TOUCH_REL="$(git -C "$REPO" ls-files '*.go' '*.py' '*.rs' '*.ts' '*.js' | head -1)"
+# `|| true` guards against pipefail turning head's early exit (SIGPIPE on
+# large repos) into a script failure.
+TOUCH_REL="$(git -C "$REPO" ls-files '*.go' '*.py' '*.rs' '*.ts' '*.js' | head -1 || true)"
 [ -n "$TOUCH_REL" ] || { echo "no code file found to modify in $REPO"; exit 1; }
 
 echo "== target repo: $REPO ($(git -C "$REPO" ls-files | wc -l) tracked files) =="
