@@ -150,8 +150,16 @@ fn git_manifest(root: &Path, extensions: &HashSet<String>) -> Result<Vec<FileRec
             continue;
         };
         let mut parts = meta.split_whitespace();
-        let _mode = parts.next();
+        let Some(mode) = parts.next() else { continue };
         let Some(oid) = parts.next() else { continue };
+        let stage = parts.next().unwrap_or("0");
+        // Symlinks (mode 120000): the blob is the link target *path*, not
+        // file content, so a git: key would mislabel whatever the link
+        // points at and go stale when the target changes. Skip them, like
+        // the walker and the untracked path do.
+        if mode == "120000" {
+            continue;
+        }
         let rel = path.to_string();
         if deleted.contains(&rel)
             || !matches_extension(&rel, extensions)
@@ -163,7 +171,19 @@ fn git_manifest(root: &Path, extensions: &HashSet<String>) -> Result<Vec<FileRec
             continue;
         }
         let abs = root.join(&rel);
-        if dirty.contains(&rel) {
+        // Unmerged paths (stage > 0) list up to three candidate blobs; none
+        // of them is authoritative, so hash the working tree (with conflict
+        // markers) like any other dirty file.
+        if dirty.contains(&rel) || stage != "0" {
+            // A tracked file replaced by a symlink in the working tree
+            // (typechange) must not be read through.
+            if abs
+                .symlink_metadata()
+                .map(|m| m.is_symlink())
+                .unwrap_or(true)
+            {
+                continue;
+            }
             // Working tree differs from the index: hash actual content.
             if let Some(key) = hash_file(&abs) {
                 records.push(FileRecord {
@@ -359,6 +379,64 @@ mod tests {
         let manifest = build_manifest(root, &identity, &exts(), &store).unwrap();
         assert_eq!(manifest.len(), 1);
         assert_eq!(manifest[0].rel_path, "kept.py");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn git_manifest_skips_tracked_symlinks() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        git(root, &["init", "-b", "main"]);
+        fs::write(root.join("real.py"), "x = 1\n").unwrap();
+        std::os::unix::fs::symlink(root.join("real.py"), root.join("link.py")).unwrap();
+        git(root, &["add", "."]);
+        git(root, &["commit", "-m", "init"]);
+
+        let identity = detect_repo_identity(root);
+        let store = ChunkStore::open_at(root.join(".teststore")).unwrap();
+        let manifest = build_manifest(root, &identity, &exts(), &store).unwrap();
+        let paths: Vec<&str> = manifest.iter().map(|r| r.rel_path.as_str()).collect();
+        assert_eq!(paths, vec!["real.py"]);
+    }
+
+    #[test]
+    fn git_manifest_hashes_unmerged_paths_from_working_tree() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        git(root, &["init", "-b", "main"]);
+        fs::write(root.join("conflicted.py"), "base = 1\n").unwrap();
+        git(root, &["add", "."]);
+        git(root, &["commit", "-m", "base"]);
+        git(root, &["checkout", "-b", "side"]);
+        fs::write(root.join("conflicted.py"), "side = 1\n").unwrap();
+        git(root, &["add", "."]);
+        git(root, &["commit", "-m", "side"]);
+        git(root, &["checkout", "main"]);
+        fs::write(root.join("conflicted.py"), "main = 1\n").unwrap();
+        git(root, &["add", "."]);
+        git(root, &["commit", "-m", "main"]);
+        // The merge fails with a conflict, leaving stage-1/2/3 index entries.
+        let _ = Command::new("git")
+            .arg("-C")
+            .arg(root)
+            .args(["merge", "side"])
+            .output()
+            .unwrap();
+
+        let identity = detect_repo_identity(root);
+        let store = ChunkStore::open_at(root.join(".teststore")).unwrap();
+        let manifest = build_manifest(root, &identity, &exts(), &store).unwrap();
+        assert_eq!(manifest.len(), 1);
+        assert_eq!(manifest[0].rel_path, "conflicted.py");
+        // Not any of the three stage blobs: the working-tree content (with
+        // conflict markers) is what search results would show, so it is what
+        // gets indexed.
+        assert!(manifest[0].content_key.starts_with("b3:"));
+        let expected = format!(
+            "b3:{}",
+            blake3::hash(&fs::read(root.join("conflicted.py")).unwrap()).to_hex()
+        );
+        assert_eq!(manifest[0].content_key, expected);
     }
 
     #[test]
