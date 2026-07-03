@@ -186,6 +186,12 @@ day per store), entries not referenced by any kept snapshot are deleted, with
 a one-hour grace period protecting concurrent builds. Deleted entries are
 never wrong — the store is a cache, and a miss just recomputes the file.
 
+Remote repositories (git URLs) are cloned once into `<cache>/clones` and
+reused: repeat queries refresh the clone with a cheap `git fetch` at most
+once per freshness window (`TROUVE_CLONE_TTL` seconds, default 300; `0`
+fetches on every query) instead of re-cloning. Clones unused for a week are
+evicted automatically, and `trouve clear index` removes them all.
+
 ## Development
 
 ```bash

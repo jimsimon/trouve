@@ -212,6 +212,19 @@ fn run_clear(clear_type: &str) -> ExitCode {
                 println!("Cleared index store at `{}`", path.display());
             }
         }
+        if let Some(report) = crate::clone_cache::clear_clones() {
+            println!(
+                "Cleared {} cached clone(s) at `{}`",
+                report.removed,
+                report.root.display()
+            );
+            if report.skipped_locked > 0 {
+                println!(
+                    "Skipped {} clone(s) in use by another trouve process",
+                    report.skipped_locked
+                );
+            }
+        }
     }
     if clear_type == "savings" || clear_type == "all" {
         match clear_savings() {

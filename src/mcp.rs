@@ -76,10 +76,11 @@ impl IndexCache {
         let needs_build = match self.entries.get(&key) {
             None => true,
             Some(cached) => {
-                // Local paths are re-validated (cheap incremental rebuild)
-                // once outside the cooldown window; git URLs stay cached.
-                !is_git_url(repo)
-                    && cached.built_at.elapsed() >= cached.build_duration * MIN_REVALIDATE_FACTOR
+                // Both local paths and git URLs are re-validated once outside
+                // the cooldown window: local rebuilds are cheap incremental
+                // patches, and remote rebuilds reuse the persistent clone
+                // cache (a TTL-gated fetch instead of a full re-clone).
+                cached.built_at.elapsed() >= cached.build_duration * MIN_REVALIDATE_FACTOR
             }
         };
         if needs_build {
