@@ -7,6 +7,7 @@
 use std::collections::HashMap;
 use std::path::Path;
 
+use crate::snapshot::{Buf, Posting};
 use crate::types::Chunk;
 
 const K1: f64 = 1.5;
@@ -39,10 +40,20 @@ pub fn enrich_for_bm25(chunk: &Chunk) -> String {
 }
 
 /// An immutable BM25 index over tokenized documents (lucene scoring variant).
+///
+/// Stored flat so it can live either in owned memory (fresh build) or
+/// zero-copy in a memory-mapped snapshot: terms are sorted lexicographically
+/// in one contiguous blob, and each term's postings are a contiguous slice of
+/// the flattened posting array. Query tokens are resolved by binary search.
 pub struct Bm25Index {
-    vocab: HashMap<String, u32>,
-    /// Precomputed per-token postings: (doc_id, idf * tf_component).
-    postings: Vec<Vec<(u32, f32)>>,
+    /// Concatenated UTF-8 bytes of all terms, sorted lexicographically.
+    term_blob: Buf<u8>,
+    /// `n_terms + 1` byte offsets into `term_blob`.
+    term_offsets: Buf<u32>,
+    /// `n_terms + 1` offsets into `postings`.
+    posting_offsets: Buf<u64>,
+    /// Flattened postings, grouped by term: precomputed `idf * tf` scores.
+    postings: Buf<Posting>,
     num_docs: usize,
 }
 
@@ -78,7 +89,7 @@ impl Bm25Index {
         }
 
         let n = num_docs as f64;
-        let mut postings: Vec<Vec<(u32, f32)>> = vec![Vec::new(); vocab.len()];
+        let mut term_postings: Vec<Vec<Posting>> = vec![Vec::new(); vocab.len()];
         for (doc_id, tf) in doc_tfs.iter().enumerate() {
             let dl = docs[doc_id].len() as f64;
             let norm = K1 * (1.0 - B + B * dl / avgdl.max(f64::MIN_POSITIVE));
@@ -86,15 +97,83 @@ impl Bm25Index {
                 let dfi = df[*id as usize] as f64;
                 let idf = (1.0 + (n - dfi + 0.5) / (dfi + 0.5)).ln();
                 let tfc = *count as f64 / (*count as f64 + norm);
-                postings[*id as usize].push((doc_id as u32, (idf * tfc) as f32));
+                term_postings[*id as usize].push(Posting {
+                    doc: doc_id as u32,
+                    score: (idf * tfc) as f32,
+                });
             }
         }
 
+        // Flatten into the sorted-term representation.
+        let mut terms: Vec<(&String, u32)> = vocab.iter().map(|(t, id)| (t, *id)).collect();
+        terms.sort_unstable_by(|a, b| a.0.as_bytes().cmp(b.0.as_bytes()));
+
+        let mut term_blob: Vec<u8> = Vec::new();
+        let mut term_offsets: Vec<u32> = Vec::with_capacity(terms.len() + 1);
+        let mut posting_offsets: Vec<u64> = Vec::with_capacity(terms.len() + 1);
+        let mut postings: Vec<Posting> = Vec::new();
+        term_offsets.push(0);
+        posting_offsets.push(0);
+        for (term, id) in terms {
+            term_blob.extend_from_slice(term.as_bytes());
+            term_offsets.push(term_blob.len() as u32);
+            postings.extend_from_slice(&term_postings[id as usize]);
+            posting_offsets.push(postings.len() as u64);
+        }
+
         Bm25Index {
-            vocab,
+            term_blob: term_blob.into(),
+            term_offsets: term_offsets.into(),
+            posting_offsets: posting_offsets.into(),
+            postings: postings.into(),
+            num_docs,
+        }
+    }
+
+    /// Reassemble an index from flat parts (snapshot load path).
+    pub fn from_parts(
+        term_blob: Buf<u8>,
+        term_offsets: Buf<u32>,
+        posting_offsets: Buf<u64>,
+        postings: Buf<Posting>,
+        num_docs: usize,
+    ) -> Bm25Index {
+        Bm25Index {
+            term_blob,
+            term_offsets,
+            posting_offsets,
             postings,
             num_docs,
         }
+    }
+
+    /// Borrow the flat parts for serialization (snapshot save path).
+    pub fn flat_parts(&self) -> (&[u8], &[u32], &[u64], &[Posting]) {
+        (
+            &self.term_blob,
+            &self.term_offsets,
+            &self.posting_offsets,
+            &self.postings,
+        )
+    }
+
+    fn term_bytes(&self, i: usize) -> &[u8] {
+        &self.term_blob[self.term_offsets[i] as usize..self.term_offsets[i + 1] as usize]
+    }
+
+    /// Binary search for a token in the sorted term blob.
+    fn find_term(&self, token: &str) -> Option<usize> {
+        let n_terms = self.term_offsets.len().saturating_sub(1);
+        let (mut lo, mut hi) = (0usize, n_terms);
+        while lo < hi {
+            let mid = (lo + hi) / 2;
+            match self.term_bytes(mid).cmp(token.as_bytes()) {
+                std::cmp::Ordering::Less => lo = mid + 1,
+                std::cmp::Ordering::Greater => hi = mid,
+                std::cmp::Ordering::Equal => return Some(mid),
+            }
+        }
+        None
     }
 
     /// Return BM25 scores for all documents given query tokens; documents
@@ -103,9 +182,11 @@ impl Bm25Index {
     pub fn get_scores(&self, query_tokens: &[String], mask: Option<&[bool]>) -> Vec<f32> {
         let mut scores = vec![0.0f32; self.num_docs];
         for tok in query_tokens {
-            if let Some(id) = self.vocab.get(tok) {
-                for (doc_id, s) in &self.postings[*id as usize] {
-                    scores[*doc_id as usize] += *s;
+            if let Some(id) = self.find_term(tok) {
+                let range =
+                    self.posting_offsets[id] as usize..self.posting_offsets[id + 1] as usize;
+                for p in &self.postings[range] {
+                    scores[p.doc as usize] += p.score;
                 }
             }
         }

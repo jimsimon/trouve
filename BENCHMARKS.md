@@ -15,10 +15,10 @@ startup and model load.
 
 | Scenario | Rust | Python | Speedup |
 | --- | --- | --- | --- |
-| Cold index + query | 322 ms ± 16 ms | 2.99 s ± 2.98 s | 9.3x |
-| Warm query (cached) | 137 ms ± 12 ms | 721 ms ± 26 ms | 5.3x |
-| Incremental (1 file touched) | 156 ms ± 12 ms | 1.31 s ± 0.04 s | 8.4x |
-| Branch switch (3.1.0 <-> 3.0.0) | 161 ms ± 4 ms | 1.33 s ± 0.02 s | 8.3x |
+| Cold index + query | 328 ms ± 8 ms | 1.34 s ± 0.02 s | 4.1x |
+| Warm query (cached) | 122 ms ± 6 ms | 717 ms ± 33 ms | 5.9x |
+| Incremental (1 file touched) | 150 ms ± 14 ms | 1.24 s ± 0.08 s | 8.3x |
+| Branch switch (3.1.0 <-> 3.0.0) | 150 ms ± 11 ms | 1.28 s ± 0.09 s | 8.6x |
 
 On a small repo Python's incremental and branch-switch times are dominated by a
 full re-index (its cache is all-or-nothing), while the Rust store recomputes
@@ -31,8 +31,8 @@ Single timed runs (the effect sizes dwarf run-to-run noise):
 | Scenario | Rust | Python | Speedup |
 | --- | --- | --- | --- |
 | Cold index + query | 17.9 s | 2 m 59 s | 10.0x |
-| Warm query (cached) | 8.7 s | 7.2 s | ~1x |
-| Incremental (1 file touched) | 8.9 s | 3 m 2 s | 20.5x |
+| Warm query (snapshot mmap) | 0.58 s | 7.2 s | 12.4x |
+| Incremental (1 file touched) | 8.6 s | 3 m 2 s | 21.2x |
 | Worktree first query (flask, other branch) | 0.34 s | n/a (full rebuild) | — |
 
 This is the headline result: touching a single file in a 30k-file repo costs
@@ -41,10 +41,13 @@ the index in under 9 seconds. The same content-addressed store is shared across
 branches and worktrees, so a new worktree of an already-indexed branch is a pure
 cache hit.
 
-Warm-query time on huge repos is dominated by loading and reassembling ~200k
-chunk entries from the store on both sides, so the two implementations converge;
-the Rust MCP server additionally keeps hot indexes in an in-process LRU, so
-repeated agent queries skip that load entirely.
+After every assembly the finished index is written to a single snapshot file
+keyed by a hash of the manifest. A warm query memory-maps that snapshot —
+embeddings and BM25 postings are used zero-copy straight out of the mapping —
+so it skips the ~200k per-file store reads and index rebuild entirely: 0.58 s
+end-to-end on kubernetes, most of which is chunk-table materialization and
+model load. The MCP server additionally keeps hot indexes in an in-process
+LRU, so repeated agent queries skip even that.
 
 ## Retrieval quality (NDCG@10)
 

@@ -30,11 +30,16 @@ same code-tuned reranking heuristics (symbol-definition boosts, file-stem
 boosts, multi-chunk coherence, test/example/compat path penalties, per-file
 saturation decay).
 
+Assembled indexes are also persisted as memory-mapped snapshots, so a warm
+query loads embeddings and BM25 postings zero-copy instead of re-reading the
+per-file store.
+
 Measured results ([BENCHMARKS.md](BENCHMARKS.md)): ~10x faster cold indexing,
 and on kubernetes/kubernetes (30k files) an incremental reindex after touching
-one file drops from ~3 minutes to under 9 seconds (20x). Retrieval quality is
-identical — mean NDCG@10 matches upstream to within 0.0002 on the upstream
-annotated benchmark, with identical chunk boundaries and BM25 scores.
+one file drops from ~3 minutes to under 9 seconds (21x), while a fully warm
+query drops from ~7 s to 0.58 s (12x). Retrieval quality is identical — mean
+NDCG@10 matches upstream to within 0.0002 on the upstream annotated benchmark,
+with identical chunk boundaries and BM25 scores.
 
 ## Install
 

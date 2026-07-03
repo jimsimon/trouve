@@ -22,6 +22,7 @@ use crate::embed::EmbeddingModel;
 use crate::languages::{detect_language, file_status_for_bytes, get_extensions, FileStatus};
 use crate::manifest::{build_manifest, detect_repo_identity, FileRecord, RepoIdentity};
 use crate::search;
+use crate::snapshot;
 use crate::stats::save_search_stats;
 use crate::store::{ChunkStore, FileEntry, StoredChunk};
 use crate::tokens::tokenize;
@@ -135,6 +136,35 @@ impl SembleIndex {
         let store = ChunkStore::open(&store_identity)?;
         let extensions = get_extensions(&content);
         let manifest = build_manifest(root, repo_identity, &extensions, &store)?;
+
+        // Fast path: identical manifest -> mmap the assembled snapshot and
+        // skip per-file store reads and index reconstruction entirely.
+        let manifest_hash = manifest_digest(&manifest, &content, &model.model_id);
+        let snapshot_dir = store.root().join("snapshots");
+        if let Some(snap) = snapshot::load(&snapshot_dir, &manifest_hash, &model.model_id) {
+            let (file_mapping, language_mapping) = populate_mappings(&snap.chunks);
+            let mut file_sizes: HashMap<String, usize> = HashMap::new();
+            for chunk in &snap.chunks {
+                *file_sizes.entry(chunk.file_path.clone()).or_insert(0) += chunk.content.len();
+            }
+            let build_stats = BuildStats {
+                files_total: manifest.len(),
+                files_from_store: manifest.len(),
+                files_computed: 0,
+                chunks_total: snap.chunks.len(),
+            };
+            return Ok(SembleIndex {
+                model,
+                chunks: snap.chunks,
+                dense: snap.dense,
+                bm25: snap.bm25,
+                file_mapping,
+                language_mapping,
+                file_sizes,
+                content,
+                build_stats,
+            });
+        }
 
         // Phase 1: look up every manifest record in the store (parallel).
         let keyed: Vec<(FileRecord, String, Option<FileEntry>)> = manifest
@@ -275,6 +305,17 @@ impl SembleIndex {
         let dense = DenseIndex::new(rows);
         let (file_mapping, language_mapping) = populate_mappings(&chunks);
 
+        // Persist the assembled index so the next identical-manifest build is
+        // a single mmap. Best effort: a failed write only costs speed.
+        let _ = snapshot::save(
+            &snapshot_dir,
+            &manifest_hash,
+            &model.model_id,
+            &chunks,
+            &dense,
+            &bm25,
+        );
+
         Ok(SembleIndex {
             model,
             chunks,
@@ -407,6 +448,35 @@ impl SembleIndex {
         );
         results
     }
+}
+
+/// Digest of everything that determines the assembled index: the set of
+/// `(path, content key)` pairs plus every parameter baked into store entries.
+fn manifest_digest(manifest: &[FileRecord], content: &[ContentType], model_id: &str) -> [u8; 32] {
+    let mut pairs: Vec<(&str, &str)> = manifest
+        .iter()
+        .map(|r| (r.rel_path.as_str(), r.content_key.as_str()))
+        .collect();
+    pairs.sort_unstable();
+    let mut hasher = blake3::Hasher::new();
+    for (path, key) in pairs {
+        hasher.update(path.as_bytes());
+        hasher.update(b"\x00");
+        hasher.update(key.as_bytes());
+        hasher.update(b"\x00");
+    }
+    let mut sorted_content = content.to_vec();
+    sorted_content.sort();
+    for ct in sorted_content {
+        hasher.update(ct.as_str().as_bytes());
+        hasher.update(b"\x00");
+    }
+    hasher.update(model_id.as_bytes());
+    hasher.update(b"\x00");
+    hasher.update(&crate::chunk::DESIRED_CHUNK_LENGTH.to_le_bytes());
+    hasher.update(&crate::store::STORE_VERSION.to_le_bytes());
+    hasher.update(&snapshot::SNAPSHOT_VERSION.to_le_bytes());
+    *hasher.finalize().as_bytes()
 }
 
 fn path_enrichment_tokens(rel_path: &str) -> Vec<String> {

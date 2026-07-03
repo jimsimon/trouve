@@ -6,12 +6,14 @@
 
 use rayon::prelude::*;
 
+use crate::snapshot::Buf;
+
 /// Rows below this count are scored serially; above it, rayon splits the work.
 const PARALLEL_THRESHOLD: usize = 4096;
 
 pub struct DenseIndex {
-    /// Row-major normalized vectors.
-    vectors: Vec<f32>,
+    /// Row-major normalized vectors (owned, or zero-copy from a snapshot).
+    vectors: Buf<f32>,
     dim: usize,
     rows: usize,
 }
@@ -36,7 +38,25 @@ impl DenseIndex {
             normalize(&mut row);
             vectors.extend_from_slice(&row);
         }
+        DenseIndex {
+            vectors: vectors.into(),
+            dim,
+            rows,
+        }
+    }
+
+    /// Reassemble an index from already-normalized flat storage (snapshot load).
+    pub fn from_parts(vectors: Buf<f32>, dim: usize, rows: usize) -> DenseIndex {
         DenseIndex { vectors, dim, rows }
+    }
+
+    /// The flat row-major normalized matrix (snapshot save path).
+    pub fn vectors(&self) -> &[f32] {
+        &self.vectors
+    }
+
+    pub fn dim(&self) -> usize {
+        self.dim
     }
 
     pub fn len(&self) -> usize {

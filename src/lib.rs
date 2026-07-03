@@ -16,6 +16,7 @@ pub mod manifest;
 pub mod mcp;
 pub mod ranking;
 pub mod search;
+pub mod snapshot;
 pub mod stats;
 pub mod store;
 pub mod tokens;

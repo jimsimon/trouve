@@ -221,6 +221,63 @@ fn stats_reflect_index_contents() {
 }
 
 #[test]
+fn snapshot_fast_path_returns_identical_results() {
+    let model = test_env();
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    sample_files(root);
+
+    // Cold build assembles from scratch and writes a snapshot.
+    let cold = SembleIndex::from_path(root, CODE, Some(model)).unwrap();
+    let cold_results = cold.search("save model to path", 3, None, None, None, None, None);
+
+    // Snapshots live under this repo's store dir (identity = canonical path).
+    let identity = root.canonicalize().unwrap().to_string_lossy().into_owned();
+    let snapshots_dir = semble::store::ChunkStore::open(&identity)
+        .unwrap()
+        .root()
+        .join("snapshots");
+    let snap_count = |dir: &std::path::Path| -> usize {
+        std::fs::read_dir(dir)
+            .map(|entries| {
+                entries
+                    .flatten()
+                    .filter(|e| e.path().extension().is_some_and(|x| x == "snap"))
+                    .count()
+            })
+            .unwrap_or(0)
+    };
+    assert_eq!(
+        snap_count(&snapshots_dir),
+        1,
+        "cold build writes one snapshot"
+    );
+
+    // Warm build loads the snapshot (mmap) and must rank identically.
+    let warm = SembleIndex::from_path(root, CODE, Some(model)).unwrap();
+    assert_eq!(warm.build_stats.files_computed, 0);
+    assert_eq!(warm.chunks, cold.chunks);
+    let warm_results = warm.search("save model to path", 3, None, None, None, None, None);
+    assert_eq!(warm_results.len(), cold_results.len());
+    for (w, c) in warm_results.iter().zip(&cold_results) {
+        assert_eq!(w.chunk, c.chunk);
+        assert!((w.score - c.score).abs() < 1e-9);
+    }
+
+    // An edit invalidates the manifest hash: new snapshot, still-correct search.
+    write_file(root, "src/db.py", "def connect():\n    return database()\n");
+    let edited = SembleIndex::from_path(root, CODE, Some(model)).unwrap();
+    assert_eq!(edited.build_stats.files_computed, 1);
+    assert_eq!(
+        snap_count(&snapshots_dir),
+        2,
+        "edit produces a second snapshot"
+    );
+    let edited_again = SembleIndex::from_path(root, CODE, Some(model)).unwrap();
+    assert_eq!(edited_again.chunks, edited.chunks);
+}
+
+#[test]
 fn empty_dir_errors() {
     let model = test_env();
     let dir = tempfile::tempdir().unwrap();
