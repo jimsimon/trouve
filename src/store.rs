@@ -7,8 +7,10 @@
 //! switches and incremental edits only pay for content that has never been
 //! embedded before.
 
+use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -18,25 +20,25 @@ use serde::{Deserialize, Serialize};
 /// embeddings. v3: flat token storage in entries.
 pub const STORE_VERSION: u32 = 3;
 
-/// Resolve the semble cache folder, respecting `SEMBLE_CACHE_LOCATION`
+/// Resolve the trouve cache folder, respecting `TROUVE_CACHE_LOCATION`
 /// (highest precedence) and platform conventions (XDG on Linux).
 pub fn resolve_cache_folder() -> PathBuf {
     let dir = user_cache_override().unwrap_or_else(|| {
         dirs::cache_dir()
             .unwrap_or_else(std::env::temp_dir)
-            .join("semble")
+            .join("trouve")
     });
     let _ = fs::create_dir_all(&dir);
     dir
 }
 
 fn user_cache_override() -> Option<PathBuf> {
-    let loc = std::env::var("SEMBLE_CACHE_LOCATION").ok()?;
+    let loc = std::env::var("TROUVE_CACHE_LOCATION").ok()?;
     let p = PathBuf::from(loc);
     if p.is_absolute() {
         Some(p)
     } else {
-        eprintln!("warning: SEMBLE_CACHE_LOCATION is not an absolute path; ignoring");
+        eprintln!("warning: TROUVE_CACHE_LOCATION is not an absolute path; ignoring");
         None
     }
 }
@@ -62,7 +64,7 @@ pub struct FileEntry {
     pub tokens: crate::tokens::TokenDocs,
 }
 
-/// A content-addressed store rooted in the semble cache folder, one per
+/// A content-addressed store rooted in the trouve cache folder, one per
 /// repository identity (git common dir, remote URL, or plain path).
 pub struct ChunkStore {
     root: PathBuf,
@@ -158,6 +160,98 @@ impl ChunkStore {
     }
 }
 
+/// Entries younger than this are never swept, protecting concurrent builds
+/// that have written entries but not yet saved their snapshot.
+const GC_GRACE: Duration = Duration::from_secs(60 * 60);
+
+/// Minimum interval between sweeps of one store (tracked via a stamp file),
+/// so the entry tree is not rescanned on every build.
+const GC_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
+
+/// What a sweep removed.
+#[derive(Debug, Default, PartialEq)]
+pub struct SweepReport {
+    pub entries_removed: usize,
+    pub bytes_removed: u64,
+}
+
+impl ChunkStore {
+    /// Mark-and-sweep GC: delete entries not referenced by any kept snapshot.
+    ///
+    /// Runs at most once per [`GC_INTERVAL`] per store; call after a snapshot
+    /// save so the current manifest is always in the mark set. Returns `None`
+    /// when throttled.
+    pub fn maybe_gc(&self) -> Option<SweepReport> {
+        let stamp = self.root.join("gc_stamp");
+        if let Ok(meta) = fs::metadata(&stamp) {
+            let recent = meta
+                .modified()
+                .ok()
+                .and_then(|t| t.elapsed().ok())
+                .is_some_and(|age| age < GC_INTERVAL);
+            if recent {
+                return None;
+            }
+        }
+        // Touch the stamp before sweeping so concurrent builds skip out early.
+        let _ = fs::write(&stamp, b"");
+        let live = crate::snapshot::live_entry_keys(&self.root.join("snapshots"));
+        Some(self.sweep(&live, GC_GRACE))
+    }
+
+    /// Delete every entry whose key is not in `live` and whose file is older
+    /// than `grace`. Also removes stale `*.tmp.*` files from crashed writes.
+    ///
+    /// Deleting an entry is always safe: the store is a cache, and a miss
+    /// just recomputes the file on the next build.
+    pub fn sweep(&self, live: &HashSet<String>, grace: Duration) -> SweepReport {
+        let mut report = SweepReport::default();
+        let Ok(shards) = fs::read_dir(&self.root) else {
+            return report;
+        };
+        for shard in shards.flatten() {
+            // Entry shards are two-hex-char directories; skip snapshots,
+            // fs_manifest.bin, gc_stamp, and anything else.
+            let name = shard.file_name();
+            let is_shard = name
+                .to_str()
+                .is_some_and(|s| s.len() == 2 && s.bytes().all(|b| b.is_ascii_hexdigit()));
+            if !is_shard || !shard.path().is_dir() {
+                continue;
+            }
+            let Ok(files) = fs::read_dir(shard.path()) else {
+                continue;
+            };
+            for file in files.flatten() {
+                let path = file.path();
+                let Ok(meta) = file.metadata() else { continue };
+                let old_enough = meta
+                    .modified()
+                    .ok()
+                    .and_then(|t| t.elapsed().ok())
+                    .is_some_and(|age| age >= grace);
+                if !old_enough {
+                    continue;
+                }
+                let file_name = file.file_name();
+                let Some(file_name) = file_name.to_str() else {
+                    continue;
+                };
+                let dead = match file_name.strip_suffix(".bin") {
+                    Some(key) => !live.contains(key),
+                    // Leftover temp file from a crashed atomic write.
+                    None => file_name.contains(".tmp."),
+                };
+                if dead && fs::remove_file(&path).is_ok() {
+                    report.entries_removed += 1;
+                    report.bytes_removed += meta.len();
+                }
+            }
+        }
+        report
+    }
+}
+
 /// mtime/size fast-path record for one file in a non-git root.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct FsManifestRecord {
@@ -219,6 +313,77 @@ mod tests {
         assert_ne!(a, b);
         assert_ne!(a, c);
         assert_ne!(a, d);
+    }
+
+    fn entry(content: &str) -> FileEntry {
+        FileEntry {
+            chunks: vec![StoredChunk {
+                content: content.into(),
+                start_line: 1,
+                end_line: 1,
+            }],
+            embeddings: vec![0.5],
+            dim: 1,
+            tokens: crate::tokens::TokenDocs::default(),
+        }
+    }
+
+    #[test]
+    fn sweep_removes_dead_entries_and_keeps_live() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = ChunkStore::open_at(dir.path().join("s")).unwrap();
+        let live_key = ChunkStore::entry_key("b3:live", Some("rust"), "m");
+        let dead_key = ChunkStore::entry_key("b3:dead", Some("rust"), "m");
+        store.put(&live_key, &entry("live")).unwrap();
+        store.put(&dead_key, &entry("dead")).unwrap();
+
+        let live: HashSet<String> = [live_key.clone()].into();
+        let report = store.sweep(&live, Duration::ZERO);
+        assert_eq!(report.entries_removed, 1);
+        assert!(report.bytes_removed > 0);
+        assert!(store.contains(&live_key));
+        assert!(!store.contains(&dead_key));
+    }
+
+    #[test]
+    fn sweep_respects_grace_period() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = ChunkStore::open_at(dir.path().join("s")).unwrap();
+        let key = ChunkStore::entry_key("b3:young", Some("rust"), "m");
+        store.put(&key, &entry("young")).unwrap();
+
+        // The entry is unreferenced but was written just now.
+        let report = store.sweep(&HashSet::new(), Duration::from_secs(3600));
+        assert_eq!(report, SweepReport::default());
+        assert!(store.contains(&key));
+    }
+
+    #[test]
+    fn sweep_removes_stale_tmp_files_only_in_shards() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = ChunkStore::open_at(dir.path().join("s")).unwrap();
+        let shard = store.root().join("ab");
+        fs::create_dir_all(&shard).unwrap();
+        fs::write(shard.join("abcd.tmp.123"), b"crashed write").unwrap();
+        // Non-shard files and directories are never touched.
+        store.save_fs_manifest(&Default::default()).unwrap();
+        let snapdir = store.root().join("snapshots");
+        fs::create_dir_all(&snapdir).unwrap();
+        fs::write(snapdir.join("x.snap"), b"snapshot").unwrap();
+
+        let report = store.sweep(&HashSet::new(), Duration::ZERO);
+        assert_eq!(report.entries_removed, 1);
+        assert!(!shard.join("abcd.tmp.123").exists());
+        assert!(store.root().join("fs_manifest.bin").exists());
+        assert!(snapdir.join("x.snap").exists());
+    }
+
+    #[test]
+    fn maybe_gc_is_throttled_by_stamp() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = ChunkStore::open_at(dir.path().join("s")).unwrap();
+        assert!(store.maybe_gc().is_some());
+        assert!(store.maybe_gc().is_none(), "second run within interval");
     }
 
     #[test]

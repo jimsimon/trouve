@@ -3,10 +3,10 @@
 use criterion::{criterion_group, criterion_main, Criterion};
 use std::hint::black_box;
 
-use semble::bm25::Bm25Index;
-use semble::chunk::chunk_source;
-use semble::dense::DenseIndex;
-use semble::tokens::tokenize;
+use trouve::bm25::Bm25Index;
+use trouve::chunk::chunk_source;
+use trouve::dense::DenseIndex;
+use trouve::tokens::tokenize;
 
 fn synthetic_source(functions: usize) -> String {
     let mut source = String::new();

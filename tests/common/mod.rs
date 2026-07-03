@@ -241,19 +241,19 @@ fn write_model(dir: &Path) {
     .unwrap();
 }
 
-/// One shared environment for the whole test binary: an isolated semble
+/// One shared environment for the whole test binary: an isolated trouve
 /// cache location and a local toy model. Returns the model path.
 pub fn test_env() -> &'static str {
     static ENV: OnceLock<String> = OnceLock::new();
     ENV.get_or_init(|| {
-        let base = std::env::temp_dir().join(format!("semble-test-env-{}", std::process::id()));
+        let base = std::env::temp_dir().join(format!("trouve-test-env-{}", std::process::id()));
         let model_dir = base.join("model");
         write_model(&model_dir);
         let cache_dir = base.join("cache");
         std::fs::create_dir_all(&cache_dir).unwrap();
         // Safety: set before any test touches the cache; tests within one
         // binary share this environment.
-        std::env::set_var("SEMBLE_CACHE_LOCATION", &cache_dir);
+        std::env::set_var("TROUVE_CACHE_LOCATION", &cache_dir);
         model_dir.to_string_lossy().into_owned()
     })
 }

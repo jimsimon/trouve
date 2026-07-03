@@ -1,7 +1,7 @@
 //! Command-line interface (port of `semble/cli.py`).
 //!
-//! `semble search|find-related|clear|savings|install|uninstall`, with the
-//! bare `semble [--content ...]` invocation starting the MCP stdio server,
+//! `trouve search|find-related|clear|savings|install|uninstall`, with the
+//! bare `trouve [--content ...]` invocation starting the MCP stdio server,
 //! matching upstream dispatch behaviour.
 
 use std::path::PathBuf;
@@ -9,7 +9,7 @@ use std::process::ExitCode;
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
 
-use crate::index::SembleIndex;
+use crate::index::TrouveIndex;
 use crate::stats::{clear_savings, format_savings_report};
 use crate::store::{clear_all_stores, resolve_cache_folder};
 use crate::types::ContentType;
@@ -17,7 +17,7 @@ use crate::utils::{format_results, is_git_url, resolve_chunk};
 
 #[derive(Parser)]
 #[command(
-    name = "semble",
+    name = "trouve",
     version,
     about = "Instant local code search for agents.",
     long_about = "Fast and accurate code search for agents. Runs as an MCP stdio server when \
@@ -114,9 +114,9 @@ enum CliCommand {
         #[command(flatten)]
         content: ContentArgs,
     },
-    /// Interactively configure semble across coding agents.
+    /// Interactively configure trouve across coding agents.
     Install,
-    /// Interactively remove semble configuration from coding agents.
+    /// Interactively remove trouve configuration from coding agents.
     Uninstall,
     /// Internal debug helpers used by the parity harness.
     #[command(hide = true)]
@@ -136,15 +136,15 @@ enum DebugCommand {
     Bm25 { query: String },
 }
 
-fn build_index(path: &str, content: &[ContentType]) -> anyhow::Result<SembleIndex> {
+fn build_index(path: &str, content: &[ContentType]) -> anyhow::Result<TrouveIndex> {
     if is_git_url(path) {
-        SembleIndex::from_git(path, None, content, None)
+        TrouveIndex::from_git(path, None, content, None)
     } else {
-        SembleIndex::from_path(&PathBuf::from(path), content, None)
+        TrouveIndex::from_path(&PathBuf::from(path), content, None)
     }
 }
 
-fn load_index_or_exit(path: &str, content: &[ContentType]) -> Result<SembleIndex, ExitCode> {
+fn load_index_or_exit(path: &str, content: &[ContentType]) -> Result<TrouveIndex, ExitCode> {
     build_index(path, content).map_err(|e| {
         eprintln!("{e:#}");
         ExitCode::FAILURE
@@ -246,7 +246,7 @@ fn run_stats(path: &str, content: &[ContentType]) -> ExitCode {
     ExitCode::SUCCESS
 }
 
-/// Entry point for the semble command-line tool.
+/// Entry point for the trouve command-line tool.
 pub fn main() -> ExitCode {
     let cli = Cli::parse();
     match cli.command {

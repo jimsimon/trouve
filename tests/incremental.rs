@@ -7,8 +7,8 @@
 mod common;
 
 use common::{git, test_env, write_file};
-use semble::index::SembleIndex;
-use semble::types::ContentType;
+use trouve::index::TrouveIndex;
+use trouve::types::ContentType;
 
 const CODE: &[ContentType] = &[ContentType::Code];
 
@@ -37,13 +37,13 @@ fn non_git_incremental_reuses_cache() {
     let root = dir.path();
     sample_files(root);
 
-    let index = SembleIndex::from_path(root, CODE, Some(model)).unwrap();
+    let index = TrouveIndex::from_path(root, CODE, Some(model)).unwrap();
     assert_eq!(index.build_stats.files_total, 3);
     assert_eq!(index.build_stats.files_computed, 3);
     assert_eq!(index.build_stats.files_from_store, 0);
 
     // Second build: everything comes from the store.
-    let index = SembleIndex::from_path(root, CODE, Some(model)).unwrap();
+    let index = TrouveIndex::from_path(root, CODE, Some(model)).unwrap();
     assert_eq!(index.build_stats.files_from_store, 3);
     assert_eq!(index.build_stats.files_computed, 0);
 
@@ -53,7 +53,7 @@ fn non_git_incremental_reuses_cache() {
         "src/auth.py",
         "def authenticate(user, password, token):\n    session = login(user, password, token)\n    return session\n",
     );
-    let index = SembleIndex::from_path(root, CODE, Some(model)).unwrap();
+    let index = TrouveIndex::from_path(root, CODE, Some(model)).unwrap();
     assert_eq!(index.build_stats.files_from_store, 2);
     assert_eq!(index.build_stats.files_computed, 1);
 
@@ -63,13 +63,13 @@ fn non_git_incremental_reuses_cache() {
         "src/new.py",
         "def process(job):\n    return run(job)\n",
     );
-    let index = SembleIndex::from_path(root, CODE, Some(model)).unwrap();
+    let index = TrouveIndex::from_path(root, CODE, Some(model)).unwrap();
     assert_eq!(index.build_stats.files_total, 4);
     assert_eq!(index.build_stats.files_computed, 1);
 
     // Deleted file disappears from the index without recomputation.
     std::fs::remove_file(root.join("src/db.py")).unwrap();
-    let index = SembleIndex::from_path(root, CODE, Some(model)).unwrap();
+    let index = TrouveIndex::from_path(root, CODE, Some(model)).unwrap();
     assert_eq!(index.build_stats.files_total, 3);
     assert_eq!(index.build_stats.files_computed, 0);
     assert!(!index.chunks.iter().any(|c| c.file_path == "src/db.py"));
@@ -85,7 +85,7 @@ fn git_repo_uses_blob_oids_and_shares_across_branches() {
     git(root, &["add", "."]);
     git(root, &["commit", "-m", "init"]);
 
-    let index = SembleIndex::from_path(root, CODE, Some(model)).unwrap();
+    let index = TrouveIndex::from_path(root, CODE, Some(model)).unwrap();
     assert_eq!(index.build_stats.files_computed, 3);
 
     // Branch with one changed file.
@@ -98,13 +98,13 @@ fn git_repo_uses_blob_oids_and_shares_across_branches() {
     git(root, &["add", "."]);
     git(root, &["commit", "-m", "change auth"]);
 
-    let index = SembleIndex::from_path(root, CODE, Some(model)).unwrap();
+    let index = TrouveIndex::from_path(root, CODE, Some(model)).unwrap();
     assert_eq!(index.build_stats.files_computed, 1, "only the edited file");
     assert_eq!(index.build_stats.files_from_store, 2);
 
     // Switching back to main: everything is already in the shared store.
     git(root, &["checkout", "main"]);
-    let index = SembleIndex::from_path(root, CODE, Some(model)).unwrap();
+    let index = TrouveIndex::from_path(root, CODE, Some(model)).unwrap();
     assert_eq!(index.build_stats.files_computed, 0, "branch switch is free");
     assert_eq!(index.build_stats.files_from_store, 3);
 }
@@ -120,7 +120,7 @@ fn worktrees_share_the_store() {
     git(&main_root, &["add", "."]);
     git(&main_root, &["commit", "-m", "init"]);
 
-    let index = SembleIndex::from_path(&main_root, CODE, Some(model)).unwrap();
+    let index = TrouveIndex::from_path(&main_root, CODE, Some(model)).unwrap();
     assert_eq!(index.build_stats.files_computed, 3);
 
     // A second worktree of the same repo pays nothing.
@@ -135,7 +135,7 @@ fn worktrees_share_the_store() {
             wt_root.to_str().unwrap(),
         ],
     );
-    let index = SembleIndex::from_path(&wt_root, CODE, Some(model)).unwrap();
+    let index = TrouveIndex::from_path(&wt_root, CODE, Some(model)).unwrap();
     assert_eq!(
         index.build_stats.files_computed, 0,
         "worktree shares the store"
@@ -152,18 +152,18 @@ fn dirty_files_are_hashed_and_cached() {
     sample_files(root);
     git(root, &["add", "."]);
     git(root, &["commit", "-m", "init"]);
-    let _ = SembleIndex::from_path(root, CODE, Some(model)).unwrap();
+    let _ = TrouveIndex::from_path(root, CODE, Some(model)).unwrap();
 
     // Uncommitted modification: recomputed once, then cached by content hash.
     write_file(root, "src/db.py", "def connect():\n    return database()\n");
-    let index = SembleIndex::from_path(root, CODE, Some(model)).unwrap();
+    let index = TrouveIndex::from_path(root, CODE, Some(model)).unwrap();
     assert_eq!(index.build_stats.files_computed, 1);
-    let index = SembleIndex::from_path(root, CODE, Some(model)).unwrap();
+    let index = TrouveIndex::from_path(root, CODE, Some(model)).unwrap();
     assert_eq!(index.build_stats.files_computed, 0);
 
     // Untracked file gets indexed too.
     write_file(root, "src/untracked.py", "def helper():\n    return true\n");
-    let index = SembleIndex::from_path(root, CODE, Some(model)).unwrap();
+    let index = TrouveIndex::from_path(root, CODE, Some(model)).unwrap();
     assert!(index
         .chunks
         .iter()
@@ -177,7 +177,7 @@ fn search_and_find_related_work_end_to_end() {
     let root = dir.path();
     sample_files(root);
 
-    let index = SembleIndex::from_path(root, CODE, Some(model)).unwrap();
+    let index = TrouveIndex::from_path(root, CODE, Some(model)).unwrap();
     let results = index.search(
         "authenticate user password",
         3,
@@ -213,7 +213,7 @@ fn stats_reflect_index_contents() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
     sample_files(root);
-    let index = SembleIndex::from_path(root, CODE, Some(model)).unwrap();
+    let index = TrouveIndex::from_path(root, CODE, Some(model)).unwrap();
     let stats = index.stats();
     assert_eq!(stats.indexed_files, 3);
     assert!(stats.total_chunks >= 3);
@@ -228,12 +228,12 @@ fn snapshot_fast_path_returns_identical_results() {
     sample_files(root);
 
     // Cold build assembles from scratch and writes a snapshot.
-    let cold = SembleIndex::from_path(root, CODE, Some(model)).unwrap();
+    let cold = TrouveIndex::from_path(root, CODE, Some(model)).unwrap();
     let cold_results = cold.search("save model to path", 3, None, None, None, None, None);
 
     // Snapshots live under this repo's store dir (identity = canonical path).
     let identity = root.canonicalize().unwrap().to_string_lossy().into_owned();
-    let snapshots_dir = semble::store::ChunkStore::open(&identity)
+    let snapshots_dir = trouve::store::ChunkStore::open(&identity)
         .unwrap()
         .root()
         .join("snapshots");
@@ -254,7 +254,7 @@ fn snapshot_fast_path_returns_identical_results() {
     );
 
     // Warm build loads the snapshot (mmap) and must rank identically.
-    let warm = SembleIndex::from_path(root, CODE, Some(model)).unwrap();
+    let warm = TrouveIndex::from_path(root, CODE, Some(model)).unwrap();
     assert_eq!(warm.build_stats.files_computed, 0);
     assert_eq!(warm.chunks, cold.chunks);
     let warm_results = warm.search("save model to path", 3, None, None, None, None, None);
@@ -266,14 +266,14 @@ fn snapshot_fast_path_returns_identical_results() {
 
     // An edit invalidates the manifest hash: new snapshot, still-correct search.
     write_file(root, "src/db.py", "def connect():\n    return database()\n");
-    let edited = SembleIndex::from_path(root, CODE, Some(model)).unwrap();
+    let edited = TrouveIndex::from_path(root, CODE, Some(model)).unwrap();
     assert_eq!(edited.build_stats.files_computed, 1);
     assert_eq!(
         snap_count(&snapshots_dir),
         2,
         "edit produces a second snapshot"
     );
-    let edited_again = SembleIndex::from_path(root, CODE, Some(model)).unwrap();
+    let edited_again = TrouveIndex::from_path(root, CODE, Some(model)).unwrap();
     assert_eq!(edited_again.chunks, edited.chunks);
 }
 
@@ -285,7 +285,7 @@ fn patched_build_matches_full_rebuild_exactly() {
     sample_files(root);
 
     // Cold build writes the snapshot the patch path will splice from.
-    let _ = SembleIndex::from_path(root, CODE, Some(model)).unwrap();
+    let _ = TrouveIndex::from_path(root, CODE, Some(model)).unwrap();
 
     // Modify one file, add one, delete one.
     write_file(
@@ -302,18 +302,18 @@ fn patched_build_matches_full_rebuild_exactly() {
 
     // This build goes through the patch path (a snapshot exists but the
     // manifest hash differs).
-    let patched = SembleIndex::from_path(root, CODE, Some(model)).unwrap();
+    let patched = TrouveIndex::from_path(root, CODE, Some(model)).unwrap();
     assert_eq!(patched.build_stats.files_total, 3);
     assert_eq!(patched.build_stats.files_computed, 2, "modified + added");
 
     // Force a full assembly of the identical tree by removing all snapshots.
     let identity = root.canonicalize().unwrap().to_string_lossy().into_owned();
-    let snapshots_dir = semble::store::ChunkStore::open(&identity)
+    let snapshots_dir = trouve::store::ChunkStore::open(&identity)
         .unwrap()
         .root()
         .join("snapshots");
     std::fs::remove_dir_all(&snapshots_dir).unwrap();
-    let full = SembleIndex::from_path(root, CODE, Some(model)).unwrap();
+    let full = TrouveIndex::from_path(root, CODE, Some(model)).unwrap();
 
     assert_eq!(patched.chunks, full.chunks);
     for query in ["authenticate token", "enqueue job", "save model"] {
@@ -328,9 +328,54 @@ fn patched_build_matches_full_rebuild_exactly() {
 }
 
 #[test]
+fn gc_sweeps_unreferenced_entries_but_keeps_live_manifest() {
+    let model = test_env();
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    sample_files(root);
+
+    // Cold build: writes entries + snapshot 1.
+    let _ = TrouveIndex::from_path(root, CODE, Some(model)).unwrap();
+    let identity = root.canonicalize().unwrap().to_string_lossy().into_owned();
+    let store = trouve::store::ChunkStore::open(&identity).unwrap();
+    let snapshots_dir = store.root().join("snapshots");
+    let snaps = |dir: &std::path::Path| -> Vec<std::path::PathBuf> {
+        std::fs::read_dir(dir)
+            .unwrap()
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| p.extension().is_some_and(|x| x == "snap"))
+            .collect()
+    };
+    let first_snapshot = snaps(&snapshots_dir).pop().unwrap();
+
+    // Edit one file: new entry + snapshot 2.
+    write_file(
+        root,
+        "src/auth.py",
+        "def authenticate(user, token):\n    return session(token)\n",
+    );
+    let _ = TrouveIndex::from_path(root, CODE, Some(model)).unwrap();
+
+    // Simulate pruning of the old manifest's snapshot: the original auth.py
+    // entry is now unreferenced.
+    std::fs::remove_file(&first_snapshot).unwrap();
+    let live = trouve::snapshot::live_entry_keys(&snapshots_dir);
+    let report = store.sweep(&live, std::time::Duration::ZERO);
+    assert_eq!(report.entries_removed, 1, "exactly the stale auth.py entry");
+
+    // Everything the current tree needs survived: a store-only rebuild
+    // (snapshots removed) recomputes nothing.
+    std::fs::remove_dir_all(&snapshots_dir).unwrap();
+    let rebuilt = TrouveIndex::from_path(root, CODE, Some(model)).unwrap();
+    assert_eq!(rebuilt.build_stats.files_computed, 0);
+    assert_eq!(rebuilt.build_stats.files_from_store, 3);
+}
+
+#[test]
 fn empty_dir_errors() {
     let model = test_env();
     let dir = tempfile::tempdir().unwrap();
-    let err = SembleIndex::from_path(dir.path(), CODE, Some(model));
+    let err = TrouveIndex::from_path(dir.path(), CODE, Some(model));
     assert!(err.is_err());
 }

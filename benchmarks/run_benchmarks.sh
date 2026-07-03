@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Speed benchmarks: Rust semble vs upstream Python semble, using hyperfine.
+# Speed benchmarks: trouve vs upstream Python semble, using hyperfine.
 #
 # Measures on a target git repository:
 #   1. cold index      (empty cache -> full index + first query)
@@ -9,12 +9,13 @@
 #
 # Usage: benchmarks/run_benchmarks.sh [REPO_DIR]
 # Defaults to a pinned clone of pallets/flask under benchmarks/repos/.
-# Env: RUNS (default 3), SEMBLE_MODEL_NAME (default: hub download).
+# Env: RUNS (default 3), TROUVE_MODEL_NAME for trouve / SEMBLE_MODEL_NAME for
+# the Python baseline (default: hub download).
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
 REPO="${1:-benchmarks/repos/flask}"
-RUST_BIN="$PWD/target/release/semble"
+RUST_BIN="$PWD/target/release/trouve"
 PY_BIN="$PWD/.venv/bin/semble"
 RUNS="${RUNS:-3}"
 QUERY="handle http request routing"
@@ -39,7 +40,7 @@ RUST_CACHE="$WORK/rust-cache"
 PY_CACHE="$WORK/py-cache"
 export TOKENIZERS_PARALLELISM=false
 
-RUST="SEMBLE_CACHE_LOCATION='$RUST_CACHE' '$RUST_BIN' search '$QUERY' '$REPO' $ARGS"
+RUST="TROUVE_CACHE_LOCATION='$RUST_CACHE' '$RUST_BIN' search '$QUERY' '$REPO' $ARGS"
 PY="SEMBLE_CACHE_LOCATION='$PY_CACHE' '$PY_BIN' search '$QUERY' '$REPO' $ARGS"
 
 echo "== target repo: $REPO ($(git -C "$REPO" ls-files | wc -l) tracked files) =="

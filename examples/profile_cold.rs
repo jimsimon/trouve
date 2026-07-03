@@ -5,18 +5,18 @@
 use std::time::Instant;
 
 use rayon::prelude::*;
-use semble::chunk::chunk_source;
-use semble::languages::detect_language;
-use semble::tokens::tokenize;
-use semble::types::ContentType;
+use trouve::chunk::chunk_source;
+use trouve::languages::detect_language;
+use trouve::tokens::tokenize;
+use trouve::types::ContentType;
 
 fn main() {
     let dir = std::env::args().nth(1).expect("usage: profile_cold <dir>");
     let root = std::path::Path::new(&dir);
 
-    let files = semble::walker::walk_files(
+    let files = trouve::walker::walk_files(
         root,
-        &semble::languages::get_extensions(&[ContentType::Code]),
+        &trouve::languages::get_extensions(&[ContentType::Code]),
         &[],
     );
     println!("files: {}", files.len());
@@ -27,8 +27,8 @@ fn main() {
         .filter_map(|f| {
             let bytes = std::fs::read(f).ok()?;
             // Same size gate as the real pipeline.
-            if semble::languages::file_status_for_bytes(&bytes)
-                != semble::languages::FileStatus::Valid
+            if trouve::languages::file_status_for_bytes(&bytes)
+                != trouve::languages::FileStatus::Valid
             {
                 return None;
             }
@@ -41,7 +41,7 @@ fn main() {
 
     for round in 0..2 {
         let t = Instant::now();
-        let chunked: Vec<(String, Vec<semble::types::Chunk>)> = sources
+        let chunked: Vec<(String, Vec<trouve::types::Chunk>)> = sources
             .par_iter()
             .map(|(rel, src)| {
                 let language = detect_language(std::path::Path::new(rel));
@@ -60,7 +60,7 @@ fn main() {
         let n_tokens: usize = docs.iter().map(Vec::len).sum();
 
         let t = Instant::now();
-        let bm25 = semble::bm25::Bm25Index::build(&docs);
+        let bm25 = trouve::bm25::Bm25Index::build(&docs);
         let bm25_t = t.elapsed();
 
         if round == 1 {

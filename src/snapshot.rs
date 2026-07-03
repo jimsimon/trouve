@@ -324,7 +324,7 @@ pub fn open_latest(dir: &Path, model_id: &str, content: &[String]) -> Option<Raw
 impl RawSnapshot {
     fn open(path: &Path, expect_hash: Option<&[u8; 32]>) -> Result<RawSnapshot> {
         let file = std::fs::File::open(path)?;
-        // SAFETY: the snapshot is private to the semble cache and replaced
+        // SAFETY: the snapshot is private to the trouve cache and replaced
         // only by atomic renames; an existing mapping stays valid after
         // replacement.
         let map = Arc::new(unsafe { Mmap::map(&file)? });
@@ -732,6 +732,36 @@ pub fn patch(old: &RawSnapshot, files: &[PatchFile<'_>]) -> Result<LoadedSnapsho
     })
 }
 
+/// Union of store entry keys referenced by every readable snapshot in `dir`:
+/// the mark phase of the store's mark-and-sweep GC. Snapshots that fail to
+/// open (older versions, corruption) contribute nothing, which is correct:
+/// their entries were written under a different store version and can never
+/// be hit by this binary anyway.
+pub fn live_entry_keys(dir: &Path) -> std::collections::HashSet<String> {
+    let mut live = std::collections::HashSet::new();
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return live;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().is_none_or(|x| x != "snap") {
+            continue;
+        }
+        let Ok(raw) = RawSnapshot::open(&path, None) else {
+            continue;
+        };
+        for m in raw.manifest() {
+            let language = detect_language(Path::new(&m.rel_path));
+            live.insert(crate::store::ChunkStore::entry_key(
+                &m.content_key,
+                language,
+                &raw.meta.model_id,
+            ));
+        }
+    }
+    live
+}
+
 /// Keep only the newest [`KEEP_SNAPSHOTS`] snapshot files in `dir`.
 fn prune(dir: &Path) {
     let Ok(entries) = std::fs::read_dir(dir) else {
@@ -921,6 +951,26 @@ mod tests {
             .get_scores(&["anything".into()], None)
             .iter()
             .all(|s| *s == 0.0));
+    }
+
+    #[test]
+    fn live_entry_keys_covers_all_kept_snapshots() {
+        let dir = tempfile::tempdir().unwrap();
+        let (chunks, _, _) = save_sample(dir.path(), &[1u8; 32]);
+
+        let live = live_entry_keys(dir.path());
+        for entry in manifest_for(&chunks) {
+            let language = detect_language(Path::new(&entry.rel_path));
+            let key =
+                crate::store::ChunkStore::entry_key(&entry.content_key, language, "model-x");
+            assert!(live.contains(&key), "missing key for {}", entry.rel_path);
+        }
+        // Exactly one key per manifest file, no extras.
+        assert_eq!(live.len(), manifest_for(&chunks).len());
+
+        // Unreadable snapshots contribute nothing instead of failing.
+        std::fs::write(dir.path().join("junk.snap"), b"not a snapshot").unwrap();
+        assert_eq!(live_entry_keys(dir.path()), live);
     }
 
     #[test]

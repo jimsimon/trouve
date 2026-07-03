@@ -1,4 +1,4 @@
-//! The Semble index: incremental, content-addressed, multithreaded.
+//! The Trouve index: incremental, content-addressed, multithreaded.
 //!
 //! Replaces upstream's all-or-nothing cached index (`semble/index/index.py` +
 //! `semble/cache.py`). Assembly works from a manifest of `(path, content key)`
@@ -37,7 +37,7 @@ pub struct BuildStats {
     pub chunks_total: usize,
 }
 
-pub struct SembleIndex {
+pub struct TrouveIndex {
     model: Arc<EmbeddingModel>,
     pub chunks: Vec<Chunk>,
     dense: DenseIndex,
@@ -50,19 +50,19 @@ pub struct SembleIndex {
 }
 
 fn git_clone_timeout() -> u64 {
-    std::env::var("SEMBLE_CLONE_TIMEOUT")
+    std::env::var("TROUVE_CLONE_TIMEOUT")
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(60)
 }
 
-impl SembleIndex {
-    /// Create and index a SembleIndex from a directory.
+impl TrouveIndex {
+    /// Create and index a TrouveIndex from a directory.
     pub fn from_path(
         path: &Path,
         content: &[ContentType],
         model_id: Option<&str>,
-    ) -> Result<SembleIndex> {
+    ) -> Result<TrouveIndex> {
         if !path.exists() {
             bail!("Path does not exist: {}", path.display());
         }
@@ -90,7 +90,7 @@ impl SembleIndex {
         git_ref: Option<&str>,
         content: &[ContentType],
         model_id: Option<&str>,
-    ) -> Result<SembleIndex> {
+    ) -> Result<TrouveIndex> {
         let tmp = tempdir_for_clone()?;
         let tmp_path = tmp.path().to_path_buf();
         let mut cmd = Command::new("git");
@@ -126,7 +126,7 @@ impl SembleIndex {
         repo_identity: &RepoIdentity,
         content: &[ContentType],
         model_id: Option<&str>,
-    ) -> Result<SembleIndex> {
+    ) -> Result<TrouveIndex> {
         let content: Vec<ContentType> = if content.is_empty() {
             vec![ContentType::Code]
         } else {
@@ -300,7 +300,7 @@ impl SembleIndex {
         }
 
         let chunks_total = chunks.len();
-        if std::env::var_os("SEMBLE_TIMING").is_some() {
+        if std::env::var_os("TROUVE_TIMING").is_some() {
             eprintln!(
                 "[timing] assemble chunks: {:.1} ms",
                 assemble_start.elapsed().as_secs_f64() * 1e3
@@ -326,6 +326,7 @@ impl SembleIndex {
                 &bm25,
             );
         });
+        crate::utils::timed("store gc", || store.maybe_gc());
 
         let stats = BuildStats {
             files_total,
@@ -345,19 +346,19 @@ impl SembleIndex {
         ))
     }
 
-    /// Wrap loaded/assembled index pieces into a `SembleIndex`.
+    /// Wrap loaded/assembled index pieces into a `TrouveIndex`.
     fn from_loaded(
         snap: snapshot::LoadedSnapshot,
         model: Arc<EmbeddingModel>,
         content: Vec<ContentType>,
         build_stats: BuildStats,
-    ) -> SembleIndex {
+    ) -> TrouveIndex {
         let (file_mapping, language_mapping) = populate_mappings(&snap.chunks);
         let mut file_sizes: HashMap<String, usize> = HashMap::new();
         for chunk in &snap.chunks {
             *file_sizes.entry(chunk.file_path.clone()).or_insert(0) += chunk.content.len();
         }
-        SembleIndex {
+        TrouveIndex {
             model,
             chunks: snap.chunks,
             dense: snap.dense,
@@ -501,6 +502,7 @@ impl SembleIndex {
                 &snap.bm25,
             );
         });
+        crate::utils::timed("store gc", || store.maybe_gc());
 
         let stats = BuildStats {
             files_total: manifest.len(),
@@ -795,7 +797,7 @@ impl Drop for TempDir {
 fn tempdir_for_clone() -> Result<TempDir> {
     let base = std::env::temp_dir();
     let path = base.join(format!(
-        "semble-clone-{}-{}",
+        "trouve-clone-{}-{}",
         std::process::id(),
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)

@@ -8,7 +8,7 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use model2vec_rs::model::StaticModel;
-use semble::embed::EmbeddingModel;
+use trouve::embed::EmbeddingModel;
 
 /// Build a small Bert-style WordPiece model (BertNormalizer +
 /// BertPreTokenizer + WordPiece + quantization mapping/weights) on disk so
@@ -105,7 +105,7 @@ fn write_bert_model(dir: &std::path::Path) {
 }
 
 fn bert_model_dir() -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("semble-bert-parity-{}", std::process::id()));
+    let dir = std::env::temp_dir().join(format!("trouve-bert-parity-{}", std::process::id()));
     if !dir.join("config.json").exists() {
         write_bert_model(&dir);
     }
@@ -180,8 +180,8 @@ fn matches_model2vec_on_wordlevel_test_model() {
 fn matches_model2vec_on_real_model_if_present() {
     // Bit-exact parity against the real potion-code-16M when available
     // locally (kept out of CI: the model is ~60 MB).
-    let Ok(dir) = std::env::var("SEMBLE_MODEL_NAME") else {
-        eprintln!("skipping: SEMBLE_MODEL_NAME not set");
+    let Ok(dir) = std::env::var("TROUVE_MODEL_NAME") else {
+        eprintln!("skipping: TROUVE_MODEL_NAME not set");
         return;
     };
     if !std::path::Path::new(&dir).join("config.json").exists() {

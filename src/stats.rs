@@ -194,7 +194,7 @@ pub fn format_savings_report() -> String {
 
     let mut lines = vec![
         String::new(),
-        "  Semble Token Savings".to_string(),
+        "  Trouve Token Savings".to_string(),
         format!("  {}", "=".repeat(60)),
         String::new(),
         format!(

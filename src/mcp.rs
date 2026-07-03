@@ -15,7 +15,7 @@ use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 
-use crate::index::SembleIndex;
+use crate::index::TrouveIndex;
 use crate::types::ContentType;
 use crate::utils::{format_results, is_git_url, resolve_chunk};
 
@@ -36,7 +36,7 @@ const INSTRUCTIONS: &str = "Instant code search for any local or remote git repo
     Never guess or infer URLs.";
 
 struct CachedIndex {
-    index: SembleIndex,
+    index: TrouveIndex,
     built_at: Instant,
     build_duration: Duration,
     last_used: Instant,
@@ -66,7 +66,7 @@ impl IndexCache {
         }
     }
 
-    fn get(&mut self, repo: &str) -> Result<&SembleIndex, String> {
+    fn get(&mut self, repo: &str) -> Result<&TrouveIndex, String> {
         if is_git_url(repo) && !repo.starts_with("https://") && !repo.starts_with("http://") {
             return Err(format!(
                 "Only https://, http://, or local directory paths are accepted as `repo`. Got: {repo:?}"
@@ -85,9 +85,9 @@ impl IndexCache {
         if needs_build {
             let start = Instant::now();
             let built = if is_git_url(repo) {
-                SembleIndex::from_git(repo, None, &self.content, None)
+                TrouveIndex::from_git(repo, None, &self.content, None)
             } else {
-                SembleIndex::from_path(&PathBuf::from(repo), &self.content, None)
+                TrouveIndex::from_path(&PathBuf::from(repo), &self.content, None)
             }
             .map_err(|e| format!("Failed to index {repo:?}: {e}"))?;
             if self.entries.len() >= CACHE_MAX_SIZE && !self.entries.contains_key(&key) {
@@ -250,7 +250,7 @@ fn handle_request(cache: &mut IndexCache, request: &Value) -> Option<Value> {
             json!({
                 "protocolVersion": requested,
                 "capabilities": {"tools": {}},
-                "serverInfo": {"name": "semble", "version": env!("CARGO_PKG_VERSION")},
+                "serverInfo": {"name": "trouve", "version": env!("CARGO_PKG_VERSION")},
                 "instructions": INSTRUCTIONS,
             })
         }
@@ -318,7 +318,7 @@ mod tests {
         let init = json!({"jsonrpc": "2.0", "id": 1, "method": "initialize",
             "params": {"protocolVersion": "2024-11-05"}});
         let response = handle_request(&mut cache, &init).unwrap();
-        assert_eq!(response["result"]["serverInfo"]["name"], "semble");
+        assert_eq!(response["result"]["serverInfo"]["name"], "trouve");
 
         let list = json!({"jsonrpc": "2.0", "id": 2, "method": "tools/list"});
         let response = handle_request(&mut cache, &list).unwrap();

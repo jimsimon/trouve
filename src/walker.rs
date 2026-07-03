@@ -20,7 +20,7 @@ pub static DEFAULT_IGNORED_DIRS: &[&str] = &[
     ".next/",
     ".pytest_cache/",
     ".ruff_cache/",
-    ".semble/",
+    ".trouve/",
     ".svn/",
     ".tox/",
     ".venv/",

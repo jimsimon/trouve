@@ -12,13 +12,13 @@ fn main() {
     let dir = args.next().expect("usage: profile_embed <dir> [model]");
     let model_id = args
         .next()
-        .or_else(|| std::env::var("SEMBLE_MODEL_NAME").ok())
+        .or_else(|| std::env::var("TROUVE_MODEL_NAME").ok())
         .unwrap_or_else(|| "minishlab/potion-code-16M".to_string());
 
     // Collect chunk texts the same way the indexer does.
     let index = {
-        let content = [semble::types::ContentType::Code];
-        semble::index::SembleIndex::from_path(std::path::Path::new(&dir), &content, Some(&model_id))
+        let content = [trouve::types::ContentType::Code];
+        trouve::index::TrouveIndex::from_path(std::path::Path::new(&dir), &content, Some(&model_id))
             .expect("index build failed")
     };
     let texts: Vec<String> = index.chunks.iter().map(|c| c.content.clone()).collect();

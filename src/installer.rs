@@ -1,8 +1,8 @@
-//! Interactive installer: configure semble across coding agents.
+//! Interactive installer: configure trouve across coding agents.
 //!
 //! Port of `semble/installer/*`. Three integrations per agent: an MCP server
 //! entry, a marked instructions block in the agent's config markdown, and a
-//! dedicated `semble-search` sub-agent file.
+//! dedicated `trouve-search` sub-agent file.
 //!
 //! Deviation from upstream: JSON config edits use strict JSON round-tripping
 //! (key order preserved) instead of a tree-sitter JSON5 grammar. Files that
@@ -17,11 +17,11 @@ use std::process::ExitCode;
 use dialoguer::{Confirm, MultiSelect};
 use serde_json::{json, Map, Value};
 
-pub const SEMBLE_START: &str = "<!-- SEMBLE_START -->";
-pub const SEMBLE_END: &str = "<!-- SEMBLE_END -->";
+pub const TROUVE_START: &str = "<!-- TROUVE_START -->";
+pub const TROUVE_END: &str = "<!-- TROUVE_END -->";
 
-const CODEX_MCP_HEADER: &str = "[mcp_servers.semble]";
-const CODEX_MCP_BLOCK: &str = "[mcp_servers.semble]\ncommand = \"semble\"\nargs = []\n";
+const CODEX_MCP_HEADER: &str = "[mcp_servers.trouve]";
+const CODEX_MCP_BLOCK: &str = "[mcp_servers.trouve]\ncommand = \"trouve\"\nargs = []\n";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mode {
@@ -57,38 +57,38 @@ impl fmt::Display for Action {
 
 fn instructions_block() -> String {
     format!(
-        r#"{SEMBLE_START}
-## Semble Code Search
+        r#"{TROUVE_START}
+## Trouve Code Search
 
-A `semble` MCP server is available with two tools:
-- `mcp__semble__search` — search the codebase with a natural-language or code query.
-- `mcp__semble__find_related` — find code similar to a specific file and line.
+A `trouve` MCP server is available with two tools:
+- `mcp__trouve__search` — search the codebase with a natural-language or code query.
+- `mcp__trouve__find_related` — find code similar to a specific file and line.
 
-Use `mcp__semble__search` to find where something is implemented — instead of using Grep or Glob to discover files. After semble returns the file and line, navigate there directly and read that file. Do not grep for the same content again.
+Use `mcp__trouve__search` to find where something is implemented — instead of using Grep or Glob to discover files. After trouve returns the file and line, navigate there directly and read that file. Do not grep for the same content again.
 
 Pass `--content docs` to search documentation and prose, `--content config` for config files, or `--content all` to search code, docs, and config together.
 
 For CLI fallback or sub-agents without MCP access, use:
 
 ```bash
-semble search "authentication flow" ./my-project --max-snippet-lines 10
-semble search "deployment guide" ./my-project --content docs
-semble search "database host port" ./my-project --content config
-semble find-related src/auth.py 42 ./my-project
-semble search "save model to disk" ./my-project --top-k 10
+trouve search "authentication flow" ./my-project --max-snippet-lines 10
+trouve search "deployment guide" ./my-project --content docs
+trouve search "database host port" ./my-project --content config
+trouve find-related src/auth.py 42 ./my-project
+trouve search "save model to disk" ./my-project --top-k 10
 ```
 
 The index is built on first run and cached automatically; updates are incremental and shared across branches and worktrees.
 
 ### Workflow
 
-1. Call `mcp__semble__search` with a query describing what the code does or its name. The tool returns results with 10 lines of context each (function/class signature + first body lines, enough to confirm the location).
+1. Call `mcp__trouve__search` with a query describing what the code does or its name. The tool returns results with 10 lines of context each (function/class signature + first body lines, enough to confirm the location).
 2. Navigate directly to the top result's file and line. Read only the function or class at that location.
 3. Make the edit. Do not re-search or grep for the same content.
 4. Use `--content docs` for documentation, `--content config` for config files, or `--content all` for everything.
-5. Optionally use `mcp__semble__find_related` with `file_path` and `line` to discover similar code elsewhere.
+5. Optionally use `mcp__trouve__find_related` with `file_path` and `line` to discover similar code elsewhere.
 6. Use Grep only when you need every occurrence of a literal string across the whole repo (e.g., all callers of a renamed function).
-{SEMBLE_END}
+{TROUVE_END}
 "#
     )
 }
@@ -122,19 +122,19 @@ pub struct AgentTarget {
 }
 
 fn stdio_config() -> Value {
-    json!({"command": "semble", "args": [], "type": "stdio"})
+    json!({"command": "trouve", "args": [], "type": "stdio"})
 }
 
 fn bare_stdio_config() -> Value {
-    json!({"command": "semble", "args": []})
+    json!({"command": "trouve", "args": []})
 }
 
 fn opencode_config() -> Value {
-    json!({"command": ["semble"], "type": "local", "enabled": true})
+    json!({"command": ["trouve"], "type": "local", "enabled": true})
 }
 
 fn zed_config() -> Value {
-    json!({"source": "custom", "command": "semble", "args": []})
+    json!({"source": "custom", "command": "trouve", "args": []})
 }
 
 fn home() -> PathBuf {
@@ -197,7 +197,7 @@ pub fn agents() -> Vec<AgentTarget> {
                 format: McpFormat::Json,
             }),
             instructions_path: Some(home.join(".claude").join("CLAUDE.md")),
-            subagent_path: Some(home.join(".claude").join("agents").join("semble-search.md")),
+            subagent_path: Some(home.join(".claude").join("agents").join("trouve-search.md")),
             subagent_asset: Some(include_str!("agents/claude.md")),
         },
         AgentTarget {
@@ -212,7 +212,7 @@ pub fn agents() -> Vec<AgentTarget> {
                 format: McpFormat::Json,
             }),
             instructions_path: None,
-            subagent_path: Some(home.join(".cursor").join("agents").join("semble-search.md")),
+            subagent_path: Some(home.join(".cursor").join("agents").join("trouve-search.md")),
             subagent_asset: Some(include_str!("agents/cursor.md")),
         },
         AgentTarget {
@@ -227,7 +227,7 @@ pub fn agents() -> Vec<AgentTarget> {
                 format: McpFormat::Json,
             }),
             instructions_path: Some(home.join(".gemini").join("GEMINI.md")),
-            subagent_path: Some(home.join(".gemini").join("agents").join("semble-search.md")),
+            subagent_path: Some(home.join(".gemini").join("agents").join("trouve-search.md")),
             subagent_asset: Some(include_str!("agents/gemini.md")),
         },
         AgentTarget {
@@ -241,8 +241,8 @@ pub fn agents() -> Vec<AgentTarget> {
                 entry: stdio_config(),
                 format: McpFormat::Json,
             }),
-            instructions_path: Some(home.join(".kiro").join("steering").join("semble.md")),
-            subagent_path: Some(home.join(".kiro").join("agents").join("semble-search.md")),
+            instructions_path: Some(home.join(".kiro").join("steering").join("trouve.md")),
+            subagent_path: Some(home.join(".kiro").join("agents").join("trouve-search.md")),
             subagent_asset: Some(include_str!("agents/kiro.md")),
         },
         AgentTarget {
@@ -261,7 +261,7 @@ pub fn agents() -> Vec<AgentTarget> {
                 home.join(".config")
                     .join("opencode")
                     .join("agents")
-                    .join("semble-search.md"),
+                    .join("trouve-search.md"),
             ),
             subagent_asset: Some(include_str!("agents/opencode.md")),
         },
@@ -280,7 +280,7 @@ pub fn agents() -> Vec<AgentTarget> {
             subagent_path: Some(
                 home.join(".copilot")
                     .join("agents")
-                    .join("semble-search.agent.md"),
+                    .join("trouve-search.agent.md"),
             ),
             subagent_asset: Some(include_str!("agents/copilot.md")),
         },
@@ -299,7 +299,7 @@ pub fn agents() -> Vec<AgentTarget> {
             subagent_path: Some(
                 home.join(".codex")
                     .join("agents")
-                    .join("semble-search.toml"),
+                    .join("trouve-search.toml"),
             ),
             subagent_asset: Some(include_str!("agents/codex.toml")),
         },
@@ -366,7 +366,7 @@ pub fn agents() -> Vec<AgentTarget> {
             subagent_path: Some(
                 home.join(".reasonix")
                     .join("skills")
-                    .join("semble-search.md"),
+                    .join("trouve-search.md"),
             ),
             subagent_asset: Some(include_str!("agents/reasonix.md")),
         },
@@ -382,7 +382,7 @@ pub fn agents() -> Vec<AgentTarget> {
                 format: McpFormat::Json,
             }),
             instructions_path: None,
-            subagent_path: Some(home.join(".pi").join("agents").join("semble-search.md")),
+            subagent_path: Some(home.join(".pi").join("agents").join("trouve-search.md")),
             subagent_asset: Some(include_str!("agents/pi.md")),
         },
         AgentTarget {
@@ -400,7 +400,7 @@ pub fn agents() -> Vec<AgentTarget> {
             subagent_path: Some(
                 home.join(".commandcode")
                     .join("agents")
-                    .join("semble-search.md"),
+                    .join("trouve-search.md"),
             ),
             subagent_asset: Some(include_str!("agents/commandcode.md")),
         },
@@ -420,7 +420,7 @@ pub fn agents() -> Vec<AgentTarget> {
                 home.join(".gemini")
                     .join("config")
                     .join("skills")
-                    .join("semble-search")
+                    .join("trouve-search")
                     .join("SKILL.md"),
             ),
             subagent_asset: Some(include_str!("agents/antigravity.md")),
@@ -557,7 +557,7 @@ fn strip_toml_section(text: &str, header: &str) -> String {
     result
 }
 
-/// Add (or refresh) the semble `[mcp_servers.semble]` table in a Codex config.toml.
+/// Add (or refresh) the trouve `[mcp_servers.trouve]` table in a Codex config.toml.
 pub fn merge_toml_block(path: &Path) -> Action {
     if std::fs::create_dir_all(path.parent().unwrap_or(Path::new("."))).is_err() {
         return Action::Error;
@@ -590,7 +590,7 @@ pub fn merge_toml_block(path: &Path) -> Action {
     }
 }
 
-/// Remove the semble `[mcp_servers.semble]` table from a Codex config.toml.
+/// Remove the trouve `[mcp_servers.trouve]` table from a Codex config.toml.
 pub fn remove_toml_block(path: &Path) -> Action {
     if !path.exists() {
         return Action::NotFound;
@@ -614,7 +614,7 @@ pub fn remove_toml_block(path: &Path) -> Action {
 
 // --- Marked instructions blocks -------------------------------------------------
 
-/// Replace the marked semble section in `path`, or append it if absent.
+/// Replace the marked trouve section in `path`, or append it if absent.
 pub fn replace_or_append_marked(path: &Path, content: &str) -> Action {
     if std::fs::create_dir_all(path.parent().unwrap_or(Path::new("."))).is_err() {
         return Action::Error;
@@ -627,11 +627,11 @@ pub fn replace_or_append_marked(path: &Path, content: &str) -> Action {
     };
 
     if let (Some(start_idx), Some(end_idx)) =
-        (existing.find(SEMBLE_START), existing.find(SEMBLE_END))
+        (existing.find(TROUVE_START), existing.find(TROUVE_END))
     {
         if end_idx > start_idx {
             let before = &existing[..start_idx];
-            let after = &existing[end_idx + SEMBLE_END.len()..];
+            let after = &existing[end_idx + TROUVE_END.len()..];
             let updated = format!(
                 "{before}{}\n{}",
                 content.trim_matches('\n'),
@@ -666,13 +666,13 @@ pub fn replace_or_append_marked(path: &Path, content: &str) -> Action {
     }
 }
 
-/// Remove the marked semble section from `path`.
+/// Remove the marked trouve section from `path`.
 pub fn remove_marked(path: &Path) -> Action {
     if !path.exists() {
         return Action::NotFound;
     }
     let existing = std::fs::read_to_string(path).unwrap_or_default();
-    let (Some(start_idx), Some(end_idx)) = (existing.find(SEMBLE_START), existing.find(SEMBLE_END))
+    let (Some(start_idx), Some(end_idx)) = (existing.find(TROUVE_START), existing.find(TROUVE_END))
     else {
         return Action::NotFound;
     };
@@ -680,7 +680,7 @@ pub fn remove_marked(path: &Path) -> Action {
         return Action::NotFound;
     }
     let before = existing[..start_idx].trim_end_matches('\n');
-    let after = existing[end_idx + SEMBLE_END.len()..].trim_start_matches('\n');
+    let after = existing[end_idx + TROUVE_END.len()..].trim_start_matches('\n');
     let mut updated = format!("{before}\n{after}");
     updated = updated.trim_matches('\n').to_string();
     if existing.ends_with('\n') && !updated.is_empty() {
@@ -710,9 +710,9 @@ fn apply_mcp(agent: &AgentTarget, mode: Mode) -> Option<WriteResult> {
         (McpFormat::Toml, Mode::Install) => merge_toml_block(&mcp.path),
         (McpFormat::Toml, Mode::Uninstall) => remove_toml_block(&mcp.path),
         (McpFormat::Json, Mode::Install) => {
-            merge_json_member(&mcp.path, mcp.key, "semble", &mcp.entry)
+            merge_json_member(&mcp.path, mcp.key, "trouve", &mcp.entry)
         }
-        (McpFormat::Json, Mode::Uninstall) => remove_json_member(&mcp.path, mcp.key, "semble"),
+        (McpFormat::Json, Mode::Uninstall) => remove_json_member(&mcp.path, mcp.key, "trouve"),
     };
     Some(WriteResult {
         path: mcp.path.clone(),
@@ -792,9 +792,9 @@ impl Integration {
 
     fn desc(&self) -> &'static str {
         match self {
-            Integration::Mcp => "lets the agent call semble directly as a tool",
+            Integration::Mcp => "lets the agent call trouve directly as a tool",
             Integration::Instructions => "adds CLI usage guidance to AGENTS.md / CLAUDE.md",
-            Integration::Subagent => "installs a dedicated semble-search sub-agent",
+            Integration::Subagent => "installs a dedicated trouve-search sub-agent",
         }
     }
 
@@ -815,15 +815,15 @@ impl Integration {
     }
 }
 
-/// Interactively install or uninstall semble across coding agents.
+/// Interactively install or uninstall trouve across coding agents.
 pub fn run(mode: Mode) -> ExitCode {
     let install = mode == Mode::Install;
     println!(
         "\n  {}\n",
         if install {
-            "Semble Installer"
+            "Trouve Installer"
         } else {
-            "Semble Uninstaller"
+            "Trouve Uninstaller"
         }
     );
 
@@ -908,7 +908,7 @@ pub fn run(mode: Mode) -> ExitCode {
     let question = if install {
         "Proceed?"
     } else {
-        "Remove semble configuration?"
+        "Remove trouve configuration?"
     };
     let confirmed = Confirm::new()
         .with_prompt(question)
@@ -965,10 +965,10 @@ mod tests {
     fn merge_json_creates_fresh_file() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("mcp.json");
-        let action = merge_json_member(&path, "mcpServers", "semble", &stdio_config());
+        let action = merge_json_member(&path, "mcpServers", "trouve", &stdio_config());
         assert_eq!(action, Action::Created);
         let parsed: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
-        assert_eq!(parsed["mcpServers"]["semble"]["command"], "semble");
+        assert_eq!(parsed["mcpServers"]["trouve"]["command"], "trouve");
     }
 
     #[test]
@@ -980,11 +980,11 @@ mod tests {
             r#"{"mcpServers": {"other": {"command": "x"}}, "theme": "dark"}"#,
         )
         .unwrap();
-        let action = merge_json_member(&path, "mcpServers", "semble", &stdio_config());
+        let action = merge_json_member(&path, "mcpServers", "trouve", &stdio_config());
         assert_eq!(action, Action::Updated);
         let parsed: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
         assert_eq!(parsed["mcpServers"]["other"]["command"], "x");
-        assert_eq!(parsed["mcpServers"]["semble"]["command"], "semble");
+        assert_eq!(parsed["mcpServers"]["trouve"]["command"], "trouve");
         assert_eq!(parsed["theme"], "dark");
     }
 
@@ -992,8 +992,8 @@ mod tests {
     fn merge_json_unchanged_when_identical() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("mcp.json");
-        merge_json_member(&path, "mcpServers", "semble", &stdio_config());
-        let action = merge_json_member(&path, "mcpServers", "semble", &stdio_config());
+        merge_json_member(&path, "mcpServers", "trouve", &stdio_config());
+        let action = merge_json_member(&path, "mcpServers", "trouve", &stdio_config());
         assert_eq!(action, Action::Unchanged);
     }
 
@@ -1003,7 +1003,7 @@ mod tests {
         let path = dir.path().join("cfg.jsonc");
         std::fs::write(&path, "{\n  // comment\n  \"a\": 1\n}").unwrap();
         assert_eq!(
-            merge_json_member(&path, "mcpServers", "semble", &stdio_config()),
+            merge_json_member(&path, "mcpServers", "trouve", &stdio_config()),
             Action::Skipped
         );
     }
@@ -1012,13 +1012,13 @@ mod tests {
     fn remove_json_member_works() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("mcp.json");
-        merge_json_member(&path, "mcpServers", "semble", &stdio_config());
+        merge_json_member(&path, "mcpServers", "trouve", &stdio_config());
         assert_eq!(
-            remove_json_member(&path, "mcpServers", "semble"),
+            remove_json_member(&path, "mcpServers", "trouve"),
             Action::Removed
         );
         assert_eq!(
-            remove_json_member(&path, "mcpServers", "semble"),
+            remove_json_member(&path, "mcpServers", "trouve"),
             Action::NotFound
         );
     }
@@ -1050,16 +1050,16 @@ mod tests {
         );
         let text = std::fs::read_to_string(&path).unwrap();
         assert!(text.starts_with("# My instructions"));
-        assert!(text.contains(SEMBLE_START));
+        assert!(text.contains(TROUVE_START));
         // Re-applying replaces in place, not duplicates.
         assert_eq!(
             replace_or_append_marked(&path, &instructions_block()),
             Action::Unchanged
         );
-        assert_eq!(text.matches(SEMBLE_START).count(), 1);
+        assert_eq!(text.matches(TROUVE_START).count(), 1);
         assert_eq!(remove_marked(&path), Action::Removed);
         let text = std::fs::read_to_string(&path).unwrap();
-        assert!(!text.contains(SEMBLE_START));
+        assert!(!text.contains(TROUVE_START));
         assert!(text.contains("# My instructions"));
     }
 

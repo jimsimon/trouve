@@ -1,14 +1,17 @@
-# semble-rs
+# trouve
 
 Fast and accurate code search for agents — a Rust port of
 [MinishLab/semble](https://github.com/MinishLab/semble) with an incremental,
 branch- and worktree-aware index and a fully multithreaded pipeline.
 
+Pronounced **"troov"** (rhymes with *groove*; French /tʁuv/). *Trouver* is
+French for "to find" — a nod to upstream's namesake *sembler*, "to seem".
+
 ## Why a port?
 
 Upstream Semble is excellent but its cache is all-or-nothing: touch one file
 and the whole repository is re-chunked and re-embedded. On a 20,000+ file
-codebase that means minutes per rebuild. semble-rs replaces the cached-index
+codebase that means minutes per rebuild. trouve replaces the cached-index
 model with a **content-addressed chunk store**:
 
 - Every per-file artifact (chunks, embedding rows, BM25 token lists) is keyed
@@ -44,24 +47,31 @@ and a fully warm query from ~7 s to 0.55 s (13x). Retrieval quality is
 identical — mean NDCG@10 matches upstream to within 0.0002 on the upstream
 annotated benchmark, with identical chunk boundaries and BM25 scores.
 
+Everything runs on CPU, like upstream: model2vec static embeddings are table
+lookups plus mean pooling, so there is no neural forward pass to accelerate.
+Disk and memory footprints are documented in
+[BENCHMARKS.md](BENCHMARKS.md#resource-usage); a complete list of differences
+from upstream (and the reasoning behind each) is in
+[DIFFERENCES.md](DIFFERENCES.md).
+
 ## Install
 
 ```bash
-cargo install semble
+cargo install trouve
 # or download a release binary from GitHub Releases
 ```
 
 ## Usage
 
 ```bash
-semble search "authentication flow" ./my-project --max-snippet-lines 10
-semble search "deployment guide" ./my-project --content docs
-semble find-related src/auth.py 42 ./my-project
-semble stats ./my-project        # index + cache-hit stats
-semble savings                   # token savings report
-semble clear all                 # wipe stores + savings
-semble install                   # configure MCP/instructions across agents
-semble                           # run as an MCP stdio server
+trouve search "authentication flow" ./my-project --max-snippet-lines 10
+trouve search "deployment guide" ./my-project --content docs
+trouve find-related src/auth.py 42 ./my-project
+trouve stats ./my-project        # index + cache-hit stats
+trouve savings                   # token savings report
+trouve clear all                 # wipe stores + savings
+trouve install                   # configure MCP/instructions across agents
+trouve                           # run as an MCP stdio server
 ```
 
 `--content` selects what to index: `code` (default), `docs`, `config`, or
@@ -77,18 +87,51 @@ with the same target chunk length, so everything remains searchable.
 
 ## Cache location
 
-Resolved in order: `SEMBLE_CACHE_LOCATION` (absolute path), then the platform
-cache dir (`~/.cache/semble` on Linux). Set `SEMBLE_MODEL_NAME` to override
+Resolved in order: `TROUVE_CACHE_LOCATION` (absolute path), then the platform
+cache dir (`~/.cache/trouve` on Linux). Set `TROUVE_MODEL_NAME` to override
 the embedding model.
+
+The store garbage-collects itself: after a snapshot write (at most once per
+day per store), entries not referenced by any kept snapshot are deleted, with
+a one-hour grace period protecting concurrent builds. Deleted entries are
+never wrong — the store is a cache, and a miss just recomputes the file.
 
 ## Development
 
 ```bash
 cargo test                        # unit + integration tests (offline)
-SEMBLE_E2E=1 cargo test -- --ignored   # end-to-end tests (downloads the model)
+TROUVE_E2E=1 cargo test -- --ignored   # end-to-end tests (downloads the model)
 ./scripts/fetch-reference.sh      # clone upstream Python semble into reference/
-python3 tests/parity/run_parity.py --binary target/release/semble
+python3 tests/parity/run_parity.py --binary target/release/trouve
 ./benchmarks/run_benchmarks.sh    # hyperfine comparison vs Python semble
+```
+
+## Acknowledgements
+
+trouve exists because of [Semble](https://github.com/MinishLab/semble) by
+Thomas van Dongen and Stephan Tulkens of [MinishLab](https://github.com/MinishLab),
+which pioneered the approach: static [Model2Vec](https://github.com/MinishLab/model2vec)
+embeddings fused with BM25 and code-aware reranking, fast enough for agents to
+use as a native tool. trouve's retrieval behaviour is a faithful port of their
+design (see [DIFFERENCES.md](DIFFERENCES.md)), and the
+[potion-code-16M](https://huggingface.co/minishlab/potion-code-16M) embedding
+model is theirs. If you find trouve useful, star their repo too.
+
+## Citing
+
+If you use trouve in your research, please cite the original Semble project,
+per its [citation guide](https://github.com/MinishLab/semble#citing):
+
+```bibtex
+@software{minishlab2026semble,
+  author       = {{van Dongen}, Thomas and Stephan Tulkens},
+  title        = {Semble: Fast and Accurate Code Search for Agents},
+  year         = {2026},
+  publisher    = {Zenodo},
+  doi          = {10.5281/zenodo.19785932},
+  url          = {https://github.com/MinishLab/semble},
+  license      = {MIT}
+}
 ```
 
 ## License

@@ -39,7 +39,7 @@ jobs:
       - name: Model-backed end-to-end tests
         run: cargo test --workspace -- --ignored
         env:
-          SEMBLE_E2E: "1"
+          TROUVE_E2E: "1"
 
   # Numeric/behavioural parity against the upstream Python implementation.
   parity:
@@ -63,4 +63,4 @@ jobs:
       - name: Build release binary
         run: cargo build --release
       - name: Run parity harness
-        run: python3 tests/parity/run_parity.py --binary target/release/semble
+        run: python3 tests/parity/run_parity.py --binary target/release/trouve

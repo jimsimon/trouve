@@ -39,19 +39,19 @@ jobs:
         if: runner.os != 'Windows'
         run: |
           cd target/${{ matrix.target }}/release
-          tar czf semble-${{ github.ref_name }}-${{ matrix.target }}.tar.gz semble
+          tar czf trouve-${{ github.ref_name }}-${{ matrix.target }}.tar.gz trouve
       - name: Package (windows)
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
           cd target/${{ matrix.target }}/release
-          Compress-Archive -Path semble.exe -DestinationPath semble-${{ github.ref_name }}-${{ matrix.target }}.zip
+          Compress-Archive -Path trouve.exe -DestinationPath trouve-${{ github.ref_name }}-${{ matrix.target }}.zip
       - uses: actions/upload-artifact@v4
         with:
-          name: semble-${{ matrix.target }}
+          name: trouve-${{ matrix.target }}
           path: |
-            target/${{ matrix.target }}/release/semble-*.tar.gz
-            target/${{ matrix.target }}/release/semble-*.zip
+            target/${{ matrix.target }}/release/trouve-*.tar.gz
+            target/${{ matrix.target }}/release/trouve-*.zip
 
   release:
     needs: build

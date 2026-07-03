@@ -24,10 +24,10 @@ fn scp_git_url_re() -> &'static Regex {
 }
 
 /// Return true if `path` looks like a remote git URL rather than a local path.
-/// Run `f`, printing its wall time to stderr when `SEMBLE_TIMING` is set.
+/// Run `f`, printing its wall time to stderr when `TROUVE_TIMING` is set.
 pub fn timed<T>(phase: &str, f: impl FnOnce() -> T) -> T {
     static ENABLED: OnceLock<bool> = OnceLock::new();
-    let enabled = *ENABLED.get_or_init(|| std::env::var_os("SEMBLE_TIMING").is_some());
+    let enabled = *ENABLED.get_or_init(|| std::env::var_os("TROUVE_TIMING").is_some());
     if !enabled {
         return f();
     }
@@ -44,9 +44,9 @@ pub fn is_git_url(path: &str) -> bool {
     GIT_URL_SCHEMES.iter().any(|s| path.starts_with(s)) || scp_git_url_re().is_match(path)
 }
 
-/// Resolve the model name, respecting `SEMBLE_MODEL_NAME`.
+/// Resolve the model name, respecting `TROUVE_MODEL_NAME`.
 pub fn resolve_model_name() -> String {
-    std::env::var("SEMBLE_MODEL_NAME").unwrap_or_else(|_| DEFAULT_MODEL_NAME.to_string())
+    std::env::var("TROUVE_MODEL_NAME").unwrap_or_else(|_| DEFAULT_MODEL_NAME.to_string())
 }
 
 /// Return the chunk containing `line` in `file_path`, or None.

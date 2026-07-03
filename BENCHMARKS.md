@@ -1,12 +1,12 @@
 # Benchmarks
 
-Rust `semble` vs upstream Python [`MinishLab/semble`](https://github.com/MinishLab/semble),
+`trouve` vs upstream Python [`MinishLab/semble`](https://github.com/MinishLab/semble),
 measured with [hyperfine](https://github.com/sharkdp/hyperfine) (end-to-end) and
 [criterion](https://github.com/bheisler/criterion.rs) (micro-benchmarks).
 
 Test machine: AMD Ryzen 9 5950X (16C/32T), 64 GB RAM, Linux, NVMe.
 Model: `minishlab/potion-code-16M`. Every timing below is a full CLI invocation
-(`semble search <query> <repo> -k 5 --max-snippet-lines 0`), including process
+(`trouve search <query> <repo> -k 5 --max-snippet-lines 0`), including process
 startup and model load.
 
 ## Small repo: pallets/flask (249 tracked files)
@@ -77,9 +77,40 @@ slices and sorts `(term, doc, tf)` triples in parallel. Chunk line numbers
 are computed with a single forward newline scan per file, and fresh
 embeddings are written straight into one flat buffer.
 
-Cold-path phase breakdown on kubernetes (`SEMBLE_TIMING=1`): chunk+tokenize
+Cold-path phase breakdown on kubernetes (`TROUVE_TIMING=1`): chunk+tokenize
 1.3 s (mostly tree-sitter parsing), embedding 0.5 s, BM25 build 0.46 s,
 everything else under 0.25 s each.
+
+## Resource usage
+
+Peak resident memory (`/usr/bin/time -v`, full CLI invocation) and on-disk
+cache size, same machine and model as above:
+
+| | flask (249 files) | kubernetes (30,563 files) |
+| --- | --- | --- |
+| Cold build peak RSS | 92 MB | 2.29 GB |
+| Incremental (patch) peak RSS | — | 1.33 GB |
+| Warm query peak RSS | 40 MB | 0.74 GB |
+| Store entries on disk | 2.4 MB | ~0.7 GB |
+| One snapshot on disk | 2.0 MB | 577 MB |
+| Snapshot cap (4 kept) | 8 MB | 2.3 GB |
+
+What scales with what:
+
+- **RAM scales with repository size, not branch count.** Each invocation
+  loads one branch's index. On the warm path embeddings and BM25 postings are
+  read zero-copy from the mmap'd snapshot, so the OS pages them in and out on
+  demand; resident memory is mostly the materialized chunk texts plus the
+  memory-mapped model (63 MB on disk, shared and paged).
+- **Disk scales with unique content, not branch count.** Store entries are
+  content-addressed by git blob OID, so all branches and worktrees share one
+  copy of identical file content; a feature branch adds only the entries for
+  the files it changed. Snapshots are capped at the 4 newest per store, and a
+  daily mark-and-sweep pass deletes entries no kept snapshot references
+  (60 ms on the kubernetes store), so the store converges to the content
+  reachable from recent snapshots instead of growing forever.
+- The MCP server keeps up to 10 indexes in its in-process LRU (keyed by
+  repository path, so 20 branches of one checkout occupy a single slot).
 
 ## Retrieval quality (NDCG@10)
 
@@ -128,12 +159,12 @@ benchmarks/run_benchmarks.sh
 # quality suite
 (cd reference/semble && PYTHONPATH=. ../../.venv/bin/python benchmarks/sync_repos.py \
     --repo flask --repo click --repo requests --repo chi --repo redux)
-.venv/bin/python benchmarks/run_quality.py --binary target/release/semble \
+.venv/bin/python benchmarks/run_quality.py --binary target/release/trouve \
     --repo flask --repo click --repo requests --repo chi --repo redux
 
 # micro-benchmarks
 cargo bench
 ```
 
-Set `SEMBLE_MODEL_NAME=/path/to/local/model` to run offline with a pre-downloaded
+Set `TROUVE_MODEL_NAME=/path/to/local/model` to run offline with a pre-downloaded
 copy of `potion-code-16M` (`config.json`, `tokenizer.json`, `model.safetensors`).

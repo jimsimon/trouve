@@ -1,20 +1,20 @@
 [package]
-name = "semble"
+name = "trouve"
 version = "0.1.0"
 edition = "2021"
 description = "Fast and accurate code search for agents. Rust port of MinishLab/semble with incremental, branch- and worktree-aware indexing."
 license = "MIT"
-repository = "https://github.com/jimsimon/semble-rs"
+repository = "https://github.com/jimsimon/trouve"
 keywords = ["code-search", "semantic-search", "mcp", "agent", "embeddings"]
 categories = ["command-line-utilities", "development-tools"]
 rust-version = "1.85"
 
 [lib]
-name = "semble"
+name = "trouve"
 path = "src/lib.rs"
 
 [[bin]]
-name = "semble"
+name = "trouve"
 path = "src/main.rs"
 
 [dependencies]

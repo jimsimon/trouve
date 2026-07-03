@@ -1,4 +1,4 @@
-//! Semble: fast and accurate code search for agents.
+//! Trouve: fast and accurate code search for agents.
 //!
 //! Rust port of [MinishLab/semble](https://github.com/MinishLab/semble) with a
 //! content-addressed chunk store that makes indexing incremental, multithreaded,
