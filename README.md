@@ -30,6 +30,12 @@ same code-tuned reranking heuristics (symbol-definition boosts, file-stem
 boosts, multi-chunk coherence, test/example/compat path penalties, per-file
 saturation decay).
 
+Measured results ([BENCHMARKS.md](BENCHMARKS.md)): ~10x faster cold indexing,
+and on kubernetes/kubernetes (30k files) an incremental reindex after touching
+one file drops from ~3 minutes to under 9 seconds (20x). Retrieval quality is
+identical — mean NDCG@10 matches upstream to within 0.0002 on the upstream
+annotated benchmark, with identical chunk boundaries and BM25 scores.
+
 ## Install
 
 ```bash

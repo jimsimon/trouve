@@ -118,6 +118,22 @@ enum CliCommand {
     Install,
     /// Interactively remove semble configuration from coding agents.
     Uninstall,
+    /// Internal debug helpers used by the parity harness.
+    #[command(hide = true)]
+    Debug {
+        #[command(subcommand)]
+        command: DebugCommand,
+    },
+}
+
+#[derive(Subcommand)]
+enum DebugCommand {
+    /// Chunk one file and print the chunks as JSON.
+    Chunk { file: PathBuf },
+    /// Tokenize text (BM25 tokenizer) and print the tokens as JSON.
+    Tokenize { text: String },
+    /// Print BM25 scores for a query over a JSON list of documents on stdin.
+    Bm25 { query: String },
 }
 
 fn build_index(path: &str, content: &[ContentType]) -> anyhow::Result<SembleIndex> {
@@ -130,7 +146,7 @@ fn build_index(path: &str, content: &[ContentType]) -> anyhow::Result<SembleInde
 
 fn load_index_or_exit(path: &str, content: &[ContentType]) -> Result<SembleIndex, ExitCode> {
     build_index(path, content).map_err(|e| {
-        eprintln!("{e}");
+        eprintln!("{e:#}");
         ExitCode::FAILURE
     })
 }
@@ -265,5 +281,56 @@ pub fn main() -> ExitCode {
         Some(CliCommand::Stats { path, content }) => run_stats(&path, &content.resolve()),
         Some(CliCommand::Install) => crate::installer::run(crate::installer::Mode::Install),
         Some(CliCommand::Uninstall) => crate::installer::run(crate::installer::Mode::Uninstall),
+        Some(CliCommand::Debug { command }) => run_debug(command),
+    }
+}
+
+fn run_debug(command: DebugCommand) -> ExitCode {
+    match command {
+        DebugCommand::Chunk { file } => {
+            let Ok(source) = crate::languages::read_file_text(&file) else {
+                eprintln!("Cannot read {}", file.display());
+                return ExitCode::FAILURE;
+            };
+            let language = crate::languages::detect_language(&file);
+            let chunks = crate::chunk::chunk_source(&source, &file.to_string_lossy(), language);
+            let out: Vec<serde_json::Value> = chunks
+                .iter()
+                .map(|c| {
+                    serde_json::json!({
+                        "start_line": c.start_line,
+                        "end_line": c.end_line,
+                        "content": c.content,
+                        "language": c.language,
+                    })
+                })
+                .collect();
+            println!("{}", serde_json::Value::Array(out));
+            ExitCode::SUCCESS
+        }
+        DebugCommand::Tokenize { text } => {
+            println!(
+                "{}",
+                serde_json::to_string(&crate::tokens::tokenize(&text)).unwrap()
+            );
+            ExitCode::SUCCESS
+        }
+        DebugCommand::Bm25 { query } => {
+            let mut input = String::new();
+            use std::io::Read;
+            if std::io::stdin().read_to_string(&mut input).is_err() {
+                return ExitCode::FAILURE;
+            }
+            let Ok(docs) = serde_json::from_str::<Vec<String>>(&input) else {
+                eprintln!("stdin must be a JSON array of document strings");
+                return ExitCode::FAILURE;
+            };
+            let tokenized: Vec<Vec<String>> =
+                docs.iter().map(|d| crate::tokens::tokenize(d)).collect();
+            let index = crate::bm25::Bm25Index::build(&tokenized);
+            let scores = index.get_scores(&crate::tokens::tokenize(&query), None);
+            println!("{}", serde_json::to_string(&scores).unwrap());
+            ExitCode::SUCCESS
+        }
     }
 }
