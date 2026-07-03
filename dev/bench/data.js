@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1783105547236,
+  "lastUpdate": 1783111671041,
   "repoUrl": "https://github.com/jimsimon/trouve",
   "entries": {
     "e2e-benchmarks": [
@@ -191,6 +191,54 @@ window.BENCHMARK_DATA = {
             "name": "non-git warm query",
             "value": 59.79942134000001,
             "range": "± 1.8",
+            "unit": "ms"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "jim.j.simon@gmail.com",
+            "name": "Jim Simon",
+            "username": "jimsimon"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "01d6d607afdfba9532dfc392fa8ff390f1703010",
+          "message": "Add trouve-native config names with deprecated semble fallbacks (#14)\n\n- .trouveignore is now honoured per directory (same gitignore semantics),\n  taking precedence over the deprecated .sembleignore where patterns\n  conflict; .sembleignore still works but logs a one-time deprecation\n  warning pointing at .trouveignore.\n- SEMBLE_CACHE_LOCATION, SEMBLE_MODEL_NAME, and SEMBLE_CLONE_TIMEOUT are\n  honoured as fallbacks when the TROUVE_* equivalent is unset, with the\n  same one-time deprecation warning.\n- .semble/ directories are skipped during walks alongside .trouve/,\n  matching upstream's default ignore list.\n\nCo-authored-by: Cursor Agent <cursoragent@cursor.com>\nCo-authored-by: Jim Simon <jimsimon@users.noreply.github.com>",
+          "timestamp": "2026-07-03T16:46:36-04:00",
+          "tree_id": "77de7c46fec7e1fb22775691563517390b8f6154",
+          "url": "https://github.com/jimsimon/trouve/commit/01d6d607afdfba9532dfc392fa8ff390f1703010"
+        },
+        "date": 1783111670646,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "cold index + query",
+            "value": 117.79910108,
+            "range": "± 9.4",
+            "unit": "ms"
+          },
+          {
+            "name": "warm query",
+            "value": 57.135625100000006,
+            "range": "± 1.3",
+            "unit": "ms"
+          },
+          {
+            "name": "incremental (1 file modified)",
+            "value": 67.80243886000001,
+            "range": "± 1.7",
+            "unit": "ms"
+          },
+          {
+            "name": "non-git warm query",
+            "value": 56.297090620000006,
+            "range": "± 1.2",
             "unit": "ms"
           }
         ]
