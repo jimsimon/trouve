@@ -1,0 +1,20 @@
+{
+  "name": "trouve",
+  "interface": {
+    "displayName": "Trouve Code Search"
+  },
+  "plugins": [
+    {
+      "name": "trouve",
+      "source": {
+        "source": "local",
+        "path": "./plugins/trouve"
+      },
+      "policy": {
+        "installation": "AVAILABLE",
+        "authentication": "ON_INSTALL"
+      },
+      "category": "Developer Tools"
+    }
+  ]
+}

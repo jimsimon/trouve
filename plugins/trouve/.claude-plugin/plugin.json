@@ -1,0 +1,18 @@
+{
+  "name": "trouve",
+  "description": "Fast, accurate code search for agents: hybrid semantic + BM25 search over any local or remote git repository, with incremental branch-aware indexing. Adds trouve search tools (MCP), a trouve-search sub-agent, and a workflow skill.",
+  "version": "1.0.0",
+  "author": {
+    "name": "Jim Simon"
+  },
+  "homepage": "https://github.com/jimsimon/trouve",
+  "repository": "https://github.com/jimsimon/trouve",
+  "license": "MIT",
+  "keywords": [
+    "code-search",
+    "semantic-search",
+    "mcp",
+    "embeddings"
+  ],
+  "hooks": "./claude-hooks.json"
+}

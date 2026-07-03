@@ -77,6 +77,57 @@ trouve                           # run as an MCP stdio server
 `--content` selects what to index: `code` (default), `docs`, `config`, or
 `all`.
 
+## Agent integrations
+
+There are three ways to wire trouve into a coding agent, plus the CLI as a
+universal fallback. Pick **one per agent** — they expose the same tools, so
+combining them shows the model duplicates.
+
+| Aspect | Plugin: OpenCode / Kilo | Plugin: Claude Code / Codex | `trouve install` | CLI only |
+| --- | --- | --- | --- | --- |
+| Agents | OpenCode, Kilo Code | Claude Code, Codex | 14 agents (Cursor, Gemini, Copilot, VS Code, Windsurf, Zed, …) | anything with a shell |
+| Tool surface | native `trouve_search` / `trouve_find_related` | MCP (`mcp__trouve__*`) | MCP (`mcp__trouve__*`) | `trouve` CLI via bash |
+| trouve process | one persistent server per session | one MCP server per session | one MCP server per session | one process per call |
+| In-session index cache (incl. remote URLs) | yes | yes | yes | disk store only |
+| Index warmed at session start | yes, + re-warm on idle turns | Claude: yes (hook) · Codex: no | no | no |
+| Bundled guidance | rich tool descriptions | workflow skill (+ sub-agent on Claude) | instructions block + sub-agent | sub-agent docs |
+| What it touches | one `plugin` entry in your config | managed by the plugin marketplace | writes agent config files (JSON/TOML/Markdown) | nothing |
+| Updates | npm (`latest` or pinned) | marketplace update | rerun `trouve install` | with the binary |
+
+How to choose:
+
+- **If your agent has a plugin route, prefer it.** Plugins are versioned in
+  lockstep with the crate, install/uninstall as one unit, and are the only
+  routes with session-start index warming. For OpenCode and Kilo Code the
+  plugin also avoids MCP entirely: tools are native, and the persistent
+  server keeps remote-repository indexes cached across calls within a
+  session.
+- **Use `trouve install` for everything else.** The interactive installer
+  covers a much wider set of agents by editing their config files directly
+  (an MCP entry, an instructions block, and a `trouve-search` sub-agent per
+  agent, each selectable). The trade-off is that it writes into your
+  existing configs — files with JSONC comments are skipped and reported —
+  and updates mean re-running it. `trouve uninstall` reverses everything it
+  wrote.
+- **The CLI needs no setup at all** and is what sub-agents without tool
+  access fall back to; every approach above shares the same on-disk index
+  store, so mixing CLI use with any other route costs nothing.
+
+Per-harness plugin install commands:
+
+- **[OpenCode](https://opencode.ai)** — `{ "plugin": ["trouve-plugin"] }` in
+  your opencode config.
+- **[Kilo Code](https://kilo.ai)** — `kilo plugin trouve-plugin --global`
+  (Kilo CLI and VS Code extension).
+- **[Claude Code](https://code.claude.com)** —
+  `/plugin marketplace add jimsimon/trouve` then
+  `/plugin install trouve@trouve`.
+- **[Codex](https://developers.openai.com/codex)** —
+  `codex plugin marketplace add 'https://github.com/jimsimon/trouve.git' --ref main`
+  then `codex plugin add trouve@trouve`.
+
+See the [plugin README](plugins/trouve/README.md) for details.
+
 ## Ignoring files
 
 `.gitignore` files are honoured per directory. To exclude files from indexing
