@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1783116838302,
+  "lastUpdate": 1783117379201,
   "repoUrl": "https://github.com/jimsimon/trouve",
   "entries": {
     "e2e-benchmarks": [
@@ -383,6 +383,54 @@ window.BENCHMARK_DATA = {
             "name": "non-git warm query",
             "value": 61.28082774,
             "range": "± 1.6",
+            "unit": "ms"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "jim.j.simon@gmail.com",
+            "name": "Jim Simon",
+            "username": "jimsimon"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "134c8e48abbdbec99793f0c76e327ed03cf5cd60",
+          "message": "Add native OpenCode custom tools as an opt-in alternative to MCP (#6)\n\ntrouve install gains a fourth, opt-in integration (\"Native tool\")\nthat writes ~/.config/opencode/tools/trouve.ts: exports surface to the\nmodel as trouve_search and trouve_find_related, run the trouve CLI via\nBun.spawn with a 10-minute watchdog (SIGTERM, then SIGKILL after 5s)\nand a catch on the stream await so every failure path returns tool\noutput, default repo to the session worktree, and support a content\nargument. MCP remains the default integration and is never touched by\nthe tool file; instruction blocks render whichever tool names the\nselected integrations expose. Documented in the README's Agent\nintegrations grid.\n\nRebased onto main (post-#4/#11) as a single commit with all review\nfixes.\n\nCo-authored-by: Cursor Agent <cursoragent@cursor.com>\nCo-authored-by: Jim Simon <jimsimon@users.noreply.github.com>",
+          "timestamp": "2026-07-03T18:21:46-04:00",
+          "tree_id": "2e99cc8b211f50fd466ffb86c3ae3f15c336ee77",
+          "url": "https://github.com/jimsimon/trouve/commit/134c8e48abbdbec99793f0c76e327ed03cf5cd60"
+        },
+        "date": 1783117378958,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "cold index + query",
+            "value": 121.01258385999999,
+            "range": "± 1.7",
+            "unit": "ms"
+          },
+          {
+            "name": "warm query",
+            "value": 59.2790148,
+            "range": "± 2",
+            "unit": "ms"
+          },
+          {
+            "name": "incremental (1 file modified)",
+            "value": 68.65951584,
+            "range": "± 0.9",
+            "unit": "ms"
+          },
+          {
+            "name": "non-git warm query",
+            "value": 56.927228420000006,
+            "range": "± 1.7",
             "unit": "ms"
           }
         ]
