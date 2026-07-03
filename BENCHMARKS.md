@@ -213,6 +213,24 @@ Delta +0.0001 — well within the 1% parity target. The parity harness
 
 HTML reports land in `target/criterion/`.
 
+## CI regression gating
+
+`.github/workflows/bench.yml` runs two gated suites on every PR and push to
+main:
+
+- **micro**: the criterion benchmarks above, gated at 150%.
+- **e2e**: full CLI invocations on a pinned flask 3.1.0 checkout
+  (`benchmarks/run_ci_bench.sh`) — cold index, warm query, incremental
+  reindex, and the non-git warm path — gated at 175% (wall-clock times on
+  shared runners are noisier).
+
+Each run is compared against the baseline recorded on the last push to main
+(kept in the actions cache via
+[github-action-benchmark](https://github.com/benchmark-action/github-action-benchmark));
+a benchmark that regresses past its threshold fails the job. PRs only
+compare, pushes to main update the baseline, and comparisons use medians
+(`benchmarks/to_gha_bench.py`) to shrug off single slow outliers.
+
 ## Reproducing
 
 ```bash
