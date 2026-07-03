@@ -29,30 +29,55 @@ fn language_for(name: &str) -> Option<Language> {
     let lang = match name {
         "bash" => tree_sitter_bash::LANGUAGE,
         "c" => tree_sitter_c::LANGUAGE,
+        "cmake" => tree_sitter_cmake::LANGUAGE,
         "cpp" => tree_sitter_cpp::LANGUAGE,
         "csharp" => tree_sitter_c_sharp::LANGUAGE,
         "css" => tree_sitter_css::LANGUAGE,
+        "d" => tree_sitter_d::LANGUAGE,
+        "dart" => tree_sitter_dart::LANGUAGE,
+        "dtd" => tree_sitter_xml::LANGUAGE_DTD,
         "elixir" => tree_sitter_elixir::LANGUAGE,
+        "elm" => tree_sitter_elm::LANGUAGE,
+        "embeddedtemplate" => tree_sitter_embedded_template::LANGUAGE,
+        "erlang" => tree_sitter_erlang::LANGUAGE,
+        "fortran" => tree_sitter_fortran::LANGUAGE,
+        "gleam" => tree_sitter_gleam::LANGUAGE,
         "go" => tree_sitter_go::LANGUAGE,
+        "graphql" => tree_sitter_graphql::LANGUAGE,
+        "groovy" => tree_sitter_groovy::LANGUAGE,
         "haskell" => tree_sitter_haskell::LANGUAGE,
+        // Terraform's .tf syntax is HCL; both names share one grammar.
+        "hcl" | "terraform" => tree_sitter_hcl::LANGUAGE,
         "html" => tree_sitter_html::LANGUAGE,
         "java" => tree_sitter_java::LANGUAGE,
         "javascript" => tree_sitter_javascript::LANGUAGE,
         "json" => tree_sitter_json::LANGUAGE,
+        "julia" => tree_sitter_julia::LANGUAGE,
         "kotlin" => tree_sitter_kotlin_ng::LANGUAGE,
         "lua" => tree_sitter_lua::LANGUAGE,
+        "make" => tree_sitter_make::LANGUAGE,
         "markdown" => tree_sitter_md::LANGUAGE,
+        "nix" => tree_sitter_nix::LANGUAGE,
+        "objc" => tree_sitter_objc::LANGUAGE,
         "ocaml" => tree_sitter_ocaml::LANGUAGE_OCAML,
         "ocaml_interface" => tree_sitter_ocaml::LANGUAGE_OCAML_INTERFACE,
+        "perl" => tree_sitter_perl::LANGUAGE,
         "php" => tree_sitter_php::LANGUAGE_PHP,
+        "powershell" => tree_sitter_powershell::LANGUAGE,
+        "proto" => tree_sitter_proto::LANGUAGE,
         "python" => tree_sitter_python::LANGUAGE,
+        "r" => tree_sitter_r::LANGUAGE,
         "ruby" => tree_sitter_ruby::LANGUAGE,
         "rust" => tree_sitter_rust::LANGUAGE,
         "scala" => tree_sitter_scala::LANGUAGE,
+        "solidity" => tree_sitter_solidity::LANGUAGE,
+        "sql" => tree_sitter_sequel::LANGUAGE,
+        "svelte" => tree_sitter_svelte_ng::LANGUAGE,
         "swift" => tree_sitter_swift::LANGUAGE,
         "toml" => tree_sitter_toml_ng::LANGUAGE,
         "tsx" => tree_sitter_typescript::LANGUAGE_TSX,
         "typescript" => tree_sitter_typescript::LANGUAGE_TYPESCRIPT,
+        "xml" => tree_sitter_xml::LANGUAGE_XML,
         "yaml" => tree_sitter_yaml::LANGUAGE,
         "zig" => tree_sitter_zig::LANGUAGE,
         _ => return None,
@@ -356,5 +381,70 @@ mod tests {
         assert!(is_supported_language("rust"));
         assert!(is_supported_language("tsx"));
         assert!(!is_supported_language("cobol"));
+    }
+
+    #[test]
+    fn next_tier_languages_are_supported() {
+        for lang in [
+            "cmake",
+            "d",
+            "dart",
+            "dtd",
+            "elm",
+            "embeddedtemplate",
+            "erlang",
+            "fortran",
+            "gleam",
+            "graphql",
+            "groovy",
+            "hcl",
+            "julia",
+            "make",
+            "nix",
+            "objc",
+            "perl",
+            "powershell",
+            "proto",
+            "r",
+            "solidity",
+            "sql",
+            "svelte",
+            "terraform",
+            "xml",
+        ] {
+            assert!(is_supported_language(lang), "expected grammar for {lang}");
+        }
+    }
+
+    #[test]
+    fn next_tier_languages_parse_and_chunk() {
+        let samples: &[(&str, &str)] = &[
+            ("dart", "int add(int a, int b) {\n  return a + b;\n}\n"),
+            ("julia", "function add(a, b)\n    return a + b\nend\n"),
+            ("r", "add <- function(a, b) {\n  a + b\n}\n"),
+            ("erlang", "-module(math).\nadd(A, B) -> A + B.\n"),
+            (
+                "perl",
+                "sub add {\n    my ($a, $b) = @_;\n    return $a + $b;\n}\n",
+            ),
+            ("sql", "SELECT id, name FROM users WHERE active = 1;\n"),
+            ("nix", "{ pkgs }: {\n  packages = [ pkgs.hello ];\n}\n"),
+            (
+                "terraform",
+                "resource \"aws_s3_bucket\" \"b\" {\n  bucket = \"my-bucket\"\n}\n",
+            ),
+            (
+                "proto",
+                "syntax = \"proto3\";\nmessage User {\n  string name = 1;\n}\n",
+            ),
+            ("xml", "<config><item key=\"a\">1</item></config>\n"),
+        ];
+        for (lang, source) in samples {
+            let source = source.repeat(30);
+            let chunks = chunk_source(&source, "sample", Some(lang));
+            assert!(!chunks.is_empty(), "no chunks for {lang}");
+            let combined_len: usize = chunks.iter().map(|c| c.content.len()).sum();
+            assert!(combined_len > 0, "empty chunks for {lang}");
+        }
     }
 }

@@ -4,6 +4,17 @@ All notable changes to this project are documented in this file. The format
 is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this
 project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **23 new tree-sitter grammars** (~50 languages total): CMake, D, Dart, Elm,
+  ERB/EJS embedded templates, Erlang, Fortran, Gleam, GraphQL, Groovy,
+  HCL/Terraform, Julia, Make, Nix, Objective-C, Perl, PowerShell, Protocol
+  Buffers, R, Solidity, SQL, Svelte, and XML (incl. DTD). Files in these
+  languages now get syntax-aware chunk boundaries instead of the line-based
+  fallback.
+
 ## [1.0.0] - 2026-07-03
 
 First stable release. trouve is a Rust port of
