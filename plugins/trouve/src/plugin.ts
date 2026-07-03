@@ -22,18 +22,29 @@ interface Pending {
   reject(error: Error): void
 }
 
+/// The initialize handshake involves no indexing and must be quick.
+const INIT_TIMEOUT_MS = 30_000
+/// A tool call may include a cold index build of a very large (or remote)
+/// repo; anything beyond this is treated as a hung server.
+const CALL_TIMEOUT_MS = 10 * 60 * 1000
+
 /** Minimal client for trouve's newline-delimited JSON-RPC stdio server. */
 class TrouveServer {
   private proc: ReturnType<typeof Bun.spawn> | null = null
   private pending = new Map<number, Pending>()
   private nextId = 1
   private starting: Promise<void> | null = null
+  private stderrTail = ""
 
   constructor(private content: ContentType[]) {}
 
   async callTool(name: string, args: Record<string, unknown>): Promise<string> {
     await this.ensureStarted()
-    const result = (await this.request("tools/call", { name, arguments: args })) as {
+    const result = (await this.request(
+      "tools/call",
+      { name, arguments: args },
+      CALL_TIMEOUT_MS,
+    )) as {
       content?: Array<{ type: string; text?: string }>
     }
     const text = result.content
@@ -62,24 +73,42 @@ class TrouveServer {
     const proc = Bun.spawn(argv, {
       stdin: "pipe",
       stdout: "pipe",
-      stderr: "ignore",
+      stderr: "pipe",
     })
     this.proc = proc
     proc.exited.then(() => this.onExit())
     this.readLoop(proc.stdout).catch(() => this.onExit())
-    await this.request("initialize", {
-      protocolVersion: PROTOCOL_VERSION,
-      capabilities: {},
-      clientInfo: { name: pkg.name, version: pkg.version },
-    })
+    this.readStderr(proc.stderr).catch(() => {})
+    await this.request(
+      "initialize",
+      {
+        protocolVersion: PROTOCOL_VERSION,
+        capabilities: {},
+        clientInfo: { name: pkg.name, version: pkg.version },
+      },
+      INIT_TIMEOUT_MS,
+    )
     this.write({ jsonrpc: "2.0", method: "notifications/initialized" })
+  }
+
+  /// Keep the tail of stderr so a crash can be diagnosed from the tool
+  /// output instead of vanishing silently.
+  private async readStderr(stderr: ReadableStream<Uint8Array>): Promise<void> {
+    const decoder = new TextDecoder()
+    for await (const chunk of stderr) {
+      this.stderrTail = (this.stderrTail + decoder.decode(chunk, { stream: true })).slice(-2000)
+    }
   }
 
   private onExit(): void {
     this.proc = null
     const pending = [...this.pending.values()]
     this.pending.clear()
-    for (const p of pending) p.reject(new Error("trouve server exited unexpectedly"))
+    const detail = this.stderrTail.trim()
+    const message = detail
+      ? `trouve server exited unexpectedly: ${detail}`
+      : "trouve server exited unexpectedly"
+    for (const p of pending) p.reject(new Error(message))
   }
 
   private async readLoop(stdout: ReadableStream<Uint8Array>): Promise<void> {
@@ -114,10 +143,33 @@ class TrouveServer {
     }
   }
 
-  private request(method: string, params: unknown): Promise<unknown> {
+  private request(method: string, params: unknown, timeoutMs: number): Promise<unknown> {
     const id = this.nextId++
     const promise = new Promise((resolve, reject) => {
-      this.pending.set(id, { resolve, reject })
+      // A server that stalls without exiting would otherwise hang the
+      // agent turn forever: fail the request and kill the process so the
+      // next call starts fresh.
+      const timer = setTimeout(() => {
+        if (this.pending.delete(id)) {
+          this.proc?.kill()
+          reject(
+            new Error(
+              `trouve server did not respond to ${method} within ${timeoutMs / 1000}s ` +
+                "and was restarted. Index builds are incremental; retrying resumes.",
+            ),
+          )
+        }
+      }, timeoutMs)
+      this.pending.set(id, {
+        resolve: (value) => {
+          clearTimeout(timer)
+          resolve(value)
+        },
+        reject: (error) => {
+          clearTimeout(timer)
+          reject(error)
+        },
+      })
     })
     this.write({ jsonrpc: "2.0", id, method, params })
     return promise
@@ -206,8 +258,19 @@ function makeWarmer(directory: string | undefined, content: ContentType[]) {
 export const TrouvePlugin: Plugin = async (input, options) => {
   const opts = options as { content?: string | string[]; warm?: boolean } | undefined
   const requested = opts?.content
-  const content = (Array.isArray(requested) ? requested : requested ? [requested] : ["code"])
-    .filter((c): c is ContentType => (CONTENT_TYPES as readonly string[]).includes(c))
+  const requestedList = Array.isArray(requested) ? requested : requested ? [requested] : ["code"]
+  const invalid = requestedList.filter(
+    (c) => !(CONTENT_TYPES as readonly string[]).includes(c),
+  )
+  if (invalid.length) {
+    console.warn(
+      `trouve-plugin: ignoring invalid content value(s) ${invalid.join(", ")}; ` +
+        `valid values are ${CONTENT_TYPES.join(", ")}.`,
+    )
+  }
+  const content = requestedList.filter((c): c is ContentType =>
+    (CONTENT_TYPES as readonly string[]).includes(c),
+  )
   const resolved = content.length ? content : (["code"] as ContentType[])
   const server = new TrouveServer(resolved)
 
