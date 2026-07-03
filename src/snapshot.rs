@@ -16,7 +16,7 @@
 //! Layout (little-endian, every section 8-byte aligned):
 //!
 //! ```text
-//! magic "SMBLSNP2" | manifest hash (32) | meta len u64 | meta (bincode)
+//! magic "SMBLSNP4" | manifest hash (32) | meta len u64 | meta (bincode)
 //! chunk records | text blob | embeddings f32 | bm25 term blob
 //! bm25 term offsets u32 | bm25 posting offsets u64 | bm25 postings
 //! bm25 doc lengths u32
@@ -40,10 +40,12 @@ use crate::languages::detect_language;
 use crate::store::FileEntry;
 use crate::types::Chunk;
 
-const MAGIC: &[u8; 8] = b"SMBLSNP3";
+const MAGIC: &[u8; 8] = b"SMBLSNP4";
 /// Bump when the snapshot layout or embedding semantics change incompatibly.
-/// v3: padding-free (batch-independent) embeddings.
-pub const SNAPSHOT_VERSION: u32 = 3;
+/// v3: padding-free (batch-independent) embeddings. v4: meta records the
+/// store version and chunk length so patch bases from a build with different
+/// chunking/tokenization parameters are rejected.
+pub const SNAPSHOT_VERSION: u32 = 4;
 /// Snapshots kept per store before the oldest are pruned. Covers a handful of
 /// branches/worktrees sharing one store without unbounded growth.
 const KEEP_SNAPSHOTS: usize = 4;
@@ -128,6 +130,15 @@ pub struct ManifestEntry {
 #[derive(Serialize, Deserialize)]
 struct SnapshotMeta {
     version: u32,
+    /// [`crate::store::STORE_VERSION`] at write time. The exact-match path is
+    /// covered by the manifest hash (which mixes this in), but the patch path
+    /// opens snapshots regardless of manifest hash, so store-level parameters
+    /// must be validated explicitly or a version bump would silently splice
+    /// rows chunked/tokenized under the old rules.
+    store_version: u32,
+    /// [`crate::chunk::DESIRED_CHUNK_LENGTH`] at write time, for the same
+    /// reason as `store_version`.
+    chunk_len: u32,
     model_id: String,
     /// Content types this index was built with (must match to reuse).
     content: Vec<String>,
@@ -200,7 +211,13 @@ pub fn save(
     std::fs::create_dir_all(dir)?;
     let path = snapshot_path(dir, manifest_hash);
     if path.exists() {
-        return Ok(path);
+        // Only skip the write if the existing file really is this snapshot
+        // (the filename truncates the hash, and a partial or foreign file
+        // would otherwise be trusted forever and miss on every load).
+        if RawSnapshot::open(&path, Some(manifest_hash)).is_ok() {
+            return Ok(path);
+        }
+        let _ = std::fs::remove_file(&path);
     }
 
     // Dedupe file paths preserving first-seen (manifest) order.
@@ -226,6 +243,8 @@ pub fn save(
     let (term_blob, term_offsets, posting_offsets, postings, doc_lengths) = bm25.flat_parts();
     let meta = SnapshotMeta {
         version: SNAPSHOT_VERSION,
+        store_version: crate::store::STORE_VERSION,
+        chunk_len: crate::chunk::DESIRED_CHUNK_LENGTH as u32,
         model_id: model_id.to_string(),
         content: content.to_vec(),
         manifest,
@@ -351,6 +370,14 @@ impl RawSnapshot {
         )?;
         if meta.version != SNAPSHOT_VERSION {
             bail!("snapshot version mismatch");
+        }
+        if meta.store_version != crate::store::STORE_VERSION
+            || meta.chunk_len != crate::chunk::DESIRED_CHUNK_LENGTH as u32
+        {
+            // Written by a build with different chunking/tokenization
+            // parameters: unusable both as an exact match and (crucially) as
+            // a patch base.
+            bail!("snapshot store parameters mismatch");
         }
 
         let mut cursor = align8(48 + meta_len);
@@ -979,5 +1006,49 @@ mod tests {
         assert!(open_latest(dir.path(), "model-x", &["code".to_string()]).is_some());
         assert!(open_latest(dir.path(), "model-y", &["code".to_string()]).is_none());
         assert!(open_latest(dir.path(), "model-x", &["docs".to_string()]).is_none());
+    }
+
+    #[test]
+    fn open_rejects_mismatched_store_parameters() {
+        let dir = tempfile::tempdir().unwrap();
+        let hash = [5u8; 32];
+        let path = snapshot_path(dir.path(), &hash);
+        save_sample(dir.path(), &hash);
+
+        // Rewrite the file with a bumped store version in the meta block,
+        // simulating a snapshot left behind by a build with different
+        // chunking/tokenization parameters (same SNAPSHOT_VERSION).
+        let bytes = std::fs::read(&path).unwrap();
+        let meta_len = u64::from_le_bytes(bytes[40..48].try_into().unwrap()) as usize;
+        let (mut meta, _): (SnapshotMeta, usize) = bincode::serde::decode_from_slice(
+            &bytes[48..48 + meta_len],
+            bincode::config::standard(),
+        )
+        .unwrap();
+        meta.store_version += 1;
+        let new_meta = bincode::serde::encode_to_vec(&meta, bincode::config::standard()).unwrap();
+        assert_eq!(new_meta.len(), meta_len, "test relies on stable meta size");
+        let mut patched = bytes.clone();
+        patched[48..48 + meta_len].copy_from_slice(&new_meta);
+        std::fs::write(&path, &patched).unwrap();
+
+        assert!(RawSnapshot::open(&path, Some(&hash)).is_err());
+        assert!(load(dir.path(), &hash, "model-x").is_none());
+        assert!(open_latest(dir.path(), "model-x", &["code".to_string()]).is_none());
+    }
+
+    #[test]
+    fn save_replaces_foreign_file_at_snapshot_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let hash = [9u8; 32];
+        let path = snapshot_path(dir.path(), &hash);
+        std::fs::create_dir_all(dir.path()).unwrap();
+        std::fs::write(&path, b"garbage left by a crash or hash-prefix collision").unwrap();
+
+        // save() must notice the existing file is not this snapshot and
+        // rewrite it instead of returning early.
+        save_sample(dir.path(), &hash);
+        let snap = load(dir.path(), &hash, "model-x").expect("snapshot should load after rewrite");
+        assert_eq!(snap.chunks.len(), 3);
     }
 }
