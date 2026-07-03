@@ -50,9 +50,8 @@ pub struct TrouveIndex {
 }
 
 fn git_clone_timeout() -> u64 {
-    std::env::var("TROUVE_CLONE_TIMEOUT")
-        .ok()
-        .and_then(|v| v.parse().ok())
+    crate::utils::env_var_compat("TROUVE_CLONE_TIMEOUT", "SEMBLE_CLONE_TIMEOUT")
+        .and_then(|(_, v)| v.parse().ok())
         .unwrap_or(60)
 }
 

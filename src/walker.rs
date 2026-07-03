@@ -1,10 +1,11 @@
-//! File walking with gitignore/sembleignore support.
+//! File walking with gitignore/trouveignore support.
 //!
 //! Port of `semble/index/file_walker.py`. A base spec of always-ignored
-//! directories is combined with per-directory `.gitignore` and `.sembleignore`
+//! directories is combined with per-directory `.gitignore` and `.trouveignore`
 //! specs; the last matching pattern wins (gitignore semantics). Negation
 //! patterns with a file extension (e.g. `!special.kjs`) bypass the extension
-//! filter, matching upstream behaviour.
+//! filter, matching upstream behaviour. Upstream's `.sembleignore` is still
+//! honoured but deprecated.
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -20,6 +21,7 @@ pub static DEFAULT_IGNORED_DIRS: &[&str] = &[
     ".next/",
     ".pytest_cache/",
     ".ruff_cache/",
+    ".semble/",
     ".trouve/",
     ".svn/",
     ".tox/",
@@ -52,9 +54,14 @@ fn build_spec(base: &Path, lines: &[String]) -> Option<Gitignore> {
 
 fn load_ignore_for_dir(directory: &Path) -> Option<Gitignore> {
     let mut lines: Vec<String> = Vec::new();
-    for name in [".gitignore", ".sembleignore"] {
+    // Later files win on conflicting patterns; the deprecated `.sembleignore`
+    // is loaded before `.trouveignore` so the new name takes precedence.
+    for name in [".gitignore", ".sembleignore", ".trouveignore"] {
         let p = directory.join(name);
         if p.is_file() {
+            if name == ".sembleignore" {
+                crate::utils::warn_deprecated(".sembleignore", ".trouveignore");
+            }
             if let Ok(text) = std::fs::read_to_string(&p) {
                 lines.extend(text.lines().map(|l| l.to_string()));
             }
@@ -96,8 +103,9 @@ fn is_ignored(path: &Path, is_dir: bool, specs: &[IgnoreSpec]) -> (bool, bool) {
 /// Yield files under `root` matching `extensions`, skipping ignored paths.
 ///
 /// Directories matching [`DEFAULT_IGNORED_DIRS`] plus any patterns in
-/// `ignore_patterns` are always skipped. `.gitignore` and `.sembleignore`
-/// files are honoured per directory, inherited downward.
+/// `ignore_patterns` are always skipped. `.gitignore` and `.trouveignore`
+/// files are honoured per directory, inherited downward (plus the deprecated
+/// `.sembleignore`).
 pub fn walk_files(root: &Path, extensions: &[String], ignore_patterns: &[String]) -> Vec<PathBuf> {
     let extension_set: HashSet<String> = extensions.iter().cloned().collect();
     let mut base_lines: Vec<String> = DEFAULT_IGNORED_DIRS.iter().map(|s| s.to_string()).collect();
@@ -211,6 +219,8 @@ mod tests {
         touch(&root.join("node_modules/x.py"), "x");
         touch(&root.join(".git/y.py"), "y");
         touch(&root.join("__pycache__/z.py"), "z");
+        touch(&root.join(".trouve/t.py"), "t");
+        touch(&root.join(".semble/s.py"), "s");
         touch(&root.join("keep.py"), "k");
         let files = walk_files(root, &exts(), &[]);
         assert_eq!(files.len(), 1);
@@ -228,6 +238,42 @@ mod tests {
         let files = walk_files(root, &exts(), &[]);
         assert_eq!(files.len(), 1);
         assert!(files[0].ends_with("visible.py"));
+    }
+
+    #[test]
+    fn honours_trouveignore() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        touch(&root.join(".trouveignore"), "secret.py\n");
+        touch(&root.join("secret.py"), "s");
+        touch(&root.join("visible.py"), "v");
+        let files = walk_files(root, &exts(), &[]);
+        assert_eq!(files.len(), 1);
+        assert!(files[0].ends_with("visible.py"));
+    }
+
+    #[test]
+    fn honours_deprecated_sembleignore() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        touch(&root.join(".sembleignore"), "secret.py\n");
+        touch(&root.join("secret.py"), "s");
+        touch(&root.join("visible.py"), "v");
+        let files = walk_files(root, &exts(), &[]);
+        assert_eq!(files.len(), 1);
+        assert!(files[0].ends_with("visible.py"));
+    }
+
+    #[test]
+    fn trouveignore_wins_over_sembleignore() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        touch(&root.join(".sembleignore"), "special.py\n");
+        touch(&root.join(".trouveignore"), "!special.py\n");
+        touch(&root.join("special.py"), "s");
+        let files = walk_files(root, &exts(), &[]);
+        assert_eq!(files.len(), 1);
+        assert!(files[0].ends_with("special.py"));
     }
 
     #[test]

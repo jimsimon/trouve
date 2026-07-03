@@ -1,6 +1,7 @@
 //! Small helpers (port of `semble/utils.py`).
 
-use std::sync::OnceLock;
+use std::collections::HashSet;
+use std::sync::{Mutex, OnceLock};
 
 use regex::Regex;
 use serde_json::{json, Value};
@@ -8,6 +9,37 @@ use serde_json::{json, Value};
 use crate::types::{Chunk, SearchResult};
 
 pub const DEFAULT_MODEL_NAME: &str = "minishlab/potion-code-16M";
+
+/// Warn (once per `deprecated` name, on stderr) that a semble-era name is
+/// deprecated and which trouve name replaces it.
+pub fn warn_deprecated(deprecated: &str, replacement: &str) {
+    static WARNED: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+    let mut warned = WARNED.get_or_init(Default::default).lock().unwrap();
+    if warned.insert(deprecated.to_string()) {
+        eprintln!(
+            "warning: {deprecated} is deprecated and will be removed in a future release; \
+             use {replacement} instead"
+        );
+    }
+}
+
+/// Read an environment variable, falling back to its deprecated semble-era
+/// name. The trouve name wins when both are set; using the semble name warns
+/// once. Returns the name that supplied the value alongside the value.
+pub fn env_var_compat(
+    trouve_name: &'static str,
+    semble_name: &'static str,
+) -> Option<(&'static str, String)> {
+    if let Ok(v) = std::env::var(trouve_name) {
+        return Some((trouve_name, v));
+    }
+    let v = std::env::var(semble_name).ok()?;
+    warn_deprecated(
+        &format!("the {semble_name} environment variable"),
+        trouve_name,
+    );
+    Some((semble_name, v))
+}
 
 static GIT_URL_SCHEMES: &[&str] = &[
     "https://",
@@ -44,9 +76,12 @@ pub fn is_git_url(path: &str) -> bool {
     GIT_URL_SCHEMES.iter().any(|s| path.starts_with(s)) || scp_git_url_re().is_match(path)
 }
 
-/// Resolve the model name, respecting `TROUVE_MODEL_NAME`.
+/// Resolve the model name, respecting `TROUVE_MODEL_NAME` (with a deprecated
+/// `SEMBLE_MODEL_NAME` fallback).
 pub fn resolve_model_name() -> String {
-    std::env::var("TROUVE_MODEL_NAME").unwrap_or_else(|_| DEFAULT_MODEL_NAME.to_string())
+    env_var_compat("TROUVE_MODEL_NAME", "SEMBLE_MODEL_NAME")
+        .map(|(_, v)| v)
+        .unwrap_or_else(|| DEFAULT_MODEL_NAME.to_string())
 }
 
 /// Return the chunk containing `line` in `file_path`, or None.
@@ -104,6 +139,27 @@ pub fn format_results(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn env_var_compat_prefers_trouve_name() {
+        // Unique names so parallel tests never race on the same variables.
+        std::env::set_var("TROUVE_COMPAT_TEST_A", "new");
+        std::env::set_var("SEMBLE_COMPAT_TEST_A", "old");
+        assert_eq!(
+            env_var_compat("TROUVE_COMPAT_TEST_A", "SEMBLE_COMPAT_TEST_A"),
+            Some(("TROUVE_COMPAT_TEST_A", "new".to_string()))
+        );
+        std::env::remove_var("TROUVE_COMPAT_TEST_A");
+        assert_eq!(
+            env_var_compat("TROUVE_COMPAT_TEST_A", "SEMBLE_COMPAT_TEST_A"),
+            Some(("SEMBLE_COMPAT_TEST_A", "old".to_string()))
+        );
+        std::env::remove_var("SEMBLE_COMPAT_TEST_A");
+        assert_eq!(
+            env_var_compat("TROUVE_COMPAT_TEST_A", "SEMBLE_COMPAT_TEST_A"),
+            None
+        );
+    }
 
     #[test]
     fn detects_git_urls() {
