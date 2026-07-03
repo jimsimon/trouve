@@ -10,6 +10,8 @@
 // Requires the `trouve` binary on PATH (cargo install trouve).
 import { tool, type Plugin } from "@opencode-ai/plugin"
 
+import pkg from "../package.json"
+
 const PROTOCOL_VERSION = "2024-11-05"
 const CONTENT_TYPES = ["code", "docs", "config", "all"] as const
 type ContentType = (typeof CONTENT_TYPES)[number]
@@ -63,7 +65,7 @@ class TrouveServer {
     await this.request("initialize", {
       protocolVersion: PROTOCOL_VERSION,
       capabilities: {},
-      clientInfo: { name: "opencode-trouve", version: "0.1.0" },
+      clientInfo: { name: pkg.name, version: pkg.version },
     })
     this.write({ jsonrpc: "2.0", method: "notifications/initialized" })
   }
