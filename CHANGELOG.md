@@ -4,6 +4,17 @@ All notable changes to this project are documented in this file. The format
 is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this
 project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **OpenCode plugin** (`plugins/opencode`, npm package `opencode-trouve`):
+  exposes `trouve_search` and `trouve_find_related` as native OpenCode tools
+  backed by a single persistent `trouve` server process per session,
+  preserving the server's in-process index cache across calls (including
+  remote git URLs). Configured via `"plugin": ["opencode-trouve"]`; a
+  `content` plugin option selects what the server indexes.
+
 ## [1.0.0] - 2026-07-03
 
 First stable release. trouve is a Rust port of

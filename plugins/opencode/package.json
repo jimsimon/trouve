@@ -1,0 +1,35 @@
+{
+  "name": "opencode-trouve",
+  "version": "0.1.0",
+  "description": "OpenCode plugin exposing trouve code search as native tools, backed by a persistent trouve server process.",
+  "type": "module",
+  "exports": {
+    ".": "./src/plugin.ts"
+  },
+  "files": [
+    "src"
+  ],
+  "keywords": [
+    "opencode",
+    "opencode-plugin",
+    "code-search",
+    "semantic-search",
+    "trouve"
+  ],
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/jimsimon/trouve.git",
+    "directory": "plugins/opencode"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@opencode-ai/plugin": "^1.17.13"
+  },
+  "devDependencies": {
+    "@types/bun": "^1.2.0",
+    "typescript": "^5.6.0"
+  }
+}

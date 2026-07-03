@@ -1,0 +1,231 @@
+// OpenCode plugin exposing trouve code search as native tools.
+//
+// Unlike the standalone tool file that `trouve install` writes (one CLI
+// process per call), this plugin keeps a single `trouve` server process
+// alive for the whole OpenCode session and speaks its newline-delimited
+// JSON-RPC protocol directly. That preserves the server's in-process index
+// cache: repeat queries — including against remote git URLs — skip index
+// reload entirely.
+//
+// Requires the `trouve` binary on PATH (cargo install trouve).
+import { tool, type Plugin } from "@opencode-ai/plugin"
+
+const PROTOCOL_VERSION = "2024-11-05"
+const CONTENT_TYPES = ["code", "docs", "config", "all"] as const
+type ContentType = (typeof CONTENT_TYPES)[number]
+
+interface Pending {
+  resolve(value: unknown): void
+  reject(error: Error): void
+}
+
+/** Minimal client for trouve's newline-delimited JSON-RPC stdio server. */
+class TrouveServer {
+  private proc: ReturnType<typeof Bun.spawn> | null = null
+  private pending = new Map<number, Pending>()
+  private nextId = 1
+  private starting: Promise<void> | null = null
+
+  constructor(private content: ContentType[]) {}
+
+  async callTool(name: string, args: Record<string, unknown>): Promise<string> {
+    await this.ensureStarted()
+    const result = (await this.request("tools/call", { name, arguments: args })) as {
+      content?: Array<{ type: string; text?: string }>
+    }
+    const text = result.content
+      ?.map((part) => (part.type === "text" ? (part.text ?? "") : ""))
+      .join("")
+    return text?.trim() || "trouve returned no output."
+  }
+
+  private ensureStarted(): Promise<void> {
+    if (this.proc) return Promise.resolve()
+    this.starting ??= this.start().finally(() => {
+      this.starting = null
+    })
+    return this.starting
+  }
+
+  private async start(): Promise<void> {
+    const argv = ["trouve"]
+    if (!(this.content.length === 1 && this.content[0] === "code")) {
+      argv.push("--content", ...this.content)
+    }
+    const proc = Bun.spawn(argv, {
+      stdin: "pipe",
+      stdout: "pipe",
+      stderr: "ignore",
+    })
+    this.proc = proc
+    proc.exited.then(() => this.onExit())
+    this.readLoop(proc.stdout).catch(() => this.onExit())
+    await this.request("initialize", {
+      protocolVersion: PROTOCOL_VERSION,
+      capabilities: {},
+      clientInfo: { name: "opencode-trouve", version: "0.1.0" },
+    })
+    this.write({ jsonrpc: "2.0", method: "notifications/initialized" })
+  }
+
+  private onExit(): void {
+    this.proc = null
+    const pending = [...this.pending.values()]
+    this.pending.clear()
+    for (const p of pending) p.reject(new Error("trouve server exited unexpectedly"))
+  }
+
+  private async readLoop(stdout: ReadableStream<Uint8Array>): Promise<void> {
+    const decoder = new TextDecoder()
+    let buffer = ""
+    for await (const chunk of stdout) {
+      buffer += decoder.decode(chunk, { stream: true })
+      let newline: number
+      while ((newline = buffer.indexOf("\n")) >= 0) {
+        const line = buffer.slice(0, newline).trim()
+        buffer = buffer.slice(newline + 1)
+        if (line) this.onMessage(line)
+      }
+    }
+  }
+
+  private onMessage(line: string): void {
+    let message: { id?: number; result?: unknown; error?: { message?: string } }
+    try {
+      message = JSON.parse(line)
+    } catch {
+      return
+    }
+    if (typeof message.id !== "number") return
+    const pending = this.pending.get(message.id)
+    if (!pending) return
+    this.pending.delete(message.id)
+    if (message.error) {
+      pending.reject(new Error(message.error.message ?? "trouve server error"))
+    } else {
+      pending.resolve(message.result)
+    }
+  }
+
+  private request(method: string, params: unknown): Promise<unknown> {
+    const id = this.nextId++
+    const promise = new Promise((resolve, reject) => {
+      this.pending.set(id, { resolve, reject })
+    })
+    this.write({ jsonrpc: "2.0", id, method, params })
+    return promise
+  }
+
+  private write(message: unknown): void {
+    const stdin = this.proc?.stdin as { write(data: string): void; flush(): void } | undefined
+    if (!stdin) throw new Error("trouve server is not running")
+    stdin.write(JSON.stringify(message) + "\n")
+    stdin.flush()
+  }
+}
+
+function errorText(error: unknown): string {
+  const message = error instanceof Error ? error.message : String(error)
+  if (/ENOENT|executable|not.*found/i.test(message)) {
+    return (
+      "trouve failed: the `trouve` binary was not found on PATH. " +
+      "Install it with `cargo install trouve` or download a release binary from GitHub."
+    )
+  }
+  return `trouve failed: ${message}`
+}
+
+const REPO = tool.schema
+  .string()
+  .optional()
+  .describe(
+    "Local directory path or https:// git URL to search. Defaults to the project root. " +
+      "The index is built on first use and cached; updates are incremental.",
+  )
+
+const TOP_K = tool.schema
+  .number()
+  .int()
+  .min(1)
+  .optional()
+  .describe("Number of results to return (default 5).")
+
+const MAX_SNIPPET_LINES = tool.schema
+  .number()
+  .int()
+  .min(0)
+  .optional()
+  .describe(
+    "Lines of source per result. Default (10): signature + first body lines, enough to " +
+      "confirm the location. 0: file path and line range only.",
+  )
+
+/**
+ * Plugin options (set in opencode config as `["opencode-trouve", {...}]`):
+ * - `content`: what the server indexes — "code" (default), "docs",
+ *   "config", "all", or an array of those.
+ */
+export const TrouvePlugin: Plugin = async (_input, options) => {
+  const requested = (options as { content?: string | string[] } | undefined)?.content
+  const content = (Array.isArray(requested) ? requested : requested ? [requested] : ["code"])
+    .filter((c): c is ContentType => (CONTENT_TYPES as readonly string[]).includes(c))
+  const server = new TrouveServer(content.length ? content : ["code"])
+
+  return {
+    tool: {
+      trouve_search: tool({
+        description:
+          "Search a codebase once with a focused query describing what the code does or its " +
+          "name. Write queries using function/class names or behaviour descriptions, not " +
+          "error messages. Returns file paths and line numbers — navigate directly there, " +
+          "do not grep for the same content again.",
+        args: {
+          query: tool.schema.string().describe("Natural language or code query."),
+          repo: REPO,
+          top_k: TOP_K,
+          max_snippet_lines: MAX_SNIPPET_LINES,
+        },
+        async execute(args, context) {
+          try {
+            return await server.callTool("search", {
+              query: args.query,
+              repo: args.repo ?? context.worktree,
+              top_k: args.top_k ?? 5,
+              max_snippet_lines: args.max_snippet_lines ?? 10,
+            })
+          } catch (error) {
+            return errorText(error)
+          }
+        },
+      }),
+      trouve_find_related: tool({
+        description:
+          "Find code similar to a known location. Useful for discovering all implementations " +
+          "of an interface, all callers of a function, or all tests for a class. Pass " +
+          "`file_path` and `line` from a prior trouve_search result.",
+        args: {
+          file_path: tool.schema
+            .string()
+            .describe("Path to the file as shown in a search result."),
+          line: tool.schema.number().int().min(1).describe("Line number (1-indexed)."),
+          repo: REPO,
+          top_k: TOP_K,
+          max_snippet_lines: MAX_SNIPPET_LINES,
+        },
+        async execute(args, context) {
+          try {
+            return await server.callTool("find_related", {
+              file_path: args.file_path,
+              line: args.line,
+              repo: args.repo ?? context.worktree,
+              top_k: args.top_k ?? 5,
+              max_snippet_lines: args.max_snippet_lines ?? 10,
+            })
+          } catch (error) {
+            return errorText(error)
+          }
+        },
+      }),
+    },
+  }
+}
