@@ -8,6 +8,21 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **`.trouveignore` files**: exclude files from indexing without git-ignoring
+  them, replacing upstream's `.sembleignore` (same syntax, same per-directory
+  inheritance; `.trouveignore` wins where patterns conflict).
+- **`.semble/` directories** are now skipped during walks, alongside
+  `.trouve/`, matching upstream's default ignore list.
+
+### Deprecated
+
+- **`.sembleignore` files**: still honoured, but log a warning and will be
+  removed in a future release. Rename to `.trouveignore`.
+- **`SEMBLE_CACHE_LOCATION`, `SEMBLE_MODEL_NAME`, `SEMBLE_CLONE_TIMEOUT`**:
+  now honoured as fallbacks when the `TROUVE_*` equivalent is unset, but log
+  a warning and will be removed in a future release. Use
+  `TROUVE_CACHE_LOCATION`, `TROUVE_MODEL_NAME`, and `TROUVE_CLONE_TIMEOUT`.
+
 - **23 new tree-sitter grammars** (~50 languages total): CMake, D, Dart, Elm,
   ERB/EJS embedded templates, Erlang, Fortran, Gleam, GraphQL, Groovy,
   HCL/Terraform, Julia, Make, Nix, Objective-C, Perl, PowerShell, Protocol

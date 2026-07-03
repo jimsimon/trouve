@@ -77,6 +77,14 @@ trouve                           # run as an MCP stdio server
 `--content` selects what to index: `code` (default), `docs`, `config`, or
 `all`.
 
+## Ignoring files
+
+`.gitignore` files are honoured per directory. To exclude files from indexing
+only (without git-ignoring them), add patterns to a `.trouveignore` file —
+same syntax, same per-directory inheritance. Upstream's `.sembleignore` is
+still honoured for backwards compatibility, but is deprecated and will be
+removed in a future release; rename it to `.trouveignore`.
+
 ## Chunking
 
 Files are split into chunks of ~750 bytes. How the boundaries are chosen
@@ -116,6 +124,11 @@ two-line change (a dependency in `Cargo.toml` and a match arm in
 Resolved in order: `TROUVE_CACHE_LOCATION` (absolute path), then the platform
 cache dir (`~/.cache/trouve` on Linux). Set `TROUVE_MODEL_NAME` to override
 the embedding model.
+
+The upstream semble environment variables (`SEMBLE_CACHE_LOCATION`,
+`SEMBLE_MODEL_NAME`, `SEMBLE_CLONE_TIMEOUT`) are still honoured as fallbacks
+when the `TROUVE_*` equivalent is unset, but are deprecated and will be
+removed in a future release.
 
 The store garbage-collects itself: after a snapshot write (at most once per
 day per store), entries not referenced by any kept snapshot are deleted, with

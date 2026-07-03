@@ -21,7 +21,8 @@ use serde::{Deserialize, Serialize};
 pub const STORE_VERSION: u32 = 3;
 
 /// Resolve the trouve cache folder, respecting `TROUVE_CACHE_LOCATION`
-/// (highest precedence) and platform conventions (XDG on Linux).
+/// (highest precedence, with a deprecated `SEMBLE_CACHE_LOCATION` fallback)
+/// and platform conventions (XDG on Linux).
 pub fn resolve_cache_folder() -> PathBuf {
     let dir = user_cache_override().unwrap_or_else(|| {
         dirs::cache_dir()
@@ -33,12 +34,13 @@ pub fn resolve_cache_folder() -> PathBuf {
 }
 
 fn user_cache_override() -> Option<PathBuf> {
-    let loc = std::env::var("TROUVE_CACHE_LOCATION").ok()?;
+    let (name, loc) =
+        crate::utils::env_var_compat("TROUVE_CACHE_LOCATION", "SEMBLE_CACHE_LOCATION")?;
     let p = PathBuf::from(loc);
     if p.is_absolute() {
         Some(p)
     } else {
-        eprintln!("warning: TROUVE_CACHE_LOCATION is not an absolute path; ignoring");
+        eprintln!("warning: {name} is not an absolute path; ignoring");
         None
     }
 }

@@ -141,7 +141,9 @@ cannot re-validate cheaply, so it caches more conservatively.
 - Hybrid fusion: same RRF (k=60), same alpha resolution.
 - Reranking: same boosts and penalties, ported constant-for-constant.
 - CLI/MCP surface, cache-location resolution, savings tracking, agent
-  installer flow.
+  installer flow. (User-facing names are trouve's own — `.trouveignore`,
+  `TROUVE_CACHE_LOCATION`, `TROUVE_MODEL_NAME`, `TROUVE_CLONE_TIMEOUT` — with
+  the semble equivalents still honoured as deprecated fallbacks.)
 - CPU-only execution (static embeddings are table lookups + mean pooling;
   there is no neural forward pass to put on a GPU).
 
