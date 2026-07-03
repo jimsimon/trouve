@@ -178,7 +178,7 @@ pub struct SweepReport {
 impl ChunkStore {
     /// Mark-and-sweep GC: delete entries not referenced by any kept snapshot.
     ///
-    /// Runs at most once per [`GC_INTERVAL`] per store; call after a snapshot
+    /// Runs at most once per `GC_INTERVAL` per store; call after a snapshot
     /// save so the current manifest is always in the mark set. Returns `None`
     /// when throttled.
     pub fn maybe_gc(&self) -> Option<SweepReport> {
