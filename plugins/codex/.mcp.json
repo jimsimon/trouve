@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "trouve": {
+      "command": "trouve",
+      "args": []
+    }
+  }
+}

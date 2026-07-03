@@ -77,6 +77,15 @@ trouve                           # run as an MCP stdio server
 `--content` selects what to index: `code` (default), `docs`, `config`, or
 `all`.
 
+For [Codex](https://developers.openai.com/codex) there is also a
+[plugin](plugins/codex) bundling the MCP server and a workflow skill,
+installable straight from this repository:
+
+```bash
+codex plugin marketplace add 'https://github.com/jimsimon/trouve.git' --ref main
+codex plugin install trouve --source trouve
+```
+
 ## Chunking
 
 Tree-sitter grammars are compiled in for ~28 mainstream languages (Rust,

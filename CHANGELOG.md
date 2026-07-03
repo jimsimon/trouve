@@ -4,6 +4,17 @@ All notable changes to this project are documented in this file. The format
 is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this
 project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **Codex plugin** (`plugins/codex`): bundles the trouve MCP server and a
+  `trouve-search` workflow skill as one installable unit, distributed via a
+  repo marketplace catalog at `.agents/plugins/marketplace.json`
+  (`codex plugin marketplace add` this repository, then
+  `codex plugin install trouve`). The manifest passes the official
+  plugin-creator validator.
+
 ## [1.0.0] - 2026-07-03
 
 First stable release. trouve is a Rust port of
