@@ -16,10 +16,13 @@ import sys
 
 def criterion_entries(root: pathlib.Path) -> list[dict]:
     out = []
-    for estimates in sorted(root.glob("*/new/estimates.json")):
-        name = estimates.parent.parent.name
-        if name == "report":
+    # Recursive: grouped/parameterized criterion IDs nest additional
+    # directories (group/case/new/estimates.json).
+    for estimates in sorted(root.glob("**/new/estimates.json")):
+        rel = estimates.parent.parent.relative_to(root)
+        if "report" in rel.parts:
             continue
+        name = "/".join(rel.parts)
         data = json.loads(estimates.read_text())
         median = data["median"]["point_estimate"]  # nanoseconds
         stderr = data["median"]["standard_error"]
@@ -63,6 +66,13 @@ def main() -> int:
         entries.extend(hyperfine_entries(args.hyperfine))
     if not entries:
         print("no benchmark results found", file=sys.stderr)
+        return 1
+    # github-action-benchmark keys history series by name; duplicates would
+    # silently collapse into one series, so fail loudly instead.
+    names = [e["name"] for e in entries]
+    duplicates = {n for n in names if names.count(n) > 1}
+    if duplicates:
+        print(f"duplicate benchmark names: {sorted(duplicates)}", file=sys.stderr)
         return 1
     json.dump(entries, sys.stdout, indent=2)
     print()

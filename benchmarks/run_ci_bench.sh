@@ -17,7 +17,6 @@ OUT="${1:-benchmarks/results/ci}"
 RUST_BIN="$PWD/target/release/trouve"
 RUNS="${RUNS:-5}"
 QUERY="handle http request routing"
-ARGS="-k 5 --max-snippet-lines 0"
 REPO="benchmarks/repos/flask-ci"
 
 command -v hyperfine >/dev/null || { echo "hyperfine is required"; exit 1; }
@@ -36,25 +35,33 @@ rm -rf "$NOGIT/.git"
 
 CACHE="$WORK/cache"
 NOGIT_CACHE="$WORK/cache-nogit"
-CMD="TROUVE_CACHE_LOCATION='$CACHE' '$RUST_BIN' search '$QUERY' '$REPO' $ARGS > /dev/null"
-NOGIT_CMD="TROUVE_CACHE_LOCATION='$NOGIT_CACHE' '$RUST_BIN' search '$QUERY' '$NOGIT' $ARGS > /dev/null"
 TOUCH_FILE="$REPO/src/flask/app.py"
+
+# Command strings for hyperfine (which runs them through a shell), with every
+# interpolated value shell-escaped. Warm-up invocations outside hyperfine
+# call the binary directly instead.
+q() { printf '%q' "$1"; }
+CMD="TROUVE_CACHE_LOCATION=$(q "$CACHE") $(q "$RUST_BIN") search $(q "$QUERY") $(q "$REPO") -k 5 --max-snippet-lines 0 > /dev/null"
+NOGIT_CMD="TROUVE_CACHE_LOCATION=$(q "$NOGIT_CACHE") $(q "$RUST_BIN") search $(q "$QUERY") $(q "$NOGIT") -k 5 --max-snippet-lines 0 > /dev/null"
+run_search() { # <cache-dir> <repo-root>
+    TROUVE_CACHE_LOCATION="$1" "$RUST_BIN" search "$QUERY" "$2" -k 5 --max-snippet-lines 0 > /dev/null
+}
 
 mkdir -p "$OUT"
 
 hyperfine --runs "$RUNS" --export-json "$OUT/cold.json" \
-    --prepare "rm -rf '$CACHE'" -n "cold index + query" "$CMD"
+    --prepare "rm -rf $(q "$CACHE")" -n "cold index + query" "$CMD"
 
-eval "$CMD"
+run_search "$CACHE" "$REPO"
 hyperfine --warmup 1 --runs "$((RUNS * 2))" --export-json "$OUT/warm.json" \
     -n "warm query" "$CMD"
 
 hyperfine --runs "$RUNS" --export-json "$OUT/incremental.json" \
-    --prepare "printf '\n# bench %s\n' \$RANDOM >> '$TOUCH_FILE'" \
+    --prepare "printf '\n# bench %s\n' \$RANDOM >> $(q "$TOUCH_FILE")" \
     -n "incremental (1 file modified)" "$CMD"
 git -C "$REPO" checkout --quiet -- .
 
-eval "$NOGIT_CMD"
+run_search "$NOGIT_CACHE" "$NOGIT"
 hyperfine --warmup 1 --runs "$((RUNS * 2))" --export-json "$OUT/nogit-warm.json" \
     -n "non-git warm query" "$NOGIT_CMD"
 
