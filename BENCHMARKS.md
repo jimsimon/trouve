@@ -15,10 +15,10 @@ startup and model load.
 
 | Scenario | Rust | Python | Speedup |
 | --- | --- | --- | --- |
-| Cold index + query | 328 ms ± 8 ms | 1.34 s ± 0.02 s | 4.1x |
-| Warm query (cached) | 122 ms ± 6 ms | 717 ms ± 33 ms | 5.9x |
-| Incremental (1 file touched) | 150 ms ± 14 ms | 1.24 s ± 0.08 s | 8.3x |
-| Branch switch (3.1.0 <-> 3.0.0) | 150 ms ± 11 ms | 1.28 s ± 0.09 s | 8.6x |
+| Cold index + query | 328 ms ± 10 ms | 1.38 s ± 0.03 s | 4.2x |
+| Warm query (cached) | 126 ms ± 9 ms | 703 ms ± 31 ms | 5.6x |
+| Incremental (1 file touched) | 135 ms ± 6 ms | 1.31 s ± 0.00 s | 9.7x |
+| Branch switch (3.1.0 <-> 3.0.0) | 139 ms ± 3 ms | 1.28 s ± 0.02 s | 9.2x |
 
 On a small repo Python's incremental and branch-switch times are dominated by a
 full re-index (its cache is all-or-nothing), while the Rust store recomputes
@@ -30,24 +30,35 @@ Single timed runs (the effect sizes dwarf run-to-run noise):
 
 | Scenario | Rust | Python | Speedup |
 | --- | --- | --- | --- |
-| Cold index + query | 17.9 s | 2 m 59 s | 10.0x |
-| Warm query (snapshot mmap) | 0.58 s | 7.2 s | 12.4x |
-| Incremental (1 file touched) | 8.6 s | 3 m 2 s | 21.2x |
+| Cold index + query | 9.9 s | 2 m 59 s | 18.1x |
+| Warm query (snapshot mmap) | 0.54 s | 7.2 s | 13.3x |
+| Incremental (1 file touched) | 0.87 s | 3 m 2 s | 209x |
 | Worktree first query (flask, other branch) | 0.34 s | n/a (full rebuild) | — |
 
 This is the headline result: touching a single file in a 30k-file repo costs
-Python a full ~3-minute rebuild, while Rust recomputes one file and reassembles
-the index in under 9 seconds. The same content-addressed store is shared across
-branches and worktrees, so a new worktree of an already-indexed branch is a pure
-cache hit.
+Python a full ~3-minute rebuild, while Rust patches the previous snapshot in
+under a second — the cost is proportional to the edit, not the repository.
+The same content-addressed store is shared across branches and worktrees, so
+a new worktree of an already-indexed branch is a pure cache hit.
 
 After every assembly the finished index is written to a single snapshot file
-keyed by a hash of the manifest. A warm query memory-maps that snapshot —
-embeddings and BM25 postings are used zero-copy straight out of the mapping —
-so it skips the ~200k per-file store reads and index rebuild entirely: 0.58 s
-end-to-end on kubernetes, most of which is chunk-table materialization and
-model load. The MCP server additionally keeps hot indexes in an in-process
-LRU, so repeated agent queries skip even that.
+keyed by a hash of the manifest, which enables two fast paths:
+
+- **Warm query** (nothing changed): the snapshot is memory-mapped and
+  embeddings/BM25 postings are used zero-copy straight out of the mapping —
+  0.54 s end-to-end on kubernetes, most of it model load and `git status`.
+- **Incremental** (a few files changed): the newest snapshot is diffed
+  against the new manifest; unchanged rows are spliced out of the old
+  mapping and only changed files are re-chunked/re-embedded. BM25 postings
+  store raw term frequencies (corpus statistics are applied at query time),
+  so the patched index is exactly what a full rebuild would produce.
+
+The MCP server additionally keeps hot indexes in an in-process LRU, so
+repeated agent queries skip even the snapshot load.
+
+Cold-path phase breakdown on kubernetes (`SEMBLE_TIMING=1`): embedding 4.6 s,
+chunk+tokenize 2.3 s, BM25 build 0.9 s, everything else under 0.2 s each —
+i.e. the remaining cold cost is essentially model inference.
 
 ## Retrieval quality (NDCG@10)
 

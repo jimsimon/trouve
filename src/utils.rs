@@ -24,6 +24,22 @@ fn scp_git_url_re() -> &'static Regex {
 }
 
 /// Return true if `path` looks like a remote git URL rather than a local path.
+/// Run `f`, printing its wall time to stderr when `SEMBLE_TIMING` is set.
+pub fn timed<T>(phase: &str, f: impl FnOnce() -> T) -> T {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    let enabled = *ENABLED.get_or_init(|| std::env::var_os("SEMBLE_TIMING").is_some());
+    if !enabled {
+        return f();
+    }
+    let start = std::time::Instant::now();
+    let out = f();
+    eprintln!(
+        "[timing] {phase}: {:.1} ms",
+        start.elapsed().as_secs_f64() * 1e3
+    );
+    out
+}
+
 pub fn is_git_url(path: &str) -> bool {
     GIT_URL_SCHEMES.iter().any(|s| path.starts_with(s)) || scp_git_url_re().is_match(path)
 }

@@ -30,16 +30,17 @@ same code-tuned reranking heuristics (symbol-definition boosts, file-stem
 boosts, multi-chunk coherence, test/example/compat path penalties, per-file
 saturation decay).
 
-Assembled indexes are also persisted as memory-mapped snapshots, so a warm
-query loads embeddings and BM25 postings zero-copy instead of re-reading the
-per-file store.
+Assembled indexes are also persisted as memory-mapped snapshots: a warm query
+loads embeddings and BM25 postings zero-copy, and an incremental build patches
+the previous snapshot — splicing unchanged rows out of the old mapping — so
+its cost is proportional to the edit, not the repository.
 
-Measured results ([BENCHMARKS.md](BENCHMARKS.md)): ~10x faster cold indexing,
-and on kubernetes/kubernetes (30k files) an incremental reindex after touching
-one file drops from ~3 minutes to under 9 seconds (21x), while a fully warm
-query drops from ~7 s to 0.58 s (12x). Retrieval quality is identical — mean
-NDCG@10 matches upstream to within 0.0002 on the upstream annotated benchmark,
-with identical chunk boundaries and BM25 scores.
+Measured results ([BENCHMARKS.md](BENCHMARKS.md)) on kubernetes/kubernetes
+(30k files): cold indexing drops from ~3 minutes to 9.9 s (18x), an
+incremental reindex after touching one file from ~3 minutes to 0.87 s (200x+),
+and a fully warm query from ~7 s to 0.54 s (13x). Retrieval quality is
+identical — mean NDCG@10 matches upstream to within 0.0002 on the upstream
+annotated benchmark, with identical chunk boundaries and BM25 scores.
 
 ## Install
 

@@ -132,50 +132,64 @@ impl SembleIndex {
         } else {
             content.to_vec()
         };
-        let model = EmbeddingModel::load(model_id)?;
+        let model = crate::utils::timed("model load", || EmbeddingModel::load(model_id))?;
         let store = ChunkStore::open(&store_identity)?;
         let extensions = get_extensions(&content);
-        let manifest = build_manifest(root, repo_identity, &extensions, &store)?;
+        let manifest = crate::utils::timed("manifest", || {
+            build_manifest(root, repo_identity, &extensions, &store)
+        })?;
 
-        // Fast path: identical manifest -> mmap the assembled snapshot and
+        // All paths assemble in rel_path order; sort the manifest up front.
+        let mut manifest = manifest;
+        manifest.sort_by(|a, b| a.rel_path.cmp(&b.rel_path));
+
+        // Fast path 1: identical manifest -> mmap the assembled snapshot and
         // skip per-file store reads and index reconstruction entirely.
         let manifest_hash = manifest_digest(&manifest, &content, &model.model_id);
         let snapshot_dir = store.root().join("snapshots");
+        let content_strs: Vec<String> = content.iter().map(|c| c.as_str().to_string()).collect();
         if let Some(snap) = snapshot::load(&snapshot_dir, &manifest_hash, &model.model_id) {
-            let (file_mapping, language_mapping) = populate_mappings(&snap.chunks);
-            let mut file_sizes: HashMap<String, usize> = HashMap::new();
-            for chunk in &snap.chunks {
-                *file_sizes.entry(chunk.file_path.clone()).or_insert(0) += chunk.content.len();
-            }
-            let build_stats = BuildStats {
+            let stats = BuildStats {
                 files_total: manifest.len(),
                 files_from_store: manifest.len(),
                 files_computed: 0,
                 chunks_total: snap.chunks.len(),
             };
-            return Ok(SembleIndex {
-                model,
-                chunks: snap.chunks,
-                dense: snap.dense,
-                bm25: snap.bm25,
-                file_mapping,
-                language_mapping,
-                file_sizes,
-                content,
-                build_stats,
-            });
+            return Ok(Self::from_loaded(snap, model, content, stats));
+        }
+
+        // Fast path 2: patch the newest compatible snapshot. Only changed
+        // files pay for store reads or recomputation; everything else is
+        // spliced out of the old mapping.
+        if let Some(old) = snapshot::open_latest(&snapshot_dir, &model.model_id, &content_strs) {
+            // Incompatible or failed patches fall through to full assembly.
+            if let Ok(Some((snap, stats))) = Self::build_by_patching(
+                &old,
+                &manifest,
+                &model,
+                &store,
+                &snapshot_dir,
+                &manifest_hash,
+                &content_strs,
+            ) {
+                return Ok(Self::from_loaded(snap, model, content, stats));
+            }
         }
 
         // Phase 1: look up every manifest record in the store (parallel).
-        let keyed: Vec<(FileRecord, String, Option<FileEntry>)> = manifest
-            .into_par_iter()
-            .map(|record| {
-                let language = detect_language(Path::new(&record.rel_path));
-                let key = ChunkStore::entry_key(&record.content_key, language, &model.model_id);
-                let cached = store.get(&key);
-                (record, key, cached)
-            })
-            .collect();
+        let keyed: Vec<(FileRecord, String, Option<FileEntry>)> =
+            crate::utils::timed("store lookups", || {
+                std::mem::take(&mut manifest)
+                    .into_par_iter()
+                    .map(|record| {
+                        let language = detect_language(Path::new(&record.rel_path));
+                        let key =
+                            ChunkStore::entry_key(&record.content_key, language, &model.model_id);
+                        let cached = store.get(&key);
+                        (record, key, cached)
+                    })
+                    .collect()
+            });
 
         let files_total = keyed.len();
         let mut hits: Vec<(FileRecord, FileEntry)> = Vec::new();
@@ -189,111 +203,91 @@ impl SembleIndex {
         let files_from_store = hits.len();
         let files_computed = misses.len();
 
-        // Phase 2: parse + chunk + tokenize missing files in parallel.
-        struct Computed {
-            record: FileRecord,
-            key: String,
-            entry: FileEntry,
-            chunk_texts: Vec<String>,
+        // Phases 2+3: chunk, tokenize, embed, and persist missing files.
+        let computed = compute_file_entries(misses, &model, &store);
+
+        // Phase 4: assemble in manifest order (hits and computed interleaved
+        // back into a single sorted-by-path sequence). Per-file work runs in
+        // parallel and moves data out of the entries instead of cloning.
+        let assemble_start = std::time::Instant::now();
+        let mut per_file: Vec<(FileRecord, FileEntry)> = hits;
+        per_file.extend(
+            computed
+                .into_iter()
+                .map(|(record, _, entry)| (record, entry)),
+        );
+        per_file.sort_by(|a, b| a.0.rel_path.cmp(&b.0.rel_path));
+
+        let dim = per_file
+            .iter()
+            .map(|(_, e)| e.dim as usize)
+            .find(|d| *d > 0)
+            .unwrap_or(0);
+
+        struct FilePart {
+            rel_path: String,
+            content_key: String,
+            chunks: Vec<Chunk>,
+            vectors: Vec<f32>,
+            docs: Vec<Vec<String>>,
         }
-        let mut computed: Vec<Computed> = misses
+        let parts: Vec<FilePart> = per_file
             .into_par_iter()
-            .filter_map(|(record, key)| {
-                let bytes = std::fs::read(&record.abs_path).ok()?;
-                let entry = match file_status_for_bytes(&bytes) {
-                    FileStatus::Valid => {
-                        let source = String::from_utf8_lossy(&bytes);
-                        let language = detect_language(Path::new(&record.rel_path));
-                        let chunks = chunk_source(&source, &record.rel_path, language);
-                        let token_lists: Vec<Vec<String>> =
-                            chunks.iter().map(|c| tokenize(&c.content)).collect();
-                        FileEntry {
-                            chunks: chunks
-                                .iter()
-                                .map(|c| StoredChunk {
-                                    content: c.content.clone(),
-                                    start_line: c.start_line,
-                                    end_line: c.end_line,
-                                })
-                                .collect(),
-                            embeddings: Vec::new(),
-                            dim: 0,
-                            token_lists,
-                        }
+            .map(|(record, entry)| {
+                let language = detect_language(Path::new(&record.rel_path));
+                let path_tokens = path_enrichment_tokens(&record.rel_path);
+                let entry_dim = entry.dim as usize;
+                let n = entry.chunks.len();
+                let mut chunks = Vec::with_capacity(n);
+                let mut vectors = Vec::with_capacity(n * dim);
+                let mut docs = Vec::with_capacity(n);
+                let mut token_lists = entry.token_lists;
+                for (i, stored) in entry.chunks.into_iter().enumerate() {
+                    let mut doc = if i < token_lists.len() {
+                        std::mem::take(&mut token_lists[i])
+                    } else {
+                        tokenize(&stored.content)
+                    };
+                    doc.extend(path_tokens.iter().cloned());
+                    docs.push(doc);
+                    if entry_dim == dim && entry.embeddings.len() >= (i + 1) * dim {
+                        vectors.extend_from_slice(&entry.embeddings[i * dim..(i + 1) * dim]);
+                    } else {
+                        vectors.extend(std::iter::repeat_n(0.0, dim));
                     }
-                    // Too large or empty: store an empty entry so the file is
-                    // never re-read on subsequent builds.
-                    _ => FileEntry::default(),
-                };
-                let chunk_texts = entry.chunks.iter().map(|c| c.content.clone()).collect();
-                Some(Computed {
-                    record,
-                    key,
-                    entry,
-                    chunk_texts,
-                })
+                    chunks.push(Chunk {
+                        content: stored.content,
+                        file_path: record.rel_path.clone(),
+                        start_line: stored.start_line,
+                        end_line: stored.end_line,
+                        language: language.map(|l| l.to_string()),
+                    });
+                }
+                FilePart {
+                    rel_path: record.rel_path,
+                    content_key: record.content_key,
+                    chunks,
+                    vectors,
+                    docs,
+                }
             })
             .collect();
 
-        // Phase 3: embed all fresh chunks in large parallel batches.
-        let all_texts: Vec<String> = computed
-            .iter()
-            .flat_map(|c| c.chunk_texts.iter().cloned())
-            .collect();
-        let embeddings = model.embed_texts(&all_texts);
-        let dim = embeddings.first().map(|r| r.len()).unwrap_or(0);
-        let mut cursor = 0usize;
-        for item in computed.iter_mut() {
-            let n = item.chunk_texts.len();
-            let mut flat = Vec::with_capacity(n * dim);
-            for row in &embeddings[cursor..cursor + n] {
-                flat.extend_from_slice(row);
-            }
-            cursor += n;
-            item.entry.embeddings = flat;
-            item.entry.dim = dim as u32;
-            let _ = store.put(&item.key, &item.entry);
-        }
-
-        // Phase 4: assemble in manifest order (hits and computed interleaved
-        // back into a single sorted-by-path sequence).
-        let mut per_file: Vec<(FileRecord, FileEntry)> = hits;
-        per_file.extend(computed.into_iter().map(|c| (c.record, c.entry)));
-        per_file.sort_by(|a, b| a.0.rel_path.cmp(&b.0.rel_path));
-
-        let mut chunks: Vec<Chunk> = Vec::new();
-        let mut rows: Vec<Vec<f32>> = Vec::new();
-        let mut docs: Vec<Vec<String>> = Vec::new();
-        let mut file_sizes: HashMap<String, usize> = HashMap::new();
-        for (record, entry) in &per_file {
-            let language = detect_language(Path::new(&record.rel_path));
-            let dim = entry.dim as usize;
-            let path_tokens = path_enrichment_tokens(&record.rel_path);
-            let file_chars: usize = entry.chunks.iter().map(|c| c.content.len()).sum();
-            if !entry.chunks.is_empty() {
-                file_sizes.insert(record.rel_path.clone(), file_chars);
-            }
-            for (i, stored) in entry.chunks.iter().enumerate() {
-                chunks.push(Chunk {
-                    content: stored.content.clone(),
-                    file_path: record.rel_path.clone(),
-                    start_line: stored.start_line,
-                    end_line: stored.end_line,
-                    language: language.map(|l| l.to_string()),
-                });
-                if dim > 0 && entry.embeddings.len() >= (i + 1) * dim {
-                    rows.push(entry.embeddings[i * dim..(i + 1) * dim].to_vec());
-                } else {
-                    rows.push(vec![0.0; dim.max(1)]);
-                }
-                let mut doc = entry
-                    .token_lists
-                    .get(i)
-                    .cloned()
-                    .unwrap_or_else(|| tokenize(&stored.content));
-                doc.extend(path_tokens.iter().cloned());
-                docs.push(doc);
-            }
+        let total_chunks: usize = parts.iter().map(|p| p.chunks.len()).sum();
+        let mut chunks: Vec<Chunk> = Vec::with_capacity(total_chunks);
+        let mut vectors: Vec<f32> = Vec::with_capacity(total_chunks * dim);
+        let mut docs: Vec<Vec<String>> = Vec::with_capacity(total_chunks);
+        let mut manifest_entries: Vec<snapshot::ManifestEntry> = Vec::with_capacity(parts.len());
+        for part in parts {
+            manifest_entries.push(snapshot::ManifestEntry {
+                rel_path: part.rel_path,
+                content_key: part.content_key,
+                first_row: chunks.len() as u32,
+                n_rows: part.chunks.len() as u32,
+            });
+            chunks.extend(part.chunks);
+            vectors.extend_from_slice(&part.vectors);
+            docs.extend(part.docs);
         }
 
         if chunks.is_empty() {
@@ -301,37 +295,214 @@ impl SembleIndex {
         }
 
         let chunks_total = chunks.len();
-        let bm25 = Bm25Index::build(&docs);
-        let dense = DenseIndex::new(rows);
-        let (file_mapping, language_mapping) = populate_mappings(&chunks);
+        if std::env::var_os("SEMBLE_TIMING").is_some() {
+            eprintln!(
+                "[timing] assemble chunks: {:.1} ms",
+                assemble_start.elapsed().as_secs_f64() * 1e3
+            );
+        }
+        let bm25 = crate::utils::timed("bm25 build", || Bm25Index::build(&docs));
+        let dense = crate::utils::timed("dense build", || {
+            DenseIndex::from_unnormalized_flat(vectors, dim, chunks_total)
+        });
 
         // Persist the assembled index so the next identical-manifest build is
         // a single mmap. Best effort: a failed write only costs speed.
-        let _ = snapshot::save(
-            &snapshot_dir,
-            &manifest_hash,
-            &model.model_id,
-            &chunks,
-            &dense,
-            &bm25,
-        );
+        crate::utils::timed("snapshot write", || {
+            let _ = snapshot::save(
+                &snapshot_dir,
+                &manifest_hash,
+                &model.model_id,
+                &content_strs,
+                manifest_entries,
+                &chunks,
+                &dense,
+                &bm25,
+            );
+        });
 
-        Ok(SembleIndex {
+        let stats = BuildStats {
+            files_total,
+            files_from_store,
+            files_computed,
+            chunks_total,
+        };
+        Ok(Self::from_loaded(
+            snapshot::LoadedSnapshot {
+                chunks,
+                dense,
+                bm25,
+            },
             model,
-            chunks,
-            dense,
-            bm25,
+            content,
+            stats,
+        ))
+    }
+
+    /// Wrap loaded/assembled index pieces into a `SembleIndex`.
+    fn from_loaded(
+        snap: snapshot::LoadedSnapshot,
+        model: Arc<EmbeddingModel>,
+        content: Vec<ContentType>,
+        build_stats: BuildStats,
+    ) -> SembleIndex {
+        let (file_mapping, language_mapping) = populate_mappings(&snap.chunks);
+        let mut file_sizes: HashMap<String, usize> = HashMap::new();
+        for chunk in &snap.chunks {
+            *file_sizes.entry(chunk.file_path.clone()).or_insert(0) += chunk.content.len();
+        }
+        SembleIndex {
+            model,
+            chunks: snap.chunks,
+            dense: snap.dense,
+            bm25: snap.bm25,
             file_mapping,
             language_mapping,
             file_sizes,
             content,
-            build_stats: BuildStats {
-                files_total,
-                files_from_store,
-                files_computed,
-                chunks_total,
-            },
-        })
+            build_stats,
+        }
+    }
+
+    /// Build by patching the newest compatible snapshot: unchanged files are
+    /// spliced from the old mapping, changed files come from the store or are
+    /// recomputed. Returns `Ok(None)` when the snapshot is unusable (e.g.
+    /// embedding dimension mismatch with fresh entries).
+    #[allow(clippy::too_many_arguments)]
+    fn build_by_patching(
+        old: &snapshot::RawSnapshot,
+        manifest: &[FileRecord],
+        model: &Arc<EmbeddingModel>,
+        store: &ChunkStore,
+        snapshot_dir: &Path,
+        manifest_hash: &[u8; 32],
+        content_strs: &[String],
+    ) -> Result<Option<(snapshot::LoadedSnapshot, BuildStats)>> {
+        let old_by_path: HashMap<&str, &snapshot::ManifestEntry> = old
+            .manifest()
+            .iter()
+            .map(|e| (e.rel_path.as_str(), e))
+            .collect();
+
+        // Classify every file: unchanged (copy rows), or changed/new (needs
+        // a store entry, possibly computed).
+        enum Plan<'m> {
+            Copy(&'m FileRecord, u32, u32),
+            Need(&'m FileRecord, String),
+        }
+        let plans: Vec<Plan> = manifest
+            .iter()
+            .map(|record| {
+                if let Some(entry) = old_by_path.get(record.rel_path.as_str()) {
+                    if entry.content_key == record.content_key {
+                        return Plan::Copy(record, entry.first_row, entry.n_rows);
+                    }
+                }
+                let language = detect_language(Path::new(&record.rel_path));
+                let key = ChunkStore::entry_key(&record.content_key, language, &model.model_id);
+                Plan::Need(record, key)
+            })
+            .collect();
+
+        // Fetch store entries for changed files (parallel), compute the rest.
+        let fetched: Vec<(&FileRecord, String, Option<FileEntry>)> =
+            crate::utils::timed("patch store lookups", || {
+                plans
+                    .par_iter()
+                    .filter_map(|plan| match plan {
+                        Plan::Copy(..) => None,
+                        Plan::Need(record, key) => Some((*record, key.clone(), store.get(key))),
+                    })
+                    .collect()
+            });
+        let mut entries: HashMap<&str, FileEntry> = HashMap::new();
+        let mut misses: Vec<(FileRecord, String)> = Vec::new();
+        for (record, key, cached) in fetched {
+            match cached {
+                Some(entry) => {
+                    entries.insert(record.rel_path.as_str(), entry);
+                }
+                None => misses.push(((*record).clone(), key)),
+            }
+        }
+        let files_computed = misses.len();
+        for (record, _, entry) in compute_file_entries(misses, model, store) {
+            // Keys the borrowed map by the manifest's copy of the path.
+            let rel: &str = &manifest
+                .iter()
+                .find(|r| r.rel_path == record.rel_path)
+                .expect("computed record comes from the manifest")
+                .rel_path;
+            entries.insert(rel, entry);
+        }
+
+        // Fresh entries must match the snapshot's embedding dimension.
+        let dim = old.dim();
+        if entries
+            .values()
+            .any(|e| !e.chunks.is_empty() && e.dim as usize != dim)
+        {
+            return Ok(None);
+        }
+
+        let files: Vec<snapshot::PatchFile> = plans
+            .iter()
+            .map(|plan| match plan {
+                Plan::Copy(record, first_row, n_rows) => snapshot::PatchFile {
+                    rel_path: &record.rel_path,
+                    source: snapshot::PatchSource::Copy {
+                        first_row: *first_row,
+                        n_rows: *n_rows,
+                    },
+                },
+                Plan::Need(record, _) => snapshot::PatchFile {
+                    rel_path: &record.rel_path,
+                    source: snapshot::PatchSource::Fresh(&entries[record.rel_path.as_str()]),
+                },
+            })
+            .collect();
+
+        let snap = crate::utils::timed("patch splice", || snapshot::patch(old, &files))?;
+        if snap.chunks.is_empty() {
+            bail!("no chunks after patch");
+        }
+
+        // Persist the patched index for the next exact-match load.
+        let mut manifest_entries: Vec<snapshot::ManifestEntry> = Vec::with_capacity(manifest.len());
+        let mut row = 0u32;
+        for (plan, record) in plans.iter().zip(manifest) {
+            let n_rows = match plan {
+                Plan::Copy(_, _, n) => *n,
+                Plan::Need(..) => entries[record.rel_path.as_str()].chunks.len() as u32,
+            };
+            manifest_entries.push(snapshot::ManifestEntry {
+                rel_path: record.rel_path.clone(),
+                content_key: record.content_key.clone(),
+                first_row: row,
+                n_rows,
+            });
+            row += n_rows;
+        }
+        crate::utils::timed("snapshot write", || {
+            let _ = snapshot::save(
+                snapshot_dir,
+                manifest_hash,
+                &model.model_id,
+                content_strs,
+                manifest_entries,
+                &snap.chunks,
+                &snap.dense,
+                &snap.bm25,
+            );
+        });
+
+        let stats = BuildStats {
+            files_total: manifest.len(),
+            files_from_store: manifest.len() - files_computed,
+            files_computed,
+            chunks_total: snap.chunks.len(),
+        };
+        Ok(Some((snap, stats)))
     }
 
     /// Stats of the index.
@@ -450,6 +621,89 @@ impl SembleIndex {
     }
 }
 
+/// Chunk, tokenize, embed, and persist a batch of files that missed the
+/// store. Returns `(record, key, entry)` per readable file.
+fn compute_file_entries(
+    misses: Vec<(FileRecord, String)>,
+    model: &Arc<EmbeddingModel>,
+    store: &ChunkStore,
+) -> Vec<(FileRecord, String, FileEntry)> {
+    // Parse + chunk + tokenize in parallel.
+    let mut computed: Vec<(FileRecord, String, FileEntry, Vec<String>)> =
+        crate::utils::timed("chunk+tokenize", || {
+            misses
+                .into_par_iter()
+                .filter_map(|(record, key)| {
+                    let bytes = std::fs::read(&record.abs_path).ok()?;
+                    let entry = match file_status_for_bytes(&bytes) {
+                        FileStatus::Valid => {
+                            let source = String::from_utf8_lossy(&bytes);
+                            let language = detect_language(Path::new(&record.rel_path));
+                            let chunks = chunk_source(&source, &record.rel_path, language);
+                            let token_lists: Vec<Vec<String>> =
+                                chunks.iter().map(|c| tokenize(&c.content)).collect();
+                            FileEntry {
+                                chunks: chunks
+                                    .iter()
+                                    .map(|c| StoredChunk {
+                                        content: c.content.clone(),
+                                        start_line: c.start_line,
+                                        end_line: c.end_line,
+                                    })
+                                    .collect(),
+                                embeddings: Vec::new(),
+                                dim: 0,
+                                token_lists,
+                            }
+                        }
+                        // Too large or empty: store an empty entry so the
+                        // file is never re-read on subsequent builds.
+                        _ => FileEntry::default(),
+                    };
+                    let chunk_texts: Vec<String> =
+                        entry.chunks.iter().map(|c| c.content.clone()).collect();
+                    Some((record, key, entry, chunk_texts))
+                })
+                .collect()
+        });
+
+    // Embed all fresh chunks in large parallel batches.
+    let all_texts: Vec<String> = computed
+        .iter()
+        .flat_map(|(_, _, _, texts)| texts.iter().cloned())
+        .collect();
+    let embeddings = crate::utils::timed("embed", || model.embed_texts(&all_texts));
+    let dim = embeddings.first().map(|r| r.len()).unwrap_or(0);
+
+    // Scatter embedding rows back to entries and persist, in parallel.
+    let mut offsets: Vec<usize> = Vec::with_capacity(computed.len());
+    let mut cursor = 0usize;
+    for (_, _, _, texts) in &computed {
+        offsets.push(cursor);
+        cursor += texts.len();
+    }
+    crate::utils::timed("store writes", || {
+        computed
+            .par_iter_mut()
+            .zip(offsets)
+            .for_each(|((_, key, entry, texts), start)| {
+                let n = texts.len();
+                let mut flat = Vec::with_capacity(n * dim);
+                for row in &embeddings[start..start + n] {
+                    flat.extend_from_slice(row);
+                }
+                entry.embeddings = flat;
+                entry.dim = dim as u32;
+                let _ = store.put(key, entry);
+            });
+    });
+
+    computed
+        .into_iter()
+        .map(|(record, key, entry, _)| (record, key, entry))
+        .collect()
+}
+
 /// Digest of everything that determines the assembled index: the set of
 /// `(path, content key)` pairs plus every parameter baked into store entries.
 fn manifest_digest(manifest: &[FileRecord], content: &[ContentType], model_id: &str) -> [u8; 32] {
@@ -479,7 +733,7 @@ fn manifest_digest(manifest: &[FileRecord], content: &[ContentType], model_id: &
     *hasher.finalize().as_bytes()
 }
 
-fn path_enrichment_tokens(rel_path: &str) -> Vec<String> {
+pub(crate) fn path_enrichment_tokens(rel_path: &str) -> Vec<String> {
     let path = Path::new(rel_path);
     let stem = path
         .file_stem()

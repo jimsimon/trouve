@@ -278,6 +278,56 @@ fn snapshot_fast_path_returns_identical_results() {
 }
 
 #[test]
+fn patched_build_matches_full_rebuild_exactly() {
+    let model = test_env();
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    sample_files(root);
+
+    // Cold build writes the snapshot the patch path will splice from.
+    let _ = SembleIndex::from_path(root, CODE, Some(model)).unwrap();
+
+    // Modify one file, add one, delete one.
+    write_file(
+        root,
+        "src/auth.py",
+        "def authenticate(user, token):\n    return verify(token)\n",
+    );
+    write_file(
+        root,
+        "src/queue.py",
+        "def enqueue(job):\n    return push(job)\n",
+    );
+    std::fs::remove_file(root.join("src/db.py")).unwrap();
+
+    // This build goes through the patch path (a snapshot exists but the
+    // manifest hash differs).
+    let patched = SembleIndex::from_path(root, CODE, Some(model)).unwrap();
+    assert_eq!(patched.build_stats.files_total, 3);
+    assert_eq!(patched.build_stats.files_computed, 2, "modified + added");
+
+    // Force a full assembly of the identical tree by removing all snapshots.
+    let identity = root.canonicalize().unwrap().to_string_lossy().into_owned();
+    let snapshots_dir = semble::store::ChunkStore::open(&identity)
+        .unwrap()
+        .root()
+        .join("snapshots");
+    std::fs::remove_dir_all(&snapshots_dir).unwrap();
+    let full = SembleIndex::from_path(root, CODE, Some(model)).unwrap();
+
+    assert_eq!(patched.chunks, full.chunks);
+    for query in ["authenticate token", "enqueue job", "save model"] {
+        let a = patched.search(query, 5, None, None, None, None, None);
+        let b = full.search(query, 5, None, None, None, None, None);
+        assert_eq!(a.len(), b.len(), "query {query:?}");
+        for (x, y) in a.iter().zip(&b) {
+            assert_eq!(x.chunk, y.chunk, "query {query:?}");
+            assert!((x.score - y.score).abs() < 1e-12, "query {query:?}");
+        }
+    }
+}
+
+#[test]
 fn empty_dir_errors() {
     let model = test_env();
     let dir = tempfile::tempdir().unwrap();

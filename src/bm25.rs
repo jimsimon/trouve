@@ -7,6 +7,8 @@
 use std::collections::HashMap;
 use std::path::Path;
 
+use rayon::prelude::*;
+
 use crate::snapshot::{Buf, Posting};
 use crate::types::Chunk;
 
@@ -45,6 +47,11 @@ pub fn enrich_for_bm25(chunk: &Chunk) -> String {
 /// zero-copy in a memory-mapped snapshot: terms are sorted lexicographically
 /// in one contiguous blob, and each term's postings are a contiguous slice of
 /// the flattened posting array. Query tokens are resolved by binary search.
+///
+/// Postings hold raw term frequencies; `idf` and the document-length norm are
+/// applied at query time from `doc_lengths` and per-term document frequencies
+/// (the posting-list lengths). This keeps every stored value per-document
+/// stable, which is what makes snapshot patching possible.
 pub struct Bm25Index {
     /// Concatenated UTF-8 bytes of all terms, sorted lexicographically.
     term_blob: Buf<u8>,
@@ -52,73 +59,82 @@ pub struct Bm25Index {
     term_offsets: Buf<u32>,
     /// `n_terms + 1` offsets into `postings`.
     posting_offsets: Buf<u64>,
-    /// Flattened postings, grouped by term: precomputed `idf * tf` scores.
+    /// Flattened postings, grouped by term, docs ascending within a term.
     postings: Buf<Posting>,
-    num_docs: usize,
+    /// Token count of every document.
+    doc_lengths: Buf<u32>,
 }
 
 impl Bm25Index {
-    /// Build an index from tokenized documents.
+    /// Build an index from tokenized documents (parallel).
     pub fn build(docs: &[Vec<String>]) -> Bm25Index {
-        let num_docs = docs.len();
-        let avgdl = if num_docs == 0 {
-            0.0
-        } else {
-            docs.iter().map(|d| d.len() as f64).sum::<f64>() / num_docs as f64
-        };
+        let doc_lengths: Vec<u32> = docs.par_iter().map(|d| d.len() as u32).collect();
 
-        let mut vocab: HashMap<String, u32> = HashMap::new();
-        // Term frequencies per document.
-        let mut doc_tfs: Vec<HashMap<u32, u32>> = Vec::with_capacity(num_docs);
-        for doc in docs {
-            let mut tf: HashMap<u32, u32> = HashMap::new();
-            for tok in doc {
-                let next_id = vocab.len() as u32;
-                let id = *vocab.entry(tok.clone()).or_insert(next_id);
-                *tf.entry(id).or_insert(0) += 1;
-            }
-            doc_tfs.push(tf);
-        }
+        // Per-document term frequencies, in parallel.
+        let doc_tfs: Vec<Vec<(&str, u32)>> = docs
+            .par_iter()
+            .map(|doc| {
+                let mut tf: HashMap<&str, u32> = HashMap::with_capacity(doc.len());
+                for tok in doc {
+                    *tf.entry(tok.as_str()).or_insert(0) += 1;
+                }
+                tf.into_iter().collect()
+            })
+            .collect();
 
-        // Document frequency per token.
-        let mut df = vec![0u32; vocab.len()];
-        for tf in &doc_tfs {
-            for id in tf.keys() {
-                df[*id as usize] += 1;
-            }
-        }
+        // Global sorted vocabulary: parallel per-shard uniquing, then merge.
+        let mut terms: Vec<&str> = doc_tfs
+            .par_iter()
+            .fold(
+                std::collections::HashSet::new,
+                |mut set: std::collections::HashSet<&str>, tf| {
+                    set.extend(tf.iter().map(|(t, _)| *t));
+                    set
+                },
+            )
+            .reduce(std::collections::HashSet::new, |mut a, b| {
+                a.extend(b);
+                a
+            })
+            .into_iter()
+            .collect();
+        terms.par_sort_unstable();
 
-        let n = num_docs as f64;
-        let mut term_postings: Vec<Vec<Posting>> = vec![Vec::new(); vocab.len()];
-        for (doc_id, tf) in doc_tfs.iter().enumerate() {
-            let dl = docs[doc_id].len() as f64;
-            let norm = K1 * (1.0 - B + B * dl / avgdl.max(f64::MIN_POSITIVE));
-            for (id, count) in tf {
-                let dfi = df[*id as usize] as f64;
-                let idf = (1.0 + (n - dfi + 0.5) / (dfi + 0.5)).ln();
-                let tfc = *count as f64 / (*count as f64 + norm);
-                term_postings[*id as usize].push(Posting {
-                    doc: doc_id as u32,
-                    score: (idf * tfc) as f32,
-                });
-            }
-        }
-
-        // Flatten into the sorted-term representation.
-        let mut terms: Vec<(&String, u32)> = vocab.iter().map(|(t, id)| (t, *id)).collect();
-        terms.sort_unstable_by(|a, b| a.0.as_bytes().cmp(b.0.as_bytes()));
-
+        let term_ids: HashMap<&str, u32> = terms
+            .iter()
+            .enumerate()
+            .map(|(i, t)| (*t, i as u32))
+            .collect();
         let mut term_blob: Vec<u8> = Vec::new();
         let mut term_offsets: Vec<u32> = Vec::with_capacity(terms.len() + 1);
-        let mut posting_offsets: Vec<u64> = Vec::with_capacity(terms.len() + 1);
-        let mut postings: Vec<Posting> = Vec::new();
         term_offsets.push(0);
-        posting_offsets.push(0);
-        for (term, id) in terms {
+        for term in &terms {
             term_blob.extend_from_slice(term.as_bytes());
             term_offsets.push(term_blob.len() as u32);
-            postings.extend_from_slice(&term_postings[id as usize]);
-            posting_offsets.push(postings.len() as u64);
+        }
+
+        // All (term, doc, tf) triples, sorted by (term, doc): sorting scales
+        // across cores where per-term pushes cannot.
+        let term_ids = &term_ids;
+        let mut triples: Vec<(u32, u32, u32)> = doc_tfs
+            .par_iter()
+            .enumerate()
+            .flat_map_iter(|(doc_id, tf)| {
+                tf.iter()
+                    .map(move |(term, count)| (term_ids[term], doc_id as u32, *count))
+            })
+            .collect();
+        triples.par_sort_unstable();
+
+        let mut posting_offsets: Vec<u64> = vec![0; terms.len() + 1];
+        let mut postings: Vec<Posting> = Vec::with_capacity(triples.len());
+        for (term_id, doc, tf) in triples {
+            postings.push(Posting { doc, tf });
+            posting_offsets[term_id as usize + 1] = postings.len() as u64;
+        }
+        // Terms with no postings inherit the previous boundary.
+        for i in 1..posting_offsets.len() {
+            posting_offsets[i] = posting_offsets[i].max(posting_offsets[i - 1]);
         }
 
         Bm25Index {
@@ -126,7 +142,7 @@ impl Bm25Index {
             term_offsets: term_offsets.into(),
             posting_offsets: posting_offsets.into(),
             postings: postings.into(),
-            num_docs,
+            doc_lengths: doc_lengths.into(),
         }
     }
 
@@ -136,24 +152,26 @@ impl Bm25Index {
         term_offsets: Buf<u32>,
         posting_offsets: Buf<u64>,
         postings: Buf<Posting>,
-        num_docs: usize,
+        doc_lengths: Buf<u32>,
     ) -> Bm25Index {
         Bm25Index {
             term_blob,
             term_offsets,
             posting_offsets,
             postings,
-            num_docs,
+            doc_lengths,
         }
     }
 
     /// Borrow the flat parts for serialization (snapshot save path).
-    pub fn flat_parts(&self) -> (&[u8], &[u32], &[u64], &[Posting]) {
+    #[allow(clippy::type_complexity)]
+    pub fn flat_parts(&self) -> (&[u8], &[u32], &[u64], &[Posting], &[u32]) {
         (
             &self.term_blob,
             &self.term_offsets,
             &self.posting_offsets,
             &self.postings,
+            &self.doc_lengths,
         )
     }
 
@@ -180,13 +198,27 @@ impl Bm25Index {
     /// excluded by `mask` (when provided) score 0. Duplicate query tokens are
     /// counted multiple times, matching `bm25s.get_scores`.
     pub fn get_scores(&self, query_tokens: &[String], mask: Option<&[bool]>) -> Vec<f32> {
-        let mut scores = vec![0.0f32; self.num_docs];
+        let num_docs = self.num_docs();
+        let mut scores = vec![0.0f32; num_docs];
+        let n = num_docs as f64;
+        let avgdl = if num_docs == 0 {
+            0.0
+        } else {
+            self.doc_lengths.iter().map(|l| *l as f64).sum::<f64>() / n
+        };
+        let norm_base = K1 * (1.0 - B);
+        let norm_scale = K1 * B / avgdl.max(f64::MIN_POSITIVE);
         for tok in query_tokens {
             if let Some(id) = self.find_term(tok) {
                 let range =
                     self.posting_offsets[id] as usize..self.posting_offsets[id + 1] as usize;
-                for p in &self.postings[range] {
-                    scores[p.doc as usize] += p.score;
+                let plist = &self.postings[range];
+                let dfi = plist.len() as f64;
+                let idf = (1.0 + (n - dfi + 0.5) / (dfi + 0.5)).ln();
+                for p in plist {
+                    let tf = p.tf as f64;
+                    let norm = norm_base + norm_scale * self.doc_lengths[p.doc as usize] as f64;
+                    scores[p.doc as usize] += (idf * (tf / (tf + norm))) as f32;
                 }
             }
         }
@@ -201,7 +233,7 @@ impl Bm25Index {
     }
 
     pub fn num_docs(&self) -> usize {
-        self.num_docs
+        self.doc_lengths.len()
     }
 }
 

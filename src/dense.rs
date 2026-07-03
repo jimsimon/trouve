@@ -18,7 +18,7 @@ pub struct DenseIndex {
     rows: usize,
 }
 
-fn normalize(v: &mut [f32]) {
+pub(crate) fn normalize(v: &mut [f32]) {
     let norm = v.iter().map(|x| x * x).sum::<f32>().sqrt();
     if norm > 0.0 {
         for x in v.iter_mut() {
@@ -48,6 +48,20 @@ impl DenseIndex {
     /// Reassemble an index from already-normalized flat storage (snapshot load).
     pub fn from_parts(vectors: Buf<f32>, dim: usize, rows: usize) -> DenseIndex {
         DenseIndex { vectors, dim, rows }
+    }
+
+    /// Build from a flat row-major matrix of raw embeddings, normalizing each
+    /// row in parallel.
+    pub fn from_unnormalized_flat(mut vectors: Vec<f32>, dim: usize, rows: usize) -> DenseIndex {
+        debug_assert_eq!(vectors.len(), rows * dim);
+        if dim > 0 {
+            vectors.par_chunks_mut(dim).for_each(normalize);
+        }
+        DenseIndex {
+            vectors: vectors.into(),
+            dim,
+            rows,
+        }
     }
 
     /// The flat row-major normalized matrix (snapshot save path).
