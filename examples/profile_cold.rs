@@ -36,8 +36,11 @@ fn main() {
             Some((rel, String::from_utf8_lossy(&bytes).into_owned()))
         })
         .collect();
-    println!("read: {:.2?} ({} MB)", t.elapsed(),
-        sources.iter().map(|(_, s)| s.len()).sum::<usize>() / (1 << 20));
+    println!(
+        "read: {:.2?} ({} MB)",
+        t.elapsed(),
+        sources.iter().map(|(_, s)| s.len()).sum::<usize>() / (1 << 20)
+    );
 
     for round in 0..2 {
         let t = Instant::now();

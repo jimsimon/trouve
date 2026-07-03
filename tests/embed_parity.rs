@@ -19,9 +19,9 @@ fn write_bert_model(dir: &std::path::Path) {
         "o", "p", "q", "r", "s", "t", "u", "v", "w", "x", "y", "z", "0", "1", "2", "##a", "##b",
         "##c", "##d", "##e", "##f", "##g", "##h", "##i", "##j", "##k", "##l", "##m", "##n", "##o",
         "##p", "##q", "##r", "##s", "##t", "##u", "##v", "##w", "##x", "##y", "##z", "##0", "##1",
-        "##2", "def", "return", "self", "fn", "let", "##ing", "##er", "##tion", "(", ")", "{",
-        "}", "[", "]", ".", ",", ":", ";", "=", "+", "-", "*", "/", "_", "##_", "\"", "'", "#",
-        "!", "?", "<", ">", "&", "|", "%", "@", "the", "value", "index",
+        "##2", "def", "return", "self", "fn", "let", "##ing", "##er", "##tion", "(", ")", "{", "}",
+        "[", "]", ".", ",", ":", ";", "=", "+", "-", "*", "/", "_", "##_", "\"", "'", "#", "!",
+        "?", "<", ">", "&", "|", "%", "@", "the", "value", "index",
     ];
     let mut vocab = BTreeMap::new();
     for (i, p) in pieces.iter().enumerate() {
@@ -120,9 +120,9 @@ const SAMPLES: &[&str] = &[
     "fn main() { let x = [1, 2, 3]; }",
     "words with trailing spaces   \t\n",
     "control\x01chars\x02every\x03where",
-    "unknown§tokens…here",           // non-ASCII: falls back to HF pipeline
-    "mixed ascii and 日本語 text",     // chinese-char handling path
-    "café naïve résumé",             // accents (strip_accents via lowercase)
+    "unknown§tokens…here",         // non-ASCII: falls back to HF pipeline
+    "mixed ascii and 日本語 text", // chinese-char handling path
+    "café naïve résumé",           // accents (strip_accents via lowercase)
     "punc!!!((()))...___===",
     "supercalifragilisticexpialidocious antidisestablishmentarianism",
     "[UNK] literal added token",
@@ -137,7 +137,8 @@ fn assert_matches_reference(model_dir: &str) {
     for text in SAMPLES {
         let a = ours.encode_one(text);
         // Batch of one: upstream padding is a no-op, output is deterministic.
-        let b = reference.encode_with_args(&[text.to_string()], Some(512), 1)
+        let b = reference
+            .encode_with_args(&[text.to_string()], Some(512), 1)
             .into_iter()
             .next()
             .unwrap();
@@ -158,8 +159,10 @@ fn assert_matches_reference(model_dir: &str) {
         .into_iter()
         .next()
         .unwrap();
-    assert_eq!(a.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
-               b.iter().map(|v| v.to_bits()).collect::<Vec<_>>());
+    assert_eq!(
+        a.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+        b.iter().map(|v| v.to_bits()).collect::<Vec<_>>()
+    );
 }
 
 #[test]

@@ -265,6 +265,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn skips_symlinks() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();

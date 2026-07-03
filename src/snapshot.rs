@@ -961,8 +961,7 @@ mod tests {
         let live = live_entry_keys(dir.path());
         for entry in manifest_for(&chunks) {
             let language = detect_language(Path::new(&entry.rel_path));
-            let key =
-                crate::store::ChunkStore::entry_key(&entry.content_key, language, "model-x");
+            let key = crate::store::ChunkStore::entry_key(&entry.content_key, language, "model-x");
             assert!(live.contains(&key), "missing key for {}", entry.rel_path);
         }
         // Exactly one key per manifest file, no extras.

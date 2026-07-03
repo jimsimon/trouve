@@ -295,7 +295,11 @@ impl EmbeddingModel {
         let mut ids: Vec<u32> = Vec::new();
 
         let fast = self.fast.as_ref().filter(|_| {
-            text.is_ascii() && !self.added_tokens.iter().any(|tok| text.contains(tok.as_str()))
+            text.is_ascii()
+                && !self
+                    .added_tokens
+                    .iter()
+                    .any(|tok| text.contains(tok.as_str()))
         });
         if let Some(fast) = fast {
             // Early-stop is only safe at the tokenizer's own truncation
@@ -409,7 +413,11 @@ fn build_fast_bert(spec: &serde_json::Value, unk_token_id: Option<u32>) -> Optio
     }
     // clean_text=false would leave control chars in words; not worth a
     // second code path since every published model2vec tokenizer sets it.
-    if !norm.get("clean_text").and_then(serde_json::Value::as_bool).unwrap_or(true) {
+    if !norm
+        .get("clean_text")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(true)
+    {
         return None;
     }
     let lowercase = norm
@@ -523,7 +531,11 @@ struct ModelFiles {
     config: PathBuf,
 }
 
-fn match_local_layout(config_base: &Path, model_base: &Path, config_file: &str) -> Option<ModelFiles> {
+fn match_local_layout(
+    config_base: &Path,
+    model_base: &Path,
+    config_file: &str,
+) -> Option<ModelFiles> {
     let config = config_base.join(config_file);
     let tokenizer = model_base.join("tokenizer.json");
     let model = model_base.join("model.safetensors");

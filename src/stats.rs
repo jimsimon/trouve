@@ -3,7 +3,6 @@
 use std::collections::HashMap;
 use std::fs::OpenOptions;
 use std::io::Write;
-use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -64,14 +63,35 @@ pub fn save_search_stats(
         return;
     };
     // Advisory lock; skip the record if another process holds it.
-    let fd = f.as_raw_fd();
-    let locked = unsafe { libc::flock(fd, libc::LOCK_EX | libc::LOCK_NB) } == 0;
-    if !locked {
+    if !try_lock_exclusive(&f) {
         return;
     }
     let _ = writeln!(f, "{record}");
-    unsafe { libc::flock(fd, libc::LOCK_UN) };
+    unlock(&f);
 }
+
+#[cfg(unix)]
+fn try_lock_exclusive(f: &std::fs::File) -> bool {
+    use std::os::fd::AsRawFd;
+    unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) == 0 }
+}
+
+#[cfg(unix)]
+fn unlock(f: &std::fs::File) {
+    use std::os::fd::AsRawFd;
+    unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_UN) };
+}
+
+// Windows: appends to the same file from concurrent processes may interleave,
+// but a torn line only costs one stats record (readers skip unparsable
+// lines), so no lock is taken.
+#[cfg(not(unix))]
+fn try_lock_exclusive(_f: &std::fs::File) -> bool {
+    true
+}
+
+#[cfg(not(unix))]
+fn unlock(_f: &std::fs::File) {}
 
 #[derive(Debug, Default, Clone)]
 pub struct BucketStats {

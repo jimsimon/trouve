@@ -86,7 +86,10 @@ fn main() {
         if round == 1 {
             println!("full encode: {:.2?}  ({} vectors)", full, out.len());
             println!("tokenize only: {:.2?}  ({} tokens)", tok, n_tokens);
-            println!("normalize+pretokenize only: {:.2?}  ({} words)", pre, n_words);
+            println!(
+                "normalize+pretokenize only: {:.2?}  ({} words)",
+                pre, n_words
+            );
             println!(
                 "pooling+overhead (full - tokenize): {:.2?}",
                 full.saturating_sub(tok)
