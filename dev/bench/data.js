@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1783101430773,
+  "lastUpdate": 1783101517880,
   "repoUrl": "https://github.com/jimsimon/trouve",
   "entries": {
     "e2e-benchmarks": [
@@ -95,6 +95,54 @@ window.BENCHMARK_DATA = {
             "name": "non-git warm query",
             "value": 57.008611140000006,
             "range": "± 1",
+            "unit": "ms"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "jim.j.simon@gmail.com",
+            "name": "Jim Simon",
+            "username": "jimsimon"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "7117bbc09c7dc497bac1c19bffd1d206b5411395",
+          "message": "Fix new stable clippy lint manual_is_multiple_of (#3)\n\n* Fix new stable clippy lint manual_is_multiple_of\n\nCurrent stable clippy (-D warnings in lint CI) flags the manual modulo\nchecks in embed.rs and tests/embed_parity.rs. Use usize::is_multiple_of\nand raise the advertised MSRV to 1.87, where it was stabilized.\n\nCo-authored-by: Jim Simon <jimsimon@users.noreply.github.com>\n\n* Remove clone_cache.rs committed by mistake\n\nThe file belongs to the separate clone-caching branch; it was untracked\nand slipped into the previous commit via git add -A.\n\nCo-authored-by: Jim Simon <jimsimon@users.noreply.github.com>\n\n---------\n\nCo-authored-by: Cursor Agent <cursoragent@cursor.com>\nCo-authored-by: Jim Simon <jimsimon@users.noreply.github.com>",
+          "timestamp": "2026-07-03T13:55:24-04:00",
+          "tree_id": "0ea316d52639cfd8ec54abe1489580c9c927c3eb",
+          "url": "https://github.com/jimsimon/trouve/commit/7117bbc09c7dc497bac1c19bffd1d206b5411395"
+        },
+        "date": 1783101517085,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "cold index + query",
+            "value": 122.62990428,
+            "range": "± 1.2",
+            "unit": "ms"
+          },
+          {
+            "name": "warm query",
+            "value": 58.91164150000001,
+            "range": "± 1.6",
+            "unit": "ms"
+          },
+          {
+            "name": "incremental (1 file modified)",
+            "value": 69.04898406,
+            "range": "± 1.4",
+            "unit": "ms"
+          },
+          {
+            "name": "non-git warm query",
+            "value": 57.970883900000004,
+            "range": "± 0.8",
             "unit": "ms"
           }
         ]
