@@ -13,8 +13,9 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
-/// Bump when the chunking algorithm or tokenizer changes incompatibly.
-pub const STORE_VERSION: u32 = 1;
+/// Bump when the chunking algorithm, tokenizer, or embedding semantics
+/// change incompatibly. v2: padding-free (batch-independent) embeddings.
+pub const STORE_VERSION: u32 = 2;
 
 /// Resolve the semble cache folder, respecting `SEMBLE_CACHE_LOCATION`
 /// (highest precedence) and platform conventions (XDG on Linux).

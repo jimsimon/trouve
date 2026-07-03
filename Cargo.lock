@@ -1554,6 +1554,7 @@ dependencies = [
 name = "semble"
 version = "0.1.0"
 dependencies = [
+ "ahash",
  "anyhow",
  "bincode",
  "blake3",
@@ -1562,6 +1563,8 @@ dependencies = [
  "criterion",
  "dialoguer",
  "dirs",
+ "half",
+ "hf-hub",
  "ignore",
  "libc",
  "memmap2",
@@ -1569,9 +1572,11 @@ dependencies = [
  "proptest",
  "rayon",
  "regex",
+ "safetensors",
  "serde",
  "serde_json",
  "tempfile",
+ "tokenizers",
  "tree-sitter",
  "tree-sitter-bash",
  "tree-sitter-c",

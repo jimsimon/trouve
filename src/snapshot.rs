@@ -40,9 +40,10 @@ use crate::languages::detect_language;
 use crate::store::FileEntry;
 use crate::types::Chunk;
 
-const MAGIC: &[u8; 8] = b"SMBLSNP2";
-/// Bump when the snapshot layout changes incompatibly.
-pub const SNAPSHOT_VERSION: u32 = 2;
+const MAGIC: &[u8; 8] = b"SMBLSNP3";
+/// Bump when the snapshot layout or embedding semantics change incompatibly.
+/// v3: padding-free (batch-independent) embeddings.
+pub const SNAPSHOT_VERSION: u32 = 3;
 /// Snapshots kept per store before the oldest are pruned. Covers a handful of
 /// branches/worktrees sharing one store without unbounded growth.
 const KEEP_SNAPSHOTS: usize = 4;
@@ -74,7 +75,7 @@ pub enum Buf<T: Pod> {
 }
 
 impl<T: Pod> Buf<T> {
-    fn mapped(map: &Arc<Mmap>, offset: usize, len: usize) -> Buf<T> {
+    pub(crate) fn mapped(map: &Arc<Mmap>, offset: usize, len: usize) -> Buf<T> {
         Buf::Mapped {
             map: Arc::clone(map),
             offset,

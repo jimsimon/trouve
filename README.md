@@ -24,7 +24,9 @@ model with a **content-addressed chunk store**:
   recomputed at assembly time (cheap relative to embedding).
 
 Retrieval behaviour is a faithful port: the same `potion-code-16M` model2vec
-embeddings (via [model2vec-rs](https://github.com/MinishLab/model2vec-rs)),
+embeddings (via an in-house engine with a memory-mapped embedding table and a
+word-caching WordPiece fast path, verified bit-identical to
+[model2vec-rs](https://github.com/MinishLab/model2vec-rs) per text),
 the same BM25 (Lucene variant) scoring, the same RRF hybrid fusion, and the
 same code-tuned reranking heuristics (symbol-definition boosts, file-stem
 boosts, multi-chunk coherence, test/example/compat path penalties, per-file
@@ -36,9 +38,9 @@ the previous snapshot — splicing unchanged rows out of the old mapping — so
 its cost is proportional to the edit, not the repository.
 
 Measured results ([BENCHMARKS.md](BENCHMARKS.md)) on kubernetes/kubernetes
-(30k files): cold indexing drops from ~3 minutes to 9.9 s (18x), an
-incremental reindex after touching one file from ~3 minutes to 0.87 s (200x+),
-and a fully warm query from ~7 s to 0.54 s (13x). Retrieval quality is
+(30k files): cold indexing drops from ~3 minutes to 6.6 s (27x), an
+incremental reindex after touching one file from ~3 minutes to 0.84 s (200x+),
+and a fully warm query from ~7 s to 0.53 s (13x). Retrieval quality is
 identical — mean NDCG@10 matches upstream to within 0.0002 on the upstream
 annotated benchmark, with identical chunk boundaries and BM25 scores.
 

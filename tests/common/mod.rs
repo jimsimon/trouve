@@ -1,5 +1,6 @@
 //! Shared test support: a tiny deterministic local model2vec model so
 //! integration tests run offline and fast, plus an isolated cache dir.
+#![allow(dead_code)] // not every test binary uses every helper
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};

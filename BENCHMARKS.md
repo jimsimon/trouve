@@ -15,10 +15,10 @@ startup and model load.
 
 | Scenario | Rust | Python | Speedup |
 | --- | --- | --- | --- |
-| Cold index + query | 328 ms ± 10 ms | 1.38 s ± 0.03 s | 4.2x |
-| Warm query (cached) | 126 ms ± 9 ms | 703 ms ± 31 ms | 5.6x |
-| Incremental (1 file touched) | 135 ms ± 6 ms | 1.31 s ± 0.00 s | 9.7x |
-| Branch switch (3.1.0 <-> 3.0.0) | 139 ms ± 3 ms | 1.28 s ± 0.02 s | 9.2x |
+| Cold index + query | 115 ms ± 3 ms | 1.22 s ± 0.03 s | 10.6x |
+| Warm query (cached) | 69 ms ± 6 ms | 734 ms ± 54 ms | 10.6x |
+| Incremental (1 file touched) | 78 ms ± 4 ms | 1.27 s ± 0.06 s | 16.3x |
+| Branch switch (3.1.0 <-> 3.0.0) | 93 ms ± 5 ms | 1.26 s ± 0.02 s | 13.5x |
 
 On a small repo Python's incremental and branch-switch times are dominated by a
 full re-index (its cache is all-or-nothing), while the Rust store recomputes
@@ -30,9 +30,9 @@ Single timed runs (the effect sizes dwarf run-to-run noise):
 
 | Scenario | Rust | Python | Speedup |
 | --- | --- | --- | --- |
-| Cold index + query | 9.9 s | 2 m 59 s | 18.1x |
-| Warm query (snapshot mmap) | 0.54 s | 7.2 s | 13.3x |
-| Incremental (1 file touched) | 0.87 s | 3 m 2 s | 209x |
+| Cold index + query | 6.6 s | 2 m 59 s | 27.1x |
+| Warm query (snapshot mmap) | 0.53 s | 7.2 s | 13.5x |
+| Incremental (1 file touched) | 0.84 s | 3 m 2 s | 216x |
 | Worktree first query (flask, other branch) | 0.34 s | n/a (full rebuild) | — |
 
 This is the headline result: touching a single file in a 30k-file repo costs
@@ -56,9 +56,22 @@ keyed by a hash of the manifest, which enables two fast paths:
 The MCP server additionally keeps hot indexes in an in-process LRU, so
 repeated agent queries skip even the snapshot load.
 
-Cold-path phase breakdown on kubernetes (`SEMBLE_TIMING=1`): embedding 4.6 s,
-chunk+tokenize 2.3 s, BM25 build 0.9 s, everything else under 0.2 s each —
-i.e. the remaining cold cost is essentially model inference.
+Embedding runs on an in-house model2vec engine rather than `model2vec-rs`:
+the embedding table is memory-mapped from safetensors (model load drops from
+~100 ms to ~55 ms), pure-ASCII text goes through a byte-level
+BertNormalizer/BertPreTokenizer/WordPiece scanner with a sharded word→ids
+memo (code is repetitive, so hit rates are high), and pooling gathers rows
+straight out of the mapping. This cut the kubernetes embed phase from 4.6 s
+to 0.6 s. Non-ASCII text falls back to the exact HF `tokenizers` pipeline,
+and `tests/embed_parity.rs` verifies bit-identical output against
+`model2vec-rs` (samples + property tests + the real potion-code-16M model).
+One deliberate difference from upstream: texts are never padded, so
+embeddings do not depend on batch composition (upstream mean-pools `[PAD]`
+rows, making its vectors vary with batching); retrieval quality is unchanged.
+
+Cold-path phase breakdown on kubernetes (`SEMBLE_TIMING=1`): chunk+tokenize
+2.5 s, BM25 build 1.2 s, embedding 0.6 s, everything else under 0.25 s each —
+the remaining cold cost is now tree-sitter parsing, not model inference.
 
 ## Retrieval quality (NDCG@10)
 
