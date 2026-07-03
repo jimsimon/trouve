@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1783101559588,
+  "lastUpdate": 1783105522422,
   "repoUrl": "https://github.com/jimsimon/trouve",
   "entries": {
     "e2e-benchmarks": [
@@ -143,6 +143,54 @@ window.BENCHMARK_DATA = {
             "name": "non-git warm query",
             "value": 57.970883900000004,
             "range": "± 0.8",
+            "unit": "ms"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "jim.j.simon@gmail.com",
+            "name": "Jim Simon",
+            "username": "jimsimon"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "c941ab5bb6338796215d329e0389cbee2a09852b",
+          "message": "Update LICENSE copyright holder to James Simon (#13)\n\nCo-authored-by: Cursor Agent <cursoragent@cursor.com>\nCo-authored-by: Jim Simon <jimsimon@users.noreply.github.com>",
+          "timestamp": "2026-07-03T15:03:48-04:00",
+          "tree_id": "71414dea1f4009dd7ff10bb72b0ab2f69d867881",
+          "url": "https://github.com/jimsimon/trouve/commit/c941ab5bb6338796215d329e0389cbee2a09852b"
+        },
+        "date": 1783105521579,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "cold index + query",
+            "value": 120.06920018000001,
+            "range": "± 4.1",
+            "unit": "ms"
+          },
+          {
+            "name": "warm query",
+            "value": 58.48141726,
+            "range": "± 2.2",
+            "unit": "ms"
+          },
+          {
+            "name": "incremental (1 file modified)",
+            "value": 70.33421738000001,
+            "range": "± 1.4",
+            "unit": "ms"
+          },
+          {
+            "name": "non-git warm query",
+            "value": 59.79942134000001,
+            "range": "± 1.8",
             "unit": "ms"
           }
         ]
