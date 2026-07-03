@@ -1,0 +1,25 @@
+{
+  $schema: 'https://docs.renovatebot.com/renovate-schema.json',
+  extends: [
+    'config:recommended',
+  ],
+  labels: ['dependencies'],
+  // Keep Cargo.lock fresh even when Cargo.toml ranges still match
+  lockFileMaintenance: {
+    enabled: true,
+    schedule: ['before 6am on monday'],
+  },
+  packageRules: [
+    {
+      // The tree-sitter core and grammar crates move together; group them
+      // into a single PR to avoid a flood of individual grammar bumps.
+      groupName: 'tree-sitter',
+      matchManagers: ['cargo'],
+      matchPackageNames: ['tree-sitter', 'tree-sitter-*'],
+    },
+    {
+      groupName: 'GitHub Actions',
+      matchManagers: ['github-actions'],
+    },
+  ],
+}
