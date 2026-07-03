@@ -112,6 +112,37 @@ What scales with what:
 - The MCP server keeps up to 10 indexes in its in-process LRU (keyed by
   repository path, so 20 branches of one checkout occupy a single slot).
 
+## CPU scaling
+
+Same kubernetes checkout, thread count pinned with `RAYON_NUM_THREADS`
+(16 physical cores / 32 SMT threads; single runs on a warm OS page cache, so
+the cold times sit slightly below the first-ever-run headline number):
+
+| Threads | Cold index + query | Incremental (1 file) | Warm query |
+| --- | --- | --- | --- |
+| 1 | 23.3 s | 0.62 s | 0.44 s |
+| 2 | 12.0 s | 0.61 s | 0.41 s |
+| 4 | 7.0 s | 0.63 s | 0.42 s |
+| 8 | 3.8 s | 0.57 s | 0.39 s |
+| 16 | 2.8 s | 0.58 s | 0.41 s |
+| 32 | 2.5 s | 0.59 s | 0.40 s |
+
+- **Cold builds scale with physical cores**: 9.2x end-to-end from 1 to 32
+  threads — near-linear through 8 threads, tapering into 16 (the parallel
+  phases keep scaling but the ~0.3 s serial floor grows in relative weight),
+  with SMT adding a final ~10%. Per-phase speedups at 32 threads:
+  chunk+tokenize 15.2x (15.6 s → 1.0 s), embedding 10x (4.0 s → 0.4 s),
+  BM25 build 5.4x (1.9 s → 0.34 s), store writes 7.9x.
+- **The serial floor is ~0.3 s**: `git ls-files`/`git status` manifest
+  (~110 ms), model load (~38 ms), snapshot write (~95 ms), and store GC when
+  it fires (~36 ms). This is what cold builds converge to as cores increase.
+- **Warm and incremental paths don't need cores.** They are latency-bound
+  serial work — git status, mmap load, patch splice — and run in ~0.4–0.6 s
+  even single-threaded. A laptop gets the same interactive experience as a
+  32-thread workstation; extra cores only buy faster first-time indexing.
+- Even at 1 thread, the 23.3 s cold build is ~8x faster than upstream's
+  ~3 minutes (which also uses one core).
+
 ## Retrieval quality (NDCG@10)
 
 `benchmarks/run_quality.py` runs the upstream annotated benchmark tasks against
