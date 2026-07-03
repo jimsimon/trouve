@@ -1,6 +1,6 @@
 {
   "name": "kilocode-trouve",
-  "version": "0.1.0",
+  "version": "1.0.0",
   "description": "Kilo Code plugin exposing trouve code search as native tools, backed by a persistent trouve server process.",
   "type": "module",
   "main": "./src/server.ts",
