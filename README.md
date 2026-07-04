@@ -134,9 +134,12 @@ See the [plugin README](plugins/trouve/README.md) for details.
 
 ## Ignoring files
 
-`.gitignore` files are honoured per directory. To exclude files from indexing
-only (without git-ignoring them), add patterns to a `.trouveignore` file —
-same syntax, same per-directory inheritance. Upstream's `.sembleignore` is
+`.gitignore` files are honoured per directory (in a git repository, git's own
+ignore rules decide which untracked files are seen; tracked files are always
+candidates). To exclude files from indexing only (without git-ignoring them),
+add patterns to a `.trouveignore` file — same syntax, same per-directory
+inheritance. `.trouveignore` applies in git and non-git roots alike, to
+tracked and untracked files. Upstream's `.sembleignore` is
 still honoured for backwards compatibility, but is deprecated and will be
 removed in a future release; rename it to `.trouveignore`.
 

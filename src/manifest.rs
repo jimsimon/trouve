@@ -15,7 +15,7 @@ use anyhow::{Context, Result};
 use rayon::prelude::*;
 
 use crate::store::{ChunkStore, FsManifestRecord};
-use crate::walker::{walk_files, DEFAULT_IGNORED_DIRS};
+use crate::walker::{walk_files, TrouveIgnore, DEFAULT_IGNORED_DIRS};
 
 /// One file to index.
 #[derive(Debug, Clone)]
@@ -144,6 +144,12 @@ fn git_manifest(root: &Path, extensions: &HashSet<String>) -> Result<Vec<FileRec
     let mut records: Vec<FileRecord> = Vec::new();
     let mut seen: HashSet<String> = HashSet::new();
 
+    // `.trouveignore` excludes files from indexing without git-ignoring
+    // them, so it must be applied on top of the git file listing (git only
+    // honours `.gitignore` for untracked files). Checked before hashing so
+    // excluded files (e.g. a large generated tree) are never read.
+    let mut trouve_ignore = TrouveIgnore::new(root);
+
     for line in ls.split('\0').filter(|s| !s.is_empty()) {
         // Format: "<mode> <oid> <stage>\t<path>"
         let Some((meta, path)) = line.split_once('\t') else {
@@ -156,6 +162,7 @@ fn git_manifest(root: &Path, extensions: &HashSet<String>) -> Result<Vec<FileRec
         if deleted.contains(&rel)
             || !matches_extension(&rel, extensions)
             || in_default_ignored_dir(&rel)
+            || trouve_ignore.is_ignored(&rel)
         {
             continue;
         }
@@ -181,13 +188,20 @@ fn git_manifest(root: &Path, extensions: &HashSet<String>) -> Result<Vec<FileRec
         }
     }
 
-    // Untracked (but not gitignored) files, hashed directly.
+    // Untracked (but not gitignored) files, hashed directly. The ignore
+    // check runs sequentially first (`TrouveIgnore` caches per-directory
+    // specs behind `&mut self`), so excluded files skip the parallel hash.
+    let untracked: Vec<String> = untracked
+        .into_iter()
+        .filter(|rel| {
+            matches_extension(rel, extensions)
+                && !in_default_ignored_dir(rel)
+                && !trouve_ignore.is_ignored(rel)
+        })
+        .collect();
     let hashed: Vec<Option<FileRecord>> = untracked
         .par_iter()
         .map(|rel| {
-            if !matches_extension(rel, extensions) || in_default_ignored_dir(rel) {
-                return None;
-            }
             let abs = root.join(rel);
             if abs.symlink_metadata().ok()?.is_symlink() {
                 return None;
@@ -364,6 +378,49 @@ mod tests {
         let manifest = build_manifest(root, &identity, &exts(), &store).unwrap();
         assert_eq!(manifest.len(), 1);
         assert_eq!(manifest[0].rel_path, "kept.py");
+    }
+
+    #[test]
+    fn git_manifest_honours_trouveignore() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        git(root, &["init", "-b", "main"]);
+        fs::write(root.join("tracked_secret.py"), "s = 1\n").unwrap();
+        fs::write(root.join("kept.py"), "k = 1\n").unwrap();
+        fs::create_dir(root.join("generated")).unwrap();
+        fs::write(root.join("generated/out.py"), "g = 1\n").unwrap();
+        git(root, &["add", "."]);
+        git(root, &["commit", "-m", "init"]);
+        // Written after the commit: excludes both tracked and untracked
+        // files from indexing without git-ignoring them.
+        fs::write(root.join("untracked_secret.py"), "u = 1\n").unwrap();
+        fs::write(root.join(".trouveignore"), "*_secret.py\ngenerated/\n").unwrap();
+
+        let identity = detect_repo_identity(root);
+        let store = ChunkStore::open_at(root.join(".teststore")).unwrap();
+        let manifest = build_manifest(root, &identity, &exts(), &store).unwrap();
+        let paths: Vec<&str> = manifest.iter().map(|r| r.rel_path.as_str()).collect();
+        assert_eq!(paths, vec!["kept.py"]);
+    }
+
+    #[test]
+    fn git_manifest_honours_nested_trouveignore() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        git(root, &["init", "-b", "main"]);
+        fs::create_dir(root.join("sub")).unwrap();
+        fs::write(root.join("sub/.trouveignore"), "local.py\n").unwrap();
+        fs::write(root.join("sub/local.py"), "l = 1\n").unwrap();
+        fs::write(root.join("sub/other.py"), "o = 1\n").unwrap();
+        fs::write(root.join("local.py"), "top = 1\n").unwrap();
+        git(root, &["add", "."]);
+        git(root, &["commit", "-m", "init"]);
+
+        let identity = detect_repo_identity(root);
+        let store = ChunkStore::open_at(root.join(".teststore")).unwrap();
+        let manifest = build_manifest(root, &identity, &exts(), &store).unwrap();
+        let paths: Vec<&str> = manifest.iter().map(|r| r.rel_path.as_str()).collect();
+        assert_eq!(paths, vec!["local.py", "sub/other.py"]);
     }
 
     #[test]

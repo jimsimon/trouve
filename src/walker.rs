@@ -52,14 +52,14 @@ fn build_spec(base: &Path, lines: &[String]) -> Option<Gitignore> {
     builder.build().ok()
 }
 
-fn load_ignore_for_dir(directory: &Path) -> Option<Gitignore> {
+fn load_named_ignores(directory: &Path, names: &[&str]) -> Option<Gitignore> {
     let mut lines: Vec<String> = Vec::new();
     // Later files win on conflicting patterns; the deprecated `.sembleignore`
     // is loaded before `.trouveignore` so the new name takes precedence.
-    for name in [".gitignore", ".sembleignore", ".trouveignore"] {
+    for name in names {
         let p = directory.join(name);
         if p.is_file() {
-            if name == ".sembleignore" {
+            if *name == ".sembleignore" {
                 crate::utils::warn_deprecated(".sembleignore", ".trouveignore");
             }
             if let Ok(text) = std::fs::read_to_string(&p) {
@@ -71,6 +71,72 @@ fn load_ignore_for_dir(directory: &Path) -> Option<Gitignore> {
         None
     } else {
         build_spec(directory, &lines)
+    }
+}
+
+fn load_ignore_for_dir(directory: &Path) -> Option<Gitignore> {
+    load_named_ignores(directory, &[".gitignore", ".sembleignore", ".trouveignore"])
+}
+
+/// Applies `.trouveignore` (and the deprecated `.sembleignore`) rules to
+/// repo-relative paths, for manifests built from `git ls-files` rather than a
+/// directory walk. `.gitignore` is intentionally not consulted here: git
+/// itself decides which files are tracked or untracked, and `.trouveignore`
+/// exists precisely to exclude files from indexing *without* git-ignoring
+/// them.
+pub struct TrouveIgnore {
+    root: PathBuf,
+    /// Per-directory spec cache; `None` means the directory has no ignore
+    /// files.
+    specs: std::collections::HashMap<PathBuf, Option<Gitignore>>,
+}
+
+impl TrouveIgnore {
+    pub fn new(root: &Path) -> TrouveIgnore {
+        TrouveIgnore {
+            root: root.to_path_buf(),
+            specs: std::collections::HashMap::new(),
+        }
+    }
+
+    fn spec_for(&mut self, dir: &Path) -> &Option<Gitignore> {
+        if !self.specs.contains_key(dir) {
+            let spec = load_named_ignores(dir, &[".sembleignore", ".trouveignore"]);
+            self.specs.insert(dir.to_path_buf(), spec);
+        }
+        &self.specs[dir]
+    }
+
+    /// Whether the repo-relative file path (forward slashes) is excluded by
+    /// an ignore rule in the root or any intermediate directory. The deepest
+    /// matching pattern wins, per gitignore semantics.
+    pub fn is_ignored(&mut self, rel_path: &str) -> bool {
+        let rel = Path::new(rel_path);
+        let mut dirs: Vec<PathBuf> = vec![self.root.clone()];
+        if let Some(parent) = rel.parent() {
+            let mut acc = self.root.clone();
+            for comp in parent.components() {
+                acc.push(comp);
+                dirs.push(acc.clone());
+            }
+        }
+        let abs = self.root.join(rel);
+        let mut ignored = false;
+        for dir in dirs {
+            let Ok(relative) = abs.strip_prefix(&dir) else {
+                continue;
+            };
+            if let Some(spec) = self.spec_for(&dir) {
+                // `matched_path_or_any_parents` also catches directory
+                // patterns (e.g. `generated/`) covering this file.
+                match spec.matched_path_or_any_parents(relative, false) {
+                    ignore::Match::None => {}
+                    ignore::Match::Ignore(_) => ignored = true,
+                    ignore::Match::Whitelist(_) => ignored = false,
+                }
+            }
+        }
+        ignored
     }
 }
 
