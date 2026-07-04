@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1783124169594,
+  "lastUpdate": 1783124219645,
   "repoUrl": "https://github.com/jimsimon/trouve",
   "entries": {
     "e2e-benchmarks": [
@@ -913,6 +913,54 @@ window.BENCHMARK_DATA = {
             "name": "dense_query_20k_rows",
             "value": 1528145.2828407225,
             "range": "± 8369",
+            "unit": "ns"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "jim.j.simon@gmail.com",
+            "name": "Jim Simon",
+            "username": "jimsimon"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "3ffd6848b3649fe9c20668def17396487e7ad869",
+          "message": "Validate store parameters on snapshot open; verify existing files in save (#16)\n\nThe patch fast path opens the newest compatible snapshot regardless of\nmanifest hash (open_latest), but only validated SNAPSHOT_VERSION,\nmodel_id, and content types. STORE_VERSION and DESIRED_CHUNK_LENGTH are\nmixed into the manifest hash (so exact-match loads were safe) but were\nnot recorded in the snapshot itself — a future STORE_VERSION bump\nwithout a matching SNAPSHOT_VERSION bump would have silently spliced\nrows chunked under the old rules into patched indexes, breaking the\npatched-equals-full-rebuild guarantee.\n\nRecord store_version and chunk_len in SnapshotMeta and reject\nmismatches in RawSnapshot::open. Bump the snapshot format to v4\n(SMBLSNP4) since the meta layout changed; old snapshots are discarded\non magic mismatch and rebuilt.\n\nAlso fix save()'s early exit: the snapshot filename truncates the\nmanifest hash to 128 bits, and save() trusted any pre-existing file at\nthat path without verifying its embedded full hash — a partial or\nforeign file would be kept forever and miss on every load. Verify the\nexisting file and rewrite it if it is not actually this snapshot.\n\nThe module doc still described the v2 magic; it now matches the code.\n\nCo-authored-by: Cursor Agent <cursoragent@cursor.com>\nCo-authored-by: Jim Simon <jimsimon@users.noreply.github.com>",
+          "timestamp": "2026-07-03T20:14:54-04:00",
+          "tree_id": "aa2fd2a41ad500b180574b14dcf106846ca7b565",
+          "url": "https://github.com/jimsimon/trouve/commit/3ffd6848b3649fe9c20668def17396487e7ad869"
+        },
+        "date": 1783124219207,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "bm25_build_5k_docs",
+            "value": 4888265.909090909,
+            "range": "± 6690",
+            "unit": "ns"
+          },
+          {
+            "name": "bm25_query_5k_docs",
+            "value": 36957.28734228734,
+            "range": "± 32",
+            "unit": "ns"
+          },
+          {
+            "name": "chunk_python_200_functions",
+            "value": 3105329.09375,
+            "range": "± 1884",
+            "unit": "ns"
+          },
+          {
+            "name": "dense_query_20k_rows",
+            "value": 1386176.0267737617,
+            "range": "± 8925",
             "unit": "ns"
           }
         ]
