@@ -36,7 +36,7 @@ regex = "1.12.4"
 safetensors = "0.5"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = { version = "1.0.150", features = ["preserve_order"] }
-tokenizers = { version = "0.21", default-features = false, features = ["onig"] }
+tokenizers = { version = "0.23", default-features = false, features = ["onig"] }
 tree-sitter = "0.26.10"
 tree-sitter-bash = "0.25.1"
 tree-sitter-c = "0.24.2"
