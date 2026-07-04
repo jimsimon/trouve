@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1783132930230,
+  "lastUpdate": 1783135133577,
   "repoUrl": "https://github.com/jimsimon/trouve",
   "entries": {
     "e2e-benchmarks": [
@@ -719,6 +719,54 @@ window.BENCHMARK_DATA = {
             "name": "non-git warm query",
             "value": 66.10110054000002,
             "range": "± 1.6",
+            "unit": "ms"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "jim.j.simon@gmail.com",
+            "name": "Jim Simon",
+            "username": "jimsimon"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "291d6705cbc26b4d31337f01d17634929c9492c2",
+          "message": "Add the model-backed e2e tests that README and CI already promised (#21)\n\n* Add the model-backed e2e tests that README and CI already promised\n\nREADME documents 'TROUVE_E2E=1 cargo test -- --ignored' as the way to\nrun end-to-end tests that download the model, and test.yml has a\ntest-with-model job running exactly that — but there was not a single\n#[ignore] test in the repo and TROUVE_E2E was never read. The CI job\nexecuted zero tests and passed green.\n\nAdd tests/e2e.rs with two ignored tests gated on TROUVE_E2E:\n\n- index a small fixture project with the real default model\n  (potion-code-16M downloaded from the Hugging Face Hub) and verify\n  semantic and identifier queries rank the right files first, plus\n  find_related excludes the seed;\n- a warm rebuild recomputes nothing and returns identical results.\n\nWithout TROUVE_E2E=1 they skip themselves so a plain\n'cargo test -- --ignored' stays offline-safe. Verified locally: both\ntests pass against the downloaded model, and the skip path passes\noffline.\n\nCo-authored-by: Jim Simon <jimsimon@users.noreply.github.com>\n\n* Address e2e review feedback: strict gate, stale-cache sweep, top-k assertions\n\n- TROUVE_E2E now requires the documented value 1, so TROUVE_E2E=0 (or\n  false) skips instead of downloading the model.\n- The per-run cache dir must stay isolated (tests assert cold-build\n  stats), but previous runs' dirs are now swept at init so repeated\n  local runs no longer accumulate trouve-e2e-cache-* garbage.\n- Ranking assertions check the expected file appears in the top\n  results instead of pinning exact top-1: this suite is a pipeline\n  sanity gate, exact ranking is covered by the parity/quality\n  harnesses, and a model bump or platform float difference must not\n  flake CI. Verified against the real downloaded model.\n\nCo-authored-by: Jim Simon <jimsimon@users.noreply.github.com>\n\n* Only sweep e2e cache dirs untouched for an hour\n\nReview feedback: the unconditional sweep could remove_dir_all the\nstill-in-use cache of a concurrent e2e run in another process,\ncorrupting its in-flight cold-build assertions. Age-gate the sweep to\ndirs whose mtime is over an hour old — a run takes seconds, so a\nconcurrent process's dir is always fresh while genuinely stale dirs\nfrom earlier runs are still cleaned up. Verified: a 2-hour-old dir is\nremoved, a fresh one survives, and the model-backed tests pass.\n\nCo-authored-by: Jim Simon <jimsimon@users.noreply.github.com>\n\n---------\n\nCo-authored-by: Cursor Agent <cursoragent@cursor.com>\nCo-authored-by: Jim Simon <jimsimon@users.noreply.github.com>",
+          "timestamp": "2026-07-03T23:17:38-04:00",
+          "tree_id": "7ea0b1f760e71df97f40163ac7c679051d1f7f45",
+          "url": "https://github.com/jimsimon/trouve/commit/291d6705cbc26b4d31337f01d17634929c9492c2"
+        },
+        "date": 1783135133192,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "cold index + query",
+            "value": 131.63367286000002,
+            "range": "± 3.3",
+            "unit": "ms"
+          },
+          {
+            "name": "warm query",
+            "value": 68.42449022,
+            "range": "± 2.3",
+            "unit": "ms"
+          },
+          {
+            "name": "incremental (1 file modified)",
+            "value": 78.67759296,
+            "range": "± 2.1",
+            "unit": "ms"
+          },
+          {
+            "name": "non-git warm query",
+            "value": 65.8175857,
+            "range": "± 1.3",
             "unit": "ms"
           }
         ]
