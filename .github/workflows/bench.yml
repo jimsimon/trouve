@@ -43,7 +43,7 @@ jobs:
       - name: Convert criterion estimates to benchmark JSON
         run: python3 benchmarks/to_gha_bench.py --criterion target/criterion > micro.json
       - name: Compare against baseline
-        uses: benchmark-action/github-action-benchmark@52576c92bccf6ac60c8223ec7eb2565637cae9ba # v1
+        uses: benchmark-action/github-action-benchmark@52576c92bccf6ac60c8223ec7eb2565637cae9ba # v1.22.1
         with:
           name: micro-benchmarks
           tool: customSmallerIsBetter
@@ -80,7 +80,7 @@ jobs:
       - name: Run end-to-end benchmarks
         run: benchmarks/run_ci_bench.sh bench-out
       - name: Compare against baseline
-        uses: benchmark-action/github-action-benchmark@52576c92bccf6ac60c8223ec7eb2565637cae9ba # v1
+        uses: benchmark-action/github-action-benchmark@52576c92bccf6ac60c8223ec7eb2565637cae9ba # v1.22.1
         with:
           name: e2e-benchmarks
           tool: customSmallerIsBetter
