@@ -212,6 +212,11 @@ fn git_manifest(root: &Path, extensions: &HashSet<String>) -> Result<Vec<FileRec
 
 /// Build the manifest for a non-git root by walking and hashing, with an
 /// mtime+size fast path stored in the repo's chunk store.
+///
+/// The fast path trusts `(mtime_ns, size)`: an edit that preserves both —
+/// same byte length within one mtime tick on a coarse-resolution filesystem
+/// — reuses the previous content key and is missed until either changes.
+/// This mirrors git's own stat-based change detection.
 fn fs_manifest(root: &Path, extensions: &[String], store: &ChunkStore) -> Result<Vec<FileRecord>> {
     let files = walk_files(root, extensions, &[]);
     let previous = store.load_fs_manifest();

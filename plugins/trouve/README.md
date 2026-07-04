@@ -53,7 +53,8 @@ array of those. Set `"warm": false` to disable background index warming.
 /plugin install trouve@trouve
 ```
 
-Installs the trouve MCP server (tools `search` and `find_related`), the
+Installs the trouve MCP server (tools surface as `mcp__trouve__search` and
+`mcp__trouve__find_related` in Claude Code), the
 `trouve-search` sub-agent, the workflow skill, and a `SessionStart` hook
 that warms the project index in the background so the first search of a
 session is instant (POSIX shells; on Windows the first search builds the

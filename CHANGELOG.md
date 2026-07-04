@@ -112,7 +112,7 @@ upstream annotated benchmark, identical chunk boundaries and BM25 scores).
   `uninstall`; bare `trouve` starts an MCP stdio server with `search` and
   `find_related` tools and an in-process LRU index cache.
 - **Agent installer**: MCP server config, instruction blocks, and dedicated
-  sub-agents across eleven coding agents (Claude Code, Cursor, Codex, Gemini,
+  sub-agents across 14 coding agents (Claude Code, Cursor, Codex, Gemini,
   OpenCode, and more).
 - **Test and parity suite**: offline unit/integration tests against a
   deterministic toy model, embedding parity tests against `model2vec-rs`,

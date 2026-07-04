@@ -161,7 +161,7 @@ Natively supported languages:
 
 | | |
 | --- | --- |
-| Systems | C, C++, D, Fortran, Objective-C, Rust, Swift, Zig |
+| Systems | C, C++, D, Fortran, Go, Objective-C, Rust, Swift, Zig |
 | Managed / JVM | C#, Groovy, Java, Kotlin, Scala |
 | Scripting | Bash, Lua, Perl, PHP, PowerShell, Python, R, Ruby |
 | Web | CSS, HTML, JavaScript/JSX, Svelte, TSX, TypeScript |
@@ -179,12 +179,16 @@ two-line change (a dependency in `Cargo.toml` and a match arm in
 
 Resolved in order: `TROUVE_CACHE_LOCATION` (absolute path), then the platform
 cache dir (`~/.cache/trouve` on Linux). Set `TROUVE_MODEL_NAME` to override
-the embedding model.
+the embedding model, and `TROUVE_CLONE_TIMEOUT` (seconds, default 60) to
+adjust the git network timeout used when cloning or fetching remote
+repositories.
 
 The upstream semble environment variables (`SEMBLE_CACHE_LOCATION`,
 `SEMBLE_MODEL_NAME`, `SEMBLE_CLONE_TIMEOUT`) are still honoured as fallbacks
-when the `TROUVE_*` equivalent is unset, but are deprecated and will be
-removed in a future release.
+when the corresponding `TROUVE_CACHE_LOCATION`, `TROUVE_MODEL_NAME`, or
+`TROUVE_CLONE_TIMEOUT` is unset, but are deprecated and will be removed in a
+future release. (`TROUVE_CLONE_TTL`, below, is trouve-only and has no semble
+fallback.)
 
 The store garbage-collects itself: after a snapshot write (at most once per
 day per store), entries not referenced by any kept snapshot are deleted, with

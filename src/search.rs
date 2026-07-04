@@ -1,5 +1,9 @@
 //! Hybrid search: RRF-fused semantic + BM25 retrieval with code-tuned
 //! reranking (port of `semble/search.py`).
+//!
+//! Returned scores are alpha-weighted RRF fusion values when `rerank` is
+//! off; reranking replaces them with boosted/penalized rerank scores on a
+//! different scale (see [`crate::types::SearchResult`]).
 
 use std::collections::HashMap;
 
