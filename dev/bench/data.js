@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1783136761768,
+  "lastUpdate": 1783136791859,
   "repoUrl": "https://github.com/jimsimon/trouve",
   "entries": {
     "e2e-benchmarks": [
@@ -1777,6 +1777,54 @@ window.BENCHMARK_DATA = {
             "name": "dense_query_20k_rows",
             "value": 1382288.0886235074,
             "range": "± 11259",
+            "unit": "ns"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "jim.j.simon@gmail.com",
+            "name": "Jim Simon",
+            "username": "jimsimon"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "732babd59237621444c19108343716d1ede8116f",
+          "message": "Fix Renovate lookup for github-action-benchmark pin (#28)\n\nRenovate resolves the version of a digest-pinned action from the trailing\ncomment. benchmark-action/github-action-benchmark has no 'v1' tag (only a\nv1 branch), so the '# v1' comment made the github-tags lookup fail with\n'Could not determine new digest for update'. Point the comment at the\nreal tag, v1.22.1, which matches the pinned SHA.\n\nCo-authored-by: Cursor Agent <cursoragent@cursor.com>\nCo-authored-by: Jim Simon <jimsimon@users.noreply.github.com>",
+          "timestamp": "2026-07-03T23:42:56-04:00",
+          "tree_id": "57fcaf9d897395b67d7642c212218d9889db4dc8",
+          "url": "https://github.com/jimsimon/trouve/commit/732babd59237621444c19108343716d1ede8116f"
+        },
+        "date": 1783136791379,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "bm25_build_5k_docs",
+            "value": 5088833.199999999,
+            "range": "± 10302",
+            "unit": "ns"
+          },
+          {
+            "name": "bm25_query_5k_docs",
+            "value": 36295.68930137844,
+            "range": "± 7",
+            "unit": "ns"
+          },
+          {
+            "name": "chunk_python_200_functions",
+            "value": 2789418.888888889,
+            "range": "± 685",
+            "unit": "ns"
+          },
+          {
+            "name": "dense_query_20k_rows",
+            "value": 1433904.6365131577,
+            "range": "± 7459",
             "unit": "ns"
           }
         ]
