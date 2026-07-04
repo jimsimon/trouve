@@ -77,14 +77,14 @@ Installs the trouve MCP server (tools surface as `mcp__trouve__search` and
 - `trouve_find_related` — find code similar to a `file_path` + `line` from a
   prior search result. Same optional arguments.
 
-## Alternative: trouve install
+## Alternative: manual MCP or tool-file setup
 
-`trouve install` configures agents directly (MCP entries, instruction
-blocks, sub-agents) and covers many more harnesses than this plugin. Use
-either the plugin or the installer per agent, not both — otherwise the
-model sees duplicate trouve tools. The
-[Agent integrations](../../README.md#agent-integrations) section of the
-main README has a feature grid comparing every route.
+Agents this plugin doesn't cover can run trouve as an MCP server (a single
+config entry), and OpenCode can alternatively load a standalone native
+tool file — see [INSTALL.md](../../INSTALL.md) for per-agent instructions.
+Use one route per agent, not several — otherwise the model sees duplicate
+trouve tools. The [Agent integrations](../../README.md#agent-integrations)
+section of the main README has a feature grid comparing every route.
 
 ## Development
 

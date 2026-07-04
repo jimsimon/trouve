@@ -21,7 +21,8 @@ Where upstream behaviour lives in this codebase:
 | `search.py` | `src/search.rs` | Port (same RRF fusion) |
 | `index/file_walker.py` | `src/walker.rs` | Port (gitignore semantics) |
 | `stats.py` | `src/stats.rs` | Port |
-| `cli.py`, `mcp.py`, `installer/` | `src/cli.rs`, `src/mcp.rs`, `src/installer.rs` | Port, plus a `stats` subcommand |
+| `cli.py`, `mcp.py` | `src/cli.rs`, `src/mcp.rs` | Port, plus a `stats` subcommand |
+| `installer/` | — | **Dropped**: manual per-agent setup is documented in [INSTALL.md](INSTALL.md) instead |
 | `cache.py`, `index/index.py`, `index/create.py`, `index/files.py` | `src/store.rs`, `src/manifest.rs`, `src/snapshot.rs`, `src/index.rs` | **Redesigned** (everything below) |
 
 ## Architectural differences
@@ -152,10 +153,11 @@ cost left. A warm remote query now costs the same as a local one.
   same path/filename enrichment.
 - Hybrid fusion: same RRF (k=60), same alpha resolution.
 - Reranking: same boosts and penalties, ported constant-for-constant.
-- CLI/MCP surface, cache-location resolution, savings tracking, agent
-  installer flow. (User-facing names are trouve's own — `.trouveignore`,
-  `TROUVE_CACHE_LOCATION`, `TROUVE_MODEL_NAME`, `TROUVE_CLONE_TIMEOUT` — with
-  the semble equivalents still honoured as deprecated fallbacks.)
+- CLI/MCP surface, cache-location resolution, savings tracking. (User-facing
+  names are trouve's own — `.trouveignore`, `TROUVE_CACHE_LOCATION`,
+  `TROUVE_MODEL_NAME`, `TROUVE_CLONE_TIMEOUT` — with the semble equivalents
+  still honoured as deprecated fallbacks. Upstream's interactive installer
+  is not ported; [INSTALL.md](INSTALL.md) documents manual setup.)
 - CPU-only execution (static embeddings are table lookups + mean pooling;
   there is no neural forward pass to put on a GPU).
 
