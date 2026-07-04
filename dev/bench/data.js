@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1783135181706,
+  "lastUpdate": 1783136055653,
   "repoUrl": "https://github.com/jimsimon/trouve",
   "entries": {
     "e2e-benchmarks": [
@@ -767,6 +767,54 @@ window.BENCHMARK_DATA = {
             "name": "non-git warm query",
             "value": 65.8175857,
             "range": "± 1.3",
+            "unit": "ms"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "jim.j.simon@gmail.com",
+            "name": "Jim Simon",
+            "username": "jimsimon"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "2bfc1f89ce58e42da0e62533501c57743064622c",
+          "message": "Prepare the v1.1.0 release (#24)\n\n* Prepare the v1.0.1 release\n\nBump the crate version to 1.0.1 (Cargo.toml, Cargo.lock) and sync the\nplugin manifests via scripts/sync_versions.py. Promote the Unreleased\nchangelog section to 1.0.1 dated 2026-07-04, and add the entries that\nhad not been recorded yet: the model-backed e2e test suite (#21) under\nAdded, and a Fixed section covering .trouveignore in git repos (#15),\nMCP protocol violations (#18), git manifest symlink/conflict handling\n(#17), snapshot compatibility checks (#16), model-loading validation\n(#20), and cache statistics (#19).\n\nCo-authored-by: Jim Simon <jimsimon@users.noreply.github.com>\n\n* Retarget the release as v1.1.0\n\nThe release adds features (clone cache, new grammars, plugins) and\nraises the MSRV, so a minor bump fits SemVer better than a patch.\n\nCo-authored-by: Jim Simon <jimsimon@users.noreply.github.com>\n\n---------\n\nCo-authored-by: Cursor Agent <cursoragent@cursor.com>\nCo-authored-by: Jim Simon <jimsimon@users.noreply.github.com>",
+          "timestamp": "2026-07-03T23:32:52-04:00",
+          "tree_id": "ed8f6317b00d2d2ec8023117dfad99d840f0ed26",
+          "url": "https://github.com/jimsimon/trouve/commit/2bfc1f89ce58e42da0e62533501c57743064622c"
+        },
+        "date": 1783136054839,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "cold index + query",
+            "value": 123.74730056000001,
+            "range": "± 8",
+            "unit": "ms"
+          },
+          {
+            "name": "warm query",
+            "value": 65.03083751999999,
+            "range": "± 1.7",
+            "unit": "ms"
+          },
+          {
+            "name": "incremental (1 file modified)",
+            "value": 75.82692062,
+            "range": "± 1",
+            "unit": "ms"
+          },
+          {
+            "name": "non-git warm query",
+            "value": 63.78238518000001,
+            "range": "± 1.5",
             "unit": "ms"
           }
         ]
