@@ -1,7 +1,7 @@
 //! Command-line interface (port of `semble/cli.py`).
 //!
-//! `trouve search|find-related|clear|savings|install|uninstall`, with the
-//! bare `trouve [--content ...]` invocation starting the MCP stdio server,
+//! `trouve search|find-related|stats|clear|savings`, with the bare
+//! `trouve [--content ...]` invocation starting the MCP stdio server,
 //! matching upstream dispatch behaviour.
 
 use std::path::PathBuf;
@@ -114,10 +114,6 @@ enum CliCommand {
         #[command(flatten)]
         content: ContentArgs,
     },
-    /// Interactively configure trouve across coding agents.
-    Install,
-    /// Interactively remove trouve configuration from coding agents.
-    Uninstall,
     /// Internal debug helpers used by the parity harness.
     #[command(hide = true)]
     Debug {
@@ -296,8 +292,6 @@ pub fn main() -> ExitCode {
             ExitCode::SUCCESS
         }
         Some(CliCommand::Stats { path, content }) => run_stats(&path, &content.resolve()),
-        Some(CliCommand::Install) => crate::installer::run(crate::installer::Mode::Install),
-        Some(CliCommand::Uninstall) => crate::installer::run(crate::installer::Mode::Uninstall),
         Some(CliCommand::Debug { command }) => run_debug(command),
     }
 }

@@ -1,7 +1,7 @@
 // Plugin exposing trouve code search as native tools in OpenCode and
 // Kilo Code (whose plugin runtime is identical to OpenCode's).
 //
-// Unlike the standalone tool file that `trouve install` writes (one CLI
+// Unlike the standalone tool file (src/agents/opencode-tool.ts, one CLI
 // process per call), this plugin keeps a single `trouve` server process
 // alive for the whole session and speaks its newline-delimited JSON-RPC
 // protocol directly. That preserves the server's in-process index cache:

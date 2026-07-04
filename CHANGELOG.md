@@ -22,17 +22,16 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   inheritance; `.trouveignore` wins where patterns conflict).
 - **`.semble/` directories** are now skipped during walks, alongside
   `.trouve/`, matching upstream's default ignore list.
-- **Native OpenCode custom tools**: `trouve install` offers a new opt-in
-  "Native tool" integration that writes
-  `~/.config/opencode/tools/trouve.ts`, exposing `trouve_search` and
-  `trouve_find_related` as native OpenCode tools. An alternative to the MCP
-  integration (which remains available and selected by default): it avoids
-  the MCP transport, sidesteps JSONC config files the installer has to
-  skip, and defaults `repo` to the session worktree.
-- Instruction blocks are now written with the tool names the selected
-  integrations expose (`trouve_search`/`trouve_find_related` when the
-  native tool file is installed, `mcp__trouve__search`/
-  `mcp__trouve__find_related` otherwise).
+- **Native OpenCode custom tools**: a standalone custom-tool file
+  (`src/agents/opencode-tool.ts`, copied to
+  `~/.config/opencode/tools/trouve.ts`) exposes `trouve_search` and
+  `trouve_find_related` as native OpenCode tools. An alternative to an MCP
+  entry: it avoids the MCP transport, needs no JSON config edits, and
+  defaults `repo` to the session worktree.
+- **[INSTALL.md](INSTALL.md)**: step-by-step manual setup for every
+  integration route — plugins, the OpenCode native tool file, and MCP
+  server entries (config file, key, and snippet for 14 agents), plus
+  optional `trouve-search` sub-agent files.
 - **23 new tree-sitter grammars** (~50 languages total): CMake, D, Dart, Elm,
   ERB/EJS embedded templates, Erlang, Fortran, Gleam, GraphQL, Groovy,
   HCL/Terraform, Julia, Make, Nix, Objective-C, Perl, PowerShell, Protocol
@@ -65,6 +64,17 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ### Changed
 
 - MSRV raised from 1.87 to 1.89 (std file locking for the clone cache).
+
+### Removed
+
+- **`trouve install` / `trouve uninstall`**: the interactive installer is
+  gone. Every integration it configured is now documented as a manual (and
+  easily reversible) step in [INSTALL.md](INSTALL.md): plugins for
+  OpenCode/Kilo/Claude Code/Codex, the OpenCode native tool file, one MCP
+  config entry per agent, and optional sub-agent files. Editing user
+  configs programmatically was the installer's main risk (JSONC files had
+  to be skipped, TOML edits could clobber user changes); a documented
+  one-line config entry per agent is simpler and safer.
 
 ### Deprecated
 

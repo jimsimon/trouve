@@ -1,6 +1,7 @@
-// Trouve custom tools for OpenCode. Installed by `trouve install` as
-// ~/.config/opencode/tools/trouve.ts; the filename prefixes the exports, so
-// these surface to the model as `trouve_search` and `trouve_find_related`.
+// Trouve custom tools for OpenCode. Install by copying this file to
+// ~/.config/opencode/tools/trouve.ts (see INSTALL.md); the filename prefixes
+// the exports, so these surface to the model as `trouve_search` and
+// `trouve_find_related`.
 // Requires the `trouve` binary on PATH (cargo install trouve).
 import { tool } from "@opencode-ai/plugin"
 
