@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1783128625638,
+  "lastUpdate": 1783128676290,
   "repoUrl": "https://github.com/jimsimon/trouve",
   "entries": {
     "e2e-benchmarks": [
@@ -1105,6 +1105,54 @@ window.BENCHMARK_DATA = {
             "name": "dense_query_20k_rows",
             "value": 1382237.3854166667,
             "range": "± 10563",
+            "unit": "ns"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "jim.j.simon@gmail.com",
+            "name": "Jim Simon",
+            "username": "jimsimon"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "81f99b6338ff3eed4521065ee09c7d80d040741e",
+          "message": "Docs cleanup: fix inaccuracies found in review (#23)\n\n- README: Go was fully wired (tree-sitter-go dependency and chunk.rs\n  match arm) but missing from the natively-supported language table.\n- README: the cache-location section paired SEMBLE_CLONE_TIMEOUT with\n  TROUVE_CLONE_TTL, but the TTL is trouve-only; the actual pair is\n  TROUVE_CLONE_TIMEOUT (git network timeout, default 60s), which was\n  undocumented. Document both correctly.\n- CHANGELOG: the 1.0.0 installer entry said eleven coding agents; there\n  are 14 (matching the README).\n- BENCHMARKS: the kubernetes warm-query time appeared as both 0.55s and\n  0.54s; use the headline 0.55s consistently.\n- plugin README: the Claude Code section listed raw MCP tool names\n  while Codex showed the harness-prefixed ones; Claude Code also\n  prefixes (mcp__trouve__*).\n- SearchResult/search module docs now state that reranking changes the\n  score scale, so scores are only comparable within one result list.\n- bm25.rs module doc now notes production indexing tokenizes content\n  and path enrichment separately (index::path_enrichment_tokens) and\n  keeps enrich_for_bm25 as the upstream-reference form.\n- manifest.rs documents the mtime+size fast-path staleness caveat for\n  non-git roots (same trade-off as git's stat-based detection).\n\nCo-authored-by: Cursor Agent <cursoragent@cursor.com>\nCo-authored-by: Jim Simon <jimsimon@users.noreply.github.com>",
+          "timestamp": "2026-07-03T21:29:10-04:00",
+          "tree_id": "8fb7a48d27a0c8e395dbdd851e9d94168ed0ff78",
+          "url": "https://github.com/jimsimon/trouve/commit/81f99b6338ff3eed4521065ee09c7d80d040741e"
+        },
+        "date": 1783128675430,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "bm25_build_5k_docs",
+            "value": 4868656.199999999,
+            "range": "± 9863",
+            "unit": "ns"
+          },
+          {
+            "name": "bm25_query_5k_docs",
+            "value": 36732.088397537766,
+            "range": "± 37",
+            "unit": "ns"
+          },
+          {
+            "name": "chunk_python_200_functions",
+            "value": 2992053.970588235,
+            "range": "± 2325",
+            "unit": "ns"
+          },
+          {
+            "name": "dense_query_20k_rows",
+            "value": 1381049.6510416665,
+            "range": "± 14219",
             "unit": "ns"
           }
         ]
