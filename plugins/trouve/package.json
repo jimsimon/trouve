@@ -1,6 +1,6 @@
 {
   "name": "trouve-plugin",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "trouve code search as native agent tools: OpenCode and Kilo Code plugin backed by a persistent trouve server process. The same directory also packages the Claude Code and Codex plugins.",
   "type": "module",
   "main": "./src/plugin.ts",
