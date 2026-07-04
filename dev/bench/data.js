@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1783136055653,
+  "lastUpdate": 1783136099840,
   "repoUrl": "https://github.com/jimsimon/trouve",
   "entries": {
     "e2e-benchmarks": [
@@ -1585,6 +1585,54 @@ window.BENCHMARK_DATA = {
             "name": "dense_query_20k_rows",
             "value": 1496008.954007286,
             "range": "± 7137",
+            "unit": "ns"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "jim.j.simon@gmail.com",
+            "name": "Jim Simon",
+            "username": "jimsimon"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "2bfc1f89ce58e42da0e62533501c57743064622c",
+          "message": "Prepare the v1.1.0 release (#24)\n\n* Prepare the v1.0.1 release\n\nBump the crate version to 1.0.1 (Cargo.toml, Cargo.lock) and sync the\nplugin manifests via scripts/sync_versions.py. Promote the Unreleased\nchangelog section to 1.0.1 dated 2026-07-04, and add the entries that\nhad not been recorded yet: the model-backed e2e test suite (#21) under\nAdded, and a Fixed section covering .trouveignore in git repos (#15),\nMCP protocol violations (#18), git manifest symlink/conflict handling\n(#17), snapshot compatibility checks (#16), model-loading validation\n(#20), and cache statistics (#19).\n\nCo-authored-by: Jim Simon <jimsimon@users.noreply.github.com>\n\n* Retarget the release as v1.1.0\n\nThe release adds features (clone cache, new grammars, plugins) and\nraises the MSRV, so a minor bump fits SemVer better than a patch.\n\nCo-authored-by: Jim Simon <jimsimon@users.noreply.github.com>\n\n---------\n\nCo-authored-by: Cursor Agent <cursoragent@cursor.com>\nCo-authored-by: Jim Simon <jimsimon@users.noreply.github.com>",
+          "timestamp": "2026-07-03T23:32:52-04:00",
+          "tree_id": "ed8f6317b00d2d2ec8023117dfad99d840f0ed26",
+          "url": "https://github.com/jimsimon/trouve/commit/2bfc1f89ce58e42da0e62533501c57743064622c"
+        },
+        "date": 1783136099014,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "bm25_build_5k_docs",
+            "value": 5149864.199999999,
+            "range": "± 13149",
+            "unit": "ns"
+          },
+          {
+            "name": "bm25_query_5k_docs",
+            "value": 35809.942325457974,
+            "range": "± 5",
+            "unit": "ns"
+          },
+          {
+            "name": "chunk_python_200_functions",
+            "value": 2691118.2894736845,
+            "range": "± 1056",
+            "unit": "ns"
+          },
+          {
+            "name": "dense_query_20k_rows",
+            "value": 1587790.0180995474,
+            "range": "± 10920",
             "unit": "ns"
           }
         ]
