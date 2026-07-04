@@ -30,14 +30,27 @@ fn e2e_env() -> Option<&'static str> {
         // The cache must stay isolated per run (tests assert cold-build
         // stats), but dirs from previous runs are stale: sweep them so
         // repeated local runs don't accumulate garbage in the temp dir.
+        // Only dirs untouched for an hour are removed, so a concurrent e2e
+        // run in another process never loses its in-use cache (a run takes
+        // seconds, not hours).
+        const STALE_AFTER: std::time::Duration = std::time::Duration::from_secs(3600);
         let temp = std::env::temp_dir();
         if let Ok(entries) = std::fs::read_dir(&temp) {
             for entry in entries.flatten() {
-                if entry
+                if !entry
                     .file_name()
                     .to_string_lossy()
                     .starts_with("trouve-e2e-cache-")
                 {
+                    continue;
+                }
+                let stale = entry
+                    .metadata()
+                    .and_then(|m| m.modified())
+                    .ok()
+                    .and_then(|mtime| mtime.elapsed().ok())
+                    .is_some_and(|age| age > STALE_AFTER);
+                if stale {
                     let _ = std::fs::remove_dir_all(entry.path());
                 }
             }
