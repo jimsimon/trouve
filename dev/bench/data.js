@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1783136099840,
+  "lastUpdate": 1783136627809,
   "repoUrl": "https://github.com/jimsimon/trouve",
   "entries": {
     "e2e-benchmarks": [
@@ -815,6 +815,54 @@ window.BENCHMARK_DATA = {
             "name": "non-git warm query",
             "value": 63.78238518000001,
             "range": "± 1.5",
+            "unit": "ms"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "29139614+renovate[bot]@users.noreply.github.com",
+            "name": "renovate[bot]",
+            "username": "renovate[bot]"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "c91ecc6c314d8864b51eae3288c873ebf258d20e",
+          "message": "Update Rust crate hf-hub to 0.5 (#26)\n\nCo-authored-by: renovate[bot] <29139614+renovate[bot]@users.noreply.github.com>",
+          "timestamp": "2026-07-03T23:42:17-04:00",
+          "tree_id": "f63dbcac5c01411c09859252cc50bdca7724b877",
+          "url": "https://github.com/jimsimon/trouve/commit/c91ecc6c314d8864b51eae3288c873ebf258d20e"
+        },
+        "date": 1783136627393,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "cold index + query",
+            "value": 128.52630710000003,
+            "range": "± 15",
+            "unit": "ms"
+          },
+          {
+            "name": "warm query",
+            "value": 66.30452222000001,
+            "range": "± 1.3",
+            "unit": "ms"
+          },
+          {
+            "name": "incremental (1 file modified)",
+            "value": 78.49268978,
+            "range": "± 2.1",
+            "unit": "ms"
+          },
+          {
+            "name": "non-git warm query",
+            "value": 67.7114693,
+            "range": "± 3.2",
             "unit": "ms"
           }
         ]
