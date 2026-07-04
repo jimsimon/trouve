@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1783136791859,
+  "lastUpdate": 1783207672543,
   "repoUrl": "https://github.com/jimsimon/trouve",
   "entries": {
     "e2e-benchmarks": [
@@ -911,6 +911,54 @@ window.BENCHMARK_DATA = {
             "name": "non-git warm query",
             "value": 64.59236098000001,
             "range": "± 2",
+            "unit": "ms"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "29139614+renovate[bot]@users.noreply.github.com",
+            "name": "renovate[bot]",
+            "username": "renovate[bot]"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "7004a2a98053e8320d523b48200e278e8ff39370",
+          "message": "Update GitHub Actions (#32)\n\nCo-authored-by: renovate[bot] <29139614+renovate[bot]@users.noreply.github.com>",
+          "timestamp": "2026-07-04T19:26:34-04:00",
+          "tree_id": "bba5eb324419f0128078061d0e8f75a54e3ffe48",
+          "url": "https://github.com/jimsimon/trouve/commit/7004a2a98053e8320d523b48200e278e8ff39370"
+        },
+        "date": 1783207672064,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "cold index + query",
+            "value": 128.34505474,
+            "range": "± 6.7",
+            "unit": "ms"
+          },
+          {
+            "name": "warm query",
+            "value": 65.6720786,
+            "range": "± 2.5",
+            "unit": "ms"
+          },
+          {
+            "name": "incremental (1 file modified)",
+            "value": 75.51961360000001,
+            "range": "± 1.5",
+            "unit": "ms"
+          },
+          {
+            "name": "non-git warm query",
+            "value": 62.901922080000006,
+            "range": "± 1.2",
             "unit": "ms"
           }
         ]
