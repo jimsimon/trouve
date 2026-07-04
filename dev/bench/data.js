@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1783136627809,
+  "lastUpdate": 1783136666514,
   "repoUrl": "https://github.com/jimsimon/trouve",
   "entries": {
     "e2e-benchmarks": [
@@ -1681,6 +1681,54 @@ window.BENCHMARK_DATA = {
             "name": "dense_query_20k_rows",
             "value": 1587790.0180995474,
             "range": "± 10920",
+            "unit": "ns"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "29139614+renovate[bot]@users.noreply.github.com",
+            "name": "renovate[bot]",
+            "username": "renovate[bot]"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "c91ecc6c314d8864b51eae3288c873ebf258d20e",
+          "message": "Update Rust crate hf-hub to 0.5 (#26)\n\nCo-authored-by: renovate[bot] <29139614+renovate[bot]@users.noreply.github.com>",
+          "timestamp": "2026-07-03T23:42:17-04:00",
+          "tree_id": "f63dbcac5c01411c09859252cc50bdca7724b877",
+          "url": "https://github.com/jimsimon/trouve/commit/c91ecc6c314d8864b51eae3288c873ebf258d20e"
+        },
+        "date": 1783136666189,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "bm25_build_5k_docs",
+            "value": 5029117.111111111,
+            "range": "± 10520",
+            "unit": "ns"
+          },
+          {
+            "name": "bm25_query_5k_docs",
+            "value": 37051.01833696442,
+            "range": "± 24",
+            "unit": "ns"
+          },
+          {
+            "name": "chunk_python_200_functions",
+            "value": 3010857.117647059,
+            "range": "± 3443",
+            "unit": "ns"
+          },
+          {
+            "name": "dense_query_20k_rows",
+            "value": 1382288.0886235074,
+            "range": "± 11259",
             "unit": "ns"
           }
         ]
