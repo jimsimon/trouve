@@ -304,17 +304,21 @@ mod tests {
     use std::fs;
     use std::process::Command;
 
-    fn git(root: &Path, args: &[&str]) {
-        let status = Command::new("git")
-            .arg("-C")
+    /// A git command with a deterministic identity (CI runners have none).
+    fn git_command(root: &Path, args: &[&str]) -> Command {
+        let mut cmd = Command::new("git");
+        cmd.arg("-C")
             .arg(root)
             .args(args)
             .env("GIT_AUTHOR_NAME", "t")
             .env("GIT_AUTHOR_EMAIL", "t@t")
             .env("GIT_COMMITTER_NAME", "t")
-            .env("GIT_COMMITTER_EMAIL", "t@t")
-            .output()
-            .unwrap();
+            .env("GIT_COMMITTER_EMAIL", "t@t");
+        cmd
+    }
+
+    fn git(root: &Path, args: &[&str]) {
+        let status = git_command(root, args).output().unwrap();
         assert!(status.status.success(), "git {args:?} failed");
     }
 
@@ -416,18 +420,9 @@ mod tests {
         git(root, &["add", "."]);
         git(root, &["commit", "-m", "main"]);
         // The merge fails with a conflict, leaving stage-1/2/3 index entries.
-        // Committer identity must be set (like the `git` helper does) or git
-        // refuses to even start the merge on hosts without a global config.
-        let out = Command::new("git")
-            .arg("-C")
-            .arg(root)
-            .args(["merge", "side"])
-            .env("GIT_AUTHOR_NAME", "t")
-            .env("GIT_AUTHOR_EMAIL", "t@t")
-            .env("GIT_COMMITTER_NAME", "t")
-            .env("GIT_COMMITTER_EMAIL", "t@t")
-            .output()
-            .unwrap();
+        // Committer identity must be set or git refuses to even start the
+        // merge on hosts without a global config.
+        let out = git_command(root, &["merge", "side"]).output().unwrap();
         assert!(!out.status.success(), "merge should conflict");
         let unmerged = run_git(root, &["ls-files", "-u"]).unwrap_or_default();
         assert!(!unmerged.is_empty(), "expected unmerged index entries");
