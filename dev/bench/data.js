@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1783124219645,
+  "lastUpdate": 1783124300511,
   "repoUrl": "https://github.com/jimsimon/trouve",
   "entries": {
     "e2e-benchmarks": [
@@ -479,6 +479,54 @@ window.BENCHMARK_DATA = {
             "name": "non-git warm query",
             "value": 60.8970364,
             "range": "± 1.2",
+            "unit": "ms"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "jim.j.simon@gmail.com",
+            "name": "Jim Simon",
+            "username": "jimsimon"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "600ffaa2e2445d200c7048ae841b2093619dfdb2",
+          "message": "Report snapshot reuse separately and add the documented cache hit rate (#19)\n\nBuildStats.files_from_store counted every non-recomputed file,\nincluding rows spliced zero-copy out of a previous snapshot — after a\npatch build the stats implied store reads that never happened, and the\nexact-match snapshot load reported the whole manifest as store hits.\nTrack files_from_snapshot separately and only count real store reads\nin files_from_store.\n\nThe stats subcommand help, README, and DIFFERENCES.md all promised a\ncache hit rate that the output never included; trouve stats now emits\ncache_hit_rate (files reused from any cache layer over files_total)\nalongside the per-layer counts.\n\nCo-authored-by: Cursor Agent <cursoragent@cursor.com>\nCo-authored-by: Jim Simon <jimsimon@users.noreply.github.com>",
+          "timestamp": "2026-07-03T20:15:20-04:00",
+          "tree_id": "4651f6562da6d13513c1e11e24fcf6b6b588ec85",
+          "url": "https://github.com/jimsimon/trouve/commit/600ffaa2e2445d200c7048ae841b2093619dfdb2"
+        },
+        "date": 1783124299698,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "cold index + query",
+            "value": 115.83488864,
+            "range": "± 7.3",
+            "unit": "ms"
+          },
+          {
+            "name": "warm query",
+            "value": 58.6285584,
+            "range": "± 0.9",
+            "unit": "ms"
+          },
+          {
+            "name": "incremental (1 file modified)",
+            "value": 70.10730076,
+            "range": "± 0.7",
+            "unit": "ms"
+          },
+          {
+            "name": "non-git warm query",
+            "value": 57.67109850000001,
+            "range": "± 2.6",
             "unit": "ms"
           }
         ]
