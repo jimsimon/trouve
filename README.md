@@ -70,7 +70,6 @@ trouve find-related src/auth.py 42 ./my-project
 trouve stats ./my-project        # index + cache-hit stats
 trouve savings                   # token savings report
 trouve clear all                 # wipe stores + savings
-trouve install                   # configure MCP/instructions across agents
 trouve                           # run as an MCP stdio server
 ```
 
@@ -81,18 +80,19 @@ trouve                           # run as an MCP stdio server
 
 There are three ways to wire trouve into a coding agent, plus the CLI as a
 universal fallback. Pick **one per agent** — they expose the same tools, so
-combining them shows the model duplicates.
+combining them shows the model duplicates. [INSTALL.md](INSTALL.md) has
+step-by-step instructions for every route and agent.
 
-| Aspect | Plugin: OpenCode / Kilo | Plugin: Claude Code / Codex | `trouve install` | CLI only |
-| --- | --- | --- | --- | --- |
-| Agents | OpenCode, Kilo Code | Claude Code, Codex | 14 agents (Cursor, Gemini, Copilot, VS Code, Windsurf, Zed, …) | anything with a shell |
-| Tool surface | native `trouve_search` / `trouve_find_related` | MCP (`mcp__trouve__*`) | MCP (`mcp__trouve__*`); opt-in native tool file for OpenCode | `trouve` CLI via bash |
-| trouve process | one persistent server per session | one MCP server per session | one MCP server per session | one process per call |
-| In-session index cache (incl. remote URLs) | yes | yes | yes | disk store only |
-| Index warmed at session start | yes, + re-warm on idle turns | Claude: yes (hook) · Codex: no | no | no |
-| Bundled guidance | rich tool descriptions | workflow skill (+ sub-agent on Claude) | instructions block + sub-agent | sub-agent docs |
-| What it touches | one `plugin` entry in your config | managed by the plugin marketplace | writes agent config files (JSON/TOML/Markdown) | nothing |
-| Updates | npm (`latest` or pinned) | marketplace update | rerun `trouve install` | with the binary |
+| Aspect | Plugin: OpenCode / Kilo | Plugin: Claude Code / Codex | Native tool file | MCP entry | CLI only |
+| --- | --- | --- | --- | --- | --- |
+| Agents | OpenCode, Kilo Code | Claude Code, Codex | OpenCode | any MCP-capable agent (Cursor, Gemini, Copilot, VS Code, Windsurf, Zed, …) | anything with a shell |
+| Tool surface | native `trouve_search` / `trouve_find_related` | MCP (`mcp__trouve__*`) | native `trouve_search` / `trouve_find_related` | MCP (`mcp__trouve__*`) | `trouve` CLI via bash |
+| trouve process | one persistent server per session | one MCP server per session | one process per call | one MCP server per session | one process per call |
+| In-session index cache (incl. remote URLs) | yes | yes | disk store only | yes | disk store only |
+| Index warmed at session start | yes, + re-warm on idle turns | Claude: yes (hook) · Codex: no | no | no | no |
+| Bundled guidance | rich tool descriptions | workflow skill (+ sub-agent on Claude) | rich tool descriptions | tool descriptions | sub-agent docs |
+| Setup | one `plugin` entry in your config | managed by the plugin marketplace | copy one file | one config entry | nothing |
+| Updates | npm (`latest` or pinned) | marketplace update | re-copy the file | with the binary | with the binary |
 
 How to choose:
 
@@ -102,18 +102,17 @@ How to choose:
   plugin also avoids MCP entirely: tools are native, and the persistent
   server keeps remote-repository indexes cached across calls within a
   session.
-- **Use `trouve install` for everything else.** The interactive installer
-  covers a much wider set of agents by editing their config files directly
-  (an MCP entry, an instructions block, and a `trouve-search` sub-agent per
-  agent, each selectable). For OpenCode it also offers an opt-in "Native
-  tool" integration — a custom-tool file at
-  `~/.config/opencode/tools/trouve.ts` exposing `trouve_search` /
+- **For OpenCode without npm, use the native tool file**: copy
+  [`src/agents/opencode-tool.ts`](src/agents/opencode-tool.ts) to
+  `~/.config/opencode/tools/trouve.ts`. It exposes `trouve_search` /
   `trouve_find_related` with no MCP server process and no JSON config
-  edits; it provides the same capabilities as the MCP entry under
-  different tool names, so enable one or the other. The installer's
-  trade-off is that it writes into your existing configs — files with
-  JSONC comments are skipped and reported — and updates mean re-running
-  it. `trouve uninstall` reverses everything it wrote.
+  edits; it provides the same capabilities as an MCP entry under different
+  tool names, so enable one or the other.
+- **Add an MCP entry for everything else.** `trouve` with no subcommand is
+  an MCP stdio server; one `{"command": "trouve"}` entry in your agent's
+  MCP config is all it takes. [INSTALL.md](INSTALL.md#3-mcp-server-entry)
+  lists the exact file and snippet for 14 agents, plus optional
+  `trouve-search` sub-agent files you can copy alongside.
 - **The CLI needs no setup at all** and is what sub-agents without tool
   access fall back to; every approach above shares the same on-disk index
   store, so mixing CLI use with any other route costs nothing.
@@ -135,9 +134,12 @@ See the [plugin README](plugins/trouve/README.md) for details.
 
 ## Ignoring files
 
-`.gitignore` files are honoured per directory. To exclude files from indexing
-only (without git-ignoring them), add patterns to a `.trouveignore` file —
-same syntax, same per-directory inheritance. Upstream's `.sembleignore` is
+`.gitignore` files are honoured per directory (in a git repository, git's own
+ignore rules decide which untracked files are seen; tracked files are always
+candidates). To exclude files from indexing only (without git-ignoring them),
+add patterns to a `.trouveignore` file — same syntax, same per-directory
+inheritance. `.trouveignore` applies in git and non-git roots alike, to
+tracked and untracked files. Upstream's `.sembleignore` is
 still honoured for backwards compatibility, but is deprecated and will be
 removed in a future release; rename it to `.trouveignore`.
 
@@ -161,7 +163,7 @@ Natively supported languages:
 
 | | |
 | --- | --- |
-| Systems | C, C++, D, Fortran, Objective-C, Rust, Swift, Zig |
+| Systems | C, C++, D, Fortran, Go, Objective-C, Rust, Swift, Zig |
 | Managed / JVM | C#, Groovy, Java, Kotlin, Scala |
 | Scripting | Bash, Lua, Perl, PHP, PowerShell, Python, R, Ruby |
 | Web | CSS, HTML, JavaScript/JSX, Svelte, TSX, TypeScript |
@@ -179,12 +181,16 @@ two-line change (a dependency in `Cargo.toml` and a match arm in
 
 Resolved in order: `TROUVE_CACHE_LOCATION` (absolute path), then the platform
 cache dir (`~/.cache/trouve` on Linux). Set `TROUVE_MODEL_NAME` to override
-the embedding model.
+the embedding model, and `TROUVE_CLONE_TIMEOUT` (seconds, default 60) to
+adjust the git network timeout used when cloning or fetching remote
+repositories.
 
 The upstream semble environment variables (`SEMBLE_CACHE_LOCATION`,
 `SEMBLE_MODEL_NAME`, `SEMBLE_CLONE_TIMEOUT`) are still honoured as fallbacks
-when the `TROUVE_*` equivalent is unset, but are deprecated and will be
-removed in a future release.
+when the corresponding `TROUVE_CACHE_LOCATION`, `TROUVE_MODEL_NAME`, or
+`TROUVE_CLONE_TIMEOUT` is unset, but are deprecated and will be removed in a
+future release. (`TROUVE_CLONE_TTL`, below, is trouve-only and has no semble
+fallback.)
 
 The store garbage-collects itself: after a snapshot write (at most once per
 day per store), entries not referenced by any kept snapshot are deleted, with

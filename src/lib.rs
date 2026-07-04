@@ -11,7 +11,6 @@ pub mod clone_cache;
 pub mod dense;
 pub mod embed;
 pub mod index;
-pub mod installer;
 pub mod languages;
 pub mod manifest;
 pub mod mcp;

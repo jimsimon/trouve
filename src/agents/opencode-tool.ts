@@ -1,6 +1,7 @@
-// Trouve custom tools for OpenCode. Installed by `trouve install` as
-// ~/.config/opencode/tools/trouve.ts; the filename prefixes the exports, so
-// these surface to the model as `trouve_search` and `trouve_find_related`.
+// Trouve custom tools for OpenCode. Install by copying this file to
+// ~/.config/opencode/tools/trouve.ts (see INSTALL.md); the filename prefixes
+// the exports, so these surface to the model as `trouve_search` and
+// `trouve_find_related`.
 // Requires the `trouve` binary on PATH (cargo install trouve).
 import { tool } from "@opencode-ai/plugin"
 
@@ -26,7 +27,8 @@ const MAX_SNIPPET_LINES = tool.schema
   .optional()
   .describe(
     "Lines of source per result. Default (10): signature + first body lines, enough to " +
-      "confirm the location. 0: file path and line range only.",
+      "confirm the location. 0: file path and line range only. Larger values include " +
+      "more, up to the full chunk.",
   )
 
 const CONTENT = tool.schema

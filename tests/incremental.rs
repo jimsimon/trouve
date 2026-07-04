@@ -42,19 +42,21 @@ fn non_git_incremental_reuses_cache() {
     assert_eq!(index.build_stats.files_computed, 3);
     assert_eq!(index.build_stats.files_from_store, 0);
 
-    // Second build: everything comes from the store.
+    // Second build: everything comes from the assembled snapshot.
     let index = TrouveIndex::from_path(root, CODE, Some(model)).unwrap();
-    assert_eq!(index.build_stats.files_from_store, 3);
+    assert_eq!(index.build_stats.files_from_snapshot, 3);
+    assert_eq!(index.build_stats.files_from_store, 0);
     assert_eq!(index.build_stats.files_computed, 0);
 
-    // Touch one file: exactly one file recomputed.
+    // Touch one file: exactly one file recomputed, the rest spliced from
+    // the previous snapshot.
     write_file(
         root,
         "src/auth.py",
         "def authenticate(user, password, token):\n    session = login(user, password, token)\n    return session\n",
     );
     let index = TrouveIndex::from_path(root, CODE, Some(model)).unwrap();
-    assert_eq!(index.build_stats.files_from_store, 2);
+    assert_eq!(index.build_stats.files_from_snapshot, 2);
     assert_eq!(index.build_stats.files_computed, 1);
 
     // New file: one more computation, existing entries reused.
@@ -100,13 +102,13 @@ fn git_repo_uses_blob_oids_and_shares_across_branches() {
 
     let index = TrouveIndex::from_path(root, CODE, Some(model)).unwrap();
     assert_eq!(index.build_stats.files_computed, 1, "only the edited file");
-    assert_eq!(index.build_stats.files_from_store, 2);
+    assert_eq!(index.build_stats.files_reused(), 2);
 
-    // Switching back to main: everything is already in the shared store.
+    // Switching back to main: everything is already cached.
     git(root, &["checkout", "main"]);
     let index = TrouveIndex::from_path(root, CODE, Some(model)).unwrap();
     assert_eq!(index.build_stats.files_computed, 0, "branch switch is free");
-    assert_eq!(index.build_stats.files_from_store, 3);
+    assert_eq!(index.build_stats.files_reused(), 3);
 }
 
 #[test]
@@ -140,7 +142,7 @@ fn worktrees_share_the_store() {
         index.build_stats.files_computed, 0,
         "worktree shares the store"
     );
-    assert_eq!(index.build_stats.files_from_store, 3);
+    assert_eq!(index.build_stats.files_reused(), 3);
 }
 
 #[test]
@@ -305,6 +307,10 @@ fn patched_build_matches_full_rebuild_exactly() {
     let patched = TrouveIndex::from_path(root, CODE, Some(model)).unwrap();
     assert_eq!(patched.build_stats.files_total, 3);
     assert_eq!(patched.build_stats.files_computed, 2, "modified + added");
+    assert_eq!(
+        patched.build_stats.files_from_snapshot, 1,
+        "the untouched file is spliced, not re-read from the store"
+    );
 
     // Force a full assembly of the identical tree by removing all snapshots.
     let identity = root.canonicalize().unwrap().to_string_lossy().into_owned();
@@ -425,9 +431,9 @@ fn from_git_reuses_persistent_clone_and_store() {
     assert_eq!(new_clones.len(), 1, "one clone created for this URL");
     let key = new_clones[0].to_string_lossy().into_owned();
 
-    // Second build: no re-clone (within TTL), everything from the store.
+    // Second build: no re-clone (within TTL), everything cached.
     let index = TrouveIndex::from_git(&url, None, CODE, Some(model)).unwrap();
-    assert_eq!(index.build_stats.files_from_store, 3);
+    assert_eq!(index.build_stats.files_reused(), 3);
     assert_eq!(index.build_stats.files_computed, 0);
 
     // Commit an edit upstream and force a refresh by expiring only this
@@ -442,5 +448,5 @@ fn from_git_reuses_persistent_clone_and_store() {
     std::fs::remove_file(clones_dir.join(format!("{key}.fetched"))).unwrap();
     let index = TrouveIndex::from_git(&url, None, CODE, Some(model)).unwrap();
     assert_eq!(index.build_stats.files_computed, 1);
-    assert_eq!(index.build_stats.files_from_store, 2);
+    assert_eq!(index.build_stats.files_reused(), 2);
 }
