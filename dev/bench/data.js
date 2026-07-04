@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1783207719857,
+  "lastUpdate": 1783207802168,
   "repoUrl": "https://github.com/jimsimon/trouve",
   "entries": {
     "e2e-benchmarks": [
@@ -959,6 +959,54 @@ window.BENCHMARK_DATA = {
             "name": "non-git warm query",
             "value": 62.901922080000006,
             "range": "± 1.2",
+            "unit": "ms"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "29139614+renovate[bot]@users.noreply.github.com",
+            "name": "renovate[bot]",
+            "username": "renovate[bot]"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "53517d96037f6214813ebc5d12c2fa694b717dc2",
+          "message": "Update Rust crate safetensors to 0.8 (#29)\n\nCo-authored-by: renovate[bot] <29139614+renovate[bot]@users.noreply.github.com>",
+          "timestamp": "2026-07-04T19:27:12-04:00",
+          "tree_id": "da51fbf85cc8e5598253114f075640587c026113",
+          "url": "https://github.com/jimsimon/trouve/commit/53517d96037f6214813ebc5d12c2fa694b717dc2"
+        },
+        "date": 1783207801712,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "cold index + query",
+            "value": 128.4568336,
+            "range": "± 15.2",
+            "unit": "ms"
+          },
+          {
+            "name": "warm query",
+            "value": 67.83514738,
+            "range": "± 1.3",
+            "unit": "ms"
+          },
+          {
+            "name": "incremental (1 file modified)",
+            "value": 78.40674848,
+            "range": "± 1",
+            "unit": "ms"
+          },
+          {
+            "name": "non-git warm query",
+            "value": 67.10799932,
+            "range": "± 1.6",
             "unit": "ms"
           }
         ]
