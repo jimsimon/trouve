@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1783132885474,
+  "lastUpdate": 1783132930230,
   "repoUrl": "https://github.com/jimsimon/trouve",
   "entries": {
     "e2e-benchmarks": [
@@ -1393,6 +1393,54 @@ window.BENCHMARK_DATA = {
             "name": "dense_query_20k_rows",
             "value": 1326441.8767131744,
             "range": "± 9875",
+            "unit": "ns"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "jim.j.simon@gmail.com",
+            "name": "Jim Simon",
+            "username": "jimsimon"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "5ba3b9f376a370459e2cfc5e034ebb384b86c0ce",
+          "message": "Validate model artifacts at load time; never panic on tokenizer failure (#20)\n\n* Validate model artifacts at load time; never panic on tokenizer failure\n\npool_into slices the embedding table without bounds checks, trusting\nthat every token id resolves to a valid row. That held for intact\nmodel files but a corrupt or mismatched model.safetensors (truncated\ndownload, wrong mapping tensor) would panic mid-index. Validate at\nload instead, keeping the pooling hot path branch-free:\n\n- decode_mapping rejects negative or out-of-range entries (negative\n  i64s previously wrapped to huge u32 row indexes);\n- the vocabulary size must be covered by the mapping tensor (when\n  present) or fit the embedding table (when absent).\n\nThe HF tokenizer fallback path used .expect(\"tokenization failed\"),\nturning any tokenizer error into a process abort — during an index\nbuild that is one bad text killing the whole run. Failed texts now\nembed as the zero vector (BM25 still covers them) with a one-time\nwarning on stderr.\n\nCo-authored-by: Jim Simon <jimsimon@users.noreply.github.com>\n\n* Validate token ids against the highest assigned id, not the vocab count\n\nReview feedback: get_vocab_size(true) counts tokens, but token id\nassignments can have gaps, so an id can exceed the count and still\nindex past the mapping/table with the count-based check. Compute the\nid space as max assigned id + 1 from get_vocab(true) and validate\nmapping length / table rows against that, which bounds every id the\ntokenizer can emit. Verified the real potion-code-16M model still\nloads and passes embed parity.\n\nCo-authored-by: Jim Simon <jimsimon@users.noreply.github.com>\n\n---------\n\nCo-authored-by: Cursor Agent <cursoragent@cursor.com>\nCo-authored-by: Jim Simon <jimsimon@users.noreply.github.com>",
+          "timestamp": "2026-07-03T22:38:17-04:00",
+          "tree_id": "e9a091cf98a813f99c072b829a55f049c4fead77",
+          "url": "https://github.com/jimsimon/trouve/commit/5ba3b9f376a370459e2cfc5e034ebb384b86c0ce"
+        },
+        "date": 1783132929446,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "bm25_build_5k_docs",
+            "value": 4810088.545454545,
+            "range": "± 6581",
+            "unit": "ns"
+          },
+          {
+            "name": "bm25_query_5k_docs",
+            "value": 37103.988343480465,
+            "range": "± 24",
+            "unit": "ns"
+          },
+          {
+            "name": "chunk_python_200_functions",
+            "value": 2966385.1176470593,
+            "range": "± 2185",
+            "unit": "ns"
+          },
+          {
+            "name": "dense_query_20k_rows",
+            "value": 1366434.5661656891,
+            "range": "± 11725",
             "unit": "ns"
           }
         ]
