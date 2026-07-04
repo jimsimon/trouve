@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1783128763663,
+  "lastUpdate": 1783128804820,
   "repoUrl": "https://github.com/jimsimon/trouve",
   "entries": {
     "e2e-benchmarks": [
@@ -1201,6 +1201,54 @@ window.BENCHMARK_DATA = {
             "name": "dense_query_20k_rows",
             "value": 1381049.6510416665,
             "range": "± 14219",
+            "unit": "ns"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "jim.j.simon@gmail.com",
+            "name": "Jim Simon",
+            "username": "jimsimon"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "4531a5660d5457b4b8379a1de306b0a15b1132da",
+          "message": "Honor .trouveignore in git repositories (#15)\n\n* Honor .trouveignore in git repositories\n\n.trouveignore (and the deprecated .sembleignore) were only consulted by\nthe directory walker, which is used for non-git roots. Git repositories\nbuild their manifest from git ls-files / git status, so the documented\n'exclude from indexing without git-ignoring' behaviour silently did\nnothing in the primary use case.\n\nApply .trouveignore rules (per-directory, gitignore semantics, deepest\nmatch wins) on top of the git file listing, for tracked and untracked\nfiles alike. .gitignore is intentionally not re-applied there: git\nitself decides what is tracked or untracked.\n\nCo-authored-by: Jim Simon <jimsimon@users.noreply.github.com>\n\n* Apply .trouveignore before hashing to avoid wasted I/O\n\nReview feedback: the filter previously ran after dirty tracked files\nand untracked files had already been read and hashed, so excluded\nfiles (e.g. a large generated tree) paid full I/O before being\ndropped. Check the ignore rules in the tracked-file loop before the\ndirty-hash, and pre-filter the untracked list sequentially before the\nparallel hash step (TrouveIgnore caches specs behind &mut self, so it\ncannot be shared across the par_iter).\n\nCo-authored-by: Jim Simon <jimsimon@users.noreply.github.com>\n\n---------\n\nCo-authored-by: Cursor Agent <cursoragent@cursor.com>\nCo-authored-by: Jim Simon <jimsimon@users.noreply.github.com>",
+          "timestamp": "2026-07-03T21:29:49-04:00",
+          "tree_id": "3464dcaf1ad2c48de4a0f5f5c3dff259528ae412",
+          "url": "https://github.com/jimsimon/trouve/commit/4531a5660d5457b4b8379a1de306b0a15b1132da"
+        },
+        "date": 1783128803959,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "bm25_build_5k_docs",
+            "value": 4854256.454545455,
+            "range": "± 10844",
+            "unit": "ns"
+          },
+          {
+            "name": "bm25_query_5k_docs",
+            "value": 36828.43239883402,
+            "range": "± 36",
+            "unit": "ns"
+          },
+          {
+            "name": "chunk_python_200_functions",
+            "value": 3010682.676470588,
+            "range": "± 3456",
+            "unit": "ns"
+          },
+          {
+            "name": "dense_query_20k_rows",
+            "value": 1341104.0014285715,
+            "range": "± 9935",
             "unit": "ns"
           }
         ]
