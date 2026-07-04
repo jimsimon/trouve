@@ -144,6 +144,12 @@ fn git_manifest(root: &Path, extensions: &HashSet<String>) -> Result<Vec<FileRec
     let mut records: Vec<FileRecord> = Vec::new();
     let mut seen: HashSet<String> = HashSet::new();
 
+    // `.trouveignore` excludes files from indexing without git-ignoring
+    // them, so it must be applied on top of the git file listing (git only
+    // honours `.gitignore` for untracked files). Checked before hashing so
+    // excluded files (e.g. a large generated tree) are never read.
+    let mut trouve_ignore = TrouveIgnore::new(root);
+
     for line in ls.split('\0').filter(|s| !s.is_empty()) {
         // Format: "<mode> <oid> <stage>\t<path>"
         let Some((meta, path)) = line.split_once('\t') else {
@@ -156,6 +162,7 @@ fn git_manifest(root: &Path, extensions: &HashSet<String>) -> Result<Vec<FileRec
         if deleted.contains(&rel)
             || !matches_extension(&rel, extensions)
             || in_default_ignored_dir(&rel)
+            || trouve_ignore.is_ignored(&rel)
         {
             continue;
         }
@@ -181,13 +188,20 @@ fn git_manifest(root: &Path, extensions: &HashSet<String>) -> Result<Vec<FileRec
         }
     }
 
-    // Untracked (but not gitignored) files, hashed directly.
+    // Untracked (but not gitignored) files, hashed directly. The ignore
+    // check runs sequentially first (`TrouveIgnore` caches per-directory
+    // specs behind `&mut self`), so excluded files skip the parallel hash.
+    let untracked: Vec<String> = untracked
+        .into_iter()
+        .filter(|rel| {
+            matches_extension(rel, extensions)
+                && !in_default_ignored_dir(rel)
+                && !trouve_ignore.is_ignored(rel)
+        })
+        .collect();
     let hashed: Vec<Option<FileRecord>> = untracked
         .par_iter()
         .map(|rel| {
-            if !matches_extension(rel, extensions) || in_default_ignored_dir(rel) {
-                return None;
-            }
             let abs = root.join(rel);
             if abs.symlink_metadata().ok()?.is_symlink() {
                 return None;
@@ -205,12 +219,6 @@ fn git_manifest(root: &Path, extensions: &HashSet<String>) -> Result<Vec<FileRec
             records.push(record);
         }
     }
-
-    // `.trouveignore` excludes files from indexing without git-ignoring
-    // them, so it must be applied on top of the git file listing (git only
-    // honours `.gitignore` for untracked files).
-    let mut trouve_ignore = TrouveIgnore::new(root);
-    records.retain(|r| !trouve_ignore.is_ignored(&r.rel_path));
 
     records.sort_by(|a, b| a.rel_path.cmp(&b.rel_path));
     Ok(records)
