@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1783207802168,
+  "lastUpdate": 1783207859004,
   "repoUrl": "https://github.com/jimsimon/trouve",
   "entries": {
     "e2e-benchmarks": [
@@ -1969,6 +1969,54 @@ window.BENCHMARK_DATA = {
             "name": "dense_query_20k_rows",
             "value": 1371828.8442124736,
             "range": "± 8766",
+            "unit": "ns"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "29139614+renovate[bot]@users.noreply.github.com",
+            "name": "renovate[bot]",
+            "username": "renovate[bot]"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "53517d96037f6214813ebc5d12c2fa694b717dc2",
+          "message": "Update Rust crate safetensors to 0.8 (#29)\n\nCo-authored-by: renovate[bot] <29139614+renovate[bot]@users.noreply.github.com>",
+          "timestamp": "2026-07-04T19:27:12-04:00",
+          "tree_id": "da51fbf85cc8e5598253114f075640587c026113",
+          "url": "https://github.com/jimsimon/trouve/commit/53517d96037f6214813ebc5d12c2fa694b717dc2"
+        },
+        "date": 1783207858748,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "bm25_build_5k_docs",
+            "value": 4903957.954545455,
+            "range": "± 9691",
+            "unit": "ns"
+          },
+          {
+            "name": "bm25_query_5k_docs",
+            "value": 36854.43462962963,
+            "range": "± 36",
+            "unit": "ns"
+          },
+          {
+            "name": "chunk_python_200_functions",
+            "value": 2972042.6470588236,
+            "range": "± 1207",
+            "unit": "ns"
+          },
+          {
+            "name": "dense_query_20k_rows",
+            "value": 1391938.156976744,
+            "range": "± 8074",
             "unit": "ns"
           }
         ]
