@@ -46,7 +46,7 @@ keyed by a hash of the manifest, which enables two fast paths:
 
 - **Warm query** (nothing changed): the snapshot is memory-mapped and
   embeddings/BM25 postings are used zero-copy straight out of the mapping —
-  0.54 s end-to-end on kubernetes, most of it model load and `git status`.
+  0.55 s end-to-end on kubernetes, most of it model load and `git status`.
 - **Incremental** (a few files changed): the newest snapshot is diffed
   against the new manifest; unchanged rows are spliced out of the old
   mapping and only changed files are re-chunked/re-embedded. BM25 postings

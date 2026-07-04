@@ -77,6 +77,13 @@ impl Chunk {
 }
 
 /// A single search result with score and source chunk index.
+///
+/// The meaning and scale of `score` depend on how the search was run: with
+/// reranking (the default) it is a rerank score — RRF fusion values scaled
+/// by boost multipliers, penalties, and per-file saturation decay — while
+/// without reranking it is the raw alpha-weighted RRF fusion value (order
+/// of `1/60`). Scores are only comparable within a single result list, not
+/// across calls with different settings.
 #[derive(Debug, Clone)]
 pub struct SearchResult {
     pub chunk: Chunk,

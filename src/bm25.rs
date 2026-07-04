@@ -3,6 +3,12 @@
 //! Reimplementation of the parts of `bm25s` used by upstream Semble: the
 //! "lucene" scoring variant with k1=1.5, b=0.75, plus `enrich_for_bm25`
 //! from `semble/index/sparse.py`.
+//!
+//! Note that production indexing does not call [`enrich_for_bm25`]: it
+//! tokenizes chunk content and path enrichment separately (see
+//! `crate::index::path_enrichment_tokens`, which yields the same token
+//! multiset without building the concatenated string). The helper is kept
+//! as the reference form of the upstream enrichment and for tests.
 
 use std::path::Path;
 
