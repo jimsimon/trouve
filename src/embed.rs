@@ -222,9 +222,37 @@ impl EmbeddingModel {
             Err(_) => None,
         };
         let mapping = match safet.tensor("mapping") {
-            Ok(t) => Some(decode_mapping(&t)?),
+            Ok(t) => Some(decode_mapping(&t, rows)?),
             Err(_) => None,
         };
+
+        // Every token id the tokenizer can emit must resolve to a row inside
+        // the embedding table; validating here keeps the pooling hot path
+        // free of bounds checks and turns a corrupt or mismatched model file
+        // into a load error instead of a panic mid-index. Ids are validated
+        // against the highest assigned id, not the vocabulary *count*: token
+        // ids may have gaps, so the id space can be larger than the count.
+        let id_space = tokenizer
+            .get_vocab(true)
+            .values()
+            .copied()
+            .max()
+            .map(|max_id| max_id as usize + 1)
+            .unwrap_or(0);
+        match &mapping {
+            Some(m) if m.len() < id_space => {
+                return Err(anyhow!(
+                    "mapping tensor covers {} entries but token ids reach {id_space}",
+                    m.len()
+                ));
+            }
+            None if id_space > rows => {
+                return Err(anyhow!(
+                    "token ids reach {id_space} but the embedding table only has {rows} rows"
+                ));
+            }
+            _ => {}
+        }
 
         // Median token length over the model vocab, used for pre-truncation
         // (same computation as model2vec's compute_metadata).
@@ -310,11 +338,22 @@ impl EmbeddingModel {
                 ids.truncate(max);
             }
         } else {
-            let encoding = self
-                .tokenizer
-                .encode_fast(text, false)
-                .expect("tokenization failed");
-            ids.extend_from_slice(encoding.get_ids());
+            match self.tokenizer.encode_fast(text, false) {
+                Ok(encoding) => ids.extend_from_slice(encoding.get_ids()),
+                Err(e) => {
+                    // A panic here would abort a whole index build over one
+                    // text. Embed it as the zero vector instead (BM25 still
+                    // covers it) and say so once.
+                    static WARNED: std::sync::atomic::AtomicBool =
+                        std::sync::atomic::AtomicBool::new(false);
+                    if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                        eprintln!(
+                            "warning: tokenization failed ({e}); affected texts get \
+                             keyword-only (BM25) matching"
+                        );
+                    }
+                }
+            }
         }
 
         if let Some(unk) = self.unk_token_id {
@@ -508,21 +547,31 @@ fn decode_f32s(tensor: &safetensors::tensor::TensorView<'_>) -> Result<Vec<f32>>
     })
 }
 
-/// Decode the vocabulary-quantization row mapping (I64 or I32).
-fn decode_mapping(tensor: &safetensors::tensor::TensorView<'_>) -> Result<Vec<u32>> {
+/// Decode the vocabulary-quantization row mapping (I64 or I32), rejecting
+/// entries that do not index a row of the embedding table (negative values
+/// would otherwise wrap to huge indexes in the `as u32` cast).
+fn decode_mapping(tensor: &safetensors::tensor::TensorView<'_>, rows: usize) -> Result<Vec<u32>> {
     use safetensors::tensor::Dtype;
     let raw = tensor.data();
-    Ok(match tensor.dtype() {
+    let validated = |v: i64| -> Result<u32> {
+        if v < 0 || v as usize >= rows {
+            return Err(anyhow!(
+                "mapping entry {v} outside the embedding table ({rows} rows)"
+            ));
+        }
+        Ok(v as u32)
+    };
+    match tensor.dtype() {
         Dtype::I64 => raw
             .chunks_exact(8)
-            .map(|b| i64::from_le_bytes(b.try_into().unwrap()) as u32)
+            .map(|b| validated(i64::from_le_bytes(b.try_into().unwrap())))
             .collect(),
         Dtype::I32 => raw
             .chunks_exact(4)
-            .map(|b| i32::from_le_bytes(b.try_into().unwrap()) as u32)
+            .map(|b| validated(i64::from(i32::from_le_bytes(b.try_into().unwrap()))))
             .collect(),
-        other => return Err(anyhow!("unsupported mapping dtype: {other:?}")),
-    })
+        other => Err(anyhow!("unsupported mapping dtype: {other:?}")),
+    }
 }
 
 struct ModelFiles {
@@ -576,4 +625,115 @@ fn resolve_model_files(id: &str) -> Result<ModelFiles> {
         model,
         config,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// WordLevel tokenizer with `words` in the vocabulary (plus [UNK] at 0).
+    fn tokenizer_json(words: &[&str]) -> String {
+        let mut vocab = serde_json::Map::new();
+        vocab.insert("[UNK]".to_string(), serde_json::json!(0));
+        for (i, w) in words.iter().enumerate() {
+            vocab.insert((*w).to_string(), serde_json::json!(i + 1));
+        }
+        serde_json::json!({
+            "version": "1.0",
+            "added_tokens": [],
+            "normalizer": {"type": "Lowercase"},
+            "pre_tokenizer": {"type": "Whitespace"},
+            "model": {"type": "WordLevel", "vocab": vocab, "unk_token": "[UNK]"}
+        })
+        .to_string()
+    }
+
+    /// A safetensors file with a `rows x 2` zero embedding table and an
+    /// optional I64 `mapping` tensor.
+    fn safetensors_bytes(rows: usize, mapping: Option<&[i64]>) -> Vec<u8> {
+        let embed_len = rows * 2 * 4;
+        let mut header = serde_json::json!({
+            "embeddings": {"dtype": "F32", "shape": [rows, 2], "data_offsets": [0, embed_len]}
+        });
+        let mut data = vec![0u8; embed_len];
+        if let Some(m) = mapping {
+            let start = data.len();
+            for v in m {
+                data.extend_from_slice(&v.to_le_bytes());
+            }
+            header["mapping"] = serde_json::json!({
+                "dtype": "I64", "shape": [m.len()], "data_offsets": [start, data.len()]
+            });
+        }
+        let header = header.to_string();
+        let mut out = Vec::new();
+        out.extend_from_slice(&(header.len() as u64).to_le_bytes());
+        out.extend_from_slice(header.as_bytes());
+        out.extend_from_slice(&data);
+        out
+    }
+
+    fn write_model(dir: &Path, words: &[&str], rows: usize, mapping: Option<&[i64]>) -> ModelFiles {
+        std::fs::write(dir.join("tokenizer.json"), tokenizer_json(words)).unwrap();
+        std::fs::write(
+            dir.join("model.safetensors"),
+            safetensors_bytes(rows, mapping),
+        )
+        .unwrap();
+        std::fs::write(dir.join("config.json"), r#"{"normalize": true}"#).unwrap();
+        ModelFiles {
+            tokenizer: dir.join("tokenizer.json"),
+            model: dir.join("model.safetensors"),
+            config: dir.join("config.json"),
+        }
+    }
+
+    #[test]
+    fn valid_model_loads_and_embeds() {
+        let dir = tempfile::tempdir().unwrap();
+        let files = write_model(dir.path(), &["alpha", "beta"], 3, None);
+        let model = EmbeddingModel::from_files(&files, "test".into()).unwrap();
+        assert_eq!(model.encode_one("alpha beta").len(), 2);
+    }
+
+    #[test]
+    fn rejects_negative_mapping_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        let files = write_model(dir.path(), &["alpha", "beta"], 3, Some(&[0, 1, -1]));
+        let err = EmbeddingModel::from_files(&files, "test".into())
+            .map(|_| ())
+            .unwrap_err();
+        assert!(err.to_string().contains("mapping entry"), "{err}");
+    }
+
+    #[test]
+    fn rejects_out_of_range_mapping_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        let files = write_model(dir.path(), &["alpha", "beta"], 3, Some(&[0, 1, 3]));
+        let err = EmbeddingModel::from_files(&files, "test".into())
+            .map(|_| ())
+            .unwrap_err();
+        assert!(err.to_string().contains("mapping entry"), "{err}");
+    }
+
+    #[test]
+    fn rejects_mapping_shorter_than_vocab() {
+        let dir = tempfile::tempdir().unwrap();
+        let files = write_model(dir.path(), &["alpha", "beta"], 3, Some(&[0, 1]));
+        let err = EmbeddingModel::from_files(&files, "test".into())
+            .map(|_| ())
+            .unwrap_err();
+        assert!(err.to_string().contains("mapping tensor covers"), "{err}");
+    }
+
+    #[test]
+    fn rejects_table_smaller_than_vocab() {
+        let dir = tempfile::tempdir().unwrap();
+        // 3 vocabulary tokens ([UNK] + 2 words) but only 2 table rows.
+        let files = write_model(dir.path(), &["alpha", "beta"], 2, None);
+        let err = EmbeddingModel::from_files(&files, "test".into())
+            .map(|_| ())
+            .unwrap_err();
+        assert!(err.to_string().contains("embedding table"), "{err}");
+    }
 }
