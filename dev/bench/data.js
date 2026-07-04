@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1783135133577,
+  "lastUpdate": 1783135181706,
   "repoUrl": "https://github.com/jimsimon/trouve",
   "entries": {
     "e2e-benchmarks": [
@@ -1489,6 +1489,54 @@ window.BENCHMARK_DATA = {
             "name": "dense_query_20k_rows",
             "value": 1366434.5661656891,
             "range": "± 11725",
+            "unit": "ns"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "jim.j.simon@gmail.com",
+            "name": "Jim Simon",
+            "username": "jimsimon"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "291d6705cbc26b4d31337f01d17634929c9492c2",
+          "message": "Add the model-backed e2e tests that README and CI already promised (#21)\n\n* Add the model-backed e2e tests that README and CI already promised\n\nREADME documents 'TROUVE_E2E=1 cargo test -- --ignored' as the way to\nrun end-to-end tests that download the model, and test.yml has a\ntest-with-model job running exactly that — but there was not a single\n#[ignore] test in the repo and TROUVE_E2E was never read. The CI job\nexecuted zero tests and passed green.\n\nAdd tests/e2e.rs with two ignored tests gated on TROUVE_E2E:\n\n- index a small fixture project with the real default model\n  (potion-code-16M downloaded from the Hugging Face Hub) and verify\n  semantic and identifier queries rank the right files first, plus\n  find_related excludes the seed;\n- a warm rebuild recomputes nothing and returns identical results.\n\nWithout TROUVE_E2E=1 they skip themselves so a plain\n'cargo test -- --ignored' stays offline-safe. Verified locally: both\ntests pass against the downloaded model, and the skip path passes\noffline.\n\nCo-authored-by: Jim Simon <jimsimon@users.noreply.github.com>\n\n* Address e2e review feedback: strict gate, stale-cache sweep, top-k assertions\n\n- TROUVE_E2E now requires the documented value 1, so TROUVE_E2E=0 (or\n  false) skips instead of downloading the model.\n- The per-run cache dir must stay isolated (tests assert cold-build\n  stats), but previous runs' dirs are now swept at init so repeated\n  local runs no longer accumulate trouve-e2e-cache-* garbage.\n- Ranking assertions check the expected file appears in the top\n  results instead of pinning exact top-1: this suite is a pipeline\n  sanity gate, exact ranking is covered by the parity/quality\n  harnesses, and a model bump or platform float difference must not\n  flake CI. Verified against the real downloaded model.\n\nCo-authored-by: Jim Simon <jimsimon@users.noreply.github.com>\n\n* Only sweep e2e cache dirs untouched for an hour\n\nReview feedback: the unconditional sweep could remove_dir_all the\nstill-in-use cache of a concurrent e2e run in another process,\ncorrupting its in-flight cold-build assertions. Age-gate the sweep to\ndirs whose mtime is over an hour old — a run takes seconds, so a\nconcurrent process's dir is always fresh while genuinely stale dirs\nfrom earlier runs are still cleaned up. Verified: a 2-hour-old dir is\nremoved, a fresh one survives, and the model-backed tests pass.\n\nCo-authored-by: Jim Simon <jimsimon@users.noreply.github.com>\n\n---------\n\nCo-authored-by: Cursor Agent <cursoragent@cursor.com>\nCo-authored-by: Jim Simon <jimsimon@users.noreply.github.com>",
+          "timestamp": "2026-07-03T23:17:38-04:00",
+          "tree_id": "7ea0b1f760e71df97f40163ac7c679051d1f7f45",
+          "url": "https://github.com/jimsimon/trouve/commit/291d6705cbc26b4d31337f01d17634929c9492c2"
+        },
+        "date": 1783135181172,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "bm25_build_5k_docs",
+            "value": 5067241.1,
+            "range": "± 12264",
+            "unit": "ns"
+          },
+          {
+            "name": "bm25_query_5k_docs",
+            "value": 36316.021017316016,
+            "range": "± 5",
+            "unit": "ns"
+          },
+          {
+            "name": "chunk_python_200_functions",
+            "value": 2799300.9444444445,
+            "range": "± 1192",
+            "unit": "ns"
+          },
+          {
+            "name": "dense_query_20k_rows",
+            "value": 1496008.954007286,
+            "range": "± 7137",
             "unit": "ns"
           }
         ]
