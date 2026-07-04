@@ -216,7 +216,8 @@ const MAX_SNIPPET_LINES = tool.schema
   .optional()
   .describe(
     "Lines of source per result. Default (10): signature + first body lines, enough to " +
-      "confirm the location. 0: file path and line range only.",
+      "confirm the location. 0: file path and line range only. Larger values include " +
+      "more, up to the full chunk.",
   )
 
 /** Minimum interval between background index warms. */
