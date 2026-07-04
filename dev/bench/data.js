@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1783124300511,
+  "lastUpdate": 1783124342599,
   "repoUrl": "https://github.com/jimsimon/trouve",
   "entries": {
     "e2e-benchmarks": [
@@ -1009,6 +1009,54 @@ window.BENCHMARK_DATA = {
             "name": "dense_query_20k_rows",
             "value": 1386176.0267737617,
             "range": "± 8925",
+            "unit": "ns"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "jim.j.simon@gmail.com",
+            "name": "Jim Simon",
+            "username": "jimsimon"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "600ffaa2e2445d200c7048ae841b2093619dfdb2",
+          "message": "Report snapshot reuse separately and add the documented cache hit rate (#19)\n\nBuildStats.files_from_store counted every non-recomputed file,\nincluding rows spliced zero-copy out of a previous snapshot — after a\npatch build the stats implied store reads that never happened, and the\nexact-match snapshot load reported the whole manifest as store hits.\nTrack files_from_snapshot separately and only count real store reads\nin files_from_store.\n\nThe stats subcommand help, README, and DIFFERENCES.md all promised a\ncache hit rate that the output never included; trouve stats now emits\ncache_hit_rate (files reused from any cache layer over files_total)\nalongside the per-layer counts.\n\nCo-authored-by: Cursor Agent <cursoragent@cursor.com>\nCo-authored-by: Jim Simon <jimsimon@users.noreply.github.com>",
+          "timestamp": "2026-07-03T20:15:20-04:00",
+          "tree_id": "4651f6562da6d13513c1e11e24fcf6b6b588ec85",
+          "url": "https://github.com/jimsimon/trouve/commit/600ffaa2e2445d200c7048ae841b2093619dfdb2"
+        },
+        "date": 1783124342333,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "bm25_build_5k_docs",
+            "value": 5000658.75,
+            "range": "± 7997",
+            "unit": "ns"
+          },
+          {
+            "name": "bm25_query_5k_docs",
+            "value": 37199.88940329218,
+            "range": "± 39",
+            "unit": "ns"
+          },
+          {
+            "name": "chunk_python_200_functions",
+            "value": 3038219.2352941176,
+            "range": "± 2485",
+            "unit": "ns"
+          },
+          {
+            "name": "dense_query_20k_rows",
+            "value": 1382237.3854166667,
+            "range": "± 10563",
             "unit": "ns"
           }
         ]
