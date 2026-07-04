@@ -416,12 +416,21 @@ mod tests {
         git(root, &["add", "."]);
         git(root, &["commit", "-m", "main"]);
         // The merge fails with a conflict, leaving stage-1/2/3 index entries.
-        let _ = Command::new("git")
+        // Committer identity must be set (like the `git` helper does) or git
+        // refuses to even start the merge on hosts without a global config.
+        let out = Command::new("git")
             .arg("-C")
             .arg(root)
             .args(["merge", "side"])
+            .env("GIT_AUTHOR_NAME", "t")
+            .env("GIT_AUTHOR_EMAIL", "t@t")
+            .env("GIT_COMMITTER_NAME", "t")
+            .env("GIT_COMMITTER_EMAIL", "t@t")
             .output()
             .unwrap();
+        assert!(!out.status.success(), "merge should conflict");
+        let unmerged = run_git(root, &["ls-files", "-u"]).unwrap_or_default();
+        assert!(!unmerged.is_empty(), "expected unmerged index entries");
 
         let identity = detect_repo_identity(root);
         let store = ChunkStore::open_at(root.join(".teststore")).unwrap();
