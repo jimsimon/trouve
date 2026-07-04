@@ -4,7 +4,7 @@ All notable changes to this project are documented in this file. The format
 is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this
 project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [1.1.0] - 2026-07-04
 
 ### Added
 
@@ -60,10 +60,51 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   drifts (`--check`). The release workflow refuses tags that don't match the
   crate version and publishes all npm plugin packages at the crate version
   alongside the crates.io publish (skipped until `NPM_TOKEN` is configured).
+- **Model-backed end-to-end tests**: `TROUVE_E2E=1 cargo test -- --ignored`
+  (already documented in the README and run by CI) now actually runs a small
+  e2e suite against the real default model — cold index, semantic and
+  identifier queries, `find_related`, and a warm rebuild that recomputes
+  nothing.
 
 ### Changed
 
 - MSRV raised from 1.87 to 1.89 (std file locking for the clone cache).
+
+### Fixed
+
+- **`.trouveignore` now works in git repositories**: ignore rules were only
+  consulted by the directory walker (non-git roots); git repositories build
+  their manifest from `git ls-files`/`git status` and skipped them entirely.
+  Rules are now applied on top of the git listing — before any hashing I/O —
+  for tracked and untracked files alike.
+- **MCP protocol violations**: tool failures were returned with
+  `isError: false` (clients treated them as successful output) and a
+  malformed request with an id but no method got no response at all, hanging
+  the client; failures now set `isError: true` and malformed requests get a
+  `-32600 Invalid Request` error. `top_k: 0` is rejected as the schema
+  advertises, and `max_snippet_lines: null` now means the documented default
+  instead of being an undocumented full-chunk escape hatch.
+- **Git manifest correctness**: tracked symlinks were keyed by the blob OID
+  of the link *target path* while indexing read the target file's content,
+  serving stale chunks whenever the target changed; symlinks are now skipped
+  like the walker already did. Merge-conflicted (unmerged) paths are treated
+  as dirty and indexed from the working tree instead of an arbitrary
+  conflict stage.
+- **Snapshot compatibility checks**: snapshots now record the store format
+  version and chunk length, and the incremental patch path rejects
+  mismatches instead of silently splicing rows chunked under different rules
+  (snapshot format bumped to v4; old snapshots are rebuilt automatically).
+  `save()` also verifies a pre-existing snapshot file's embedded hash and
+  rewrites partial or foreign files instead of trusting them forever.
+- **Model loading robustness**: corrupt or mismatched model artifacts
+  (out-of-range mapping entries, undersized embedding tables, token-id gaps)
+  are rejected with a clear error at load time instead of panicking
+  mid-index, and a tokenizer failure on one text now embeds it as the zero
+  vector with a one-time warning instead of aborting the whole build.
+- **Accurate cache statistics**: `files_from_store` no longer counts rows
+  spliced zero-copy from a previous snapshot (reported separately as
+  `files_from_snapshot`), and `trouve stats` now emits the documented
+  `cache_hit_rate`.
 
 ### Removed
 
@@ -141,4 +182,5 @@ semble ([BENCHMARKS.md](BENCHMARKS.md)):
 - Incremental reindex (1 file touched): 0.86 s vs ~3 min (212x)
 - Warm query: 0.55 s vs 7.2 s (13x)
 
+[1.1.0]: https://github.com/jimsimon/trouve/releases/tag/v1.1.0
 [1.0.0]: https://github.com/jimsimon/trouve/releases/tag/v1.0.0
