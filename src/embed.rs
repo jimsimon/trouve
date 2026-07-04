@@ -229,18 +229,26 @@ impl EmbeddingModel {
         // Every token id the tokenizer can emit must resolve to a row inside
         // the embedding table; validating here keeps the pooling hot path
         // free of bounds checks and turns a corrupt or mismatched model file
-        // into a load error instead of a panic mid-index.
-        let vocab_size = tokenizer.get_vocab_size(true);
+        // into a load error instead of a panic mid-index. Ids are validated
+        // against the highest assigned id, not the vocabulary *count*: token
+        // ids may have gaps, so the id space can be larger than the count.
+        let id_space = tokenizer
+            .get_vocab(true)
+            .values()
+            .copied()
+            .max()
+            .map(|max_id| max_id as usize + 1)
+            .unwrap_or(0);
         match &mapping {
-            Some(m) if m.len() < vocab_size => {
+            Some(m) if m.len() < id_space => {
                 return Err(anyhow!(
-                    "mapping tensor covers {} of {vocab_size} vocabulary tokens",
+                    "mapping tensor covers {} entries but token ids reach {id_space}",
                     m.len()
                 ));
             }
-            None if vocab_size > rows => {
+            None if id_space > rows => {
                 return Err(anyhow!(
-                    "vocabulary has {vocab_size} tokens but the embedding table only {rows} rows"
+                    "token ids reach {id_space} but the embedding table only has {rows} rows"
                 ));
             }
             _ => {}
@@ -715,7 +723,7 @@ mod tests {
         let err = EmbeddingModel::from_files(&files, "test".into())
             .map(|_| ())
             .unwrap_err();
-        assert!(err.to_string().contains("vocabulary tokens"), "{err}");
+        assert!(err.to_string().contains("mapping tensor covers"), "{err}");
     }
 
     #[test]
