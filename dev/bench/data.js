@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1783132758301,
+  "lastUpdate": 1783132805932,
   "repoUrl": "https://github.com/jimsimon/trouve",
   "entries": {
     "e2e-benchmarks": [
@@ -1297,6 +1297,54 @@ window.BENCHMARK_DATA = {
             "name": "dense_query_20k_rows",
             "value": 1341104.0014285715,
             "range": "± 9935",
+            "unit": "ns"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "jim.j.simon@gmail.com",
+            "name": "Jim Simon",
+            "username": "jimsimon"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "febd208234caa0db7d972b61cbac0e00b2627403",
+          "message": "Handle tracked symlinks and merge conflicts in the git manifest (#17)\n\n* Handle tracked symlinks and merge conflicts in the git manifest\n\nTracked symlinks were keyed by their git blob OID — the hash of the\nlink target *path* — while indexing read straight through the link and\nchunked the target file's content. The store entry would then serve\nstale content whenever the target changed without the link itself\nbecoming dirty. Skip symlinks (mode 120000) like the walker and the\nuntracked path already do, and guard the dirty-file branch against\ntracked files replaced by symlinks in the working tree (typechange).\n\nUnmerged paths appear in git ls-files -s with stage-1/2/3 entries;\nthe first stage listed used to win arbitrarily when the path escaped\nthe dirty set. Treat any stage > 0 as dirty and hash the working tree,\nwhich is what search results would show.\n\nCo-authored-by: Jim Simon <jimsimon@users.noreply.github.com>\n\n* Fix unmerged-paths test on CI runners without a git identity\n\ngit merge refuses to start when no committer identity is configured\n(CI runners have no global git config), so the test's merge never\ncreated stage-1/2/3 entries and the file stayed a clean stage-0 blob,\nfailing the b3: content-key assertion. Set the identity env vars like\nthe git() helper does, and assert the conflict precondition explicitly\nso an environment problem fails with a clear message.\n\nCo-authored-by: Jim Simon <jimsimon@users.noreply.github.com>\n\n* Extract git_command test helper to deduplicate identity env setup\n\nReview feedback: the merge invocation duplicated the identity env\nvars already set in the git() helper. Both now build on a shared\ngit_command helper.\n\nCo-authored-by: Jim Simon <jimsimon@users.noreply.github.com>\n\n---------\n\nCo-authored-by: Cursor Agent <cursoragent@cursor.com>\nCo-authored-by: Jim Simon <jimsimon@users.noreply.github.com>",
+          "timestamp": "2026-07-03T22:38:07-04:00",
+          "tree_id": "3acb0e7ae7b5d656f70e188f5a2d7f18c7d868c9",
+          "url": "https://github.com/jimsimon/trouve/commit/febd208234caa0db7d972b61cbac0e00b2627403"
+        },
+        "date": 1783132805690,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "bm25_build_5k_docs",
+            "value": 4792754.636363637,
+            "range": "± 8499",
+            "unit": "ns"
+          },
+          {
+            "name": "bm25_query_5k_docs",
+            "value": 36915.37893630345,
+            "range": "± 22",
+            "unit": "ns"
+          },
+          {
+            "name": "chunk_python_200_functions",
+            "value": 2954736.9411764704,
+            "range": "± 1113",
+            "unit": "ns"
+          },
+          {
+            "name": "dense_query_20k_rows",
+            "value": 1326441.8767131744,
+            "range": "± 9875",
             "unit": "ns"
           }
         ]
