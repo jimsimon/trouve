@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1783136666514,
+  "lastUpdate": 1783136761768,
   "repoUrl": "https://github.com/jimsimon/trouve",
   "entries": {
     "e2e-benchmarks": [
@@ -863,6 +863,54 @@ window.BENCHMARK_DATA = {
             "name": "non-git warm query",
             "value": 67.7114693,
             "range": "± 3.2",
+            "unit": "ms"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "jim.j.simon@gmail.com",
+            "name": "Jim Simon",
+            "username": "jimsimon"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "732babd59237621444c19108343716d1ede8116f",
+          "message": "Fix Renovate lookup for github-action-benchmark pin (#28)\n\nRenovate resolves the version of a digest-pinned action from the trailing\ncomment. benchmark-action/github-action-benchmark has no 'v1' tag (only a\nv1 branch), so the '# v1' comment made the github-tags lookup fail with\n'Could not determine new digest for update'. Point the comment at the\nreal tag, v1.22.1, which matches the pinned SHA.\n\nCo-authored-by: Cursor Agent <cursoragent@cursor.com>\nCo-authored-by: Jim Simon <jimsimon@users.noreply.github.com>",
+          "timestamp": "2026-07-03T23:42:56-04:00",
+          "tree_id": "57fcaf9d897395b67d7642c212218d9889db4dc8",
+          "url": "https://github.com/jimsimon/trouve/commit/732babd59237621444c19108343716d1ede8116f"
+        },
+        "date": 1783136760914,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "cold index + query",
+            "value": 124.04259848000001,
+            "range": "± 9.2",
+            "unit": "ms"
+          },
+          {
+            "name": "warm query",
+            "value": 68.72900166000001,
+            "range": "± 1.1",
+            "unit": "ms"
+          },
+          {
+            "name": "incremental (1 file modified)",
+            "value": 82.52808608000001,
+            "range": "± 0.8",
+            "unit": "ms"
+          },
+          {
+            "name": "non-git warm query",
+            "value": 64.59236098000001,
+            "range": "± 2",
             "unit": "ms"
           }
         ]
