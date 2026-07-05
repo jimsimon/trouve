@@ -57,5 +57,5 @@ whatever comes next).
   brand.
 - **Product packages:** `@trouve-ai/<product>-…` (e.g. `search-core`,
   `search-plugin`, per-platform binary packages).
-- **Environment variables:** `TROUVE_*`.
-- **Ignore file:** `.trouveignore`.
+- **Environment variables:** `TROUVE_*` (with deprecated `SEMBLE_*` fallbacks).
+- **Ignore file:** `.trouveignore` (with deprecated `.sembleignore` fallback).
