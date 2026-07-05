@@ -4,7 +4,11 @@ All notable changes to this project are documented in this file. The format
 is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this
 project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [2.0.0] - 2026-07-05
+
+Major bump: the crate, CLI binary, and npm packages are renamed, which breaks
+existing installs and MCP configurations pointing at the `trouve` binary or
+the `trouve-plugin` npm package. See [INSTALL.md](INSTALL.md) to migrate.
 
 ### Changed
 
@@ -22,6 +26,12 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - `npm/` is now an npm workspace (`search-core` + `search-plugin`, one shared
   lockfile), and `@trouve-ai/search-core` is plain ESM JavaScript with a type
   declaration, so it runs under Node 18+ (`npx`) and Bun alike.
+- Dependency updates: hf-hub 0.5, tokenizers 0.23, safetensors 0.8.
+
+### Added
+
+- [NAME.md](NAME.md): where the name *trouve* comes from and how to pronounce
+  it.
 
 ## [1.1.0] - 2026-07-04
 
@@ -201,5 +211,6 @@ semble ([BENCHMARKS.md](BENCHMARKS.md)):
 - Incremental reindex (1 file touched): 0.86 s vs ~3 min (212x)
 - Warm query: 0.55 s vs 7.2 s (13x)
 
+[2.0.0]: https://github.com/jimsimon/trouve/releases/tag/v2.0.0
 [1.1.0]: https://github.com/jimsimon/trouve/releases/tag/v1.1.0
 [1.0.0]: https://github.com/jimsimon/trouve/releases/tag/v1.0.0
