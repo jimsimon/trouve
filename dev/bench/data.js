@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1783294700224,
+  "lastUpdate": 1783294753728,
   "repoUrl": "https://github.com/jimsimon/trouve",
   "entries": {
     "e2e-benchmarks": [
@@ -2257,6 +2257,54 @@ window.BENCHMARK_DATA = {
             "name": "dense_query_20k_rows",
             "value": 1539586.0712067436,
             "range": "± 14178",
+            "unit": "ns"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "jim.j.simon@gmail.com",
+            "name": "Jim Simon",
+            "username": "jimsimon"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "52a77f702d6b42e51ebbbad09f3b797e6872d1e6",
+          "message": "Prepare the v2.0.0 release (#37)\n\nBump the crate version to 2.0.0 (Cargo.toml, Cargo.lock) and sync the\nnpm workspace and plugin manifests via scripts/sync_versions.py.\nPromote the Unreleased changelog section to 2.0.0 dated 2026-07-05 —\na major bump because the crate/binary rename to trouve-search and the\nmove to @trouve-ai npm packages break existing installs and MCP\nconfigs — and record the entries not yet captured: NAME.md and the\nhf-hub/tokenizers/safetensors dependency updates.\n\nCo-authored-by: Cursor <cursoragent@cursor.com>",
+          "timestamp": "2026-07-05T19:37:07-04:00",
+          "tree_id": "80d8fef5fef5cedcf0eb7d60a32e01ea0d5ad0ef",
+          "url": "https://github.com/jimsimon/trouve/commit/52a77f702d6b42e51ebbbad09f3b797e6872d1e6"
+        },
+        "date": 1783294752903,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "bm25_build_5k_docs",
+            "value": 4887822.454545455,
+            "range": "± 9656",
+            "unit": "ns"
+          },
+          {
+            "name": "bm25_query_5k_docs",
+            "value": 37260.668032972,
+            "range": "± 8",
+            "unit": "ns"
+          },
+          {
+            "name": "chunk_python_200_functions",
+            "value": 2970796.794117647,
+            "range": "± 1852",
+            "unit": "ns"
+          },
+          {
+            "name": "dense_query_20k_rows",
+            "value": 1409997.3903508773,
+            "range": "± 16386",
             "unit": "ns"
           }
         ]
