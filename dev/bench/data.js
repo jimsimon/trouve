@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1783279825131,
+  "lastUpdate": 1783294700224,
   "repoUrl": "https://github.com/jimsimon/trouve",
   "entries": {
     "e2e-benchmarks": [
@@ -1103,6 +1103,54 @@ window.BENCHMARK_DATA = {
             "name": "non-git warm query",
             "value": 64.6292997,
             "range": "± 2",
+            "unit": "ms"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "jim.j.simon@gmail.com",
+            "name": "Jim Simon",
+            "username": "jimsimon"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "52a77f702d6b42e51ebbbad09f3b797e6872d1e6",
+          "message": "Prepare the v2.0.0 release (#37)\n\nBump the crate version to 2.0.0 (Cargo.toml, Cargo.lock) and sync the\nnpm workspace and plugin manifests via scripts/sync_versions.py.\nPromote the Unreleased changelog section to 2.0.0 dated 2026-07-05 —\na major bump because the crate/binary rename to trouve-search and the\nmove to @trouve-ai npm packages break existing installs and MCP\nconfigs — and record the entries not yet captured: NAME.md and the\nhf-hub/tokenizers/safetensors dependency updates.\n\nCo-authored-by: Cursor <cursoragent@cursor.com>",
+          "timestamp": "2026-07-05T19:37:07-04:00",
+          "tree_id": "80d8fef5fef5cedcf0eb7d60a32e01ea0d5ad0ef",
+          "url": "https://github.com/jimsimon/trouve/commit/52a77f702d6b42e51ebbbad09f3b797e6872d1e6"
+        },
+        "date": 1783294699968,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "cold index + query",
+            "value": 123.55365230000001,
+            "range": "± 8.4",
+            "unit": "ms"
+          },
+          {
+            "name": "warm query",
+            "value": 66.86768992,
+            "range": "± 1.4",
+            "unit": "ms"
+          },
+          {
+            "name": "incremental (1 file modified)",
+            "value": 77.5731818,
+            "range": "± 1.6",
+            "unit": "ms"
+          },
+          {
+            "name": "non-git warm query",
+            "value": 65.08919156,
+            "range": "± 1.4",
             "unit": "ms"
           }
         ]
