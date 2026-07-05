@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1783278055034,
+  "lastUpdate": 1783279789733,
   "repoUrl": "https://github.com/jimsimon/trouve",
   "entries": {
     "e2e-benchmarks": [
@@ -1055,6 +1055,54 @@ window.BENCHMARK_DATA = {
             "name": "non-git warm query",
             "value": 62.87806214000001,
             "range": "± 1.1",
+            "unit": "ms"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "jim.j.simon@gmail.com",
+            "name": "Jim Simon",
+            "username": "jimsimon"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "5d92f0950f3b6d01649db5bb135a8129bbad90ce",
+          "message": "Add NAME.md explaining the trouve name (#35)\n\n* Add NAME.md documenting the trouve name and its significance\n\nExplains the nod to upstream semble, the literal fit for the search\ntool, and why the find/create etymology of \"trouver\" suits an AI\numbrella brand; README already links to it.\n\nCo-authored-by: Cursor <cursoragent@cursor.com>\n\n* Note deprecated SEMBLE_*/.sembleignore fallbacks in NAME.md\n\nCo-authored-by: Cursor <cursoragent@cursor.com>\n\n---------\n\nCo-authored-by: Cursor <cursoragent@cursor.com>",
+          "timestamp": "2026-07-05T15:28:23-04:00",
+          "tree_id": "7c7554cd8887c34f3c69ce5e779d14fdb481495b",
+          "url": "https://github.com/jimsimon/trouve/commit/5d92f0950f3b6d01649db5bb135a8129bbad90ce"
+        },
+        "date": 1783279788868,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "cold index + query",
+            "value": 124.53375626000002,
+            "range": "± 8",
+            "unit": "ms"
+          },
+          {
+            "name": "warm query",
+            "value": 65.36098528000001,
+            "range": "± 1.7",
+            "unit": "ms"
+          },
+          {
+            "name": "incremental (1 file modified)",
+            "value": 75.11357228,
+            "range": "± 2",
+            "unit": "ms"
+          },
+          {
+            "name": "non-git warm query",
+            "value": 64.6292997,
+            "range": "± 2",
             "unit": "ms"
           }
         ]
