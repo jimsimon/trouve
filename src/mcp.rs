@@ -262,7 +262,7 @@ fn handle_request(cache: &mut IndexCache, request: &Value) -> Option<Value> {
             json!({
                 "protocolVersion": requested,
                 "capabilities": {"tools": {}},
-                "serverInfo": {"name": "trouve", "version": env!("CARGO_PKG_VERSION")},
+                "serverInfo": {"name": "trouve-search", "version": env!("CARGO_PKG_VERSION")},
                 "instructions": INSTRUCTIONS,
             })
         }
@@ -335,7 +335,7 @@ mod tests {
         let init = json!({"jsonrpc": "2.0", "id": 1, "method": "initialize",
             "params": {"protocolVersion": "2024-11-05"}});
         let response = handle_request(&mut cache, &init).unwrap();
-        assert_eq!(response["result"]["serverInfo"]["name"], "trouve");
+        assert_eq!(response["result"]["serverInfo"]["name"], "trouve-search");
 
         let list = json!({"jsonrpc": "2.0", "id": 2, "method": "tools/list"});
         let response = handle_request(&mut cache, &list).unwrap();

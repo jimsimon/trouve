@@ -1,7 +1,7 @@
 //! Command-line interface (port of `semble/cli.py`).
 //!
-//! `trouve search|find-related|stats|clear|savings`, with the bare
-//! `trouve [--content ...]` invocation starting the MCP stdio server,
+//! `trouve-search search|find-related|stats|clear|savings`, with the bare
+//! `trouve-search [--content ...]` invocation starting the MCP stdio server,
 //! matching upstream dispatch behaviour.
 
 use std::path::PathBuf;
@@ -17,7 +17,7 @@ use crate::utils::{format_results, is_git_url, resolve_chunk};
 
 #[derive(Parser)]
 #[command(
-    name = "trouve",
+    name = "trouve-search",
     version,
     about = "Instant local code search for agents.",
     long_about = "Fast and accurate code search for agents. Runs as an MCP stdio server when \

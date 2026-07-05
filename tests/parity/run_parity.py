@@ -8,7 +8,7 @@ Compares, over real source files from the upstream repository:
   4. End-to-end search results — top-1 file agreement and top-5 overlap.
 
 Usage:
-  python3 tests/parity/run_parity.py --binary target/release/trouve \
+  python3 tests/parity/run_parity.py --binary target/release/trouve-search \
       [--reference reference/semble] [--skip-search]
 
 The search comparison downloads the potion-code-16M model; pass --skip-search
@@ -219,7 +219,7 @@ def parity_search(binary: Path, reference: Path) -> int:
 
 def main() -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--binary", type=Path, default=REPO_ROOT / "target/release/trouve")
+    parser.add_argument("--binary", type=Path, default=REPO_ROOT / "target/release/trouve-search")
     parser.add_argument("--reference", type=Path, default=REPO_ROOT / "reference/semble")
     parser.add_argument("--skip-search", action="store_true")
     args = parser.parse_args()

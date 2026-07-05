@@ -13,8 +13,8 @@
 mod common;
 
 use common::write_file;
-use trouve::index::TrouveIndex;
-use trouve::types::ContentType;
+use trouve_search::index::TrouveIndex;
+use trouve_search::types::ContentType;
 
 const CODE: &[ContentType] = &[ContentType::Code];
 
@@ -102,7 +102,7 @@ fn e2e_index_search_and_find_related() {
     // pinning the exact top-1: this suite is a pipeline sanity check, and
     // exact ranking is covered by the parity/quality harnesses. A model
     // version bump or platform float differences must not flake the gate.
-    let hits = |results: &[trouve::types::SearchResult]| -> Vec<String> {
+    let hits = |results: &[trouve_search::types::SearchResult]| -> Vec<String> {
         results.iter().map(|r| r.chunk.file_path.clone()).collect()
     };
     let results = index.search("validate user credentials", 3, None, None, None, None, None);

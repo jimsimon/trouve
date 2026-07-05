@@ -6,9 +6,9 @@
   },
   "plugins": [
     {
-      "name": "trouve",
-      "source": "./plugins/trouve",
-      "description": "Fast, accurate code search: hybrid semantic + BM25 search over any local or remote git repository, with incremental branch-aware indexing. Requires the trouve binary on PATH (cargo install trouve)."
+      "name": "trouve-search",
+      "source": "./npm/search-plugin",
+      "description": "Fast, accurate code search: hybrid semantic + BM25 search over any local or remote git repository, with incremental branch-aware indexing. Installs the native binary via npm (@trouve-ai/search-core)."
     }
   ]
 }

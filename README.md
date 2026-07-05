@@ -6,6 +6,7 @@ branch- and worktree-aware index and a fully multithreaded pipeline.
 
 Pronounced **"troov"** (rhymes with *groove*; French /tʁuv/). *Trouver* is
 French for "to find" — a nod to upstream's namesake *sembler*, "to seem".
+The full story behind the name is in [NAME.md](NAME.md).
 
 ## Why a port?
 
@@ -57,20 +58,21 @@ from upstream (and the reasoning behind each) is in
 ## Install
 
 ```bash
-cargo install trouve
+npm i -g @trouve-ai/search-core
+# or: cargo install trouve-search
 # or download a release binary from GitHub Releases
 ```
 
 ## Usage
 
 ```bash
-trouve search "authentication flow" ./my-project --max-snippet-lines 10
-trouve search "deployment guide" ./my-project --content docs
-trouve find-related src/auth.py 42 ./my-project
-trouve stats ./my-project        # index + cache-hit stats
-trouve savings                   # token savings report
-trouve clear all                 # wipe stores + savings
-trouve                           # run as an MCP stdio server
+trouve-search search "authentication flow" ./my-project --max-snippet-lines 10
+trouve-search search "deployment guide" ./my-project --content docs
+trouve-search find-related src/auth.py 42 ./my-project
+trouve-search stats ./my-project        # index + cache-hit stats
+trouve-search savings                   # token savings report
+trouve-search clear all                 # wipe stores + savings
+trouve-search                           # run as an MCP stdio server
 ```
 
 `--content` selects what to index: `code` (default), `docs`, `config`, or
@@ -86,7 +88,7 @@ step-by-step instructions for every route and agent.
 | Aspect | Plugin: OpenCode / Kilo | Plugin: Claude Code / Codex | Native tool file | MCP entry | CLI only |
 | --- | --- | --- | --- | --- | --- |
 | Agents | OpenCode, Kilo Code | Claude Code, Codex | OpenCode | any MCP-capable agent (Cursor, Gemini, Copilot, VS Code, Windsurf, Zed, …) | anything with a shell |
-| Tool surface | native `trouve_search` / `trouve_find_related` | MCP (`mcp__trouve__*`) | native `trouve_search` / `trouve_find_related` | MCP (`mcp__trouve__*`) | `trouve` CLI via bash |
+| Tool surface | native `trouve_search` / `trouve_find_related` | MCP (`mcp__trouve-search__*`) | native `trouve_search` / `trouve_find_related` | MCP (`mcp__trouve-search__*`) | `trouve-search` CLI via bash |
 | trouve process | one persistent server per session | one MCP server per session | one process per call | one MCP server per session | one process per call |
 | In-session index cache (incl. remote URLs) | yes | yes | disk store only | yes | disk store only |
 | Index warmed at session start | yes, + re-warm on idle turns | Claude: yes (hook) · Codex: no | no | no | no |
@@ -108,29 +110,30 @@ How to choose:
   `trouve_find_related` with no MCP server process and no JSON config
   edits; it provides the same capabilities as an MCP entry under different
   tool names, so enable one or the other.
-- **Add an MCP entry for everything else.** `trouve` with no subcommand is
-  an MCP stdio server; one `{"command": "trouve"}` entry in your agent's
-  MCP config is all it takes. [INSTALL.md](INSTALL.md#3-mcp-server-entry)
-  lists the exact file and snippet for 14 agents, plus optional
-  `trouve-search` sub-agent files you can copy alongside.
+- **Add an MCP entry for everything else.** `trouve-search` with no subcommand is
+  an MCP stdio server; one `{"command": "npx", "args": ["-y", "@trouve-ai/search-core"]}`
+  entry in your agent's MCP config is all it takes.
+  [INSTALL.md](INSTALL.md#3-mcp-server-entry) lists the exact file and snippet
+  for 14 agents, plus optional `trouve-search` sub-agent files you can copy
+  alongside.
 - **The CLI needs no setup at all** and is what sub-agents without tool
   access fall back to; every approach above shares the same on-disk index
   store, so mixing CLI use with any other route costs nothing.
 
 Per-harness plugin install commands:
 
-- **[OpenCode](https://opencode.ai)** — `{ "plugin": ["trouve-plugin"] }` in
+- **[OpenCode](https://opencode.ai)** — `{ "plugin": ["@trouve-ai/search-plugin"] }` in
   your opencode config.
-- **[Kilo Code](https://kilo.ai)** — `kilo plugin trouve-plugin --global`
+- **[Kilo Code](https://kilo.ai)** — `kilo plugin @trouve-ai/search-plugin --global`
   (Kilo CLI and VS Code extension).
 - **[Claude Code](https://code.claude.com)** —
   `/plugin marketplace add jimsimon/trouve` then
-  `/plugin install trouve@trouve`.
+  `/plugin install trouve-search@trouve`.
 - **[Codex](https://developers.openai.com/codex)** —
   `codex plugin marketplace add 'https://github.com/jimsimon/trouve.git' --ref main`
-  then `codex plugin add trouve@trouve`.
+  then `codex plugin add trouve-search@trouve`.
 
-See the [plugin README](plugins/trouve/README.md) for details.
+See [search-plugin](npm/search-plugin/README.md) for details.
 
 ## Ignoring files
 
@@ -201,7 +204,7 @@ Remote repositories (git URLs) are cloned once into `<cache>/clones` and
 reused: repeat queries refresh the clone with a cheap `git fetch` at most
 once per freshness window (`TROUVE_CLONE_TTL` seconds, default 300; `0`
 fetches on every query) instead of re-cloning. Clones unused for a week are
-evicted automatically, and `trouve clear index` removes them all.
+evicted automatically, and `trouve-search clear index` removes them all.
 
 ## Development
 
@@ -209,7 +212,7 @@ evicted automatically, and `trouve clear index` removes them all.
 cargo test                        # unit + integration tests (offline)
 TROUVE_E2E=1 cargo test -- --ignored   # end-to-end tests (downloads the model)
 ./scripts/fetch-reference.sh      # clone upstream Python semble into reference/
-python3 tests/parity/run_parity.py --binary target/release/trouve
+python3 tests/parity/run_parity.py --binary target/release/trouve-search
 ./benchmarks/run_benchmarks.sh    # hyperfine comparison vs Python semble
 ```
 

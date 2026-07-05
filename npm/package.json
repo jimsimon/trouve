@@ -1,0 +1,11 @@
+{
+  "name": "@trouve-ai/workspace",
+  "private": true,
+  "workspaces": [
+    "search-core",
+    "search-plugin"
+  ],
+  "scripts": {
+    "typecheck": "npm run typecheck --workspaces --if-present"
+  }
+}

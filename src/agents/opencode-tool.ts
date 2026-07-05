@@ -2,7 +2,7 @@
 // ~/.config/opencode/tools/trouve.ts (see INSTALL.md); the filename prefixes
 // the exports, so these surface to the model as `trouve_search` and
 // `trouve_find_related`.
-// Requires the `trouve` binary on PATH (cargo install trouve).
+// Requires the `trouve-search` binary on PATH (npm i -g @trouve-ai/search-core or cargo install trouve-search).
 import { tool } from "@opencode-ai/plugin"
 
 const REPO = tool.schema
@@ -44,7 +44,7 @@ const CONTENT = tool.schema
 const TIMEOUT_MS = 10 * 60 * 1000
 
 function spawnTrouve(args: string[]) {
-  return Bun.spawn(["trouve", ...args], {
+  return Bun.spawn(["trouve-search", ...args], {
     stdin: "ignore",
     stdout: "pipe",
     stderr: "pipe",
@@ -57,8 +57,8 @@ async function trouve(args: string[]): Promise<string> {
     proc = spawnTrouve(args)
   } catch (error) {
     return (
-      `trouve failed: ${error}. Is the trouve binary on PATH? ` +
-      "Install it with `cargo install trouve` or download a release binary from GitHub."
+      `trouve-search failed: ${error}. Is the trouve-search binary on PATH? ` +
+      "Install with `npm i -g @trouve-ai/search-core`, `cargo install trouve-search`, or download a release binary from GitHub."
     )
   }
   let timedOut = false

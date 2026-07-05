@@ -1,0 +1,14 @@
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "command -v trouve-search >/dev/null 2>&1 || command -v npx >/dev/null 2>&1 || { echo 'trouve-search not found; install with `npm i -g @trouve-ai/search-core`, `cargo install trouve-search`, or download a release binary from https://github.com/jimsimon/trouve/releases' >&2; exit 1; }; nohup sh -c 'command -v trouve-search >/dev/null && trouve-search stats \"${CLAUDE_PROJECT_DIR:-.}\" || npx -y @trouve-ai/search-core stats \"${CLAUDE_PROJECT_DIR:-.}\"' >/dev/null 2>&1 &"
+          }
+        ]
+      }
+    ]
+  }
+}

@@ -1,5 +1,5 @@
 [package]
-name = "trouve"
+name = "trouve-search"
 version = "1.1.0"
 edition = "2021"
 description = "Fast and accurate code search for agents. Rust port of MinishLab/semble with incremental, branch- and worktree-aware indexing."
@@ -12,11 +12,11 @@ categories = ["command-line-utilities", "development-tools"]
 rust-version = "1.89"
 
 [lib]
-name = "trouve"
+name = "trouve_search"
 path = "src/lib.rs"
 
 [[bin]]
-name = "trouve"
+name = "trouve-search"
 path = "src/main.rs"
 
 [dependencies]

@@ -1,0 +1,23 @@
+{
+  "name": "@trouve-ai/search-win32-x64",
+  "version": "1.1.0",
+  "description": "trouve-search native binary for x86_64-pc-windows-msvc",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/jimsimon/trouve.git",
+    "directory": "npm/search-win32-x64"
+  },
+  "os": [
+    "win32"
+  ],
+  "cpu": [
+    "x64"
+  ],
+  "files": [
+    "bin/trouve-search.exe"
+  ],
+  "scripts": {
+    "prepublishOnly": "node -e \"require('fs').accessSync('bin/trouve-search.exe')\""
+  }
+}

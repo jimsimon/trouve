@@ -17,9 +17,13 @@ fn main() {
 
     // Collect chunk texts the same way the indexer does.
     let index = {
-        let content = [trouve::types::ContentType::Code];
-        trouve::index::TrouveIndex::from_path(std::path::Path::new(&dir), &content, Some(&model_id))
-            .expect("index build failed")
+        let content = [trouve_search::types::ContentType::Code];
+        trouve_search::index::TrouveIndex::from_path(
+            std::path::Path::new(&dir),
+            &content,
+            Some(&model_id),
+        )
+        .expect("index build failed")
     };
     let texts: Vec<String> = index.chunks.iter().map(|c| c.content.clone()).collect();
     println!("chunks: {}", texts.len());

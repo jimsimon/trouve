@@ -1,0 +1,51 @@
+{
+  "name": "@trouve-ai/search-core",
+  "version": "1.1.0",
+  "description": "trouve-search native binary and MCP launcher for Node. Platform-specific binaries install via optional dependencies.",
+  "type": "module",
+  "exports": {
+    ".": {
+      "types": "./src/platform.d.ts",
+      "default": "./src/platform.js"
+    }
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "bin": {
+    "trouve-search": "./bin/trouve-search.js"
+  },
+  "files": [
+    "bin",
+    "src"
+  ],
+  "keywords": [
+    "code-search",
+    "semantic-search",
+    "mcp",
+    "trouve"
+  ],
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/jimsimon/trouve.git",
+    "directory": "npm/search-core"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit"
+  },
+  "optionalDependencies": {
+    "@trouve-ai/search-darwin-arm64": "1.1.0",
+    "@trouve-ai/search-darwin-x64": "1.1.0",
+    "@trouve-ai/search-linux-arm64-gnu": "1.1.0",
+    "@trouve-ai/search-linux-arm64-musl": "1.1.0",
+    "@trouve-ai/search-linux-x64-gnu": "1.1.0",
+    "@trouve-ai/search-linux-x64-musl": "1.1.0",
+    "@trouve-ai/search-win32-arm64": "1.1.0",
+    "@trouve-ai/search-win32-x64": "1.1.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "typescript": "^5.6.0"
+  }
+}

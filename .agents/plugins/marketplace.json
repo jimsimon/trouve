@@ -5,10 +5,10 @@
   },
   "plugins": [
     {
-      "name": "trouve",
+      "name": "trouve-search",
       "source": {
         "source": "local",
-        "path": "./plugins/trouve"
+        "path": "./npm/search-plugin"
       },
       "policy": {
         "installation": "AVAILABLE",

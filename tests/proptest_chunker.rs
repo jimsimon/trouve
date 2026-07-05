@@ -2,9 +2,9 @@
 
 use proptest::prelude::*;
 
-use trouve::chunk::{chunk_lines, chunk_source, DESIRED_CHUNK_LENGTH};
+use trouve_search::chunk::{chunk_lines, chunk_source, DESIRED_CHUNK_LENGTH};
 
-fn assert_boundary_invariants(boundaries: &[trouve::chunk::ChunkBoundary], text_len: usize) {
+fn assert_boundary_invariants(boundaries: &[trouve_search::chunk::ChunkBoundary], text_len: usize) {
     for b in boundaries {
         assert!(b.start <= b.end, "start must not exceed end");
         assert!(b.end <= text_len, "boundary must stay inside the text");
@@ -84,7 +84,7 @@ proptest! {
 
     #[test]
     fn tokenize_roundtrip_is_lowercase(text in "[A-Za-z0-9_ ]{0,200}") {
-        for token in trouve::tokens::tokenize(&text) {
+        for token in trouve_search::tokens::tokenize(&text) {
             prop_assert_eq!(token.to_lowercase(), token.clone());
             prop_assert!(!token.is_empty());
         }
