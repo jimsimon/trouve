@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1783279789733,
+  "lastUpdate": 1783279825131,
   "repoUrl": "https://github.com/jimsimon/trouve",
   "entries": {
     "e2e-benchmarks": [
@@ -2161,6 +2161,54 @@ window.BENCHMARK_DATA = {
             "name": "dense_query_20k_rows",
             "value": 1529519.929078014,
             "range": "± 9123",
+            "unit": "ns"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "jim.j.simon@gmail.com",
+            "name": "Jim Simon",
+            "username": "jimsimon"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "5d92f0950f3b6d01649db5bb135a8129bbad90ce",
+          "message": "Add NAME.md explaining the trouve name (#35)\n\n* Add NAME.md documenting the trouve name and its significance\n\nExplains the nod to upstream semble, the literal fit for the search\ntool, and why the find/create etymology of \"trouver\" suits an AI\numbrella brand; README already links to it.\n\nCo-authored-by: Cursor <cursoragent@cursor.com>\n\n* Note deprecated SEMBLE_*/.sembleignore fallbacks in NAME.md\n\nCo-authored-by: Cursor <cursoragent@cursor.com>\n\n---------\n\nCo-authored-by: Cursor <cursoragent@cursor.com>",
+          "timestamp": "2026-07-05T15:28:23-04:00",
+          "tree_id": "7c7554cd8887c34f3c69ce5e779d14fdb481495b",
+          "url": "https://github.com/jimsimon/trouve/commit/5d92f0950f3b6d01649db5bb135a8129bbad90ce"
+        },
+        "date": 1783279824823,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "bm25_build_5k_docs",
+            "value": 5114487.85,
+            "range": "± 12781",
+            "unit": "ns"
+          },
+          {
+            "name": "bm25_query_5k_docs",
+            "value": 35839.83273622929,
+            "range": "± 11",
+            "unit": "ns"
+          },
+          {
+            "name": "chunk_python_200_functions",
+            "value": 2834609.722222222,
+            "range": "± 1045",
+            "unit": "ns"
+          },
+          {
+            "name": "dense_query_20k_rows",
+            "value": 1539586.0712067436,
+            "range": "± 14178",
             "unit": "ns"
           }
         ]
