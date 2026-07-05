@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1783278013618,
+  "lastUpdate": 1783278055034,
   "repoUrl": "https://github.com/jimsimon/trouve",
   "entries": {
     "e2e-benchmarks": [
@@ -2065,6 +2065,54 @@ window.BENCHMARK_DATA = {
             "name": "dense_query_20k_rows",
             "value": 1391938.156976744,
             "range": "± 8074",
+            "unit": "ns"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "jim.j.simon@gmail.com",
+            "name": "Jim Simon",
+            "username": "jimsimon"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "ec59273899b07e063644005c7ba750af9eafd00a",
+          "message": "Rename to trouve-search and ship npm packages under @trouve-ai (#34)\n\n* Rename to trouve-search and ship npm packages under @trouve-ai\n\nThe crate and CLI binary become trouve-search, reserving the bare\ntrouve name for future products. npm distribution moves to an npm\nworkspace under npm/: @trouve-ai/search-core ships the native binary\nvia per-platform optional dependencies plus a Node MCP launcher\n(npx -y @trouve-ai/search-core), and @trouve-ai/search-plugin replaces\ntrouve-plugin, absorbing the Claude/Codex bundle from plugins/trouve.\nRelease and lint workflows, version syncing, and agent docs updated to\nmatch.\n\nCo-authored-by: Cursor <cursoragent@cursor.com>\n\n* Harden release workflow per review: no persisted credentials, npm provenance\n\nDisable persist-credentials on the build and publish-crate checkouts to\nmatch the other jobs, and publish npm packages with --provenance (the\npublish-npm job gets id-token: write for the OIDC-signed attestation).\n\nCo-authored-by: Cursor <cursoragent@cursor.com>\n\n* Run cargo publish verification before uploading to crates.io\n\nRemove --no-verify so the release workflow builds the crate in Cargo's\nisolated package mode before publishing.\n\nCo-authored-by: Cursor <cursoragent@cursor.com>\n\n* Pass the release tag to packaging steps via env\n\nInterpolating github.ref_name directly into the run scripts exposes\ntar/Compress-Archive to tag-name injection; route it through REF_NAME.\n\nCo-authored-by: Cursor <cursoragent@cursor.com>\n\n* Address PR review feedback\n\n- Rename remaining \"trouve\" diagnostics to \"trouve-search\" in the\n  OpenCode tool file and the plugin's server/error messages.\n- platform.js: fail fast on unsupported CPU architectures instead of\n  silently falling back to x64.\n- stage_npm_binaries.py: report missing archive members with the\n  member list instead of an uncaught KeyError.\n- release.yml: pass github.ref_name through env in the package steps\n  to avoid shell template injection via tag names.\n- lint.yml: pin Node and cache the npm workspace via setup-node.\n\nCo-authored-by: Cursor <cursoragent@cursor.com>\n\n* Pin actions/setup-node to a commit SHA\n\nPin the two setup-node uses to the v6.4.0 commit with a version\ncomment; Renovate's github-actions manager keeps SHA pins updated.\n\nCo-authored-by: Cursor <cursoragent@cursor.com>\n\n---------\n\nCo-authored-by: Cursor <cursoragent@cursor.com>",
+          "timestamp": "2026-07-05T14:58:52-04:00",
+          "tree_id": "3bea8e2df0a49d1f2f54b62888105c53c40517af",
+          "url": "https://github.com/jimsimon/trouve/commit/ec59273899b07e063644005c7ba750af9eafd00a"
+        },
+        "date": 1783278054663,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "bm25_build_5k_docs",
+            "value": 5088260.300000001,
+            "range": "± 10346",
+            "unit": "ns"
+          },
+          {
+            "name": "bm25_query_5k_docs",
+            "value": 36746.194526680825,
+            "range": "± 6",
+            "unit": "ns"
+          },
+          {
+            "name": "chunk_python_200_functions",
+            "value": 2809248.4444444445,
+            "range": "± 563",
+            "unit": "ns"
+          },
+          {
+            "name": "dense_query_20k_rows",
+            "value": 1529519.929078014,
+            "range": "± 9123",
             "unit": "ns"
           }
         ]
