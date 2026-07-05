@@ -2,7 +2,7 @@
 // ~/.config/opencode/tools/trouve.ts (see INSTALL.md); the filename prefixes
 // the exports, so these surface to the model as `trouve_search` and
 // `trouve_find_related`.
-// Requires the `trouve` binary on PATH (cargo install trouve).
+// Requires the `trouve-search` binary on PATH (npm i -g @trouve-ai/search-core or cargo install trouve-search).
 import { tool } from "@opencode-ai/plugin"
 
 const REPO = tool.schema
@@ -44,7 +44,7 @@ const CONTENT = tool.schema
 const TIMEOUT_MS = 10 * 60 * 1000
 
 function spawnTrouve(args: string[]) {
-  return Bun.spawn(["trouve", ...args], {
+  return Bun.spawn(["trouve-search", ...args], {
     stdin: "ignore",
     stdout: "pipe",
     stderr: "pipe",
@@ -57,8 +57,8 @@ async function trouve(args: string[]): Promise<string> {
     proc = spawnTrouve(args)
   } catch (error) {
     return (
-      `trouve failed: ${error}. Is the trouve binary on PATH? ` +
-      "Install it with `cargo install trouve` or download a release binary from GitHub."
+      `trouve-search failed: ${error}. Is the trouve-search binary on PATH? ` +
+      "Install with `npm i -g @trouve-ai/search-core`, `cargo install trouve-search`, or download a release binary from GitHub."
     )
   }
   let timedOut = false
@@ -78,19 +78,21 @@ async function trouve(args: string[]): Promise<string> {
     ])
     if (timedOut) {
       return (
-        `trouve timed out after ${TIMEOUT_MS / 60000} minutes and was killed. ` +
+        `trouve-search timed out after ${TIMEOUT_MS / 60000} minutes and was killed. ` +
         "Index builds are incremental, so retrying will resume where it left off."
       )
     }
     if (exitCode !== 0) {
       const detail = stderr.trim()
-      return detail ? `trouve failed: ${detail}` : `trouve exited with code ${exitCode}`
+      return detail
+        ? `trouve-search failed: ${detail}`
+        : `trouve-search exited with code ${exitCode}`
     }
     return stdout.trim()
   } catch (error) {
     // Stream reads or exited can reject after a forced kill; surface it
     // like every other failure path instead of throwing.
-    return `trouve failed: ${error}`
+    return `trouve-search failed: ${error}`
   } finally {
     clearTimeout(timer)
     clearTimeout(escalation)

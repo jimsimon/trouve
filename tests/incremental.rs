@@ -7,8 +7,8 @@
 mod common;
 
 use common::{git, test_env, write_file};
-use trouve::index::TrouveIndex;
-use trouve::types::ContentType;
+use trouve_search::index::TrouveIndex;
+use trouve_search::types::ContentType;
 
 const CODE: &[ContentType] = &[ContentType::Code];
 
@@ -235,7 +235,7 @@ fn snapshot_fast_path_returns_identical_results() {
 
     // Snapshots live under this repo's store dir (identity = canonical path).
     let identity = root.canonicalize().unwrap().to_string_lossy().into_owned();
-    let snapshots_dir = trouve::store::ChunkStore::open(&identity)
+    let snapshots_dir = trouve_search::store::ChunkStore::open(&identity)
         .unwrap()
         .root()
         .join("snapshots");
@@ -314,7 +314,7 @@ fn patched_build_matches_full_rebuild_exactly() {
 
     // Force a full assembly of the identical tree by removing all snapshots.
     let identity = root.canonicalize().unwrap().to_string_lossy().into_owned();
-    let snapshots_dir = trouve::store::ChunkStore::open(&identity)
+    let snapshots_dir = trouve_search::store::ChunkStore::open(&identity)
         .unwrap()
         .root()
         .join("snapshots");
@@ -343,7 +343,7 @@ fn gc_sweeps_unreferenced_entries_but_keeps_live_manifest() {
     // Cold build: writes entries + snapshot 1.
     let _ = TrouveIndex::from_path(root, CODE, Some(model)).unwrap();
     let identity = root.canonicalize().unwrap().to_string_lossy().into_owned();
-    let store = trouve::store::ChunkStore::open(&identity).unwrap();
+    let store = trouve_search::store::ChunkStore::open(&identity).unwrap();
     let snapshots_dir = store.root().join("snapshots");
     let snaps = |dir: &std::path::Path| -> Vec<std::path::PathBuf> {
         std::fs::read_dir(dir)
@@ -366,7 +366,7 @@ fn gc_sweeps_unreferenced_entries_but_keeps_live_manifest() {
     // Simulate pruning of the old manifest's snapshot: the original auth.py
     // entry is now unreferenced.
     std::fs::remove_file(&first_snapshot).unwrap();
-    let live = trouve::snapshot::live_entry_keys(&snapshots_dir);
+    let live = trouve_search::snapshot::live_entry_keys(&snapshots_dir);
     let report = store.sweep(&live, std::time::Duration::ZERO);
     assert_eq!(report.entries_removed, 1, "exactly the stale auth.py entry");
 

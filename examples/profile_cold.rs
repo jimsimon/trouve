@@ -5,18 +5,18 @@
 use std::time::Instant;
 
 use rayon::prelude::*;
-use trouve::chunk::chunk_source;
-use trouve::languages::detect_language;
-use trouve::tokens::tokenize;
-use trouve::types::ContentType;
+use trouve_search::chunk::chunk_source;
+use trouve_search::languages::detect_language;
+use trouve_search::tokens::tokenize;
+use trouve_search::types::ContentType;
 
 fn main() {
     let dir = std::env::args().nth(1).expect("usage: profile_cold <dir>");
     let root = std::path::Path::new(&dir);
 
-    let files = trouve::walker::walk_files(
+    let files = trouve_search::walker::walk_files(
         root,
-        &trouve::languages::get_extensions(&[ContentType::Code]),
+        &trouve_search::languages::get_extensions(&[ContentType::Code]),
         &[],
     );
     println!("files: {}", files.len());
@@ -27,8 +27,8 @@ fn main() {
         .filter_map(|f| {
             let bytes = std::fs::read(f).ok()?;
             // Same size gate as the real pipeline.
-            if trouve::languages::file_status_for_bytes(&bytes)
-                != trouve::languages::FileStatus::Valid
+            if trouve_search::languages::file_status_for_bytes(&bytes)
+                != trouve_search::languages::FileStatus::Valid
             {
                 return None;
             }
@@ -44,7 +44,7 @@ fn main() {
 
     for round in 0..2 {
         let t = Instant::now();
-        let chunked: Vec<(String, Vec<trouve::types::Chunk>)> = sources
+        let chunked: Vec<(String, Vec<trouve_search::types::Chunk>)> = sources
             .par_iter()
             .map(|(rel, src)| {
                 let language = detect_language(std::path::Path::new(rel));
@@ -63,7 +63,7 @@ fn main() {
         let n_tokens: usize = docs.iter().map(Vec::len).sum();
 
         let t = Instant::now();
-        let bm25 = trouve::bm25::Bm25Index::build(&docs);
+        let bm25 = trouve_search::bm25::Bm25Index::build(&docs);
         let bm25_t = t.elapsed();
 
         if round == 1 {

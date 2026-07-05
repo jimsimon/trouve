@@ -112,7 +112,7 @@ def evaluate_python(spec: RepoSpec, tasks: list[Task]) -> dict:
 
 def main() -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--binary", type=Path, default=REPO_ROOT / "target/release/trouve")
+    parser.add_argument("--binary", type=Path, default=REPO_ROOT / "target/release/trouve-search")
     parser.add_argument("--repo", action="append", default=[])
     parser.add_argument("--skip-python", action="store_true")
     args = parser.parse_args()

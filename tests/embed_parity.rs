@@ -8,7 +8,7 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use model2vec_rs::model::StaticModel;
-use trouve::embed::EmbeddingModel;
+use trouve_search::embed::EmbeddingModel;
 
 /// Build a small Bert-style WordPiece model (BertNormalizer +
 /// BertPreTokenizer + WordPiece + quantization mapping/weights) on disk so

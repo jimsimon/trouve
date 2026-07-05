@@ -14,7 +14,7 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 OUT="${1:-benchmarks/results/ci}"
-RUST_BIN="$PWD/target/release/trouve"
+RUST_BIN="$PWD/target/release/trouve-search"
 RUNS="${RUNS:-5}"
 QUERY="handle http request routing"
 REPO="benchmarks/repos/flask-ci"

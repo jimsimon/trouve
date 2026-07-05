@@ -2514,7 +2514,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "trouve"
+name = "trouve-search"
 version = "1.1.0"
 dependencies = [
  "ahash",

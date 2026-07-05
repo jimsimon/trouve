@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
-"""Keep every published artifact's version in sync with the trouve crate.
+"""Keep every published artifact's version in sync with the trouve-search crate.
 
 The crate version in Cargo.toml is the single source of truth. Everything
-else that carries a version — npm plugin packages (package.json and
-package-lock.json under plugins/*/), Claude Code and Codex plugin manifests
-— must match it exactly, so a release tag means the same version everywhere.
+else that carries a version — npm packages under npm/*, package-lock.json
+files, Claude Code and Codex plugin manifests, @trouve-ai/search-core
+optionalDependencies, and @trouve-ai/search-plugin's search-core dependency
+— must match it exactly.
 
 Usage:
   python3 scripts/sync_versions.py          # rewrite manifests to the crate version
@@ -33,24 +34,48 @@ def crate_version() -> str:
 def manifest_paths() -> list[Path]:
     paths: list[Path] = []
     for pattern in (
-        "plugins/*/package.json",
-        "plugins/*/package-lock.json",
-        "plugins/*/.claude-plugin/plugin.json",
-        "plugins/*/.codex-plugin/plugin.json",
+        "npm/*/.claude-plugin/plugin.json",
+        "npm/*/.codex-plugin/plugin.json",
+        "npm/*/package.json",
+        "npm/package-lock.json",
     ):
         paths.extend(sorted(ROOT.glob(pattern)))
     return paths
+
+
+# Our own packages: any dependency pin on these must equal the crate version.
+INTERNAL_PREFIX = "@trouve-ai/search"
 
 
 def versions_in(payload: dict, path: Path) -> list[dict]:
     """Return every object in `payload` whose `version` field must match."""
     holders = [payload]
     if path.name == "package-lock.json":
-        # The lockfile repeats the version in its root package record.
-        root_record = payload.get("packages", {}).get("")
-        if isinstance(root_record, dict):
-            holders.append(root_record)
+        # The workspace lockfile repeats internal packages: workspace records
+        # like "search-core" (with their own dep pins) and node_modules links.
+        for record in payload.get("packages", {}).values():
+            if not isinstance(record, dict) or record is payload:
+                continue
+            name = record.get("name", "")
+            if record is payload.get("packages", {}).get("") or name.startswith(
+                INTERNAL_PREFIX
+            ):
+                holders.append(record)
     return holders
+
+
+def sync_internal_pins(holder: dict, expected: str) -> bool:
+    """Pin every @trouve-ai/search-* dependency in `holder` to the crate version."""
+    changed = False
+    for field in ("dependencies", "optionalDependencies"):
+        deps = holder.get(field)
+        if not isinstance(deps, dict):
+            continue
+        for name, version in list(deps.items()):
+            if name.startswith(INTERNAL_PREFIX) and version != expected:
+                deps[name] = expected
+                changed = True
+    return changed
 
 
 def main() -> None:
@@ -63,11 +88,17 @@ def main() -> None:
         changed = False
         for holder in versions_in(payload, path):
             found = holder.get("version")
-            if found != expected:
+            if found is not None and found != expected:
                 out_of_sync.append(
                     f"{path.relative_to(ROOT)}: {found!r} (expected {expected!r})"
                 )
                 holder["version"] = expected
+                changed = True
+            if sync_internal_pins(holder, expected):
+                out_of_sync.append(
+                    f"{path.relative_to(ROOT)}: internal @trouve-ai/search-* pins "
+                    f"(expected {expected!r})"
+                )
                 changed = True
         if changed and not check:
             path.write_text(

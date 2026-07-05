@@ -6,7 +6,7 @@ measured with [hyperfine](https://github.com/sharkdp/hyperfine) (end-to-end) and
 
 Test machine: AMD Ryzen 9 5950X (16C/32T), 64 GB RAM, Linux, NVMe.
 Model: `minishlab/potion-code-16M`. Every timing below is a full CLI invocation
-(`trouve search <query> <repo> -k 5 --max-snippet-lines 0`), including process
+(`trouve-search search <query> <repo> -k 5 --max-snippet-lines 0`), including process
 startup and model load.
 
 ## Small repo: pallets/flask (249 tracked files)
@@ -254,7 +254,7 @@ benchmarks/run_git_vs_nogit.sh
 # quality suite
 (cd reference/semble && PYTHONPATH=. ../../.venv/bin/python benchmarks/sync_repos.py \
     --repo flask --repo click --repo requests --repo chi --repo redux)
-.venv/bin/python benchmarks/run_quality.py --binary target/release/trouve \
+.venv/bin/python benchmarks/run_quality.py --binary target/release/trouve-search \
     --repo flask --repo click --repo requests --repo chi --repo redux
 
 # micro-benchmarks

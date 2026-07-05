@@ -15,7 +15,7 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 REPO="${1:-benchmarks/repos/flask}"
-RUST_BIN="$PWD/target/release/trouve"
+RUST_BIN="$PWD/target/release/trouve-search"
 PY_BIN="$PWD/.venv/bin/semble"
 RUNS="${RUNS:-3}"
 QUERY="handle http request routing"

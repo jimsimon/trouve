@@ -1,0 +1,46 @@
+{
+  "name": "@trouve-ai/search-plugin",
+  "version": "1.1.0",
+  "description": "trouve code search plugin for OpenCode, Kilo Code, Claude Code, and Codex: native tools (OpenCode/Kilo), MCP server + skill + sub-agent (Claude/Codex).",
+  "type": "module",
+  "main": "./src/plugin.ts",
+  "exports": {
+    ".": "./src/plugin.ts",
+    "./server": "./src/plugin.ts"
+  },
+  "files": [
+    "src",
+    "agents",
+    "skills",
+    "claude-hooks.json",
+    ".mcp.json",
+    ".claude-plugin",
+    ".codex-plugin"
+  ],
+  "keywords": [
+    "opencode",
+    "opencode-plugin",
+    "kilocode",
+    "kilo",
+    "code-search",
+    "semantic-search",
+    "trouve"
+  ],
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/jimsimon/trouve.git",
+    "directory": "npm/search-plugin"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@opencode-ai/plugin": "^1.17.13",
+    "@trouve-ai/search-core": "1.1.0"
+  },
+  "devDependencies": {
+    "@types/bun": "^1.2.0",
+    "typescript": "^6.0.0"
+  }
+}

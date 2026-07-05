@@ -63,4 +63,4 @@ jobs:
       - name: Build release binary
         run: cargo build --release
       - name: Run parity harness
-        run: python3 tests/parity/run_parity.py --binary target/release/trouve
+        run: python3 tests/parity/run_parity.py --binary target/release/trouve-search

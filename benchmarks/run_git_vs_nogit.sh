@@ -30,7 +30,7 @@ if [ -z "$REPO" ]; then
     fi
 fi
 
-RUST_BIN="$PWD/target/release/trouve"
+RUST_BIN="$PWD/target/release/trouve-search"
 RUNS="${RUNS:-3}"
 QUERY="handle http request routing"
 

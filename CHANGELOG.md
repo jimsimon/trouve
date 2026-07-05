@@ -4,6 +4,25 @@ All notable changes to this project are documented in this file. The format
 is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this
 project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+
+- **Rename for the `@trouve-ai` npm org**: the crates.io crate and CLI binary
+  are now `trouve-search` (the bare `trouve` name is reserved for future
+  products). **`@trouve-ai/search-core`** ships the native binary and MCP
+  launcher, with per-platform binaries installed via `@trouve-ai/search-*`
+  optional dependencies — `npm i -g @trouve-ai/search-core` needs no separate
+  install step, and MCP configs default to `npx -y @trouve-ai/search-core`.
+  **`@trouve-ai/search-plugin`** replaces `trouve-plugin` and now carries the
+  whole plugin surface: the OpenCode/Kilo native tools plus the Claude Code
+  and Codex bundles (MCP config, workflow skill, sub-agent, session hook)
+  formerly in `plugins/trouve` — one directory (`npm/search-plugin`), two
+  install channels (npm registry and git marketplace).
+- `npm/` is now an npm workspace (`search-core` + `search-plugin`, one shared
+  lockfile), and `@trouve-ai/search-core` is plain ESM JavaScript with a type
+  declaration, so it runs under Node 18+ (`npx`) and Bun alike.
+
 ## [1.1.0] - 2026-07-04
 
 ### Added
