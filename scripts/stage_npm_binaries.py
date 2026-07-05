@@ -17,14 +17,20 @@ def extract_binary(artifact: Path, binary_name: str, dest: Path) -> None:
     dest.parent.mkdir(parents=True, exist_ok=True)
     if artifact.suffix == ".gz" and artifact.name.endswith(".tar.gz"):
         with tarfile.open(artifact, "r:gz") as tar:
-            member = tar.getmember(binary_name)
+            try:
+                member = tar.getmember(binary_name)
+            except KeyError:
+                sys.exit(f"{binary_name} not found in {artifact} (members: {tar.getnames()})")
             extracted = tar.extractfile(member)
             if extracted is None:
                 sys.exit(f"failed to read {binary_name} from {artifact}")
             dest.write_bytes(extracted.read())
     elif artifact.suffix == ".zip":
         with zipfile.ZipFile(artifact) as zf:
-            dest.write_bytes(zf.read(binary_name))
+            try:
+                dest.write_bytes(zf.read(binary_name))
+            except KeyError:
+                sys.exit(f"{binary_name} not found in {artifact} (members: {zf.namelist()})")
     else:
         sys.exit(f"unsupported artifact format: {artifact}")
     dest.chmod(dest.stat().st_mode | 0o111)

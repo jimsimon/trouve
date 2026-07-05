@@ -15,18 +15,18 @@ const require = createRequire(import.meta.url)
 export function platformPackageName() {
   const os = platform()
   const cpu = arch()
+  if (cpu !== "x64" && cpu !== "arm64") {
+    throw new Error(`Unsupported platform: ${os}-${cpu}`)
+  }
   if (os === "linux") {
     const libc = isMusl() ? "musl" : "gnu"
-    const archTag = cpu === "arm64" ? "arm64" : "x64"
-    return `@trouve-ai/search-linux-${archTag}-${libc}`
+    return `@trouve-ai/search-linux-${cpu}-${libc}`
   }
   if (os === "darwin") {
-    const archTag = cpu === "arm64" ? "arm64" : "x64"
-    return `@trouve-ai/search-darwin-${archTag}`
+    return `@trouve-ai/search-darwin-${cpu}`
   }
   if (os === "win32") {
-    const archTag = cpu === "arm64" ? "arm64" : "x64"
-    return `@trouve-ai/search-win32-${archTag}`
+    return `@trouve-ai/search-win32-${cpu}`
   }
   throw new Error(`Unsupported platform: ${os}-${cpu}`)
 }

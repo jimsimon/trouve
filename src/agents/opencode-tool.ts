@@ -78,19 +78,21 @@ async function trouve(args: string[]): Promise<string> {
     ])
     if (timedOut) {
       return (
-        `trouve timed out after ${TIMEOUT_MS / 60000} minutes and was killed. ` +
+        `trouve-search timed out after ${TIMEOUT_MS / 60000} minutes and was killed. ` +
         "Index builds are incremental, so retrying will resume where it left off."
       )
     }
     if (exitCode !== 0) {
       const detail = stderr.trim()
-      return detail ? `trouve failed: ${detail}` : `trouve exited with code ${exitCode}`
+      return detail
+        ? `trouve-search failed: ${detail}`
+        : `trouve-search exited with code ${exitCode}`
     }
     return stdout.trim()
   } catch (error) {
     // Stream reads or exited can reject after a forced kill; surface it
     // like every other failure path instead of throwing.
-    return `trouve failed: ${error}`
+    return `trouve-search failed: ${error}`
   } finally {
     clearTimeout(timer)
     clearTimeout(escalation)

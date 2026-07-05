@@ -27,6 +27,11 @@ jobs:
           RUSTDOCFLAGS: -D warnings
       - name: versions in sync
         run: python3 scripts/sync_versions.py --check
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: npm/package-lock.json
       # npm/ is an npm workspace; one install links the local packages
       # (search-plugin -> search-core) and installs all dev dependencies.
       # `npm install` rather than `npm ci`: search-core's optional platform

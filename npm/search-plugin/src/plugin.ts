@@ -51,7 +51,7 @@ class TrouveServer {
     const text = result.content
       ?.map((part) => (part.type === "text" ? (part.text ?? "") : ""))
       .join("")
-    return text?.trim() || "trouve returned no output."
+    return text?.trim() || "trouve-search returned no output."
   }
 
   private ensureStarted(): Promise<void> {
@@ -108,8 +108,8 @@ class TrouveServer {
     this.pending.clear()
     const detail = this.stderrTail.trim()
     const message = detail
-      ? `trouve server exited unexpectedly: ${detail}`
-      : "trouve server exited unexpectedly"
+      ? `trouve-search server exited unexpectedly: ${detail}`
+      : "trouve-search server exited unexpectedly"
     for (const p of pending) p.reject(new Error(message))
   }
 
@@ -139,7 +139,7 @@ class TrouveServer {
     if (!pending) return
     this.pending.delete(message.id)
     if (message.error) {
-      pending.reject(new Error(message.error.message ?? "trouve server error"))
+      pending.reject(new Error(message.error.message ?? "trouve-search server error"))
     } else {
       pending.resolve(message.result)
     }
@@ -156,7 +156,7 @@ class TrouveServer {
           this.proc?.kill()
           reject(
             new Error(
-              `trouve server did not respond to ${method} within ${timeoutMs / 1000}s ` +
+              `trouve-search server did not respond to ${method} within ${timeoutMs / 1000}s ` +
                 "and was restarted. Index builds are incremental; retrying resumes.",
             ),
           )
@@ -179,7 +179,7 @@ class TrouveServer {
 
   private write(message: unknown): void {
     const stdin = this.proc?.stdin as { write(data: string): void; flush(): void } | undefined
-    if (!stdin) throw new Error("trouve server is not running")
+    if (!stdin) throw new Error("trouve-search server is not running")
     stdin.write(JSON.stringify(message) + "\n")
     stdin.flush()
   }
@@ -194,7 +194,7 @@ function errorText(error: unknown): string {
       "or download a release binary from GitHub."
     )
   }
-  return `trouve failed: ${message}`
+  return `trouve-search failed: ${message}`
 }
 
 const REPO = tool.schema
