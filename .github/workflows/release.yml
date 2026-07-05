@@ -71,6 +71,8 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
@@ -128,6 +130,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
       - uses: dtolnay/rust-toolchain@stable
       - name: Publish to crates.io
         run: cargo publish --no-verify
@@ -138,6 +142,10 @@ jobs:
   publish-npm:
     needs: release
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      # npm provenance attestations are signed with the job's OIDC token.
+      id-token: write
     env:
       NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
     steps:
@@ -170,7 +178,7 @@ jobs:
               return
             fi
             echo "Publishing $name@$version from $dir"
-            (cd "$dir" && npm publish --access public)
+            (cd "$dir" && npm publish --access public --provenance)
           }
           shopt -s nullglob
           for pkg in npm/search-*/package.json; do
