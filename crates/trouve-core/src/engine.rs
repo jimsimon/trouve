@@ -1552,6 +1552,13 @@ impl Engine {
                             Event::AssistantDelta { turn, text: delta },
                         )?;
                     }
+                    // Display-only; never joins the provider transcript.
+                    ProviderEvent::ThinkingDelta(delta) => {
+                        self.store.append_event(
+                            scope.clone(),
+                            Event::AssistantThinking { turn, text: delta },
+                        )?;
+                    }
                     ProviderEvent::ToolCall(call) => tool_calls.push(call),
                     ProviderEvent::Completed { usage } => {
                         usage_total.input_tokens += usage.input_tokens;
@@ -1893,6 +1900,24 @@ impl Engine {
                     segment.push_str(&delta);
                     self.store
                         .append_event(scope.clone(), Event::AssistantDelta { turn, text: delta })?;
+                }
+                BackendEvent::ThinkingDelta(delta) => {
+                    // Thinking is a block boundary like a tool call:
+                    // finalize the streamed text so far so post-thinking
+                    // text starts a new bubble in the right order.
+                    if !segment.is_empty() {
+                        self.store.append_event(
+                            scope.clone(),
+                            Event::AssistantMessage {
+                                turn,
+                                content: std::mem::take(&mut segment),
+                            },
+                        )?;
+                    }
+                    self.store.append_event(
+                        scope.clone(),
+                        Event::AssistantThinking { turn, text: delta },
+                    )?;
                 }
                 BackendEvent::ToolStarted {
                     call_id,

@@ -305,10 +305,23 @@ fn turn_stream(
                             let _ = tx.send(Ok(BackendEvent::TextDelta(d.into()))).await;
                         }
                     }
+                    // Reasoning summaries (all OpenAI models) and raw
+                    // reasoning (open-source models).
+                    "item/reasoning/summaryTextDelta" | "item/reasoning/textDelta" => {
+                        if let Some(d) = params["delta"].as_str() {
+                            let _ = tx.send(Ok(BackendEvent::ThinkingDelta(d.into()))).await;
+                        }
+                    }
+                    // Boundary between summary sections.
+                    "item/reasoning/summaryPartAdded" => {
+                        let _ = tx
+                            .send(Ok(BackendEvent::ThinkingDelta("\n\n".into())))
+                            .await;
+                    }
                     "item/started" => {
                         let item = &params["item"];
                         let ty = item["type"].as_str().unwrap_or("");
-                        if !matches!(ty, "" | "agentMessage" | "userMessage" | "plan") {
+                        if !matches!(ty, "" | "agentMessage" | "userMessage" | "plan" | "reasoning") {
                             let _ = tx
                                 .send(Ok(BackendEvent::ToolStarted {
                                     call_id: item["id"].as_str().unwrap_or("").into(),
@@ -333,7 +346,7 @@ fn turn_stream(
                     "item/completed" => {
                         let item = &params["item"];
                         let ty = item["type"].as_str().unwrap_or("");
-                        if !matches!(ty, "" | "agentMessage" | "userMessage" | "plan") {
+                        if !matches!(ty, "" | "agentMessage" | "userMessage" | "plan" | "reasoning") {
                             let failed = item["status"].as_str() == Some("failed");
                             let _ = tx
                                 .send(Ok(BackendEvent::ToolCompleted {

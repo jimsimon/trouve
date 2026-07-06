@@ -34,7 +34,8 @@ export struct ThreadTabItem {
 }
 
 export struct ChatRow {
-    // 0 user, 1 markdown block, 2 tool card, 3 turn status
+    // 0 user, 1 markdown block, 2 tool card, 3 turn status,
+    // 4 thinking, 5 activity (spinner + label)
     kind: int,
     // For kind 1: 0 paragraph, 1 h1, 2 h2, 3 h3, 4 bullet, 5 code fence.
     md-kind: int,
@@ -645,6 +646,37 @@ export component AppWindow inherits Window {
                                 text: row.text;
                                 color: row.turn-state == 2 ? #e39ea6 : #7a7a7a;
                                 font-size: 11px;
+                            }
+
+                            // Model thinking (reasoning stream).
+                            if row.kind == 4: Text {
+                                text: row.text;
+                                color: #8f8f8f;
+                                font-size: 13px;
+                                font-italic: true;
+                                wrap: word-wrap;
+                            }
+
+                            // Activity: indeterminate spinner + label while
+                            // the agent works ("Processing…"/"Thinking…").
+                            if row.kind == 5: HorizontalLayout {
+                                spacing: 8px;
+                                Rectangle {
+                                    width: 16px;
+                                    height: 16px;
+                                    Spinner {
+                                        width: 16px;
+                                        height: 16px;
+                                        indeterminate: true;
+                                    }
+                                }
+                                Text {
+                                    text: row.text;
+                                    color: #9a9a9a;
+                                    font-size: 13px;
+                                    vertical-alignment: center;
+                                }
+                                Rectangle { horizontal-stretch: 1; }
                             }
                         }
                     }

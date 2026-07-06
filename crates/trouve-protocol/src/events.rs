@@ -93,6 +93,10 @@ pub enum Event {
     /// final message exactly.
     #[serde(rename = "assistant.delta")]
     AssistantDelta { turn: u64, text: String },
+    /// Streamed model reasoning ("thinking") text, where the provider
+    /// exposes it. Display-only: never part of the provider transcript.
+    #[serde(rename = "assistant.thinking")]
+    AssistantThinking { turn: u64, text: String },
     /// Folded final assistant text for the turn.
     #[serde(rename = "assistant.message")]
     AssistantMessage { turn: u64, content: String },

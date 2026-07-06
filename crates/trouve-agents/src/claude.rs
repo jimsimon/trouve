@@ -228,6 +228,13 @@ fn map_event(ev: &Value) -> Vec<BackendEvent> {
                                 }
                             }
                         }
+                        Some("thinking") => {
+                            if let Some(t) = b["thinking"].as_str() {
+                                if !t.is_empty() {
+                                    out.push(BackendEvent::ThinkingDelta(t.to_string()));
+                                }
+                            }
+                        }
                         Some("tool_use") => out.push(BackendEvent::ToolStarted {
                             call_id: b["id"].as_str().unwrap_or("claude-tool").into(),
                             tool: b["name"].as_str().unwrap_or("tool").into(),
@@ -270,7 +277,10 @@ fn map_event(ev: &Value) -> Vec<BackendEvent> {
                     input_tokens: usage["input_tokens"].as_u64().unwrap_or(0),
                     output_tokens: usage["output_tokens"].as_u64().unwrap_or(0),
                     cached_input_tokens: usage["cache_read_input_tokens"].as_u64().unwrap_or(0),
-                    cost_usd: ev["total_cost_usd"].as_f64(),
+                    // The CLI reports an estimate even on subscription
+                    // plans, where nothing is billed per turn; suppress it
+                    // like the other subscription backends.
+                    cost_usd: None,
                 },
             });
             events

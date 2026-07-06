@@ -83,11 +83,12 @@ EOF
     assert!(events.iter().any(
         |e| matches!(e, BackendEvent::ToolCompleted { call_id, ok: true, .. } if call_id == "t1")
     ));
+    // Cost stays unset: the CLI's estimate is misleading on subscriptions.
     assert!(events.iter().any(|e| matches!(
         e,
         BackendEvent::Completed { usage } if usage.input_tokens == 10
             && usage.output_tokens == 5
-            && usage.cost_usd == Some(0.01)
+            && usage.cost_usd.is_none()
     )));
 
     // Flags: resume + read-only permission mapping + mode instructions.
@@ -225,6 +226,7 @@ cat > /dev/null
                 responder.send(true).unwrap();
             }
             BackendEvent::Completed { usage: u } => usage = Some(u),
+            BackendEvent::ThinkingDelta(_) => {}
         }
     }
 

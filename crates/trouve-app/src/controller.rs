@@ -552,15 +552,17 @@ impl Controller {
             return;
         };
         if let Ok(usage) = self.client.session_usage(&session_id).await {
-            ui::set_usage_text(
-                &self.ui,
-                format!(
-                    "{} in / {} out · ${:.4}",
-                    format_tokens(usage.input_tokens),
-                    format_tokens(usage.output_tokens),
-                    usage.cost_usd
-                ),
+            let mut text = format!(
+                "{} in / {} out",
+                format_tokens(usage.input_tokens),
+                format_tokens(usage.output_tokens),
             );
+            // Subscription backends report no per-turn cost; only per-use
+            // APIs accumulate a nonzero total worth showing.
+            if usage.cost_usd > 0.0 {
+                text.push_str(&format!(" · ${:.4}", usage.cost_usd));
+            }
+            ui::set_usage_text(&self.ui, text);
         }
     }
 

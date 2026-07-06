@@ -266,6 +266,14 @@ fn sse_events(
                             let _ = tx.send(Ok(ProviderEvent::TextDelta(d.to_string()))).await;
                         }
                     }
+                    // Reasoning summaries (and raw reasoning where exposed).
+                    "response.reasoning_summary_text.delta" | "response.reasoning_text.delta" => {
+                        if let Some(d) = ev["delta"].as_str() {
+                            let _ = tx
+                                .send(Ok(ProviderEvent::ThinkingDelta(d.to_string())))
+                                .await;
+                        }
+                    }
                     "response.output_item.done" => {
                         let item = &ev["item"];
                         if item["type"].as_str() == Some("function_call") {

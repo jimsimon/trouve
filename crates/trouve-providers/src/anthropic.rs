@@ -260,6 +260,15 @@ fn sse_to_events(
                                         .await;
                                 }
                             }
+                            Some("thinking_delta") => {
+                                if let Some(text) =
+                                    v.pointer("/delta/thinking").and_then(Value::as_str)
+                                {
+                                    let _ = tx
+                                        .send(Ok(ProviderEvent::ThinkingDelta(text.to_string())))
+                                        .await;
+                                }
+                            }
                             Some("input_json_delta") => {
                                 if let Some(part) =
                                     v.pointer("/delta/partial_json").and_then(Value::as_str)

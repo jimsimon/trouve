@@ -80,6 +80,8 @@ pub enum BackendEvent {
         session_id: String,
     },
     TextDelta(String),
+    /// Reasoning ("thinking") text, where the vendor harness exposes it.
+    ThinkingDelta(String),
     ToolStarted {
         call_id: String,
         tool: String,
@@ -113,6 +115,7 @@ impl std::fmt::Debug for BackendEvent {
                 write!(f, "SessionStarted({session_id})")
             }
             Self::TextDelta(t) => write!(f, "TextDelta({t:?})"),
+            Self::ThinkingDelta(t) => write!(f, "ThinkingDelta({t:?})"),
             Self::ToolStarted { call_id, tool, .. } => {
                 write!(f, "ToolStarted({call_id}, {tool})")
             }

@@ -241,6 +241,14 @@ fn async_stream(
                             .await;
                     }
                 }
+                // DeepSeek-style reasoning stream on chat completions.
+                if let Some(text) = delta.get("reasoning_content").and_then(Value::as_str) {
+                    if !text.is_empty() {
+                        let _ = tx
+                            .send(Ok(ProviderEvent::ThinkingDelta(text.to_string())))
+                            .await;
+                    }
+                }
                 if let Some(calls) = delta.get("tool_calls").and_then(Value::as_array) {
                     for call in calls {
                         let idx = call["index"].as_u64().unwrap_or(0) as usize;

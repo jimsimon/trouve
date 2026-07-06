@@ -8,6 +8,8 @@ use slint_markdown::{parse_blocks, BlockKind};
 use trouve_client_core::viewmodel::{ChatItem, ThreadViewModel, ToolCallStatus, TurnState};
 
 /// Mirrors the `ChatRow` struct in `app.slint`.
+/// Kinds: 0 user, 1 markdown block, 2 tool card, 3 turn status,
+/// 4 thinking, 5 activity (spinner + label).
 #[derive(Debug, Clone, Default)]
 pub struct ChatRowData {
     pub kind: i32,
@@ -149,17 +151,20 @@ pub fn chat_rows(
                     Some(call_id.clone()),
                 );
             }
-            ChatItem::TurnStatus { turn, state } => {
+            ChatItem::Thinking { content, .. } => push(
+                ChatRowData {
+                    kind: 4,
+                    text: content.clone(),
+                    ..Default::default()
+                },
+                None,
+            ),
+            ChatItem::TurnStatus { state, .. } => {
                 let (text, code) = match state {
-                    TurnState::Running => (format!("turn {turn} — running…"), 0),
-                    TurnState::Completed { usage } => (
-                        format!(
-                            "turn {turn} — done ({} in / {} out tokens)",
-                            usage.input_tokens, usage.output_tokens
-                        ),
-                        1,
-                    ),
-                    TurnState::Failed { error } => (format!("turn {turn} — failed: {error}"), 2),
+                    // Progress shows as the trailing activity row instead.
+                    TurnState::Running => continue,
+                    TurnState::Completed { usage } => (turn_summary(usage), 1),
+                    TurnState::Failed { error } => (format!("failed: {error}"), 2),
                 };
                 push(
                     ChatRowData {
@@ -173,26 +178,35 @@ pub fn chat_rows(
             }
         }
     }
+    if vm.turn_running {
+        let label = if vm.thinking {
+            "Thinking…"
+        } else {
+            "Processing…"
+        };
+        push(
+            ChatRowData {
+                kind: 5,
+                text: label.into(),
+                ..Default::default()
+            },
+            None,
+        );
+    }
     (rows, call_ids)
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn shell_tools_show_their_command() {
-        let args = serde_json::json!({"command": "wc -l  bench.rs\n"});
-        assert_eq!(tool_label("Bash", &args), "Bash (wc -l bench.rs)");
-        assert_eq!(tool_label("shell", &args), "shell (wc -l bench.rs)");
-        // Non-shell tools and malformed args keep the plain name.
-        assert_eq!(tool_label("search", &args), "search");
-        assert_eq!(tool_label("Bash", &serde_json::json!({})), "Bash");
-        // Long commands truncate on a char boundary with an ellipsis.
-        let long = serde_json::json!({ "command": "x".repeat(100) });
-        let label = tool_label("Bash", &long);
-        assert!(label.len() < 70 && label.ends_with("…)"), "{label}");
+/// Turn header: token counts, plus the dollar cost for per-use APIs.
+/// Subscription backends never report a cost, so nothing shows there.
+fn turn_summary(usage: &trouve_protocol::Usage) -> String {
+    let mut s = format!(
+        "{} in / {} out tokens",
+        usage.input_tokens, usage.output_tokens
+    );
+    if let Some(cost) = usage.cost_usd.filter(|c| *c > 0.0) {
+        s.push_str(&format!(" · ${cost:.4}"));
     }
+    s
 }
 
 trait FloorBoundary {
@@ -260,4 +274,54 @@ pub fn highlight_file(path: &str, content: &str) -> Vec<Vec<(String, u32)>> {
         lines.push(vec![(String::new(), 0)]);
     }
     lines
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn turn_summary_shows_cost_only_when_billed() {
+        let mut usage = trouve_protocol::Usage {
+            input_tokens: 1200,
+            output_tokens: 340,
+            ..Default::default()
+        };
+        // Subscription backends report no cost.
+        assert_eq!(turn_summary(&usage), "1200 in / 340 out tokens");
+        usage.cost_usd = Some(0.0231);
+        assert_eq!(turn_summary(&usage), "1200 in / 340 out tokens · $0.0231");
+    }
+
+    #[test]
+    fn running_turn_renders_trailing_activity_row() {
+        let mut vm = ThreadViewModel {
+            turn_running: true,
+            ..Default::default()
+        };
+        let (rows, _) = chat_rows(&vm, &HashSet::new());
+        assert_eq!(rows.last().unwrap().kind, 5);
+        assert_eq!(rows.last().unwrap().text, "Processing…");
+        vm.thinking = true;
+        let (rows, _) = chat_rows(&vm, &HashSet::new());
+        assert_eq!(rows.last().unwrap().text, "Thinking…");
+        vm.turn_running = false;
+        vm.thinking = false;
+        let (rows, _) = chat_rows(&vm, &HashSet::new());
+        assert!(rows.is_empty());
+    }
+
+    #[test]
+    fn shell_tools_show_their_command() {
+        let args = serde_json::json!({"command": "wc -l  bench.rs\n"});
+        assert_eq!(tool_label("Bash", &args), "Bash (wc -l bench.rs)");
+        assert_eq!(tool_label("shell", &args), "shell (wc -l bench.rs)");
+        // Non-shell tools and malformed args keep the plain name.
+        assert_eq!(tool_label("search", &args), "search");
+        assert_eq!(tool_label("Bash", &serde_json::json!({})), "Bash");
+        // Long commands truncate on a char boundary with an ellipsis.
+        let long = serde_json::json!({ "command": "x".repeat(100) });
+        let label = tool_label("Bash", &long);
+        assert!(label.len() < 70 && label.ends_with("…)"), "{label}");
+    }
 }

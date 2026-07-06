@@ -53,6 +53,8 @@ pub enum Message {
 #[derive(Debug, Clone)]
 pub enum ProviderEvent {
     TextDelta(String),
+    /// Reasoning ("thinking") text, where the model/provider exposes it.
+    ThinkingDelta(String),
     ToolCall(ToolCallRequest),
     Completed { usage: Usage },
 }

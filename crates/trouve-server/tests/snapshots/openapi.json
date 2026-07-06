@@ -1576,6 +1576,31 @@
           },
           {
             "type": "object",
+            "description": "Streamed model reasoning (\"thinking\") text, where the provider\nexposes it. Display-only: never part of the provider transcript.",
+            "required": [
+              "turn",
+              "text",
+              "type"
+            ],
+            "properties": {
+              "text": {
+                "type": "string"
+              },
+              "turn": {
+                "type": "integer",
+                "format": "int64",
+                "minimum": 0
+              },
+              "type": {
+                "type": "string",
+                "enum": [
+                  "assistant.thinking"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
             "description": "Folded final assistant text for the turn.",
             "required": [
               "turn",

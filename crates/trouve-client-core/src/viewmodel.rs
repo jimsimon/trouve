@@ -16,6 +16,12 @@ pub enum ChatItem {
         content: String,
         complete: bool,
     },
+    /// Model reasoning ("thinking") text; closed when other output arrives.
+    Thinking {
+        turn: u64,
+        content: String,
+        complete: bool,
+    },
     ToolCall {
         call_id: String,
         tool: String,
@@ -61,6 +67,9 @@ pub struct ThreadViewModel {
     pub compacting: bool,
     /// True while a turn is running (between turn.started and completion).
     pub turn_running: bool,
+    /// True while the model is streaming thinking and nothing has followed
+    /// it yet ("Thinking…" vs "Processing…" activity label).
+    pub thinking: bool,
 }
 
 impl ThreadViewModel {
@@ -73,6 +82,20 @@ impl ThreadViewModel {
             .iter_mut()
             .rev()
             .find(|i| matches!(i, ChatItem::ToolCall { call_id: c, .. } if c == call_id))
+    }
+
+    /// Close the trailing open thinking block (any non-thinking output ends
+    /// it; a later thinking delta starts a fresh block).
+    fn finish_thinking(&mut self) {
+        self.thinking = false;
+        if let Some(ChatItem::Thinking { complete, .. }) = self
+            .items
+            .iter_mut()
+            .rev()
+            .find(|i| matches!(i, ChatItem::Thinking { .. }))
+        {
+            *complete = true;
+        }
     }
 
     /// Apply one event. Returns the index of the item that changed (for
@@ -97,7 +120,27 @@ impl ThreadViewModel {
                 self.items.push(ChatItem::User { turn: *turn, content: content.clone() });
                 Some(self.items.len() - 1)
             }
+            Event::AssistantThinking { turn, text } => {
+                self.thinking = true;
+                // Grow the trailing open thinking item, or start one.
+                if let Some(idx) = self.items.iter().rposition(|i| {
+                    matches!(i, ChatItem::Thinking { turn: t, complete: false, .. } if t == turn)
+                }) {
+                    if let ChatItem::Thinking { content, .. } = &mut self.items[idx] {
+                        content.push_str(text);
+                    }
+                    Some(idx)
+                } else {
+                    self.items.push(ChatItem::Thinking {
+                        turn: *turn,
+                        content: text.clone(),
+                        complete: false,
+                    });
+                    Some(self.items.len() - 1)
+                }
+            }
             Event::AssistantDelta { turn, text } => {
+                self.finish_thinking();
                 // Grow the trailing incomplete assistant item, or start one.
                 if let Some(idx) = self.items.iter().rposition(|i| {
                     matches!(i, ChatItem::Assistant { turn: t, complete: false, .. } if t == turn)
@@ -116,6 +159,7 @@ impl ThreadViewModel {
                 }
             }
             Event::AssistantMessage { turn, content } => {
+                self.finish_thinking();
                 if let Some(idx) = self.items.iter().rposition(|i| {
                     matches!(i, ChatItem::Assistant { turn: t, complete: false, .. } if t == turn)
                 }) {
@@ -135,6 +179,7 @@ impl ThreadViewModel {
                 }
             }
             Event::ToolRequested { call_id, tool, args, requires_approval, .. } => {
+                self.finish_thinking();
                 self.items.push(ChatItem::ToolCall {
                     call_id: call_id.clone(),
                     tool: tool.clone(),
@@ -199,6 +244,7 @@ impl ThreadViewModel {
             Event::TurnCompleted { turn, usage, .. } => {
                 self.turn_running = false;
                 self.compacting = false;
+                self.finish_thinking();
                 self.last_usage = Some(usage.clone());
                 let idx = self.items.iter().rposition(|i| {
                     matches!(i, ChatItem::TurnStatus { turn: t, state: TurnState::Running } if t == turn)
@@ -214,6 +260,7 @@ impl ThreadViewModel {
             Event::TurnFailed { turn, error } => {
                 self.turn_running = false;
                 self.compacting = false;
+                self.finish_thinking();
                 let idx = self.items.iter().rposition(|i| {
                     matches!(i, ChatItem::TurnStatus { turn: t, state: TurnState::Running } if t == turn)
                 });
@@ -379,6 +426,52 @@ mod tests {
         }));
         assert!(!vm.turn_running);
         assert_eq!(vm.last_usage, Some(usage));
+    }
+
+    #[test]
+    fn thinking_folds_and_closes_on_other_output() {
+        let mut vm = ThreadViewModel::new();
+        vm.apply(&env(Event::TurnStarted {
+            turn: 1,
+            mode: "code".into(),
+            model: "m".into(),
+        }));
+        vm.apply(&env(Event::AssistantThinking {
+            turn: 1,
+            text: "Let me ".into(),
+        }));
+        vm.apply(&env(Event::AssistantThinking {
+            turn: 1,
+            text: "look.".into(),
+        }));
+        assert!(vm.thinking);
+        assert!(matches!(
+            vm.items.last().unwrap(),
+            ChatItem::Thinking { content, complete: false, .. } if content == "Let me look."
+        ));
+
+        // Regular text closes the thinking block and clears the flag.
+        vm.apply(&env(Event::AssistantDelta {
+            turn: 1,
+            text: "Found it.".into(),
+        }));
+        assert!(!vm.thinking);
+        assert!(matches!(
+            &vm.items[1],
+            ChatItem::Thinking { complete: true, .. }
+        ));
+
+        // A later thinking delta starts a fresh block.
+        vm.apply(&env(Event::AssistantThinking {
+            turn: 1,
+            text: "More thought.".into(),
+        }));
+        let thinking_blocks = vm
+            .items
+            .iter()
+            .filter(|i| matches!(i, ChatItem::Thinking { .. }))
+            .count();
+        assert_eq!(thinking_blocks, 2);
     }
 
     #[test]

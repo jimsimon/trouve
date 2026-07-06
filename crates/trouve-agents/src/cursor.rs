@@ -298,6 +298,12 @@ fn map_event(ev: &Value) -> Vec<BackendEvent> {
             }
             out
         }
+        // Reasoning stream (thinking models); deltas coalesce client-side.
+        Some("thinking") => ev["text"]
+            .as_str()
+            .filter(|t| !t.is_empty())
+            .map(|t| vec![BackendEvent::ThinkingDelta(t.to_string())])
+            .unwrap_or_default(),
         Some("tool_call") => {
             let subtype = ev["subtype"].as_str().unwrap_or("");
             let call = &ev["tool_call"];
