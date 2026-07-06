@@ -10,7 +10,7 @@ mod grep;
 mod search;
 mod shell;
 
-pub use search::{gc_index_store_in_background, warm_index_in_background};
+pub use search::{gc_index_store_in_background, warm_index_in_background, VENDOR_SEARCH_GUIDANCE};
 
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;

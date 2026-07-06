@@ -1840,16 +1840,26 @@ impl Engine {
             }
         };
 
+        let mcp_bridge = self.mcp_bridge_for(&thread.model, &thread.id);
+        // Vendor agents get the mode prompt plus, when the bridge serves
+        // trouve's search tools, guidance to prefer them over built-ins
+        // (MCP instructions alone are too weak a signal).
+        let mut instructions = mode.system_prompt.trim().to_string();
+        if mcp_bridge.is_some() {
+            if !instructions.is_empty() {
+                instructions.push_str("\n\n");
+            }
+            instructions.push_str(crate::tools::VENDOR_SEARCH_GUIDANCE);
+        }
         let backend_turn = BackendTurn {
             thread_id: thread.id.clone(),
             worktree: PathBuf::from(&session.worktree_path),
             session: self.store.backend_session(&thread.id)?,
             model: model_name,
             prompt: content,
-            instructions: (!mode.system_prompt.trim().is_empty())
-                .then(|| mode.system_prompt.clone()),
+            instructions: (!instructions.is_empty()).then_some(instructions),
             permission,
-            mcp_bridge: self.mcp_bridge_for(&thread.model, &thread.id),
+            mcp_bridge,
         };
 
         let mut stream = backend

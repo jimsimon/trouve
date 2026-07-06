@@ -4,9 +4,10 @@
 //! The engine launches vendor agents with `--mcp-config` pointing at this
 //! process and `TROUVE_SERVER` / `TROUVE_THREAD_ID` in its environment. It
 //! always serves `approval_prompt` (Claude's `--permission-prompt-tool`
-//! target: permission requests become trouve approvals). With
-//! `TROUVE_BRIDGE_TOOLS=1` it additionally serves trouve's ToolExecutor
-//! tools; every `tools/call` dials back into the engine's internal
+//! target: permission requests become trouve approvals) plus trouve's
+//! read-only semantic search tools, which complement the vendor's built-ins.
+//! With `TROUVE_BRIDGE_TOOLS=1` it additionally serves the full ToolExecutor
+//! tool set; every `tools/call` dials back into the engine's internal
 //! endpoints, so bridged calls flow through the same permission gate,
 //! approval hub, and event log as native tool calls.
 
@@ -55,6 +56,10 @@ pub async fn run() -> Result<()> {
                     "name": "trouve-bridge",
                     "version": env!("CARGO_PKG_VERSION"),
                 },
+                "instructions": "Prefer the `search` tool over grep/file scans when \
+                    exploring the codebase: it is a pre-built hybrid semantic index and \
+                    returns file paths with exact line numbers. Use `find_related` with a \
+                    result's file_path and line to discover similar code.",
             })),
             "ping" => Ok(json!({})),
             "tools/list" => tools_list(&http, &base, bridge_tools).await,
@@ -80,6 +85,11 @@ pub async fn run() -> Result<()> {
     Ok(())
 }
 
+/// Read-only tools served even without full tool bridging: the vendor
+/// agent keeps its own built-ins, but trouve's native semantic search (a
+/// core harness feature the vendor has no equivalent of) is always offered.
+const ALWAYS_BRIDGED: &[&str] = &["search", "find_related"];
+
 async fn tools_list(
     http: &reqwest::Client,
     base: &str,
@@ -101,28 +111,44 @@ async fn tools_list(
             "required": ["tool_name", "input"],
         },
     })];
-    if bridge_tools {
-        let specs: Value = http
-            .get(format!("{base}/tools"))
-            .send()
-            .await
-            .map_err(|e| format!("engine unreachable: {e}"))?
-            .error_for_status()
-            .map_err(|e| e.to_string())?
-            .json()
-            .await
-            .map_err(|e| e.to_string())?;
-        if let Some(specs) = specs.as_array() {
-            tools.extend(specs.iter().map(|s| {
-                json!({
-                    "name": s["name"],
-                    "description": s["description"],
-                    "inputSchema": s["parameters"],
+    // Best-effort: the approval gate must exist even when the engine is
+    // briefly unreachable, so a failed spec fetch just serves fewer tools.
+    let specs = fetch_tool_specs(http, base).await.unwrap_or_else(|e| {
+        eprintln!("trouve-bridge: tool specs unavailable: {e}");
+        Value::Null
+    });
+    if let Some(specs) = specs.as_array() {
+        tools.extend(
+            specs
+                .iter()
+                .filter(|s| {
+                    bridge_tools
+                        || s["name"]
+                            .as_str()
+                            .is_some_and(|n| ALWAYS_BRIDGED.contains(&n))
                 })
-            }));
-        }
+                .map(|s| {
+                    json!({
+                        "name": s["name"],
+                        "description": s["description"],
+                        "inputSchema": s["parameters"],
+                    })
+                }),
+        );
     }
     Ok(json!({ "tools": tools }))
+}
+
+async fn fetch_tool_specs(http: &reqwest::Client, base: &str) -> Result<Value, String> {
+    http.get(format!("{base}/tools"))
+        .send()
+        .await
+        .map_err(|e| format!("engine unreachable: {e}"))?
+        .error_for_status()
+        .map_err(|e| e.to_string())?
+        .json()
+        .await
+        .map_err(|e| e.to_string())
 }
 
 /// Relay one Claude permission request to the engine's approval flow and

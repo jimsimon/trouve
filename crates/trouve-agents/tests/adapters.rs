@@ -325,13 +325,17 @@ EOF
     }
 
     // Approvals-only: Claude keeps its built-in tools but permission
-    // requests route to trouve.
+    // requests route to trouve, and trouve's read-only semantic search
+    // tools ride along pre-allowed.
     let args = std::fs::read_to_string(format!("{stub}.args")).unwrap();
     assert!(args.contains("--mcp-config"), "{args}");
     assert!(args.contains("--permission-prompt-tool"), "{args}");
     assert!(args.contains("mcp__trouve__approval_prompt"), "{args}");
     assert!(!args.contains("--disallowedTools"), "{args}");
-    assert!(!args.contains("--allowedTools"), "{args}");
+    assert!(
+        args.contains("mcp__trouve__search,mcp__trouve__find_related"),
+        "{args}"
+    );
     let _ = std::fs::remove_file(std::env::temp_dir().join("trouve-mcp-th_2.json"));
 }
 

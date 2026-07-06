@@ -128,6 +128,14 @@ impl AgentBackend for ClaudeBackend {
                     cmd.args(["--disallowedTools", &bridge.disallowed_tools.join(",")]);
                 }
                 cmd.args(["--allowedTools", "mcp__trouve"]);
+            } else {
+                // Approvals-only: Claude keeps its built-ins, but trouve's
+                // read-only semantic search tools ride along on the bridge
+                // and are pre-allowed (they are gated inside trouve).
+                cmd.args([
+                    "--allowedTools",
+                    "mcp__trouve__search,mcp__trouve__find_related",
+                ]);
             }
             if matches!(turn.permission, BackendPermission::Ask) {
                 cmd.args(["--permission-prompt-tool", "mcp__trouve__approval_prompt"]);
