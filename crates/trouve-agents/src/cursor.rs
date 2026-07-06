@@ -179,6 +179,10 @@ impl AgentBackend for CursorBackend {
             .args(["--resume", &chat_id])
             .args(["--output-format", "stream-json"])
             .arg("--stream-partial-output")
+            // Trouve creates the worktree from a workspace the user opened
+            // deliberately; without this, headless runs abort with a
+            // "Workspace Trust Required" prompt.
+            .arg("--trust")
             .current_dir(&turn.worktree)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())

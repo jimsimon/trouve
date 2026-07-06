@@ -163,6 +163,8 @@ EOF
     assert!(args.contains("chat-123"), "{args}");
     assert!(args.contains("--force"), "{args}"); // yolo mapping
     assert!(args.contains("stream-json"), "{args}");
+    // Headless runs abort on the workspace-trust prompt without this.
+    assert!(args.contains("--trust"), "{args}");
 }
 
 #[tokio::test]
