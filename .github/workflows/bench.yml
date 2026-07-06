@@ -39,7 +39,7 @@ jobs:
       - name: Run criterion benchmarks
         # Clear stale criterion state (rust-cache persists ./target) so the
         # converter only sees estimates from this run.
-        run: rm -rf target/criterion && cargo bench --bench index_and_search
+        run: rm -rf target/criterion && cargo bench --package trouve-search --bench index_and_search
       - name: Convert criterion estimates to benchmark JSON
         run: python3 benchmarks/to_gha_bench.py --criterion target/criterion > micro.json
       - name: Compare against baseline
@@ -76,7 +76,7 @@ jobs:
           path: ~/.cache/huggingface
           key: hf-potion-code-16m
       - name: Build release binary
-        run: cargo build --release
+        run: cargo build --release --package trouve-search
       - name: Run end-to-end benchmarks
         run: benchmarks/run_ci_bench.sh bench-out
       - name: Compare against baseline

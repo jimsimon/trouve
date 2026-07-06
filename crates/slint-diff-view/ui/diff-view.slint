@@ -1,0 +1,92 @@
+// DiffView: virtualized unified diff rendering.
+//
+// The host flattens a parsed diff into one model row per visual line
+// (file headers, hunk headers, context/add/del lines) — the flat model is
+// what keeps a 3k-line diff cheap in a ListView. File collapse is handled
+// by the host rebuilding the row model (see the Rust helpers).
+
+import { ListView } from "std-widgets.slint";
+
+export struct DiffRow {
+    // 0 = file header, 1 = hunk header, 2 = context, 3 = add, 4 = delete
+    kind: int,
+    old-no: string,
+    new-no: string,
+    text: string,
+    // Index of the file this row belongs to (for collapse toggling).
+    file-index: int,
+    // Only meaningful on file header rows.
+    collapsed: bool,
+}
+
+export component DiffView inherits Rectangle {
+    in property <[DiffRow]> rows;
+    in property <length> code-font-size: 13px;
+    in property <length> line-height: code-font-size * 1.5;
+    in property <string> font-family: "monospace";
+
+    callback file-toggled(int);
+
+    background: #1e1e1e;
+
+    ListView {
+        for row[idx] in root.rows: Rectangle {
+            height: root.line-height;
+            background: row.kind == 0 ? #2d2d2d
+                : row.kind == 1 ? #253547
+                : row.kind == 3 ? #1e3a24
+                : row.kind == 4 ? #42272b
+                : transparent;
+
+            if row.kind == 0: TouchArea {
+                clicked => { root.file-toggled(row.file-index); }
+            }
+
+            HorizontalLayout {
+                spacing: 0;
+                if row.kind == 0: Text {
+                    text: (row.collapsed ? "▸ " : "▾ ") + row.text;
+                    color: #e8e8e8;
+                    font-family: root.font-family;
+                    font-size: root.code-font-size;
+                    font-weight: 700;
+                    vertical-alignment: center;
+                }
+                if row.kind != 0: Text {
+                    width: 44px;
+                    text: row.old-no;
+                    color: #6e6e6e;
+                    horizontal-alignment: right;
+                    vertical-alignment: center;
+                    font-family: root.font-family;
+                    font-size: root.code-font-size;
+                }
+                if row.kind != 0: Text {
+                    width: 44px;
+                    text: row.new-no;
+                    color: #6e6e6e;
+                    horizontal-alignment: right;
+                    vertical-alignment: center;
+                    font-family: root.font-family;
+                    font-size: root.code-font-size;
+                }
+                if row.kind != 0: Text {
+                    width: 20px;
+                    text: row.kind == 3 ? "+" : row.kind == 4 ? "-" : " ";
+                    color: row.kind == 3 ? #7fd18a : row.kind == 4 ? #e39ea6 : #6e6e6e;
+                    horizontal-alignment: center;
+                    vertical-alignment: center;
+                    font-family: root.font-family;
+                    font-size: root.code-font-size;
+                }
+                if row.kind != 0: Text {
+                    text: row.text;
+                    color: row.kind == 1 ? #9cbdde : #d4d4d4;
+                    vertical-alignment: center;
+                    font-family: root.font-family;
+                    font-size: root.code-font-size;
+                }
+            }
+        }
+    }
+}

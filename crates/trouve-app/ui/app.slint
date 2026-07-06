@@ -1,0 +1,1036 @@
+// trouve desktop: three-column layout.
+//   left   — sessions grouped by workspace, settings footer
+//   center — thread tabs, chat stream, composer (or the new-chat screen)
+//   right  — inspection tabs (Diff / Files)
+//
+// The window is intentionally dumb: models in, callbacks out. All state
+// folding happens in Rust (client-core view models + the app controller).
+
+import {
+    Button, ComboBox, LineEdit, ListView, Spinner, TabWidget
+} from "std-widgets.slint";
+import { DiffView, DiffRow } from "diff-view.slint";
+import { CodeView, TextSegment } from "code-view.slint";
+import { SettingsWindow, ProviderItem } from "settings-window.slint";
+
+export { DiffRow, TextSegment, SettingsWindow, ProviderItem }
+
+// One row of the left nav: workspace headers, sessions, archived toggles.
+export struct NavRow {
+    // 0 workspace header, 1 session, 2 archived-group toggle
+    kind: int,
+    title: string,
+    subtitle: string,
+    // For kind 1: stable index the controller maps back to a session.
+    session-index: int,
+    selected: bool,
+    archived: bool,
+    expanded: bool,
+}
+
+export struct ThreadTabItem {
+    id: string,
+    label: string,
+}
+
+export struct ChatRow {
+    // 0 user, 1 markdown block, 2 tool card, 3 turn status
+    kind: int,
+    // For kind 1: 0 paragraph, 1 h1, 2 h2, 3 h3, 4 bullet, 5 code fence.
+    md-kind: int,
+    text: string,
+    // Tool-card fields (kind 2).
+    tool-name: string,
+    // 0 awaiting approval, 1 running, 2 ok, 3 error, 4 denied, 5 aborted
+    tool-status: int,
+    detail: string,
+    expanded: bool,
+    // Turn-status fields (kind 3): 0 running, 1 completed, 2 failed.
+    turn-state: int,
+}
+
+export struct FileItem {
+    name: string,
+    is-dir: bool,
+}
+
+// A ComboBox stand-in whose option list opens *above* the control, for use
+// at the bottom edge of the window where a downward popup would be clipped.
+component DropUpPicker inherits Rectangle {
+    in property <[string]> options;
+    in-out property <int> current-index: -1;
+    in property <bool> enabled: true;
+    in property <string> placeholder: "select…";
+    callback changed(int);
+
+    height: 30px;
+    background: #222222;
+    border-radius: 6px;
+
+    popup := PopupWindow {
+        x: 0;
+        y: -min(root.options.length, 10) * 28px - 8px;
+        width: max(root.width, 260px);
+        height: min(root.options.length, 10) * 28px + 2px;
+
+        Rectangle {
+            background: #262626;
+            border-radius: 6px;
+            border-width: 1px;
+            border-color: #3a3a3a;
+            ListView {
+                for option[idx] in root.options: Rectangle {
+                    height: 28px;
+                    background: idx == root.current-index ? #2b3d55 : transparent;
+                    TouchArea {
+                        clicked => {
+                            root.current-index = idx;
+                            root.changed(idx);
+                        }
+                    }
+                    Text {
+                        x: 8px;
+                        width: parent.width - 16px;
+                        text: option;
+                        color: #d8d8d8;
+                        font-size: 12px;
+                        vertical-alignment: center;
+                        overflow: elide;
+                    }
+                }
+            }
+        }
+    }
+
+    TouchArea {
+        enabled: root.enabled;
+        clicked => { popup.show(); }
+    }
+    HorizontalLayout {
+        padding-left: 8px;
+        padding-right: 8px;
+        Text {
+            text: root.current-index >= 0 && root.current-index < root.options.length
+                ? root.options[root.current-index]
+                : root.placeholder;
+            color: root.enabled ? #d8d8d8 : #6a6a6a;
+            font-size: 12px;
+            vertical-alignment: center;
+            overflow: elide;
+            horizontal-stretch: 1;
+        }
+        Text {
+            text: "▴";
+            color: #8a8a8a;
+            font-size: 10px;
+            vertical-alignment: center;
+        }
+    }
+}
+
+// Drag handle between columns. Dragging integrates mouse deltas into the
+// bound width; `direction` is +1 when dragging right grows the column.
+component SplitterHandle inherits Rectangle {
+    in-out property <length> value;
+    in property <int> direction: 1;
+    in property <length> min-value: 180px;
+    in property <length> max-value: 700px;
+
+    width: 5px;
+    background: ta.has-hover || ta.pressed ? #3d5a80 : #242424;
+
+    ta := TouchArea {
+        mouse-cursor: col-resize;
+        moved => {
+            root.value = clamp(
+                root.value + (self.mouse-x - self.pressed-x) * root.direction,
+                root.min-value, root.max-value);
+        }
+    }
+}
+
+export component AppWindow inherits Window {
+    preferred-width: 1400px;
+    preferred-height: 900px;
+    min-width: 900px;
+    min-height: 560px;
+    title: "trouve";
+    background: #141414;
+
+    // --- layout -------------------------------------------------------------
+    in-out property <length> left-width: 260px;
+    in-out property <length> right-width: 460px;
+
+    // --- left column ---------------------------------------------------------
+    in property <[NavRow]> nav-rows;
+    callback nav-row-clicked(int);
+    callback new-session();
+    /// Open a workspace folder from the file system (native picker).
+    callback open-workspace();
+    /// Start a new session in the workspace at this nav row.
+    callback workspace-new-session(int);
+    callback open-settings();
+    callback session-renamed(/* nav row */ int, /* new title */ string);
+    callback session-archived(/* nav row */ int, /* archived */ bool);
+    callback session-deleted(/* nav row */ int);
+
+    // Rename/delete modal state (UI-local; -1 = closed).
+    in-out property <int> rename-row: -1;
+    in-out property <int> delete-row: -1;
+    in-out property <string> modal-title: "";
+
+    // --- center column ---------------------------------------------------------
+    // 0 chat, 1 new-session screen, 2 new-thread screen
+    in property <int> center-screen: 0;
+
+    in property <[ThreadTabItem]> threads;
+    in property <int> current-thread: -1;
+    callback thread-selected(int);
+    callback new-thread();
+
+    in property <[ChatRow]> chat-rows;
+    callback approval-resolved(/* row index */ int, /* approved */ bool);
+    callback tool-toggled(/* row index */ int);
+    callback send-message(string);
+    in property <bool> composer-enabled: false;
+    in property <string> status-text: "starting…";
+    in-out property <string> error-text: "";
+
+    in property <[string]> modes;
+    in property <[string]> models;
+    in-out property <int> mode-index: -1;
+    in-out property <int> model-index: -1;
+    callback composer-mode-changed(int);
+    callback composer-model-changed(int);
+
+    // Session usage + context indicator (composer bar).
+    in property <string> usage-text: "";
+    in property <float> context-fill: 0.0;
+    in property <bool> context-compacting: false;
+    in property <string> context-tooltip: "no usage yet";
+
+    // --- new-chat screen -------------------------------------------------------
+    in property <[string]> nc-workspaces;
+    in property <[string]> nc-branches;
+    in-out property <int> nc-workspace-index: -1;
+    in-out property <int> nc-branch-index: -1;
+    in-out property <int> nc-mode-index: 0;
+    in-out property <int> nc-model-index: 0;
+    callback nc-workspace-changed(int);
+    callback register-workspace-path(string);
+    callback start-new-chat(/* ws */ int, /* branch */ int, /* mode */ int,
+                            /* model */ int, /* prompt */ string);
+    callback cancel-new-chat();
+
+    // --- right column -------------------------------------------------------
+    in property <[DiffRow]> diff-rows;
+    callback diff-file-toggled(int);
+    callback refresh-diff();
+    callback undo-turn();
+    callback redo-turn();
+
+    in property <string> pr-status: "";
+    callback create-pr();
+    callback refresh-pr();
+
+    in property <string> file-path: ".";
+    in property <[FileItem]> file-entries;
+    callback file-activated(int);
+    callback file-up();
+    in property <[[TextSegment]]> file-lines;
+    in property <[int]> file-numbers;
+    in property <string> open-file-name: "";
+
+    public function scroll-chat-to-end() {
+        chat-list.viewport-y = min(0px, chat-list.visible-height - chat-list.viewport-height);
+    }
+
+    HorizontalLayout {
+        // ---------------- left: sessions ----------------
+        Rectangle {
+            width: root.left-width;
+            background: #1a1a1a;
+
+            VerticalLayout {
+                padding: 10px;
+                spacing: 8px;
+
+                HorizontalLayout {
+                    Text {
+                        text: "Workspaces";
+                        color: #e8e8e8;
+                        font-size: 15px;
+                        font-weight: 700;
+                        vertical-alignment: center;
+                        horizontal-stretch: 1;
+                    }
+                    Button {
+                        text: "+ Open";
+                        clicked => { root.open-workspace(); }
+                    }
+                }
+
+                ListView {
+                    vertical-stretch: 1;
+                    for row[idx] in root.nav-rows: Rectangle {
+                        height: row.kind == 1 ? 52px : row.kind == 0 ? 34px : 30px;
+                        background: row.kind == 0
+                            ? (row-ta.has-hover ? #2b2b2b : #232323)
+                            : row.kind == 1 && row.selected ? #2b3d55 : transparent;
+                        border-radius: 6px;
+
+                        row-menu := PopupWindow {
+                            x: parent.width - 150px;
+                            y: 28px;
+                            width: 150px;
+                            height: 100px;
+                            Rectangle {
+                                background: #262626;
+                                border-radius: 6px;
+                                border-width: 1px;
+                                border-color: #3a3a3a;
+                                VerticalLayout {
+                                    padding: 4px;
+                                    Rectangle {
+                                        height: 30px;
+                                        background: rename-ta.has-hover ? #2b3d55 : transparent;
+                                        border-radius: 4px;
+                                        rename-ta := TouchArea {
+                                            clicked => {
+                                                root.modal-title = row.title;
+                                                root.rename-row = idx;
+                                            }
+                                        }
+                                        Text {
+                                            x: 8px;
+                                            text: "Rename";
+                                            color: #d8d8d8;
+                                            font-size: 12px;
+                                            vertical-alignment: center;
+                                        }
+                                    }
+                                    Rectangle {
+                                        height: 30px;
+                                        background: archive-ta.has-hover ? #2b3d55 : transparent;
+                                        border-radius: 4px;
+                                        archive-ta := TouchArea {
+                                            clicked => {
+                                                root.session-archived(idx, !row.archived);
+                                            }
+                                        }
+                                        Text {
+                                            x: 8px;
+                                            text: row.archived ? "Unarchive" : "Archive";
+                                            color: #d8d8d8;
+                                            font-size: 12px;
+                                            vertical-alignment: center;
+                                        }
+                                    }
+                                    Rectangle {
+                                        height: 30px;
+                                        background: delete-ta.has-hover ? #6b2b33 : transparent;
+                                        border-radius: 4px;
+                                        delete-ta := TouchArea {
+                                            clicked => {
+                                                root.modal-title = row.title;
+                                                root.delete-row = idx;
+                                            }
+                                        }
+                                        Text {
+                                            x: 8px;
+                                            text: "Delete…";
+                                            color: #e39ea6;
+                                            font-size: 12px;
+                                            vertical-alignment: center;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
+                        row-ta := TouchArea {
+                            clicked => { root.nav-row-clicked(idx); }
+                        }
+
+                        // Workspace header: chevron + name, "+" starts a
+                        // session in this workspace. Clicking elsewhere
+                        // collapses/expands the group.
+                        if row.kind == 0: HorizontalLayout {
+                            padding-left: 8px;
+                            padding-right: 4px;
+                            spacing: 6px;
+                            Text {
+                                text: row.expanded ? "⌄" : "›";
+                                color: #8a8a8a;
+                                font-size: 12px;
+                                vertical-alignment: center;
+                            }
+                            Text {
+                                text: row.title;
+                                color: #d8d8d8;
+                                font-size: 13px;
+                                font-weight: 700;
+                                vertical-alignment: center;
+                                overflow: elide;
+                                horizontal-stretch: 1;
+                            }
+                            Rectangle {
+                                width: 26px;
+                                height: 26px;
+                                y: (parent.height - self.height) / 2;
+                                border-radius: 5px;
+                                background: plus-ta.has-hover ? #3a3a3a : transparent;
+                                plus-ta := TouchArea {
+                                    clicked => { root.workspace-new-session(idx); }
+                                }
+                                Text {
+                                    text: "+";
+                                    color: plus-ta.has-hover ? #e8e8e8 : #8a8a8a;
+                                    font-size: 15px;
+                                    horizontal-alignment: center;
+                                    vertical-alignment: center;
+                                    width: 100%;
+                                    height: 100%;
+                                }
+                            }
+                        }
+
+                        // Session row.
+                        if row.kind == 1: HorizontalLayout {
+                            padding-left: 22px;
+                            padding-right: 4px;
+                            VerticalLayout {
+                                padding-top: 8px;
+                                spacing: 2px;
+                                horizontal-stretch: 1;
+                                Text {
+                                    text: row.title;
+                                    color: row.archived ? #8a8a8a : #e0e0e0;
+                                    font-size: 13px;
+                                    overflow: elide;
+                                }
+                                Text {
+                                    text: row.subtitle;
+                                    color: #8a8a8a;
+                                    font-size: 11px;
+                                    overflow: elide;
+                                }
+                            }
+                            Rectangle {
+                                width: 26px;
+                                menu-ta := TouchArea {
+                                    clicked => { row-menu.show(); }
+                                }
+                                Text {
+                                    text: "⋯";
+                                    color: menu-ta.has-hover ? #e0e0e0 : #6a6a6a;
+                                    font-size: 15px;
+                                    horizontal-alignment: center;
+                                    vertical-alignment: center;
+                                    width: 100%;
+                                    height: 100%;
+                                }
+                            }
+                        }
+
+                        // Archived-group toggle.
+                        if row.kind == 2: Text {
+                            x: 22px;
+                            text: (row.expanded ? "▾ " : "▸ ") + row.title;
+                            color: #7a7a7a;
+                            font-size: 11px;
+                            vertical-alignment: center;
+                            height: 100%;
+                        }
+                    }
+                }
+
+                // Footer: settings + status.
+                HorizontalLayout {
+                    spacing: 6px;
+                    Button {
+                        text: "⚙ Settings";
+                        clicked => { root.open-settings(); }
+                    }
+                    Rectangle { horizontal-stretch: 1; }
+                }
+                Text {
+                    text: root.status-text;
+                    color: #7a7a7a;
+                    font-size: 11px;
+                    wrap: word-wrap;
+                }
+            }
+        }
+
+        SplitterHandle {
+            value <=> root.left-width;
+            direction: 1;
+            min-value: 190px;
+            max-value: 460px;
+        }
+
+        // ---------------- center ----------------
+        Rectangle {
+            horizontal-stretch: 1;
+            background: #141414;
+
+            // ----- chat screen (kept in the tree so scroll-chat-to-end can
+            // reach the list; hidden while a new-chat screen is up) -----
+            VerticalLayout {
+                visible: root.center-screen == 0;
+                padding: 10px;
+                spacing: 8px;
+
+                // Error banner.
+                if root.error-text != "": Rectangle {
+                    background: #4a2328;
+                    border-radius: 6px;
+                    height: banner.preferred-height + 12px;
+                    banner := HorizontalLayout {
+                        padding: 6px;
+                        padding-left: 10px;
+                        spacing: 8px;
+                        Text {
+                            text: root.error-text;
+                            color: #f2c4ca;
+                            font-size: 12px;
+                            wrap: word-wrap;
+                            vertical-alignment: center;
+                            horizontal-stretch: 1;
+                        }
+                        Button {
+                            text: "✕";
+                            clicked => { root.error-text = ""; }
+                        }
+                    }
+                }
+
+                // Thread tabs.
+                HorizontalLayout {
+                    spacing: 6px;
+                    for thread[idx] in root.threads: Rectangle {
+                        width: 130px;
+                        height: 30px;
+                        background: idx == root.current-thread ? #2b3d55 : #222222;
+                        border-radius: 6px;
+                        TouchArea {
+                            clicked => { root.thread-selected(idx); }
+                        }
+                        Text {
+                            text: thread.label;
+                            color: #d8d8d8;
+                            font-size: 12px;
+                            horizontal-alignment: center;
+                            vertical-alignment: center;
+                            overflow: elide;
+                            width: parent.width - 12px;
+                            x: 6px;
+                        }
+                    }
+                    Button {
+                        text: "+";
+                        enabled: root.threads.length > 0 || root.composer-enabled;
+                        clicked => { root.new-thread(); }
+                    }
+                    Rectangle { horizontal-stretch: 1; }
+                }
+
+                // Chat stream.
+                chat-list := ListView {
+                    vertical-stretch: 1;
+
+                    for row[idx] in root.chat-rows: Rectangle {
+                        height: row-content.preferred-height + 10px;
+                        background: row.kind == 0 ? #20293a
+                            : row.kind == 2 ? #1d1d1d
+                            : row.kind == 1 && row.md-kind == 5 ? #191919
+                            : transparent;
+                        border-radius: 6px;
+
+                        row-content := VerticalLayout {
+                            padding: 6px;
+                            padding-left: row.kind == 1 && row.md-kind == 4 ? 22px : 10px;
+                            spacing: 4px;
+
+                            // User message.
+                            if row.kind == 0: Text {
+                                text: row.text;
+                                color: #dbe6f5;
+                                font-size: 14px;
+                                wrap: word-wrap;
+                            }
+
+                            // Markdown block.
+                            if row.kind == 1: Text {
+                                text: row.md-kind == 4 ? "•  " + row.text : row.text;
+                                color: #d4d4d4;
+                                wrap: word-wrap;
+                                font-size: row.md-kind == 1 ? 22px
+                                    : row.md-kind == 2 ? 19px
+                                    : row.md-kind == 3 ? 16px
+                                    : 14px;
+                                font-weight: row.md-kind >= 1 && row.md-kind <= 3 ? 700 : 400;
+                                font-family: row.md-kind == 5 ? "monospace" : "";
+                            }
+
+                            // Tool card header.
+                            if row.kind == 2: HorizontalLayout {
+                                spacing: 8px;
+                                Text {
+                                    text: row.tool-status == 0 ? "⏸"
+                                        : row.tool-status == 1 ? "▶"
+                                        : row.tool-status == 2 ? "✓"
+                                        : row.tool-status == 4 ? "⊘"
+                                        : "✗";
+                                    color: row.tool-status == 2 ? #7fd18a
+                                        : row.tool-status == 0 ? #e5c07b
+                                        : row.tool-status == 1 ? #9cbdde
+                                        : #e39ea6;
+                                    font-size: 14px;
+                                    vertical-alignment: center;
+                                }
+                                Text {
+                                    text: row.tool-name;
+                                    color: #e0e0e0;
+                                    font-size: 13px;
+                                    font-weight: 700;
+                                    vertical-alignment: center;
+                                }
+                                Text {
+                                    text: row.expanded ? "hide details" : "details";
+                                    color: #6fa8dc;
+                                    font-size: 12px;
+                                    vertical-alignment: center;
+                                    TouchArea {
+                                        clicked => { root.tool-toggled(idx); }
+                                    }
+                                }
+                                Rectangle { horizontal-stretch: 1; }
+                                if row.tool-status == 0: Button {
+                                    text: "Approve";
+                                    primary: true;
+                                    clicked => { root.approval-resolved(idx, true); }
+                                }
+                                if row.tool-status == 0: Button {
+                                    text: "Deny";
+                                    clicked => { root.approval-resolved(idx, false); }
+                                }
+                            }
+
+                            // Tool card detail.
+                            if row.kind == 2 && row.expanded: Text {
+                                text: row.detail;
+                                color: #a8a8a8;
+                                font-size: 12px;
+                                font-family: "monospace";
+                                wrap: word-wrap;
+                            }
+
+                            // Turn status.
+                            if row.kind == 3: Text {
+                                text: row.text;
+                                color: row.turn-state == 2 ? #e39ea6 : #7a7a7a;
+                                font-size: 11px;
+                            }
+                        }
+                    }
+                }
+
+                // Composer bar: pickers (drop-up), input, send, context dial,
+                // and session usage.
+                HorizontalLayout {
+                    spacing: 8px;
+                    DropUpPicker {
+                        width: 130px;
+                        options: root.modes;
+                        current-index <=> root.mode-index;
+                        enabled: root.composer-enabled;
+                        placeholder: "mode";
+                        changed(i) => { root.composer-mode-changed(i); }
+                    }
+                    DropUpPicker {
+                        width: 210px;
+                        options: root.models;
+                        current-index <=> root.model-index;
+                        enabled: root.composer-enabled;
+                        placeholder: "model";
+                        changed(i) => { root.composer-model-changed(i); }
+                    }
+                    composer := LineEdit {
+                        horizontal-stretch: 1;
+                        placeholder-text: root.composer-enabled
+                            ? "Message the agent…"
+                            : "Select or create a thread first";
+                        enabled: root.composer-enabled;
+                        accepted(text) => {
+                            if (text != "") {
+                                root.send-message(text);
+                                self.text = "";
+                            }
+                        }
+                    }
+                    Button {
+                        text: "Send";
+                        primary: true;
+                        enabled: root.composer-enabled && composer.text != "";
+                        clicked => {
+                            root.send-message(composer.text);
+                            composer.text = "";
+                        }
+                    }
+                    // Context usage dial; indeterminate while compacting.
+                    dial := Rectangle {
+                        width: 30px;
+                        height: 30px;
+                        Spinner {
+                            width: 26px;
+                            height: 26px;
+                            x: 2px;
+                            y: 2px;
+                            progress: root.context-fill;
+                            indeterminate: root.context-compacting;
+                        }
+                        dial-ta := TouchArea { }
+                        if dial-ta.has-hover: Rectangle {
+                            x: dial.width - self.width;
+                            y: -self.height - 6px;
+                            width: min(tooltip-text.preferred-width + 16px, 340px);
+                            height: tooltip-text.preferred-height + 12px;
+                            background: #262626;
+                            border-radius: 6px;
+                            border-width: 1px;
+                            border-color: #3a3a3a;
+                            tooltip-text := Text {
+                                x: 8px;
+                                y: 6px;
+                                width: parent.width - 16px;
+                                text: root.context-compacting
+                                    ? "compacting context…\n" + root.context-tooltip
+                                    : root.context-tooltip;
+                                color: #d8d8d8;
+                                font-size: 11px;
+                                wrap: word-wrap;
+                            }
+                        }
+                    }
+                    Text {
+                        text: root.usage-text;
+                        color: #8a8a8a;
+                        font-size: 11px;
+                        vertical-alignment: center;
+                        max-width: 190px;
+                        overflow: elide;
+                    }
+                }
+            }
+
+            // ----- new-chat screen (new session / new thread) -----
+            if root.center-screen != 0: VerticalLayout {
+                padding: 40px;
+                spacing: 14px;
+                alignment: center;
+
+                Text {
+                    text: root.center-screen == 1 ? "New session" : "New thread";
+                    color: #e8e8e8;
+                    font-size: 22px;
+                    font-weight: 700;
+                }
+                Text {
+                    text: root.center-screen == 1
+                        ? "Pick where to work, what to branch from, and how the agent should run."
+                        : "Threads share the session worktree; pick the agent setup for this one.";
+                    color: #9a9a9a;
+                    font-size: 13px;
+                    wrap: word-wrap;
+                }
+
+                if root.center-screen == 1: VerticalLayout {
+                    spacing: 6px;
+                    Text { text: "Workspace"; color: #c8c8c8; font-size: 12px; font-weight: 700; }
+                    ComboBox {
+                        model: root.nc-workspaces;
+                        current-index <=> root.nc-workspace-index;
+                        selected => { root.nc-workspace-changed(self.current-index); }
+                    }
+                    HorizontalLayout {
+                        spacing: 6px;
+                        ws-path := LineEdit {
+                            horizontal-stretch: 1;
+                            placeholder-text: "…or register a git repo by absolute path";
+                        }
+                        Button {
+                            text: "Add";
+                            enabled: ws-path.text != "";
+                            clicked => {
+                                root.register-workspace-path(ws-path.text);
+                                ws-path.text = "";
+                            }
+                        }
+                    }
+                }
+
+                if root.center-screen == 1: VerticalLayout {
+                    spacing: 6px;
+                    Text { text: "Base branch"; color: #c8c8c8; font-size: 12px; font-weight: 700; }
+                    ComboBox {
+                        model: root.nc-branches;
+                        current-index <=> root.nc-branch-index;
+                    }
+                }
+
+                HorizontalLayout {
+                    spacing: 12px;
+                    VerticalLayout {
+                        spacing: 6px;
+                        horizontal-stretch: 1;
+                        Text { text: "Agent mode"; color: #c8c8c8; font-size: 12px; font-weight: 700; }
+                        ComboBox {
+                            model: root.modes;
+                            current-index <=> root.nc-mode-index;
+                        }
+                    }
+                    VerticalLayout {
+                        spacing: 6px;
+                        horizontal-stretch: 1;
+                        Text { text: "Model"; color: #c8c8c8; font-size: 12px; font-weight: 700; }
+                        ComboBox {
+                            model: root.models;
+                            current-index <=> root.nc-model-index;
+                        }
+                    }
+                }
+
+                VerticalLayout {
+                    spacing: 6px;
+                    Text { text: "First message"; color: #c8c8c8; font-size: 12px; font-weight: 700; }
+                    prompt-edit := LineEdit {
+                        placeholder-text: "What should the agent do?";
+                        accepted(text) => {
+                            if (text != "") {
+                                root.start-new-chat(
+                                    root.nc-workspace-index, root.nc-branch-index,
+                                    root.nc-mode-index, root.nc-model-index, text);
+                                self.text = "";
+                            }
+                        }
+                    }
+                }
+
+                HorizontalLayout {
+                    spacing: 8px;
+                    Button {
+                        text: root.center-screen == 1 ? "Start session" : "Start thread";
+                        primary: true;
+                        enabled: prompt-edit.text != ""
+                            && (root.center-screen == 2 || root.nc-workspace-index >= 0);
+                        clicked => {
+                            root.start-new-chat(
+                                root.nc-workspace-index, root.nc-branch-index,
+                                root.nc-mode-index, root.nc-model-index, prompt-edit.text);
+                            prompt-edit.text = "";
+                        }
+                    }
+                    Button {
+                        text: "Cancel";
+                        clicked => { root.cancel-new-chat(); }
+                    }
+                    Rectangle { horizontal-stretch: 1; }
+                }
+                if root.error-text != "" : Text {
+                    text: root.error-text;
+                    color: #e39ea6;
+                    font-size: 12px;
+                    wrap: word-wrap;
+                }
+            }
+        }
+
+        SplitterHandle {
+            value <=> root.right-width;
+            direction: -1;
+            min-value: 280px;
+            max-value: 800px;
+        }
+
+        // ---------------- right: inspection ----------------
+        Rectangle {
+            width: root.right-width;
+            background: #181818;
+
+            TabWidget {
+                Tab {
+                    title: "Diff";
+                    VerticalLayout {
+                        padding: 6px;
+                        spacing: 6px;
+                        HorizontalLayout {
+                            spacing: 6px;
+                            Button {
+                                text: "Refresh diff";
+                                clicked => { root.refresh-diff(); }
+                            }
+                            Button {
+                                text: "↶ Undo turn";
+                                clicked => { root.undo-turn(); }
+                            }
+                            Button {
+                                text: "↷ Redo";
+                                clicked => { root.redo-turn(); }
+                            }
+                            Rectangle { horizontal-stretch: 1; }
+                            Button {
+                                text: "Create PR";
+                                clicked => { root.create-pr(); }
+                            }
+                            Button {
+                                text: "PR status";
+                                clicked => { root.refresh-pr(); }
+                            }
+                        }
+                        if root.pr-status != "": Text {
+                            text: root.pr-status;
+                            color: #9cbdde;
+                            font-size: 12px;
+                            wrap: word-wrap;
+                        }
+                        DiffView {
+                            vertical-stretch: 1;
+                            rows: root.diff-rows;
+                            file-toggled(i) => { root.diff-file-toggled(i); }
+                        }
+                    }
+                }
+                Tab {
+                    title: "Files";
+                    VerticalLayout {
+                        padding: 6px;
+                        spacing: 6px;
+                        HorizontalLayout {
+                            spacing: 6px;
+                            Button {
+                                text: "↑ Up";
+                                clicked => { root.file-up(); }
+                            }
+                            Text {
+                                text: root.file-path;
+                                color: #9a9a9a;
+                                font-size: 12px;
+                                vertical-alignment: center;
+                                overflow: elide;
+                                horizontal-stretch: 1;
+                            }
+                        }
+                        ListView {
+                            height: 180px;
+                            for entry[idx] in root.file-entries: Rectangle {
+                                height: 24px;
+                                TouchArea {
+                                    clicked => { root.file-activated(idx); }
+                                }
+                                Text {
+                                    x: 6px;
+                                    text: (entry.is-dir ? "📁 " : "📄 ") + entry.name;
+                                    color: #d0d0d0;
+                                    font-size: 12px;
+                                    vertical-alignment: center;
+                                }
+                            }
+                        }
+                        Text {
+                            text: root.open-file-name;
+                            color: #9a9a9a;
+                            font-size: 12px;
+                        }
+                        CodeView {
+                            vertical-stretch: 1;
+                            lines: root.file-lines;
+                            line-numbers: root.file-numbers;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // ---------------- modal overlays (rename / delete) ----------------
+    if root.rename-row >= 0 || root.delete-row >= 0: Rectangle {
+        width: 100%;
+        height: 100%;
+        background: #000000aa;
+        TouchArea { } // swallow clicks behind the modal
+
+        Rectangle {
+            width: 380px;
+            height: modal-layout.preferred-height + 32px;
+            x: (parent.width - self.width) / 2;
+            y: (parent.height - self.height) / 2;
+            background: #232323;
+            border-radius: 8px;
+            border-width: 1px;
+            border-color: #3a3a3a;
+
+            modal-layout := VerticalLayout {
+                padding: 16px;
+                spacing: 12px;
+
+                Text {
+                    text: root.rename-row >= 0
+                        ? "Rename session"
+                        : "Delete session \"" + root.modal-title + "\"?";
+                    color: #e8e8e8;
+                    font-size: 15px;
+                    font-weight: 700;
+                    wrap: word-wrap;
+                }
+
+                if root.rename-row >= 0: LineEdit {
+                    text <=> root.modal-title;
+                    placeholder-text: "Session title";
+                    accepted(text) => {
+                        if (text != "") {
+                            root.session-renamed(root.rename-row, text);
+                            root.rename-row = -1;
+                        }
+                    }
+                }
+
+                if root.delete-row >= 0: Text {
+                    text: "This removes the session's worktree, branch history in trouve, and its event log. The git branch itself is kept.";
+                    color: #9a9a9a;
+                    font-size: 12px;
+                    wrap: word-wrap;
+                }
+
+                HorizontalLayout {
+                    spacing: 8px;
+                    Rectangle { horizontal-stretch: 1; }
+                    Button {
+                        text: "Cancel";
+                        clicked => {
+                            root.rename-row = -1;
+                            root.delete-row = -1;
+                        }
+                    }
+                    if root.rename-row >= 0: Button {
+                        text: "Rename";
+                        primary: true;
+                        clicked => {
+                            root.session-renamed(root.rename-row, root.modal-title);
+                            root.rename-row = -1;
+                        }
+                    }
+                    if root.delete-row >= 0: Button {
+                        text: "Delete";
+                        primary: true;
+                        clicked => {
+                            root.session-deleted(root.delete-row);
+                            root.delete-row = -1;
+                        }
+                    }
+                }
+            }
+        }
+    }
+}

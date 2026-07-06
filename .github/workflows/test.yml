@@ -21,7 +21,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Unit and integration tests (offline)
         run: cargo test --workspace
-      - name: Build release binary
+      - name: Build release binaries
         run: cargo build --release
 
   # End-to-end tests that download the embedding model from Hugging Face.
@@ -61,6 +61,6 @@ jobs:
       - name: Install upstream semble
         run: pip install './reference/semble[mcp]'
       - name: Build release binary
-        run: cargo build --release
+        run: cargo build --release --package trouve-search
       - name: Run parity harness
-        run: python3 tests/parity/run_parity.py --binary target/release/trouve-search
+        run: python3 crates/trouve-search/tests/parity/run_parity.py --binary target/release/trouve-search

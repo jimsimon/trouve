@@ -1,0 +1,2781 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "trouve harness protocol",
+    "description": "Commands are POST endpoints; state flows back on cursor-addressed SSE event streams.",
+    "license": {
+      "name": "MIT",
+      "identifier": "MIT"
+    },
+    "version": "0.4"
+  },
+  "paths": {
+    "/v1/approvals": {
+      "post": {
+        "tags": [],
+        "operationId": "resolve_approval",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ResolveApprovalRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "204": {
+            "description": ""
+          },
+          "404": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/config/default-model": {
+      "put": {
+        "tags": [],
+        "operationId": "set_default_model",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SetDefaultModelRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "204": {
+            "description": ""
+          },
+          "400": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/info": {
+      "get": {
+        "tags": [],
+        "operationId": "info",
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ServerInfo"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/models": {
+      "get": {
+        "tags": [],
+        "operationId": "list_models",
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/ModelInfo"
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/modes": {
+      "get": {
+        "tags": [],
+        "operationId": "list_modes",
+        "parameters": [
+          {
+            "name": "workspace_id",
+            "in": "query",
+            "description": "Include the workspace's .agents modes",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/AgentMode"
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/providers": {
+      "get": {
+        "tags": [],
+        "operationId": "list_providers",
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProvidersResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/providers/known": {
+      "get": {
+        "tags": [],
+        "operationId": "known_providers",
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/KnownProvider"
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/providers/{id}": {
+      "put": {
+        "tags": [],
+        "operationId": "upsert_provider",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UpsertProviderRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProviderInfo"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      },
+      "delete": {
+        "tags": [],
+        "operationId": "delete_provider",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": ""
+          },
+          "404": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/providers/{id}/login": {
+      "get": {
+        "tags": [],
+        "operationId": "login_status",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/LoginStatus"
+                }
+              }
+            }
+          }
+        }
+      },
+      "post": {
+        "tags": [],
+        "operationId": "start_login",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/LoginStarted"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/sessions": {
+      "get": {
+        "tags": [],
+        "operationId": "list_sessions",
+        "parameters": [
+          {
+            "name": "workspace_id",
+            "in": "query",
+            "description": "Filter by workspace",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/Session"
+                  }
+                }
+              }
+            }
+          }
+        }
+      },
+      "post": {
+        "tags": [],
+        "operationId": "create_session",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateSessionRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Session"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/sessions/{id}": {
+      "get": {
+        "tags": [],
+        "operationId": "get_session",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Session"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      },
+      "delete": {
+        "tags": [],
+        "operationId": "delete_session",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": ""
+          },
+          "404": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      },
+      "patch": {
+        "tags": [],
+        "operationId": "update_session",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UpdateSessionRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Session"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/sessions/{id}/diff": {
+      "get": {
+        "tags": [],
+        "operationId": "session_diff",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SessionDiff"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/sessions/{id}/file": {
+      "get": {
+        "tags": [],
+        "operationId": "session_file",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "path",
+            "in": "query",
+            "description": "Worktree-relative file",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/FileContent"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/sessions/{id}/files": {
+      "get": {
+        "tags": [],
+        "operationId": "session_files",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "path",
+            "in": "query",
+            "description": "Worktree-relative directory",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/DirEntry"
+                  }
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/sessions/{id}/pr": {
+      "get": {
+        "tags": [],
+        "operationId": "get_session_pr",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "oneOf": [
+                    {
+                      "type": "null"
+                    },
+                    {
+                      "$ref": "#/components/schemas/PrInfo"
+                    }
+                  ]
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      },
+      "post": {
+        "tags": [],
+        "operationId": "create_session_pr",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreatePrRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PrInfo"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/sessions/{id}/pr/merge": {
+      "post": {
+        "tags": [],
+        "operationId": "merge_session_pr",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/MergePrRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "204": {
+            "description": ""
+          },
+          "400": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/sessions/{id}/redo": {
+      "post": {
+        "tags": [],
+        "operationId": "redo_session",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": ""
+          },
+          "400": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/sessions/{id}/undo": {
+      "post": {
+        "tags": [],
+        "operationId": "undo_session",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": ""
+          },
+          "400": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/sessions/{id}/usage": {
+      "get": {
+        "tags": [],
+        "operationId": "session_usage",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/UsageSummary"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/threads": {
+      "get": {
+        "tags": [],
+        "operationId": "list_threads",
+        "parameters": [
+          {
+            "name": "session_id",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/Thread"
+                  }
+                }
+              }
+            }
+          }
+        }
+      },
+      "post": {
+        "tags": [],
+        "operationId": "create_thread",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateThreadRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Thread"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/threads/{id}": {
+      "get": {
+        "tags": [],
+        "operationId": "get_thread",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Thread"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      },
+      "patch": {
+        "tags": [],
+        "operationId": "update_thread",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UpdateThreadRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Thread"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/threads/{id}/messages": {
+      "post": {
+        "tags": [],
+        "operationId": "send_message",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SendMessageRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "202": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TurnAccepted"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/threads/{id}/usage": {
+      "get": {
+        "tags": [],
+        "operationId": "thread_usage",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/UsageSummary"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/workspaces": {
+      "get": {
+        "tags": [],
+        "operationId": "list_workspaces",
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/Workspace"
+                  }
+                }
+              }
+            }
+          }
+        }
+      },
+      "post": {
+        "tags": [],
+        "operationId": "register_workspace",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RegisterWorkspaceRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Workspace"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/workspaces/{id}/branches": {
+      "get": {
+        "tags": [],
+        "operationId": "workspace_branches",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BranchList"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "components": {
+    "schemas": {
+      "AgentMode": {
+        "type": "object",
+        "description": "A data-driven agent mode: prompt + tool policy + default permissions.\nAdding a mode is configuration, not code (AGENTS.md invariant 6).",
+        "required": [
+          "id",
+          "display_name",
+          "system_prompt"
+        ],
+        "properties": {
+          "allowed_tools": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Tool names this mode may use; empty means all registered tools."
+          },
+          "default_permission_mode": {
+            "$ref": "#/components/schemas/PermissionMode"
+          },
+          "display_name": {
+            "type": "string"
+          },
+          "id": {
+            "type": "string",
+            "description": "Stable identifier, e.g. \"code\", \"plan\", \"review\"."
+          },
+          "read_only": {
+            "type": "boolean",
+            "description": "When true the mode can never mutate the worktree regardless of the\nthread's permission mode (e.g. plan/question modes)."
+          },
+          "system_prompt": {
+            "type": "string",
+            "description": "Appended to the base system prompt."
+          }
+        }
+      },
+      "ApprovalDecision": {
+        "type": "string",
+        "description": "Permission decision for an approval request.",
+        "enum": [
+          "approve",
+          "always_approve",
+          "deny"
+        ]
+      },
+      "BranchList": {
+        "type": "object",
+        "description": "Local branches of a workspace repository, for base-ref selection.",
+        "required": [
+          "branches",
+          "head"
+        ],
+        "properties": {
+          "branches": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "head": {
+            "type": "string",
+            "description": "The branch HEAD currently points at (default selection)."
+          }
+        }
+      },
+      "CheckRun": {
+        "type": "object",
+        "required": [
+          "name",
+          "status"
+        ],
+        "properties": {
+          "conclusion": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "success / failure / … (None while running)"
+          },
+          "name": {
+            "type": "string"
+          },
+          "status": {
+            "type": "string",
+            "description": "queued / in_progress / completed"
+          }
+        }
+      },
+      "CreatePrRequest": {
+        "type": "object",
+        "required": [
+          "title"
+        ],
+        "properties": {
+          "base": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Base branch (default: the session's base ref without `origin/`)."
+          },
+          "body": {
+            "type": "string"
+          },
+          "draft": {
+            "type": "boolean"
+          },
+          "title": {
+            "type": "string"
+          }
+        }
+      },
+      "CreateSessionRequest": {
+        "type": "object",
+        "required": [
+          "workspace_id"
+        ],
+        "properties": {
+          "base_ref": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Base ref the session branch is created from (default: workspace HEAD)."
+          },
+          "title": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Human-readable title; also used to derive the branch slug."
+          },
+          "workspace_id": {
+            "$ref": "#/components/schemas/String"
+          }
+        }
+      },
+      "CreateThreadRequest": {
+        "type": "object",
+        "required": [
+          "session_id"
+        ],
+        "properties": {
+          "mode": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Agent mode id (default: \"code\")."
+          },
+          "model": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Provider/model identifier, e.g. \"openai/gpt-4.1\"."
+          },
+          "model_options": {
+            "type": "object",
+            "description": "Model-specific options validated against the model's options schema.",
+            "additionalProperties": {},
+            "propertyNames": {
+              "type": "string"
+            }
+          },
+          "permission_mode": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/PermissionMode"
+              }
+            ]
+          },
+          "session_id": {
+            "$ref": "#/components/schemas/String"
+          }
+        }
+      },
+      "DirEntry": {
+        "type": "object",
+        "required": [
+          "name",
+          "is_dir"
+        ],
+        "properties": {
+          "is_dir": {
+            "type": "boolean"
+          },
+          "name": {
+            "type": "string"
+          }
+        }
+      },
+      "ErrorBody": {
+        "type": "object",
+        "description": "Uniform error body for non-2xx responses.",
+        "required": [
+          "code",
+          "message"
+        ],
+        "properties": {
+          "code": {
+            "type": "string"
+          },
+          "message": {
+            "type": "string"
+          }
+        }
+      },
+      "Event": {
+        "oneOf": [
+          {
+            "type": "object",
+            "required": [
+              "turn",
+              "mode",
+              "model",
+              "type"
+            ],
+            "properties": {
+              "mode": {
+                "type": "string"
+              },
+              "model": {
+                "type": "string"
+              },
+              "turn": {
+                "type": "integer",
+                "format": "int64",
+                "minimum": 0
+              },
+              "type": {
+                "type": "string",
+                "enum": [
+                  "turn.started"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "turn",
+              "usage",
+              "type"
+            ],
+            "properties": {
+              "checkpoint_id": {
+                "oneOf": [
+                  {
+                    "type": "null"
+                  },
+                  {
+                    "$ref": "#/components/schemas/String"
+                  }
+                ]
+              },
+              "turn": {
+                "type": "integer",
+                "format": "int64",
+                "minimum": 0
+              },
+              "type": {
+                "type": "string",
+                "enum": [
+                  "turn.completed"
+                ]
+              },
+              "usage": {
+                "$ref": "#/components/schemas/Usage"
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "turn",
+              "error",
+              "type"
+            ],
+            "properties": {
+              "error": {
+                "type": "string"
+              },
+              "turn": {
+                "type": "integer",
+                "format": "int64",
+                "minimum": 0
+              },
+              "type": {
+                "type": "string",
+                "enum": [
+                  "turn.failed"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "turn",
+              "content",
+              "type"
+            ],
+            "properties": {
+              "content": {
+                "type": "string"
+              },
+              "turn": {
+                "type": "integer",
+                "format": "int64",
+                "minimum": 0
+              },
+              "type": {
+                "type": "string",
+                "enum": [
+                  "user.message"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "description": "Streamed model output. Replaying all deltas of a turn reproduces the\nfinal message exactly.",
+            "required": [
+              "turn",
+              "text",
+              "type"
+            ],
+            "properties": {
+              "text": {
+                "type": "string"
+              },
+              "turn": {
+                "type": "integer",
+                "format": "int64",
+                "minimum": 0
+              },
+              "type": {
+                "type": "string",
+                "enum": [
+                  "assistant.delta"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "description": "Folded final assistant text for the turn.",
+            "required": [
+              "turn",
+              "content",
+              "type"
+            ],
+            "properties": {
+              "content": {
+                "type": "string"
+              },
+              "turn": {
+                "type": "integer",
+                "format": "int64",
+                "minimum": 0
+              },
+              "type": {
+                "type": "string",
+                "enum": [
+                  "assistant.message"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "turn",
+              "call_id",
+              "tool",
+              "args",
+              "requires_approval",
+              "type"
+            ],
+            "properties": {
+              "args": {},
+              "call_id": {
+                "$ref": "#/components/schemas/String"
+              },
+              "requires_approval": {
+                "type": "boolean"
+              },
+              "tool": {
+                "type": "string"
+              },
+              "turn": {
+                "type": "integer",
+                "format": "int64",
+                "minimum": 0
+              },
+              "type": {
+                "type": "string",
+                "enum": [
+                  "tool.requested"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "turn",
+              "call_id",
+              "type"
+            ],
+            "properties": {
+              "call_id": {
+                "$ref": "#/components/schemas/String"
+              },
+              "turn": {
+                "type": "integer",
+                "format": "int64",
+                "minimum": 0
+              },
+              "type": {
+                "type": "string",
+                "enum": [
+                  "approval.requested"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "call_id",
+              "decision",
+              "type"
+            ],
+            "properties": {
+              "call_id": {
+                "$ref": "#/components/schemas/String"
+              },
+              "decision": {
+                "$ref": "#/components/schemas/ApprovalDecision"
+              },
+              "type": {
+                "type": "string",
+                "enum": [
+                  "approval.resolved"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "call_id",
+              "type"
+            ],
+            "properties": {
+              "call_id": {
+                "$ref": "#/components/schemas/String"
+              },
+              "type": {
+                "type": "string",
+                "enum": [
+                  "tool.started"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "call_id",
+              "chunk",
+              "type"
+            ],
+            "properties": {
+              "call_id": {
+                "$ref": "#/components/schemas/String"
+              },
+              "chunk": {
+                "type": "string"
+              },
+              "type": {
+                "type": "string",
+                "enum": [
+                  "tool.output"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "call_id",
+              "status",
+              "result",
+              "type"
+            ],
+            "properties": {
+              "call_id": {
+                "$ref": "#/components/schemas/String"
+              },
+              "result": {},
+              "status": {
+                "$ref": "#/components/schemas/ToolStatus"
+              },
+              "type": {
+                "type": "string",
+                "enum": [
+                  "tool.completed"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "description": "The thread's transcript neared the model's context window; the engine\nis summarizing older messages. Clients show a busy indicator.",
+            "required": [
+              "turn",
+              "type"
+            ],
+            "properties": {
+              "turn": {
+                "type": "integer",
+                "format": "int64",
+                "minimum": 0
+              },
+              "type": {
+                "type": "string",
+                "enum": [
+                  "thread.compaction_started"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "turn",
+              "messages_compacted",
+              "type"
+            ],
+            "properties": {
+              "messages_compacted": {
+                "type": "integer",
+                "format": "int64",
+                "description": "Provider-transcript messages folded into the summary.",
+                "minimum": 0
+              },
+              "turn": {
+                "type": "integer",
+                "format": "int64",
+                "minimum": 0
+              },
+              "type": {
+                "type": "string",
+                "enum": [
+                  "thread.compaction_completed"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "checkpoint_id",
+              "thread_id",
+              "turn",
+              "commit",
+              "type"
+            ],
+            "properties": {
+              "checkpoint_id": {
+                "$ref": "#/components/schemas/String"
+              },
+              "commit": {
+                "type": "string",
+                "description": "Git commit hash the checkpoint points at."
+              },
+              "thread_id": {
+                "$ref": "#/components/schemas/String"
+              },
+              "turn": {
+                "type": "integer",
+                "format": "int64",
+                "minimum": 0
+              },
+              "type": {
+                "type": "string",
+                "enum": [
+                  "checkpoint.created"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "checkpoint_id",
+              "direction",
+              "type"
+            ],
+            "properties": {
+              "checkpoint_id": {
+                "$ref": "#/components/schemas/String"
+              },
+              "direction": {
+                "$ref": "#/components/schemas/RestoreDirection"
+              },
+              "type": {
+                "type": "string",
+                "enum": [
+                  "checkpoint.restored"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "path",
+              "branch",
+              "type"
+            ],
+            "properties": {
+              "branch": {
+                "type": "string"
+              },
+              "path": {
+                "type": "string"
+              },
+              "type": {
+                "type": "string",
+                "enum": [
+                  "worktree.created"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "path",
+              "branch",
+              "type"
+            ],
+            "properties": {
+              "branch": {
+                "type": "string"
+              },
+              "path": {
+                "type": "string"
+              },
+              "type": {
+                "type": "string",
+                "enum": [
+                  "worktree.removed"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "workspace_id",
+              "path",
+              "type"
+            ],
+            "properties": {
+              "path": {
+                "type": "string"
+              },
+              "type": {
+                "type": "string",
+                "enum": [
+                  "workspace.registered"
+                ]
+              },
+              "workspace_id": {
+                "$ref": "#/components/schemas/String"
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "session_id",
+              "workspace_id",
+              "type"
+            ],
+            "properties": {
+              "session_id": {
+                "$ref": "#/components/schemas/String"
+              },
+              "type": {
+                "type": "string",
+                "enum": [
+                  "session.created"
+                ]
+              },
+              "workspace_id": {
+                "$ref": "#/components/schemas/String"
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "number",
+              "url",
+              "type"
+            ],
+            "properties": {
+              "number": {
+                "type": "integer",
+                "format": "int64",
+                "minimum": 0
+              },
+              "type": {
+                "type": "string",
+                "enum": [
+                  "session.pr_opened"
+                ]
+              },
+              "url": {
+                "type": "string"
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "session_id",
+              "workspace_id",
+              "type"
+            ],
+            "properties": {
+              "session_id": {
+                "$ref": "#/components/schemas/String"
+              },
+              "type": {
+                "type": "string",
+                "enum": [
+                  "session.deleted"
+                ]
+              },
+              "workspace_id": {
+                "$ref": "#/components/schemas/String"
+              }
+            }
+          },
+          {
+            "type": "object",
+            "description": "Session metadata changed (rename / archive). Clients refetch.",
+            "required": [
+              "session_id",
+              "workspace_id",
+              "type"
+            ],
+            "properties": {
+              "session_id": {
+                "$ref": "#/components/schemas/String"
+              },
+              "type": {
+                "type": "string",
+                "enum": [
+                  "session.updated"
+                ]
+              },
+              "workspace_id": {
+                "$ref": "#/components/schemas/String"
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "thread_id",
+              "session_id",
+              "type"
+            ],
+            "properties": {
+              "session_id": {
+                "$ref": "#/components/schemas/String"
+              },
+              "thread_id": {
+                "$ref": "#/components/schemas/String"
+              },
+              "type": {
+                "type": "string",
+                "enum": [
+                  "thread.created"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "description": "Thread settings changed (mode/model). Clients refetch.",
+            "required": [
+              "thread_id",
+              "session_id",
+              "type"
+            ],
+            "properties": {
+              "session_id": {
+                "$ref": "#/components/schemas/String"
+              },
+              "thread_id": {
+                "$ref": "#/components/schemas/String"
+              },
+              "type": {
+                "type": "string",
+                "enum": [
+                  "thread.updated"
+                ]
+              }
+            }
+          }
+        ],
+        "description": "Every event type in the log. Serialized with a `type` tag using\ndot-namespaced names, per the event-log design doc."
+      },
+      "EventEnvelope": {
+        "allOf": [
+          {
+            "$ref": "#/components/schemas/Event"
+          },
+          {
+            "type": "object",
+            "required": [
+              "cursor",
+              "scope",
+              "ts"
+            ],
+            "properties": {
+              "cursor": {
+                "type": "integer",
+                "format": "int64",
+                "description": "Strictly increasing within a scope; used as the SSE event id for\n`Last-Event-ID` resumption. Not necessarily dense.",
+                "minimum": 0
+              },
+              "scope": {
+                "$ref": "#/components/schemas/Scope"
+              },
+              "ts": {
+                "type": "string",
+                "format": "date-time",
+                "description": "RFC 3339 timestamp assigned at append time."
+              }
+            }
+          }
+        ],
+        "description": "The envelope every event is delivered in (and persisted as)."
+      },
+      "FileContent": {
+        "type": "object",
+        "required": [
+          "path",
+          "content"
+        ],
+        "properties": {
+          "content": {
+            "type": "string"
+          },
+          "path": {
+            "type": "string"
+          }
+        }
+      },
+      "KnownProvider": {
+        "type": "object",
+        "description": "A well-known provider preset: clients offer these for one-click setup\ninstead of hand-typed base URLs.",
+        "required": [
+          "id",
+          "display_name",
+          "kind",
+          "auth"
+        ],
+        "properties": {
+          "api_key_env": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Conventional environment variable holding the API key, when one\nexists (empty for keyless local providers like Ollama)."
+          },
+          "auth": {
+            "type": "string",
+            "description": "How the provider authenticates: \"api-key\", \"oauth\" (subscription\nlogin), \"cli\" (the vendor's own CLI holds subscription auth), or\n\"none\" (keyless local endpoints)."
+          },
+          "base_url": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "display_name": {
+            "type": "string"
+          },
+          "experimental": {
+            "type": "boolean",
+            "description": "Uses an undocumented vendor endpoint that may break or be restricted\nat any time; clients should display a warning."
+          },
+          "id": {
+            "type": "string",
+            "description": "Suggested provider id, e.g. \"openrouter\"."
+          },
+          "kind": {
+            "type": "string",
+            "description": "Wire protocol: \"openai-compat\" or \"anthropic\"."
+          }
+        }
+      },
+      "LoginStarted": {
+        "type": "object",
+        "description": "Response to starting an OAuth login for a provider.",
+        "required": [
+          "verification_url"
+        ],
+        "properties": {
+          "user_code": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Code the user must enter at the verification URL (device flow only;\nPKCE flows encode everything in the URL)."
+          },
+          "verification_url": {
+            "type": "string",
+            "description": "URL the user must open in a browser to approve access."
+          }
+        }
+      },
+      "LoginStatus": {
+        "type": "object",
+        "description": "Current state of a provider's OAuth login attempt.",
+        "required": [
+          "status"
+        ],
+        "properties": {
+          "error": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "status": {
+            "type": "string",
+            "description": "\"none\" (no login running), \"pending\", \"success\", or \"failed\"."
+          }
+        }
+      },
+      "MergePrRequest": {
+        "type": "object",
+        "properties": {
+          "method": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "merge / squash / rebase (default: merge)"
+          }
+        }
+      },
+      "ModelInfo": {
+        "type": "object",
+        "description": "A model a configured provider can run, with enough metadata for clients\nto render selection and options UIs generically.",
+        "required": [
+          "id",
+          "display_name",
+          "context_window",
+          "supports_tools",
+          "options_schema"
+        ],
+        "properties": {
+          "context_window": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "display_name": {
+            "type": "string"
+          },
+          "id": {
+            "type": "string",
+            "description": "Provider-qualified id, e.g. \"openai/gpt-4.1-mini\"."
+          },
+          "input_price_per_mtok": {
+            "type": [
+              "number",
+              "null"
+            ],
+            "format": "double",
+            "description": "USD per million input tokens (None = unknown; cost reporting skips it)."
+          },
+          "options_schema": {
+            "description": "JSON Schema for the model's options object (thinking level, etc.).\nClients render these controls from the schema, not from hardcoded\nper-model knowledge."
+          },
+          "output_price_per_mtok": {
+            "type": [
+              "number",
+              "null"
+            ],
+            "format": "double"
+          },
+          "supports_tools": {
+            "type": "boolean"
+          }
+        }
+      },
+      "PermissionMode": {
+        "type": "string",
+        "description": "How tool calls are gated in a thread. See ADR 0004.",
+        "enum": [
+          "ask",
+          "allow_list",
+          "yolo"
+        ]
+      },
+      "PrInfo": {
+        "type": "object",
+        "required": [
+          "number",
+          "url",
+          "title",
+          "state",
+          "draft",
+          "base",
+          "head",
+          "checks",
+          "reviews"
+        ],
+        "properties": {
+          "base": {
+            "type": "string"
+          },
+          "checks": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/CheckRun"
+            }
+          },
+          "draft": {
+            "type": "boolean"
+          },
+          "head": {
+            "type": "string"
+          },
+          "number": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "reviews": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/PrReview"
+            }
+          },
+          "state": {
+            "type": "string"
+          },
+          "title": {
+            "type": "string"
+          },
+          "url": {
+            "type": "string"
+          }
+        }
+      },
+      "PrReview": {
+        "type": "object",
+        "required": [
+          "reviewer",
+          "state"
+        ],
+        "properties": {
+          "reviewer": {
+            "type": "string"
+          },
+          "state": {
+            "type": "string",
+            "description": "approved / changes_requested / commented / …"
+          }
+        }
+      },
+      "ProviderInfo": {
+        "type": "object",
+        "description": "A configured provider, with secrets elided.",
+        "required": [
+          "id",
+          "kind",
+          "has_credentials",
+          "auth"
+        ],
+        "properties": {
+          "auth": {
+            "type": "string",
+            "description": "\"api-key\", \"oauth\", \"cli\" (vendor CLI holds the subscription auth),\nor \"none\" — drives which credential UI to show."
+          },
+          "base_url": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "experimental": {
+            "type": "boolean",
+            "description": "Uses an undocumented vendor endpoint that may break or be restricted\nat any time; clients should display a warning."
+          },
+          "has_credentials": {
+            "type": "boolean",
+            "description": "Whether usable credentials were resolved (key, env, OAuth, or a\nlogged-in vendor CLI)."
+          },
+          "id": {
+            "type": "string",
+            "description": "Stable identifier, e.g. \"openai\" or \"openrouter\"."
+          },
+          "kind": {
+            "type": "string",
+            "description": "\"openai-compat\" or \"anthropic\"."
+          }
+        }
+      },
+      "ProvidersResponse": {
+        "type": "object",
+        "required": [
+          "providers",
+          "default_model"
+        ],
+        "properties": {
+          "default_model": {
+            "type": "string",
+            "description": "Default model for new threads, e.g. \"openai/gpt-4.1-mini\"."
+          },
+          "providers": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ProviderInfo"
+            }
+          }
+        }
+      },
+      "RegisterWorkspaceRequest": {
+        "type": "object",
+        "required": [
+          "path"
+        ],
+        "properties": {
+          "name": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "path": {
+            "type": "string",
+            "description": "Absolute path to a git repository root."
+          }
+        }
+      },
+      "ResolveApprovalRequest": {
+        "type": "object",
+        "required": [
+          "call_id",
+          "decision"
+        ],
+        "properties": {
+          "call_id": {
+            "$ref": "#/components/schemas/String"
+          },
+          "decision": {
+            "$ref": "#/components/schemas/ApprovalDecision"
+          }
+        }
+      },
+      "RestoreDirection": {
+        "type": "string",
+        "enum": [
+          "undo",
+          "redo"
+        ]
+      },
+      "Scope": {
+        "oneOf": [
+          {
+            "type": "string",
+            "enum": [
+              "server"
+            ]
+          },
+          {
+            "type": "object",
+            "required": [
+              "session"
+            ],
+            "properties": {
+              "session": {
+                "$ref": "#/components/schemas/String"
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "thread"
+            ],
+            "properties": {
+              "thread": {
+                "$ref": "#/components/schemas/String"
+              }
+            }
+          }
+        ],
+        "description": "Which stream an event belongs to. Cursors are monotonic per scope."
+      },
+      "SendMessageRequest": {
+        "type": "object",
+        "required": [
+          "content"
+        ],
+        "properties": {
+          "content": {
+            "type": "string"
+          }
+        }
+      },
+      "ServerInfo": {
+        "type": "object",
+        "required": [
+          "name",
+          "version",
+          "protocol_version"
+        ],
+        "properties": {
+          "name": {
+            "type": "string"
+          },
+          "protocol_version": {
+            "type": "string"
+          },
+          "version": {
+            "type": "string"
+          }
+        }
+      },
+      "Session": {
+        "type": "object",
+        "required": [
+          "id",
+          "workspace_id",
+          "title",
+          "branch",
+          "worktree_path",
+          "base_ref",
+          "created_at"
+        ],
+        "properties": {
+          "archived": {
+            "type": "boolean",
+            "description": "Archived sessions are hidden from default listings but keep their\nworktree and history."
+          },
+          "base_ref": {
+            "type": "string"
+          },
+          "branch": {
+            "type": "string",
+            "description": "Branch dedicated to this session (`trouve/<slug>`)."
+          },
+          "created_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "id": {
+            "$ref": "#/components/schemas/String"
+          },
+          "title": {
+            "type": "string"
+          },
+          "workspace_id": {
+            "$ref": "#/components/schemas/String"
+          },
+          "worktree_path": {
+            "type": "string",
+            "description": "Absolute path of the session worktree."
+          }
+        }
+      },
+      "SessionDiff": {
+        "type": "object",
+        "description": "The session's unified diff against its base ref.",
+        "required": [
+          "diff"
+        ],
+        "properties": {
+          "diff": {
+            "type": "string"
+          }
+        }
+      },
+      "SetDefaultModelRequest": {
+        "type": "object",
+        "required": [
+          "model"
+        ],
+        "properties": {
+          "model": {
+            "type": "string",
+            "description": "Provider-qualified id, e.g. \"openai/gpt-4.1-mini\"."
+          }
+        }
+      },
+      "String": {
+        "type": "string"
+      },
+      "Thread": {
+        "type": "object",
+        "required": [
+          "id",
+          "session_id",
+          "mode",
+          "model",
+          "permission_mode",
+          "created_at"
+        ],
+        "properties": {
+          "created_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "id": {
+            "$ref": "#/components/schemas/String"
+          },
+          "mode": {
+            "type": "string"
+          },
+          "model": {
+            "type": "string"
+          },
+          "permission_mode": {
+            "$ref": "#/components/schemas/PermissionMode"
+          },
+          "session_id": {
+            "$ref": "#/components/schemas/String"
+          }
+        }
+      },
+      "ToolStatus": {
+        "type": "string",
+        "description": "Terminal status of a tool call.",
+        "enum": [
+          "ok",
+          "error",
+          "denied",
+          "aborted"
+        ]
+      },
+      "TurnAccepted": {
+        "type": "object",
+        "description": "Accepted-for-processing response; progress arrives on the event stream.",
+        "required": [
+          "thread_id",
+          "turn"
+        ],
+        "properties": {
+          "thread_id": {
+            "$ref": "#/components/schemas/String"
+          },
+          "turn": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          }
+        }
+      },
+      "UpdateSessionRequest": {
+        "type": "object",
+        "description": "Partial session update (rename / archive). Omitted fields are unchanged.",
+        "properties": {
+          "archived": {
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "title": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        }
+      },
+      "UpdateThreadRequest": {
+        "type": "object",
+        "description": "Partial thread update between turns (mode/model switching). Rejected with\na conflict while a turn is running. Omitted fields are unchanged.",
+        "properties": {
+          "mode": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "model": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "model_options": {
+            "type": [
+              "object",
+              "null"
+            ],
+            "description": "Replaces the thread's model options when present.",
+            "additionalProperties": {},
+            "propertyNames": {
+              "type": "string"
+            }
+          },
+          "permission_mode": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/PermissionMode"
+              }
+            ]
+          }
+        }
+      },
+      "UpsertProviderRequest": {
+        "type": "object",
+        "description": "Create or update a provider. The API key (when given) goes to the secret\nstore, never to the config file.",
+        "required": [
+          "kind"
+        ],
+        "properties": {
+          "api_key": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "base_url": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "kind": {
+            "type": "string",
+            "description": "\"openai-compat\" or \"anthropic\"."
+          }
+        }
+      },
+      "Usage": {
+        "type": "object",
+        "description": "Token/cost usage for a turn.",
+        "required": [
+          "input_tokens",
+          "output_tokens"
+        ],
+        "properties": {
+          "cached_input_tokens": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Cached/read tokens where the provider reports them.",
+            "minimum": 0
+          },
+          "cost_usd": {
+            "type": [
+              "number",
+              "null"
+            ],
+            "format": "double",
+            "description": "Estimated cost in USD, when list pricing for the model is known."
+          },
+          "input_tokens": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "output_tokens": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          }
+        }
+      },
+      "UsageSummary": {
+        "type": "object",
+        "description": "Aggregated usage for a thread or session.",
+        "required": [
+          "turns",
+          "input_tokens",
+          "output_tokens",
+          "cached_input_tokens",
+          "cost_usd"
+        ],
+        "properties": {
+          "cached_input_tokens": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "cost_usd": {
+            "type": "number",
+            "format": "double"
+          },
+          "input_tokens": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "output_tokens": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "turns": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          }
+        }
+      },
+      "Workspace": {
+        "type": "object",
+        "required": [
+          "id",
+          "name",
+          "path"
+        ],
+        "properties": {
+          "id": {
+            "$ref": "#/components/schemas/String"
+          },
+          "name": {
+            "type": "string"
+          },
+          "path": {
+            "type": "string"
+          }
+        }
+      }
+    }
+  }
+}

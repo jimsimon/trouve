@@ -1,0 +1,206 @@
+//! Pure render helpers: fold client-core view-model state into plain row
+//! data. Plain data crosses the controller-thread → UI-thread boundary; the
+//! UI thread maps it onto generated Slint structs.
+
+use std::collections::HashSet;
+
+use slint_markdown::{parse_blocks, BlockKind};
+use trouve_client_core::viewmodel::{ChatItem, ThreadViewModel, ToolCallStatus, TurnState};
+
+/// Mirrors the `ChatRow` struct in `app.slint`.
+#[derive(Debug, Clone, Default)]
+pub struct ChatRowData {
+    pub kind: i32,
+    pub md_kind: i32,
+    pub text: String,
+    pub tool_name: String,
+    pub tool_status: i32,
+    pub detail: String,
+    pub expanded: bool,
+    pub turn_state: i32,
+}
+
+fn md_kind(kind: BlockKind) -> i32 {
+    match kind {
+        BlockKind::Paragraph => 0,
+        BlockKind::H1 => 1,
+        BlockKind::H2 => 2,
+        BlockKind::H3 => 3,
+        BlockKind::Bullet => 4,
+        BlockKind::Code => 5,
+    }
+}
+
+fn tool_status(status: ToolCallStatus) -> i32 {
+    match status {
+        ToolCallStatus::AwaitingApproval => 0,
+        ToolCallStatus::Running => 1,
+        ToolCallStatus::Ok => 2,
+        ToolCallStatus::Error => 3,
+        ToolCallStatus::Denied => 4,
+        ToolCallStatus::Aborted => 5,
+    }
+}
+
+/// Flatten a thread's chat items into rows. Returns the rows plus a parallel
+/// map from row index to the tool call id (for approvals/expansion).
+pub fn chat_rows(
+    vm: &ThreadViewModel,
+    expanded: &HashSet<String>,
+) -> (Vec<ChatRowData>, Vec<Option<String>>) {
+    let mut rows = Vec::new();
+    let mut call_ids = Vec::new();
+    let mut push = |row: ChatRowData, call_id: Option<String>| {
+        rows.push(row);
+        call_ids.push(call_id);
+    };
+    for item in &vm.items {
+        match item {
+            ChatItem::User { content, .. } => push(
+                ChatRowData {
+                    kind: 0,
+                    text: content.clone(),
+                    ..Default::default()
+                },
+                None,
+            ),
+            ChatItem::Assistant { content, .. } => {
+                // Markdown blocks become individual virtualized rows, so a
+                // long streaming answer never re-lays-out the whole chat.
+                for block in parse_blocks(content) {
+                    push(
+                        ChatRowData {
+                            kind: 1,
+                            md_kind: md_kind(block.kind),
+                            text: block.text,
+                            ..Default::default()
+                        },
+                        None,
+                    );
+                }
+            }
+            ChatItem::ToolCall {
+                call_id,
+                tool,
+                args,
+                status,
+                result,
+            } => {
+                let mut detail =
+                    serde_json::to_string_pretty(args).unwrap_or_else(|_| args.to_string());
+                if let Some(result) = result {
+                    detail.push_str("\n→ ");
+                    detail.push_str(
+                        &serde_json::to_string_pretty(result)
+                            .unwrap_or_else(|_| result.to_string()),
+                    );
+                }
+                if detail.len() > 4000 {
+                    detail.truncate(detail.floor_boundary(4000));
+                    detail.push('…');
+                }
+                push(
+                    ChatRowData {
+                        kind: 2,
+                        tool_name: tool.clone(),
+                        tool_status: tool_status(*status),
+                        detail,
+                        expanded: expanded.contains(call_id),
+                        ..Default::default()
+                    },
+                    Some(call_id.clone()),
+                );
+            }
+            ChatItem::TurnStatus { turn, state } => {
+                let (text, code) = match state {
+                    TurnState::Running => (format!("turn {turn} — running…"), 0),
+                    TurnState::Completed { usage } => (
+                        format!(
+                            "turn {turn} — done ({} in / {} out tokens)",
+                            usage.input_tokens, usage.output_tokens
+                        ),
+                        1,
+                    ),
+                    TurnState::Failed { error } => (format!("turn {turn} — failed: {error}"), 2),
+                };
+                push(
+                    ChatRowData {
+                        kind: 3,
+                        text,
+                        turn_state: code,
+                        ..Default::default()
+                    },
+                    None,
+                );
+            }
+        }
+    }
+    (rows, call_ids)
+}
+
+trait FloorBoundary {
+    fn floor_boundary(&self, at: usize) -> usize;
+}
+
+impl FloorBoundary for String {
+    fn floor_boundary(&self, at: usize) -> usize {
+        let mut i = at.min(self.len());
+        while i > 0 && !self.is_char_boundary(i) {
+            i -= 1;
+        }
+        i
+    }
+}
+
+/// Syntax-highlight file content into per-line `(text, rgb)` segments.
+pub fn highlight_file(path: &str, content: &str) -> Vec<Vec<(String, u32)>> {
+    use std::sync::OnceLock;
+    use syntect::easy::HighlightLines;
+    use syntect::highlighting::ThemeSet;
+    use syntect::parsing::SyntaxSet;
+    use syntect::util::LinesWithEndings;
+
+    static ASSETS: OnceLock<(SyntaxSet, ThemeSet)> = OnceLock::new();
+    let (syntaxes, themes) = ASSETS.get_or_init(|| {
+        (
+            SyntaxSet::load_defaults_newlines(),
+            ThemeSet::load_defaults(),
+        )
+    });
+    let theme = &themes.themes["base16-ocean.dark"];
+    let syntax = std::path::Path::new(path)
+        .extension()
+        .and_then(|e| e.to_str())
+        .and_then(|e| syntaxes.find_syntax_by_extension(e))
+        .unwrap_or_else(|| syntaxes.find_syntax_plain_text());
+
+    let mut highlighter = HighlightLines::new(syntax, theme);
+    let mut lines = Vec::new();
+    for line in LinesWithEndings::from(content) {
+        let mut segments = Vec::new();
+        match highlighter.highlight_line(line, syntaxes) {
+            Ok(ranges) => {
+                for (style, text) in ranges {
+                    let text = text.trim_end_matches(['\n', '\r']);
+                    if text.is_empty() {
+                        continue;
+                    }
+                    let fg = style.foreground;
+                    let rgb = ((fg.r as u32) << 16) | ((fg.g as u32) << 8) | (fg.b as u32);
+                    segments.push((text.to_string(), rgb));
+                }
+            }
+            Err(_) => {
+                segments.push((line.trim_end_matches(['\n', '\r']).to_string(), 0));
+            }
+        }
+        if segments.is_empty() {
+            segments.push((String::new(), 0));
+        }
+        lines.push(segments);
+    }
+    if lines.is_empty() {
+        lines.push(vec![(String::new(), 0)]);
+    }
+    lines
+}

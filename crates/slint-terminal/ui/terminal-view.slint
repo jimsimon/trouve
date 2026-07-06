@@ -1,0 +1,41 @@
+// TerminalView: virtualized monospace scrollback with colored segments.
+// Output-only (command output, build logs); interactive PTY input is a
+// separate concern handled at the application layer.
+
+import { ListView } from "std-widgets.slint";
+
+export struct TermSegment {
+    text: string,
+    color: color,
+}
+
+export component TerminalView inherits Rectangle {
+    in property <[[TermSegment]]> lines;
+    in property <length> term-font-size: 13px;
+    in property <length> line-height: term-font-size * 1.4;
+    in property <string> font-family: "monospace";
+    in property <color> foreground: #d4d4d4;
+
+    background: #101010;
+
+    list := ListView {
+        for line in root.lines: Rectangle {
+            height: root.line-height;
+            HorizontalLayout {
+                alignment: start;
+                for seg in line: Text {
+                    vertical-alignment: center;
+                    text: seg.text;
+                    color: seg.color == #000000 ? root.foreground : seg.color;
+                    font-family: root.font-family;
+                    font-size: root.term-font-size;
+                }
+            }
+        }
+    }
+
+    // Keep the tail visible while output streams in.
+    public function scroll-to-end() {
+        list.viewport-y = min(0px, list.visible-height - list.viewport-height);
+    }
+}

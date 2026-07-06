@@ -42,13 +42,16 @@ struct CachedIndex {
     last_used: Instant,
 }
 
-struct IndexCache {
+/// LRU cache of built indexes, re-validated after a cooldown. Public so
+/// embedders (e.g. the trouve harness's native tools) can share one cache
+/// across in-process [`call_tool`] invocations.
+pub struct IndexCache {
     content: Vec<ContentType>,
     entries: HashMap<String, CachedIndex>,
 }
 
 impl IndexCache {
-    fn new(content: Vec<ContentType>) -> IndexCache {
+    pub fn new(content: Vec<ContentType>) -> IndexCache {
         IndexCache {
             content,
             entries: HashMap::new(),
@@ -181,8 +184,10 @@ fn arg_snippet_lines(args: &Value) -> Option<usize> {
     }
 }
 
-/// Run a tool; `Err` becomes an `isError: true` tool result.
-fn call_tool(cache: &mut IndexCache, name: &str, args: &Value) -> Result<String, String> {
+/// Run the `search` / `find_related` tool with MCP-shaped arguments;
+/// `Err` becomes an `isError: true` tool result (or an embedder's tool
+/// error). Public for in-process embedding alongside [`IndexCache`].
+pub fn call_tool(cache: &mut IndexCache, name: &str, args: &Value) -> Result<String, String> {
     match name {
         "search" => {
             let Some(query) = args.get("query").and_then(|v| v.as_str()) else {

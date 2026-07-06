@@ -1,0 +1,37 @@
+[package]
+name = "trouve-app"
+version = "0.1.0"
+edition.workspace = true
+description = "trouve desktop client: Slint UI over the trouve protocol."
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+publish = false
+
+[[bin]]
+name = "trouve-app"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+serde_json.workspace = true
+slint.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+trouve-client-core.workspace = true
+trouve-protocol.workspace = true
+# Plain-data helpers (diff parsing, markdown blocks, highlight segments).
+slint-code-view = { path = "../slint-code-view" }
+slint-diff-view = { path = "../slint-diff-view" }
+slint-markdown = { path = "../slint-markdown" }
+# Syntax highlighting for the file viewer.
+syntect = { version = "5", default-features = false, features = ["default-fancy"] }
+rfd = { version = "0.17.2", default-features = false, features = ["xdg-portal", "pollster"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+# PR_SET_PDEATHSIG so the spawned server dies with the app.
+libc = "0.2"
+
+[build-dependencies]
+slint-build = "1.17"

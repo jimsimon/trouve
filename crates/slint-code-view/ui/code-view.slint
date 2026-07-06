@@ -1,0 +1,153 @@
+// CodeView: a virtualized, selectable, monospace code viewer.
+//
+// Rendering model: the host supplies one entry per line; each line is a
+// list of colored segments (syntax highlight tokens as plain data). The
+// ListView only instantiates visible rows, which is what makes 10k-line
+// files cheap.
+//
+// Selection is a character grid selection (monospace): the host receives
+// `selection-changed` with line/column bounds and answers `copy-requested`
+// by putting the selected text on the clipboard.
+
+import { ListView } from "std-widgets.slint";
+
+export struct TextSegment {
+    text: string,
+    color: color,
+}
+
+export component CodeView inherits Rectangle {
+    // One model entry per line: the line's highlight segments.
+    in property <[[TextSegment]]> lines;
+    // Parallel model: displayed line numbers (usually 1..n).
+    in property <[int]> line-numbers;
+    in property <length> code-font-size: 13px;
+    // Monospace advance width; hosts may calibrate for their font.
+    in property <length> char-width: code-font-size * 0.6;
+    in property <length> line-height: code-font-size * 1.5;
+    in property <color> foreground: #d4d4d4;
+    in property <color> gutter-color: #858585;
+    in property <color> selection-color: #264f7855;
+    in property <string> font-family: "monospace";
+    in property <length> gutter-width: 56px;
+
+    // Selection state (line, column), inclusive start, exclusive end column.
+    out property <int> sel-start-line: -1;
+    out property <int> sel-start-col: 0;
+    out property <int> sel-end-line: -1;
+    out property <int> sel-end-col: 0;
+    out property <bool> has-selection: root.sel-start-line >= 0
+        && (root.sel-start-line != root.sel-end-line || root.sel-start-col != root.sel-end-col);
+
+    // Host puts the selected text on the clipboard.
+    callback copy-requested();
+
+    // Drag bookkeeping (anchor point of the selection).
+    private property <int> anchor-line: -1;
+    private property <int> anchor-col: 0;
+
+    background: #1e1e1e;
+    forward-focus: focus-scope;
+
+    function clamp-line(l: int) -> int {
+        return max(0, min(l, root.lines.length - 1));
+    }
+
+    // `y` is relative to the viewer (touch area and list share an origin);
+    // viewport-y is the negative scroll offset.
+    function point-to-line(y: length) -> int {
+        return root.clamp-line(((y - list.viewport-y) / root.line-height).floor());
+    }
+
+    function point-to-col(x: length) -> int {
+        return max(0, ((x - root.gutter-width) / root.char-width).round());
+    }
+
+    function update-selection(line: int, col: int) {
+        if (line > root.anchor-line || (line == root.anchor-line && col >= root.anchor-col)) {
+            root.sel-start-line = root.anchor-line;
+            root.sel-start-col = root.anchor-col;
+            root.sel-end-line = line;
+            root.sel-end-col = col;
+        } else {
+            root.sel-start-line = line;
+            root.sel-start-col = col;
+            root.sel-end-line = root.anchor-line;
+            root.sel-end-col = root.anchor-col;
+        }
+    }
+
+    focus-scope := FocusScope {
+        key-pressed(event) => {
+            if (event.text == "c" && event.modifiers.control && root.has-selection) {
+                root.copy-requested();
+                return accept;
+            }
+            reject
+        }
+
+        list := ListView {
+            for line[idx] in root.lines: Rectangle {
+                height: root.line-height;
+
+                // Selection overlay for this row.
+                if root.has-selection && idx >= root.sel-start-line && idx <= root.sel-end-line: Rectangle {
+                    property <length> from: idx == root.sel-start-line ? root.sel-start-col * root.char-width : 0;
+                    property <length> to: idx == root.sel-end-line
+                        ? root.sel-end-col * root.char-width
+                        : parent.width - root.gutter-width;
+                    x: root.gutter-width + self.from;
+                    width: max(self.to - self.from, 0);
+                    height: parent.height;
+                    background: root.selection-color;
+                }
+
+                Text {
+                    x: 0;
+                    width: root.gutter-width - 12px;
+                    horizontal-alignment: right;
+                    vertical-alignment: center;
+                    text: idx < root.line-numbers.length ? root.line-numbers[idx] : idx + 1;
+                    color: root.gutter-color;
+                    font-family: root.font-family;
+                    font-size: root.code-font-size;
+                }
+
+                HorizontalLayout {
+                    x: root.gutter-width;
+                    alignment: start;
+                    for seg in line: Text {
+                        vertical-alignment: center;
+                        text: seg.text;
+                        color: seg.color == #000000 ? root.foreground : seg.color;
+                        font-family: root.font-family;
+                        font-size: root.code-font-size;
+                    }
+                }
+            }
+        }
+
+        touch := TouchArea {
+            mouse-cursor: text;
+            pointer-event(event) => {
+                if (event.kind == PointerEventKind.down && event.button == PointerEventButton.left) {
+                    focus-scope.focus();
+                    root.anchor-line = root.point-to-line(self.pressed-y);
+                    root.anchor-col = root.point-to-col(self.pressed-x);
+                    root.update-selection(root.anchor-line, root.anchor-col);
+                }
+            }
+            moved => {
+                if (self.pressed) {
+                    root.update-selection(
+                        root.point-to-line(self.mouse-y),
+                        root.point-to-col(self.mouse-x));
+                }
+            }
+            scroll-event(event) => {
+                // Forward wheel scrolling to the ListView behind us.
+                reject
+            }
+        }
+    }
+}

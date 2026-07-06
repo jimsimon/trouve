@@ -1,0 +1,332 @@
+// Settings window: provider configuration, default model, agent modes, and
+// the About section (AboutSlint attribution lives here, reachable from the
+// left-column footer — royalty-free license requirement).
+//
+// Like the main window, this is dumb: models in, callbacks out.
+
+import {
+    AboutSlint, Button, ComboBox, LineEdit, ListView, ScrollView
+} from "std-widgets.slint";
+
+export struct ProviderItem {
+    id: string,
+    kind: string,
+    base-url: string,
+    has-credentials: bool,
+    auth: string,
+    experimental: bool,
+}
+
+// A well-known provider preset served by the backend; picking one prefills
+// the add/edit form so nothing has to be typed by hand.
+export struct KnownProviderItem {
+    id: string,
+    display-name: string,
+    kind: string,
+    base-url: string,
+    api-key-env: string,
+    // "api-key", "oauth" (subscription login), "cli" (vendor CLI holds the
+    // subscription auth), or "none" (keyless local).
+    auth: string,
+    // Undocumented vendor endpoint; may break or be restricted at any time.
+    experimental: bool,
+}
+
+export component SettingsWindow inherits Window {
+    preferred-width: 640px;
+    preferred-height: 760px;
+    min-width: 480px;
+    min-height: 500px;
+    title: "trouve — Settings";
+    background: #181818;
+
+    in property <[ProviderItem]> providers;
+    in property <[KnownProviderItem]> known-providers;
+    // Preset display names (alphabetical; index i maps to
+    // known-providers[i]) followed by "Custom" as the last entry.
+    in property <[string]> known-provider-names;
+    in property <[string]> models;
+    in property <int> default-model-index: -1;
+    in property <[string]> modes;
+    in property <string> settings-status: "";
+
+    // Provider form state (prefilled by "Edit" or a preset).
+    in-out property <string> form-id: "";
+    in-out property <string> form-base-url: "";
+    in-out property <int> form-kind-index: 0;
+    // Wire kind actually saved; presets can carry kinds beyond the custom
+    // combo's two entries (codex-app-server, cursor-cli, claude-cli, ...).
+    in-out property <string> form-kind: "openai-compat";
+    in-out property <string> form-hint: "";
+    in-out property <bool> form-warning: false;
+    // Index into known-provider-names: a preset (fields hidden, prefilled
+    // from known-providers[index]) or the trailing "Custom" entry (id/kind/
+    // url fields shown). The controller points it at Custom on load.
+    in-out property <int> preset-index: 0;
+    property <bool> preset-is-custom: root.preset-index >= root.known-providers.length;
+    property <string> preset-auth:
+        !root.preset-is-custom && root.preset-index >= 0
+            ? root.known-providers[root.preset-index].auth
+            : "api-key";
+
+    callback provider-saved(/* id */ string, /* kind */ string,
+                            /* base-url */ string, /* api-key */ string);
+    callback provider-deleted(string);
+    callback provider-login(string);
+    callback default-model-picked(int);
+    callback refresh-settings();
+
+    ScrollView {
+        VerticalLayout {
+            padding: 16px;
+            spacing: 12px;
+
+            // ---------------- providers ----------------
+            HorizontalLayout {
+                Text {
+                    text: "Providers";
+                    color: #e8e8e8;
+                    font-size: 16px;
+                    font-weight: 700;
+                    vertical-alignment: center;
+                    horizontal-stretch: 1;
+                }
+                Button {
+                    text: "Refresh";
+                    clicked => { root.refresh-settings(); }
+                }
+            }
+
+            Rectangle {
+                background: #1e1e1e;
+                border-radius: 6px;
+                height: 150px;
+                ListView {
+                    for provider in root.providers: Rectangle {
+                        height: 34px;
+                        HorizontalLayout {
+                            padding-left: 10px;
+                            padding-right: 6px;
+                            spacing: 8px;
+                            Text {
+                                text: provider.id;
+                                color: #e0e0e0;
+                                font-size: 13px;
+                                font-weight: 700;
+                                vertical-alignment: center;
+                                width: 110px;
+                                overflow: elide;
+                            }
+                            Text {
+                                text: provider.kind
+                                    + (provider.base-url != "" ? "  ·  " + provider.base-url : "");
+                                color: #9a9a9a;
+                                font-size: 12px;
+                                vertical-alignment: center;
+                                overflow: elide;
+                                horizontal-stretch: 1;
+                            }
+                            if provider.experimental: Text {
+                                text: "⚠ experimental";
+                                color: #e08787;
+                                font-size: 11px;
+                                vertical-alignment: center;
+                            }
+                            Text {
+                                text: provider.auth == "oauth"
+                                    ? (provider.has-credentials ? "✓ logged in" : "not logged in")
+                                    : (provider.auth == "cli"
+                                        ? (provider.has-credentials ? "✓ CLI ready" : "CLI not set up")
+                                        : (provider.has-credentials ? "✓ credentials" : "no credentials"));
+                                color: provider.has-credentials ? #7fd18a : #e5c07b;
+                                font-size: 11px;
+                                vertical-alignment: center;
+                            }
+                            if provider.auth == "oauth" || provider.auth == "cli": Button {
+                                text: provider.has-credentials ? "Re-login" : "Log in";
+                                clicked => { root.provider-login(provider.id); }
+                            }
+                            Button {
+                                text: "Edit";
+                                clicked => {
+                                    root.preset-index = root.known-providers.length;
+                                    root.form-id = provider.id;
+                                    root.form-base-url = provider.base-url;
+                                    root.form-kind-index = provider.kind == "anthropic" ? 1 : 0;
+                                    root.form-kind = provider.kind;
+                                    root.form-hint = "";
+                                    root.form-warning = false;
+                                }
+                            }
+                            Button {
+                                text: "Remove";
+                                clicked => { root.provider-deleted(provider.id); }
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Provider add/edit form.
+            Text {
+                text: "Add or edit a provider";
+                color: #c8c8c8;
+                font-size: 13px;
+                font-weight: 700;
+            }
+            // Provider picker: a known preset prefills (and hides) the id /
+            // protocol / URL details; "Custom" shows them for hand entry.
+            preset-box := ComboBox {
+                model: root.known-provider-names;
+                current-index <=> root.preset-index;
+                selected => {
+                    if (!root.preset-is-custom) {
+                        root.form-id = root.known-providers[root.preset-index].id;
+                        root.form-base-url = root.known-providers[root.preset-index].base-url;
+                        root.form-kind = root.known-providers[root.preset-index].kind;
+                        root.form-kind-index =
+                            root.known-providers[root.preset-index].kind == "anthropic" ? 1 : 0;
+                        root.form-warning = root.known-providers[root.preset-index].experimental;
+                        root.form-hint =
+                            root.known-providers[root.preset-index].experimental
+                            ? "Experimental: talks to an undocumented vendor endpoint using your `codex login` token. OpenAI may break or restrict it at any time — use at your own risk. Save, then log in via the Codex CLI."
+                            : (root.known-providers[root.preset-index].auth == "cli"
+                                ? "Subscription via the vendor's CLI: install it, save, then click \"Log in\" in the list above (or log in from a terminal)."
+                                : (root.known-providers[root.preset-index].auth == "oauth"
+                                    ? "Subscription login: save, then click \"Log in\" in the list above."
+                                    : (root.known-providers[root.preset-index].auth == "api-key"
+                                        ? "Paste your API key below and save. Also honors the "
+                                            + root.known-providers[root.preset-index].api-key-env
+                                            + " environment variable."
+                                        : "No API key needed — just save.")));
+                    } else {
+                        root.form-kind = root.form-kind-index == 1 ? "anthropic" : "openai-compat";
+                        root.form-hint = "";
+                        root.form-warning = false;
+                    }
+                }
+            }
+            if root.preset-is-custom: HorizontalLayout {
+                spacing: 8px;
+                LineEdit {
+                    width: 150px;
+                    placeholder-text: "id (e.g. openai)";
+                    text <=> root.form-id;
+                }
+                ComboBox {
+                    width: 150px;
+                    model: ["openai-compat", "anthropic"];
+                    current-index <=> root.form-kind-index;
+                    selected => {
+                        root.form-kind = root.form-kind-index == 1 ? "anthropic" : "openai-compat";
+                    }
+                }
+                LineEdit {
+                    horizontal-stretch: 1;
+                    placeholder-text: "base URL (optional)";
+                    text <=> root.form-base-url;
+                }
+            }
+            HorizontalLayout {
+                spacing: 8px;
+                key-edit := LineEdit {
+                    horizontal-stretch: 1;
+                    visible: root.preset-auth == "api-key";
+                    placeholder-text: "API key (stored in the OS keychain; leave empty to keep)";
+                    input-type: password;
+                }
+                Button {
+                    text: "Save provider";
+                    primary: true;
+                    enabled: root.form-id != "";
+                    clicked => {
+                        root.provider-saved(
+                            root.form-id,
+                            root.form-kind,
+                            root.form-base-url,
+                            key-edit.text);
+                        key-edit.text = "";
+                        root.form-hint = "";
+                        root.form-warning = false;
+                    }
+                }
+            }
+            if root.form-hint != "": Text {
+                text: root.form-hint;
+                color: root.form-warning ? #e08787 : #8fae8f;
+                font-size: 12px;
+                wrap: word-wrap;
+            }
+            if root.settings-status != "": Text {
+                text: root.settings-status;
+                color: #9cbdde;
+                font-size: 12px;
+                wrap: word-wrap;
+            }
+
+            // ---------------- default model ----------------
+            Text {
+                text: "Default model";
+                color: #e8e8e8;
+                font-size: 16px;
+                font-weight: 700;
+            }
+            HorizontalLayout {
+                spacing: 8px;
+                model-box := ComboBox {
+                    horizontal-stretch: 1;
+                    model: root.models;
+                    current-index: root.default-model-index;
+                }
+                Button {
+                    text: "Set default";
+                    enabled: model-box.current-index >= 0;
+                    clicked => { root.default-model-picked(model-box.current-index); }
+                }
+            }
+
+            // ---------------- agent modes ----------------
+            Text {
+                text: "Agent modes";
+                color: #e8e8e8;
+                font-size: 16px;
+                font-weight: 700;
+            }
+            Rectangle {
+                background: #1e1e1e;
+                border-radius: 6px;
+                height: 130px;
+                ListView {
+                    for mode in root.modes: Text {
+                        height: 24px;
+                        x: 10px;
+                        text: mode;
+                        color: #c8c8c8;
+                        font-size: 12px;
+                        vertical-alignment: center;
+                    }
+                }
+            }
+            Text {
+                text: "Custom modes and mode overrides live in ~/.config/trouve/modes/ and .agents/modes/.";
+                color: #8a8a8a;
+                font-size: 11px;
+                wrap: word-wrap;
+            }
+
+            // ---------------- about ----------------
+            Text {
+                text: "About";
+                color: #e8e8e8;
+                font-size: 16px;
+                font-weight: 700;
+            }
+            Text {
+                text: "trouve — a protocol-first AI coding harness.";
+                color: #9a9a9a;
+                font-size: 12px;
+            }
+            AboutSlint { }
+        }
+    }
+}

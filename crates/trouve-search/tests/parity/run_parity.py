@@ -8,7 +8,7 @@ Compares, over real source files from the upstream repository:
   4. End-to-end search results — top-1 file agreement and top-5 overlap.
 
 Usage:
-  python3 tests/parity/run_parity.py --binary target/release/trouve-search \
+  python3 crates/trouve-search/tests/parity/run_parity.py --binary target/release/trouve-search \
       [--reference reference/semble] [--skip-search]
 
 The search comparison downloads the potion-code-16M model; pass --skip-search
@@ -23,7 +23,8 @@ import subprocess
 import sys
 from pathlib import Path
 
-REPO_ROOT = Path(__file__).resolve().parents[2]
+# crates/trouve-search/tests/parity/run_parity.py -> repo root is four levels up.
+REPO_ROOT = Path(__file__).resolve().parents[4]
 
 TOKENIZE_SAMPLES = [
     "HandlerStack",

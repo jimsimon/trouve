@@ -208,17 +208,22 @@ evicted automatically, and `trouve-search clear index` removes them all.
 
 ## Development
 
+This repository is a Cargo workspace (the trouve monorepo); the search tool
+lives in `crates/trouve-search`. From the repo root:
+
 ```bash
-cargo test                        # unit + integration tests (offline)
-TROUVE_E2E=1 cargo test -- --ignored   # end-to-end tests (downloads the model)
+cargo test -p trouve-search       # unit + integration tests (offline)
+TROUVE_E2E=1 cargo test -p trouve-search -- --ignored   # e2e tests (downloads the model)
 ./scripts/fetch-reference.sh      # clone upstream Python semble into reference/
-python3 tests/parity/run_parity.py --binary target/release/trouve-search
+python3 crates/trouve-search/tests/parity/run_parity.py --binary target/release/trouve-search
 ./benchmarks/run_benchmarks.sh    # hyperfine comparison vs Python semble
 ```
 
-Releases version everything together: the crate version in `Cargo.toml` is
-the single source of truth, and every published plugin/package manifest must
-match it exactly (enforced in CI). After bumping `Cargo.toml`, run:
+trouve-search's distribution artifacts version together: the crate version in
+`crates/trouve-search/Cargo.toml` is the single source of truth, and every
+published plugin/package manifest must match it exactly (enforced in CI).
+Releases are tagged per crate (`trouve-search-vX.Y.Z`). After bumping the
+crate version, run:
 
 ```bash
 python3 scripts/sync_versions.py  # rewrite all plugin manifests to match

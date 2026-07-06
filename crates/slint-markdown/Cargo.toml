@@ -1,0 +1,19 @@
+[package]
+name = "slint-markdown"
+version = "0.1.0"
+edition.workspace = true
+description = "Streaming markdown renderer component for Slint: incremental block updates for token-by-token model output."
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+keywords = ["slint", "markdown", "streaming"]
+categories = ["gui"]
+
+[dependencies]
+slint.workspace = true
+
+[build-dependencies]
+slint-build = "1.17"
+
+[[example]]
+name = "markdown_demo"

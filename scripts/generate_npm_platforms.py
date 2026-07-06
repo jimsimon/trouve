@@ -13,11 +13,12 @@ PLATFORMS = ROOT / "npm" / "platforms.json"
 
 
 def crate_version() -> str:
-    with (ROOT / "Cargo.toml").open("rb") as f:
+    manifest_path = ROOT / "crates" / "trouve-search" / "Cargo.toml"
+    with manifest_path.open("rb") as f:
         manifest = tomllib.load(f)
     version = manifest.get("package", {}).get("version")
     if not isinstance(version, str) or not version:
-        sys.exit("Cargo.toml has no package.version field")
+        sys.exit(f"{manifest_path} has no package.version field")
     return version
 
 

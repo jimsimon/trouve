@@ -1,106 +1,57 @@
-[package]
-name = "trouve-search"
-version = "2.0.0"
+# Workspace manifest for the trouve monorepo.
+#
+# Members:
+#   crates/trouve-search   — code search/indexing library + CLI (published)
+#   crates/trouve-*        — harness crates (protocol, core, providers, server, cli, ...)
+#   crates/slint-*         — reusable Slint widget crates (published independently)
+#
+# Crates are versioned independently; releases are tagged per crate
+# (e.g. `trouve-search-v1.2.0`). See docs/adr/0001-monorepo-workspace.md.
+
+[workspace]
+resolver = "2"
+members = ["crates/*"]
+
+[workspace.package]
 edition = "2021"
-description = "Fast and accurate code search for agents. Rust port of MinishLab/semble with incremental, branch- and worktree-aware indexing."
 license = "MIT"
 repository = "https://github.com/jimsimon/trouve"
-keywords = ["code-search", "semantic-search", "mcp", "agent", "embeddings"]
-categories = ["command-line-utilities", "development-tools"]
-# 1.89 for std file locking (`File::lock`), used by the clone cache
-# (1.87 was already required for `usize::is_multiple_of`).
+# 1.89 for std file locking (`File::lock`), used by trouve-search's clone cache.
 rust-version = "1.89"
 
-[lib]
-name = "trouve_search"
-path = "src/lib.rs"
-
-[[bin]]
-name = "trouve-search"
-path = "src/main.rs"
-
-[dependencies]
-ahash = "0.8"
+[workspace.dependencies]
 anyhow = "1.0.103"
-bincode = { version = "2", features = ["serde"] }
-blake3 = "1.8.5"
-bytemuck = { version = "1.25.0", features = ["derive"] }
+async-trait = "0.1"
+bytes = "1"
+axum = { version = "0.8", features = ["macros"] }
+chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4.6.1", features = ["derive"] }
 dirs = "6.0.0"
-half = "2"
-hf-hub = { version = "0.5", default-features = false, features = ["ureq"] }
-ignore = "0.4.27"
-memmap2 = "0.9.11"
-rayon = "1.12.0"
-regex = "1.12.4"
-safetensors = "0.8"
+futures = "0.3"
+octocrab = "0.49"
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
+rusqlite = { version = "0.32", features = ["bundled"] }
 serde = { version = "1.0.228", features = ["derive"] }
+slint = "1.17"
 serde_json = { version = "1.0.150", features = ["preserve_order"] }
-tokenizers = { version = "0.23", default-features = false, features = ["onig"] }
-tree-sitter = "0.26.10"
-tree-sitter-bash = "0.25.1"
-tree-sitter-c = "0.24.2"
-tree-sitter-c-sharp = "0.23.5"
-tree-sitter-cmake = "0.7.1"
-tree-sitter-cpp = "0.23.4"
-tree-sitter-css = "0.25.0"
-tree-sitter-d = "0.8.2"
-tree-sitter-dart = "0.2.0"
-tree-sitter-elixir = "0.3.5"
-tree-sitter-elm = "5.9.0"
-tree-sitter-embedded-template = "0.25.0"
-tree-sitter-erlang = "0.19.0"
-tree-sitter-fortran = "0.6.0"
-tree-sitter-gleam = "1.0.0"
-tree-sitter-go = "0.25.0"
-tree-sitter-graphql = "0.1.0"
-tree-sitter-groovy = "0.1.2"
-tree-sitter-haskell = "0.23.1"
-tree-sitter-hcl = "1.1.0"
-tree-sitter-html = "0.23.2"
-tree-sitter-java = "0.23.5"
-tree-sitter-javascript = "0.25.0"
-tree-sitter-json = "0.24.8"
-tree-sitter-julia = "0.23.1"
-tree-sitter-kotlin-ng = "1.1.0"
-tree-sitter-lua = "0.5.0"
-tree-sitter-make = "1.1.1"
-tree-sitter-md = "0.5.3"
-tree-sitter-nix = "0.3.0"
-tree-sitter-objc = "3.0.2"
-tree-sitter-ocaml = "0.25.0"
-tree-sitter-perl = "1.1.2"
-tree-sitter-php = "0.24.2"
-tree-sitter-powershell = "0.26.4"
-tree-sitter-proto = "0.4.0"
-tree-sitter-python = "0.25.0"
-tree-sitter-r = "1.3.0"
-tree-sitter-ruby = "0.23.1"
-tree-sitter-rust = "0.24.2"
-tree-sitter-scala = "0.26.0"
-tree-sitter-sequel = "0.3.11"
-tree-sitter-solidity = "1.2.13"
-tree-sitter-svelte-ng = "1.0.2"
-tree-sitter-swift = "0.7.3"
-tree-sitter-toml-ng = "0.7.0"
-tree-sitter-typescript = "0.23.2"
-tree-sitter-xml = "0.7.0"
-tree-sitter-yaml = "0.7.2"
-tree-sitter-zig = "1.1.2"
-
-[target.'cfg(unix)'.dependencies]
-libc = "0.2.186"
-
-[dev-dependencies]
-criterion = "0.8.2"
-filetime = "0.2"
-model2vec-rs = "0.2.1"
-proptest = "1.11.0"
 tempfile = "3.27.0"
+thiserror = "2"
+tokio = { version = "1", features = ["full"] }
+tokio-stream = { version = "0.1", features = ["sync"] }
+toml = "0.8"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+utoipa = { version = "5", features = ["chrono"] }
+uuid = { version = "1", features = ["v4"] }
 
-[[bench]]
-name = "index_and_search"
-harness = false
+# Internal crates
+trouve-protocol = { path = "crates/trouve-protocol", version = "0.1.0" }
+trouve-search = { path = "crates/trouve-search", version = "2.0.0" }
+trouve-agents = { path = "crates/trouve-agents", version = "0.1.0" }
+trouve-core = { path = "crates/trouve-core", version = "0.1.0" }
+trouve-providers = { path = "crates/trouve-providers", version = "0.1.0" }
+trouve-server = { path = "crates/trouve-server", version = "0.1.0" }
+trouve-client-core = { path = "crates/trouve-client-core", version = "0.1.0" }
 
 [profile.release]
 lto = "thin"
