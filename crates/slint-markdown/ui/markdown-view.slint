@@ -7,10 +7,12 @@
 import { ListView } from "std-widgets.slint";
 
 export struct MarkdownBlock {
-    // 0 paragraph, 1 h1, 2 h2, 3 h3, 4 bullet, 5 code fence
+    // 0 paragraph, 1 h1, 2 h2, 3 h3, 4 bullet, 5 code fence, 6 numbered
     kind: int,
     text: string,
     language: string,
+    // Nesting level for list items (0 = top level).
+    indent: int,
 }
 
 export component MarkdownView inherits Rectangle {
@@ -28,9 +30,18 @@ export component MarkdownView inherits Rectangle {
             border-radius: block.kind == 5 ? 6px : 0;
 
             content := VerticalLayout {
-                padding-top: block.kind == 5 ? 8px : 2px;
-                padding-bottom: block.kind == 5 ? 8px : 2px;
-                padding-left: block.kind == 4 ? 18px : block.kind == 5 ? 10px : 0px;
+                // Headings get room above; list items stay tight so a list
+                // reads as one group; paragraphs breathe.
+                padding-top: block.kind == 5 ? 8px
+                    : block.kind >= 1 && block.kind <= 3 ? 10px
+                    : block.kind == 4 || block.kind == 6 ? 2px
+                    : 5px;
+                padding-bottom: block.kind == 5 ? 8px
+                    : block.kind == 4 || block.kind == 6 ? 2px
+                    : 5px;
+                padding-left: block.kind == 4 || block.kind == 6
+                    ? 18px + block.indent * 18px
+                    : block.kind == 5 ? 10px : 0px;
                 padding-right: 4px;
 
                 Text {

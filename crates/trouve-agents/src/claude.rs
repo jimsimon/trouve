@@ -23,8 +23,8 @@ use tokio::process::Command;
 use trouve_protocol::{ModelInfo, Usage};
 
 use crate::{
-    async_stream, binary_on_path, model, AgentBackend, BackendError, BackendEvent,
-    BackendEventStream, BackendLogin, BackendPermission, BackendStatus, BackendTurn,
+    async_stream, binary_on_path, AgentBackend, BackendError, BackendEvent, BackendEventStream,
+    BackendLogin, BackendPermission, BackendStatus, BackendTurn,
 };
 
 pub struct ClaudeBackend {
@@ -48,13 +48,28 @@ impl AgentBackend for ClaudeBackend {
     }
 
     fn models(&self) -> Vec<ModelInfo> {
-        // Claude Code accepts model aliases; it maps them to the newest
-        // matching model on the account's plan.
-        vec![
-            model(&self.id, "sonnet", "Claude Sonnet (Claude Code)", 200_000),
-            model(&self.id, "opus", "Claude Opus (Claude Code)", 200_000),
-            model(&self.id, "haiku", "Claude Haiku (Claude Code)", 200_000),
-        ]
+        // The same catalog as the per-use Anthropic API provider, so both
+        // surface the same list. Claude Code accepts full model ids; the
+        // subscription bills nothing per token, so pricing is dropped.
+        trouve_providers::catalog::anthropic_models(&self.id)
+            .into_iter()
+            .map(|mut m| {
+                m.display_name = format!("{} (Claude Code)", m.display_name);
+                m.input_price_per_mtok = None;
+                m.output_price_per_mtok = None;
+                // Temperature isn't controllable through the CLI.
+                m.options_schema = serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "thinking_level": m.options_schema
+                            .pointer("/properties/thinking_level")
+                            .cloned()
+                            .unwrap_or_default(),
+                    }
+                });
+                m
+            })
+            .collect()
     }
 
     fn status(&self) -> BackendStatus {
@@ -93,6 +108,15 @@ impl AgentBackend for ClaudeBackend {
         }
         if !turn.model.is_empty() {
             cmd.args(["--model", &turn.model]);
+        }
+        // Extended thinking rides on Claude Code's budget env var.
+        if let Some(budget) = turn
+            .model_options
+            .get("thinking_level")
+            .and_then(Value::as_str)
+            .and_then(trouve_providers::catalog::thinking_budget_tokens)
+        {
+            cmd.env("MAX_THINKING_TOKENS", budget.to_string());
         }
         if let Some(instr) = &turn.instructions {
             cmd.args(["--append-system-prompt", instr]);

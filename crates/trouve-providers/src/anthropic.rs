@@ -22,7 +22,12 @@ pub struct AnthropicProvider {
     /// Subscription (OAuth) tokens authenticate with `Authorization: Bearer`
     /// plus the oauth beta header instead of `x-api-key`.
     oauth_bearer: bool,
+    /// Live `/v1/models` result, cached for [`MODELS_TTL`].
+    models_cache: tokio::sync::Mutex<Option<(std::time::Instant, Vec<trouve_protocol::ModelInfo>)>>,
 }
+
+/// How long a fetched model list stays fresh.
+const MODELS_TTL: std::time::Duration = std::time::Duration::from_secs(300);
 
 impl AnthropicProvider {
     pub fn new(
@@ -39,7 +44,76 @@ impl AnthropicProvider {
             token,
             client: reqwest::Client::new(),
             oauth_bearer: false,
+            models_cache: tokio::sync::Mutex::new(None),
         }
+    }
+
+    /// Add auth headers (API key or OAuth bearer) to a request.
+    fn authed(&self, req: reqwest::RequestBuilder, key: &str) -> reqwest::RequestBuilder {
+        let req = req.header("anthropic-version", ANTHROPIC_VERSION);
+        if self.oauth_bearer {
+            req.bearer_auth(key)
+                .header("anthropic-beta", "oauth-2025-04-20")
+        } else {
+            req.header("x-api-key", key)
+        }
+    }
+
+    /// Fetch the account's model list from `/v1/models`, keeping the static
+    /// catalog's pricing where ids match (the API doesn't report pricing).
+    async fn fetch_models(&self) -> Result<Vec<trouve_protocol::ModelInfo>, ProviderError> {
+        let key = self.token.bearer().await?;
+        let resp = self
+            .authed(
+                self.client
+                    .get(format!("{}/v1/models?limit=100", self.base_url)),
+                &key,
+            )
+            .send()
+            .await
+            .map_err(|e| ProviderError::Request(e.to_string()))?;
+        if !resp.status().is_success() {
+            return Err(ProviderError::Api(format!("{}", resp.status())));
+        }
+        let body: Value = resp
+            .json()
+            .await
+            .map_err(|e| ProviderError::Request(e.to_string()))?;
+        let known = catalog::anthropic_models(&self.id);
+        let Some(data) = body["data"].as_array() else {
+            return Ok(Vec::new());
+        };
+        Ok(data
+            .iter()
+            .filter_map(|entry| {
+                let name = entry["id"].as_str()?;
+                let known = known.iter().find(|k| k.id.ends_with(&format!("/{name}")));
+                let window = entry["max_input_tokens"]
+                    .as_u64()
+                    .filter(|w| *w > 0)
+                    .or(known.map(|k| k.context_window))
+                    .unwrap_or(200_000);
+                let thinking = entry
+                    .pointer("/capabilities/thinking/supported")
+                    .and_then(Value::as_bool)
+                    // Older API versions omit capabilities; assume thinking.
+                    .unwrap_or(true);
+                Some(trouve_protocol::ModelInfo {
+                    id: format!("{}/{name}", self.id),
+                    display_name: entry["display_name"].as_str().unwrap_or(name).to_string(),
+                    context_window: window,
+                    supports_tools: true,
+                    input_price_per_mtok: known.and_then(|k| k.input_price_per_mtok),
+                    output_price_per_mtok: known.and_then(|k| k.output_price_per_mtok),
+                    options_schema: if thinking {
+                        catalog::anthropic_thinking_schema()
+                    } else {
+                        serde_json::json!({"type": "object", "properties": {}})
+                    },
+                    max_mode: false,
+                })
+            })
+            .collect())
     }
 
     pub fn with_oauth_bearer(mut self) -> Self {
@@ -115,6 +189,26 @@ impl Provider for AnthropicProvider {
         catalog::anthropic_models(&self.id)
     }
 
+    async fn list_models(&self) -> Vec<trouve_protocol::ModelInfo> {
+        let mut cache = self.models_cache.lock().await;
+        if let Some((at, models)) = cache.as_ref() {
+            if at.elapsed() < MODELS_TTL {
+                return models.clone();
+            }
+        }
+        match self.fetch_models().await {
+            Ok(models) if !models.is_empty() => {
+                *cache = Some((std::time::Instant::now(), models.clone()));
+                models
+            }
+            Ok(_) => self.models(),
+            Err(e) => {
+                tracing::debug!("anthropic model list failed: {e}; using static catalog");
+                self.models()
+            }
+        }
+    }
+
     async fn stream_chat(
         &self,
         model: &str,
@@ -149,24 +243,35 @@ impl Provider for AnthropicProvider {
         for (k, v) in options {
             // Map trouve's generic option names onto Anthropic's shapes.
             match k.as_str() {
+                "thinking_level" => {
+                    if let Some(budget) = v.as_str().and_then(catalog::thinking_budget_tokens) {
+                        body["thinking"] = json!({"type": "enabled", "budget_tokens": budget});
+                    }
+                }
                 "thinking_budget_tokens" => {
                     body["thinking"] = json!({"type": "enabled", "budget_tokens": v});
                 }
                 _ => body[k.as_str()] = v.clone(),
             }
         }
+        // API constraints with thinking enabled: max_tokens must exceed the
+        // budget, and temperature must stay at its default.
+        if let Some(budget) = body
+            .pointer("/thinking/budget_tokens")
+            .and_then(Value::as_u64)
+        {
+            let max = body["max_tokens"].as_u64().unwrap_or(DEFAULT_MAX_TOKENS);
+            if max <= budget {
+                body["max_tokens"] = json!(budget + DEFAULT_MAX_TOKENS);
+            }
+            body.as_object_mut().unwrap().remove("temperature");
+        }
 
         let key = self.token.bearer().await?;
-        let mut req = self
-            .client
-            .post(format!("{}/v1/messages", self.base_url))
-            .header("anthropic-version", ANTHROPIC_VERSION);
-        req = if self.oauth_bearer {
-            req.bearer_auth(key)
-                .header("anthropic-beta", "oauth-2025-04-20")
-        } else {
-            req.header("x-api-key", key)
-        };
+        let req = self.authed(
+            self.client.post(format!("{}/v1/messages", self.base_url)),
+            &key,
+        );
         let resp = req
             .json(&body)
             .send()

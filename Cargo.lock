@@ -7989,6 +7989,7 @@ dependencies = [
  "tokio",
  "tracing",
  "trouve-protocol",
+ "trouve-providers",
 ]
 
 [[package]]
@@ -8118,7 +8119,6 @@ dependencies = [
  "clap",
  "criterion",
  "dirs",
- "filetime",
  "half",
  "hf-hub 0.5.0",
  "ignore",

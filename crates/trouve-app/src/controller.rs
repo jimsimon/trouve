@@ -66,6 +66,8 @@ pub enum UiCommand {
     ToggleTool(usize),
     ComposerModeChanged(usize),
     ComposerModelChanged(usize),
+    ComposerThinkingChanged(usize),
+    ComposerFastToggled(bool),
 
     // Right column.
     RefreshDiff,
@@ -136,6 +138,11 @@ struct Controller {
 
     modes: Vec<AgentMode>,
     models: Vec<ModelInfo>,
+    /// Thinking dropdown state for the current thread's model: the schema
+    /// property the values belong to and the raw value tokens (parallel to
+    /// the displayed labels).
+    thinking_key: Option<String>,
+    thinking_values: Vec<String>,
 
     new_chat: Option<NewChat>,
     branches: Vec<String>,
@@ -180,6 +187,8 @@ pub async fn run(
         row_call_ids: Vec::new(),
         modes: Vec::new(),
         models: Vec::new(),
+        thinking_key: None,
+        thinking_values: Vec::new(),
         new_chat: None,
         branches: Vec::new(),
         diff_files: Vec::new(),
@@ -457,7 +466,7 @@ impl Controller {
     }
 
     /// Composer pickers mirror the current thread's mode/model.
-    fn push_picker_indices(&self) {
+    fn push_picker_indices(&mut self) {
         let (mode, model) = match self.current_thread.and_then(|i| self.threads.get(i)) {
             Some(thread) => (
                 self.modes
@@ -474,6 +483,47 @@ impl Controller {
             None => (-1, -1),
         };
         ui::set_picker_indices(&self.ui, mode, model);
+        self.push_model_knobs();
+    }
+
+    /// Model knobs (thinking dropdown, fast toggle) come from the current
+    /// model's options schema; selections from the thread's stored options.
+    fn push_model_knobs(&mut self) {
+        let thread = self.current_thread.and_then(|i| self.threads.get(i));
+        let info = thread.and_then(|t| self.models.iter().find(|m| m.id == t.model));
+
+        let thinking = info.and_then(|m| thinking_property(&m.options_schema));
+        let (key, values, default) = match thinking {
+            Some(t) => (Some(t.0), t.1, t.2),
+            None => (None, Vec::new(), None),
+        };
+        let current = key
+            .as_deref()
+            .and_then(|k| thread?.model_options.get(k)?.as_str().map(String::from))
+            .or(default);
+        let index = current
+            .and_then(|c| values.iter().position(|v| *v == c))
+            .map(|i| i as i32)
+            .unwrap_or(-1);
+
+        let fast_visible = info
+            .map(|m| m.options_schema.pointer("/properties/fast").is_some())
+            .unwrap_or(false);
+        let fast_checked = thread
+            .and_then(|t| t.model_options.get("fast"))
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+
+        self.thinking_key = key;
+        self.thinking_values = values.clone();
+        ui::set_model_knobs(
+            &self.ui,
+            values.iter().map(|v| level_label(v)).collect(),
+            index,
+            fast_visible,
+            fast_checked,
+            info.map(|m| m.max_mode).unwrap_or(false),
+        );
     }
 
     /// Start following the current thread's event stream (idempotent).
@@ -974,8 +1024,32 @@ impl Controller {
             }
             UiCommand::ComposerModelChanged(i) => {
                 let model = self.models.get(i).map(|m| m.id.clone());
+                // Options are per-model; switching models resets them.
                 self.update_current_thread(UpdateThreadRequest {
                     model,
+                    model_options: Some(serde_json::Map::new()),
+                    ..Default::default()
+                })
+                .await;
+            }
+            UiCommand::ComposerThinkingChanged(i) => {
+                let key = self.thinking_key.clone();
+                let token = self.thinking_values.get(i).cloned();
+                if let (Some(key), Some(token)) = (key, token) {
+                    let mut options = self.current_model_options();
+                    options.insert(key, serde_json::Value::String(token));
+                    self.update_current_thread(UpdateThreadRequest {
+                        model_options: Some(options),
+                        ..Default::default()
+                    })
+                    .await;
+                }
+            }
+            UiCommand::ComposerFastToggled(on) => {
+                let mut options = self.current_model_options();
+                options.insert("fast".into(), serde_json::Value::Bool(on));
+                self.update_current_thread(UpdateThreadRequest {
+                    model_options: Some(options),
                     ..Default::default()
                 })
                 .await;
@@ -1199,6 +1273,14 @@ impl Controller {
 
     /// PATCH the current thread's settings; on failure (e.g. mid-turn
     /// conflict) surface the error and restore the pickers.
+    /// The current thread's stored model options (empty when no thread).
+    fn current_model_options(&self) -> serde_json::Map<String, serde_json::Value> {
+        self.current_thread
+            .and_then(|i| self.threads.get(i))
+            .map(|t| t.model_options.clone())
+            .unwrap_or_default()
+    }
+
     async fn update_current_thread(&mut self, req: UpdateThreadRequest) {
         let Some(index) = self.current_thread else {
             return;
@@ -1245,6 +1327,43 @@ impl Controller {
 
 fn short_model(model: &str) -> String {
     model.rsplit('/').next().unwrap_or(model).to_string()
+}
+
+/// The thinking-style enum in a model's options schema, if any: property
+/// name, value tokens, and the schema default. Providers name the knob
+/// differently (cursor/anthropic: thinking_level, codex: reasoning_effort).
+fn thinking_property(schema: &serde_json::Value) -> Option<(String, Vec<String>, Option<String>)> {
+    for key in ["thinking_level", "reasoning_effort"] {
+        let Some(prop) = schema.pointer(&format!("/properties/{key}")) else {
+            continue;
+        };
+        let values: Vec<String> = prop["enum"]
+            .as_array()?
+            .iter()
+            .filter_map(|v| v.as_str().map(String::from))
+            .collect();
+        if values.len() > 1 {
+            let default = prop["default"].as_str().map(String::from);
+            return Some((key.into(), values, default));
+        }
+    }
+    None
+}
+
+/// Human label for a thinking-level token.
+fn level_label(token: &str) -> String {
+    match token {
+        "off" => "Off".into(),
+        "none" => "None".into(),
+        "minimal" => "Minimal".into(),
+        "low" => "Low".into(),
+        "default" => "Default".into(),
+        "medium" => "Medium".into(),
+        "high" => "High".into(),
+        "xhigh" => "Extra High".into(),
+        "max" => "Max".into(),
+        other => other.to_string(),
+    }
 }
 
 /// Prefer the "code" mode as the default picker selection.

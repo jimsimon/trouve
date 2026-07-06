@@ -215,6 +215,7 @@ pub fn codex_models(provider_id: &str) -> Vec<ModelInfo> {
             input_price_per_mtok: None,
             output_price_per_mtok: None,
             options_schema: reasoning.clone(),
+            max_mode: false,
         },
         ModelInfo {
             id: format!("{provider_id}/gpt-5.4"),
@@ -224,6 +225,7 @@ pub fn codex_models(provider_id: &str) -> Vec<ModelInfo> {
             input_price_per_mtok: None,
             output_price_per_mtok: None,
             options_schema: reasoning,
+            max_mode: false,
         },
     ]
 }
@@ -254,6 +256,7 @@ pub fn openai_models(provider_id: &str) -> Vec<ModelInfo> {
             input_price_per_mtok: Some(2.00),
             output_price_per_mtok: Some(8.00),
             options_schema: plain.clone(),
+            max_mode: false,
         },
         ModelInfo {
             id: format!("{provider_id}/gpt-4.1-mini"),
@@ -263,6 +266,7 @@ pub fn openai_models(provider_id: &str) -> Vec<ModelInfo> {
             input_price_per_mtok: Some(0.40),
             output_price_per_mtok: Some(1.60),
             options_schema: plain,
+            max_mode: false,
         },
         ModelInfo {
             id: format!("{provider_id}/o4-mini"),
@@ -272,41 +276,95 @@ pub fn openai_models(provider_id: &str) -> Vec<ModelInfo> {
             input_price_per_mtok: Some(1.10),
             output_price_per_mtok: Some(4.40),
             options_schema: reasoning,
+            max_mode: false,
         },
     ]
 }
 
-pub fn anthropic_models(provider_id: &str) -> Vec<ModelInfo> {
-    let thinking = json!({
+/// The options schema shared by all Claude models that support extended
+/// thinking. Levels map to thinking budgets via [`thinking_budget_tokens`].
+pub fn anthropic_thinking_schema() -> serde_json::Value {
+    json!({
         "type": "object",
         "properties": {
-            "thinking_budget_tokens": {
-                "type": "integer",
-                "minimum": 1024,
-                "description": "Extended thinking budget; omit to disable extended thinking"
+            "thinking_level": {
+                "type": "string",
+                "enum": ["off", "low", "medium", "high"],
+                "default": "off",
+                "description": "Extended thinking budget"
             },
             "temperature": {"type": "number", "minimum": 0.0, "maximum": 1.0}
         }
-    });
+    })
+}
+
+/// Token budget for a thinking level ("off"/unknown = thinking disabled).
+/// Used by the Anthropic API provider (`thinking.budget_tokens`) and the
+/// Claude Code backend (`MAX_THINKING_TOKENS`).
+pub fn thinking_budget_tokens(level: &str) -> Option<u64> {
+    match level {
+        "low" => Some(4_096),
+        "medium" => Some(16_384),
+        "high" => Some(32_768),
+        _ => None,
+    }
+}
+
+/// Claude model catalog, shared by the per-use Anthropic API provider and
+/// the Claude Code subscription backend so both surface the same list. The
+/// API provider upgrades this with a live `/v1/models` fetch when it can.
+///
+/// List prices are flat across the full context window: Anthropic removed
+/// the long-context (>200k input) surcharge in March 2026.
+pub fn anthropic_models(provider_id: &str) -> Vec<ModelInfo> {
+    let m = |name: &str, display: &str, window: u64, prices: Option<(f64, f64)>| ModelInfo {
+        id: format!("{provider_id}/{name}"),
+        display_name: display.into(),
+        context_window: window,
+        supports_tools: true,
+        input_price_per_mtok: prices.map(|p| p.0),
+        output_price_per_mtok: prices.map(|p| p.1),
+        options_schema: anthropic_thinking_schema(),
+        max_mode: false,
+    };
     vec![
-        ModelInfo {
-            id: format!("{provider_id}/claude-sonnet-4-5"),
-            display_name: "Claude Sonnet 4.5".into(),
-            context_window: 200_000,
-            supports_tools: true,
-            input_price_per_mtok: Some(3.00),
-            output_price_per_mtok: Some(15.00),
-            options_schema: thinking.clone(),
-        },
-        ModelInfo {
-            id: format!("{provider_id}/claude-haiku-4-5"),
-            display_name: "Claude Haiku 4.5".into(),
-            context_window: 200_000,
-            supports_tools: true,
-            input_price_per_mtok: Some(1.00),
-            output_price_per_mtok: Some(5.00),
-            options_schema: thinking,
-        },
+        m(
+            "claude-fable-5",
+            "Claude Fable 5",
+            1_000_000,
+            Some((10.00, 50.00)),
+        ),
+        m(
+            "claude-opus-4-8",
+            "Claude Opus 4.8",
+            1_000_000,
+            Some((5.00, 25.00)),
+        ),
+        // Introductory pricing through Aug 31, 2026 ($3/$15 after).
+        m(
+            "claude-sonnet-5",
+            "Claude Sonnet 5",
+            1_000_000,
+            Some((2.00, 10.00)),
+        ),
+        m(
+            "claude-sonnet-4-6",
+            "Claude Sonnet 4.6",
+            1_000_000,
+            Some((3.00, 15.00)),
+        ),
+        m(
+            "claude-sonnet-4-5",
+            "Claude Sonnet 4.5",
+            200_000,
+            Some((3.00, 15.00)),
+        ),
+        m(
+            "claude-haiku-4-5",
+            "Claude Haiku 4.5",
+            200_000,
+            Some((1.00, 5.00)),
+        ),
     ]
 }
 

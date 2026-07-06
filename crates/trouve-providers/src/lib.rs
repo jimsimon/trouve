@@ -56,7 +56,9 @@ pub enum ProviderEvent {
     /// Reasoning ("thinking") text, where the model/provider exposes it.
     ThinkingDelta(String),
     ToolCall(ToolCallRequest),
-    Completed { usage: Usage },
+    Completed {
+        usage: Usage,
+    },
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -75,6 +77,12 @@ pub type EventStream = BoxStream<'static, Result<ProviderEvent, ProviderError>>;
 pub trait Provider: Send + Sync {
     /// Stable identifier used as the prefix of model ids ("openai/gpt-4.1").
     fn id(&self) -> &str;
+
+    /// Live model listing, for providers whose catalog can be queried.
+    /// Defaults to the static snapshot.
+    async fn list_models(&self) -> Vec<trouve_protocol::ModelInfo> {
+        self.models()
+    }
 
     /// Known models with capability/options schemas and pricing. Empty when
     /// the provider can't enumerate its models (custom gateways).

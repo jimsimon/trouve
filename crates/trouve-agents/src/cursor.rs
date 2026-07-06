@@ -105,6 +105,32 @@ impl CursorBackend {
         }
         Ok(id)
     }
+
+    /// Turn a base model + options into the concrete vendor id. Threads
+    /// created before the variant split may still store a full variant id;
+    /// those pass through unchanged.
+    async fn resolve_model(&self, turn: &BackendTurn) -> String {
+        let (_, level, fast) = split_variant(&turn.model);
+        if level.is_some() || fast {
+            return turn.model.clone();
+        }
+        // The group's default level lives in the cached schema (the bare id
+        // doesn't exist for groups like claude-opus-4-8, whose unlabeled
+        // variant is claude-opus-4-8-high).
+        let default_level = {
+            let cache = self.models_cache.lock().await;
+            cache.as_ref().and_then(|(_, models)| {
+                let qualified = format!("{}/{}", self.id, turn.model);
+                models.iter().find(|m| m.id == qualified).and_then(|m| {
+                    m.options_schema
+                        .pointer("/properties/thinking_level/default")
+                        .and_then(Value::as_str)
+                        .map(str::to_string)
+                })
+            })
+        };
+        compose_model_id(&turn.model, &turn.model_options, default_level.as_deref())
+    }
 }
 
 #[async_trait::async_trait]
@@ -189,7 +215,7 @@ impl AgentBackend for CursorBackend {
             .stderr(Stdio::piped())
             .kill_on_drop(true);
         if !turn.model.is_empty() && turn.model != "auto" {
-            cmd.args(["--model", &turn.model]);
+            cmd.args(["--model", &self.resolve_model(&turn).await]);
         }
         match turn.permission {
             BackendPermission::Yolo => {
@@ -260,28 +286,154 @@ impl AgentBackend for CursorBackend {
     }
 }
 
-/// Parse `cursor-agent models` output: one `<id> - <display name>` line per
-/// model, between an "Available models" header and a "Tip:" footer.
+/// Thinking/effort level tokens the catalog uses as id suffixes. Note that
+/// `-max` here is an *effort level* (mirroring Anthropic's effort API), not
+/// the IDE's "Max Mode" context toggle — the CLI has no such toggle and its
+/// models already run at their full context window.
+const LEVELS: [&str; 6] = ["none", "low", "medium", "high", "xhigh", "max"];
+
+/// Split a raw catalog id into `(base, thinking level, fast)`. The grammar
+/// is `<base>[-<level>][-fast]`; a `-thinking` marker stays part of the
+/// base because Cursor treats thinking/non-thinking as distinct models.
+fn split_variant(id: &str) -> (&str, Option<&str>, bool) {
+    let (rest, fast) = match id.strip_suffix("-fast") {
+        Some(rest) => (rest, true),
+        None => (id, false),
+    };
+    if let Some((head, tail)) = rest.rsplit_once('-') {
+        if LEVELS.contains(&tail) {
+            return (head, Some(tail), fast);
+        }
+    }
+    (rest, None, fast)
+}
+
+/// Parse `cursor-agent models` output (one `<id> - <display name>` line per
+/// model) and fold the variant explosion into one entry per base model with
+/// a `thinking_level` / `fast` options schema. The default variant of a
+/// group is the one with the shortest display name ("Opus 4.8 1M" is the
+/// unlabeled default among "Opus 4.8 1M Low/Medium/Extra High/...").
 fn parse_models_output(backend_id: &str, output: &str) -> Vec<ModelInfo> {
-    output
-        .lines()
-        .filter_map(|line| {
-            let (id, display) = line.trim().split_once(" - ")?;
-            let id = id.trim();
-            if id.is_empty() || id.contains(' ') {
-                return None;
+    struct Group {
+        order: usize,
+        levels: Vec<String>, // "default" = the bare (level-less) id
+        has_fast: bool,
+        display: String,
+        default_level: String,
+    }
+    let mut groups: std::collections::BTreeMap<String, Group> = Default::default();
+
+    for (order, line) in output.lines().enumerate() {
+        let Some((id, display)) = line.trim().split_once(" - ") else {
+            continue;
+        };
+        let (id, display) = (id.trim(), display.trim());
+        if id.is_empty() || id.contains(' ') {
+            continue;
+        }
+        let (base, level, fast) = split_variant(id);
+        let level = level.unwrap_or("default").to_string();
+        let group = groups.entry(base.to_string()).or_insert_with(|| Group {
+            order,
+            levels: Vec::new(),
+            has_fast: false,
+            display: display.to_string(),
+            default_level: level.clone(),
+        });
+        group.has_fast |= fast;
+        if !fast {
+            if !group.levels.contains(&level) {
+                group.levels.push(level.clone());
+            }
+            // Shortest display in the group names the base model itself.
+            if display.len() < group.display.len() {
+                group.display = display.to_string();
+                group.default_level = level;
+            }
+        }
+    }
+
+    let mut models: Vec<(usize, ModelInfo)> = groups
+        .into_iter()
+        .map(|(base, mut group)| {
+            group.levels.sort_by_key(|l| level_rank(l));
+            let mut properties = serde_json::Map::new();
+            if group.levels.len() > 1 {
+                properties.insert(
+                    "thinking_level".into(),
+                    serde_json::json!({
+                        "type": "string",
+                        "enum": group.levels,
+                        "default": group.default_level,
+                        "description": "How much thinking the model does before answering"
+                    }),
+                );
+            }
+            if group.has_fast {
+                properties.insert(
+                    "fast".into(),
+                    serde_json::json!({
+                        "type": "boolean",
+                        "description": "Priority serving (consumes usage faster)"
+                    }),
+                );
             }
             // The CLI doesn't report context windows; "1M" in the display
             // name is the only signal, everything else gets a conservative
-            // default.
-            let window = if display.contains("1M") {
-                1_000_000
-            } else {
-                200_000
-            };
-            Some(model(backend_id, id, display.trim(), window))
+            // default. Those extended-context models are Max Mode-only —
+            // the CLI has no toggle — and Max Mode usage bills at a premium
+            // (20% surcharge on some Cursor plans), so flag them.
+            let max_mode = group.display.contains("1M");
+            let window = if max_mode { 1_000_000 } else { 200_000 };
+            let mut info = model(backend_id, &base, &group.display, window);
+            info.max_mode = max_mode;
+            info.options_schema = serde_json::json!({
+                "type": "object",
+                "properties": properties,
+            });
+            (group.order, info)
         })
-        .collect()
+        .collect();
+    models.sort_by_key(|(order, _)| *order);
+    models.into_iter().map(|(_, info)| info).collect()
+}
+
+/// Sort order for level tokens; the bare "default" sits at medium.
+fn level_rank(level: &str) -> usize {
+    match level {
+        "none" => 0,
+        "low" => 1,
+        "default" => 2,
+        "medium" => 3,
+        "high" => 4,
+        "xhigh" => 5,
+        "max" => 6,
+        _ => 7,
+    }
+}
+
+/// Rebuild the concrete vendor model id from a base model plus options.
+/// `default_level` is the group's unlabeled variant (from the schema);
+/// "default" means the bare base id.
+fn compose_model_id(
+    base: &str,
+    options: &serde_json::Map<String, Value>,
+    default_level: Option<&str>,
+) -> String {
+    let level = options
+        .get("thinking_level")
+        .and_then(Value::as_str)
+        .or(default_level)
+        .unwrap_or("default");
+    let mut id = base.to_string();
+    if level != "default" {
+        id.push('-');
+        id.push_str(level);
+    }
+    if options.get("fast").and_then(Value::as_bool) == Some(true) {
+        id.push_str("-fast");
+    }
+    id
 }
 
 /// Map one cursor-agent stream-json event to zero or more backend events.
@@ -362,21 +514,113 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parses_models_listing() {
-        let out = "Available models\n\nauto - Auto\ngpt-5.3-codex-high - Codex 5.3 High\n\
-                   grok-4.3 - Grok 4.3 1M\n\nTip: use --model <id> to switch.\n";
+    fn groups_variant_explosion_into_base_models() {
+        let out = "Available models\n\n\
+            auto - Auto\n\
+            gpt-5.3-codex-low - Codex 5.3 Low\n\
+            gpt-5.3-codex - Codex 5.3\n\
+            gpt-5.3-codex-fast - Codex 5.3 Fast\n\
+            gpt-5.3-codex-high - Codex 5.3 High\n\
+            gpt-5.3-codex-high-fast - Codex 5.3 High Fast\n\
+            claude-opus-4-8-low - Opus 4.8 1M Low\n\
+            claude-opus-4-8-high - Opus 4.8 1M\n\
+            claude-opus-4-8-max - Opus 4.8 1M Max\n\
+            claude-opus-4-8-thinking-high - Opus 4.8 1M Thinking\n\
+            claude-opus-4-8-thinking-low - Opus 4.8 1M Low Thinking\n\
+            grok-4.3 - Grok 4.3 1M\n\n\
+            Tip: use --model <id> to switch.\n";
         let models = parse_models_output("cursor", out);
         let ids: Vec<&str> = models.iter().map(|m| m.id.as_str()).collect();
         assert_eq!(
             ids,
             vec![
                 "cursor/auto",
-                "cursor/gpt-5.3-codex-high",
-                "cursor/grok-4.3"
+                "cursor/gpt-5.3-codex",
+                "cursor/claude-opus-4-8",
+                "cursor/claude-opus-4-8-thinking",
+                "cursor/grok-4.3",
             ]
         );
-        assert_eq!(models[2].context_window, 1_000_000);
-        assert_eq!(models[1].context_window, 200_000);
-        assert_eq!(models[1].display_name, "Codex 5.3 High");
+
+        // Bare variant is the default; levels sorted; fast noted.
+        let codex = &models[1];
+        assert_eq!(codex.display_name, "Codex 5.3");
+        assert_eq!(
+            codex
+                .options_schema
+                .pointer("/properties/thinking_level/enum")
+                .unwrap(),
+            &serde_json::json!(["low", "default", "high"])
+        );
+        assert_eq!(
+            codex
+                .options_schema
+                .pointer("/properties/thinking_level/default")
+                .and_then(Value::as_str),
+            Some("default")
+        );
+        assert!(codex.options_schema.pointer("/properties/fast").is_some());
+
+        // No bare id: the unlabeled display ("Opus 4.8 1M") marks high as
+        // default; `-thinking` stays a separate model; `-max` is a level.
+        let opus = &models[2];
+        assert_eq!(opus.display_name, "Opus 4.8 1M");
+        assert_eq!(opus.context_window, 1_000_000);
+        // Extended-context models are Max Mode-only (billed at a premium).
+        assert!(opus.max_mode);
+        assert!(!models[1].max_mode);
+        assert_eq!(
+            opus.options_schema
+                .pointer("/properties/thinking_level/enum")
+                .unwrap(),
+            &serde_json::json!(["low", "high", "max"])
+        );
+        assert_eq!(
+            opus.options_schema
+                .pointer("/properties/thinking_level/default")
+                .and_then(Value::as_str),
+            Some("high")
+        );
+        assert!(opus.options_schema.pointer("/properties/fast").is_none());
+
+        // Single-variant models get no thinking knob.
+        assert!(models[4]
+            .options_schema
+            .pointer("/properties/thinking_level")
+            .is_none());
+    }
+
+    #[test]
+    fn composes_variant_ids_from_options() {
+        let opts = |v: Value| v.as_object().unwrap().clone();
+
+        // Explicit level and fast.
+        assert_eq!(
+            compose_model_id(
+                "claude-opus-4-8",
+                &opts(serde_json::json!({"thinking_level": "max", "fast": true})),
+                Some("high"),
+            ),
+            "claude-opus-4-8-max-fast"
+        );
+        // No option set: fall back to the group default.
+        assert_eq!(
+            compose_model_id("claude-opus-4-8", &serde_json::Map::new(), Some("high")),
+            "claude-opus-4-8-high"
+        );
+        // "default" maps to the bare id.
+        assert_eq!(
+            compose_model_id(
+                "gpt-5.3-codex",
+                &opts(serde_json::json!({"thinking_level": "default"})),
+                Some("default"),
+            ),
+            "gpt-5.3-codex"
+        );
+        // Unknown group (cold cache): bare id passes through.
+        assert_eq!(
+            compose_model_id("grok-4.3", &serde_json::Map::new(), None),
+            "grok-4.3"
+        );
     }
 }

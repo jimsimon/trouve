@@ -50,6 +50,25 @@ pub fn set_picker_indices(ui: &Ui, mode: i32, model: i32) {
     });
 }
 
+/// Model knobs for the current thread: thinking-level labels + selection,
+/// and the fast toggle. Empty options hide the dropdown.
+pub fn set_model_knobs(
+    ui: &Ui,
+    thinking_options: Vec<String>,
+    thinking_index: i32,
+    fast_visible: bool,
+    fast_checked: bool,
+    max_mode: bool,
+) {
+    let _ = ui.upgrade_in_event_loop(move |ui| {
+        ui.set_thinking_options(string_model(thinking_options));
+        ui.set_thinking_index(thinking_index);
+        ui.set_fast_visible(fast_visible);
+        ui.set_fast_checked(fast_checked);
+        ui.set_max_mode(max_mode);
+    });
+}
+
 pub fn set_nav(ui: &Ui, rows: Vec<NavRowData>) {
     let _ = ui.upgrade_in_event_loop(move |ui| {
         let items: Vec<NavRow> = rows
@@ -89,6 +108,8 @@ pub fn set_chat(ui: &Ui, rows: Vec<ChatRowData>) {
             .map(|r| ChatRow {
                 kind: r.kind,
                 md_kind: r.md_kind,
+                md_indent: r.md_indent,
+                md_lang: SharedString::from(r.md_lang.as_str()),
                 text: SharedString::from(r.text.as_str()),
                 // Malformed markup falls back to the raw text rather than
                 // dropping the row.

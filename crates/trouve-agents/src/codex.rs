@@ -130,7 +130,14 @@ impl AgentBackend for CodexBackend {
     async fn run_turn(&self, turn: BackendTurn) -> Result<BackendEventStream, BackendError> {
         let server = self.server().await?;
 
-        let (model_name, effort) = split_effort(&turn.model);
+        // Effort comes from the thread's model options; `@effort` model ids
+        // from before the options split still resolve.
+        let (model_name, id_effort) = split_effort(&turn.model);
+        let effort = turn
+            .model_options
+            .get("reasoning_effort")
+            .and_then(Value::as_str)
+            .or(id_effort);
         let (approval_policy, sandbox) = match turn.permission {
             BackendPermission::ReadOnly => ("never", "readOnly"),
             BackendPermission::Ask => ("unlessTrusted", "workspaceWrite"),
@@ -225,9 +232,9 @@ fn model_or_default(model: &str) -> &str {
     }
 }
 
-/// Split a `<model>@<effort>` id into its parts. Reasoning effort is a
-/// separate app-server parameter, not part of the vendor model id, so
-/// trouve encodes the chosen effort as an `@` suffix in its model ids.
+/// Split a `<model>@<effort>` id into its parts. Threads created before the
+/// options split stored the chosen effort as an `@` suffix; the effort now
+/// travels in the thread's model options instead.
 fn split_effort(model: &str) -> (&str, Option<&str>) {
     match model.rsplit_once('@') {
         Some((m, e)) if !m.is_empty() && !e.is_empty() => (m, Some(e)),
@@ -235,9 +242,9 @@ fn split_effort(model: &str) -> (&str, Option<&str>) {
     }
 }
 
-/// Expand a `model/list` result into ModelInfos: one entry per model at its
-/// default reasoning effort, plus one `<id>@<effort>` variant per other
-/// supported effort.
+/// Map a `model/list` result to ModelInfos: one entry per model, with the
+/// supported reasoning efforts as a `reasoning_effort` options schema
+/// (rendered as the client's thinking dropdown).
 fn parse_model_list(backend_id: &str, result: &Value) -> Vec<ModelInfo> {
     let Some(data) = result["data"].as_array() else {
         return Vec::new();
@@ -252,23 +259,29 @@ fn parse_model_list(backend_id: &str, result: &Value) -> Vec<ModelInfo> {
         };
         let display = entry["displayName"].as_str().unwrap_or(id);
         let default_effort = entry["defaultReasoningEffort"].as_str().unwrap_or("");
-        out.push(model(backend_id, id, display, 272_000));
-        if let Some(efforts) = entry["supportedReasoningEfforts"].as_array() {
-            for e in efforts {
-                let Some(effort) = e["reasoningEffort"].as_str() else {
-                    continue;
-                };
-                if effort == default_effort {
-                    continue;
+        let efforts: Vec<&str> = entry["supportedReasoningEfforts"]
+            .as_array()
+            .map(|list| {
+                list.iter()
+                    .filter_map(|e| e["reasoningEffort"].as_str())
+                    .collect()
+            })
+            .unwrap_or_default();
+        let mut info = model(backend_id, id, display, 272_000);
+        if efforts.len() > 1 {
+            info.options_schema = json!({
+                "type": "object",
+                "properties": {
+                    "reasoning_effort": {
+                        "type": "string",
+                        "enum": efforts,
+                        "default": default_effort,
+                        "description": "How much thinking the model does before answering"
+                    }
                 }
-                out.push(model(
-                    backend_id,
-                    &format!("{id}@{effort}"),
-                    &format!("{display} ({effort})"),
-                    272_000,
-                ));
-            }
+            });
         }
+        out.push(info);
     }
     out
 }
@@ -321,7 +334,10 @@ fn turn_stream(
                     "item/started" => {
                         let item = &params["item"];
                         let ty = item["type"].as_str().unwrap_or("");
-                        if !matches!(ty, "" | "agentMessage" | "userMessage" | "plan" | "reasoning") {
+                        if !matches!(
+                            ty,
+                            "" | "agentMessage" | "userMessage" | "plan" | "reasoning"
+                        ) {
                             let _ = tx
                                 .send(Ok(BackendEvent::ToolStarted {
                                     call_id: item["id"].as_str().unwrap_or("").into(),
@@ -346,7 +362,10 @@ fn turn_stream(
                     "item/completed" => {
                         let item = &params["item"];
                         let ty = item["type"].as_str().unwrap_or("");
-                        if !matches!(ty, "" | "agentMessage" | "userMessage" | "plan" | "reasoning") {
+                        if !matches!(
+                            ty,
+                            "" | "agentMessage" | "userMessage" | "plan" | "reasoning"
+                        ) {
                             let failed = item["status"].as_str() == Some("failed");
                             let _ = tx
                                 .send(Ok(BackendEvent::ToolCompleted {
@@ -623,7 +642,7 @@ mod tests {
     }
 
     #[test]
-    fn expands_model_list_with_effort_variants() {
+    fn maps_model_list_efforts_into_options_schema() {
         let result = json!({ "data": [
             {
                 "id": "gpt-5.5",
@@ -640,10 +659,20 @@ mod tests {
         ]});
         let models = parse_model_list("codex", &result);
         let ids: Vec<&str> = models.iter().map(|m| m.id.as_str()).collect();
+        assert_eq!(ids, vec!["codex/gpt-5.5"]);
         assert_eq!(
-            ids,
-            vec!["codex/gpt-5.5", "codex/gpt-5.5@low", "codex/gpt-5.5@high"]
+            models[0]
+                .options_schema
+                .pointer("/properties/reasoning_effort/enum")
+                .unwrap(),
+            &json!(["low", "medium", "high"])
         );
-        assert_eq!(models[2].display_name, "GPT-5.5 (high)");
+        assert_eq!(
+            models[0]
+                .options_schema
+                .pointer("/properties/reasoning_effort/default")
+                .and_then(Value::as_str),
+            Some("medium")
+        );
     }
 }

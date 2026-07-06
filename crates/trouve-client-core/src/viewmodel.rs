@@ -105,7 +105,10 @@ impl ThreadViewModel {
         match &envelope.event {
             Event::TurnStarted { turn, .. } => {
                 self.turn_running = true;
-                self.items.push(ChatItem::TurnStatus { turn: *turn, state: TurnState::Running });
+                self.items.push(ChatItem::TurnStatus {
+                    turn: *turn,
+                    state: TurnState::Running,
+                });
                 Some(self.items.len() - 1)
             }
             Event::CompactionStarted { .. } => {
@@ -117,7 +120,10 @@ impl ThreadViewModel {
                 None
             }
             Event::UserMessage { turn, content } => {
-                self.items.push(ChatItem::User { turn: *turn, content: content.clone() });
+                self.items.push(ChatItem::User {
+                    turn: *turn,
+                    content: content.clone(),
+                });
                 Some(self.items.len() - 1)
             }
             Event::AssistantThinking { turn, text } => {
@@ -178,7 +184,13 @@ impl ThreadViewModel {
                     Some(self.items.len() - 1)
                 }
             }
-            Event::ToolRequested { call_id, tool, args, requires_approval, .. } => {
+            Event::ToolRequested {
+                call_id,
+                tool,
+                args,
+                requires_approval,
+                ..
+            } => {
                 self.finish_thinking();
                 self.items.push(ChatItem::ToolCall {
                     call_id: call_id.clone(),
@@ -197,38 +209,47 @@ impl ThreadViewModel {
                 if !self.pending_approvals.contains(call_id) {
                     self.pending_approvals.push(call_id.clone());
                 }
-                self.items
-                    .iter()
-                    .rposition(|i| matches!(i, ChatItem::ToolCall { call_id: c, .. } if c == call_id))
+                self.items.iter().rposition(
+                    |i| matches!(i, ChatItem::ToolCall { call_id: c, .. } if c == call_id),
+                )
             }
             Event::ApprovalResolved { call_id, decision } => {
                 self.pending_approvals.retain(|c| c != call_id);
                 let denied = *decision == ApprovalDecision::Deny;
-                let idx = self
-                    .items
-                    .iter()
-                    .rposition(|i| matches!(i, ChatItem::ToolCall { call_id: c, .. } if c == call_id));
+                let idx = self.items.iter().rposition(
+                    |i| matches!(i, ChatItem::ToolCall { call_id: c, .. } if c == call_id),
+                );
                 if let Some(ChatItem::ToolCall { status, .. }) = self.find_tool(call_id) {
-                    *status = if denied { ToolCallStatus::Denied } else { ToolCallStatus::Running };
+                    *status = if denied {
+                        ToolCallStatus::Denied
+                    } else {
+                        ToolCallStatus::Running
+                    };
                 }
                 idx
             }
             Event::ToolStarted { call_id } => {
-                let idx = self
-                    .items
-                    .iter()
-                    .rposition(|i| matches!(i, ChatItem::ToolCall { call_id: c, .. } if c == call_id));
+                let idx = self.items.iter().rposition(
+                    |i| matches!(i, ChatItem::ToolCall { call_id: c, .. } if c == call_id),
+                );
                 if let Some(ChatItem::ToolCall { status, .. }) = self.find_tool(call_id) {
                     *status = ToolCallStatus::Running;
                 }
                 idx
             }
-            Event::ToolCompleted { call_id, status, result } => {
-                let idx = self
-                    .items
-                    .iter()
-                    .rposition(|i| matches!(i, ChatItem::ToolCall { call_id: c, .. } if c == call_id));
-                if let Some(ChatItem::ToolCall { status: s, result: r, .. }) = self.find_tool(call_id)
+            Event::ToolCompleted {
+                call_id,
+                status,
+                result,
+            } => {
+                let idx = self.items.iter().rposition(
+                    |i| matches!(i, ChatItem::ToolCall { call_id: c, .. } if c == call_id),
+                );
+                if let Some(ChatItem::ToolCall {
+                    status: s,
+                    result: r,
+                    ..
+                }) = self.find_tool(call_id)
                 {
                     *s = match status {
                         ToolStatus::Ok => ToolCallStatus::Ok,
@@ -252,7 +273,9 @@ impl ThreadViewModel {
                 if let Some(idx) = idx {
                     self.items[idx] = ChatItem::TurnStatus {
                         turn: *turn,
-                        state: TurnState::Completed { usage: usage.clone() },
+                        state: TurnState::Completed {
+                            usage: usage.clone(),
+                        },
                     };
                 }
                 idx
@@ -267,7 +290,9 @@ impl ThreadViewModel {
                 if let Some(idx) = idx {
                     self.items[idx] = ChatItem::TurnStatus {
                         turn: *turn,
-                        state: TurnState::Failed { error: error.clone() },
+                        state: TurnState::Failed {
+                            error: error.clone(),
+                        },
                     };
                 }
                 idx

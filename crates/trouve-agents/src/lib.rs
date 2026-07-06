@@ -45,6 +45,8 @@ pub struct BackendTurn {
     pub session: Option<String>,
     /// Bare model name (provider prefix already stripped); empty = default.
     pub model: String,
+    /// Values for the model's options schema (thinking level, fast, ...).
+    pub model_options: serde_json::Map<String, serde_json::Value>,
     pub prompt: String,
     /// Trouve mode prompt, appended to the vendor's own system prompt where
     /// the vendor protocol allows.
@@ -228,5 +230,6 @@ pub(crate) fn model(backend_id: &str, name: &str, display: &str, context_window:
         input_price_per_mtok: None,
         output_price_per_mtok: None,
         options_schema: empty_schema(),
+        max_mode: false,
     }
 }

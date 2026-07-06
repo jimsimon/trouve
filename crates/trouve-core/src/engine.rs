@@ -327,13 +327,10 @@ impl Engine {
     /// skipped entirely — their models can't run, so listing them only
     /// clutters the picker.
     pub async fn list_models(&self) -> Vec<trouve_protocol::ModelInfo> {
-        let mut models: Vec<_> = self
-            .providers
-            .read()
-            .unwrap()
-            .values()
-            .flat_map(|p| p.models())
-            .collect();
+        let providers: Vec<_> = self.providers.read().unwrap().values().cloned().collect();
+        let provider_lists =
+            futures::future::join_all(providers.iter().map(|p| p.list_models())).await;
+        let mut models: Vec<_> = provider_lists.into_iter().flatten().collect();
         let ready: Vec<_> = self
             .backends
             .read()
@@ -1249,6 +1246,7 @@ impl Engine {
             session_id: session.id.clone(),
             mode: mode.id.clone(),
             model,
+            model_options: req.model_options.clone(),
             permission_mode: req.permission_mode.unwrap_or(mode.default_permission_mode),
             created_at: chrono::Utc::now(),
         };
@@ -1872,6 +1870,7 @@ impl Engine {
             worktree: PathBuf::from(&session.worktree_path),
             session: self.store.backend_session(&thread.id)?,
             model: model_name,
+            model_options: self.store.thread_model_options(&thread.id)?,
             prompt: content,
             instructions: (!instructions.is_empty()).then_some(instructions),
             permission,

@@ -24,6 +24,8 @@ pub enum BlockKind {
     H3,
     Bullet,
     Code,
+    /// Ordered-list item; the marker ("1.", "2)") stays in the text.
+    Numbered,
 }
 
 impl BlockKind {
@@ -35,6 +37,7 @@ impl BlockKind {
             BlockKind::H3 => 3,
             BlockKind::Bullet => 4,
             BlockKind::Code => 5,
+            BlockKind::Numbered => 6,
         }
     }
 }
@@ -44,35 +47,92 @@ pub struct Block {
     pub kind: BlockKind,
     pub text: String,
     pub language: String,
+    /// Nesting level for list items (0 = top level), from leading spaces.
+    pub indent: i32,
 }
 
-/// Parse markdown into flat blocks. Supports headings (#/##/###), bullets
-/// (-/*), fenced code blocks (``` with optional language), and paragraphs.
-/// Inline styling is intentionally out of scope for the spike.
+impl Block {
+    fn new(kind: BlockKind, text: impl Into<String>) -> Self {
+        Self {
+            kind,
+            text: text.into(),
+            language: String::new(),
+            indent: 0,
+        }
+    }
+}
+
+/// Split an ordered-list line ("3. item", "3) item") into marker and body.
+fn split_ordered(s: &str) -> Option<(&str, &str)> {
+    let digits = s.bytes().take_while(|b| b.is_ascii_digit()).count();
+    if digits == 0 || digits > 3 {
+        return None;
+    }
+    if !matches!(s.as_bytes().get(digits), Some(b'.' | b')')) {
+        return None;
+    }
+    let (marker, rest) = s.split_at(digits + 1);
+    Some((marker, rest.strip_prefix(' ')?))
+}
+
+/// Opening code fence: three or more backticks plus an optional info
+/// string (which, per CommonMark, may not itself contain backticks).
+/// Returns the fence length and the language tag.
+fn split_fence(s: &str) -> Option<(usize, &str)> {
+    let ticks = s.bytes().take_while(|b| *b == b'`').count();
+    let info = &s[ticks..];
+    (ticks >= 3 && !info.contains('`')).then(|| (ticks, info.trim()))
+}
+
+/// Heading level from a run of '#' followed by a space; #### and deeper
+/// render like ###.
+fn split_heading(s: &str) -> Option<(BlockKind, &str)> {
+    let hashes = s.bytes().take_while(|b| *b == b'#').count();
+    if hashes == 0 || hashes > 6 {
+        return None;
+    }
+    let kind = match hashes {
+        1 => BlockKind::H1,
+        2 => BlockKind::H2,
+        _ => BlockKind::H3,
+    };
+    Some((kind, s[hashes..].strip_prefix(' ')?))
+}
+
+/// Parse markdown into flat blocks. Supports headings (# through ######),
+/// bullets (-/*/+) and ordered lists (1. / 1)) with nesting from
+/// indentation, fenced code blocks (``` with optional language), and
+/// paragraphs. Indented lines directly under a list item continue that
+/// item. Inline styling is left in the text for the renderer.
 pub fn parse_blocks(text: &str) -> Vec<Block> {
     let mut blocks: Vec<Block> = Vec::new();
     let mut paragraph: Vec<&str> = Vec::new();
-    let mut code: Option<(String, Vec<&str>)> = None;
+    // Open fence: (fence length, language, content lines). The length
+    // matters for nesting — a ```` fence can contain ``` fences as content
+    // and only closes on a fence at least as long.
+    let mut code: Option<(usize, String, Vec<&str>)> = None;
+    // True while the last block is a list item with no blank line after it
+    // yet; indented lines then continue that item.
+    let mut list_open = false;
 
     let flush_paragraph = |blocks: &mut Vec<Block>, paragraph: &mut Vec<&str>| {
         if !paragraph.is_empty() {
-            blocks.push(Block {
-                kind: BlockKind::Paragraph,
-                text: paragraph.join(" "),
-                language: String::new(),
-            });
+            blocks.push(Block::new(BlockKind::Paragraph, paragraph.join(" ")));
             paragraph.clear();
         }
     };
 
     for line in text.lines() {
-        if let Some((lang, lines)) = code.as_mut() {
-            if line.trim_start().starts_with("```") {
-                blocks.push(Block {
-                    kind: BlockKind::Code,
-                    text: lines.join("\n"),
-                    language: std::mem::take(lang),
-                });
+        if let Some((ticks, lang, lines)) = code.as_mut() {
+            // Only a closing fence at least as long as the opener (and
+            // nothing but backticks) ends the block; shorter fences are
+            // content (raw-markdown examples).
+            let trimmed = line.trim();
+            let closing = trimmed.len() >= *ticks && trimmed.bytes().all(|b| b == b'`');
+            if closing {
+                let mut block = Block::new(BlockKind::Code, lines.join("\n"));
+                block.language = std::mem::take(lang);
+                blocks.push(block);
                 code = None;
             } else {
                 lines.push(line);
@@ -80,53 +140,50 @@ pub fn parse_blocks(text: &str) -> Vec<Block> {
             continue;
         }
         let trimmed = line.trim_start();
-        if let Some(lang) = trimmed.strip_prefix("```") {
+        let leading = line.len() - trimmed.len();
+        let indent = ((leading as i32) / 2).min(4);
+        if let Some((ticks, lang)) = split_fence(trimmed) {
             flush_paragraph(&mut blocks, &mut paragraph);
-            code = Some((lang.trim().to_string(), Vec::new()));
-        } else if let Some(h) = trimmed.strip_prefix("### ") {
+            code = Some((ticks, lang.to_string(), Vec::new()));
+            list_open = false;
+        } else if let Some((kind, h)) = split_heading(trimmed) {
             flush_paragraph(&mut blocks, &mut paragraph);
-            blocks.push(Block {
-                kind: BlockKind::H3,
-                text: h.into(),
-                language: String::new(),
-            });
-        } else if let Some(h) = trimmed.strip_prefix("## ") {
-            flush_paragraph(&mut blocks, &mut paragraph);
-            blocks.push(Block {
-                kind: BlockKind::H2,
-                text: h.into(),
-                language: String::new(),
-            });
-        } else if let Some(h) = trimmed.strip_prefix("# ") {
-            flush_paragraph(&mut blocks, &mut paragraph);
-            blocks.push(Block {
-                kind: BlockKind::H1,
-                text: h.into(),
-                language: String::new(),
-            });
+            blocks.push(Block::new(kind, h));
+            list_open = false;
         } else if let Some(item) = trimmed
             .strip_prefix("- ")
             .or_else(|| trimmed.strip_prefix("* "))
+            .or_else(|| trimmed.strip_prefix("+ "))
         {
             flush_paragraph(&mut blocks, &mut paragraph);
-            blocks.push(Block {
-                kind: BlockKind::Bullet,
-                text: item.into(),
-                language: String::new(),
-            });
+            let mut block = Block::new(BlockKind::Bullet, item);
+            block.indent = indent;
+            blocks.push(block);
+            list_open = true;
+        } else if let Some((marker, item)) = split_ordered(trimmed) {
+            flush_paragraph(&mut blocks, &mut paragraph);
+            let mut block = Block::new(BlockKind::Numbered, format!("{marker} {item}"));
+            block.indent = indent;
+            blocks.push(block);
+            list_open = true;
         } else if trimmed.is_empty() {
             flush_paragraph(&mut blocks, &mut paragraph);
+            list_open = false;
+        } else if list_open && leading >= 2 && paragraph.is_empty() {
+            // Indented text directly under a list item is a continuation of
+            // that item (wrapped or multi-line list entries).
+            let last = blocks.last_mut().unwrap();
+            last.text.push(' ');
+            last.text.push_str(trimmed);
         } else {
             paragraph.push(trimmed);
         }
     }
     // An unterminated fence is still rendered as code (it is mid-stream).
-    if let Some((lang, lines)) = code {
-        blocks.push(Block {
-            kind: BlockKind::Code,
-            text: lines.join("\n"),
-            language: lang,
-        });
+    if let Some((_, lang, lines)) = code {
+        let mut block = Block::new(BlockKind::Code, lines.join("\n"));
+        block.language = lang;
+        blocks.push(block);
     }
     flush_paragraph(&mut blocks, &mut paragraph);
     blocks
@@ -137,6 +194,7 @@ fn to_widget_block(b: &Block) -> MarkdownBlock {
         kind: b.kind.as_int(),
         text: SharedString::from(b.text.as_str()),
         language: SharedString::from(b.language.as_str()),
+        indent: b.indent,
     }
 }
 
@@ -239,6 +297,81 @@ mod tests {
         let blocks = parse_blocks("```py\nprint(1)");
         assert_eq!(blocks.len(), 1);
         assert_eq!(blocks[0].kind, BlockKind::Code);
+    }
+
+    #[test]
+    fn longer_fences_contain_shorter_ones_as_content() {
+        // Raw-markdown example: a ```` fence showing a ``` fence.
+        let blocks = parse_blocks("intro\n\n````markdown\n```rust\nfn main() {}\n```\n````\ntail");
+        let kinds: Vec<_> = blocks.iter().map(|b| b.kind).collect();
+        assert_eq!(
+            kinds,
+            vec![BlockKind::Paragraph, BlockKind::Code, BlockKind::Paragraph]
+        );
+        assert_eq!(blocks[1].text, "```rust\nfn main() {}\n```");
+        assert_eq!(blocks[1].language, "markdown");
+    }
+
+    #[test]
+    fn closing_fence_must_be_backticks_only() {
+        // "``` trailing words" inside a block is content, not a closer.
+        let blocks = parse_blocks("```\ncode\n``` not a closer\nstill code\n```");
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0].text, "code\n``` not a closer\nstill code");
+    }
+
+    #[test]
+    fn inline_code_span_is_not_a_fence() {
+        let blocks = parse_blocks("```not a fence``` because the info string has backticks");
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0].kind, BlockKind::Paragraph);
+    }
+
+    #[test]
+    fn ordered_lists_keep_their_markers_and_stay_separate_items() {
+        // Tight list: no blank lines between items — these must not merge
+        // into one paragraph.
+        let blocks = parse_blocks("1. first\n2. second\n10) tenth");
+        let kinds: Vec<_> = blocks.iter().map(|b| b.kind).collect();
+        assert_eq!(
+            kinds,
+            vec![
+                BlockKind::Numbered,
+                BlockKind::Numbered,
+                BlockKind::Numbered
+            ]
+        );
+        assert_eq!(blocks[0].text, "1. first");
+        assert_eq!(blocks[2].text, "10) tenth");
+        // Not a list: version strings, years.
+        let blocks = parse_blocks("2026 was the year.\n1.5x speedup");
+        assert!(blocks.iter().all(|b| b.kind == BlockKind::Paragraph));
+    }
+
+    #[test]
+    fn nested_lists_carry_indent_levels() {
+        let blocks = parse_blocks("1. top\n  - nested\n    - deeper\n- flat");
+        assert_eq!(blocks[0].indent, 0);
+        assert_eq!(blocks[1].indent, 1);
+        assert_eq!((blocks[1].kind, blocks[1].text.as_str()), (BlockKind::Bullet, "nested"));
+        assert_eq!(blocks[2].indent, 2);
+        assert_eq!(blocks[3].indent, 0);
+    }
+
+    #[test]
+    fn indented_continuation_joins_its_list_item() {
+        let blocks = parse_blocks("- item text\n  wraps onto a second line\n\nplain paragraph");
+        assert_eq!(blocks.len(), 2);
+        assert_eq!(blocks[0].text, "item text wraps onto a second line");
+        assert_eq!(blocks[1].kind, BlockKind::Paragraph);
+    }
+
+    #[test]
+    fn deep_headings_render_as_h3() {
+        let blocks = parse_blocks("#### deep\n##### deeper");
+        assert_eq!(blocks[0].kind, BlockKind::H3);
+        assert_eq!(blocks[1].kind, BlockKind::H3);
+        assert_eq!(blocks[0].text, "deep");
     }
 
     #[test]

@@ -160,6 +160,18 @@ fn main() -> anyhow::Result<()> {
     }
     {
         let tx = tx.clone();
+        window.on_composer_thinking_changed(move |i| {
+            let _ = tx.send(UiCommand::ComposerThinkingChanged(i.max(0) as usize));
+        });
+    }
+    {
+        let tx = tx.clone();
+        window.on_composer_fast_toggled(move |on| {
+            let _ = tx.send(UiCommand::ComposerFastToggled(on));
+        });
+    }
+    {
+        let tx = tx.clone();
         window.on_refresh_diff(move || {
             let _ = tx.send(UiCommand::RefreshDiff);
         });

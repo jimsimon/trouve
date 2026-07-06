@@ -26,6 +26,7 @@ fn turn(worktree: PathBuf, session: Option<&str>, permission: BackendPermission)
         worktree,
         session: session.map(str::to_string),
         model: "test-model".into(),
+        model_options: serde_json::Map::new(),
         prompt: "do the thing".into(),
         instructions: Some("mode prompt".into()),
         permission,

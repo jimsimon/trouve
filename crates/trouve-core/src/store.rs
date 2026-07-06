@@ -405,7 +405,8 @@ impl Store {
     pub fn thread(&self, id: &str) -> Result<Option<Thread>> {
         let conn = self.conn.lock().unwrap();
         conn.query_row(
-            "SELECT id, session_id, mode, model, permission_mode, created_at FROM threads WHERE id = ?1",
+            "SELECT id, session_id, mode, model, permission_mode, model_options, created_at
+             FROM threads WHERE id = ?1",
             params![id],
             row_to_thread,
         )
@@ -429,7 +430,7 @@ impl Store {
     pub fn list_threads(&self, session_id: &str) -> Result<Vec<Thread>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT id, session_id, mode, model, permission_mode, created_at
+            "SELECT id, session_id, mode, model, permission_mode, model_options, created_at
              FROM threads WHERE session_id = ?1 ORDER BY created_at",
         )?;
         let rows = stmt.query_map(params![session_id], row_to_thread)?;
@@ -747,8 +748,9 @@ fn row_to_thread(r: &rusqlite::Row<'_>) -> rusqlite::Result<Thread> {
         mode: r.get(2)?,
         model: r.get(3)?,
         permission_mode: permission_mode_from(&r.get::<_, String>(4)?),
+        model_options: serde_json::from_str(&r.get::<_, String>(5)?).unwrap_or_default(),
         created_at: r
-            .get::<_, String>(5)?
+            .get::<_, String>(6)?
             .parse()
             .unwrap_or_else(|_| chrono::Utc::now()),
     })
@@ -881,6 +883,7 @@ mod tests {
             session_id: "se_1".into(),
             mode: "code".into(),
             model: "p/m".into(),
+            model_options: serde_json::Map::new(),
             permission_mode: PermissionMode::Ask,
             created_at: chrono::Utc::now(),
         };

@@ -37,8 +37,13 @@ export struct ChatRow {
     // 0 user, 1 markdown block, 2 tool card, 3 turn status,
     // 4 thinking, 5 activity (spinner + label)
     kind: int,
-    // For kind 1: 0 paragraph, 1 h1, 2 h2, 3 h3, 4 bullet, 5 code fence.
+    // For kind 1: 0 paragraph, 1 h1, 2 h2, 3 h3, 4 bullet, 5 code fence,
+    // 6 numbered list item.
     md-kind: int,
+    // List nesting level for md-kind 4/6 (0 = top level).
+    md-indent: int,
+    // Language tag for code fences ("rust"; empty when untagged).
+    md-lang: string,
     text: string,
     // For kind 1, non-code blocks: `text` with inline markup resolved
     // (bold/italic/inline code/links), built via StyledText::from_markdown.
@@ -208,6 +213,19 @@ export component AppWindow inherits Window {
     in-out property <int> model-index: -1;
     callback composer-mode-changed(int);
     callback composer-model-changed(int);
+
+    // Model knobs, derived from the current model's options schema.
+    // Empty thinking-options hides the dropdown; fast-visible gates the
+    // fast/priority toggle (Cursor only).
+    in property <[string]> thinking-options;
+    in-out property <int> thinking-index: -1;
+    in property <bool> fast-visible: false;
+    in-out property <bool> fast-checked: false;
+    // The model always runs in the vendor's Max Mode (extended context at a
+    // usage premium); informational, the vendor CLI has no toggle.
+    in property <bool> max-mode: false;
+    callback composer-thinking-changed(int);
+    callback composer-fast-toggled(bool);
 
     // Session usage + context indicator (composer bar).
     in property <string> usage-text: "";
@@ -547,16 +565,31 @@ export component AppWindow inherits Window {
                     vertical-stretch: 1;
 
                     for row[idx] in root.chat-rows: Rectangle {
-                        height: row-content.preferred-height + 10px;
+                        // Markdown rows manage their own vertical rhythm via
+                        // padding (lists tight, paragraphs spaced, headings
+                        // set off); boxed rows keep a fixed gap.
+                        height: row-content.preferred-height
+                            + (row.kind == 1 && row.md-kind != 5 ? 0px : 10px);
                         background: row.kind == 0 ? #20293a
                             : row.kind == 2 ? #1d1d1d
-                            : row.kind == 1 && row.md-kind == 5 ? #191919
+                            // Lighter than the panel (#141414) so the block
+                            // reads as a slab, not just an outline.
+                            : row.kind == 1 && row.md-kind == 5 ? #1f2226
                             : transparent;
                         border-radius: 6px;
+                        border-width: row.kind == 1 && row.md-kind == 5 ? 1px : 0px;
+                        border-color: #35393f;
+
+                        property <bool> md-list: row.kind == 1
+                            && (row.md-kind == 4 || row.md-kind == 6);
+                        property <bool> md-heading: row.kind == 1
+                            && row.md-kind >= 1 && row.md-kind <= 3;
 
                         row-content := VerticalLayout {
                             padding: 6px;
-                            padding-left: row.kind == 1 && row.md-kind == 4 ? 22px : 10px;
+                            padding-top: md-list ? 2px : md-heading ? 14px : 6px;
+                            padding-bottom: md-list ? 2px : md-heading ? 4px : 6px;
+                            padding-left: md-list ? 22px + row.md-indent * 18px : 10px;
                             spacing: 4px;
 
                             // User message.
@@ -568,13 +601,19 @@ export component AppWindow inherits Window {
                             }
 
                             // Markdown block: code fences stay plain
-                            // monospace Text; everything else renders
-                            // inline markup through StyledText.
+                            // monospace Text (with a language label when
+                            // tagged); everything else renders inline
+                            // markup through StyledText.
+                            if row.kind == 1 && row.md-kind == 5 && row.md-lang != "": Text {
+                                text: row.md-lang;
+                                color: #6f6f6f;
+                                font-size: 11px;
+                            }
                             if row.kind == 1 && row.md-kind == 5: Text {
                                 text: row.text;
-                                color: #d4d4d4;
+                                color: #d8d8c8;
                                 wrap: word-wrap;
-                                font-size: 14px;
+                                font-size: 13px;
                                 font-family: "monospace";
                             }
                             if row.kind == 1 && row.md-kind != 5: StyledText {
@@ -682,46 +721,119 @@ export component AppWindow inherits Window {
                     }
                 }
 
-                // Composer bar: pickers (drop-up), input, send, context dial,
-                // and session usage.
+                // Composer bar: labeled pickers (drop-up), model knobs from
+                // the options schema, input, send, context dial, usage.
                 HorizontalLayout {
                     spacing: 8px;
-                    DropUpPicker {
-                        width: 130px;
-                        options: root.modes;
-                        current-index <=> root.mode-index;
-                        enabled: root.composer-enabled;
-                        placeholder: "mode";
-                        changed(i) => { root.composer-mode-changed(i); }
+                    VerticalLayout {
+                        spacing: 2px;
+                        Text { text: "Mode"; color: #7a7a7a; font-size: 10px; }
+                        DropUpPicker {
+                            width: 130px;
+                            options: root.modes;
+                            current-index <=> root.mode-index;
+                            enabled: root.composer-enabled;
+                            placeholder: "mode";
+                            changed(i) => { root.composer-mode-changed(i); }
+                        }
                     }
-                    DropUpPicker {
-                        width: 210px;
-                        options: root.models;
-                        current-index <=> root.model-index;
-                        enabled: root.composer-enabled;
-                        placeholder: "model";
-                        changed(i) => { root.composer-model-changed(i); }
+                    VerticalLayout {
+                        spacing: 2px;
+                        Text { text: "Model"; color: #7a7a7a; font-size: 10px; }
+                        DropUpPicker {
+                            width: 210px;
+                            options: root.models;
+                            current-index <=> root.model-index;
+                            enabled: root.composer-enabled;
+                            placeholder: "model";
+                            changed(i) => { root.composer-model-changed(i); }
+                        }
                     }
-                    composer := LineEdit {
-                        horizontal-stretch: 1;
-                        placeholder-text: root.composer-enabled
-                            ? "Message the agent…"
-                            : "Select or create a thread first";
-                        enabled: root.composer-enabled;
-                        accepted(text) => {
-                            if (text != "") {
-                                root.send-message(text);
-                                self.text = "";
+                    if root.thinking-options.length > 0: VerticalLayout {
+                        spacing: 2px;
+                        Text { text: "Thinking"; color: #7a7a7a; font-size: 10px; }
+                        DropUpPicker {
+                            width: 110px;
+                            options: root.thinking-options;
+                            current-index <=> root.thinking-index;
+                            enabled: root.composer-enabled;
+                            placeholder: "thinking";
+                            changed(i) => { root.composer-thinking-changed(i); }
+                        }
+                    }
+                    if root.max-mode: VerticalLayout {
+                        spacing: 2px;
+                        Text { text: "Context"; color: #7a7a7a; font-size: 10px; }
+                        Rectangle {
+                            width: 92px;
+                            height: 30px;
+                            background: #3a2e1a;
+                            border-radius: 6px;
+                            border-width: 1px;
+                            border-color: #6a5426;
+                            Text {
+                                text: "Max · +20%";
+                                color: #d9b96a;
+                                font-size: 12px;
+                                horizontal-alignment: center;
+                                vertical-alignment: center;
                             }
                         }
                     }
-                    Button {
-                        text: "Send";
-                        primary: true;
-                        enabled: root.composer-enabled && composer.text != "";
-                        clicked => {
-                            root.send-message(composer.text);
-                            composer.text = "";
+                    if root.fast-visible: VerticalLayout {
+                        spacing: 2px;
+                        Text { text: "Fast"; color: #7a7a7a; font-size: 10px; }
+                        Rectangle {
+                            width: 44px;
+                            height: 30px;
+                            background: root.fast-checked ? #2b3d55 : #222222;
+                            border-radius: 6px;
+                            border-width: 1px;
+                            border-color: root.fast-checked ? #4a6a97 : #3a3a3a;
+                            TouchArea {
+                                enabled: root.composer-enabled;
+                                clicked => {
+                                    root.fast-checked = !root.fast-checked;
+                                    root.composer-fast-toggled(root.fast-checked);
+                                }
+                            }
+                            Text {
+                                text: root.fast-checked ? "On" : "Off";
+                                color: root.fast-checked ? #dbe6f5 : #8a8a8a;
+                                font-size: 12px;
+                                horizontal-alignment: center;
+                                vertical-alignment: center;
+                            }
+                        }
+                    }
+                    VerticalLayout {
+                        spacing: 2px;
+                        horizontal-stretch: 1;
+                        Text { text: " "; font-size: 10px; }
+                        composer := LineEdit {
+                            placeholder-text: root.composer-enabled
+                                ? "Message the agent…"
+                                : "Select or create a thread first";
+                            enabled: root.composer-enabled;
+                            accepted(text) => {
+                                if (text != "") {
+                                    root.send-message(text);
+                                    self.text = "";
+                                }
+                            }
+                        }
+                    }
+                    VerticalLayout {
+                        spacing: 2px;
+                        Text { text: " "; font-size: 10px; }
+                        Button {
+                            text: "Send";
+                            primary: true;
+                            enabled: root.composer-enabled && composer.text != "";
+                            clicked => {
+                                root.send-message(composer.text);
+                                composer.text = "";
+                            }
                         }
                     }
                     // Context usage dial; indeterminate while compacting.

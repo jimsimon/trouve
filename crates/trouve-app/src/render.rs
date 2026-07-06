@@ -14,6 +14,10 @@ use trouve_client_core::viewmodel::{ChatItem, ThreadViewModel, ToolCallStatus, T
 pub struct ChatRowData {
     pub kind: i32,
     pub md_kind: i32,
+    /// List nesting level for markdown list rows (0 = top level).
+    pub md_indent: i32,
+    /// Language tag for code-fence rows ("rust", "" when untagged).
+    pub md_lang: String,
     pub text: String,
     /// Markdown source for inline styling (bold/italic/code/links) of
     /// non-code markdown blocks; the UI thread parses it into a Slint
@@ -26,6 +30,61 @@ pub struct ChatRowData {
     pub turn_state: i32,
 }
 
+/// Wrap inline code spans (backtick runs, CommonMark-style: closed by a run
+/// of the same length) in a font-color tag. StyledText renders code spans
+/// monospace but offers no color knob, and monospace alone doesn't stand
+/// out from prose.
+fn tint_code_spans(md: &str) -> String {
+    const OPEN: &str = "<font color=\"#e5c07b\">";
+    const CLOSE: &str = "</font>";
+    let bytes = md.as_bytes();
+    let mut out = String::with_capacity(md.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] != b'`' {
+            // Copy prose up to the next backtick (ASCII, so slicing at it
+            // is always a char boundary).
+            let next = md[i..].find('`').map(|o| i + o).unwrap_or(md.len());
+            out.push_str(&md[i..next]);
+            i = next;
+            continue;
+        }
+        let start = i;
+        while i < bytes.len() && bytes[i] == b'`' {
+            i += 1;
+        }
+        let ticks = i - start;
+        // Find the closing run of exactly the same length.
+        let mut j = i;
+        let mut close = None;
+        while j < bytes.len() {
+            if bytes[j] != b'`' {
+                j += 1;
+                continue;
+            }
+            let run_start = j;
+            while j < bytes.len() && bytes[j] == b'`' {
+                j += 1;
+            }
+            if j - run_start == ticks {
+                close = Some(j);
+                break;
+            }
+        }
+        match close {
+            Some(end) => {
+                out.push_str(OPEN);
+                out.push_str(&md[start..end]);
+                out.push_str(CLOSE);
+                i = end;
+            }
+            // Unbalanced backticks stay literal.
+            None => out.push_str(&md[start..i]),
+        }
+    }
+    out
+}
+
 fn md_kind(kind: BlockKind) -> i32 {
     match kind {
         BlockKind::Paragraph => 0,
@@ -34,6 +93,7 @@ fn md_kind(kind: BlockKind) -> i32 {
         BlockKind::H3 => 3,
         BlockKind::Bullet => 4,
         BlockKind::Code => 5,
+        BlockKind::Numbered => 6,
     }
 }
 
@@ -105,12 +165,27 @@ pub fn chat_rows(
                             format!("**{}**", block.text)
                         }
                         BlockKind::Bullet => format!("•  {}", block.text),
+                        // The marker rides in the text ("1. item"); escape
+                        // its delimiter so StyledText's markdown pass can't
+                        // reinterpret the row as list syntax.
+                        BlockKind::Numbered => {
+                            let digits =
+                                block.text.bytes().take_while(u8::is_ascii_digit).count();
+                            let mut s = block.text.clone();
+                            s.insert(digits, '\\');
+                            s
+                        }
                         BlockKind::Paragraph => block.text.clone(),
                     };
+                    // Inline code spans get a distinct color; code fences
+                    // are excluded (empty styled_md).
+                    let styled_md = tint_code_spans(&styled_md);
                     push(
                         ChatRowData {
                             kind: 1,
                             md_kind: md_kind(block.kind),
+                            md_indent: block.indent,
+                            md_lang: block.language,
                             text: block.text,
                             styled_md,
                             ..Default::default()
@@ -279,6 +354,23 @@ pub fn highlight_file(path: &str, content: &str) -> Vec<Vec<(String, u32)>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn code_spans_get_tinted_and_prose_stays_untouched() {
+        assert_eq!(
+            tint_code_spans("run `cargo test` twice"),
+            "run <font color=\"#e5c07b\">`cargo test`</font> twice"
+        );
+        // Double-backtick spans (code containing a backtick) match runs of
+        // the same length only.
+        assert_eq!(
+            tint_code_spans("``a ` b`` end"),
+            "<font color=\"#e5c07b\">``a ` b``</font> end"
+        );
+        // Unbalanced backticks stay literal.
+        assert_eq!(tint_code_spans("a ` b"), "a ` b");
+        assert_eq!(tint_code_spans("no code"), "no code");
+    }
 
     #[test]
     fn turn_summary_shows_cost_only_when_billed() {

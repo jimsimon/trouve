@@ -127,6 +127,10 @@ pub struct Thread {
     pub session_id: SessionId,
     pub mode: String,
     pub model: String,
+    /// Current values for the model's options (thinking level, etc.);
+    /// clients render controls from the model's `options_schema`.
+    #[serde(default)]
+    pub model_options: serde_json::Map<String, serde_json::Value>,
     pub permission_mode: PermissionMode,
     pub created_at: chrono::DateTime<chrono::Utc>,
 }
@@ -362,6 +366,11 @@ pub struct ModelInfo {
     /// Clients render these controls from the schema, not from hardcoded
     /// per-model knowledge.
     pub options_schema: serde_json::Value,
+    /// The model always runs in the vendor's "Max Mode" (extended context
+    /// billed at a premium — Cursor adds a surcharge on some plans). The
+    /// constraint is the vendor's; clients surface it, they can't toggle it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub max_mode: bool,
 }
 
 /// Aggregated usage for a thread or session.

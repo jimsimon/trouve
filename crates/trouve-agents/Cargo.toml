@@ -17,6 +17,7 @@ thiserror.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 trouve-protocol.workspace = true
+trouve-providers.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
