@@ -434,19 +434,26 @@ impl Controller {
     }
 
     fn push_threads(&self) {
-        ui::set_threads(
-            &self.ui,
-            self.threads
-                .iter()
-                .map(|t| {
-                    (
-                        t.id.clone(),
-                        format!("{} · {}", t.mode, short_model(&t.model)),
-                    )
-                })
-                .collect(),
-            self.current_thread.map(|i| i as i32).unwrap_or(-1),
-        );
+        let mut tabs: Vec<(String, String)> = self
+            .threads
+            .iter()
+            .map(|t| {
+                (
+                    t.id.clone(),
+                    format!("{} · {}", t.mode, short_model(&t.model)),
+                )
+            })
+            .collect();
+        // The new-thread form lives in a provisional tab so the previous
+        // tab stays one click away; `current_thread` is untouched
+        // underneath, making cancel a pure UI dismissal.
+        let selected = if matches!(self.new_chat, Some(NewChat::Thread)) {
+            tabs.push((String::new(), "New Thread".into()));
+            (tabs.len() - 1) as i32
+        } else {
+            self.current_thread.map(|i| i as i32).unwrap_or(-1)
+        };
+        ui::set_threads(&self.ui, tabs, selected);
     }
 
     /// Composer pickers mirror the current thread's mode/model.
@@ -634,6 +641,9 @@ impl Controller {
             self.error("select a session first (threads share its worktree)");
             return;
         }
+        if matches!(self.new_chat, Some(NewChat::Thread)) {
+            return; // Already on the provisional tab.
+        }
         self.new_chat = Some(NewChat::Thread);
         ui::set_new_chat(
             &self.ui,
@@ -644,11 +654,17 @@ impl Controller {
             default_mode_index(&self.modes),
             0,
         );
+        self.push_threads();
         ui::set_center_screen(&self.ui, 2);
     }
 
     fn close_new_chat(&mut self) {
+        let had_thread_form = matches!(self.new_chat, Some(NewChat::Thread));
         self.new_chat = None;
+        if had_thread_form {
+            // Drop the provisional tab and land back on the previous one.
+            self.push_threads();
+        }
         ui::set_center_screen(&self.ui, 0);
     }
 
@@ -909,6 +925,11 @@ impl Controller {
             }
             UiCommand::SelectThread(i) => {
                 if i < self.threads.len() {
+                    // Clicking a real tab while the provisional "New Thread"
+                    // tab is up dismisses the form (its tab disappears).
+                    if self.new_chat.is_some() {
+                        self.close_new_chat();
+                    }
                     self.current_thread = Some(i);
                     self.push_threads();
                     self.push_picker_indices();
@@ -916,6 +937,7 @@ impl Controller {
                     self.render_chat();
                     self.push_context();
                 }
+                // i == threads.len() is the provisional tab itself: no-op.
             }
             UiCommand::SendMessage(text) => {
                 if let Some(thread_id) = self.current_thread_id() {
