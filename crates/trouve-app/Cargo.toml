@@ -28,6 +28,7 @@ slint-markdown = { path = "../slint-markdown" }
 # Syntax highlighting for the file viewer.
 syntect = { version = "5", default-features = false, features = ["default-fancy"] }
 rfd = { version = "0.17.2", default-features = false, features = ["xdg-portal", "pollster"] }
+open = "5.3.6"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 # PR_SET_PDEATHSIG so the spawned server dies with the app.

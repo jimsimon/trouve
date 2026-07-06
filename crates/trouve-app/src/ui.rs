@@ -90,6 +90,10 @@ pub fn set_chat(ui: &Ui, rows: Vec<ChatRowData>) {
                 kind: r.kind,
                 md_kind: r.md_kind,
                 text: SharedString::from(r.text.as_str()),
+                // Malformed markup falls back to the raw text rather than
+                // dropping the row.
+                styled: slint::StyledText::from_markdown(&r.styled_md)
+                    .unwrap_or_else(|_| slint::StyledText::from_plain_text(&r.styled_md)),
                 tool_name: SharedString::from(r.tool_name.as_str()),
                 tool_status: r.tool_status,
                 detail: SharedString::from(r.detail.as_str()),

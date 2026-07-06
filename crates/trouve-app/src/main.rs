@@ -40,6 +40,13 @@ fn main() -> anyhow::Result<()> {
             let _ = tx.send(UiCommand::OpenWorkspaceDialog);
         });
     }
+    window.on_open_link(|url| {
+        // http(s) only: chat markdown is model output, so no file:// or
+        // arbitrary schemes reach the system opener.
+        if url.starts_with("https://") || url.starts_with("http://") {
+            let _ = open::that_detached(url.as_str());
+        }
+    });
     {
         let tx = tx.clone();
         window.on_workspace_new_session(move |row| {

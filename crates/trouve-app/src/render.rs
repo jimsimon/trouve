@@ -13,6 +13,10 @@ pub struct ChatRowData {
     pub kind: i32,
     pub md_kind: i32,
     pub text: String,
+    /// Markdown source for inline styling (bold/italic/code/links) of
+    /// non-code markdown blocks; the UI thread parses it into a Slint
+    /// `StyledText`. Empty for rows rendered as plain text.
+    pub styled_md: String,
     pub tool_name: String,
     pub tool_status: i32,
     pub detail: String,
@@ -42,6 +46,27 @@ fn tool_status(status: ToolCallStatus) -> i32 {
     }
 }
 
+/// Card title for a tool call. Shell-style tools (native `shell`, vendor
+/// `Bash`) show the command they run — `Bash (wc -l foo.rs)` — since the
+/// tool name alone says nothing about what happened.
+fn tool_label(tool: &str, args: &serde_json::Value) -> String {
+    let command = matches!(tool, "shell" | "Bash" | "bash")
+        .then(|| args.get("command").and_then(|v| v.as_str()))
+        .flatten();
+    match command {
+        Some(cmd) => {
+            // Newlines and runs of spaces collapse so the title stays one line.
+            let mut one_line = cmd.split_whitespace().collect::<Vec<_>>().join(" ");
+            if one_line.len() > 60 {
+                one_line.truncate(one_line.floor_boundary(59));
+                one_line.push('…');
+            }
+            format!("{tool} ({one_line})")
+        }
+        None => tool.to_string(),
+    }
+}
+
 /// Flatten a thread's chat items into rows. Returns the rows plus a parallel
 /// map from row index to the tool call id (for approvals/expansion).
 pub fn chat_rows(
@@ -68,11 +93,24 @@ pub fn chat_rows(
                 // Markdown blocks become individual virtualized rows, so a
                 // long streaming answer never re-lays-out the whole chat.
                 for block in parse_blocks(content) {
+                    // Inline markup survives block parsing verbatim; hand
+                    // it to StyledText with block-level structure (heading
+                    // weight, bullet glyph) re-applied as markup. Code
+                    // fences stay plain text.
+                    let styled_md = match block.kind {
+                        BlockKind::Code => String::new(),
+                        BlockKind::H1 | BlockKind::H2 | BlockKind::H3 => {
+                            format!("**{}**", block.text)
+                        }
+                        BlockKind::Bullet => format!("•  {}", block.text),
+                        BlockKind::Paragraph => block.text.clone(),
+                    };
                     push(
                         ChatRowData {
                             kind: 1,
                             md_kind: md_kind(block.kind),
                             text: block.text,
+                            styled_md,
                             ..Default::default()
                         },
                         None,
@@ -102,7 +140,7 @@ pub fn chat_rows(
                 push(
                     ChatRowData {
                         kind: 2,
-                        tool_name: tool.clone(),
+                        tool_name: tool_label(tool, args),
                         tool_status: tool_status(*status),
                         detail,
                         expanded: expanded.contains(call_id),
@@ -136,6 +174,25 @@ pub fn chat_rows(
         }
     }
     (rows, call_ids)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn shell_tools_show_their_command() {
+        let args = serde_json::json!({"command": "wc -l  bench.rs\n"});
+        assert_eq!(tool_label("Bash", &args), "Bash (wc -l bench.rs)");
+        assert_eq!(tool_label("shell", &args), "shell (wc -l bench.rs)");
+        // Non-shell tools and malformed args keep the plain name.
+        assert_eq!(tool_label("search", &args), "search");
+        assert_eq!(tool_label("Bash", &serde_json::json!({})), "Bash");
+        // Long commands truncate on a char boundary with an ellipsis.
+        let long = serde_json::json!({ "command": "x".repeat(100) });
+        let label = tool_label("Bash", &long);
+        assert!(label.len() < 70 && label.ends_with("…)"), "{label}");
+    }
 }
 
 trait FloorBoundary {
