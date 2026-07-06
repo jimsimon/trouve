@@ -165,9 +165,16 @@ pub trait AgentBackend: Send + Sync {
     /// Stable identifier used as the prefix of model ids ("codex/gpt-5.4").
     fn id(&self) -> &str;
 
-    /// Models this backend can run. Static data, not truth — vendors evolve
-    /// their catalogs faster than we ship.
+    /// Static model snapshot: instant and offline-safe, used when the
+    /// vendor can't be asked (not installed, not logged in, query failed).
     fn models(&self) -> Vec<ModelInfo>;
+
+    /// Models as reported by the vendor right now (authoritative: vendors
+    /// evolve their catalogs faster than we ship). Implementations should
+    /// cache; the default falls back to the static snapshot.
+    async fn list_models(&self) -> Vec<ModelInfo> {
+        self.models()
+    }
 
     fn status(&self) -> BackendStatus;
 

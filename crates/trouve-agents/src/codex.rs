@@ -37,7 +37,12 @@ pub struct CodexBackend {
     id: String,
     command: String,
     server: Mutex<Option<Arc<AppServer>>>,
+    /// `model/list` result, cached for [`MODELS_TTL`].
+    models_cache: Mutex<Option<(std::time::Instant, Vec<ModelInfo>)>>,
 }
+
+/// How long a fetched vendor model list stays fresh.
+const MODELS_TTL: std::time::Duration = std::time::Duration::from_secs(300);
 
 impl CodexBackend {
     pub fn new(id: impl Into<String>, command: Option<String>) -> Self {
@@ -45,6 +50,7 @@ impl CodexBackend {
             id: id.into(),
             command: command.unwrap_or_else(|| "codex".into()),
             server: Mutex::new(None),
+            models_cache: Mutex::new(None),
         }
     }
 
@@ -69,13 +75,42 @@ impl AgentBackend for CodexBackend {
     }
 
     fn models(&self) -> Vec<ModelInfo> {
-        // Static snapshot of the Codex catalog; the vendor evolves this
-        // faster than we ship, so treat as data not truth.
+        // Minimal offline fallback; `list_models` asks the app-server for
+        // the real catalog (with per-model reasoning-effort variants).
         vec![
             model(&self.id, "gpt-5.4-codex", "GPT-5.4 Codex", 272_000),
             model(&self.id, "gpt-5.4", "GPT-5.4", 272_000),
-            model(&self.id, "gpt-5.3-codex", "GPT-5.3 Codex", 272_000),
         ]
+    }
+
+    async fn list_models(&self) -> Vec<ModelInfo> {
+        {
+            let cache = self.models_cache.lock().await;
+            if let Some((at, models)) = cache.as_ref() {
+                if at.elapsed() < MODELS_TTL {
+                    return models.clone();
+                }
+            }
+        }
+        let fetched = async {
+            let server = self.server().await?;
+            server.request("model/list", json!({})).await
+        }
+        .await;
+        match fetched {
+            Ok(result) => {
+                let models = parse_model_list(&self.id, &result);
+                if models.is_empty() {
+                    return self.models();
+                }
+                *self.models_cache.lock().await = Some((std::time::Instant::now(), models.clone()));
+                models
+            }
+            Err(e) => {
+                tracing::debug!("codex model/list failed: {e}; using static list");
+                self.models()
+            }
+        }
     }
 
     fn status(&self) -> BackendStatus {
@@ -95,6 +130,7 @@ impl AgentBackend for CodexBackend {
     async fn run_turn(&self, turn: BackendTurn) -> Result<BackendEventStream, BackendError> {
         let server = self.server().await?;
 
+        let (model_name, effort) = split_effort(&turn.model);
         let (approval_policy, sandbox) = match turn.permission {
             BackendPermission::ReadOnly => ("never", "readOnly"),
             BackendPermission::Ask => ("unlessTrusted", "workspaceWrite"),
@@ -117,7 +153,7 @@ impl AgentBackend for CodexBackend {
                             .request(
                                 "thread/start",
                                 json!({
-                                    "model": model_or_default(&turn.model),
+                                    "model": model_or_default(model_name),
                                     "cwd": turn.worktree,
                                     "approvalPolicy": approval_policy,
                                     "sandbox": sandbox,
@@ -135,7 +171,7 @@ impl AgentBackend for CodexBackend {
                     .request(
                         "thread/start",
                         json!({
-                            "model": model_or_default(&turn.model),
+                            "model": model_or_default(model_name),
                             "cwd": turn.worktree,
                             "approvalPolicy": approval_policy,
                             "sandbox": sandbox,
@@ -159,18 +195,17 @@ impl AgentBackend for CodexBackend {
             _ => turn.prompt.clone(),
         };
 
-        server
-            .request(
-                "turn/start",
-                json!({
-                    "threadId": codex_thread_id,
-                    "model": model_or_default(&turn.model),
-                    "approvalPolicy": approval_policy,
-                    "sandboxPolicy": { "type": sandbox },
-                    "input": [ { "type": "text", "text": text } ],
-                }),
-            )
-            .await?;
+        let mut turn_params = json!({
+            "threadId": codex_thread_id,
+            "model": model_or_default(model_name),
+            "approvalPolicy": approval_policy,
+            "sandboxPolicy": { "type": sandbox },
+            "input": [ { "type": "text", "text": text } ],
+        });
+        if let Some(effort) = effort {
+            turn_params["effort"] = json!(effort);
+        }
+        server.request("turn/start", turn_params).await?;
 
         let stream = turn_stream(
             server.clone(),
@@ -188,6 +223,54 @@ fn model_or_default(model: &str) -> &str {
     } else {
         model
     }
+}
+
+/// Split a `<model>@<effort>` id into its parts. Reasoning effort is a
+/// separate app-server parameter, not part of the vendor model id, so
+/// trouve encodes the chosen effort as an `@` suffix in its model ids.
+fn split_effort(model: &str) -> (&str, Option<&str>) {
+    match model.rsplit_once('@') {
+        Some((m, e)) if !m.is_empty() && !e.is_empty() => (m, Some(e)),
+        _ => (model, None),
+    }
+}
+
+/// Expand a `model/list` result into ModelInfos: one entry per model at its
+/// default reasoning effort, plus one `<id>@<effort>` variant per other
+/// supported effort.
+fn parse_model_list(backend_id: &str, result: &Value) -> Vec<ModelInfo> {
+    let Some(data) = result["data"].as_array() else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for entry in data {
+        if entry["hidden"].as_bool() == Some(true) {
+            continue;
+        }
+        let Some(id) = entry["id"].as_str() else {
+            continue;
+        };
+        let display = entry["displayName"].as_str().unwrap_or(id);
+        let default_effort = entry["defaultReasoningEffort"].as_str().unwrap_or("");
+        out.push(model(backend_id, id, display, 272_000));
+        if let Some(efforts) = entry["supportedReasoningEfforts"].as_array() {
+            for e in efforts {
+                let Some(effort) = e["reasoningEffort"].as_str() else {
+                    continue;
+                };
+                if effort == default_effort {
+                    continue;
+                }
+                out.push(model(
+                    backend_id,
+                    &format!("{id}@{effort}"),
+                    &format!("{display} ({effort})"),
+                    272_000,
+                ));
+            }
+        }
+    }
+    out
 }
 
 fn thread_id_of(result: &Value) -> Result<String, BackendError> {
@@ -511,5 +594,43 @@ impl AppServer {
 
     async fn unsubscribe(&self, thread_id: &str) {
         self.routes.lock().await.remove(thread_id);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn splits_effort_suffix() {
+        assert_eq!(split_effort("gpt-5.5@high"), ("gpt-5.5", Some("high")));
+        assert_eq!(split_effort("gpt-5.5"), ("gpt-5.5", None));
+        assert_eq!(split_effort(""), ("", None));
+        assert_eq!(split_effort("gpt@"), ("gpt@", None));
+    }
+
+    #[test]
+    fn expands_model_list_with_effort_variants() {
+        let result = json!({ "data": [
+            {
+                "id": "gpt-5.5",
+                "displayName": "GPT-5.5",
+                "hidden": false,
+                "defaultReasoningEffort": "medium",
+                "supportedReasoningEfforts": [
+                    { "reasoningEffort": "low" },
+                    { "reasoningEffort": "medium" },
+                    { "reasoningEffort": "high" },
+                ],
+            },
+            { "id": "secret", "displayName": "Hidden", "hidden": true },
+        ]});
+        let models = parse_model_list("codex", &result);
+        let ids: Vec<&str> = models.iter().map(|m| m.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            vec!["codex/gpt-5.5", "codex/gpt-5.5@low", "codex/gpt-5.5@high"]
+        );
+        assert_eq!(models[2].display_name, "GPT-5.5 (high)");
     }
 }

@@ -412,7 +412,7 @@ async fn resolve_approval(
 
 #[utoipa::path(get, path = "/v1/models", responses((status = 200, body = [ModelInfo])))]
 async fn list_models(State(engine): State<Arc<Engine>>) -> Json<Vec<ModelInfo>> {
-    Json(engine.list_models())
+    Json(engine.list_models().await)
 }
 
 #[utoipa::path(get, path = "/v1/providers", responses((status = 200, body = ProvidersResponse)))]

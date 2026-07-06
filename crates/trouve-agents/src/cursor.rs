@@ -31,7 +31,12 @@ pub struct CursorBackend {
     id: String,
     command: String,
     api_key: Option<String>,
+    /// `cursor-agent models` result, cached for [`MODELS_TTL`].
+    models_cache: tokio::sync::Mutex<Option<(std::time::Instant, Vec<ModelInfo>)>>,
 }
+
+/// How long a fetched vendor model list stays fresh.
+const MODELS_TTL: std::time::Duration = std::time::Duration::from_secs(300);
 
 impl CursorBackend {
     pub fn new(id: impl Into<String>, command: Option<String>, api_key: Option<String>) -> Self {
@@ -39,6 +44,7 @@ impl CursorBackend {
             id: id.into(),
             command: command.unwrap_or_else(|| "cursor-agent".into()),
             api_key,
+            models_cache: tokio::sync::Mutex::new(None),
         }
     }
 
@@ -48,6 +54,29 @@ impl CursorBackend {
             cmd.env("CURSOR_API_KEY", key);
         }
         cmd
+    }
+
+    /// Ask the CLI for the account's model catalog.
+    async fn fetch_models(&self) -> Result<Vec<ModelInfo>, BackendError> {
+        let mut cmd = self.base_command();
+        cmd.arg("models").stdin(Stdio::null());
+        let out = tokio::time::timeout(std::time::Duration::from_secs(10), cmd.output())
+            .await
+            .map_err(|_| BackendError::Protocol("cursor-agent models timed out".into()))?
+            .map_err(|e| match e.kind() {
+                std::io::ErrorKind::NotFound => BackendError::NotInstalled(self.command.clone()),
+                _ => BackendError::Io(e),
+            })?;
+        if !out.status.success() {
+            return Err(BackendError::Protocol(format!(
+                "cursor-agent models failed: {}",
+                String::from_utf8_lossy(&out.stderr).trim()
+            )));
+        }
+        Ok(parse_models_output(
+            &self.id,
+            &String::from_utf8_lossy(&out.stdout),
+        ))
     }
 
     async fn create_chat(&self, worktree: &std::path::Path) -> Result<String, BackendError> {
@@ -85,19 +114,29 @@ impl AgentBackend for CursorBackend {
     }
 
     fn models(&self) -> Vec<ModelInfo> {
-        // `cursor-agent models` is authoritative; this static snapshot keeps
-        // listings fast and offline-safe.
-        vec![
-            model(&self.id, "auto", "Cursor Auto", 200_000),
-            model(&self.id, "composer-1", "Cursor Composer", 200_000),
-            model(
-                &self.id,
-                "sonnet-4.5",
-                "Claude Sonnet (via Cursor)",
-                200_000,
-            ),
-            model(&self.id, "gpt-5.3", "GPT-5.3 (via Cursor)", 272_000),
-        ]
+        // Minimal offline fallback; `list_models` asks the vendor for the
+        // real catalog (per-account, includes thinking/effort variants).
+        vec![model(&self.id, "auto", "Cursor Auto", 200_000)]
+    }
+
+    async fn list_models(&self) -> Vec<ModelInfo> {
+        let mut cache = self.models_cache.lock().await;
+        if let Some((at, models)) = cache.as_ref() {
+            if at.elapsed() < MODELS_TTL {
+                return models.clone();
+            }
+        }
+        match self.fetch_models().await {
+            Ok(models) if !models.is_empty() => {
+                *cache = Some((std::time::Instant::now(), models.clone()));
+                models
+            }
+            Ok(_) => self.models(),
+            Err(e) => {
+                tracing::debug!("cursor-agent models failed: {e}; using static list");
+                self.models()
+            }
+        }
     }
 
     fn status(&self) -> BackendStatus {
@@ -217,6 +256,30 @@ impl AgentBackend for CursorBackend {
     }
 }
 
+/// Parse `cursor-agent models` output: one `<id> - <display name>` line per
+/// model, between an "Available models" header and a "Tip:" footer.
+fn parse_models_output(backend_id: &str, output: &str) -> Vec<ModelInfo> {
+    output
+        .lines()
+        .filter_map(|line| {
+            let (id, display) = line.trim().split_once(" - ")?;
+            let id = id.trim();
+            if id.is_empty() || id.contains(' ') {
+                return None;
+            }
+            // The CLI doesn't report context windows; "1M" in the display
+            // name is the only signal, everything else gets a conservative
+            // default.
+            let window = if display.contains("1M") {
+                1_000_000
+            } else {
+                200_000
+            };
+            Some(model(backend_id, id, display.trim(), window))
+        })
+        .collect()
+}
+
 /// Map one cursor-agent stream-json event to zero or more backend events.
 fn map_event(ev: &Value) -> Vec<BackendEvent> {
     match ev["type"].as_str() {
@@ -281,5 +344,29 @@ fn map_event(ev: &Value) -> Vec<BackendEvent> {
             }]
         }
         _ => vec![],
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_models_listing() {
+        let out = "Available models\n\nauto - Auto\ngpt-5.3-codex-high - Codex 5.3 High\n\
+                   grok-4.3 - Grok 4.3 1M\n\nTip: use --model <id> to switch.\n";
+        let models = parse_models_output("cursor", out);
+        let ids: Vec<&str> = models.iter().map(|m| m.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            vec![
+                "cursor/auto",
+                "cursor/gpt-5.3-codex-high",
+                "cursor/grok-4.3"
+            ]
+        );
+        assert_eq!(models[2].context_window, 1_000_000);
+        assert_eq!(models[1].context_window, 200_000);
+        assert_eq!(models[1].display_name, "Codex 5.3 High");
     }
 }

@@ -321,9 +321,12 @@ impl Engine {
         ids
     }
 
-    /// All models known to configured providers and agent backends, for
-    /// generic client UIs.
-    pub fn list_models(&self) -> Vec<trouve_protocol::ModelInfo> {
+    /// All models available right now: native provider models plus, for each
+    /// agent backend that is installed and logged in, the vendor-reported
+    /// catalog (cached inside the backend). Backends without credentials are
+    /// skipped entirely — their models can't run, so listing them only
+    /// clutters the picker.
+    pub async fn list_models(&self) -> Vec<trouve_protocol::ModelInfo> {
         let mut models: Vec<_> = self
             .providers
             .read()
@@ -331,13 +334,19 @@ impl Engine {
             .values()
             .flat_map(|p| p.models())
             .collect();
-        models.extend(
-            self.backends
-                .read()
-                .unwrap()
-                .values()
-                .flat_map(|b| b.models()),
-        );
+        let ready: Vec<_> = self
+            .backends
+            .read()
+            .unwrap()
+            .values()
+            .filter(|b| {
+                let status = b.status();
+                status.installed && status.has_credentials
+            })
+            .cloned()
+            .collect();
+        let listings = futures::future::join_all(ready.iter().map(|b| b.list_models())).await;
+        models.extend(listings.into_iter().flatten());
         models.sort_by(|a, b| a.id.cmp(&b.id));
         models
     }
