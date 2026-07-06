@@ -30,7 +30,7 @@ Use `trouve-search find-related` to discover code similar to a known location (p
 trouve-search find-related src/auth.py 42 ./my-project
 ```
 
-`path` defaults to the current directory when omitted; git URLs are accepted.
+`path` defaults to the current directory when omitted.
 
 If `trouve-search` is not on `$PATH`, install it with `npm i -g @trouve-ai/search-core`, `cargo install trouve-search` or download a release binary from GitHub.
 

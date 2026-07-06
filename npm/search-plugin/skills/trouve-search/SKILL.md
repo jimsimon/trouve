@@ -18,9 +18,8 @@ directly and read that file. Do not grep for the same content again.
 
 1. Call `search` with a query describing what the code does or its name
    (function/class names or behaviour descriptions, not error messages).
-   Pass the project root as `repo`; https:// git URLs also work. Results
-   include 10 lines of context each — signature plus first body lines,
-   enough to confirm the location.
+   Pass the project root as `repo`. Results include 10 lines of context
+   each — signature plus first body lines, enough to confirm the location.
 2. Navigate directly to the top result's file and line. Read only the
    function or class at that location.
 3. Make the edit. Do not re-search or grep for the same content.

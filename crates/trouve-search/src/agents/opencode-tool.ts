@@ -9,7 +9,7 @@ const REPO = tool.schema
   .string()
   .optional()
   .describe(
-    "Local directory path or https:// git URL to search. Defaults to the project root. " +
+    "Local directory path to search. Defaults to the project root. " +
       "The index is built on first use and cached; updates are incremental.",
   )
 
@@ -39,7 +39,7 @@ const CONTENT = tool.schema
       "or all.",
   )
 
-/// Generous ceiling: a cold first index of a very large (or remote) repo
+/// Generous ceiling: a cold first index of a very large repo
 /// can take minutes; anything beyond this is treated as hung.
 const TIMEOUT_MS = 10 * 60 * 1000
 

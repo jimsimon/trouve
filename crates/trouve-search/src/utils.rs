@@ -55,7 +55,6 @@ fn scp_git_url_re() -> &'static Regex {
     RE.get_or_init(|| Regex::new(r"^[\w.-]+@[\w.-]+:[^/]").unwrap())
 }
 
-/// Return true if `path` looks like a remote git URL rather than a local path.
 /// Run `f`, printing its wall time to stderr when `TROUVE_TIMING` is set.
 pub fn timed<T>(phase: &str, f: impl FnOnce() -> T) -> T {
     static ENABLED: OnceLock<bool> = OnceLock::new();
@@ -72,6 +71,10 @@ pub fn timed<T>(phase: &str, f: impl FnOnce() -> T) -> T {
     out
 }
 
+/// Return true if `path` looks like a remote git URL rather than a local
+/// path. Remote URLs are not supported (trouve does not clone repositories);
+/// this exists to reject them with a clear error instead of a confusing
+/// "path does not exist".
 pub fn is_git_url(path: &str) -> bool {
     GIT_URL_SCHEMES.iter().any(|s| path.starts_with(s)) || scp_git_url_re().is_match(path)
 }

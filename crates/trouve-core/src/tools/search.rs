@@ -100,13 +100,13 @@ pub fn shared_cache() -> Arc<Mutex<IndexCache>> {
 }
 
 /// Resolve the `repo` argument: session worktree by default, or a
-/// workspace-relative subdirectory, or an explicit https:// git URL.
+/// workspace-relative subdirectory.
 fn resolve_repo(ctx: &ToolCtx, args: &Value) -> Result<String, String> {
     match args.get("repo").and_then(Value::as_str) {
         None | Some("") | Some(".") => Ok(ctx.worktree.to_string_lossy().into_owned()),
-        Some(url) if url.starts_with("https://") || url.starts_with("http://") => {
-            Ok(url.to_string())
-        }
+        Some(url) if trouve_search::utils::is_git_url(url) => Err(
+            "Remote git URLs are not supported; pass a workspace-relative directory.".to_string(),
+        ),
         Some(rel) => ctx
             .resolve(rel)
             .map(|p| p.to_string_lossy().into_owned())
@@ -141,8 +141,8 @@ async fn run_search_tool(
     }
 }
 
-const REPO_PARAM: &str = "Workspace-relative directory or an https:// git URL to search. \
-     Default: the session worktree. Never guess remote URLs.";
+const REPO_PARAM: &str = "Workspace-relative directory to search. \
+     Default: the session worktree.";
 const SNIPPET_PARAM: &str = "Lines of source per result. Default (10): signature + first \
      body lines. 0: path and line range only.";
 
@@ -238,9 +238,9 @@ mod tests {
             resolve_repo(&ctx, &json!({"repo": "sub/dir"})).unwrap(),
             "/tmp/wt/sub/dir"
         );
-        assert_eq!(
-            resolve_repo(&ctx, &json!({"repo": "https://github.com/org/repo"})).unwrap(),
-            "https://github.com/org/repo"
+        assert!(
+            resolve_repo(&ctx, &json!({"repo": "https://github.com/org/repo"}))
+                .is_err_and(|e| e.contains("not supported"))
         );
         assert!(resolve_repo(&ctx, &json!({"repo": "/etc"})).is_err());
         assert!(resolve_repo(&ctx, &json!({"repo": "../up"})).is_err());

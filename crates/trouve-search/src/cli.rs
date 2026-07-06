@@ -68,7 +68,7 @@ enum CliCommand {
     Search {
         /// Natural language or code query.
         query: String,
-        /// Local path or git URL (default: current directory).
+        /// Local path (default: current directory).
         #[arg(default_value = ".")]
         path: String,
         /// Number of results.
@@ -86,7 +86,7 @@ enum CliCommand {
         file_path: String,
         /// Line number (1-indexed).
         line: u32,
-        /// Local path or git URL (default: current directory).
+        /// Local path (default: current directory).
         #[arg(default_value = ".")]
         path: String,
         /// Number of results.
@@ -134,10 +134,12 @@ enum DebugCommand {
 
 fn build_index(path: &str, content: &[ContentType]) -> anyhow::Result<TrouveIndex> {
     if is_git_url(path) {
-        TrouveIndex::from_git(path, None, content, None)
-    } else {
-        TrouveIndex::from_path(&PathBuf::from(path), content, None)
+        anyhow::bail!(
+            "Remote git URLs are not supported. Clone the repository yourself and pass the \
+             local directory path."
+        );
     }
+    TrouveIndex::from_path(&PathBuf::from(path), content, None)
 }
 
 fn load_index_or_exit(path: &str, content: &[ContentType]) -> Result<TrouveIndex, ExitCode> {
@@ -206,19 +208,6 @@ fn run_clear(clear_type: &str) -> ExitCode {
         } else {
             for path in removed {
                 println!("Cleared index store at `{}`", path.display());
-            }
-        }
-        if let Some(report) = crate::clone_cache::clear_clones() {
-            println!(
-                "Cleared {} cached clone(s) at `{}`",
-                report.removed,
-                report.root.display()
-            );
-            if report.skipped_locked > 0 {
-                println!(
-                    "Skipped {} clone(s) in use by another trouve process",
-                    report.skipped_locked
-                );
             }
         }
     }

@@ -4,6 +4,18 @@ All notable changes to this project are documented in this file. The format
 is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this
 project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Removed
+
+- **Remote git URL support**: trouve no longer clones repositories on the
+  user's behalf. The CLI, MCP server, and library (`TrouveIndex::from_git`,
+  the `clone_cache` module) reject or omit git URLs; clone the repository
+  yourself and pass the local directory path. The `<cache>/clones` directory,
+  its eviction logic, and the `TROUVE_CLONE_TTL` / `TROUVE_CLONE_TIMEOUT`
+  (and deprecated `SEMBLE_CLONE_TIMEOUT`) environment variables are gone.
+  Local indexing is unaffected.
+
 ## [2.0.0] - 2026-07-05
 
 Major bump: the crate, CLI binary, and npm packages are renamed, which breaks

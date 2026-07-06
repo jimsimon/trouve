@@ -24,16 +24,14 @@ const CACHE_MAX_SIZE: usize = 10;
 /// Don't re-validate a repo sooner than this many times the last build's duration.
 const MIN_REVALIDATE_FACTOR: u32 = 3;
 
-const REPO_DESCRIPTION: &str = "A local directory path or https:// or http:// git URL (e.g. \
-    https://github.com/org/repo) to index and search. The index is cached after the first call, \
-    so repeat queries are fast.";
+const REPO_DESCRIPTION: &str = "A local directory path to index and search. The index is \
+    cached after the first call, so repeat queries are fast.";
 
-const INSTRUCTIONS: &str = "Instant code search for any local or remote git repository. Call \
+const INSTRUCTIONS: &str = "Instant code search for any local git repository. Call \
     `search` once with a focused query, it returns the file path and exact line. Navigate \
     directly to that file at the given line; do not grep for the same content. Use \
-    `find_related` to discover similar code elsewhere in the same repo. When working in a local \
-    project, pass the project root as `repo`. For remote repos, pass an explicit https:// URL. \
-    Never guess or infer URLs.";
+    `find_related` to discover similar code elsewhere in the same repo. Pass the project \
+    root as `repo`.";
 
 struct CachedIndex {
     index: TrouveIndex,
@@ -59,41 +57,32 @@ impl IndexCache {
     }
 
     fn cache_key(&self, repo: &str) -> String {
-        if is_git_url(repo) {
-            repo.to_string()
-        } else {
-            PathBuf::from(repo)
-                .canonicalize()
-                .map(|p| p.to_string_lossy().into_owned())
-                .unwrap_or_else(|_| repo.to_string())
-        }
+        PathBuf::from(repo)
+            .canonicalize()
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_else(|_| repo.to_string())
     }
 
     fn get(&mut self, repo: &str) -> Result<&TrouveIndex, String> {
-        if is_git_url(repo) && !repo.starts_with("https://") && !repo.starts_with("http://") {
+        if is_git_url(repo) {
             return Err(format!(
-                "Only https://, http://, or local directory paths are accepted as `repo`. Got: {repo:?}"
+                "Remote git URLs are not supported; only local directory paths are accepted as \
+                 `repo`. Clone the repository and pass the local path. Got: {repo:?}"
             ));
         }
         let key = self.cache_key(repo);
         let needs_build = match self.entries.get(&key) {
             None => true,
             Some(cached) => {
-                // Both local paths and git URLs are re-validated once outside
-                // the cooldown window: local rebuilds are cheap incremental
-                // patches, and remote rebuilds reuse the persistent clone
-                // cache (a TTL-gated fetch instead of a full re-clone).
+                // Re-validated once outside the cooldown window: rebuilds
+                // are cheap incremental patches.
                 cached.built_at.elapsed() >= cached.build_duration * MIN_REVALIDATE_FACTOR
             }
         };
         if needs_build {
             let start = Instant::now();
-            let built = if is_git_url(repo) {
-                TrouveIndex::from_git(repo, None, &self.content, None)
-            } else {
-                TrouveIndex::from_path(&PathBuf::from(repo), &self.content, None)
-            }
-            .map_err(|e| format!("Failed to index {repo:?}: {e}"))?;
+            let built = TrouveIndex::from_path(&PathBuf::from(repo), &self.content, None)
+                .map_err(|e| format!("Failed to index {repo:?}: {e}"))?;
             if self.entries.len() >= CACHE_MAX_SIZE && !self.entries.contains_key(&key) {
                 // Evict least-recently-used.
                 if let Some(lru) = self
@@ -131,7 +120,7 @@ fn tool_definitions() -> Value {
             "description": "Search once with a focused query describing what the code does or its name. \
                 Write queries using function/class names or behavior descriptions, not error messages. \
                 Returns file paths and line numbers — navigate directly there, do not repeat the search. \
-                Pass a git URL or local path as `repo`; indexes are cached for the session.",
+                Pass a local path as `repo`; indexes are cached for the session.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -366,12 +355,17 @@ mod tests {
     }
 
     #[test]
-    fn rejects_non_http_git_urls() {
+    fn rejects_git_urls() {
         let mut cache = IndexCache::new(vec![ContentType::Code]);
-        let err = cache.get("git://host/repo").err().unwrap();
-        assert!(err.contains("Only https://"));
-        let err = cache.get("ssh://git@host/repo").err().unwrap();
-        assert!(err.contains("Only https://"));
+        for repo in [
+            "https://github.com/org/repo",
+            "git://host/repo",
+            "ssh://git@host/repo",
+            "git@github.com:org/repo.git",
+        ] {
+            let err = cache.get(repo).err().unwrap();
+            assert!(err.contains("not supported"), "repo: {repo}, got: {err}");
+        }
     }
 
     #[test]

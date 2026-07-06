@@ -91,28 +91,6 @@ impl TrouveIndex {
         )
     }
 
-    /// Index a remote git repository via a persistently cached shallow clone.
-    ///
-    /// The clone lives in the trouve cache dir keyed by URL (and optional
-    /// ref) and is refreshed with a cheap `git fetch` once its freshness
-    /// window elapses, so repeat queries skip the network entirely (see
-    /// `crate::clone_cache`). The store identity is derived from the URL,
-    /// so cached chunks survive even a full re-clone.
-    pub fn from_git(
-        url: &str,
-        git_ref: Option<&str>,
-        content: &[ContentType],
-        model_id: Option<&str>,
-    ) -> Result<TrouveIndex> {
-        let clone = crate::clone_cache::cached_clone(url, git_ref)?;
-        let identity_key = match git_ref {
-            Some(r) => format!("git-url:{url}@{r}"),
-            None => format!("git-url:{url}"),
-        };
-        let identity = detect_repo_identity(clone.path());
-        Self::build(clone.path(), identity_key, &identity, content, model_id)
-    }
-
     fn build(
         root: &Path,
         store_identity: String,

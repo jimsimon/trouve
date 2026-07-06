@@ -5,8 +5,7 @@
 // process per call), this plugin keeps a single `trouve-search` server process
 // alive for the whole session and speaks its newline-delimited JSON-RPC
 // protocol directly. That preserves the server's in-process index cache:
-// repeat queries — including against remote git URLs — skip index reload
-// entirely.
+// repeat queries skip index reload entirely.
 //
 // Binary resolution is delegated to @trouve-ai/search-core.
 import { resolveBinaryPath } from "@trouve-ai/search-core"
@@ -25,8 +24,8 @@ interface Pending {
 
 /// The initialize handshake involves no indexing and must be quick.
 const INIT_TIMEOUT_MS = 30_000
-/// A tool call may include a cold index build of a very large (or remote)
-/// repo; anything beyond this is treated as a hung server.
+/// A tool call may include a cold index build of a very large repo;
+/// anything beyond this is treated as a hung server.
 const CALL_TIMEOUT_MS = 10 * 60 * 1000
 
 /** Minimal client for trouve's newline-delimited JSON-RPC stdio server. */
@@ -201,7 +200,7 @@ const REPO = tool.schema
   .string()
   .optional()
   .describe(
-    "Local directory path or https:// git URL to search. Defaults to the project root. " +
+    "Local directory path to search. Defaults to the project root. " +
       "The index is built on first use and cached; updates are incremental.",
   )
 
