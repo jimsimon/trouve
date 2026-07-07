@@ -479,8 +479,9 @@ fn push_card(
 
 /// Append a mixed stretch of tool-call and thinking items to a card body,
 /// in order: consecutive tool calls group via [`tool_run_rows`]; each
-/// thinking item becomes one collapsible kind-4 sub-card (expanded by
-/// default, keyed by its item index).
+/// thinking item becomes one collapsible kind-4 sub-card keyed by its item
+/// index — expanded while its turn is the latest, collapsed by default once
+/// the next prompt is submitted (the reader has moved on).
 fn nested_rows(
     body: &mut Vec<(ChatRowData, Option<String>)>,
     vm: &ThreadViewModel,
@@ -493,9 +494,15 @@ fn nested_rows(
     let mut p = 0;
     while p < run.len() {
         let j = run[p];
-        if let ChatItem::Thinking { content, .. } = &vm.items[j] {
+        if let ChatItem::Thinking { turn, content, .. } = &vm.items[j] {
             let key = format!("t:{j}");
-            let open = !collapsed.contains(&key);
+            // The toggle set flips whichever default applies.
+            let toggled = collapsed.contains(&key);
+            let open = if *turn < latest_turn(vm) {
+                toggled
+            } else {
+                !toggled
+            };
             // Purple header pill; the content follows as ordinary markdown
             // rows (tone 2), indented one level under the pill.
             body.push((
@@ -700,6 +707,21 @@ fn preview(content: &str) -> String {
         s.push('…');
     }
     s
+}
+
+/// The highest turn number present in the thread (0 when empty).
+fn latest_turn(vm: &ThreadViewModel) -> u64 {
+    vm.items
+        .iter()
+        .filter_map(|item| match item {
+            ChatItem::User { turn, .. }
+            | ChatItem::Assistant { turn, .. }
+            | ChatItem::Thinking { turn, .. }
+            | ChatItem::TurnStatus { turn, .. } => Some(*turn),
+            ChatItem::ToolCall { .. } => None,
+        })
+        .max()
+        .unwrap_or(0)
 }
 
 /// The final state of a turn, if its status item arrived.
@@ -1092,6 +1114,23 @@ mod tests {
         assert_eq!(kinds, vec![7, 1, 7, 4, 1, 6, 4, 1, 6]);
         assert_eq!(rows[5].text, "part one");
         assert_eq!(rows[8].text, "part two");
+
+        // Submitting the next prompt flips the default: earlier turns'
+        // thinking collapses to its header pill (the reader moved on)…
+        let mut vm = vm;
+        vm.items.push(ChatItem::User {
+            turn: 2,
+            content: "next question".into(),
+        });
+        let (rows, _) = chat_rows(&vm, &HashSet::new(), &HashSet::new(), &HashSet::new());
+        let think: Vec<_> = rows.iter().filter(|r| r.kind == 4).collect();
+        assert!(think.iter().all(|r| !r.expanded), "collapsed once superseded");
+        // …and the toggle set now re-expands instead of collapsing.
+        let toggled: HashSet<String> = ["t:1".to_string()].into();
+        let (rows, _) = chat_rows(&vm, &HashSet::new(), &HashSet::new(), &toggled);
+        let think: Vec<_> = rows.iter().filter(|r| r.kind == 4).collect();
+        assert!(think[0].expanded);
+        assert!(!think[1].expanded);
     }
 
     #[test]
