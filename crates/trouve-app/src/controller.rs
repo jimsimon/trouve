@@ -82,6 +82,9 @@ pub enum UiCommand {
     RefreshPr,
     FileActivated(usize),
     FileUp,
+    /// A filename clicked in a chat tool card; path as the tool saw it
+    /// (possibly absolute).
+    OpenChatFile(String),
 
     // Settings window.
     RefreshSettings,
@@ -1125,6 +1128,27 @@ impl Controller {
                     let file = self.client.session_file(&session_id, &joined).await?;
                     let lines = render::highlight_file(&file.path, &file.content);
                     ui::set_file_view(&self.ui, joined, file.content, lines);
+                }
+            }
+            UiCommand::OpenChatFile(path) => {
+                let Some(index) = self.current_session else {
+                    return Ok(());
+                };
+                let session = &self.sessions[index];
+                let session_id = session.id.clone();
+                // Vendor tools report absolute paths; the server wants
+                // worktree-relative ones.
+                let rel = path
+                    .strip_prefix(session.worktree_path.as_str())
+                    .map(|p| p.trim_start_matches('/').to_string())
+                    .unwrap_or(path);
+                match self.client.session_file(&session_id, &rel).await {
+                    Ok(file) => {
+                        let lines = render::highlight_file(&file.path, &file.content);
+                        ui::set_file_view(&self.ui, rel, file.content, lines);
+                        ui::set_right_tab(&self.ui, 1);
+                    }
+                    Err(e) => self.status(&format!("could not open {rel}: {e}")),
                 }
             }
             UiCommand::FileUp => {

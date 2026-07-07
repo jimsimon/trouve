@@ -32,6 +32,9 @@ pub struct ChatRowData {
     pub tone: i32,
     pub tool_name: String,
     pub tool_status: i32,
+    /// Read-style tool cards: the file path argument, so the header
+    /// filename can open it in the Files view (`text` holds the basename).
+    pub tool_file: String,
     pub detail: String,
     pub expanded: bool,
     pub turn_state: i32,
@@ -658,9 +661,25 @@ fn tool_row(
         detail.truncate(detail.floor_boundary(4000));
         detail.push('…');
     }
+    // Read-style tools (native read_file, Claude Read, cursor read) title
+    // as "Read <filename>", with the filename clickable in the UI.
+    let file = matches!(tool, "Read" | "read" | "read_file")
+        .then(|| {
+            args.get("file_path")
+                .or_else(|| args.get("path"))
+                .and_then(serde_json::Value::as_str)
+        })
+        .flatten()
+        .unwrap_or_default();
     ChatRowData {
         kind: 2,
-        tool_name: tool_label(tool, args),
+        tool_name: if file.is_empty() {
+            tool_label(tool, args)
+        } else {
+            "Read".into()
+        },
+        text: file.rsplit('/').next().unwrap_or_default().to_string(),
+        tool_file: file.to_string(),
         tool_status: tool_status(status),
         detail,
         expanded: expanded.contains(call_id),
@@ -1164,5 +1183,25 @@ mod tests {
         let long = serde_json::json!({ "command": "x".repeat(100) });
         let label = tool_label("Bash", &long);
         assert!(label.len() < 70 && label.ends_with("…)"), "{label}");
+    }
+
+    #[test]
+    fn read_tools_title_with_a_clickable_filename() {
+        let args = serde_json::json!({"file_path": "/w/src/app/main.rs"});
+        let row = tool_row("c1", "Read", &args, ToolCallStatus::Ok, &None, &HashSet::new());
+        assert_eq!(row.tool_name, "Read");
+        assert_eq!(row.text, "main.rs");
+        assert_eq!(row.tool_file, "/w/src/app/main.rs");
+
+        // Cursor / native variants use a "path" argument.
+        let args = serde_json::json!({"path": "notes.md"});
+        let row = tool_row("c2", "read_file", &args, ToolCallStatus::Ok, &None, &HashSet::new());
+        assert_eq!(row.tool_name, "Read");
+        assert_eq!((row.text.as_str(), row.tool_file.as_str()), ("notes.md", "notes.md"));
+
+        // Non-read tools keep their plain label and no file link.
+        let row = tool_row("c3", "search", &args, ToolCallStatus::Ok, &None, &HashSet::new());
+        assert_eq!(row.tool_name, "search");
+        assert!(row.tool_file.is_empty());
     }
 }

@@ -56,6 +56,9 @@ export struct ChatRow {
     tone: int,
     // Tool-card fields (kind 2).
     tool-name: string,
+    // Read-style tools: the file path argument; `text` holds the basename
+    // shown (and clickable) in the header.
+    tool-file: string,
     // 0 awaiting approval, 1 running, 2 ok, 3 error, 4 denied, 5 aborted
     tool-status: int,
     detail: string,
@@ -575,6 +578,11 @@ export component AppWindow inherits Window {
     callback tool-toggled(/* row index */ int);
     callback raw-toggled(/* turn */ int);
     callback card-toggled(/* card key */ string);
+    // Filename click on a Read tool card: open the file in the Files tab.
+    callback chat-file-opened(/* path */ string);
+    // Right-panel tab (0 diff, 1 files); the controller flips it when a
+    // chat click opens a file.
+    in-out property <int> right-tab: 0;
     callback send-message(string);
     in property <bool> composer-enabled: false;
     in property <string> status-text: "starting…";
@@ -1210,64 +1218,83 @@ export component AppWindow inherits Window {
                                 link-clicked(url) => { root.open-link(url); }
                             }
 
-                            // Tool card header.
-                            if row.kind == 2: HorizontalLayout {
-                                spacing: 8px;
-                                // Running tools show an indeterminate
-                                // spinner; settled ones a status glyph.
-                                if row.tool-status == 1: VerticalLayout {
-                                    alignment: center;
-                                    Spinner {
-                                        width: 12px;
-                                        height: 12px;
-                                        indeterminate: true;
+                            // Tool card header: click anywhere to toggle
+                            // the detail panel (nested controls sit on top
+                            // and win).
+                            if row.kind == 2: Rectangle {
+                                height: tool-hdr.preferred-height;
+                                TouchArea {
+                                    clicked => { root.tool-toggled(idx); }
+                                }
+                                tool-hdr := HorizontalLayout {
+                                    spacing: 8px;
+                                    Text {
+                                        text: row.expanded ? "▾" : "▸";
+                                        color: #8a8a8a;
+                                        font-size: 10px;
+                                        vertical-alignment: center;
                                     }
-                                }
-                                if row.tool-status != 1: Text {
-                                    text: row.tool-status == 0 ? "⏸"
-                                        : row.tool-status == 2 ? "✓"
-                                        : row.tool-status == 4 ? "⊘"
-                                        : "✗";
-                                    color: row.tool-status == 2 ? #7fd18a
-                                        : row.tool-status == 0 ? #e5c07b
-                                        : #e39ea6;
-                                    font-size: 12px;
-                                    vertical-alignment: center;
-                                }
-                                Text {
-                                    text: row.tool-name;
-                                    color: #d8d8d8;
-                                    font-size: 11px;
-                                    font-weight: 700;
-                                    vertical-alignment: center;
-                                }
-                                Text {
-                                    text: row.expanded ? "hide details" : "details";
-                                    color: #6fa8dc;
-                                    font-size: 11px;
-                                    vertical-alignment: center;
-                                    TouchArea {
-                                        clicked => { root.tool-toggled(idx); }
-                                    }
-                                }
-                                Rectangle { horizontal-stretch: 1; }
-                                CopyButton {
-                                    payload: row.detail;
-                                    height: 18px;
-                                    tip: "Copy tool call";
-                                }
-                                if row.tool-status == 0: VerticalLayout {
-                                    alignment: center;
-                                    HorizontalLayout {
-                                        spacing: 4px;
-                                        PillButton {
-                                            label: "Approve";
-                                            primary: true;
-                                            clicked => { root.approval-resolved(idx, true); }
+                                    // Running tools show an indeterminate
+                                    // spinner; settled ones a status glyph.
+                                    if row.tool-status == 1: VerticalLayout {
+                                        alignment: center;
+                                        Spinner {
+                                            width: 12px;
+                                            height: 12px;
+                                            indeterminate: true;
                                         }
-                                        PillButton {
-                                            label: "Deny";
-                                            clicked => { root.approval-resolved(idx, false); }
+                                    }
+                                    if row.tool-status != 1: Text {
+                                        text: row.tool-status == 0 ? "⏸"
+                                            : row.tool-status == 2 ? "✓"
+                                            : row.tool-status == 4 ? "⊘"
+                                            : "✗";
+                                        color: row.tool-status == 2 ? #7fd18a
+                                            : row.tool-status == 0 ? #e5c07b
+                                            : #e39ea6;
+                                        font-size: 12px;
+                                        vertical-alignment: center;
+                                    }
+                                    Text {
+                                        text: row.tool-name;
+                                        color: #d8d8d8;
+                                        font-size: 11px;
+                                        font-weight: 700;
+                                        vertical-alignment: center;
+                                    }
+                                    // Read tools: the filename opens the
+                                    // file in the Files tab.
+                                    if row.tool-file != "": Text {
+                                        text: row.text;
+                                        color: #6fa8dc;
+                                        font-size: 11px;
+                                        vertical-alignment: center;
+                                        TouchArea {
+                                            mouse-cursor: pointer;
+                                            clicked => {
+                                                root.chat-file-opened(row.tool-file);
+                                            }
+                                        }
+                                    }
+                                    Rectangle { horizontal-stretch: 1; }
+                                    CopyButton {
+                                        payload: row.detail;
+                                        height: 18px;
+                                        tip: "Copy tool call";
+                                    }
+                                    if row.tool-status == 0: VerticalLayout {
+                                        alignment: center;
+                                        HorizontalLayout {
+                                            spacing: 4px;
+                                            PillButton {
+                                                label: "Approve";
+                                                primary: true;
+                                                clicked => { root.approval-resolved(idx, true); }
+                                            }
+                                            PillButton {
+                                                label: "Deny";
+                                                clicked => { root.approval-resolved(idx, false); }
+                                            }
                                         }
                                     }
                                 }
@@ -1784,6 +1811,7 @@ export component AppWindow inherits Window {
             background: #181818;
 
             TabWidget {
+                current-index <=> root.right-tab;
                 Tab {
                     title: "Diff";
                     VerticalLayout {

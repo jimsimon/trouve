@@ -208,6 +208,12 @@ fn main() -> anyhow::Result<()> {
     }
     {
         let tx = tx.clone();
+        window.on_chat_file_opened(move |path| {
+            let _ = tx.send(UiCommand::OpenChatFile(path.to_string()));
+        });
+    }
+    {
+        let tx = tx.clone();
         window.on_undo_turn(move || {
             let _ = tx.send(UiCommand::Undo);
         });

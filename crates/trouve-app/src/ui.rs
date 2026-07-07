@@ -138,6 +138,7 @@ fn to_chat_row(r: &ChatRowData) -> ChatRow {
         tone: r.tone,
         tool_name: SharedString::from(r.tool_name.as_str()),
         tool_status: r.tool_status,
+        tool_file: SharedString::from(r.tool_file.as_str()),
         detail: SharedString::from(r.detail.as_str()),
         expanded: r.expanded,
         turn_state: r.turn_state,
@@ -203,6 +204,11 @@ pub fn set_composer_enabled(ui: &Ui, enabled: bool) {
 /// 0 = chat, 1 = new-session screen, 2 = new-thread screen.
 pub fn set_center_screen(ui: &Ui, screen: i32) {
     let _ = ui.upgrade_in_event_loop(move |ui| ui.set_center_screen(screen));
+}
+
+/// Right-panel tab: 0 = Diff, 1 = Files.
+pub fn set_right_tab(ui: &Ui, tab: i32) {
+    let _ = ui.upgrade_in_event_loop(move |ui| ui.set_right_tab(tab));
 }
 
 /// Populate the new-chat screen's pickers.
