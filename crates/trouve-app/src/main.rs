@@ -335,6 +335,7 @@ fn main() -> anyhow::Result<()> {
     }
 
     // Controller (and spawned server) live on a background tokio runtime.
+    let scroll_tx = tx.clone();
     let weak = window.as_weak();
     let settings_weak = settings.as_weak();
     std::thread::spawn(move || {
@@ -359,12 +360,14 @@ fn main() -> anyhow::Result<()> {
 
     // Slint has no move/resize callbacks, so poll for geometry changes and
     // persist them as they happen. While maximized, keep the last floating
-    // rect so unmaximizing on a later launch lands where it used to.
+    // rect so unmaximizing on a later launch lands where it used to. The
+    // same poll samples the chat scroll offset for the controller's
+    // per-thread resume bookmark (scrolling has no callback either).
     let geometry_timer = slint::Timer::default();
     {
         let weak = window.as_weak();
         let last = std::cell::RefCell::new(restored);
-        let last_resume = std::cell::RefCell::new(winstate::load_resume());
+        let last_scroll = std::cell::RefCell::new(f32::NAN);
         geometry_timer.start(
             slint::TimerMode::Repeated,
             std::time::Duration::from_secs(1),
@@ -386,20 +389,11 @@ fn main() -> anyhow::Result<()> {
                         *last = Some(next);
                     }
                 }
-                // Where-you-left-off bookmark. Empty session id means the
-                // controller hasn't selected anything yet — never clobber
-                // the stored bookmark with that.
-                let resume = winstate::Resume {
-                    session_id: window.get_resume_session_id().to_string(),
-                    thread_id: window.get_resume_thread_id().to_string(),
-                    scroll: window.get_chat_scroll(),
-                };
-                if !resume.session_id.is_empty() {
-                    let mut last = last_resume.borrow_mut();
-                    if last.as_ref() != Some(&resume) {
-                        winstate::save_resume(&resume);
-                        *last = Some(resume);
-                    }
+                let scroll = window.get_chat_scroll();
+                let mut last_scroll = last_scroll.borrow_mut();
+                if *last_scroll != scroll {
+                    *last_scroll = scroll;
+                    let _ = scroll_tx.send(UiCommand::ChatScrolled(scroll));
                 }
             },
         );

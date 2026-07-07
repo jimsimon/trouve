@@ -62,6 +62,8 @@ pub enum UiCommand {
 
     // Chat screen.
     SelectThread(usize),
+    /// Chat viewport-y sampled by the shell's poll, bookmarked per thread.
+    ChatScrolled(f32),
     SendMessage(String),
     Approval {
         row: usize,
@@ -155,6 +157,10 @@ struct Controller {
     collapsed_cards: HashSet<(String, String)>,
     row_call_ids: Vec<Option<String>>,
 
+    /// Where-you-left-off bookmark (last session, per-session last thread,
+    /// per-thread scroll), persisted to resume.json as it changes.
+    resume: crate::winstate::Resume,
+
     modes: Vec<AgentMode>,
     models: Vec<ModelInfo>,
     /// Thinking dropdown state for the current thread's model: the schema
@@ -209,6 +215,7 @@ pub async fn run(
         raw_turns: HashSet::new(),
         collapsed_cards: HashSet::new(),
         row_call_ids: Vec::new(),
+        resume: crate::winstate::load_resume(),
         modes: Vec::new(),
         models: Vec::new(),
         thinking_key: None,
@@ -317,37 +324,20 @@ impl Controller {
         self.reload_catalogs().await;
         self.reload_sessions().await?;
 
-        // Reopen where the user left off; fall back to the most recent
-        // active session of the home workspace.
-        let resume = crate::winstate::load_resume();
-        let resumed = resume
-            .as_ref()
-            .and_then(|r| self.sessions.iter().position(|s| s.id == r.session_id));
-        let initial = resumed.or_else(|| {
-            self.sessions
-                .iter()
-                .rposition(|s| s.workspace_id == self.home_workspace_id && !s.archived)
-        });
+        // Reopen the last open session (select_session then restores its
+        // last thread and scroll); fall back to the most recent active
+        // session of the home workspace.
+        let initial = self
+            .sessions
+            .iter()
+            .position(|s| s.id == self.resume.session_id)
+            .or_else(|| {
+                self.sessions
+                    .iter()
+                    .rposition(|s| s.workspace_id == self.home_workspace_id && !s.archived)
+            });
         if let Some(index) = initial {
             self.select_session(index).await?;
-            if let (Some(r), true) = (&resume, resumed == initial && resumed.is_some()) {
-                if let Some(ti) = self.threads.iter().position(|t| t.id == r.thread_id) {
-                    if self.current_thread != Some(ti) {
-                        self.current_thread = Some(ti);
-                        self.push_threads();
-                        self.push_picker_indices();
-                        self.follow_current();
-                        self.render_chat(true);
-                        self.push_context();
-                    }
-                }
-                // Land at the saved scroll offset (render queued above; this
-                // applies after it). Best effort: virtualized row heights
-                // settle as they come on screen.
-                if r.scroll < 0.0 {
-                    ui::set_chat_scroll(&self.ui, r.scroll);
-                }
-            }
         }
         self.status(&format!("workspace: {}", workspace.name));
         Ok(())
@@ -490,21 +480,52 @@ impl Controller {
         self.push_nav();
         let session_id = self.sessions[index].id.clone();
         self.threads = self.client.list_threads(&session_id).await?;
-        self.current_thread = if self.threads.is_empty() {
-            None
-        } else {
-            Some(0)
-        };
+        // Reopen the thread the user last had open in this session; first
+        // thread when there's no bookmark (or it was deleted).
+        self.current_thread = self
+            .resume
+            .session_threads
+            .get(&session_id)
+            .and_then(|tid| self.threads.iter().position(|t| t.id == *tid))
+            .or(if self.threads.is_empty() { None } else { Some(0) });
         self.push_threads();
         self.push_picker_indices();
         self.follow_current();
         self.render_chat(true);
         self.push_context();
+        self.remember_position();
+        self.restore_scroll();
         self.refresh_usage_text().await;
         self.file_path = ".".into();
         let _ = self.load_files().await;
         let _ = self.refresh_diff().await;
         Ok(())
+    }
+
+    /// Record the open session/thread in the resume bookmark and persist it.
+    fn remember_position(&mut self) {
+        let Some(session_id) = self.current_session_id() else {
+            return;
+        };
+        self.resume.session_id = session_id.clone();
+        if let Some(thread_id) = self.current_thread_id() {
+            self.resume.session_threads.insert(session_id, thread_id);
+        }
+        crate::winstate::save_resume(&self.resume);
+    }
+
+    /// Land the just-opened thread at its saved scroll offset. The render is
+    /// queued ahead of this, so it applies after; best effort, as
+    /// virtualized row heights settle while they come on screen.
+    fn restore_scroll(&self) {
+        let Some(thread_id) = self.current_thread_id() else {
+            return;
+        };
+        if let Some(&y) = self.resume.thread_scroll.get(&thread_id) {
+            if y < 0.0 {
+                ui::set_chat_scroll(&self.ui, y);
+            }
+        }
     }
 
     fn push_threads(&self) {
@@ -534,12 +555,6 @@ impl Controller {
             self.current_thread.map(|i| i as i32).unwrap_or(-1)
         };
         ui::set_threads(&self.ui, tabs, selected);
-        // Keep the resume bookmark current (the shell persists it).
-        ui::set_resume_ids(
-            &self.ui,
-            self.current_session_id().unwrap_or_default(),
-            self.current_thread_id().unwrap_or_default(),
-        );
     }
 
     /// Composer pickers mirror the current thread's mode/model.
@@ -998,6 +1013,14 @@ impl Controller {
                     let id = self.sessions[i].id.clone();
                     let was_current = self.current_session == Some(i);
                     self.client.delete_session(&id).await?;
+                    // Drop the session's resume bookmarks along with it.
+                    if let Some(thread_id) = self.resume.session_threads.remove(&id) {
+                        self.resume.thread_scroll.remove(&thread_id);
+                    }
+                    if self.resume.session_id == id {
+                        self.resume.session_id.clear();
+                    }
+                    crate::winstate::save_resume(&self.resume);
                     if was_current {
                         self.current_session = None;
                         self.threads.clear();
@@ -1088,8 +1111,18 @@ impl Controller {
                     self.follow_current();
                     self.render_chat(true);
                     self.push_context();
+                    self.remember_position();
+                    self.restore_scroll();
                 }
                 // i == threads.len() is the provisional tab itself: no-op.
+            }
+            UiCommand::ChatScrolled(y) => {
+                if let Some(thread_id) = self.current_thread_id() {
+                    if self.resume.thread_scroll.get(&thread_id) != Some(&y) {
+                        self.resume.thread_scroll.insert(thread_id, y);
+                        crate::winstate::save_resume(&self.resume);
+                    }
+                }
             }
             UiCommand::SendMessage(text) => {
                 if let Some(thread_id) = self.current_thread_id() {
@@ -1466,6 +1499,7 @@ impl Controller {
         self.follow_current();
         self.render_chat(true);
         self.push_context();
+        self.remember_position();
         Ok(())
     }
 }

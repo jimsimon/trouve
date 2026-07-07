@@ -220,14 +220,6 @@ pub fn set_show_archived(ui: &Ui, show: bool) {
     let _ = ui.upgrade_in_event_loop(move |ui| ui.set_show_archived(show));
 }
 
-/// Current session/thread ids, polled by the shell into resume.json.
-pub fn set_resume_ids(ui: &Ui, session_id: String, thread_id: String) {
-    let _ = ui.upgrade_in_event_loop(move |ui| {
-        ui.set_resume_session_id(SharedString::from(session_id.as_str()));
-        ui.set_resume_thread_id(SharedString::from(thread_id.as_str()));
-    });
-}
-
 /// Restore the chat scroll offset (viewport-y; 0 or negative).
 pub fn set_chat_scroll(ui: &Ui, y: f32) {
     let _ = ui.upgrade_in_event_loop(move |ui| ui.set_chat_scroll(y));

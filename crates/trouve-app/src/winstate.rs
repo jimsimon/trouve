@@ -3,6 +3,7 @@
 //! no move/resize callbacks) writes changes as the user drags the window.
 
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::path::PathBuf;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -39,16 +40,20 @@ impl WindowState {
     }
 }
 
-/// Where the user left off: the open session/thread and chat scroll offset
-/// (Slint viewport-y, so 0 or negative). Restored on launch when the ids
-/// still exist.
+/// Where the user left off, per session and thread: the last open session
+/// (restored on launch), each session's last open thread (restored when the
+/// session is clicked), and each thread's chat scroll offset — a Slint
+/// viewport-y, so 0 or negative — restored when the thread is opened.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 pub struct Resume {
+    #[serde(default)]
     pub session_id: String,
+    /// session id → last open thread id.
     #[serde(default)]
-    pub thread_id: String,
+    pub session_threads: HashMap<String, String>,
+    /// thread id → chat scroll offset.
     #[serde(default)]
-    pub scroll: f32,
+    pub thread_scroll: HashMap<String, f32>,
 }
 
 fn config_path(file: &str) -> Option<PathBuf> {
@@ -75,10 +80,12 @@ pub fn save(state: &WindowState) {
     write_json(state_path(), state);
 }
 
-pub fn load_resume() -> Option<Resume> {
-    let text = std::fs::read_to_string(resume_path()?).ok()?;
-    let resume: Resume = serde_json::from_str(&text).ok()?;
-    (!resume.session_id.is_empty()).then_some(resume)
+pub fn load_resume() -> Resume {
+    let read = || {
+        let text = std::fs::read_to_string(resume_path()?).ok()?;
+        serde_json::from_str::<Resume>(&text).ok()
+    };
+    read().unwrap_or_default()
 }
 
 pub fn save_resume(resume: &Resume) {
@@ -98,6 +105,17 @@ fn write_json<T: Serialize>(path: Option<PathBuf>, value: &T) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn old_flat_resume_format_still_parses() {
+        let old = r#"{"session_id":"s1","thread_id":"t1","scroll":-42.0}"#;
+        let resume: Resume = serde_json::from_str(old).unwrap();
+        assert_eq!(resume.session_id, "s1");
+        // The flat thread/scroll bookmark isn't carried over; the maps
+        // start empty and refill as the user navigates.
+        assert!(resume.session_threads.is_empty());
+        assert!(resume.thread_scroll.is_empty());
+    }
 
     #[test]
     fn insane_geometry_is_rejected() {
