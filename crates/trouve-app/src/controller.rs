@@ -440,7 +440,7 @@ impl Controller {
         self.push_threads();
         self.push_picker_indices();
         self.follow_current();
-        self.render_chat();
+        self.render_chat(true);
         self.push_context();
         self.refresh_usage_text().await;
         self.file_path = ".".into();
@@ -558,10 +558,13 @@ impl Controller {
         });
     }
 
-    fn render_chat(&mut self) {
+    /// Re-fold the current thread into chat rows. `scroll` jumps the list to
+    /// the end — wanted when content arrives or threads switch, jarring for
+    /// in-place toggles (tool details, raw view).
+    fn render_chat(&mut self, scroll: bool) {
         let Some(thread_id) = self.current_thread_id() else {
             self.row_call_ids.clear();
-            ui::set_chat(&self.ui, Vec::new());
+            ui::set_chat(&self.ui, Vec::new(), false);
             ui::set_composer_enabled(&self.ui, false);
             return;
         };
@@ -574,7 +577,7 @@ impl Controller {
         let vm = self.vms.entry(thread_id).or_default();
         let (rows, call_ids) = render::chat_rows(vm, &self.expanded_tools, &raw_turns);
         self.row_call_ids = call_ids;
-        ui::set_chat(&self.ui, rows);
+        ui::set_chat(&self.ui, rows, scroll);
         ui::set_composer_enabled(&self.ui, true);
     }
 
@@ -918,7 +921,7 @@ impl Controller {
                         self.threads.clear();
                         self.current_thread = None;
                         self.push_threads();
-                        self.render_chat();
+                        self.render_chat(true);
                     }
                     self.reload_sessions().await?;
                     self.status("session deleted");
@@ -953,7 +956,7 @@ impl Controller {
             UiCommand::NewThread => self.open_new_thread_screen(),
             UiCommand::CancelNewChat => {
                 self.close_new_chat();
-                self.render_chat();
+                self.render_chat(true);
             }
             UiCommand::NewChatWorkspaceChanged(i) => self.load_branches(i).await,
             UiCommand::RegisterWorkspacePath(path) => {
@@ -1001,7 +1004,7 @@ impl Controller {
                     self.push_threads();
                     self.push_picker_indices();
                     self.follow_current();
-                    self.render_chat();
+                    self.render_chat(true);
                     self.push_context();
                 }
                 // i == threads.len() is the provisional tab itself: no-op.
@@ -1026,7 +1029,7 @@ impl Controller {
                     if !self.expanded_tools.remove(call_id) {
                         self.expanded_tools.insert(call_id.clone());
                     }
-                    self.render_chat();
+                    self.render_chat(false);
                 }
             }
             UiCommand::ToggleRawTurn(turn) => {
@@ -1035,7 +1038,7 @@ impl Controller {
                     if !self.raw_turns.remove(&key) {
                         self.raw_turns.insert(key);
                     }
-                    self.render_chat();
+                    self.render_chat(false);
                 }
             }
             UiCommand::ComposerModeChanged(i) => {
@@ -1283,7 +1286,7 @@ impl Controller {
                     // changing, so the dial refreshes on every event.
                     self.push_context();
                     if changed.is_some() {
-                        self.render_chat();
+                        self.render_chat(true);
                     }
                     if matches!(envelope.event, trouve_protocol::Event::TurnCompleted { .. }) {
                         let _ = self.refresh_diff().await;
@@ -1343,7 +1346,7 @@ impl Controller {
         self.push_threads();
         self.push_picker_indices();
         self.follow_current();
-        self.render_chat();
+        self.render_chat(true);
         self.push_context();
         Ok(())
     }

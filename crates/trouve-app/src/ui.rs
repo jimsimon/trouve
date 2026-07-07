@@ -101,7 +101,7 @@ pub fn set_threads(ui: &Ui, threads: Vec<(String, String)>, current: i32) {
     });
 }
 
-pub fn set_chat(ui: &Ui, rows: Vec<ChatRowData>) {
+pub fn set_chat(ui: &Ui, rows: Vec<ChatRowData>, scroll_to_end: bool) {
     let _ = ui.upgrade_in_event_loop(move |ui| {
         let items: Vec<ChatRow> = rows
             .into_iter()
@@ -125,7 +125,9 @@ pub fn set_chat(ui: &Ui, rows: Vec<ChatRowData>) {
             })
             .collect();
         ui.set_chat_rows(ModelRc::new(VecModel::from(items)));
-        ui.invoke_scroll_chat_to_end();
+        if scroll_to_end {
+            ui.invoke_scroll_chat_to_end();
+        }
     });
 }
 
