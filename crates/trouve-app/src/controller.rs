@@ -38,6 +38,8 @@ pub enum UiCommand {
     },
     /// Flip the "show archived sessions" filter.
     ToggleArchivedFilter,
+    /// Quit once all running agent turns complete.
+    QuitWhenIdle,
     /// Native folder picker → register the chosen directory as a workspace.
     OpenWorkspaceDialog,
     /// The "+" on a workspace header row: new session there.
@@ -138,6 +140,8 @@ struct Controller {
     collapsed_workspaces: HashSet<String>,
     /// Session-list filter: include archived sessions (default hidden).
     show_archived: bool,
+    /// Quit once every agent turn finishes (armed from the quit dialog).
+    quit_when_idle: bool,
 
     threads: Vec<Thread>,
     current_thread: Option<usize>,
@@ -196,6 +200,7 @@ pub async fn run(
         archived_expanded: HashSet::new(),
         collapsed_workspaces: HashSet::new(),
         show_archived: false,
+        quit_when_idle: false,
         threads: Vec::new(),
         current_thread: None,
         vms: HashMap::new(),
@@ -441,6 +446,17 @@ impl Controller {
         }
         self.nav = nav;
         ui::set_nav(&self.ui, rows);
+    }
+
+    /// Push the number of threads with an active turn to the UI (feeds the
+    /// quit-confirmation dialog) and, when a deferred quit is armed, leave
+    /// as soon as that count reaches zero.
+    fn push_agents_running(&mut self) {
+        let running = self.vms.values().filter(|vm| vm.turn_running).count() as i32;
+        ui::set_agents_running(&self.ui, running);
+        if self.quit_when_idle && running == 0 {
+            ui::quit(&self.ui);
+        }
     }
 
     fn nav_session(&self, row: usize) -> Option<usize> {
@@ -1378,6 +1394,12 @@ impl Controller {
                         self.refresh_usage_text().await;
                     }
                 }
+                self.push_agents_running();
+            }
+            UiCommand::QuitWhenIdle => {
+                self.quit_when_idle = true;
+                self.status("quitting once all agents finish…");
+                self.push_agents_running();
             }
         }
         Ok(())

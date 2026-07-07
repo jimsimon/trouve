@@ -248,6 +248,30 @@ fn main() -> anyhow::Result<()> {
             let _ = tx.send(UiCommand::ToggleArchivedFilter);
         });
     }
+
+    // Closing with agents mid-turn asks first (quit / quit when idle /
+    // cancel) instead of tearing the run down silently.
+    {
+        let weak = window.as_weak();
+        window.window().on_close_requested(move || {
+            let window = weak.unwrap();
+            if window.get_agents_running() > 0 {
+                window.set_quit_dialog(true);
+                slint::CloseRequestResponse::KeepWindowShown
+            } else {
+                slint::CloseRequestResponse::HideWindow
+            }
+        });
+    }
+    window.on_quit_now(|| {
+        let _ = slint::quit_event_loop();
+    });
+    {
+        let tx = tx.clone();
+        window.on_quit_when_idle(move || {
+            let _ = tx.send(UiCommand::QuitWhenIdle);
+        });
+    }
     {
         let tx = tx.clone();
         window.on_undo_turn(move || {

@@ -791,6 +791,13 @@ export component AppWindow inherits Window {
     in property <string> resume-thread-id: "";
     in-out property <length> chat-scroll <=> chat-list.viewport-y;
 
+    // Quit confirmation while agents run: closing the window with active
+    // turns opens the modal instead of quitting.
+    in property <int> agents-running: 0;
+    in-out property <bool> quit-dialog: false;
+    callback quit-now();
+    callback quit-when-idle();
+
     HorizontalLayout {
         // ---------------- left: sessions ----------------
         Rectangle {
@@ -2287,6 +2294,67 @@ export component AppWindow inherits Window {
                             root.session-deleted(root.delete-row);
                             root.delete-row = -1;
                         }
+                    }
+                }
+            }
+        }
+    }
+
+    // ---------------- quit confirmation (agents still running) ----------------
+    if root.quit-dialog: Rectangle {
+        width: 100%;
+        height: 100%;
+        background: #000000aa;
+        TouchArea { } // swallow clicks behind the modal
+
+        Rectangle {
+            width: 440px;
+            height: quit-layout.preferred-height + 32px;
+            x: (parent.width - self.width) / 2;
+            y: (parent.height - self.height) / 2;
+            background: #232323;
+            border-radius: 8px;
+            border-width: 1px;
+            border-color: #3a3a3a;
+
+            quit-layout := VerticalLayout {
+                padding: 16px;
+                spacing: 12px;
+
+                Text {
+                    text: root.agents-running == 1
+                        ? "An agent is still running"
+                        : root.agents-running + " agents are still running";
+                    color: #e8e8e8;
+                    font-size: 15px;
+                    font-weight: 700;
+                    wrap: word-wrap;
+                }
+                Text {
+                    text: "Quitting now stops the running work mid-turn. You can also let the agents finish and quit automatically.";
+                    color: #9a9a9a;
+                    font-size: 12px;
+                    wrap: word-wrap;
+                }
+
+                HorizontalLayout {
+                    spacing: 8px;
+                    Rectangle { horizontal-stretch: 1; }
+                    Button {
+                        text: "Cancel";
+                        clicked => { root.quit-dialog = false; }
+                    }
+                    Button {
+                        text: "Quit when agents finish";
+                        clicked => {
+                            root.quit-dialog = false;
+                            root.quit-when-idle();
+                        }
+                    }
+                    Button {
+                        text: "Quit";
+                        primary: true;
+                        clicked => { root.quit-now(); }
                     }
                 }
             }

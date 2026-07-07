@@ -233,6 +233,18 @@ pub fn set_chat_scroll(ui: &Ui, y: f32) {
     let _ = ui.upgrade_in_event_loop(move |ui| ui.set_chat_scroll(y));
 }
 
+/// How many threads have an agent turn in flight (quit-confirm dialog).
+pub fn set_agents_running(ui: &Ui, count: i32) {
+    let _ = ui.upgrade_in_event_loop(move |ui| ui.set_agents_running(count));
+}
+
+/// Tear down the UI event loop (deferred quit).
+pub fn quit(ui: &Ui) {
+    let _ = ui.upgrade_in_event_loop(|_| {
+        let _ = slint::quit_event_loop();
+    });
+}
+
 /// Populate the new-chat screen's pickers.
 pub fn set_new_chat(
     ui: &Ui,
