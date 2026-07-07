@@ -651,6 +651,10 @@ export component AppWindow inherits Window {
     in property <[[TextSegment]]> file-lines;
     in property <[int]> file-numbers;
     in property <string> open-file-name: "";
+    // Markdown preview for the open file (toggle lives in the file header).
+    in property <bool> file-is-markdown: false;
+    in-out property <bool> file-preview: false;
+    in property <[ChatRow]> file-preview-rows;
 
     public function scroll-chat-to-end() {
         chat-list.viewport-y = min(0px, chat-list.visible-height - chat-list.viewport-height);
@@ -1977,16 +1981,94 @@ export component AppWindow inherits Window {
                                 overflow: elide;
                                 horizontal-stretch: 1;
                             }
+                            if root.file-is-markdown: VerticalLayout {
+                                alignment: center;
+                                IconButton {
+                                    icon: "👁";
+                                    icon-size: 13px;
+                                    icon-color: root.file-preview ? #6fa8dc : #8a8a8a;
+                                    tip: root.file-preview
+                                        ? "Show source" : "Preview markdown";
+                                    clicked => {
+                                        root.file-preview = !root.file-preview;
+                                    }
+                                }
+                            }
                             if root.open-file-text != "": CopyButton {
                                 payload: root.open-file-text;
                                 label: "copy file";
                                 tip: "Copy file contents";
                             }
                         }
-                        CodeView {
+                        if !root.file-preview: CodeView {
                             vertical-stretch: 1;
                             lines: root.file-lines;
                             line-numbers: root.file-numbers;
+                        }
+                        // Rendered markdown preview: the chat's block rows
+                        // (headings, lists, fenced code with highlighting).
+                        if root.file-preview: ListView {
+                            vertical-stretch: 1;
+                            changed viewport-y => { Tip.hide-all(); }
+                            for row in root.file-preview-rows: VerticalLayout {
+                                padding-top: 3px;
+                                padding-bottom: 3px;
+                                padding-left: (row.md-kind == 4 || row.md-kind == 6)
+                                    ? 10px + row.md-indent * 18px : 0px;
+                                padding-right: 6px;
+                                if row.md-kind == 5: Rectangle {
+                                    background: #1f2226;
+                                    border-radius: 6px;
+                                    border-width: 1px;
+                                    border-color: #35393f;
+                                    VerticalLayout {
+                                        padding: 8px;
+                                        spacing: 4px;
+                                        HorizontalLayout {
+                                            spacing: 6px;
+                                            Text {
+                                                text: row.md-lang == ""
+                                                    ? "code" : row.md-lang;
+                                                color: #6f6f6f;
+                                                font-size: 11px;
+                                                vertical-alignment: center;
+                                                horizontal-stretch: 1;
+                                            }
+                                            CopyButton {
+                                                payload: row.text;
+                                                tip: "Copy code";
+                                            }
+                                        }
+                                        VerticalLayout {
+                                            for line in row.code-lines: Rectangle {
+                                                height: 19px;
+                                                clip: true;
+                                                HorizontalLayout {
+                                                    alignment: start;
+                                                    for seg in line: Text {
+                                                        text: seg.text;
+                                                        color: seg.color == #000000
+                                                            ? #d8d8c8 : seg.color;
+                                                        font-family: "monospace";
+                                                        font-size: 13px;
+                                                        vertical-alignment: center;
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                                if row.md-kind != 5: StyledText {
+                                    text: row.styled;
+                                    default-color: #d4d4d4;
+                                    link-color: #6fa8dc;
+                                    default-font-size: row.md-kind == 1 ? 22px
+                                        : row.md-kind == 2 ? 19px
+                                        : row.md-kind == 3 ? 16px
+                                        : 14px;
+                                    link-clicked(url) => { root.open-link(url); }
+                                }
+                            }
                         }
                     }
                 }

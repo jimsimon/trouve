@@ -295,6 +295,23 @@ pub fn set_file_list(ui: &Ui, path: String, entries: Vec<(String, bool)>) {
 
 pub fn set_file_view(ui: &Ui, name: String, content: String, lines: Vec<Vec<(String, u32)>>) {
     let _ = ui.upgrade_in_event_loop(move |ui| {
+        // Markdown files get a rendered-preview toggle; the preview reuses
+        // the chat's markdown row shape and renderer.
+        let is_md = std::path::Path::new(&name)
+            .extension()
+            .is_some_and(|e| e.eq_ignore_ascii_case("md") || e.eq_ignore_ascii_case("markdown"));
+        let preview: Vec<ChatRow> = if is_md {
+            crate::render::markdown_rows(&content)
+                .iter()
+                .map(to_chat_row)
+                .collect()
+        } else {
+            Vec::new()
+        };
+        ui.set_file_is_markdown(is_md);
+        ui.set_file_preview_rows(ModelRc::new(VecModel::from(preview)));
+        ui.set_file_preview(false);
+
         let count = lines.len();
         let rows: Vec<ModelRc<TextSegment>> = lines
             .into_iter()

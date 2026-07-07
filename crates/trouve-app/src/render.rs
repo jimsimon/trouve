@@ -805,6 +805,14 @@ pub fn highlight_file(path: &str, content: &str) -> Vec<Vec<(String, u32)>> {
 /// Syntax-highlight a fenced code block by its language tag ("rust",
 /// "py", …). Unknown or empty tags fall back to plain text (default
 /// foreground).
+/// Markdown-block rows (kind 1) for the file previewer; same shape the
+/// chat renderer uses, so the UI mapping is shared.
+pub fn markdown_rows(content: &str) -> Vec<ChatRowData> {
+    let mut body = Vec::new();
+    push_blocks(&mut body, content);
+    body.into_iter().map(|(row, _)| row).collect()
+}
+
 pub fn highlight_code(lang: &str, content: &str) -> Vec<Vec<(String, u32)>> {
     let (syntaxes, _) = syntect_assets();
     let syntax = syntaxes
