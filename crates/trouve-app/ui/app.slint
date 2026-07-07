@@ -35,7 +35,8 @@ export struct ThreadTabItem {
 
 export struct ChatRow {
     // 0 user, 1 markdown block, 2 tool card, 3 turn status,
-    // 4 thinking, 5 activity (spinner + label)
+    // 4 thinking, 5 activity (spinner + label),
+    // 6 raw response text (selectable markdown source)
     kind: int,
     // For kind 1: 0 paragraph, 1 h1, 2 h2, 3 h3, 4 bullet, 5 code fence,
     // 6 numbered list item.
@@ -56,6 +57,10 @@ export struct ChatRow {
     expanded: bool,
     // Turn-status fields (kind 3): 0 running, 1 completed, 2 failed.
     turn-state: int,
+    // Turn number (kind 3), for per-turn actions like the raw-view toggle.
+    turn: int,
+    // Kind 3: this turn's response is currently shown as raw text.
+    raw: bool,
 }
 
 export struct FileItem {
@@ -137,6 +142,63 @@ component DropUpPicker inherits Rectangle {
     }
 }
 
+// Clipboard button: copies `payload` on click and flashes a checkmark.
+// Self-contained — the hidden TextInput reaches the system clipboard through
+// its built-in select-all/copy functions, so no native plumbing is needed.
+component CopyButton inherits Rectangle {
+    in property <string> payload;
+    // Optional label rendered next to the icon ("copy response").
+    in property <string> label: "";
+    property <bool> copied: false;
+
+    height: 22px;
+    width: content.preferred-width + 8px;
+    border-radius: 4px;
+    background: ta.has-hover ? #333333 : transparent;
+
+    clip-src := TextInput {
+        visible: false;
+        width: 0;
+        height: 0;
+        single-line: false;
+    }
+    Timer {
+        interval: 1.2s;
+        running: root.copied;
+        triggered => { root.copied = false; }
+    }
+    content := HorizontalLayout {
+        padding-left: 4px;
+        padding-right: 4px;
+        spacing: 4px;
+        Text {
+            text: root.copied ? "✓" : "⧉";
+            color: root.copied ? #7fd18a
+                : ta.has-hover ? #d8d8d8
+                : #8a8a8a;
+            font-size: 12px;
+            vertical-alignment: center;
+        }
+        if root.label != "": Text {
+            text: root.copied ? "copied" : root.label;
+            color: root.copied ? #7fd18a
+                : ta.has-hover ? #d8d8d8
+                : #8a8a8a;
+            font-size: 11px;
+            vertical-alignment: center;
+        }
+    }
+    ta := TouchArea {
+        clicked => {
+            clip-src.text = root.payload;
+            clip-src.select-all();
+            clip-src.copy();
+            clip-src.text = "";
+            root.copied = true;
+        }
+    }
+}
+
 // Drag handle between columns. Dragging integrates mouse deltas into the
 // bound width; `direction` is +1 when dragging right grows the column.
 component SplitterHandle inherits Rectangle {
@@ -202,6 +264,7 @@ export component AppWindow inherits Window {
     in property <[ChatRow]> chat-rows;
     callback approval-resolved(/* row index */ int, /* approved */ bool);
     callback tool-toggled(/* row index */ int);
+    callback raw-toggled(/* turn */ int);
     callback send-message(string);
     in property <bool> composer-enabled: false;
     in property <string> status-text: "starting…";
@@ -248,6 +311,9 @@ export component AppWindow inherits Window {
 
     // --- right column -------------------------------------------------------
     in property <[DiffRow]> diff-rows;
+    // Raw unified diff / raw file content backing the views, for copying.
+    in property <string> diff-text: "";
+    in property <string> open-file-text: "";
     callback diff-file-toggled(int);
     callback refresh-diff();
     callback undo-turn();
@@ -575,10 +641,12 @@ export component AppWindow inherits Window {
                             // Lighter than the panel (#141414) so the block
                             // reads as a slab, not just an outline.
                             : row.kind == 1 && row.md-kind == 5 ? #1f2226
+                            : row.kind == 6 ? #17191c
                             : transparent;
                         border-radius: 6px;
-                        border-width: row.kind == 1 && row.md-kind == 5 ? 1px : 0px;
-                        border-color: #35393f;
+                        border-width: (row.kind == 1 && row.md-kind == 5)
+                            || row.kind == 6 ? 1px : 0px;
+                        border-color: row.kind == 6 ? #2a2d31 : #35393f;
 
                         property <bool> md-list: row.kind == 1
                             && (row.md-kind == 4 || row.md-kind == 6);
@@ -592,29 +660,49 @@ export component AppWindow inherits Window {
                             padding-left: md-list ? 22px + row.md-indent * 18px : 10px;
                             spacing: 4px;
 
-                            // User message.
-                            if row.kind == 0: Text {
-                                text: row.text;
-                                color: #dbe6f5;
-                                font-size: 14px;
-                                wrap: word-wrap;
+                            // User message: selectable, copy button top-right.
+                            if row.kind == 0: HorizontalLayout {
+                                spacing: 6px;
+                                TextInput {
+                                    text: row.text;
+                                    read-only: true;
+                                    single-line: false;
+                                    color: #dbe6f5;
+                                    font-size: 14px;
+                                    wrap: word-wrap;
+                                    selection-background-color: #3d5a80;
+                                    horizontal-stretch: 1;
+                                }
+                                VerticalLayout {
+                                    alignment: start;
+                                    CopyButton { payload: row.text; }
+                                }
                             }
 
-                            // Markdown block: code fences stay plain
-                            // monospace Text (with a language label when
-                            // tagged); everything else renders inline
-                            // markup through StyledText.
-                            if row.kind == 1 && row.md-kind == 5 && row.md-lang != "": Text {
-                                text: row.md-lang;
-                                color: #6f6f6f;
-                                font-size: 11px;
+                            // Markdown block: code fences render as
+                            // selectable monospace text under a header
+                            // (language label + copy); everything else
+                            // renders inline markup through StyledText.
+                            if row.kind == 1 && row.md-kind == 5: HorizontalLayout {
+                                spacing: 6px;
+                                Text {
+                                    text: row.md-lang;
+                                    color: #6f6f6f;
+                                    font-size: 11px;
+                                    vertical-alignment: center;
+                                    horizontal-stretch: 1;
+                                }
+                                CopyButton { payload: row.text; }
                             }
-                            if row.kind == 1 && row.md-kind == 5: Text {
+                            if row.kind == 1 && row.md-kind == 5: TextInput {
                                 text: row.text;
+                                read-only: true;
+                                single-line: false;
                                 color: #d8d8c8;
                                 wrap: word-wrap;
                                 font-size: 13px;
                                 font-family: "monospace";
+                                selection-background-color: #3d5a80;
                             }
                             if row.kind == 1 && row.md-kind != 5: StyledText {
                                 text: row.styled;
@@ -660,6 +748,7 @@ export component AppWindow inherits Window {
                                     }
                                 }
                                 Rectangle { horizontal-stretch: 1; }
+                                CopyButton { payload: row.detail; }
                                 if row.tool-status == 0: Button {
                                     text: "Approve";
                                     primary: true;
@@ -672,28 +761,67 @@ export component AppWindow inherits Window {
                             }
 
                             // Tool card detail.
-                            if row.kind == 2 && row.expanded: Text {
+                            if row.kind == 2 && row.expanded: TextInput {
                                 text: row.detail;
+                                read-only: true;
+                                single-line: false;
                                 color: #a8a8a8;
                                 font-size: 12px;
                                 font-family: "monospace";
                                 wrap: word-wrap;
+                                selection-background-color: #3d5a80;
                             }
 
-                            // Turn status.
-                            if row.kind == 3: Text {
+                            // Turn status; `detail` carries the turn's full
+                            // assistant response for one-click copying.
+                            if row.kind == 3: HorizontalLayout {
+                                spacing: 8px;
+                                Text {
+                                    text: row.text;
+                                    color: row.turn-state == 2 ? #e39ea6 : #7a7a7a;
+                                    font-size: 11px;
+                                    vertical-alignment: center;
+                                }
+                                if row.detail != "": CopyButton {
+                                    payload: row.detail;
+                                    label: "copy response";
+                                }
+                                // Swap the turn's styled markdown for one
+                                // selectable plain-text block and back.
+                                if row.detail != "": Text {
+                                    text: row.raw ? "styled view" : "select text";
+                                    color: #6fa8dc;
+                                    font-size: 11px;
+                                    vertical-alignment: center;
+                                    TouchArea {
+                                        clicked => { root.raw-toggled(row.turn); }
+                                    }
+                                }
+                                Rectangle { horizontal-stretch: 1; }
+                            }
+
+                            // Raw response text: the turn's markdown source
+                            // as one fully selectable block.
+                            if row.kind == 6: TextInput {
                                 text: row.text;
-                                color: row.turn-state == 2 ? #e39ea6 : #7a7a7a;
-                                font-size: 11px;
+                                read-only: true;
+                                single-line: false;
+                                color: #d4d4d4;
+                                font-size: 13px;
+                                wrap: word-wrap;
+                                selection-background-color: #3d5a80;
                             }
 
                             // Model thinking (reasoning stream).
-                            if row.kind == 4: Text {
+                            if row.kind == 4: TextInput {
                                 text: row.text;
+                                read-only: true;
+                                single-line: false;
                                 color: #8f8f8f;
                                 font-size: 13px;
                                 font-italic: true;
                                 wrap: word-wrap;
+                                selection-background-color: #3d5a80;
                             }
 
                             // Activity: indeterminate spinner + label while
@@ -1036,6 +1164,13 @@ export component AppWindow inherits Window {
                                 text: "↷ Redo";
                                 clicked => { root.redo-turn(); }
                             }
+                            if root.diff-text != "": VerticalLayout {
+                                alignment: center;
+                                CopyButton {
+                                    payload: root.diff-text;
+                                    label: "copy diff";
+                                }
+                            }
                             Rectangle { horizontal-stretch: 1; }
                             Button {
                                 text: "Create PR";
@@ -1095,10 +1230,20 @@ export component AppWindow inherits Window {
                                 }
                             }
                         }
-                        Text {
-                            text: root.open-file-name;
-                            color: #9a9a9a;
-                            font-size: 12px;
+                        HorizontalLayout {
+                            spacing: 6px;
+                            Text {
+                                text: root.open-file-name;
+                                color: #9a9a9a;
+                                font-size: 12px;
+                                vertical-alignment: center;
+                                overflow: elide;
+                                horizontal-stretch: 1;
+                            }
+                            if root.open-file-text != "": CopyButton {
+                                payload: root.open-file-text;
+                                label: "copy file";
+                            }
                         }
                         CodeView {
                             vertical-stretch: 1;

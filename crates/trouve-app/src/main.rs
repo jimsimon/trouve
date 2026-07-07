@@ -148,6 +148,12 @@ fn main() -> anyhow::Result<()> {
     }
     {
         let tx = tx.clone();
+        window.on_raw_toggled(move |turn| {
+            let _ = tx.send(UiCommand::ToggleRawTurn(turn.max(0) as u64));
+        });
+    }
+    {
+        let tx = tx.clone();
         window.on_composer_mode_changed(move |i| {
             let _ = tx.send(UiCommand::ComposerModeChanged(i.max(0) as usize));
         });

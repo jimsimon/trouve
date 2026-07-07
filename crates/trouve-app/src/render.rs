@@ -9,7 +9,7 @@ use trouve_client_core::viewmodel::{ChatItem, ThreadViewModel, ToolCallStatus, T
 
 /// Mirrors the `ChatRow` struct in `app.slint`.
 /// Kinds: 0 user, 1 markdown block, 2 tool card, 3 turn status,
-/// 4 thinking, 5 activity (spinner + label).
+/// 4 thinking, 5 activity (spinner + label), 6 raw response text.
 #[derive(Debug, Clone, Default)]
 pub struct ChatRowData {
     pub kind: i32,
@@ -28,6 +28,10 @@ pub struct ChatRowData {
     pub detail: String,
     pub expanded: bool,
     pub turn_state: i32,
+    /// Turn number (status rows), so the UI can address per-turn actions.
+    pub turn: i32,
+    /// Status rows: this turn's response is showing as raw text.
+    pub raw: bool,
 }
 
 /// Wrap inline code spans (backtick runs, CommonMark-style: closed by a run
@@ -131,9 +135,12 @@ fn tool_label(tool: &str, args: &serde_json::Value) -> String {
 
 /// Flatten a thread's chat items into rows. Returns the rows plus a parallel
 /// map from row index to the tool call id (for approvals/expansion).
+/// Turns listed in `raw_turns` render their assistant text as one plain
+/// (selectable) block instead of styled markdown.
 pub fn chat_rows(
     vm: &ThreadViewModel,
     expanded: &HashSet<String>,
+    raw_turns: &HashSet<u64>,
 ) -> (Vec<ChatRowData>, Vec<Option<String>>) {
     let mut rows = Vec::new();
     let mut call_ids = Vec::new();
@@ -151,7 +158,20 @@ pub fn chat_rows(
                 },
                 None,
             ),
-            ChatItem::Assistant { content, .. } => {
+            ChatItem::Assistant { turn, content, .. } => {
+                // Raw view: the whole item as one selectable plain-text row
+                // (StyledText offers no selection, this is the escape hatch).
+                if raw_turns.contains(turn) {
+                    push(
+                        ChatRowData {
+                            kind: 6,
+                            text: content.clone(),
+                            ..Default::default()
+                        },
+                        None,
+                    );
+                    continue;
+                }
                 // Markdown blocks become individual virtualized rows, so a
                 // long streaming answer never re-lays-out the whole chat.
                 for block in parse_blocks(content) {
@@ -234,7 +254,7 @@ pub fn chat_rows(
                 },
                 None,
             ),
-            ChatItem::TurnStatus { state, .. } => {
+            ChatItem::TurnStatus { turn, state } => {
                 let (text, code) = match state {
                     // Progress shows as the trailing activity row instead.
                     TurnState::Running => continue,
@@ -246,6 +266,11 @@ pub fn chat_rows(
                         kind: 3,
                         text,
                         turn_state: code,
+                        // The turn's full assistant markdown, for the
+                        // "copy response" button on the status row.
+                        detail: turn_response(vm, *turn),
+                        turn: *turn as i32,
+                        raw: raw_turns.contains(turn),
                         ..Default::default()
                     },
                     None,
@@ -269,6 +294,22 @@ pub fn chat_rows(
         );
     }
     (rows, call_ids)
+}
+
+/// All assistant markdown of one turn, joined — the payload for the
+/// "copy response" button. (StyledText offers no selection, so this is the
+/// only way to get a styled response out of the app as text.)
+fn turn_response(vm: &ThreadViewModel, turn: u64) -> String {
+    vm.items
+        .iter()
+        .filter_map(|item| match item {
+            ChatItem::Assistant { turn: t, content, .. } if *t == turn => {
+                Some(content.as_str())
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("\n\n")
 }
 
 /// Turn header: token counts, plus the dollar cost for per-use APIs.
@@ -391,16 +432,65 @@ mod tests {
             turn_running: true,
             ..Default::default()
         };
-        let (rows, _) = chat_rows(&vm, &HashSet::new());
+        let (rows, _) = chat_rows(&vm, &HashSet::new(), &HashSet::new());
         assert_eq!(rows.last().unwrap().kind, 5);
         assert_eq!(rows.last().unwrap().text, "Processing…");
         vm.thinking = true;
-        let (rows, _) = chat_rows(&vm, &HashSet::new());
+        let (rows, _) = chat_rows(&vm, &HashSet::new(), &HashSet::new());
         assert_eq!(rows.last().unwrap().text, "Thinking…");
         vm.turn_running = false;
         vm.thinking = false;
-        let (rows, _) = chat_rows(&vm, &HashSet::new());
+        let (rows, _) = chat_rows(&vm, &HashSet::new(), &HashSet::new());
         assert!(rows.is_empty());
+    }
+
+    #[test]
+    fn raw_turns_render_as_one_plain_row() {
+        let vm = ThreadViewModel {
+            items: vec![ChatItem::Assistant {
+                turn: 3,
+                content: "# heading\n\nbody `code`".into(),
+                complete: true,
+            }],
+            ..Default::default()
+        };
+        // Styled: one row per markdown block.
+        let (rows, _) = chat_rows(&vm, &HashSet::new(), &HashSet::new());
+        assert!(rows.len() > 1);
+        // Raw: the whole item as a single kind-6 row of markdown source.
+        let raw: HashSet<u64> = [3].into();
+        let (rows, _) = chat_rows(&vm, &HashSet::new(), &raw);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].kind, 6);
+        assert_eq!(rows[0].text, "# heading\n\nbody `code`");
+    }
+
+    #[test]
+    fn turn_status_carries_the_turns_response_for_copying() {
+        let vm = ThreadViewModel {
+            items: vec![
+                ChatItem::Assistant {
+                    turn: 1,
+                    content: "part one".into(),
+                    complete: true,
+                },
+                ChatItem::Assistant {
+                    turn: 1,
+                    content: "part two".into(),
+                    complete: true,
+                },
+                ChatItem::TurnStatus {
+                    turn: 1,
+                    state: TurnState::Completed {
+                        usage: Default::default(),
+                    },
+                },
+            ],
+            ..Default::default()
+        };
+        let (rows, _) = chat_rows(&vm, &HashSet::new(), &HashSet::new());
+        let status = rows.iter().find(|r| r.kind == 3).unwrap();
+        assert_eq!(status.detail, "part one\n\npart two");
     }
 
     #[test]

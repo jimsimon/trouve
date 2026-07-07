@@ -120,6 +120,8 @@ pub fn set_chat(ui: &Ui, rows: Vec<ChatRowData>) {
                 detail: SharedString::from(r.detail.as_str()),
                 expanded: r.expanded,
                 turn_state: r.turn_state,
+                turn: r.turn,
+                raw: r.raw,
             })
             .collect();
         ui.set_chat_rows(ModelRc::new(VecModel::from(items)));
@@ -181,7 +183,7 @@ pub fn set_pr_status(ui: &Ui, text: String) {
     let _ = ui.upgrade_in_event_loop(move |ui| ui.set_pr_status(SharedString::from(text.as_str())));
 }
 
-pub fn set_diff(ui: &Ui, rows: Vec<slint_diff_view::RowData>) {
+pub fn set_diff(ui: &Ui, rows: Vec<slint_diff_view::RowData>, raw: String) {
     let _ = ui.upgrade_in_event_loop(move |ui| {
         let items: Vec<DiffRow> = rows
             .into_iter()
@@ -195,6 +197,7 @@ pub fn set_diff(ui: &Ui, rows: Vec<slint_diff_view::RowData>) {
             })
             .collect();
         ui.set_diff_rows(ModelRc::new(VecModel::from(items)));
+        ui.set_diff_text(SharedString::from(raw.as_str()));
     });
 }
 
@@ -212,7 +215,7 @@ pub fn set_file_list(ui: &Ui, path: String, entries: Vec<(String, bool)>) {
     });
 }
 
-pub fn set_file_view(ui: &Ui, name: String, lines: Vec<Vec<(String, u32)>>) {
+pub fn set_file_view(ui: &Ui, name: String, content: String, lines: Vec<Vec<(String, u32)>>) {
     let _ = ui.upgrade_in_event_loop(move |ui| {
         let count = lines.len();
         let rows: Vec<ModelRc<TextSegment>> = lines
@@ -233,6 +236,7 @@ pub fn set_file_view(ui: &Ui, name: String, lines: Vec<Vec<(String, u32)>>) {
             (1..=count as i32).collect::<Vec<i32>>(),
         )));
         ui.set_open_file_name(SharedString::from(name.as_str()));
+        ui.set_open_file_text(SharedString::from(content.as_str()));
     });
 }
 

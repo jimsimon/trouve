@@ -64,6 +64,8 @@ pub enum UiCommand {
         approved: bool,
     },
     ToggleTool(usize),
+    /// Toggle a turn between styled markdown and raw selectable text.
+    ToggleRawTurn(u64),
     ComposerModeChanged(usize),
     ComposerModelChanged(usize),
     ComposerThinkingChanged(usize),
@@ -134,6 +136,8 @@ struct Controller {
     vms: HashMap<String, ThreadViewModel>,
     followed: HashSet<String>,
     expanded_tools: HashSet<String>,
+    /// (thread id, turn) pairs showing raw text instead of styled markdown.
+    raw_turns: HashSet<(String, u64)>,
     row_call_ids: Vec<Option<String>>,
 
     modes: Vec<AgentMode>,
@@ -149,6 +153,7 @@ struct Controller {
 
     diff_files: Vec<slint_diff_view::FileDiff>,
     diff_collapsed: Vec<bool>,
+    diff_raw: String,
     file_path: String,
     file_entries: Vec<DirEntry>,
 }
@@ -184,6 +189,7 @@ pub async fn run(
         vms: HashMap::new(),
         followed: HashSet::new(),
         expanded_tools: HashSet::new(),
+        raw_turns: HashSet::new(),
         row_call_ids: Vec::new(),
         modes: Vec::new(),
         models: Vec::new(),
@@ -193,6 +199,7 @@ pub async fn run(
         branches: Vec::new(),
         diff_files: Vec::new(),
         diff_collapsed: Vec::new(),
+        diff_raw: String::new(),
         file_path: ".".into(),
         file_entries: Vec::new(),
     };
@@ -558,8 +565,14 @@ impl Controller {
             ui::set_composer_enabled(&self.ui, false);
             return;
         };
+        let raw_turns: HashSet<u64> = self
+            .raw_turns
+            .iter()
+            .filter(|(t, _)| *t == thread_id)
+            .map(|(_, turn)| *turn)
+            .collect();
         let vm = self.vms.entry(thread_id).or_default();
-        let (rows, call_ids) = render::chat_rows(vm, &self.expanded_tools);
+        let (rows, call_ids) = render::chat_rows(vm, &self.expanded_tools, &raw_turns);
         self.row_call_ids = call_ids;
         ui::set_chat(&self.ui, rows);
         ui::set_composer_enabled(&self.ui, true);
@@ -623,6 +636,7 @@ impl Controller {
         let diff = self.client.session_diff(&session_id).await?;
         self.diff_files = slint_diff_view::parse_unified_diff(&diff.diff);
         self.diff_collapsed = vec![false; self.diff_files.len()];
+        self.diff_raw = diff.diff;
         self.push_diff();
         Ok(())
     }
@@ -631,6 +645,7 @@ impl Controller {
         ui::set_diff(
             &self.ui,
             slint_diff_view::build_rows(&self.diff_files, &self.diff_collapsed),
+            self.diff_raw.clone(),
         );
     }
 
@@ -1014,6 +1029,15 @@ impl Controller {
                     self.render_chat();
                 }
             }
+            UiCommand::ToggleRawTurn(turn) => {
+                if let Some(thread_id) = self.current_thread_id() {
+                    let key = (thread_id, turn);
+                    if !self.raw_turns.remove(&key) {
+                        self.raw_turns.insert(key);
+                    }
+                    self.render_chat();
+                }
+            }
             UiCommand::ComposerModeChanged(i) => {
                 let mode = self.modes.get(i).map(|m| m.id.clone());
                 self.update_current_thread(UpdateThreadRequest {
@@ -1076,7 +1100,7 @@ impl Controller {
                 } else if let Some(session_id) = self.current_session_id() {
                     let file = self.client.session_file(&session_id, &joined).await?;
                     let lines = render::highlight_file(&file.path, &file.content);
-                    ui::set_file_view(&self.ui, joined, lines);
+                    ui::set_file_view(&self.ui, joined, file.content, lines);
                 }
             }
             UiCommand::FileUp => {
