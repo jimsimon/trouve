@@ -112,11 +112,15 @@ EOF
     )));
 
     // Flags: resume + read-only permission mapping + mode instructions.
+    // Read-only avoids `--permission-mode plan` (its interactive plan
+    // workflow prompt misfires headless); mutating built-ins are disallowed
+    // and everything else is denied through the approval gate.
     let args = std::fs::read_to_string(format!("{stub}.args")).unwrap();
     assert!(args.contains("--resume"), "{args}");
     assert!(args.contains("old-sess"), "{args}");
-    assert!(args.contains("--permission-mode"), "{args}");
-    assert!(args.contains("plan"), "{args}");
+    assert!(!args.contains("--permission-mode"), "{args}");
+    assert!(args.contains("--disallowedTools"), "{args}");
+    assert!(args.contains("Write,Edit,MultiEdit,NotebookEdit"), "{args}");
     assert!(args.contains("--append-system-prompt"), "{args}");
     assert!(args.contains("--model"), "{args}");
     assert!(args.contains("--include-partial-messages"), "{args}");

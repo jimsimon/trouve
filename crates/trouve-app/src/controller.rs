@@ -361,9 +361,14 @@ impl Controller {
             .await
             .unwrap_or_default();
         self.models = self.client.list_models().await.unwrap_or_default();
+        let mode_names = self
+            .modes
+            .iter()
+            .map(|m| mode_display_name(&m.display_name, &m.id))
+            .collect();
         ui::set_pickers(
             &self.ui,
-            self.modes.iter().map(|m| m.id.clone()).collect(),
+            mode_names,
             self.models.iter().map(|m| m.id.clone()).collect(),
         );
         self.push_picker_indices();
@@ -507,9 +512,15 @@ impl Controller {
             .threads
             .iter()
             .map(|t| {
+                let mode = self
+                    .modes
+                    .iter()
+                    .find(|m| m.id == t.mode)
+                    .map(|m| mode_display_name(&m.display_name, &m.id))
+                    .unwrap_or_else(|| mode_display_name("", &t.mode));
                 (
                     t.id.clone(),
-                    format!("{} · {}", t.mode, short_model(&t.model)),
+                    format!("{} · {}", mode, short_model(&t.model)),
                 )
             })
             .collect();
@@ -1501,6 +1512,19 @@ fn level_label(token: &str) -> String {
 }
 
 /// Prefer the "code" mode as the default picker selection.
+/// Display label for a mode: its declared display name, or the id with the
+/// first letter capitalized when a (user-defined) mode omits one.
+fn mode_display_name(display_name: &str, id: &str) -> String {
+    if !display_name.trim().is_empty() {
+        return display_name.to_string();
+    }
+    let mut cs = id.chars();
+    match cs.next() {
+        Some(first) => first.to_uppercase().collect::<String>() + cs.as_str(),
+        None => String::new(),
+    }
+}
+
 fn default_mode_index(modes: &[AgentMode]) -> i32 {
     modes
         .iter()

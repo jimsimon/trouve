@@ -103,6 +103,11 @@ impl AgentBackend for ClaudeBackend {
             // Anthropic redacts thinking text by default (empty blocks with
             // only a signature); this opts back in to summarized thinking.
             .args(["--thinking-display", "summarized"])
+            // Claude Code defers tool schemas behind a ToolSearch lookup by
+            // default. The trouve bridge exposes only a handful of tools, so
+            // load them upfront — no ToolSearch round-trip before the first
+            // code search, and no failures while the bridge reconnects.
+            .env("ENABLE_TOOL_SEARCH", "false")
             .current_dir(&turn.worktree)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
@@ -166,7 +171,10 @@ impl AgentBackend for ClaudeBackend {
                     "mcp__trouve__search,mcp__trouve__find_related",
                 ]);
             }
-            if matches!(turn.permission, BackendPermission::Ask) {
+            if matches!(
+                turn.permission,
+                BackendPermission::Ask | BackendPermission::ReadOnly
+            ) {
                 cmd.args(["--permission-prompt-tool", "mcp__trouve__approval_prompt"]);
             }
         }
@@ -174,8 +182,21 @@ impl AgentBackend for ClaudeBackend {
             BackendPermission::Yolo => {
                 cmd.arg("--dangerously-skip-permissions");
             }
+            // Read-only rides on trouve's approval gate (mutating requests
+            // are denied inside trouve) rather than `--permission-mode plan`:
+            // plan mode injects Claude's interactive plan workflow prompt
+            // (ExitPlanMode / AskUserQuestion, unavailable headless) and
+            // blocks read-only MCP tools like trouve's code search. The
+            // definite mutators are additionally unavailable outright, so
+            // the model doesn't waste turns on doomed requests.
             BackendPermission::ReadOnly => {
-                cmd.args(["--permission-mode", "plan"]);
+                let vendor_tools_stand_down = turn
+                    .mcp_bridge
+                    .as_ref()
+                    .is_some_and(|bridge| bridge.bridge_tools);
+                if !vendor_tools_stand_down {
+                    cmd.args(["--disallowedTools", "Write,Edit,MultiEdit,NotebookEdit"]);
+                }
             }
             BackendPermission::Ask => {}
         }

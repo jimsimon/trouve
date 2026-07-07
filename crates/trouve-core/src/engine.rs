@@ -2099,11 +2099,18 @@ impl Engine {
     ) -> Result<bool> {
         let scope = Scope::Thread(thread.id.clone());
         let key = allow_key(tool, args);
-        // The vendor only asks for things it considers mutating.
+        // Bridged trouve tools are our own: trust the executor's mutability
+        // flag so read-only tools (code search) pass even in read-only
+        // modes. Anything else the vendor asks about is treated as mutating
+        // (it only asks for things it considers mutating).
+        let mutates = crate::mcp::split_tool_name(tool)
+            .filter(|(server, _)| *server == "trouve")
+            .and_then(|(_, name)| self.executor.tool_mutates(name))
+            .unwrap_or(true);
         let decision = gate(
             thread.permission_mode,
             mode.read_only,
-            true,
+            mutates,
             &self.approvals.allow_list(&session.id),
             &key,
         );

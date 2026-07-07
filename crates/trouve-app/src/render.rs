@@ -132,24 +132,84 @@ fn tool_status(status: ToolCallStatus) -> i32 {
     }
 }
 
+/// Collapse whitespace to one line and cap the length for a card title.
+fn title_arg(text: &str) -> String {
+    let mut one_line = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if one_line.len() > 60 {
+        one_line.truncate(one_line.floor_boundary(59));
+        one_line.push('…');
+    }
+    one_line
+}
+
+/// Human display name for a raw tool identifier: known tools map to their
+/// product name (`search` → `Code Search`), camelCase and snake_case split
+/// into capitalized words (`WebSearch` → `Web Search`, `find_related` →
+/// `Find Related`), and foreign MCP tools show their server
+/// (`mcp__jira__create_issue` → `jira: Create Issue`).
+fn tool_display_name(tool: &str) -> String {
+    if let Some((server, name)) = tool
+        .strip_prefix("mcp__")
+        .and_then(|rest| rest.split_once("__"))
+    {
+        if server == "trouve" {
+            return tool_display_name(name);
+        }
+        return format!("{server}: {}", tool_display_name(name));
+    }
+    match tool {
+        "search" => "Code Search".into(),
+        "find_related" => "Find Related".into(),
+        _ => {
+            // snake_case → words; camelCase → split before upper runs.
+            let mut words: Vec<String> = Vec::new();
+            for part in tool.split('_') {
+                let mut word = String::new();
+                for c in part.chars() {
+                    if c.is_uppercase() && !word.is_empty() {
+                        words.push(word);
+                        word = String::new();
+                    }
+                    word.push(c);
+                }
+                if !word.is_empty() {
+                    words.push(word);
+                }
+            }
+            words
+                .iter()
+                .map(|w| {
+                    let mut cs = w.chars();
+                    match cs.next() {
+                        Some(first) => first.to_uppercase().collect::<String>() + cs.as_str(),
+                        None => String::new(),
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join(" ")
+        }
+    }
+}
+
 /// Card title for a tool call. Shell-style tools (native `shell`, vendor
-/// `Bash`) show the command they run — `Bash (wc -l foo.rs)` — since the
+/// `Bash`) show the command they run — `Bash (wc -l foo.rs)` — and querying
+/// tools show their query — `Code Search markdown renderer` — since the
 /// tool name alone says nothing about what happened.
 fn tool_label(tool: &str, args: &serde_json::Value) -> String {
     let command = matches!(tool, "shell" | "Bash" | "bash")
         .then(|| args.get("command").and_then(|v| v.as_str()))
         .flatten();
-    match command {
-        Some(cmd) => {
-            // Newlines and runs of spaces collapse so the title stays one line.
-            let mut one_line = cmd.split_whitespace().collect::<Vec<_>>().join(" ");
-            if one_line.len() > 60 {
-                one_line.truncate(one_line.floor_boundary(59));
-                one_line.push('…');
-            }
-            format!("{tool} ({one_line})")
-        }
-        None => tool.to_string(),
+    if let Some(cmd) = command {
+        return format!("{} ({})", tool_display_name(tool), title_arg(cmd));
+    }
+    let display = tool_display_name(tool);
+    let query = ["query", "pattern", "url", "path"]
+        .iter()
+        .find_map(|k| args.get(k).and_then(|v| v.as_str()))
+        .filter(|q| !q.trim().is_empty());
+    match query {
+        Some(q) => format!("{display} {}", title_arg(q)),
+        None => display,
     }
 }
 
@@ -1310,14 +1370,38 @@ mod tests {
     fn shell_tools_show_their_command() {
         let args = serde_json::json!({"command": "wc -l  bench.rs\n"});
         assert_eq!(tool_label("Bash", &args), "Bash (wc -l bench.rs)");
-        assert_eq!(tool_label("shell", &args), "shell (wc -l bench.rs)");
-        // Non-shell tools and malformed args keep the plain name.
-        assert_eq!(tool_label("search", &args), "search");
+        assert_eq!(tool_label("shell", &args), "Shell (wc -l bench.rs)");
+        // Tools without a recognized arg keep the plain (display) name.
+        assert_eq!(tool_label("search", &args), "Code Search");
         assert_eq!(tool_label("Bash", &serde_json::json!({})), "Bash");
         // Long commands truncate on a char boundary with an ellipsis.
         let long = serde_json::json!({ "command": "x".repeat(100) });
         let label = tool_label("Bash", &long);
         assert!(label.len() < 70 && label.ends_with("…)"), "{label}");
+    }
+
+    #[test]
+    fn tool_titles_are_human_readable() {
+        let q = serde_json::json!({"query": "markdown renderer"});
+        // trouve's search rides the MCP bridge under a mangled name.
+        assert_eq!(
+            tool_label("mcp__trouve__search", &q),
+            "Code Search markdown renderer"
+        );
+        assert_eq!(tool_label("search", &q), "Code Search markdown renderer");
+        // Vendor camelCase names split into words, with the query appended.
+        assert_eq!(tool_label("ToolSearch", &q), "Tool Search markdown renderer");
+        assert_eq!(tool_label("WebSearch", &q), "Web Search markdown renderer");
+        assert_eq!(
+            tool_label("WebFetch", &serde_json::json!({"url": "https://a.io"})),
+            "Web Fetch https://a.io"
+        );
+        // snake_case splits too; foreign MCP tools keep their server.
+        assert_eq!(tool_label("list_dir", &serde_json::json!({})), "List Dir");
+        assert_eq!(
+            tool_label("mcp__jira__create_issue", &serde_json::json!({})),
+            "jira: Create Issue"
+        );
     }
 
     #[test]
@@ -1376,9 +1460,9 @@ mod tests {
         assert_eq!(row.tool_name, "Read");
         assert_eq!((row.text.as_str(), row.tool_file.as_str()), ("notes.md", "notes.md"));
 
-        // Non-read tools keep their plain label and no file link.
+        // Non-read tools get their display label and no file link.
         let row = tool_row("c3", "search", &args, ToolCallStatus::Ok, &None, &HashSet::new());
-        assert_eq!(row.tool_name, "search");
+        assert_eq!(row.tool_name, "Code Search notes.md");
         assert!(row.tool_file.is_empty());
     }
 }
