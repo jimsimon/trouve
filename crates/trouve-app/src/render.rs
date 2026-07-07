@@ -657,13 +657,19 @@ fn tool_row(
     result: &Option<serde_json::Value>,
     expanded: &HashSet<String>,
 ) -> ChatRowData {
-    let mut detail = serde_json::to_string_pretty(args).unwrap_or_else(|_| args.to_string());
+    let mut detail = String::new();
+    humanize_json(args, 0, &mut detail);
     if let Some(result) = result {
-        detail.push_str("\n→ ");
-        detail.push_str(
-            &serde_json::to_string_pretty(result).unwrap_or_else(|_| result.to_string()),
-        );
+        if !detail.is_empty() {
+            detail.push('\n');
+        }
+        detail.push_str("── result ──\n");
+        match text_blocks(result) {
+            Some(text) => detail.push_str(&text),
+            None => humanize_json(result, 0, &mut detail),
+        }
     }
+    let mut detail = detail.trim_end().to_string();
     if detail.len() > 4000 {
         detail.truncate(detail.floor_boundary(4000));
         detail.push('…');
@@ -692,6 +698,88 @@ fn tool_row(
         expanded: expanded.contains(call_id),
         ..Default::default()
     }
+}
+
+/// Render a JSON value as indented `key: value` text — the detail panels
+/// show tool args/results to humans, so no quoting or brace noise. Multiline
+/// strings become indented blocks; null and empty values are dropped.
+fn humanize_json(v: &serde_json::Value, indent: usize, out: &mut String) {
+    use serde_json::Value;
+    let pad = "  ".repeat(indent);
+    let noise = |v: &Value| match v {
+        Value::Null => true,
+        Value::String(s) => s.is_empty(),
+        Value::Array(a) => a.is_empty(),
+        Value::Object(o) => o.is_empty(),
+        _ => false,
+    };
+    match v {
+        Value::Object(map) => {
+            for (key, val) in map {
+                if noise(val) {
+                    continue;
+                }
+                match val {
+                    Value::String(s) if s.contains('\n') => {
+                        out.push_str(&format!("{pad}{key}:\n"));
+                        for line in s.lines() {
+                            out.push_str(&format!("{pad}  {line}\n"));
+                        }
+                    }
+                    Value::String(s) => out.push_str(&format!("{pad}{key}: {s}\n")),
+                    Value::Object(_) | Value::Array(_) => {
+                        out.push_str(&format!("{pad}{key}:\n"));
+                        humanize_json(val, indent + 1, out);
+                    }
+                    other => out.push_str(&format!("{pad}{key}: {other}\n")),
+                }
+            }
+        }
+        Value::Array(items) => {
+            for item in items {
+                match item {
+                    Value::Object(_) | Value::Array(_) => {
+                        out.push_str(&format!("{pad}-\n"));
+                        humanize_json(item, indent + 1, out);
+                    }
+                    Value::String(s) => out.push_str(&format!("{pad}- {s}\n")),
+                    other => out.push_str(&format!("{pad}- {other}\n")),
+                }
+            }
+        }
+        Value::String(s) => {
+            for line in s.lines() {
+                out.push_str(&format!("{pad}{line}\n"));
+            }
+        }
+        other => out.push_str(&format!("{pad}{other}\n")),
+    }
+}
+
+/// Vendor results often wrap plain text in content blocks — a bare string,
+/// an array of `{type: "text", text}` blocks, or an object with a `content`
+/// array (Claude / MCP shapes). Unwrap those to the text itself.
+fn text_blocks(v: &serde_json::Value) -> Option<String> {
+    use serde_json::Value;
+    if let Value::String(s) = v {
+        return Some(s.clone());
+    }
+    let arr = match v {
+        Value::Array(a) => a,
+        Value::Object(o) if o.len() == 1 => o.get("content")?.as_array()?,
+        _ => return None,
+    };
+    let texts: Vec<&str> = arr
+        .iter()
+        .map(|b| {
+            (b.get("type").and_then(Value::as_str) == Some("text"))
+                .then(|| b.get("text").and_then(Value::as_str))
+                .flatten()
+                .ok_or(())
+        })
+        .collect::<Result<_, _>>()
+        .ok()?;
+    (!texts.is_empty()).then(|| texts.join("\n"))
 }
 
 /// One-line teaser for a collapsed card header: the first non-empty line,
@@ -1230,6 +1318,48 @@ mod tests {
         let long = serde_json::json!({ "command": "x".repeat(100) });
         let label = tool_label("Bash", &long);
         assert!(label.len() < 70 && label.ends_with("…)"), "{label}");
+    }
+
+    #[test]
+    fn tool_details_render_human_readable() {
+        let args = serde_json::json!({"command": "ls -la", "cwd": null});
+        let result = serde_json::json!({
+            "exit_code": 0, "stdout": "a\nb", "stderr": "", "truncated": false,
+        });
+        let row = tool_row(
+            "c1",
+            "Bash",
+            &args,
+            ToolCallStatus::Ok,
+            &Some(result),
+            &HashSet::new(),
+        );
+        assert!(
+            !row.detail.contains('{') && !row.detail.contains('"'),
+            "no JSON noise: {}",
+            row.detail
+        );
+        assert!(row.detail.contains("command: ls -la"));
+        assert!(row.detail.contains("── result ──"));
+        assert!(row.detail.contains("stdout:\n  a\n  b"), "{}", row.detail);
+        assert!(!row.detail.contains("stderr"), "empty values dropped");
+        assert!(!row.detail.contains("cwd"), "nulls dropped");
+
+        // Claude-style text-block results unwrap to the plain text.
+        let blocks = serde_json::json!([{"type": "text", "text": "42 files"}]);
+        let row = tool_row(
+            "c2",
+            "Bash",
+            &args,
+            ToolCallStatus::Ok,
+            &Some(blocks),
+            &HashSet::new(),
+        );
+        assert!(
+            row.detail.ends_with("── result ──\n42 files"),
+            "{}",
+            row.detail
+        );
     }
 
     #[test]
