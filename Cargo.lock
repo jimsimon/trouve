@@ -8006,10 +8006,12 @@ name = "trouve-app"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "dirs",
  "fuzzy-matcher",
  "libc",
  "open",
  "rfd",
+ "serde",
  "serde_json",
  "slint",
  "slint-build",

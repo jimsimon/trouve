@@ -4,6 +4,7 @@
 mod controller;
 mod render;
 mod ui;
+mod winstate;
 
 slint::include_modules!();
 
@@ -319,6 +320,48 @@ fn main() -> anyhow::Result<()> {
             .expect("tokio runtime");
         runtime.block_on(controller::run(weak, settings_weak, tx, rx));
     });
+
+    // Restore the last window geometry (position picks the monitor too);
+    // an absent or implausible file keeps the defaults from app.slint.
+    let restored = winstate::load();
+    if let Some(state) = restored {
+        let w = window.window();
+        w.set_size(slint::PhysicalSize::new(state.width, state.height));
+        w.set_position(slint::PhysicalPosition::new(state.x, state.y));
+        if state.maximized {
+            w.set_maximized(true);
+        }
+    }
+
+    // Slint has no move/resize callbacks, so poll for geometry changes and
+    // persist them as they happen. While maximized, keep the last floating
+    // rect so unmaximizing on a later launch lands where it used to.
+    let geometry_timer = slint::Timer::default();
+    {
+        let weak = window.as_weak();
+        let last = std::cell::RefCell::new(restored);
+        geometry_timer.start(
+            slint::TimerMode::Repeated,
+            std::time::Duration::from_secs(1),
+            move || {
+                let Some(window) = weak.upgrade() else { return };
+                let w = window.window();
+                let mut next = last.borrow().unwrap_or_default();
+                next.maximized = w.is_maximized();
+                if !next.maximized {
+                    let pos = w.position();
+                    let size = w.size();
+                    (next.x, next.y) = (pos.x, pos.y);
+                    (next.width, next.height) = (size.width, size.height);
+                }
+                let mut last = last.borrow_mut();
+                if *last != Some(next) {
+                    winstate::save(&next);
+                    *last = Some(next);
+                }
+            },
+        );
+    }
 
     window.run()?;
     Ok(())
