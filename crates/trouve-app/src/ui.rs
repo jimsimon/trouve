@@ -211,6 +211,11 @@ pub fn set_right_tab(ui: &Ui, tab: i32) {
     let _ = ui.upgrade_in_event_loop(move |ui| ui.set_right_tab(tab));
 }
 
+/// Session-list filter: whether archived sessions are shown.
+pub fn set_show_archived(ui: &Ui, show: bool) {
+    let _ = ui.upgrade_in_event_loop(move |ui| ui.set_show_archived(show));
+}
+
 /// Populate the new-chat screen's pickers.
 pub fn set_new_chat(
     ui: &Ui,

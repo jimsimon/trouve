@@ -214,6 +214,12 @@ fn main() -> anyhow::Result<()> {
     }
     {
         let tx = tx.clone();
+        window.on_archived_filter_toggled(move || {
+            let _ = tx.send(UiCommand::ToggleArchivedFilter);
+        });
+    }
+    {
+        let tx = tx.clone();
         window.on_undo_turn(move || {
             let _ = tx.send(UiCommand::Undo);
         });

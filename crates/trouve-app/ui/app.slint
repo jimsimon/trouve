@@ -558,6 +558,9 @@ export component AppWindow inherits Window {
     callback session-renamed(/* nav row */ int, /* new title */ string);
     callback session-archived(/* nav row */ int, /* archived */ bool);
     callback session-deleted(/* nav row */ int);
+    // Session-list filters (controller owns the state).
+    in property <bool> show-archived: false;
+    callback archived-filter-toggled();
 
     // Rename/delete modal state (UI-local; -1 = closed).
     in-out property <int> rename-row: -1;
@@ -763,9 +766,65 @@ export component AppWindow inherits Window {
                             clicked => { root.nav-row-clicked(idx); }
                         }
 
-                        // Workspace header: chevron + name, "+" starts a
-                        // session in this workspace. Clicking elsewhere
-                        // collapses/expands the group.
+                        // Session-list filter menu (opened from the funnel
+                        // button in the workspace header).
+                        filter-menu := PopupWindow {
+                            x: parent.width - 190px;
+                            y: 32px;
+                            width: 180px;
+                            height: 70px;
+                            Rectangle {
+                                background: #262626;
+                                border-radius: 6px;
+                                border-width: 1px;
+                                border-color: #3a3a3a;
+                                VerticalLayout {
+                                    padding: 4px;
+                                    Rectangle {
+                                        height: 24px;
+                                        Text {
+                                            x: 8px;
+                                            text: "Filters";
+                                            color: #8a8a8a;
+                                            font-size: 11px;
+                                            vertical-alignment: center;
+                                        }
+                                    }
+                                    Rectangle {
+                                        height: 30px;
+                                        background: archived-filter-ta.has-hover
+                                            ? #2b3d55 : transparent;
+                                        border-radius: 4px;
+                                        archived-filter-ta := TouchArea {
+                                            clicked => {
+                                                root.archived-filter-toggled();
+                                            }
+                                        }
+                                        HorizontalLayout {
+                                            padding-left: 8px;
+                                            padding-right: 8px;
+                                            Text {
+                                                text: "Archived";
+                                                color: #d8d8d8;
+                                                font-size: 12px;
+                                                vertical-alignment: center;
+                                                horizontal-stretch: 1;
+                                            }
+                                            if root.show-archived: Text {
+                                                text: "✓";
+                                                color: #d8d8d8;
+                                                font-size: 12px;
+                                                vertical-alignment: center;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
+                        // Workspace header: chevron + name, filter menu, and
+                        // "+" starts a session in this workspace. Clicking
+                        // elsewhere collapses/expands the group.
                         if row.kind == 0: HorizontalLayout {
                             padding-left: 8px;
                             padding-right: 4px;
@@ -784,6 +843,16 @@ export component AppWindow inherits Window {
                                 vertical-alignment: center;
                                 overflow: elide;
                                 horizontal-stretch: 1;
+                            }
+                            IconButton {
+                                width: 26px;
+                                height: 26px;
+                                y: (parent.height - self.height) / 2;
+                                border-radius: 5px;
+                                icon: "▽";
+                                icon-size: 13px;
+                                tip: "Filter sessions";
+                                clicked => { filter-menu.show(); }
                             }
                             IconButton {
                                 width: 26px;

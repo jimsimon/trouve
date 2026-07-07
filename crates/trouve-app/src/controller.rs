@@ -36,6 +36,8 @@ pub enum UiCommand {
     SessionDelete {
         row: usize,
     },
+    /// Flip the "show archived sessions" filter.
+    ToggleArchivedFilter,
     /// Native folder picker → register the chosen directory as a workspace.
     OpenWorkspaceDialog,
     /// The "+" on a workspace header row: new session there.
@@ -134,6 +136,8 @@ struct Controller {
     current_session: Option<usize>,
     archived_expanded: HashSet<String>,
     collapsed_workspaces: HashSet<String>,
+    /// Session-list filter: include archived sessions (default hidden).
+    show_archived: bool,
 
     threads: Vec<Thread>,
     current_thread: Option<usize>,
@@ -191,6 +195,7 @@ pub async fn run(
         current_session: None,
         archived_expanded: HashSet::new(),
         collapsed_workspaces: HashSet::new(),
+        show_archived: false,
         threads: Vec::new(),
         current_thread: None,
         vms: HashMap::new(),
@@ -382,7 +387,7 @@ impl Controller {
                 });
                 nav.push(NavEntry::Session(i));
             }
-            if archived_count > 0 {
+            if archived_count > 0 && self.show_archived {
                 let expanded = self.archived_expanded.contains(&ws.id);
                 rows.push(NavRowData {
                     kind: 2,
@@ -925,6 +930,11 @@ impl Controller {
                         .await?;
                     self.reload_sessions().await?;
                 }
+            }
+            UiCommand::ToggleArchivedFilter => {
+                self.show_archived = !self.show_archived;
+                ui::set_show_archived(&self.ui, self.show_archived);
+                self.push_nav();
             }
             UiCommand::SessionDelete { row } => {
                 if let Some(i) = self.nav_session(row) {

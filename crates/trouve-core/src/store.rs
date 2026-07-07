@@ -158,6 +158,8 @@ impl Store {
 
     pub fn open_in_memory() -> Result<Self> {
         let conn = Connection::open_in_memory()?;
+        // Match on-disk behavior so tests exercise the same constraints.
+        conn.pragma_update(None, "foreign_keys", "ON")?;
         conn.execute_batch(SCHEMA)?;
         apply_migrations(&conn)?;
         let (events_tx, _) = broadcast::channel(4096);
@@ -363,19 +365,26 @@ impl Store {
 
     pub fn delete_session(&self, id: &str) -> Result<()> {
         let conn = self.conn.lock().unwrap();
-        conn.execute(
+        // One transaction so a failure can't leave a half-deleted session.
+        let tx = conn.unchecked_transaction()?;
+        tx.execute(
             "DELETE FROM events WHERE (scope_kind = 'session' AND scope_id = ?1)
              OR (scope_kind = 'thread' AND scope_id IN (SELECT id FROM threads WHERE session_id = ?1))",
             params![id],
         )?;
-        conn.execute(
+        tx.execute(
             "DELETE FROM messages WHERE thread_id IN (SELECT id FROM threads WHERE session_id = ?1)",
             params![id],
         )?;
-        conn.execute("DELETE FROM usage WHERE session_id = ?1", params![id])?;
-        conn.execute("DELETE FROM checkpoints WHERE session_id = ?1", params![id])?;
-        conn.execute("DELETE FROM threads WHERE session_id = ?1", params![id])?;
-        conn.execute("DELETE FROM sessions WHERE id = ?1", params![id])?;
+        tx.execute(
+            "DELETE FROM backend_sessions WHERE thread_id IN (SELECT id FROM threads WHERE session_id = ?1)",
+            params![id],
+        )?;
+        tx.execute("DELETE FROM usage WHERE session_id = ?1", params![id])?;
+        tx.execute("DELETE FROM checkpoints WHERE session_id = ?1", params![id])?;
+        tx.execute("DELETE FROM threads WHERE session_id = ?1", params![id])?;
+        tx.execute("DELETE FROM sessions WHERE id = ?1", params![id])?;
+        tx.commit()?;
         Ok(())
     }
 
@@ -856,6 +865,46 @@ mod tests {
         let got = store.session("se_1").unwrap().unwrap();
         assert_eq!(got.title, "after");
         assert!(!got.archived);
+    }
+
+    #[test]
+    fn delete_session_clears_backend_session_links() {
+        let store = Store::open_in_memory().unwrap();
+        let ws = Workspace {
+            id: "ws_1".into(),
+            name: "x".into(),
+            path: "/tmp/repo".into(),
+        };
+        store.insert_workspace(&ws).unwrap();
+        let session = Session {
+            id: "se_1".into(),
+            workspace_id: ws.id.clone(),
+            title: "t".into(),
+            branch: "b".into(),
+            worktree_path: "/tmp/wt".into(),
+            base_ref: "main".into(),
+            archived: false,
+            created_at: chrono::Utc::now(),
+        };
+        store.insert_session(&session).unwrap();
+        let thread = Thread {
+            id: "th_1".into(),
+            session_id: "se_1".into(),
+            mode: "code".into(),
+            model: "p/m".into(),
+            model_options: serde_json::Map::new(),
+            permission_mode: PermissionMode::Ask,
+            created_at: chrono::Utc::now(),
+        };
+        store
+            .insert_thread(&thread, &serde_json::Map::new())
+            .unwrap();
+        // The vendor-resume link is what used to trip the FK constraint.
+        store.set_backend_session("th_1", "vendor-abc").unwrap();
+
+        store.delete_session("se_1").unwrap();
+        assert!(store.session("se_1").unwrap().is_none());
+        assert!(store.backend_session("th_1").unwrap().is_none());
     }
 
     #[test]
