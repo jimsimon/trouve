@@ -159,6 +159,127 @@ component DropUpPicker inherits Rectangle {
     }
 }
 
+// Model picker with a fuzzy-search box. The filtering itself runs in Rust
+// (`filter-edited` out, `matches` back in: indices into `options`, best
+// match first), so the popup just renders whatever the harness returns.
+component SearchPicker inherits Rectangle {
+    in property <[string]> options;
+    in-out property <int> current-index: -1;
+    in property <bool> enabled: true;
+    in property <string> placeholder: "select…";
+    // Open upward (composer) or downward (forms).
+    in property <bool> up: true;
+    in property <[int]> matches;
+    callback changed(int);
+    callback filter-edited(string);
+
+    in-out property <string> query: "";
+    property <length> list-h: max(min(root.matches.length, 10), 1) * 28px;
+    property <length> popup-h: list-h + 40px;
+
+    height: 30px;
+    background: #222222;
+    border-radius: 6px;
+
+    popup := PopupWindow {
+        close-policy: close-on-click-outside;
+        x: 0;
+        y: root.up ? -root.popup-h - 8px : root.height + 4px;
+        width: max(root.width, 260px);
+        height: root.popup-h;
+
+        Rectangle {
+            background: #262626;
+            border-radius: 6px;
+            border-width: 1px;
+            border-color: #3a3a3a;
+            VerticalLayout {
+                padding: 4px;
+                spacing: 4px;
+                search := LineEdit {
+                    height: 28px;
+                    font-size: 12px;
+                    placeholder-text: "Search models…";
+                    text <=> root.query;
+                    init => { self.focus(); }
+                    edited => { root.filter-edited(self.text); }
+                    // Enter picks the top match.
+                    accepted => {
+                        if (root.matches.length > 0) {
+                            root.current-index = root.matches[0];
+                            root.changed(root.matches[0]);
+                            popup.close();
+                        }
+                    }
+                }
+                if root.matches.length == 0: Rectangle {
+                    height: 28px;
+                    Text {
+                        x: 8px;
+                        text: "no matches";
+                        color: #6a6a6a;
+                        font-size: 12px;
+                        vertical-alignment: center;
+                    }
+                }
+                ListView {
+                    for oi[k] in root.matches: Rectangle {
+                        height: 28px;
+                        background: oi == root.current-index ? #2b3d55
+                            : opt-ta.has-hover ? #2e2e2e : transparent;
+                        opt-ta := TouchArea {
+                            clicked => {
+                                root.current-index = oi;
+                                root.changed(oi);
+                                popup.close();
+                            }
+                        }
+                        Text {
+                            x: 8px;
+                            width: parent.width - 16px;
+                            text: root.options[oi];
+                            color: #d8d8d8;
+                            font-size: 12px;
+                            vertical-alignment: center;
+                            overflow: elide;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    TouchArea {
+        enabled: root.enabled;
+        clicked => {
+            // Fresh filter on every open.
+            root.query = "";
+            root.filter-edited("");
+            popup.show();
+        }
+    }
+    HorizontalLayout {
+        padding-left: 8px;
+        padding-right: 8px;
+        Text {
+            text: root.current-index >= 0 && root.current-index < root.options.length
+                ? root.options[root.current-index]
+                : root.placeholder;
+            color: root.enabled ? #d8d8d8 : #6a6a6a;
+            font-size: 12px;
+            vertical-alignment: center;
+            overflow: elide;
+            horizontal-stretch: 1;
+        }
+        Text {
+            text: root.up ? "▴" : "▾";
+            color: #8a8a8a;
+            font-size: 10px;
+            vertical-alignment: center;
+        }
+    }
+}
+
 // Shared tooltip state. Icon buttons arm it on hover/focus with their
 // window position; the AppWindow overlay shows it after a short delay.
 // `show` hands the caller a token and `unshow` only clears while that
@@ -593,6 +714,10 @@ export component AppWindow inherits Window {
 
     in property <[string]> modes;
     in property <[string]> models;
+    // Fuzzy-filtered model indices for the search pickers (Rust computes;
+    // only one picker popup is ever open, so the state is shared).
+    in property <[int]> model-filter-matches;
+    callback model-filter-changed(string);
     in-out property <int> mode-index: -1;
     in-out property <int> model-index: -1;
     callback composer-mode-changed(int);
@@ -1618,13 +1743,15 @@ export component AppWindow inherits Window {
                     VerticalLayout {
                         spacing: 2px;
                         Text { text: "Model"; color: #7a7a7a; font-size: 10px; }
-                        DropUpPicker {
+                        SearchPicker {
                             width: 210px;
                             options: root.models;
+                            matches: root.model-filter-matches;
                             current-index <=> root.model-index;
                             enabled: root.composer-enabled;
                             placeholder: "model";
                             changed(i) => { root.composer-model-changed(i); }
+                            filter-edited(q) => { root.model-filter-changed(q); }
                         }
                     }
                     if root.thinking-options.length > 0: VerticalLayout {
@@ -1819,9 +1946,13 @@ export component AppWindow inherits Window {
                         spacing: 6px;
                         horizontal-stretch: 1;
                         Text { text: "Model"; color: #c8c8c8; font-size: 12px; font-weight: 700; }
-                        ComboBox {
-                            model: root.models;
+                        SearchPicker {
+                            up: false;
+                            options: root.models;
+                            matches: root.model-filter-matches;
                             current-index <=> root.nc-model-index;
+                            placeholder: "model";
+                            filter-edited(q) => { root.model-filter-changed(q); }
                         }
                     }
                 }

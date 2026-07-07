@@ -38,6 +38,10 @@ pub fn set_error(ui: &Ui, text: &str) {
 pub fn set_pickers(ui: &Ui, modes: Vec<String>, models: Vec<String>) {
     let _ = ui.upgrade_in_event_loop(move |ui| {
         ui.set_modes(string_model(modes));
+        // A fresh list resets the search picker's filter to "everything".
+        ui.set_model_filter_matches(ModelRc::new(VecModel::from(
+            (0..models.len() as i32).collect::<Vec<i32>>(),
+        )));
         ui.set_models(string_model(models));
     });
 }

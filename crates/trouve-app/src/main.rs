@@ -8,7 +8,25 @@ mod ui;
 slint::include_modules!();
 
 use controller::UiCommand;
-use slint::ComponentHandle;
+use slint::{ComponentHandle, Model};
+
+/// Indices into `items` fuzzy-matching `query`, best score first (stable by
+/// position on ties). An empty query keeps the full list in its own order.
+fn fuzzy_match_indices(items: &[String], query: &str) -> Vec<i32> {
+    use fuzzy_matcher::{skim::SkimMatcherV2, FuzzyMatcher};
+    let query = query.trim();
+    if query.is_empty() {
+        return (0..items.len() as i32).collect();
+    }
+    let matcher = SkimMatcherV2::default();
+    let mut scored: Vec<(i64, i32)> = items
+        .iter()
+        .enumerate()
+        .filter_map(|(i, s)| matcher.fuzzy_match(s, query).map(|score| (score, i as i32)))
+        .collect();
+    scored.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
+    scored.into_iter().map(|(_, i)| i).collect()
+}
 
 fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
@@ -47,6 +65,17 @@ fn main() -> anyhow::Result<()> {
             let _ = open::that_detached(url.as_str());
         }
     });
+    {
+        // Model search picker: fuzzy-filter the model list. Pure UI-thread
+        // work, so it never round-trips through the controller.
+        let weak = window.as_weak();
+        window.on_model_filter_changed(move |query| {
+            let window = weak.unwrap();
+            let models: Vec<String> = window.get_models().iter().map(|s| s.to_string()).collect();
+            let matches = fuzzy_match_indices(&models, &query);
+            window.set_model_filter_matches(slint::ModelRc::new(slint::VecModel::from(matches)));
+        });
+    }
     {
         let tx = tx.clone();
         window.on_workspace_new_session(move |row| {
