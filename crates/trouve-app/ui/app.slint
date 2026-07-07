@@ -785,6 +785,12 @@ export component AppWindow inherits Window {
         chat-list.viewport-y = min(0px, chat-list.visible-height - chat-list.viewport-height);
     }
 
+    // Where-you-left-off bookkeeping: the controller keeps the ids current;
+    // the shell polls them (plus the live scroll offset) into resume.json.
+    in property <string> resume-session-id: "";
+    in property <string> resume-thread-id: "";
+    in-out property <length> chat-scroll <=> chat-list.viewport-y;
+
     HorizontalLayout {
         // ---------------- left: sessions ----------------
         Rectangle {

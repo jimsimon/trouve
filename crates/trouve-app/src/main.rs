@@ -340,6 +340,7 @@ fn main() -> anyhow::Result<()> {
     {
         let weak = window.as_weak();
         let last = std::cell::RefCell::new(restored);
+        let last_resume = std::cell::RefCell::new(winstate::load_resume());
         geometry_timer.start(
             slint::TimerMode::Repeated,
             std::time::Duration::from_secs(1),
@@ -354,10 +355,27 @@ fn main() -> anyhow::Result<()> {
                     (next.x, next.y) = (pos.x, pos.y);
                     (next.width, next.height) = (size.width, size.height);
                 }
-                let mut last = last.borrow_mut();
-                if *last != Some(next) {
-                    winstate::save(&next);
-                    *last = Some(next);
+                {
+                    let mut last = last.borrow_mut();
+                    if *last != Some(next) {
+                        winstate::save(&next);
+                        *last = Some(next);
+                    }
+                }
+                // Where-you-left-off bookmark. Empty session id means the
+                // controller hasn't selected anything yet — never clobber
+                // the stored bookmark with that.
+                let resume = winstate::Resume {
+                    session_id: window.get_resume_session_id().to_string(),
+                    thread_id: window.get_resume_thread_id().to_string(),
+                    scroll: window.get_chat_scroll(),
+                };
+                if !resume.session_id.is_empty() {
+                    let mut last = last_resume.borrow_mut();
+                    if last.as_ref() != Some(&resume) {
+                        winstate::save_resume(&resume);
+                        *last = Some(resume);
+                    }
                 }
             },
         );

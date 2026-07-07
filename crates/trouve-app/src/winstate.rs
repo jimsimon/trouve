@@ -39,8 +39,28 @@ impl WindowState {
     }
 }
 
+/// Where the user left off: the open session/thread and chat scroll offset
+/// (Slint viewport-y, so 0 or negative). Restored on launch when the ids
+/// still exist.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+pub struct Resume {
+    pub session_id: String,
+    #[serde(default)]
+    pub thread_id: String,
+    #[serde(default)]
+    pub scroll: f32,
+}
+
+fn config_path(file: &str) -> Option<PathBuf> {
+    dirs::config_dir().map(|d| d.join("trouve").join(file))
+}
+
 fn state_path() -> Option<PathBuf> {
-    dirs::config_dir().map(|d| d.join("trouve").join("window.json"))
+    config_path("window.json")
+}
+
+fn resume_path() -> Option<PathBuf> {
+    config_path("resume.json")
 }
 
 /// The stored state, if present and plausible.
@@ -52,11 +72,25 @@ pub fn load() -> Option<WindowState> {
 
 /// Best-effort persist; a failed write only costs restore-on-next-launch.
 pub fn save(state: &WindowState) {
-    let Some(path) = state_path() else { return };
+    write_json(state_path(), state);
+}
+
+pub fn load_resume() -> Option<Resume> {
+    let text = std::fs::read_to_string(resume_path()?).ok()?;
+    let resume: Resume = serde_json::from_str(&text).ok()?;
+    (!resume.session_id.is_empty()).then_some(resume)
+}
+
+pub fn save_resume(resume: &Resume) {
+    write_json(resume_path(), resume);
+}
+
+fn write_json<T: Serialize>(path: Option<PathBuf>, value: &T) {
+    let Some(path) = path else { return };
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
-    if let Ok(json) = serde_json::to_string_pretty(state) {
+    if let Ok(json) = serde_json::to_string_pretty(value) {
         let _ = std::fs::write(path, json);
     }
 }

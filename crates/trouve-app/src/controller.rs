@@ -312,13 +312,37 @@ impl Controller {
         self.reload_catalogs().await;
         self.reload_sessions().await?;
 
-        // Open on the most recent active session of the home workspace.
-        let initial = self
-            .sessions
-            .iter()
-            .rposition(|s| s.workspace_id == self.home_workspace_id && !s.archived);
+        // Reopen where the user left off; fall back to the most recent
+        // active session of the home workspace.
+        let resume = crate::winstate::load_resume();
+        let resumed = resume
+            .as_ref()
+            .and_then(|r| self.sessions.iter().position(|s| s.id == r.session_id));
+        let initial = resumed.or_else(|| {
+            self.sessions
+                .iter()
+                .rposition(|s| s.workspace_id == self.home_workspace_id && !s.archived)
+        });
         if let Some(index) = initial {
             self.select_session(index).await?;
+            if let (Some(r), true) = (&resume, resumed == initial && resumed.is_some()) {
+                if let Some(ti) = self.threads.iter().position(|t| t.id == r.thread_id) {
+                    if self.current_thread != Some(ti) {
+                        self.current_thread = Some(ti);
+                        self.push_threads();
+                        self.push_picker_indices();
+                        self.follow_current();
+                        self.render_chat(true);
+                        self.push_context();
+                    }
+                }
+                // Land at the saved scroll offset (render queued above; this
+                // applies after it). Best effort: virtualized row heights
+                // settle as they come on screen.
+                if r.scroll < 0.0 {
+                    ui::set_chat_scroll(&self.ui, r.scroll);
+                }
+            }
         }
         self.status(&format!("workspace: {}", workspace.name));
         Ok(())
@@ -483,6 +507,12 @@ impl Controller {
             self.current_thread.map(|i| i as i32).unwrap_or(-1)
         };
         ui::set_threads(&self.ui, tabs, selected);
+        // Keep the resume bookmark current (the shell persists it).
+        ui::set_resume_ids(
+            &self.ui,
+            self.current_session_id().unwrap_or_default(),
+            self.current_thread_id().unwrap_or_default(),
+        );
     }
 
     /// Composer pickers mirror the current thread's mode/model.
