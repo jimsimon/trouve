@@ -2,15 +2,19 @@
 //! data. Plain data crosses the controller-thread → UI-thread boundary; the
 //! UI thread maps it onto generated Slint structs.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use slint_markdown::{parse_blocks, BlockKind};
 use trouve_client_core::viewmodel::{ChatItem, ThreadViewModel, ToolCallStatus, TurnState};
 
 /// Mirrors the `ChatRow` struct in `app.slint`.
-/// Kinds: 0 user, 1 markdown block, 2 tool card, 3 turn status,
-/// 4 thinking, 5 activity (spinner + label), 6 raw response text.
-#[derive(Debug, Clone, Default)]
+/// Kinds: 0 user, 1 markdown block, 2 tool card, 3 turn status (failures),
+/// 4 thinking sub-card (nested in the agent card like tool calls),
+/// 5 activity (spinner + label), 6 raw response text,
+/// 7 card header (collapsible group for user/agent items),
+/// 8 horizontal rule between turns, 9 grouped tool-run header
+/// ("Called n tools").
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct ChatRowData {
     pub kind: i32,
     pub md_kind: i32,
@@ -23,6 +27,9 @@ pub struct ChatRowData {
     /// non-code markdown blocks; the UI thread parses it into a Slint
     /// `StyledText`. Empty for rows rendered as plain text.
     pub styled_md: String,
+    /// Text tint for markdown rows: 0 agent (default), 1 user prompt,
+    /// 2 thinking.
+    pub tone: i32,
     pub tool_name: String,
     pub tool_status: i32,
     pub detail: String,
@@ -30,8 +37,18 @@ pub struct ChatRowData {
     pub turn_state: i32,
     /// Turn number (status rows), so the UI can address per-turn actions.
     pub turn: i32,
-    /// Status rows: this turn's response is showing as raw text.
+    /// Assistant headers: this turn's response is showing as raw text.
     pub raw: bool,
+    /// Assistant headers: token/cost summary once the turn completed.
+    pub meta: String,
+    /// Header rows: stable key for the collapse toggle ("u:3", "a:5", …).
+    pub card_key: String,
+    /// Position within a collapsible card, for drawing one continuous
+    /// outline across its rows: 0 not carded, 1 header (body follows),
+    /// 2 body, 3 last body row, 4 standalone header (collapsed/empty).
+    pub card_pos: i32,
+    /// First body row of its card (slab rows pad down from the header).
+    pub card_first: bool,
 }
 
 /// Wrap inline code spans (backtick runs, CommonMark-style: closed by a run
@@ -136,145 +153,280 @@ fn tool_label(tool: &str, args: &serde_json::Value) -> String {
 /// Flatten a thread's chat items into rows. Returns the rows plus a parallel
 /// map from row index to the tool call id (for approvals/expansion).
 /// Turns listed in `raw_turns` render their assistant text as one plain
-/// (selectable) block instead of styled markdown.
+/// (selectable) block instead of styled markdown. User/assistant/thinking
+/// items get a collapsible header row; keys in `collapsed` hide the body.
 pub fn chat_rows(
     vm: &ThreadViewModel,
     expanded: &HashSet<String>,
     raw_turns: &HashSet<u64>,
+    collapsed: &HashSet<String>,
 ) -> (Vec<ChatRowData>, Vec<Option<String>>) {
-    let mut rows = Vec::new();
-    let mut call_ids = Vec::new();
-    let mut push = |row: ChatRowData, call_id: Option<String>| {
-        rows.push(row);
-        call_ids.push(call_id);
+    let mut rows: Vec<ChatRowData> = Vec::new();
+    let mut call_ids: Vec<Option<String>> = Vec::new();
+    // Tool calls and thinking render inside an assistant card: preferably
+    // the nearest assistant item before them (the response that requested
+    // them), else the next one after (turns that open with tool calls or
+    // thinking before any text). User prompts and turn-status items bound
+    // the search so nothing attaches across turns.
+    let owner: HashMap<usize, usize> = {
+        let mut owner = HashMap::new();
+        let mut prev = None;
+        for (i, item) in vm.items.iter().enumerate() {
+            match item {
+                ChatItem::Assistant { .. } => prev = Some(i),
+                ChatItem::User { .. } | ChatItem::TurnStatus { .. } => prev = None,
+                ChatItem::ToolCall { .. } | ChatItem::Thinking { .. } => {
+                    if let Some(a) = prev {
+                        owner.insert(i, a);
+                    }
+                }
+            }
+        }
+        let mut next = None;
+        for (i, item) in vm.items.iter().enumerate().rev() {
+            match item {
+                ChatItem::Assistant { .. } => next = Some(i),
+                ChatItem::User { .. } | ChatItem::TurnStatus { .. } => next = None,
+                ChatItem::ToolCall { .. } | ChatItem::Thinking { .. } => {
+                    if let (None, Some(a)) = (owner.get(&i), next) {
+                        owner.insert(i, a);
+                    }
+                }
+            }
+        }
+        owner
     };
-    for item in &vm.items {
+    // Assistant items already folded into an earlier item's card.
+    let mut merged: HashSet<usize> = HashSet::new();
+    // Item indices are stable (the event fold only appends or edits in
+    // place), so they key the collapse state.
+    for (i, item) in vm.items.iter().enumerate() {
         match item {
-            ChatItem::User { content, .. } => push(
-                ChatRowData {
-                    kind: 0,
-                    text: content.clone(),
+            ChatItem::User { content, .. } => {
+                // A user prompt starts a new turn: separate it from the
+                // previous one with a horizontal rule.
+                if !rows.is_empty() {
+                    rows.push(ChatRowData {
+                        kind: 8,
+                        ..Default::default()
+                    });
+                    call_ids.push(None);
+                }
+                let key = format!("u:{i}");
+                let open = !collapsed.contains(&key);
+                let mut body = Vec::new();
+                if open {
+                    // Prompts render as markdown too, tinted prompt-blue.
+                    push_blocks(&mut body, content);
+                    for (b, _) in &mut body {
+                        b.tone = 1;
+                    }
+                }
+                let header = ChatRowData {
+                    tool_name: "You".into(),
+                    text: preview(content),
+                    detail: content.clone(),
+                    expanded: open,
+                    card_key: key,
                     ..Default::default()
-                },
-                None,
-            ),
-            ChatItem::Assistant { turn, content, .. } => {
-                // Raw view: the whole item as one selectable plain-text row
-                // (StyledText offers no selection, this is the escape hatch).
-                if raw_turns.contains(turn) {
-                    push(
-                        ChatRowData {
-                            kind: 6,
-                            text: content.clone(),
-                            ..Default::default()
-                        },
-                        None,
-                    );
+                };
+                push_card(&mut rows, &mut call_ids, header, body);
+            }
+            ChatItem::Assistant { turn, .. } => {
+                // Consecutive assistant items (a response resuming after
+                // its tool calls) merge into one card; this run was already
+                // rendered under an earlier item's card.
+                if merged.contains(&i) {
                     continue;
                 }
-                // Markdown blocks become individual virtualized rows, so a
-                // long streaming answer never re-lays-out the whole chat.
-                for block in parse_blocks(content) {
-                    // Inline markup survives block parsing verbatim; hand
-                    // it to StyledText with block-level structure (heading
-                    // weight, bullet glyph) re-applied as markup. Code
-                    // fences stay plain text.
-                    let styled_md = match block.kind {
-                        BlockKind::Code => String::new(),
-                        BlockKind::H1 | BlockKind::H2 | BlockKind::H3 => {
-                            format!("**{}**", block.text)
+                // The run: this item plus every following assistant,
+                // (owned) tool-call, or thinking item, until something
+                // else intervenes.
+                let mut end = i;
+                let mut k = i + 1;
+                while k < vm.items.len() {
+                    match &vm.items[k] {
+                        ChatItem::Assistant { .. } => {
+                            merged.insert(k);
+                            end = k;
                         }
-                        BlockKind::Bullet => format!("•  {}", block.text),
-                        // The marker rides in the text ("1. item"); escape
-                        // its delimiter so StyledText's markdown pass can't
-                        // reinterpret the row as list syntax.
-                        BlockKind::Numbered => {
-                            let digits =
-                                block.text.bytes().take_while(u8::is_ascii_digit).count();
-                            let mut s = block.text.clone();
-                            s.insert(digits, '\\');
-                            s
-                        }
-                        BlockKind::Paragraph => block.text.clone(),
-                    };
-                    // Inline code spans get a distinct color; code fences
-                    // are excluded (empty styled_md).
-                    let styled_md = tint_code_spans(&styled_md);
-                    push(
-                        ChatRowData {
-                            kind: 1,
-                            md_kind: md_kind(block.kind),
-                            md_indent: block.indent,
-                            md_lang: block.language,
-                            text: block.text,
-                            styled_md,
-                            ..Default::default()
-                        },
-                        None,
-                    );
+                        ChatItem::ToolCall { .. } | ChatItem::Thinking { .. } => end = k,
+                        _ => break,
+                    }
+                    k += 1;
                 }
-            }
-            ChatItem::ToolCall {
-                call_id,
-                tool,
-                args,
-                status,
-                result,
-            } => {
-                let mut detail =
-                    serde_json::to_string_pretty(args).unwrap_or_else(|_| args.to_string());
-                if let Some(result) = result {
-                    detail.push_str("\n→ ");
-                    detail.push_str(
-                        &serde_json::to_string_pretty(result)
-                            .unwrap_or_else(|_| result.to_string()),
-                    );
-                }
-                if detail.len() > 4000 {
-                    detail.truncate(detail.floor_boundary(4000));
-                    detail.push('…');
-                }
-                push(
-                    ChatRowData {
-                        kind: 2,
-                        tool_name: tool_label(tool, args),
-                        tool_status: tool_status(*status),
-                        detail,
-                        expanded: expanded.contains(call_id),
-                        ..Default::default()
-                    },
-                    Some(call_id.clone()),
-                );
-            }
-            ChatItem::Thinking { content, .. } => push(
-                ChatRowData {
-                    kind: 4,
-                    text: content.clone(),
-                    ..Default::default()
-                },
-                None,
-            ),
-            ChatItem::TurnStatus { turn, state } => {
-                let (text, code) = match state {
-                    // Progress shows as the trailing activity row instead.
-                    TurnState::Running => continue,
-                    TurnState::Completed { usage } => (turn_summary(usage), 1),
-                    TurnState::Failed { error } => (format!("failed: {error}"), 2),
+                let run_content = |m: usize| match &vm.items[m] {
+                    ChatItem::Assistant { content, .. } => content.as_str(),
+                    _ => "",
                 };
-                push(
-                    ChatRowData {
-                        kind: 3,
-                        text,
-                        turn_state: code,
-                        // The turn's full assistant markdown, for the
-                        // "copy response" button on the status row.
-                        detail: turn_response(vm, *turn),
-                        turn: *turn as i32,
-                        raw: raw_turns.contains(turn),
-                        ..Default::default()
-                    },
-                    None,
+                let joined = (i..=end)
+                    .map(run_content)
+                    .filter(|s| !s.is_empty())
+                    .collect::<Vec<_>>()
+                    .join("\n\n");
+                let key = format!("a:{i}");
+                let open = !collapsed.contains(&key);
+                let raw = raw_turns.contains(turn);
+                let done = turn_state(vm, *turn).is_some();
+                let mut body = Vec::new();
+                if open {
+                    // Tool calls / thinking issued before any text
+                    // streamed.
+                    let mut lead: Vec<usize> = owner
+                        .iter()
+                        .filter(|&(&j, &a)| a == i && j < i)
+                        .map(|(&j, _)| j)
+                        .collect();
+                    lead.sort_unstable();
+                    nested_rows(&mut body, vm, &lead, i, done, collapsed, expanded);
+                    // Walk the run in order: text stretches become markdown
+                    // rows — or, in raw view, one selectable plain-text row
+                    // per stretch (StyledText offers no selection, this is
+                    // the escape hatch) — while tool-call and thinking
+                    // stretches nest where they happened.
+                    let mut k = i;
+                    while k <= end {
+                        match &vm.items[k] {
+                            ChatItem::Assistant { .. } => {
+                                let start = k;
+                                while k <= end
+                                    && matches!(vm.items[k], ChatItem::Assistant { .. })
+                                {
+                                    k += 1;
+                                }
+                                let stretch = (start..k)
+                                    .map(run_content)
+                                    .filter(|s| !s.is_empty())
+                                    .collect::<Vec<_>>()
+                                    .join("\n\n");
+                                if stretch.is_empty() {
+                                    // Nothing streamed yet for this item.
+                                } else if raw {
+                                    body.push((
+                                        ChatRowData {
+                                            kind: 6,
+                                            text: stretch,
+                                            ..Default::default()
+                                        },
+                                        None,
+                                    ));
+                                } else {
+                                    push_blocks(&mut body, &stretch);
+                                }
+                            }
+                            _ => {
+                                let start = k;
+                                while k <= end
+                                    && !matches!(vm.items[k], ChatItem::Assistant { .. })
+                                {
+                                    k += 1;
+                                }
+                                let run: Vec<usize> = (start..k).collect();
+                                nested_rows(&mut body, vm, &run, i, done, collapsed, expanded);
+                            }
+                        }
+                    }
+                }
+                // The turn's token/cost summary shows in the header of the
+                // turn's last card (where the status row used to sit).
+                let last_of_turn = !vm.items[end + 1..].iter().any(
+                    |it| matches!(it, ChatItem::Assistant { turn: t, .. } if t == turn),
                 );
+                let meta = match (last_of_turn, turn_state(vm, *turn)) {
+                    (true, Some(TurnState::Completed { usage })) => turn_summary(usage),
+                    _ => String::new(),
+                };
+                let header = ChatRowData {
+                    tool_name: "Agent".into(),
+                    text: preview(&joined),
+                    // The header copy button mirrors what's on screen: the
+                    // markdown source in raw view, rendered-ish plain text
+                    // (inline markers stripped) in styled view.
+                    detail: if raw {
+                        joined.clone()
+                    } else {
+                        plain_text(&joined)
+                    },
+                    expanded: open,
+                    card_key: key,
+                    turn: *turn as i32,
+                    raw,
+                    meta,
+                    ..Default::default()
+                };
+                push_card(&mut rows, &mut call_ids, header, body);
+            }
+            ChatItem::ToolCall { .. } | ChatItem::Thinking { .. } => {
+                // Owned tool calls / thinking were rendered inside their
+                // assistant card; ones folded into an earlier synthesized
+                // card below are done too.
+                if owner.contains_key(&i) || merged.contains(&i) {
+                    continue;
+                }
+                // No assistant item exists yet (a turn that opens with
+                // tool calls or thinking, still streaming) — synthesize
+                // the Agent card around the run now so the wrapper is
+                // present for the whole turn instead of popping in with
+                // the first text.
+                let mut run = vec![i];
+                let mut k = i + 1;
+                while k < vm.items.len() && !owner.contains_key(&k) {
+                    if matches!(
+                        vm.items[k],
+                        ChatItem::ToolCall { .. } | ChatItem::Thinking { .. }
+                    ) {
+                        merged.insert(k);
+                        run.push(k);
+                    } else {
+                        break;
+                    }
+                    k += 1;
+                }
+                // The enclosing turn, from the prompt that started it.
+                let turn = vm.items[..i]
+                    .iter()
+                    .rev()
+                    .find_map(|it| match it {
+                        ChatItem::User { turn, .. } => Some(*turn),
+                        _ => None,
+                    })
+                    .unwrap_or(0);
+                let key = format!("a:{i}");
+                let open = !collapsed.contains(&key);
+                let done = turn_state(vm, turn).is_some();
+                let mut body = Vec::new();
+                if open {
+                    nested_rows(&mut body, vm, &run, i, done, collapsed, expanded);
+                }
+                // Orphan items mean no assistant item in this turn, so this
+                // card is where the turn summary lands once it completes.
+                let meta = match turn_state(vm, turn) {
+                    Some(TurnState::Completed { usage }) => turn_summary(usage),
+                    _ => String::new(),
+                };
+                let header = ChatRowData {
+                    tool_name: "Agent".into(),
+                    expanded: open,
+                    card_key: key,
+                    turn: turn as i32,
+                    meta,
+                    ..Default::default()
+                };
+                push_card(&mut rows, &mut call_ids, header, body);
+            }
+            ChatItem::TurnStatus { state, .. } => {
+                // Completed turns show their summary in the assistant card
+                // header instead; running turns show the activity row.
+                let TurnState::Failed { error } = state else {
+                    continue;
+                };
+                rows.push(ChatRowData {
+                    kind: 3,
+                    text: format!("failed: {error}"),
+                    turn_state: 2,
+                    ..Default::default()
+                });
+                call_ids.push(None);
             }
         }
     }
@@ -284,32 +436,279 @@ pub fn chat_rows(
         } else {
             "Processing…"
         };
-        push(
-            ChatRowData {
-                kind: 5,
-                text: label.into(),
-                ..Default::default()
-            },
-            None,
-        );
+        rows.push(ChatRowData {
+            kind: 5,
+            text: label.into(),
+            ..Default::default()
+        });
+        call_ids.push(None);
     }
     (rows, call_ids)
 }
 
-/// All assistant markdown of one turn, joined — the payload for the
-/// "copy response" button. (StyledText offers no selection, so this is the
-/// only way to get a styled response out of the app as text.)
-fn turn_response(vm: &ThreadViewModel, turn: u64) -> String {
-    vm.items
-        .iter()
-        .filter_map(|item| match item {
-            ChatItem::Assistant { turn: t, content, .. } if *t == turn => {
-                Some(content.as_str())
+/// Append a collapsible card: the (caller-built) header row, then the body
+/// rows (each with an optional tool call id) positioned so the UI can draw
+/// one continuous outline (`card_pos`). Body rows inherit the header's
+/// title so the outline keeps its tint — except tool rows, whose
+/// `tool_name` is the visible label.
+fn push_card(
+    rows: &mut Vec<ChatRowData>,
+    call_ids: &mut Vec<Option<String>>,
+    mut header: ChatRowData,
+    body: Vec<(ChatRowData, Option<String>)>,
+) {
+    let n = body.len();
+    let title = header.tool_name.clone();
+    header.kind = 7;
+    header.card_pos = if n == 0 { 4 } else { 1 };
+    rows.push(header);
+    call_ids.push(None);
+    for (j, (mut b, id)) in body.into_iter().enumerate() {
+        b.card_pos = if j + 1 == n { 3 } else { 2 };
+        b.card_first = j == 0;
+        if b.kind != 2 {
+            b.tool_name = title.clone();
+        }
+        rows.push(b);
+        call_ids.push(id);
+    }
+}
+
+/// Append a mixed stretch of tool-call and thinking items to a card body,
+/// in order: consecutive tool calls group via [`tool_run_rows`]; each
+/// thinking item becomes one collapsible kind-4 sub-card (expanded by
+/// default, keyed by its item index).
+fn nested_rows(
+    body: &mut Vec<(ChatRowData, Option<String>)>,
+    vm: &ThreadViewModel,
+    run: &[usize],
+    anchor: usize,
+    done: bool,
+    collapsed: &HashSet<String>,
+    expanded: &HashSet<String>,
+) {
+    let mut p = 0;
+    while p < run.len() {
+        let j = run[p];
+        if let ChatItem::Thinking { content, .. } = &vm.items[j] {
+            let key = format!("t:{j}");
+            let open = !collapsed.contains(&key);
+            // Purple header pill; the content follows as ordinary markdown
+            // rows (tone 2), indented one level under the pill.
+            body.push((
+                ChatRowData {
+                    kind: 4,
+                    detail: content.clone(),
+                    // Header teaser for the collapsed state.
+                    meta: preview(content),
+                    expanded: open,
+                    card_key: key,
+                    ..Default::default()
+                },
+                None,
+            ));
+            if open {
+                let start = body.len();
+                push_blocks(body, content);
+                for (b, _) in &mut body[start..] {
+                    b.tone = 2;
+                }
             }
-            _ => None,
+            p += 1;
+        } else {
+            let start = p;
+            while p < run.len() && matches!(vm.items[run[p]], ChatItem::ToolCall { .. }) {
+                p += 1;
+            }
+            // Group keys stay stable across renders: first tool's item
+            // index plus the owning card's anchor.
+            let gkey = format!("g{}:{anchor}", run[start]);
+            tool_run_rows(body, vm, &run[start..p], gkey, done, collapsed, expanded);
+        }
+    }
+}
+
+/// Append a run of tool-call items to a card body. Runs of 2+ consecutive
+/// tool calls fold under one "Called n tools" header (kind 9) — expanded
+/// while the turn streams so progress is visible, collapsed by default once
+/// it's done (`gkey` in `collapsed` flips whichever default applies).
+fn tool_run_rows(
+    body: &mut Vec<(ChatRowData, Option<String>)>,
+    vm: &ThreadViewModel,
+    run: &[usize],
+    gkey: String,
+    done: bool,
+    collapsed: &HashSet<String>,
+    expanded: &HashSet<String>,
+) {
+    let tool_body = |j: usize| {
+        let ChatItem::ToolCall {
+            call_id,
+            tool,
+            args,
+            status,
+            result,
+        } = &vm.items[j]
+        else {
+            unreachable!("tool runs hold only tool-call items");
+        };
+        (
+            tool_row(call_id, tool, args, *status, result, expanded),
+            Some(call_id.clone()),
+        )
+    };
+    if run.len() < 2 {
+        body.extend(run.iter().map(|&j| tool_body(j)));
+        return;
+    }
+    // A pending approval must be visible to be answered: it holds the
+    // group open regardless of the collapse toggle.
+    let needs_approval = run.iter().any(|&j| {
+        matches!(
+            &vm.items[j],
+            ChatItem::ToolCall {
+                status: ToolCallStatus::AwaitingApproval,
+                ..
+            }
+        )
+    });
+    let toggled = collapsed.contains(&gkey);
+    let g_open = needs_approval || if done { toggled } else { !toggled };
+    body.push((
+        ChatRowData {
+            kind: 9,
+            text: format!("Called {} tools", run.len()),
+            expanded: g_open,
+            card_key: gkey,
+            ..Default::default()
+        },
+        None,
+    ));
+    if g_open {
+        // One indent level under the group header.
+        body.extend(run.iter().map(|&j| {
+            let (mut row, id) = tool_body(j);
+            row.md_indent = 1;
+            (row, id)
+        }));
+    }
+}
+
+/// Append one assistant text segment as markdown-block rows. Each block is
+/// an individual virtualized row, so a long streaming answer never
+/// re-lays-out the whole chat.
+fn push_blocks(body: &mut Vec<(ChatRowData, Option<String>)>, content: &str) {
+    for block in parse_blocks(content) {
+        // Inline markup survives block parsing verbatim; hand it to
+        // StyledText with block-level structure (heading weight, bullet
+        // glyph) re-applied as markup. Code fences stay plain text.
+        let styled_md = match block.kind {
+            BlockKind::Code => String::new(),
+            BlockKind::H1 | BlockKind::H2 | BlockKind::H3 => {
+                format!("**{}**", block.text)
+            }
+            BlockKind::Bullet => format!("•  {}", block.text),
+            // The marker rides in the text ("1. item"); escape its
+            // delimiter so StyledText's markdown pass can't reinterpret
+            // the row as list syntax.
+            BlockKind::Numbered => {
+                let digits = block.text.bytes().take_while(u8::is_ascii_digit).count();
+                let mut s = block.text.clone();
+                s.insert(digits, '\\');
+                s
+            }
+            BlockKind::Paragraph => block.text.clone(),
+        };
+        // Inline code spans get a distinct color; code fences are
+        // excluded (empty styled_md).
+        let styled_md = tint_code_spans(&styled_md);
+        body.push((
+            ChatRowData {
+                kind: 1,
+                md_kind: md_kind(block.kind),
+                md_indent: block.indent,
+                md_lang: block.language,
+                text: block.text,
+                styled_md,
+                ..Default::default()
+            },
+            None,
+        ));
+    }
+}
+
+/// Build the row for one tool call card (used standalone and inside
+/// assistant card bodies).
+fn tool_row(
+    call_id: &str,
+    tool: &str,
+    args: &serde_json::Value,
+    status: ToolCallStatus,
+    result: &Option<serde_json::Value>,
+    expanded: &HashSet<String>,
+) -> ChatRowData {
+    let mut detail = serde_json::to_string_pretty(args).unwrap_or_else(|_| args.to_string());
+    if let Some(result) = result {
+        detail.push_str("\n→ ");
+        detail.push_str(
+            &serde_json::to_string_pretty(result).unwrap_or_else(|_| result.to_string()),
+        );
+    }
+    if detail.len() > 4000 {
+        detail.truncate(detail.floor_boundary(4000));
+        detail.push('…');
+    }
+    ChatRowData {
+        kind: 2,
+        tool_name: tool_label(tool, args),
+        tool_status: tool_status(status),
+        detail,
+        expanded: expanded.contains(call_id),
+        ..Default::default()
+    }
+}
+
+/// One-line teaser for a collapsed card header: the first non-empty line,
+/// capped; the header row elides it further to fit.
+fn preview(content: &str) -> String {
+    let line = content
+        .lines()
+        .find(|l| !l.trim().is_empty())
+        .unwrap_or_default();
+    let mut s = line.trim().to_string();
+    if s.len() > 120 {
+        s.truncate(s.floor_boundary(119));
+        s.push('…');
+    }
+    s
+}
+
+/// The final state of a turn, if its status item arrived.
+fn turn_state(vm: &ThreadViewModel, turn: u64) -> Option<&TurnState> {
+    vm.items.iter().find_map(|item| match item {
+        ChatItem::TurnStatus { turn: t, state } if *t == turn => Some(state),
+        _ => None,
+    })
+}
+
+/// Approximate the on-screen text of a styled markdown response for the
+/// header copy button: block structure kept, inline markers (emphasis,
+/// code-span backticks) stripped, bullets rendered as they display.
+fn plain_text(md: &str) -> String {
+    let strip = |s: &str| s.replace("**", "").replace('`', "");
+    parse_blocks(md)
+        .iter()
+        .map(|b| match b.kind {
+            BlockKind::Code => b.text.clone(),
+            BlockKind::Bullet => format!(
+                "{}•  {}",
+                "  ".repeat(b.indent as usize),
+                strip(&b.text)
+            ),
+            _ => strip(&b.text),
         })
         .collect::<Vec<_>>()
-        .join("\n\n")
+        .join("\n")
 }
 
 /// Turn header: token counts, plus the dollar cost for per-use APIs.
@@ -339,28 +738,49 @@ impl FloorBoundary for String {
     }
 }
 
+fn syntect_assets() -> &'static (syntect::parsing::SyntaxSet, syntect::highlighting::ThemeSet) {
+    use std::sync::OnceLock;
+    static ASSETS: OnceLock<(syntect::parsing::SyntaxSet, syntect::highlighting::ThemeSet)> =
+        OnceLock::new();
+    ASSETS.get_or_init(|| {
+        (
+            syntect::parsing::SyntaxSet::load_defaults_newlines(),
+            syntect::highlighting::ThemeSet::load_defaults(),
+        )
+    })
+}
+
 /// Syntax-highlight file content into per-line `(text, rgb)` segments.
 pub fn highlight_file(path: &str, content: &str) -> Vec<Vec<(String, u32)>> {
-    use std::sync::OnceLock;
-    use syntect::easy::HighlightLines;
-    use syntect::highlighting::ThemeSet;
-    use syntect::parsing::SyntaxSet;
-    use syntect::util::LinesWithEndings;
-
-    static ASSETS: OnceLock<(SyntaxSet, ThemeSet)> = OnceLock::new();
-    let (syntaxes, themes) = ASSETS.get_or_init(|| {
-        (
-            SyntaxSet::load_defaults_newlines(),
-            ThemeSet::load_defaults(),
-        )
-    });
-    let theme = &themes.themes["base16-ocean.dark"];
+    let (syntaxes, _) = syntect_assets();
     let syntax = std::path::Path::new(path)
         .extension()
         .and_then(|e| e.to_str())
         .and_then(|e| syntaxes.find_syntax_by_extension(e))
         .unwrap_or_else(|| syntaxes.find_syntax_plain_text());
+    highlight_lines(syntax, content)
+}
 
+/// Syntax-highlight a fenced code block by its language tag ("rust",
+/// "py", …). Unknown or empty tags fall back to plain text (default
+/// foreground).
+pub fn highlight_code(lang: &str, content: &str) -> Vec<Vec<(String, u32)>> {
+    let (syntaxes, _) = syntect_assets();
+    let syntax = syntaxes
+        .find_syntax_by_token(lang)
+        .unwrap_or_else(|| syntaxes.find_syntax_plain_text());
+    highlight_lines(syntax, content)
+}
+
+fn highlight_lines(
+    syntax: &syntect::parsing::SyntaxReference,
+    content: &str,
+) -> Vec<Vec<(String, u32)>> {
+    use syntect::easy::HighlightLines;
+    use syntect::util::LinesWithEndings;
+
+    let (syntaxes, themes) = syntect_assets();
+    let theme = &themes.themes["base16-ocean.dark"];
     let mut highlighter = HighlightLines::new(syntax, theme);
     let mut lines = Vec::new();
     for line in LinesWithEndings::from(content) {
@@ -432,15 +852,15 @@ mod tests {
             turn_running: true,
             ..Default::default()
         };
-        let (rows, _) = chat_rows(&vm, &HashSet::new(), &HashSet::new());
+        let (rows, _) = chat_rows(&vm, &HashSet::new(), &HashSet::new(), &HashSet::new());
         assert_eq!(rows.last().unwrap().kind, 5);
         assert_eq!(rows.last().unwrap().text, "Processing…");
         vm.thinking = true;
-        let (rows, _) = chat_rows(&vm, &HashSet::new(), &HashSet::new());
+        let (rows, _) = chat_rows(&vm, &HashSet::new(), &HashSet::new(), &HashSet::new());
         assert_eq!(rows.last().unwrap().text, "Thinking…");
         vm.turn_running = false;
         vm.thinking = false;
-        let (rows, _) = chat_rows(&vm, &HashSet::new(), &HashSet::new());
+        let (rows, _) = chat_rows(&vm, &HashSet::new(), &HashSet::new(), &HashSet::new());
         assert!(rows.is_empty());
     }
 
@@ -454,19 +874,27 @@ mod tests {
             }],
             ..Default::default()
         };
-        // Styled: one row per markdown block.
-        let (rows, _) = chat_rows(&vm, &HashSet::new(), &HashSet::new());
-        assert!(rows.len() > 1);
-        // Raw: the whole item as a single kind-6 row of markdown source.
+        // Styled: a card header, then one row per markdown block.
+        let (rows, _) = chat_rows(&vm, &HashSet::new(), &HashSet::new(), &HashSet::new());
+        assert_eq!(rows[0].kind, 7);
+        assert!(rows.len() > 2);
+        // Raw: header plus a single kind-6 row of markdown source.
         let raw: HashSet<u64> = [3].into();
-        let (rows, _) = chat_rows(&vm, &HashSet::new(), &raw);
+        let (rows, _) = chat_rows(&vm, &HashSet::new(), &raw, &HashSet::new());
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[1].kind, 6);
+        assert_eq!(rows[1].text, "# heading\n\nbody `code`");
+        // Collapsed: the header alone, with a one-line preview.
+        let collapsed: HashSet<String> = ["a:0".to_string()].into();
+        let (rows, _) = chat_rows(&vm, &HashSet::new(), &HashSet::new(), &collapsed);
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].kind, 6);
-        assert_eq!(rows[0].text, "# heading\n\nbody `code`");
+        assert_eq!(rows[0].kind, 7);
+        assert!(!rows[0].expanded);
+        assert_eq!(rows[0].text, "# heading");
     }
 
     #[test]
-    fn turn_status_carries_the_turns_response_for_copying() {
+    fn turn_summary_moves_to_the_last_assistant_header() {
         let vm = ThreadViewModel {
             items: vec![
                 ChatItem::Assistant {
@@ -476,7 +904,7 @@ mod tests {
                 },
                 ChatItem::Assistant {
                     turn: 1,
-                    content: "part two".into(),
+                    content: "part **two**".into(),
                     complete: true,
                 },
                 ChatItem::TurnStatus {
@@ -488,9 +916,240 @@ mod tests {
             ],
             ..Default::default()
         };
-        let (rows, _) = chat_rows(&vm, &HashSet::new(), &HashSet::new());
-        let status = rows.iter().find(|r| r.kind == 3).unwrap();
-        assert_eq!(status.detail, "part one\n\npart two");
+        let (rows, _) = chat_rows(&vm, &HashSet::new(), &HashSet::new(), &HashSet::new());
+        // Completed turns no longer emit a status row; the summary rides in
+        // the merged assistant card's header.
+        assert!(!rows.iter().any(|r| r.kind == 3));
+        let headers: Vec<_> = rows
+            .iter()
+            .filter(|r| r.kind == 7 && r.tool_name == "Agent")
+            .collect();
+        // Consecutive assistant items fold into one card.
+        assert_eq!(headers.len(), 1);
+        assert_eq!(headers[0].meta, "0 in / 0 out tokens");
+        // Styled view: the copy payload is the stripped display text of
+        // the whole run.
+        assert_eq!(headers[0].detail, "part one\npart two");
+        // Raw view: the copy payload is the joined markdown source.
+        let raw: HashSet<u64> = [1].into();
+        let (rows, _) = chat_rows(&vm, &HashSet::new(), &raw, &HashSet::new());
+        let header = rows
+            .iter()
+            .find(|r| r.kind == 7 && r.tool_name == "Agent")
+            .unwrap();
+        assert_eq!(header.detail, "part one\n\npart **two**");
+    }
+
+    #[test]
+    fn tool_calls_nest_in_their_turns_assistant_card() {
+        let tool = |id: &str| ChatItem::ToolCall {
+            call_id: id.into(),
+            tool: "search".into(),
+            args: serde_json::json!({}),
+            status: ToolCallStatus::Ok,
+            result: None,
+        };
+        let mut vm = ThreadViewModel {
+            items: vec![
+                ChatItem::User {
+                    turn: 1,
+                    content: "q".into(),
+                },
+                // The agent searched before writing any text.
+                tool("t1"),
+                tool("t2"),
+                ChatItem::Assistant {
+                    turn: 1,
+                    content: "answer".into(),
+                    complete: true,
+                },
+                tool("t3"),
+            ],
+            ..Default::default()
+        };
+        let (rows, ids) = chat_rows(&vm, &HashSet::new(), &HashSet::new(), &HashSet::new());
+        // Streaming turn: You header, prompt, Assistant header, the 2-tool
+        // run under an expanded group header, text, trailing single tool —
+        // every tool row inside the card outline.
+        let kinds: Vec<i32> = rows.iter().map(|r| r.kind).collect();
+        assert_eq!(kinds, vec![7, 1, 7, 9, 2, 2, 1, 2]);
+        assert_eq!(rows[3].text, "Called 2 tools");
+        assert!(rows[3].expanded);
+        assert!(rows[3..].iter().all(|r| r.card_pos >= 2));
+        assert_eq!(rows.last().unwrap().card_pos, 3);
+        assert_eq!(ids[4].as_deref(), Some("t1"));
+        assert_eq!(ids[7].as_deref(), Some("t3"));
+        // Once the turn completes, the run collapses by default.
+        vm.items.push(ChatItem::TurnStatus {
+            turn: 1,
+            state: TurnState::Completed {
+                usage: Default::default(),
+            },
+        });
+        let (rows, _) = chat_rows(&vm, &HashSet::new(), &HashSet::new(), &HashSet::new());
+        let kinds: Vec<i32> = rows.iter().map(|r| r.kind).collect();
+        assert_eq!(kinds, vec![7, 1, 7, 9, 1, 2]);
+        assert!(!rows[3].expanded);
+        // Toggling the group key (first tool's item index + the owning
+        // card's anchor) reopens it.
+        let opened: HashSet<String> = ["g1:3".to_string()].into();
+        let (rows, _) = chat_rows(&vm, &HashSet::new(), &HashSet::new(), &opened);
+        let kinds: Vec<i32> = rows.iter().map(|r| r.kind).collect();
+        assert_eq!(kinds, vec![7, 1, 7, 9, 2, 2, 1, 2]);
+        // A tool call with no assistant item (yet) still gets an Assistant
+        // wrapper card, so the panel is present from the turn's first tool.
+        let vm = ThreadViewModel {
+            items: vec![tool("t9")],
+            ..Default::default()
+        };
+        let (rows, ids) = chat_rows(&vm, &HashSet::new(), &HashSet::new(), &HashSet::new());
+        let kinds: Vec<i32> = rows.iter().map(|r| r.kind).collect();
+        assert_eq!(kinds, vec![7, 2]);
+        assert_eq!(rows[0].tool_name, "Agent");
+        assert_eq!(rows[1].card_pos, 3);
+        assert_eq!(ids[1].as_deref(), Some("t9"));
+    }
+
+    #[test]
+    fn thinking_nests_in_the_agent_card() {
+        let vm = ThreadViewModel {
+            items: vec![
+                ChatItem::User {
+                    turn: 1,
+                    content: "q".into(),
+                },
+                // Thinking before any text (owned by the following
+                // assistant item)…
+                ChatItem::Thinking {
+                    turn: 1,
+                    content: "hmm, let me see".into(),
+                    complete: true,
+                },
+                ChatItem::Assistant {
+                    turn: 1,
+                    content: "part one".into(),
+                    complete: true,
+                },
+                // …and mid-response thinking between text segments.
+                ChatItem::Thinking {
+                    turn: 1,
+                    content: "more thought".into(),
+                    complete: true,
+                },
+                ChatItem::Assistant {
+                    turn: 1,
+                    content: "part two".into(),
+                    complete: true,
+                },
+            ],
+            ..Default::default()
+        };
+        let (rows, _) = chat_rows(&vm, &HashSet::new(), &HashSet::new(), &HashSet::new());
+        // One You card, one Agent card; each thinking item renders as a
+        // kind-4 header pill followed by its content as markdown rows
+        // (tone 2), in stream order.
+        let kinds: Vec<i32> = rows.iter().map(|r| r.kind).collect();
+        assert_eq!(kinds, vec![7, 1, 7, 4, 1, 1, 4, 1, 1]);
+        let think: Vec<_> = rows.iter().filter(|r| r.kind == 4).collect();
+        assert_eq!(think[0].card_key, "t:1");
+        assert!(think[0].expanded, "expanded by default");
+        assert_eq!(think[0].meta, "hmm, let me see");
+        assert_eq!(rows[4].tone, 2, "thinking content is tinted");
+        assert_eq!(rows[5].tone, 0, "agent text is not");
+        assert!(rows[3..].iter().all(|r| r.card_pos >= 2), "all nested");
+        // Collapsing one thinking block keeps its header pill only.
+        let collapsed: HashSet<String> = ["t:1".to_string()].into();
+        let (rows, _) = chat_rows(&vm, &HashSet::new(), &HashSet::new(), &collapsed);
+        let kinds: Vec<i32> = rows.iter().map(|r| r.kind).collect();
+        assert_eq!(kinds, vec![7, 1, 7, 4, 1, 4, 1, 1]);
+        let think: Vec<_> = rows.iter().filter(|r| r.kind == 4).collect();
+        assert!(!think[0].expanded);
+        assert!(think[1].expanded);
+        // Raw view keeps stream order too: each text stretch becomes a
+        // kind-6 row in place, not one blob hoisted to the top.
+        let raw: HashSet<u64> = [1].into();
+        let (rows, _) = chat_rows(&vm, &HashSet::new(), &raw, &HashSet::new());
+        let kinds: Vec<i32> = rows.iter().map(|r| r.kind).collect();
+        assert_eq!(kinds, vec![7, 1, 7, 4, 1, 6, 4, 1, 6]);
+        assert_eq!(rows[5].text, "part one");
+        assert_eq!(rows[8].text, "part two");
+    }
+
+    #[test]
+    fn streaming_tools_before_any_text_get_the_assistant_wrapper() {
+        let tool = |id: &str| ChatItem::ToolCall {
+            call_id: id.into(),
+            tool: "search".into(),
+            args: serde_json::json!({}),
+            status: ToolCallStatus::Running,
+            result: None,
+        };
+        // Mid-turn: the agent has made three tool calls but streamed no
+        // text yet, so no Assistant item exists.
+        let mut vm = ThreadViewModel {
+            items: vec![
+                ChatItem::User {
+                    turn: 2,
+                    content: "weather?".into(),
+                },
+                tool("t1"),
+                tool("t2"),
+                tool("t3"),
+            ],
+            turn_running: true,
+            ..Default::default()
+        };
+        let (rows, _) = chat_rows(&vm, &HashSet::new(), &HashSet::new(), &HashSet::new());
+        // You card, then a synthesized Assistant card wrapping the grouped
+        // run, then the activity row.
+        let kinds: Vec<i32> = rows.iter().map(|r| r.kind).collect();
+        assert_eq!(kinds, vec![7, 1, 7, 9, 2, 2, 2, 5]);
+        assert_eq!(rows[2].tool_name, "Agent");
+        assert_eq!(rows[2].turn, 2);
+        assert!(rows[3].expanded, "group stays open while streaming");
+        assert!(rows[3..7].iter().all(|r| r.card_pos >= 2));
+        // Once text arrives the real assistant item takes the tools over —
+        // still exactly one Assistant card.
+        vm.items.push(ChatItem::Assistant {
+            turn: 2,
+            content: "Sunny.".into(),
+            complete: false,
+        });
+        let (rows, _) = chat_rows(&vm, &HashSet::new(), &HashSet::new(), &HashSet::new());
+        let headers = rows
+            .iter()
+            .filter(|r| r.kind == 7 && r.tool_name == "Agent")
+            .count();
+        assert_eq!(headers, 1);
+    }
+
+    #[test]
+    fn user_prompts_after_the_first_get_a_rule_above() {
+        let vm = ThreadViewModel {
+            items: vec![
+                ChatItem::User {
+                    turn: 1,
+                    content: "one".into(),
+                },
+                ChatItem::Assistant {
+                    turn: 1,
+                    content: "reply".into(),
+                    complete: true,
+                },
+                ChatItem::User {
+                    turn: 2,
+                    content: "two".into(),
+                },
+            ],
+            ..Default::default()
+        };
+        let (rows, _) = chat_rows(&vm, &HashSet::new(), &HashSet::new(), &HashSet::new());
+        assert_ne!(rows[0].kind, 8, "no rule before the first turn");
+        let rules: Vec<_> = rows.iter().enumerate().filter(|(_, r)| r.kind == 8).collect();
+        assert_eq!(rules.len(), 1);
+        // The rule sits directly above the second prompt's header.
+        assert_eq!(rows[rules[0].0 + 1].kind, 7);
+        assert_eq!(rows[rules[0].0 + 1].tool_name, "You");
     }
 
     #[test]

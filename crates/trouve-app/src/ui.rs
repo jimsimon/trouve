@@ -101,30 +101,95 @@ pub fn set_threads(ui: &Ui, threads: Vec<(String, String)>, current: i32) {
     });
 }
 
+fn to_chat_row(r: &ChatRowData) -> ChatRow {
+    // Highlighting runs here — after the diff in `set_chat` — so only new
+    // or changed code blocks pay for syntect, not every block every frame.
+    let code_lines: ModelRc<ModelRc<TextSegment>> =
+        if r.kind == 1 && r.md_kind == 5 {
+            let lines: Vec<ModelRc<TextSegment>> =
+                crate::render::highlight_code(&r.md_lang, &r.text)
+                    .into_iter()
+                    .map(|segments| {
+                        let segs: Vec<TextSegment> = segments
+                            .into_iter()
+                            .map(|(text, rgb)| TextSegment {
+                                text: SharedString::from(text.as_str()),
+                                color: slint::Color::from_argb_encoded(0xff00_0000 | rgb),
+                            })
+                            .collect();
+                        ModelRc::new(VecModel::from(segs))
+                    })
+                    .collect();
+            ModelRc::new(VecModel::from(lines))
+        } else {
+            ModelRc::default()
+        };
+    ChatRow {
+        kind: r.kind,
+        md_kind: r.md_kind,
+        md_indent: r.md_indent,
+        md_lang: SharedString::from(r.md_lang.as_str()),
+        text: SharedString::from(r.text.as_str()),
+        code_lines,
+        // Malformed markup falls back to the raw text rather than
+        // dropping the row.
+        styled: slint::StyledText::from_markdown(&r.styled_md)
+            .unwrap_or_else(|_| slint::StyledText::from_plain_text(&r.styled_md)),
+        tone: r.tone,
+        tool_name: SharedString::from(r.tool_name.as_str()),
+        tool_status: r.tool_status,
+        detail: SharedString::from(r.detail.as_str()),
+        expanded: r.expanded,
+        turn_state: r.turn_state,
+        turn: r.turn,
+        raw: r.raw,
+        card_key: SharedString::from(r.card_key.as_str()),
+        card_pos: r.card_pos,
+        card_first: r.card_first,
+        meta: SharedString::from(r.meta.as_str()),
+    }
+}
+
 pub fn set_chat(ui: &Ui, rows: Vec<ChatRowData>, scroll_to_end: bool) {
+    use slint::Model as _;
+    use std::cell::RefCell;
+
+    // The previous render's source rows, for diffing (UI thread only).
+    thread_local! {
+        static LAST_CHAT: RefCell<Vec<ChatRowData>> = const { RefCell::new(Vec::new()) };
+    }
+
     let _ = ui.upgrade_in_event_loop(move |ui| {
-        let items: Vec<ChatRow> = rows
-            .into_iter()
-            .map(|r| ChatRow {
-                kind: r.kind,
-                md_kind: r.md_kind,
-                md_indent: r.md_indent,
-                md_lang: SharedString::from(r.md_lang.as_str()),
-                text: SharedString::from(r.text.as_str()),
-                // Malformed markup falls back to the raw text rather than
-                // dropping the row.
-                styled: slint::StyledText::from_markdown(&r.styled_md)
-                    .unwrap_or_else(|_| slint::StyledText::from_plain_text(&r.styled_md)),
-                tool_name: SharedString::from(r.tool_name.as_str()),
-                tool_status: r.tool_status,
-                detail: SharedString::from(r.detail.as_str()),
-                expanded: r.expanded,
-                turn_state: r.turn_state,
-                turn: r.turn,
-                raw: r.raw,
-            })
-            .collect();
-        ui.set_chat_rows(ModelRc::new(VecModel::from(items)));
+        LAST_CHAT.with(|cache| {
+            let mut cache = cache.borrow_mut();
+            let model = ui.get_chat_rows();
+            // Update the existing model in place: replacing it wholesale
+            // makes the ListView re-instantiate every row and recompute
+            // its viewport, which visibly jumps the scroll position on
+            // every expand/collapse. The cache/model length check guards
+            // against a model this function didn't build.
+            match model.as_any().downcast_ref::<VecModel<ChatRow>>() {
+                Some(vec) if vec.row_count() == cache.len() => {
+                    let common = cache.len().min(rows.len());
+                    for (i, row) in rows.iter().take(common).enumerate() {
+                        if cache[i] != *row {
+                            vec.set_row_data(i, to_chat_row(row));
+                        }
+                    }
+                    for row in &rows[common..] {
+                        vec.push(to_chat_row(row));
+                    }
+                    for i in (rows.len()..cache.len()).rev() {
+                        vec.remove(i);
+                    }
+                }
+                _ => {
+                    let items: Vec<ChatRow> = rows.iter().map(to_chat_row).collect();
+                    ui.set_chat_rows(ModelRc::new(VecModel::from(items)));
+                }
+            }
+            *cache = rows;
+        });
         if scroll_to_end {
             ui.invoke_scroll_chat_to_end();
         }

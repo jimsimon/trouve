@@ -209,6 +209,12 @@ impl ThreadViewModel {
                 if !self.pending_approvals.contains(call_id) {
                     self.pending_approvals.push(call_id.clone());
                 }
+                // Bridged approvals attach to the vendor's own tool card,
+                // which arrived as a plain Running call; flip it so the
+                // Approve/Deny UI shows there.
+                if let Some(ChatItem::ToolCall { status, .. }) = self.find_tool(call_id) {
+                    *status = ToolCallStatus::AwaitingApproval;
+                }
                 self.items.iter().rposition(
                     |i| matches!(i, ChatItem::ToolCall { call_id: c, .. } if c == call_id),
                 )
@@ -251,12 +257,17 @@ impl ThreadViewModel {
                     ..
                 }) = self.find_tool(call_id)
                 {
-                    *s = match status {
-                        ToolStatus::Ok => ToolCallStatus::Ok,
-                        ToolStatus::Error => ToolCallStatus::Error,
-                        ToolStatus::Denied => ToolCallStatus::Denied,
-                        ToolStatus::Aborted => ToolCallStatus::Aborted,
-                    };
+                    // A denied call stays denied: the vendor follows up
+                    // with an error tool_result ("user denied"), which
+                    // shouldn't repaint the card as a tool failure.
+                    if *s != ToolCallStatus::Denied {
+                        *s = match status {
+                            ToolStatus::Ok => ToolCallStatus::Ok,
+                            ToolStatus::Error => ToolCallStatus::Error,
+                            ToolStatus::Denied => ToolCallStatus::Denied,
+                            ToolStatus::Aborted => ToolCallStatus::Aborted,
+                        };
+                    }
                     *r = Some(result.clone());
                 }
                 self.pending_approvals.retain(|c| c != call_id);
@@ -451,6 +462,46 @@ mod tests {
         }));
         assert!(!vm.turn_running);
         assert_eq!(vm.last_usage, Some(usage));
+    }
+
+    #[test]
+    fn bridged_approval_attaches_to_the_vendors_tool_card() {
+        let mut vm = ThreadViewModel::new();
+        // The vendor's stream announces the call first (plain Running)…
+        vm.apply(&env(Event::ToolRequested {
+            turn: 1,
+            call_id: "toolu_1".into(),
+            tool: "Bash".into(),
+            args: serde_json::json!({"command": "ls"}),
+            requires_approval: false,
+        }));
+        vm.apply(&env(Event::ToolStarted {
+            call_id: "toolu_1".into(),
+        }));
+        // …then the bridged permission request lands on the same card.
+        vm.apply(&env(Event::ApprovalRequested {
+            turn: 1,
+            call_id: "toolu_1".into(),
+        }));
+        assert_eq!(vm.items.len(), 1, "no duplicate card for the approval");
+        assert!(matches!(
+            &vm.items[0],
+            ChatItem::ToolCall { status: ToolCallStatus::AwaitingApproval, .. }
+        ));
+        // Denial sticks even after the vendor's error tool_result.
+        vm.apply(&env(Event::ApprovalResolved {
+            call_id: "toolu_1".into(),
+            decision: ApprovalDecision::Deny,
+        }));
+        vm.apply(&env(Event::ToolCompleted {
+            call_id: "toolu_1".into(),
+            status: ToolStatus::Error,
+            result: serde_json::json!("user denied"),
+        }));
+        assert!(matches!(
+            &vm.items[0],
+            ChatItem::ToolCall { status: ToolCallStatus::Denied, result: Some(_), .. }
+        ));
     }
 
     #[test]

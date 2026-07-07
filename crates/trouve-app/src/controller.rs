@@ -66,6 +66,8 @@ pub enum UiCommand {
     ToggleTool(usize),
     /// Toggle a turn between styled markdown and raw selectable text.
     ToggleRawTurn(u64),
+    /// Collapse/expand a chat card (user/assistant/thinking header).
+    ToggleCard(String),
     ComposerModeChanged(usize),
     ComposerModelChanged(usize),
     ComposerThinkingChanged(usize),
@@ -138,6 +140,8 @@ struct Controller {
     expanded_tools: HashSet<String>,
     /// (thread id, turn) pairs showing raw text instead of styled markdown.
     raw_turns: HashSet<(String, u64)>,
+    /// (thread id, card key) pairs whose card body is collapsed.
+    collapsed_cards: HashSet<(String, String)>,
     row_call_ids: Vec<Option<String>>,
 
     modes: Vec<AgentMode>,
@@ -190,6 +194,7 @@ pub async fn run(
         followed: HashSet::new(),
         expanded_tools: HashSet::new(),
         raw_turns: HashSet::new(),
+        collapsed_cards: HashSet::new(),
         row_call_ids: Vec::new(),
         modes: Vec::new(),
         models: Vec::new(),
@@ -574,8 +579,15 @@ impl Controller {
             .filter(|(t, _)| *t == thread_id)
             .map(|(_, turn)| *turn)
             .collect();
+        let collapsed: HashSet<String> = self
+            .collapsed_cards
+            .iter()
+            .filter(|(t, _)| *t == thread_id)
+            .map(|(_, key)| key.clone())
+            .collect();
         let vm = self.vms.entry(thread_id).or_default();
-        let (rows, call_ids) = render::chat_rows(vm, &self.expanded_tools, &raw_turns);
+        let (rows, call_ids) =
+            render::chat_rows(vm, &self.expanded_tools, &raw_turns, &collapsed);
         self.row_call_ids = call_ids;
         ui::set_chat(&self.ui, rows, scroll);
         ui::set_composer_enabled(&self.ui, true);
@@ -1037,6 +1049,15 @@ impl Controller {
                     let key = (thread_id, turn);
                     if !self.raw_turns.remove(&key) {
                         self.raw_turns.insert(key);
+                    }
+                    self.render_chat(false);
+                }
+            }
+            UiCommand::ToggleCard(card_key) => {
+                if let Some(thread_id) = self.current_thread_id() {
+                    let key = (thread_id, card_key);
+                    if !self.collapsed_cards.remove(&key) {
+                        self.collapsed_cards.insert(key);
                     }
                     self.render_chat(false);
                 }

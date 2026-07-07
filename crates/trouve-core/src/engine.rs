@@ -1736,8 +1736,10 @@ impl Engine {
 
     /// Gate a vendor-side tool call (Claude Code's `--permission-prompt-tool`
     /// hook) through trouve's permission layer. The vendor executes the tool
-    /// itself if allowed; we only decide and record the decision. A synthetic
-    /// tool card carries the Approve/Deny UI and shows the outcome.
+    /// itself if allowed; we only decide and record the decision. The
+    /// approval attaches to the tool card the vendor's stream already
+    /// created (the `tool_use` block precedes the permission request); a
+    /// synthetic card is the fallback when no open call matches.
     pub async fn bridged_approval(
         &self,
         thread_id: &str,
@@ -1749,39 +1751,91 @@ impl Engine {
             .store
             .last_turn(thread_id)
             .map_err(EngineError::Internal)?;
-        let call_id = new_id("appr");
         let scope = Scope::Thread(thread.id.clone());
-        self.store
-            .append_event(
-                scope.clone(),
-                Event::ToolRequested {
-                    turn,
-                    call_id: call_id.clone(),
-                    tool: tool.to_string(),
-                    args: args.clone(),
-                    requires_approval: true,
-                },
-            )
-            .map_err(EngineError::Internal)?;
+        let matched = self.open_vendor_call(&thread.id, turn, tool, args);
+        let synthetic = matched.is_none();
+        let call_id = matched.unwrap_or_else(|| new_id("appr"));
+        if synthetic {
+            self.store
+                .append_event(
+                    scope.clone(),
+                    Event::ToolRequested {
+                        turn,
+                        call_id: call_id.clone(),
+                        tool: tool.to_string(),
+                        args: args.clone(),
+                        requires_approval: true,
+                    },
+                )
+                .map_err(EngineError::Internal)?;
+        }
         let approved = self
             .gate_backend_approval(&session, &thread, turn, &mode, &call_id, tool, args)
             .await
             .map_err(EngineError::Internal)?;
-        self.store
-            .append_event(
-                scope,
-                Event::ToolCompleted {
-                    call_id,
-                    status: if approved {
-                        ToolStatus::Ok
-                    } else {
-                        ToolStatus::Denied
+        // A matched card gets its completion from the vendor's own
+        // tool_result; only the synthetic card needs closing here.
+        if synthetic {
+            self.store
+                .append_event(
+                    scope,
+                    Event::ToolCompleted {
+                        call_id,
+                        status: if approved {
+                            ToolStatus::Ok
+                        } else {
+                            ToolStatus::Denied
+                        },
+                        result: serde_json::json!(if approved { "approved" } else { "denied" }),
                     },
-                    result: serde_json::json!(if approved { "approved" } else { "denied" }),
-                },
-            )
-            .map_err(EngineError::Internal)?;
+                )
+                .map_err(EngineError::Internal)?;
+        }
         Ok(approved)
+    }
+
+    /// The newest still-open vendor tool call in this turn that a
+    /// permission request refers to: same tool, preferring an exact args
+    /// match, never one already carrying an approval.
+    fn open_vendor_call(
+        &self,
+        thread_id: &str,
+        turn: u64,
+        tool: &str,
+        args: &serde_json::Value,
+    ) -> Option<String> {
+        let events = self
+            .store
+            .events_after(&Scope::Thread(thread_id.to_string()), 0)
+            .ok()?;
+        let mut open: Vec<(String, serde_json::Value)> = Vec::new();
+        let mut gated: std::collections::HashSet<String> = Default::default();
+        for env in &events {
+            match &env.event {
+                Event::ToolRequested {
+                    turn: t,
+                    call_id,
+                    tool: name,
+                    args: a,
+                    ..
+                } if *t == turn && name == tool => {
+                    open.push((call_id.clone(), a.clone()));
+                }
+                Event::ToolCompleted { call_id, .. } => {
+                    open.retain(|(id, _)| id != call_id);
+                }
+                Event::ApprovalRequested { call_id, .. } => {
+                    gated.insert(call_id.clone());
+                }
+                _ => {}
+            }
+        }
+        open.retain(|(id, _)| !gated.contains(id));
+        open.iter()
+            .rev()
+            .find(|(_, a)| a == args)
+            .or(open.last())
+            .map(|(id, _)| id.clone())
     }
 
     fn bridged_context(

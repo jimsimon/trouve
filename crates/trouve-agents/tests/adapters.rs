@@ -44,7 +44,10 @@ async fn claude_adapter_maps_stream_json() {
 printf '%s\n' "$@" > "$0.args"
 cat <<'EOF'
 {"type":"system","subtype":"init","session_id":"sess-1"}
-{"type":"assistant","message":{"content":[{"type":"text","text":"Hello"},{"type":"tool_use","id":"t1","name":"Bash","input":{"command":"ls"}}]}}
+{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"Hmm."}}}
+{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"","estimated_tokens":50}}}
+{"type":"stream_event","event":{"type":"content_block_delta","index":1,"delta":{"type":"text_delta","text":"Hello"}}}
+{"type":"assistant","message":{"content":[{"type":"thinking","thinking":"Hmm.","signature":"sig"},{"type":"text","text":"Hello"},{"type":"tool_use","id":"t1","name":"Bash","input":{"command":"ls"}}]}}
 {"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"t1","content":"files"}]}}
 {"type":"result","subtype":"success","session_id":"sess-2","usage":{"input_tokens":10,"output_tokens":5},"total_cost_usd":0.01}
 EOF
@@ -75,9 +78,25 @@ EOF
         .collect();
     assert_eq!(sessions, vec!["sess-1", "sess-2"]);
 
-    assert!(events
+    // Text and thinking come only from the streamed deltas: exactly once
+    // each (the complete assistant message must not re-emit them), and the
+    // empty redacted thinking delta is dropped.
+    let texts: Vec<_> = events
         .iter()
-        .any(|e| matches!(e, BackendEvent::TextDelta(t) if t == "Hello")));
+        .filter_map(|e| match e {
+            BackendEvent::TextDelta(t) => Some(t.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(texts, vec!["Hello"]);
+    let thinking: Vec<_> = events
+        .iter()
+        .filter_map(|e| match e {
+            BackendEvent::ThinkingDelta(t) => Some(t.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(thinking, vec!["Hmm."]);
     assert!(events.iter().any(
         |e| matches!(e, BackendEvent::ToolStarted { call_id, tool, .. } if call_id == "t1" && tool == "Bash")
     ));
@@ -100,6 +119,8 @@ EOF
     assert!(args.contains("plan"), "{args}");
     assert!(args.contains("--append-system-prompt"), "{args}");
     assert!(args.contains("--model"), "{args}");
+    assert!(args.contains("--include-partial-messages"), "{args}");
+    assert!(args.contains("--thinking-display"), "{args}");
 }
 
 #[tokio::test]

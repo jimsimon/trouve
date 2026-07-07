@@ -98,6 +98,11 @@ impl AgentBackend for ClaudeBackend {
             .arg(&turn.prompt)
             .args(["--output-format", "stream-json"])
             .arg("--verbose")
+            // Stream text/thinking deltas live instead of whole blocks.
+            .arg("--include-partial-messages")
+            // Anthropic redacts thinking text by default (empty blocks with
+            // only a signature); this opts back in to summarized thinking.
+            .args(["--thinking-display", "summarized"])
             .current_dir(&turn.worktree)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
@@ -240,31 +245,40 @@ fn map_event(ev: &Value) -> Vec<BackendEvent> {
                 }]
             })
             .unwrap_or_default(),
+        // Live deltas (--include-partial-messages). Text and thinking stream
+        // here; the complete "assistant" event that follows repeats the same
+        // content as whole blocks, so those are skipped below.
+        Some("stream_event") => {
+            let delta = &ev["event"]["delta"];
+            match delta["type"].as_str() {
+                Some("text_delta") => delta["text"]
+                    .as_str()
+                    .filter(|t| !t.is_empty())
+                    .map(|t| vec![BackendEvent::TextDelta(t.to_string())])
+                    .unwrap_or_default(),
+                // Redacted thinking arrives as empty deltas carrying only a
+                // token estimate; there is nothing to show, so drop them.
+                Some("thinking_delta") => delta["thinking"]
+                    .as_str()
+                    .filter(|t| !t.is_empty())
+                    .map(|t| vec![BackendEvent::ThinkingDelta(t.to_string())])
+                    .unwrap_or_default(),
+                _ => vec![],
+            }
+        }
         Some("assistant") => {
             let mut out = Vec::new();
             if let Some(blocks) = ev["message"]["content"].as_array() {
                 for b in blocks {
-                    match b["type"].as_str() {
-                        Some("text") => {
-                            if let Some(t) = b["text"].as_str() {
-                                if !t.is_empty() {
-                                    out.push(BackendEvent::TextDelta(t.to_string()));
-                                }
-                            }
-                        }
-                        Some("thinking") => {
-                            if let Some(t) = b["thinking"].as_str() {
-                                if !t.is_empty() {
-                                    out.push(BackendEvent::ThinkingDelta(t.to_string()));
-                                }
-                            }
-                        }
-                        Some("tool_use") => out.push(BackendEvent::ToolStarted {
+                    // Text and thinking already streamed via stream_event
+                    // deltas; only tool calls are taken from the complete
+                    // message (their input JSON arrives fully assembled).
+                    if b["type"].as_str() == Some("tool_use") {
+                        out.push(BackendEvent::ToolStarted {
                             call_id: b["id"].as_str().unwrap_or("claude-tool").into(),
                             tool: b["name"].as_str().unwrap_or("tool").into(),
                             args: b["input"].clone(),
-                        }),
-                        _ => {}
+                        });
                     }
                 }
             }

@@ -154,6 +154,12 @@ fn main() -> anyhow::Result<()> {
     }
     {
         let tx = tx.clone();
+        window.on_card_toggled(move |key| {
+            let _ = tx.send(UiCommand::ToggleCard(key.to_string()));
+        });
+    }
+    {
+        let tx = tx.clone();
         window.on_composer_mode_changed(move |i| {
             let _ = tx.send(UiCommand::ComposerModeChanged(i.max(0) as usize));
         });
