@@ -199,6 +199,85 @@ component CopyButton inherits Rectangle {
     }
 }
 
+// Multiline prompt input. Grows with content up to `max-input-height`
+// (then scrolls, keeping the cursor visible); Enter submits, Shift+Enter
+// inserts a newline. Built on a raw TextInput because the TextEdit widget
+// offers no way to intercept Enter.
+component PromptBox inherits Rectangle {
+    in property <string> placeholder;
+    in property <bool> enabled: true;
+    in-out property <string> text <=> input.text;
+    callback submitted(string);
+
+    property <length> pad: 8px;
+    property <length> line-height: 18px;
+    property <length> max-input-height: 162px; // ~8 lines
+    // Desired scroll offset (<= 0); the binding on `input.y` clamps it so
+    // shrinking content snaps back into view.
+    property <length> scroll-y: 0px;
+
+    height: clamp(input.preferred-height + 2 * root.pad,
+        34px, root.max-input-height);
+    background: #1d1d1d;
+    border-radius: 6px;
+    border-width: 1px;
+    border-color: input.has-focus ? #3d5a80 : #3a3a3a;
+
+    // Focus the input when the padding area is clicked.
+    TouchArea {
+        clicked => { input.focus(); }
+        mouse-cursor: MouseCursor.text;
+    }
+
+    clipper := Rectangle {
+        x: root.pad;
+        y: root.pad;
+        width: parent.width - 2 * root.pad;
+        height: parent.height - 2 * root.pad;
+        clip: true;
+
+        input := TextInput {
+            x: 0;
+            y: min(0px, max(root.scroll-y, clipper.height - self.preferred-height));
+            width: parent.width;
+            height: max(self.preferred-height, clipper.height);
+            single-line: false;
+            wrap: word-wrap;
+            enabled: root.enabled;
+            color: root.enabled ? #e0e0e0 : #6a6a6a;
+            font-size: 13px;
+            selection-background-color: #3d5a80;
+
+            key-pressed(event) => {
+                if (event.text == Key.Return && !event.modifiers.shift) {
+                    if (self.text != "") {
+                        root.submitted(self.text);
+                    }
+                    return accept;
+                }
+                return reject;
+            }
+            cursor-position-changed(pos) => {
+                if (pos.y + root.scroll-y < 0) {
+                    root.scroll-y = -pos.y;
+                } else if (pos.y + root.scroll-y + root.line-height > clipper.height) {
+                    root.scroll-y = clipper.height - pos.y - root.line-height;
+                }
+            }
+        }
+    }
+
+    if input.text == "": Text {
+        x: root.pad;
+        y: root.pad;
+        width: parent.width - 2 * root.pad;
+        text: root.placeholder;
+        color: #6a6a6a;
+        font-size: 13px;
+        overflow: elide;
+    }
+}
+
 // Drag handle between columns. Dragging integrates mouse deltas into the
 // bound width; `direction` is +1 when dragging right grows the column.
 component SplitterHandle inherits Rectangle {
@@ -849,9 +928,23 @@ export component AppWindow inherits Window {
                     }
                 }
 
-                // Composer bar: labeled pickers (drop-up), model knobs from
-                // the options schema, input, send, context dial, usage.
-                HorizontalLayout {
+                // Composer: multiline prompt on top (grows with content),
+                // then a controls row — pickers, model knobs, send, dial.
+                VerticalLayout {
+                    spacing: 6px;
+
+                    composer := PromptBox {
+                        placeholder: root.composer-enabled
+                            ? "Message the agent…  (Shift+Enter for a new line)"
+                            : "Select or create a thread first";
+                        enabled: root.composer-enabled;
+                        submitted(text) => {
+                            root.send-message(text);
+                            self.text = "";
+                        }
+                    }
+
+                    HorizontalLayout {
                     spacing: 8px;
                     VerticalLayout {
                         spacing: 2px;
@@ -934,23 +1027,7 @@ export component AppWindow inherits Window {
                             }
                         }
                     }
-                    VerticalLayout {
-                        spacing: 2px;
-                        horizontal-stretch: 1;
-                        Text { text: " "; font-size: 10px; }
-                        composer := LineEdit {
-                            placeholder-text: root.composer-enabled
-                                ? "Message the agent…"
-                                : "Select or create a thread first";
-                            enabled: root.composer-enabled;
-                            accepted(text) => {
-                                if (text != "") {
-                                    root.send-message(text);
-                                    self.text = "";
-                                }
-                            }
-                        }
-                    }
+                    Rectangle { horizontal-stretch: 1; }
                     VerticalLayout {
                         spacing: 2px;
                         Text { text: " "; font-size: 10px; }
@@ -965,6 +1042,9 @@ export component AppWindow inherits Window {
                         }
                     }
                     // Context usage dial; indeterminate while compacting.
+                    VerticalLayout {
+                        spacing: 2px;
+                        Text { text: " "; font-size: 10px; }
                     dial := Rectangle {
                         width: 30px;
                         height: 30px;
@@ -999,6 +1079,7 @@ export component AppWindow inherits Window {
                             }
                         }
                     }
+                    }
                     Text {
                         text: root.usage-text;
                         color: #8a8a8a;
@@ -1006,6 +1087,7 @@ export component AppWindow inherits Window {
                         vertical-alignment: center;
                         max-width: 190px;
                         overflow: elide;
+                    }
                     }
                 }
             }
@@ -1090,10 +1172,10 @@ export component AppWindow inherits Window {
                 VerticalLayout {
                     spacing: 6px;
                     Text { text: "First message"; color: #c8c8c8; font-size: 12px; font-weight: 700; }
-                    prompt-edit := LineEdit {
-                        placeholder-text: "What should the agent do?";
-                        accepted(text) => {
-                            if (text != "") {
+                    prompt-edit := PromptBox {
+                        placeholder: "What should the agent do?  (Shift+Enter for a new line)";
+                        submitted(text) => {
+                            if (root.center-screen == 2 || root.nc-workspace-index >= 0) {
                                 root.start-new-chat(
                                     root.nc-workspace-index, root.nc-branch-index,
                                     root.nc-mode-index, root.nc-model-index, text);
