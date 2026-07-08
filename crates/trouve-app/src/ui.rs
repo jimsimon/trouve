@@ -375,16 +375,19 @@ pub fn set_diff(ui: &Ui, rows: Vec<slint_diff_view::RowData>, raw: String) {
     });
 }
 
-pub fn set_file_list(ui: &Ui, path: String, entries: Vec<(String, bool)>) {
+/// Rows of the Files tree, already flattened in display order:
+/// (name, is_dir, depth, expanded).
+pub fn set_file_list(ui: &Ui, entries: Vec<(String, bool, i32, bool)>) {
     let _ = ui.upgrade_in_event_loop(move |ui| {
         let items: Vec<FileItem> = entries
             .into_iter()
-            .map(|(name, is_dir)| FileItem {
+            .map(|(name, is_dir, depth, expanded)| FileItem {
                 name: name.into(),
                 is_dir,
+                depth,
+                expanded,
             })
             .collect();
-        ui.set_file_path(SharedString::from(path.as_str()));
         ui.set_file_entries(ModelRc::new(VecModel::from(items)));
     });
 }

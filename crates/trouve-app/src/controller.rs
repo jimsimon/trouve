@@ -105,7 +105,6 @@ pub enum UiCommand {
     CreatePr,
     RefreshPr,
     FileActivated(usize),
-    FileUp,
     /// A filename clicked in a chat tool card; path as the tool saw it
     /// (possibly absolute), plus the 1-based line range the tool covered
     /// (0 = none) to preselect in the file view.
@@ -202,8 +201,23 @@ struct Controller {
     diff_files: Vec<slint_diff_view::FileDiff>,
     diff_collapsed: Vec<bool>,
     diff_raw: String,
-    file_path: String,
-    file_entries: Vec<DirEntry>,
+    /// Files tab tree: directory listings cached by worktree-relative path
+    /// ("." for the root), fetched lazily as folders are expanded.
+    file_children: HashMap<String, Vec<DirEntry>>,
+    file_expanded: HashSet<String>,
+    /// The tree flattened in display order; indices match the UI rows.
+    file_rows: Vec<FileRow>,
+}
+
+/// One visible row of the Files tree.
+#[derive(Debug, Clone)]
+struct FileRow {
+    /// Worktree-relative path (doubles as the open/expand key).
+    path: String,
+    name: String,
+    is_dir: bool,
+    depth: i32,
+    expanded: bool,
 }
 
 pub async fn run(
@@ -254,8 +268,9 @@ pub async fn run(
         diff_files: Vec::new(),
         diff_collapsed: Vec::new(),
         diff_raw: String::new(),
-        file_path: ".".into(),
-        file_entries: Vec::new(),
+        file_children: HashMap::new(),
+        file_expanded: HashSet::new(),
+        file_rows: Vec::new(),
     };
 
     if let Err(e) = ctl.bootstrap().await {
@@ -540,7 +555,6 @@ impl Controller {
         self.remember_position();
         self.restore_scroll();
         self.refresh_usage_text().await;
-        self.file_path = ".".into();
         let _ = self.load_files().await;
         let _ = self.refresh_diff().await;
         Ok(())
@@ -829,23 +843,67 @@ impl Controller {
         );
     }
 
+    /// Reload the Files tree from scratch (session switch, refresh).
     async fn load_files(&mut self) -> Result<()> {
+        self.file_children.clear();
+        self.file_expanded.clear();
         let Some(session_id) = self.current_session_id() else {
+            self.file_rows.clear();
+            ui::set_file_list(&self.ui, Vec::new());
             return Ok(());
         };
-        self.file_entries = self
-            .client
-            .session_files(&session_id, &self.file_path)
-            .await?;
+        let root = self.client.session_files(&session_id, ".").await?;
+        self.file_children.insert(".".into(), root);
+        self.push_file_tree();
+        Ok(())
+    }
+
+    /// Flatten the cached tree (expanded dirs only) into display rows.
+    fn push_file_tree(&mut self) {
+        fn walk(
+            dir: &str,
+            depth: i32,
+            children: &HashMap<String, Vec<DirEntry>>,
+            expanded: &HashSet<String>,
+            out: &mut Vec<FileRow>,
+        ) {
+            let Some(entries) = children.get(dir) else {
+                return;
+            };
+            for entry in entries {
+                let path = if dir == "." {
+                    entry.name.clone()
+                } else {
+                    format!("{dir}/{}", entry.name)
+                };
+                let is_expanded = entry.is_dir && expanded.contains(&path);
+                out.push(FileRow {
+                    path: path.clone(),
+                    name: entry.name.clone(),
+                    is_dir: entry.is_dir,
+                    depth,
+                    expanded: is_expanded,
+                });
+                if is_expanded {
+                    walk(&path, depth + 1, children, expanded, out);
+                }
+            }
+        }
+        let mut rows = Vec::new();
+        walk(
+            ".",
+            0,
+            &self.file_children,
+            &self.file_expanded,
+            &mut rows,
+        );
         ui::set_file_list(
             &self.ui,
-            self.file_path.clone(),
-            self.file_entries
-                .iter()
-                .map(|e| (e.name.clone(), e.is_dir))
+            rows.iter()
+                .map(|r| (r.name.clone(), r.is_dir, r.depth, r.expanded))
                 .collect(),
         );
-        Ok(())
+        self.file_rows = rows;
     }
 
     // --- new-chat screens ----------------------------------------------------
@@ -1441,21 +1499,27 @@ impl Controller {
                 }
             }
             UiCommand::FileActivated(i) => {
-                let Some(entry) = self.file_entries.get(i).cloned() else {
+                let Some(row) = self.file_rows.get(i).cloned() else {
                     return Ok(());
                 };
-                let joined = if self.file_path == "." {
-                    entry.name.clone()
-                } else {
-                    format!("{}/{}", self.file_path, entry.name)
-                };
-                if entry.is_dir {
-                    self.file_path = joined;
-                    self.load_files().await?;
+                if row.is_dir {
+                    // Toggle the folder; children are fetched lazily on the
+                    // first expand and kept for later re-expands.
+                    if !self.file_expanded.remove(&row.path) {
+                        self.file_expanded.insert(row.path.clone());
+                        if !self.file_children.contains_key(&row.path) {
+                            if let Some(session_id) = self.current_session_id() {
+                                let entries =
+                                    self.client.session_files(&session_id, &row.path).await?;
+                                self.file_children.insert(row.path.clone(), entries);
+                            }
+                        }
+                    }
+                    self.push_file_tree();
                 } else if let Some(session_id) = self.current_session_id() {
-                    let file = self.client.session_file(&session_id, &joined).await?;
+                    let file = self.client.session_file(&session_id, &row.path).await?;
                     let lines = render::highlight_file(&file.path, &file.content);
-                    ui::set_file_view(&self.ui, joined, file.content, lines);
+                    ui::set_file_view(&self.ui, row.path, file.content, lines);
                     // A browser open carries no line range to highlight.
                     ui::set_file_selection(&self.ui, -1, -1);
                 }
@@ -1487,13 +1551,6 @@ impl Controller {
                     }
                     Err(e) => self.status(&format!("could not open {rel}: {e}")),
                 }
-            }
-            UiCommand::FileUp => {
-                self.file_path = match self.file_path.rsplit_once('/') {
-                    Some((parent, _)) => parent.to_string(),
-                    None => ".".into(),
-                };
-                self.load_files().await?;
             }
             UiCommand::Undo => {
                 if let Some(session_id) = self.current_session_id() {

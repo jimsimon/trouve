@@ -122,9 +122,13 @@ export struct ChatRow {
     q-last: bool,
 }
 
+// One visible row of the Files tree, pre-flattened by the controller:
+// folders carry an expanded flag, depth drives the indent.
 export struct FileItem {
     name: string,
     is-dir: bool,
+    depth: int,
+    expanded: bool,
 }
 
 // A ComboBox stand-in whose option list opens *above* the control, for use
@@ -983,10 +987,8 @@ export component AppWindow inherits Window {
     callback create-pr();
     callback refresh-pr();
 
-    in property <string> file-path: ".";
     in property <[FileItem]> file-entries;
     callback file-activated(int);
-    callback file-up();
     in property <[[TextSegment]]> file-lines;
     in property <[int]> file-numbers;
     in property <string> open-file-name: "";
@@ -2505,34 +2507,42 @@ export component AppWindow inherits Window {
                     VerticalLayout {
                         padding: 6px;
                         spacing: 6px;
-                        HorizontalLayout {
-                            spacing: 6px;
-                            Button {
-                                text: "↑ Up";
-                                clicked => { root.file-up(); }
-                            }
-                            Text {
-                                text: root.file-path;
-                                color: #9a9a9a;
-                                font-size: 12px;
-                                vertical-alignment: center;
-                                overflow: elide;
-                                horizontal-stretch: 1;
-                            }
-                        }
+                        // Worktree tree: folders expand in place, children
+                        // indented underneath (IDE-style explorer).
                         ListView {
-                            height: 180px;
+                            height: 220px;
                             for entry[idx] in root.file-entries: Rectangle {
-                                height: 24px;
-                                TouchArea {
+                                height: 22px;
+                                background: entry-ta.has-hover ? #26282c : transparent;
+                                border-radius: 4px;
+                                entry-ta := TouchArea {
                                     clicked => { root.file-activated(idx); }
                                 }
-                                Text {
-                                    x: 6px;
-                                    text: (entry.is-dir ? "📁 " : "📄 ") + entry.name;
-                                    color: #d0d0d0;
-                                    font-size: 12px;
-                                    vertical-alignment: center;
+                                HorizontalLayout {
+                                    padding-left: 4px + entry.depth * 16px;
+                                    spacing: 4px;
+                                    // Chevron gutter: twists open for
+                                    // expanded folders, blank for files so
+                                    // names in one folder line up.
+                                    Text {
+                                        width: 12px;
+                                        text: !entry.is-dir ? ""
+                                            : entry.expanded ? "▾" : "▸";
+                                        color: #8a8a8a;
+                                        font-size: 11px;
+                                        vertical-alignment: center;
+                                        horizontal-alignment: center;
+                                    }
+                                    Text {
+                                        text: (entry.is-dir
+                                            ? (entry.expanded ? "📂 " : "📁 ")
+                                            : "📄 ") + entry.name;
+                                        color: #d0d0d0;
+                                        font-size: 12px;
+                                        vertical-alignment: center;
+                                        overflow: elide;
+                                        horizontal-stretch: 1;
+                                    }
                                 }
                             }
                         }
