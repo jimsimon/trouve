@@ -398,6 +398,14 @@ fn main() -> anyhow::Result<()> {
         if state.maximized {
             w.set_maximized(true);
         }
+        // Panel splitters (0 = never dragged, keep the slint defaults). The
+        // slint-side clamps re-fit them if the window shrank meanwhile.
+        if state.left_width > 0 {
+            window.set_left_width(state.left_width as f32);
+        }
+        if state.right_width > 0 {
+            window.set_right_width(state.right_width as f32);
+        }
     }
 
     // Slint has no move/resize callbacks, so poll for geometry changes and
@@ -424,6 +432,8 @@ fn main() -> anyhow::Result<()> {
                     (next.x, next.y) = (pos.x, pos.y);
                     (next.width, next.height) = (size.width, size.height);
                 }
+                next.left_width = window.get_left_width() as u32;
+                next.right_width = window.get_right_width() as u32;
                 {
                     let mut last = last.borrow_mut();
                     if *last != Some(next) {

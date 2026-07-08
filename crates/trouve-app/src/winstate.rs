@@ -13,6 +13,13 @@ pub struct WindowState {
     pub width: u32,
     pub height: u32,
     pub maximized: bool,
+    /// Splitter positions (logical px); 0 = never dragged, keep the
+    /// app.slint defaults. The middle panel stretches, so absolute side
+    /// widths survive window resizes gracefully.
+    #[serde(default)]
+    pub left_width: u32,
+    #[serde(default)]
+    pub right_width: u32,
 }
 
 impl Default for WindowState {
@@ -25,6 +32,8 @@ impl Default for WindowState {
             width: 1400,
             height: 900,
             maximized: false,
+            left_width: 0,
+            right_width: 0,
         }
     }
 }
@@ -37,6 +46,8 @@ impl WindowState {
             && (200..=16000).contains(&self.height)
             && (-16000..=16000).contains(&self.x)
             && (-16000..=16000).contains(&self.y)
+            && (self.left_width == 0 || (100..=2000).contains(&self.left_width))
+            && (self.right_width == 0 || (100..=8000).contains(&self.right_width))
     }
 }
 
