@@ -726,6 +726,7 @@ impl Controller {
             self.row_call_ids.clear();
             ui::set_chat(&self.ui, Vec::new(), false);
             ui::set_composer_enabled(&self.ui, false);
+            ui::set_slash_commands(&self.ui, Vec::new());
             return;
         };
         let raw_turns: HashSet<u64> = self
@@ -768,6 +769,13 @@ impl Controller {
             &self.wizards,
         );
         self.row_call_ids = call_ids;
+        ui::set_slash_commands(
+            &self.ui,
+            vm.commands
+                .iter()
+                .map(|c| (c.name.clone(), c.description.clone()))
+                .collect(),
+        );
         ui::set_chat(&self.ui, rows, scroll);
         ui::set_composer_enabled(&self.ui, true);
     }

@@ -7,7 +7,7 @@
       "name": "MIT",
       "identifier": "MIT"
     },
-    "version": "0.5"
+    "version": "0.6"
   },
   "paths": {
     "/v1/approvals": {
@@ -1525,6 +1525,22 @@
           }
         }
       },
+      "CommandInfo": {
+        "type": "object",
+        "description": "One slash command / skill the vendor harness accepts in prompts (e.g.\n\"/simplify\"), surfaced by clients as prompt-box completions.",
+        "required": [
+          "name"
+        ],
+        "properties": {
+          "description": {
+            "type": "string"
+          },
+          "name": {
+            "type": "string",
+            "description": "Name without the leading slash."
+          }
+        }
+      },
       "CreatePrRequest": {
         "type": "object",
         "required": [
@@ -2041,6 +2057,28 @@
                 "type": "string",
                 "enum": [
                   "question.resolved"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "description": "The slash commands / skills the vendor harness currently accepts in\nprompts. Replaces any previously announced list for the thread.",
+            "required": [
+              "commands",
+              "type"
+            ],
+            "properties": {
+              "commands": {
+                "type": "array",
+                "items": {
+                  "$ref": "#/components/schemas/CommandInfo"
+                }
+              },
+              "type": {
+                "type": "string",
+                "enum": [
+                  "thread.commands_updated"
                 ]
               }
             }

@@ -74,6 +74,16 @@ pub struct QuestionAnswer {
     pub other_text: Option<String>,
 }
 
+/// One slash command / skill the vendor harness accepts in prompts (e.g.
+/// "/simplify"), surfaced by clients as prompt-box completions.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct CommandInfo {
+    /// Name without the leading slash.
+    pub name: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub description: String,
+}
+
 /// Token/cost usage for a turn.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, ToSchema)]
 pub struct Usage {
@@ -176,6 +186,11 @@ pub enum Event {
         #[serde(default)]
         answers: Option<Vec<QuestionAnswer>>,
     },
+
+    /// The slash commands / skills the vendor harness currently accepts in
+    /// prompts. Replaces any previously announced list for the thread.
+    #[serde(rename = "thread.commands_updated")]
+    CommandsUpdated { commands: Vec<CommandInfo> },
 
     /// The thread's transcript neared the model's context window; the engine
     /// is summarizing older messages. Clients show a busy indicator.

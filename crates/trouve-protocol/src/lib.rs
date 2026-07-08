@@ -22,7 +22,7 @@ pub use requests::*;
 // events (all additive).
 // 0.5: added the interactive question flow — question.requested /
 // question.resolved events and POST /v1/questions (additive).
-pub const PROTOCOL_VERSION: &str = "0.5";
+pub const PROTOCOL_VERSION: &str = "0.6";
 
 pub type WorkspaceId = String;
 pub type SessionId = String;

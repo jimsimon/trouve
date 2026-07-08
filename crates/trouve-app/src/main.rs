@@ -78,6 +78,38 @@ fn main() -> anyhow::Result<()> {
         });
     }
     {
+        // "/" skill completion: re-rank on every composer edit. The popup is
+        // live while the draft is a bare "/query" first token (no whitespace
+        // yet — a space means the user is typing arguments).
+        let weak = window.as_weak();
+        window.on_slash_filter_changed(move |text| {
+            let window = weak.unwrap();
+            let query = match text.strip_prefix('/') {
+                Some(q) if !q.contains(char::is_whitespace) => q,
+                _ => {
+                    window.set_slash_active(false);
+                    return;
+                }
+            };
+            let names: Vec<String> = window
+                .get_slash_commands()
+                .iter()
+                .map(|s| s.to_string())
+                .collect();
+            let mut matches = fuzzy_match_indices(&names, query);
+            matches.truncate(8);
+            match matches.first() {
+                Some(&top) => {
+                    window.set_slash_completion(format!("/{}", names[top as usize]).into());
+                    window
+                        .set_slash_matches(slint::ModelRc::new(slint::VecModel::from(matches)));
+                    window.set_slash_active(true);
+                }
+                None => window.set_slash_active(false),
+            }
+        });
+    }
+    {
         let tx = tx.clone();
         window.on_workspace_new_session(move |row| {
             let _ = tx.send(UiCommand::WorkspaceNewSession(row as usize));

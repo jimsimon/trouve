@@ -284,6 +284,19 @@ pub fn set_composer_enabled(ui: &Ui, enabled: bool) {
     let _ = ui.upgrade_in_event_loop(move |ui| ui.set_composer_enabled(enabled));
 }
 
+/// Slash commands the current thread's harness accepts, as (name,
+/// description) pairs — the prompt box's "/" completion popup.
+pub fn set_slash_commands(ui: &Ui, commands: Vec<(String, String)>) {
+    let _ = ui.upgrade_in_event_loop(move |ui| {
+        let (names, details): (Vec<SharedString>, Vec<SharedString>) = commands
+            .into_iter()
+            .map(|(n, d)| (SharedString::from(n.as_str()), SharedString::from(d.as_str())))
+            .unzip();
+        ui.set_slash_commands(ModelRc::new(VecModel::from(names)));
+        ui.set_slash_details(ModelRc::new(VecModel::from(details)));
+    });
+}
+
 /// 0 = chat, 1 = new-session screen, 2 = new-thread screen.
 pub fn set_center_screen(ui: &Ui, screen: i32) {
     let _ = ui.upgrade_in_event_loop(move |ui| ui.set_center_screen(screen));

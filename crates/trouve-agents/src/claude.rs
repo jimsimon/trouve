@@ -259,14 +259,31 @@ impl AgentBackend for ClaudeBackend {
 fn map_event(ev: &Value) -> Vec<BackendEvent> {
     match ev["type"].as_str() {
         // Claude rotates session ids per run; always persist the latest.
-        Some("system") if ev["subtype"].as_str() == Some("init") => ev["session_id"]
-            .as_str()
-            .map(|sid| {
-                vec![BackendEvent::SessionStarted {
-                    session_id: sid.to_string(),
-                }]
-            })
-            .unwrap_or_default(),
+        // The init event also lists the accepted slash commands (names
+        // only), surfaced as prompt-box completions.
+        Some("system") if ev["subtype"].as_str() == Some("init") => {
+            let mut out: Vec<BackendEvent> = ev["session_id"]
+                .as_str()
+                .map(|sid| {
+                    vec![BackendEvent::SessionStarted {
+                        session_id: sid.to_string(),
+                    }]
+                })
+                .unwrap_or_default();
+            if let Some(cmds) = ev["slash_commands"].as_array() {
+                out.push(BackendEvent::CommandsUpdated {
+                    commands: cmds
+                        .iter()
+                        .filter_map(|c| c.as_str())
+                        .map(|name| trouve_protocol::CommandInfo {
+                            name: name.to_string(),
+                            description: String::new(),
+                        })
+                        .collect(),
+                });
+            }
+            out
+        }
         // Live deltas (--include-partial-messages). Text and thinking stream
         // here; the complete "assistant" event that follows repeats the same
         // content as whole blocks, so those are skipped below.

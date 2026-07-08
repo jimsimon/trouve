@@ -118,6 +118,7 @@ impl IntoResponse for ApiError {
         trouve_protocol::Question,
         trouve_protocol::QuestionOption,
         trouve_protocol::QuestionAnswer,
+        trouve_protocol::CommandInfo,
         ModelInfo,
         ProviderInfo,
         ProvidersResponse,

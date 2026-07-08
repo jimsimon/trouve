@@ -114,6 +114,12 @@ pub enum BackendEvent {
         questions: Vec<trouve_protocol::Question>,
         responder: tokio::sync::oneshot::Sender<Option<Vec<trouve_protocol::QuestionAnswer>>>,
     },
+    /// The vendor harness announced the slash commands / skills it accepts
+    /// in prompts (cursor sends these per session; claude lists them at
+    /// init). Replaces any earlier list.
+    CommandsUpdated {
+        commands: Vec<trouve_protocol::CommandInfo>,
+    },
     Completed {
         usage: Usage,
     },
@@ -143,6 +149,9 @@ impl std::fmt::Debug for BackendEvent {
             }
             Self::ApprovalNeeded { call_id, tool, .. } => {
                 write!(f, "ApprovalNeeded({call_id}, {tool})")
+            }
+            Self::CommandsUpdated { commands } => {
+                write!(f, "CommandsUpdated({} commands)", commands.len())
             }
             Self::Completed { usage } => write!(f, "Completed({usage:?})"),
         }

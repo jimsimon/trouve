@@ -424,7 +424,9 @@ cat > /dev/null
                 responder.send(true).unwrap();
             }
             BackendEvent::Completed { usage: u } => usage = Some(u),
-            BackendEvent::ThinkingDelta(_) | BackendEvent::QuestionsNeeded { .. } => {}
+            BackendEvent::ThinkingDelta(_)
+            | BackendEvent::QuestionsNeeded { .. }
+            | BackendEvent::CommandsUpdated { .. } => {}
         }
     }
 

@@ -88,6 +88,9 @@ pub struct ThreadViewModel {
     /// The model that ran each turn ("cursor/claude-fable-5"), from
     /// turn.started — shown in the agent card header.
     pub turn_models: HashMap<u64, String>,
+    /// Slash commands / skills the vendor harness accepts in prompts
+    /// (latest announcement wins) — prompt-box completions.
+    pub commands: Vec<trouve_protocol::CommandInfo>,
 }
 
 impl ThreadViewModel {
@@ -132,6 +135,10 @@ impl ThreadViewModel {
             }
             Event::CompactionStarted { .. } => {
                 self.compacting = true;
+                None
+            }
+            Event::CommandsUpdated { commands } => {
+                self.commands = commands.clone();
                 None
             }
             Event::CompactionCompleted { .. } => {

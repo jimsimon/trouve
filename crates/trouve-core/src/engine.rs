@@ -2286,6 +2286,10 @@ impl Engine {
                     self.store
                         .append_event(scope.clone(), Event::ToolOutput { call_id, chunk })?;
                 }
+                BackendEvent::CommandsUpdated { commands } => {
+                    self.store
+                        .append_event(scope.clone(), Event::CommandsUpdated { commands })?;
+                }
                 BackendEvent::ToolCompleted {
                     call_id,
                     ok,

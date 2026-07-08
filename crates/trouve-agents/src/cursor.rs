@@ -598,8 +598,26 @@ fn map_update(update: &Value) -> Vec<BackendEvent> {
                 _ => vec![], // pending / in_progress
             }
         }
-        // Plans, title updates, command lists, mode echoes: nothing trouve
-        // renders from these yet.
+        // The slash commands / skills this session accepts in prompts,
+        // surfaced as prompt-box completions.
+        Some("available_commands_update") => {
+            let commands = update["availableCommands"]
+                .as_array()
+                .map(|list| {
+                    list.iter()
+                        .filter_map(|c| {
+                            let name = c["name"].as_str()?.to_string();
+                            let description =
+                                c["description"].as_str().unwrap_or_default().to_string();
+                            Some(trouve_protocol::CommandInfo { name, description })
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            vec![BackendEvent::CommandsUpdated { commands }]
+        }
+        // Plans, title updates, mode echoes: nothing trouve renders from
+        // these yet.
         _ => vec![],
     }
 }

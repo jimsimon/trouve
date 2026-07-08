@@ -544,6 +544,18 @@ component PromptBox inherits Rectangle {
     in property <bool> enabled: true;
     in-out property <string> text <=> input.text;
     callback submitted(string);
+    // Slash-command completion: while active, Tab completes the box to
+    // `completion-text` plus a trailing space (arguments follow), Enter
+    // submits `completion-text` directly, Escape dismisses the popup.
+    in property <bool> completion-active: false;
+    in property <string> completion-text;
+    callback completion-dismissed();
+    public function apply-completion(t: string) {
+        input.text = t + " ";
+        input.set-selection-offsets(
+            input.text.character-count, input.text.character-count);
+        input.focus();
+    }
 
     property <length> pad: 8px;
     property <length> line-height: 18px;
@@ -595,8 +607,18 @@ component PromptBox inherits Rectangle {
             selection-background-color: #3d5a80;
 
             key-pressed(event) => {
+                if (root.completion-active && event.text == Key.Tab) {
+                    root.apply-completion(root.completion-text);
+                    return accept;
+                }
+                if (root.completion-active && event.text == Key.Escape) {
+                    root.completion-dismissed();
+                    return accept;
+                }
                 if (event.text == Key.Return && !event.modifiers.shift) {
-                    if (self.text != "") {
+                    if (root.completion-active && root.completion-text != "") {
+                        root.submitted(root.completion-text);
+                    } else if (self.text != "") {
                         root.submitted(self.text);
                     }
                     return accept;
@@ -927,6 +949,23 @@ export component AppWindow inherits Window {
     in property <bool> composer-enabled: false;
     // Draft survives the composer being swapped out for the new-thread form.
     property <string> composer-draft;
+
+    // "/" skill completion: the harness's slash commands (parallel name /
+    // description lists), the fuzzy-ranked match indices (best first,
+    // capped), and the best match as ready-to-send text ("/simplify").
+    // Rust recomputes matches/active on every draft edit; Escape suppresses
+    // the popup until the next edit.
+    in property <[string]> slash-commands;
+    in property <[string]> slash-details;
+    in property <[int]> slash-matches;
+    in-out property <bool> slash-active: false;
+    in property <string> slash-completion;
+    property <bool> slash-suppressed: false;
+    callback slash-filter-changed(string);
+    changed composer-draft => {
+        root.slash-suppressed = false;
+        root.slash-filter-changed(root.composer-draft);
+    }
     in property <string> status-text: "starting…";
     in-out property <string> error-text: "";
 
@@ -2264,12 +2303,67 @@ export component AppWindow inherits Window {
                     spacing: 6px;
                     vertical-stretch: 0;
 
+                    // "/" completion popup, floated above the composer via a
+                    // zero-height anchor (rows can then reach `composer`
+                    // directly, which lives in this same conditional scope).
+                    Rectangle {
+                        height: 0;
+                        visible: root.slash-active && !root.slash-suppressed;
+                        Rectangle {
+                            x: 0;
+                            y: -self.height - 6px;
+                            width: min(parent.width, 480px);
+                            height: slash-list.preferred-height;
+                            background: #262626;
+                            border-radius: 8px;
+                            border-width: 1px;
+                            border-color: #3a3a3a;
+                            slash-list := VerticalLayout {
+                                padding: 6px;
+                                for cmd[rank] in root.slash-matches: Rectangle {
+                                    height: 26px;
+                                    border-radius: 5px;
+                                    background: rank == 0 ? #2b3d55
+                                        : slash-ta.has-hover ? #303030 : transparent;
+                                    slash-ta := TouchArea {
+                                        clicked => {
+                                            composer.apply-completion(
+                                                "/" + root.slash-commands[cmd]);
+                                        }
+                                    }
+                                    HorizontalLayout {
+                                        padding-left: 8px;
+                                        padding-right: 8px;
+                                        spacing: 10px;
+                                        Text {
+                                            text: "/" + root.slash-commands[cmd];
+                                            color: #e8e8e8;
+                                            font-size: 12px;
+                                            vertical-alignment: center;
+                                        }
+                                        Text {
+                                            text: root.slash-details[cmd];
+                                            color: #8a8a8a;
+                                            font-size: 11px;
+                                            vertical-alignment: center;
+                                            overflow: elide;
+                                            horizontal-stretch: 1;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+
                     composer := PromptBox {
                         text <=> root.composer-draft;
                         placeholder: root.composer-enabled
                             ? "Message the agent…  (Shift+Enter for a new line)"
                             : "Select or create a thread first";
                         enabled: root.composer-enabled;
+                        completion-active: root.slash-active && !root.slash-suppressed;
+                        completion-text: root.slash-completion;
+                        completion-dismissed => { root.slash-suppressed = true; }
                         submitted(text) => {
                             root.send-message(text);
                             self.text = "";
