@@ -676,6 +676,17 @@ export component AppWindow inherits Window {
     in-out property <length> left-width: 260px;
     in-out property <length> right-width: 460px;
 
+    // Keep the panels inside the window when it shrinks (or the left
+    // column widens): squeeze the right panel, never the chat, down to
+    // its 280px floor. Imperative (not a width binding) to avoid a
+    // layout binding loop.
+    function clamp-right-width() {
+        right-width = clamp(right-width, 280px,
+            max(280px, root.width - root.left-width - 340px));
+    }
+    changed width => { root.clamp-right-width(); }
+    changed left-width => { root.clamp-right-width(); }
+
     // --- left column ---------------------------------------------------------
     in property <[NavRow]> nav-rows;
     callback nav-row-clicked(int);
@@ -2110,7 +2121,8 @@ export component AppWindow inherits Window {
             value <=> root.right-width;
             direction: -1;
             min-value: 280px;
-            max-value: 800px;
+            // The panel may take everything but a readable chat column.
+            max-value: max(280px, root.width - root.left-width - 340px);
         }
 
         // ---------------- right: inspection ----------------
