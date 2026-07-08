@@ -730,9 +730,6 @@ export component AppWindow inherits Window {
     in-out property <int> thinking-index: -1;
     in property <bool> fast-visible: false;
     in-out property <bool> fast-checked: false;
-    // The model always runs in the vendor's Max Mode (extended context at a
-    // usage premium); informational, the vendor CLI has no toggle.
-    in property <bool> max-mode: false;
     callback composer-thinking-changed(int);
     callback composer-fast-toggled(bool);
 
@@ -1776,25 +1773,6 @@ export component AppWindow inherits Window {
                             enabled: root.composer-enabled;
                             placeholder: "thinking";
                             changed(i) => { root.composer-thinking-changed(i); }
-                        }
-                    }
-                    if root.max-mode: VerticalLayout {
-                        spacing: 2px;
-                        Text { text: "Context"; color: #7a7a7a; font-size: 10px; }
-                        Rectangle {
-                            width: 92px;
-                            height: 30px;
-                            background: #3a2e1a;
-                            border-radius: 6px;
-                            border-width: 1px;
-                            border-color: #6a5426;
-                            Text {
-                                text: "Max · +20%";
-                                color: #d9b96a;
-                                font-size: 12px;
-                                horizontal-alignment: center;
-                                vertical-alignment: center;
-                            }
                         }
                     }
                     if root.fast-visible: VerticalLayout {

@@ -286,9 +286,8 @@ impl AgentBackend for CursorBackend {
     }
 }
 
-/// Thinking/effort level tokens the catalog uses as id suffixes. Note that
-/// `-max` here is an *effort level* (mirroring Anthropic's effort API), not
-/// the IDE's "Max Mode" context toggle — the CLI has no such toggle and its
+/// Thinking/effort level tokens the catalog uses as id suffixes. `-max`
+/// here is an *effort level* (mirroring Anthropic's effort API); Cursor's
 /// models already run at their full context window.
 const LEVELS: [&str; 6] = ["none", "low", "medium", "high", "xhigh", "max"];
 
@@ -380,13 +379,13 @@ fn parse_models_output(backend_id: &str, output: &str) -> Vec<ModelInfo> {
             }
             // The CLI doesn't report context windows; "1M" in the display
             // name is the only signal, everything else gets a conservative
-            // default. Those extended-context models are Max Mode-only —
-            // the CLI has no toggle — and Max Mode usage bills at a premium
-            // (20% surcharge on some Cursor plans), so flag them.
-            let max_mode = group.display.contains("1M");
-            let window = if max_mode { 1_000_000 } else { 200_000 };
+            // default.
+            let window = if group.display.contains("1M") {
+                1_000_000
+            } else {
+                200_000
+            };
             let mut info = model(backend_id, &base, &group.display, window);
-            info.max_mode = max_mode;
             info.options_schema = serde_json::json!({
                 "type": "object",
                 "properties": properties,
@@ -566,9 +565,6 @@ mod tests {
         let opus = &models[2];
         assert_eq!(opus.display_name, "Opus 4.8 1M");
         assert_eq!(opus.context_window, 1_000_000);
-        // Extended-context models are Max Mode-only (billed at a premium).
-        assert!(opus.max_mode);
-        assert!(!models[1].max_mode);
         assert_eq!(
             opus.options_schema
                 .pointer("/properties/thinking_level/enum")

@@ -215,7 +215,6 @@ pub fn codex_models(provider_id: &str) -> Vec<ModelInfo> {
             input_price_per_mtok: None,
             output_price_per_mtok: None,
             options_schema: reasoning.clone(),
-            max_mode: false,
         },
         ModelInfo {
             id: format!("{provider_id}/gpt-5.4"),
@@ -225,7 +224,6 @@ pub fn codex_models(provider_id: &str) -> Vec<ModelInfo> {
             input_price_per_mtok: None,
             output_price_per_mtok: None,
             options_schema: reasoning,
-            max_mode: false,
         },
     ]
 }
@@ -256,7 +254,6 @@ pub fn openai_models(provider_id: &str) -> Vec<ModelInfo> {
             input_price_per_mtok: Some(2.00),
             output_price_per_mtok: Some(8.00),
             options_schema: plain.clone(),
-            max_mode: false,
         },
         ModelInfo {
             id: format!("{provider_id}/gpt-4.1-mini"),
@@ -266,7 +263,6 @@ pub fn openai_models(provider_id: &str) -> Vec<ModelInfo> {
             input_price_per_mtok: Some(0.40),
             output_price_per_mtok: Some(1.60),
             options_schema: plain,
-            max_mode: false,
         },
         ModelInfo {
             id: format!("{provider_id}/o4-mini"),
@@ -276,7 +272,6 @@ pub fn openai_models(provider_id: &str) -> Vec<ModelInfo> {
             input_price_per_mtok: Some(1.10),
             output_price_per_mtok: Some(4.40),
             options_schema: reasoning,
-            max_mode: false,
         },
     ]
 }
@@ -325,7 +320,6 @@ pub fn anthropic_models(provider_id: &str) -> Vec<ModelInfo> {
         input_price_per_mtok: prices.map(|p| p.0),
         output_price_per_mtok: prices.map(|p| p.1),
         options_schema: anthropic_thinking_schema(),
-        max_mode: false,
     };
     vec![
         m(

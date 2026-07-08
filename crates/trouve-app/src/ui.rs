@@ -62,14 +62,12 @@ pub fn set_model_knobs(
     thinking_index: i32,
     fast_visible: bool,
     fast_checked: bool,
-    max_mode: bool,
 ) {
     let _ = ui.upgrade_in_event_loop(move |ui| {
         ui.set_thinking_options(string_model(thinking_options));
         ui.set_thinking_index(thinking_index);
         ui.set_fast_visible(fast_visible);
         ui.set_fast_checked(fast_checked);
-        ui.set_max_mode(max_mode);
     });
 }
 

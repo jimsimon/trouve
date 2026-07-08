@@ -110,7 +110,6 @@ impl AnthropicProvider {
                     } else {
                         serde_json::json!({"type": "object", "properties": {}})
                     },
-                    max_mode: false,
                 })
             })
             .collect())

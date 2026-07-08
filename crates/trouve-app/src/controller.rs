@@ -614,7 +614,6 @@ impl Controller {
             index,
             fast_visible,
             fast_checked,
-            info.map(|m| m.max_mode).unwrap_or(false),
         );
     }
 

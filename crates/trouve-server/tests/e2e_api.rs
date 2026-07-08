@@ -313,7 +313,6 @@ impl Provider for CompactingProvider {
             input_price_per_mtok: None,
             output_price_per_mtok: None,
             options_schema: serde_json::json!({}),
-            max_mode: false,
         }]
     }
 
@@ -823,7 +822,6 @@ impl trouve_agents::AgentBackend for ScriptedBackend {
             input_price_per_mtok: None,
             output_price_per_mtok: None,
             options_schema: serde_json::json!({"type": "object", "properties": {}}),
-            max_mode: false,
         }]
     }
 

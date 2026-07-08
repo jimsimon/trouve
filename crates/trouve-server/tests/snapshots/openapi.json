@@ -2249,10 +2249,6 @@
             "format": "double",
             "description": "USD per million input tokens (None = unknown; cost reporting skips it)."
           },
-          "max_mode": {
-            "type": "boolean",
-            "description": "The model always runs in the vendor's \"Max Mode\" (extended context\nbilled at a premium — Cursor adds a surcharge on some plans). The\nconstraint is the vendor's; clients surface it, they can't toggle it."
-          },
           "options_schema": {
             "description": "JSON Schema for the model's options object (thinking level, etc.).\nClients render these controls from the schema, not from hardcoded\nper-model knowledge."
           },

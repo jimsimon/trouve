@@ -366,11 +366,6 @@ pub struct ModelInfo {
     /// Clients render these controls from the schema, not from hardcoded
     /// per-model knowledge.
     pub options_schema: serde_json::Value,
-    /// The model always runs in the vendor's "Max Mode" (extended context
-    /// billed at a premium — Cursor adds a surcharge on some plans). The
-    /// constraint is the vendor's; clients surface it, they can't toggle it.
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    pub max_mode: bool,
 }
 
 /// Aggregated usage for a thread or session.

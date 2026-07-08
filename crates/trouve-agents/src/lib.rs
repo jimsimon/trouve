@@ -230,6 +230,5 @@ pub(crate) fn model(backend_id: &str, name: &str, display: &str, context_window:
         input_price_per_mtok: None,
         output_price_per_mtok: None,
         options_schema: empty_schema(),
-        max_mode: false,
     }
 }
