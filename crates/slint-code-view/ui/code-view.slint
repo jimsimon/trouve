@@ -39,6 +39,38 @@ export component CodeView inherits Rectangle {
     out property <bool> has-selection: root.sel-start-line >= 0
         && (root.sel-start-line != root.sel-end-line || root.sel-start-col != root.sel-end-col);
 
+    // Host-driven selection: a 0-based inclusive line range applied (and
+    // scrolled into view) whenever the host bumps select-seq. A negative
+    // select-from clears any selection instead.
+    in property <int> select-from: -1;
+    in property <int> select-to: -1;
+    in property <int> select-seq: 0;
+
+    changed select-seq => { root.apply-host-selection(); }
+    // The host may set the range while this view isn't instantiated
+    // (hidden tab); apply on creation too.
+    init => { if (root.select-seq != 0) { root.apply-host-selection(); } }
+
+    function apply-host-selection() {
+        if (root.select-from < 0) {
+            root.sel-start-line = -1;
+            root.sel-end-line = -1;
+            root.anchor-line = -1;
+            return;
+        }
+        root.anchor-line = root.clamp-line(root.select-from);
+        root.anchor-col = 0;
+        root.sel-start-line = root.anchor-line;
+        root.sel-start-col = 0;
+        root.sel-end-line = root.clamp-line(max(root.select-to, root.select-from));
+        // Selects through end-of-line (the overlay clamps to the row).
+        root.sel-end-col = 100000;
+        // Scroll the range's first line a third down the viewport.
+        list.viewport-y = -max(0px, min(
+            root.sel-start-line * root.line-height - list.visible-height / 3,
+            root.lines.length * root.line-height - list.visible-height));
+    }
+
     // Host puts the selected text on the clipboard.
     callback copy-requested();
 
@@ -93,9 +125,13 @@ export component CodeView inherits Rectangle {
                 // Selection overlay for this row.
                 if root.has-selection && idx >= root.sel-start-line && idx <= root.sel-end-line: Rectangle {
                     property <length> from: idx == root.sel-start-line ? root.sel-start-col * root.char-width : 0;
-                    property <length> to: idx == root.sel-end-line
-                        ? root.sel-end-col * root.char-width
-                        : parent.width - root.gutter-width;
+                    // Clamped to the row so whole-line (host) selections
+                    // can use an arbitrarily large end column.
+                    property <length> to: min(
+                        idx == root.sel-end-line
+                            ? root.sel-end-col * root.char-width
+                            : parent.width - root.gutter-width,
+                        parent.width - root.gutter-width);
                     x: root.gutter-width + self.from;
                     width: max(self.to - self.from, 0);
                     height: parent.height;

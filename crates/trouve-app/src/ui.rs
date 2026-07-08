@@ -146,6 +146,29 @@ fn to_chat_row(r: &ChatRowData) -> ChatRow {
         tool_name: SharedString::from(r.tool_name.as_str()),
         tool_status: r.tool_status,
         tool_file: SharedString::from(r.tool_file.as_str()),
+        tool_line_from: r.tool_line_from,
+        tool_line_to: r.tool_line_to,
+        // Header badge strings ("+12" / "−3"); empty hides them.
+        tool_adds: if r.tool_adds > 0 {
+            format!("+{}", r.tool_adds).into()
+        } else {
+            SharedString::new()
+        },
+        tool_dels: if r.tool_dels > 0 {
+            format!("−{}", r.tool_dels).into()
+        } else {
+            SharedString::new()
+        },
+        tool_diff: ModelRc::new(VecModel::from(
+            r.diff
+                .iter()
+                .map(|(kind, text)| DiffRow {
+                    kind: *kind,
+                    text: SharedString::from(text.as_str()),
+                    ..Default::default()
+                })
+                .collect::<Vec<_>>(),
+        )),
         detail: SharedString::from(r.detail.as_str()),
         expanded: r.expanded,
         turn_state: r.turn_state,
@@ -155,6 +178,7 @@ fn to_chat_row(r: &ChatRowData) -> ChatRow {
         card_pos: r.card_pos,
         card_first: r.card_first,
         meta: SharedString::from(r.meta.as_str()),
+        subtitle: SharedString::from(r.subtitle.as_str()),
     }
 }
 
@@ -314,6 +338,17 @@ pub fn set_file_list(ui: &Ui, path: String, entries: Vec<(String, bool)>) {
             .collect();
         ui.set_file_path(SharedString::from(path.as_str()));
         ui.set_file_entries(ModelRc::new(VecModel::from(items)));
+    });
+}
+
+/// Select (and scroll to) a 0-based inclusive line range in the file view;
+/// `from < 0` clears any selection. Bumping the seq is what makes the
+/// CodeView apply it.
+pub fn set_file_selection(ui: &Ui, from: i32, to: i32) {
+    let _ = ui.upgrade_in_event_loop(move |ui| {
+        ui.set_file_sel_from(from);
+        ui.set_file_sel_to(to);
+        ui.set_file_sel_seq(ui.get_file_sel_seq().wrapping_add(1));
     });
 }
 

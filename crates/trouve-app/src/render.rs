@@ -35,6 +35,18 @@ pub struct ChatRowData {
     /// Read-style tool cards: the file path argument, so the header
     /// filename can open it in the Files view (`text` holds the basename).
     pub tool_file: String,
+    /// Read-style tool cards: the 1-based inclusive line range read
+    /// (0 = whole file / unknown). The header shows it (via `meta`) and
+    /// opening the file preselects it.
+    pub tool_line_from: i32,
+    pub tool_line_to: i32,
+    /// Edit-style tool cards: added/removed line counts for the header
+    /// badge, and the computed line diff shown as the expanded body.
+    /// Line kinds follow `DiffRow`: 1 separator, 2 context, 3 add,
+    /// 4 delete.
+    pub tool_adds: i32,
+    pub tool_dels: i32,
+    pub diff: Vec<(i32, String)>,
     pub detail: String,
     pub expanded: bool,
     pub turn_state: i32,
@@ -44,6 +56,9 @@ pub struct ChatRowData {
     pub raw: bool,
     /// Assistant headers: token/cost summary once the turn completed.
     pub meta: String,
+    /// Agent headers: the model that ran the turn, shown dimmed after the
+    /// title ("(cursor/claude-fable-5)").
+    pub subtitle: String,
     /// Header rows: stable key for the collapse toggle ("u:3", "a:5", …).
     pub card_key: String,
     /// Position within a collapsible card, for drawing one continuous
@@ -337,62 +352,17 @@ pub fn chat_rows(
                 let done = turn_state(vm, *turn).is_some();
                 let mut body = Vec::new();
                 if open {
-                    // Tool calls / thinking issued before any text
-                    // streamed.
-                    let mut lead: Vec<usize> = owner
+                    // Everything in stream order: tool calls / thinking
+                    // issued before any text streamed (the lead), then the
+                    // run itself.
+                    let mut ordered: Vec<usize> = owner
                         .iter()
                         .filter(|&(&j, &a)| a == i && j < i)
                         .map(|(&j, _)| j)
                         .collect();
-                    lead.sort_unstable();
-                    nested_rows(&mut body, vm, &lead, i, done, collapsed, expanded);
-                    // Walk the run in order: text stretches become markdown
-                    // rows — or, in raw view, one selectable plain-text row
-                    // per stretch (StyledText offers no selection, this is
-                    // the escape hatch) — while tool-call and thinking
-                    // stretches nest where they happened.
-                    let mut k = i;
-                    while k <= end {
-                        match &vm.items[k] {
-                            ChatItem::Assistant { .. } => {
-                                let start = k;
-                                while k <= end
-                                    && matches!(vm.items[k], ChatItem::Assistant { .. })
-                                {
-                                    k += 1;
-                                }
-                                let stretch = (start..k)
-                                    .map(run_content)
-                                    .filter(|s| !s.is_empty())
-                                    .collect::<Vec<_>>()
-                                    .join("\n\n");
-                                if stretch.is_empty() {
-                                    // Nothing streamed yet for this item.
-                                } else if raw {
-                                    body.push((
-                                        ChatRowData {
-                                            kind: 6,
-                                            text: stretch,
-                                            ..Default::default()
-                                        },
-                                        None,
-                                    ));
-                                } else {
-                                    push_blocks(&mut body, &stretch);
-                                }
-                            }
-                            _ => {
-                                let start = k;
-                                while k <= end
-                                    && !matches!(vm.items[k], ChatItem::Assistant { .. })
-                                {
-                                    k += 1;
-                                }
-                                let run: Vec<usize> = (start..k).collect();
-                                nested_rows(&mut body, vm, &run, i, done, collapsed, expanded);
-                            }
-                        }
-                    }
+                    ordered.sort_unstable();
+                    ordered.extend(i..=end);
+                    card_body_rows(&mut body, vm, &ordered, i, raw, done, collapsed, expanded);
                 }
                 // The turn's token/cost summary shows in the header of the
                 // turn's last card (where the status row used to sit).
@@ -405,6 +375,7 @@ pub fn chat_rows(
                 };
                 let header = ChatRowData {
                     tool_name: "Agent".into(),
+                    subtitle: turn_model_label(vm, *turn),
                     text: preview(&joined),
                     // The header copy button mirrors what's on screen: the
                     // markdown source in raw view, rendered-ish plain text
@@ -461,9 +432,10 @@ pub fn chat_rows(
                 let key = format!("a:{i}");
                 let open = !collapsed.contains(&key);
                 let done = turn_state(vm, turn).is_some();
+                let raw = raw_turns.contains(&turn);
                 let mut body = Vec::new();
                 if open {
-                    nested_rows(&mut body, vm, &run, i, done, collapsed, expanded);
+                    card_body_rows(&mut body, vm, &run, i, raw, done, collapsed, expanded);
                 }
                 // Orphan items mean no assistant item in this turn, so this
                 // card is where the turn summary lands once it completes.
@@ -473,6 +445,7 @@ pub fn chat_rows(
                 };
                 let header = ChatRowData {
                     tool_name: "Agent".into(),
+                    subtitle: turn_model_label(vm, turn),
                     expanded: open,
                     card_key: key,
                     turn: turn as i32,
@@ -541,131 +514,278 @@ fn push_card(
     }
 }
 
-/// Append a mixed stretch of tool-call and thinking items to a card body,
-/// in order: consecutive tool calls group via [`tool_run_rows`]; each
-/// thinking item becomes one collapsible kind-4 sub-card keyed by its item
-/// index — expanded while its turn is the latest, collapsed by default once
-/// the next prompt is submitted (the reader has moved on).
-fn nested_rows(
+/// One stream-ordered piece of a card body: a stretch of assistant text or
+/// a single tool-call / thinking item.
+enum Segment {
+    Text(String),
+    Item(usize),
+}
+
+/// Append a card body in stream order. Text stretches — the agent's
+/// narration and answer — always render at the card's top level. Runs of
+/// 2+ consecutive working items (tool calls, thinking) between them fold
+/// under one summarized group header ("Edited 2 files, read 3 files,
+/// called 1 tool"), expanded while the turn streams so progress is
+/// visible, collapsed by default once it's done (the group key in
+/// `collapsed` flips whichever default applies).
+#[allow(clippy::too_many_arguments)]
+fn card_body_rows(
     body: &mut Vec<(ChatRowData, Option<String>)>,
     vm: &ThreadViewModel,
-    run: &[usize],
+    ordered: &[usize],
     anchor: usize,
+    raw: bool,
     done: bool,
     collapsed: &HashSet<String>,
     expanded: &HashSet<String>,
 ) {
-    let mut p = 0;
-    while p < run.len() {
-        let j = run[p];
-        if let ChatItem::Thinking { turn, content, .. } = &vm.items[j] {
-            let key = format!("t:{j}");
-            // The toggle set flips whichever default applies.
-            let toggled = collapsed.contains(&key);
-            let open = if *turn < latest_turn(vm) {
-                toggled
-            } else {
-                !toggled
-            };
-            // Purple header pill; the content follows as ordinary markdown
-            // rows (tone 2), indented one level under the pill.
-            body.push((
-                ChatRowData {
-                    kind: 4,
-                    detail: content.clone(),
-                    // Header teaser for the collapsed state.
-                    meta: preview(content),
-                    expanded: open,
-                    card_key: key,
-                    ..Default::default()
-                },
-                None,
-            ));
-            if open {
-                let start = body.len();
-                push_blocks(body, content);
-                for (b, _) in &mut body[start..] {
-                    b.tone = 2;
-                }
+    let mut segments: Vec<Segment> = Vec::new();
+    let mut k = 0;
+    while k < ordered.len() {
+        if matches!(vm.items[ordered[k]], ChatItem::Assistant { .. }) {
+            let start = k;
+            while k < ordered.len()
+                && matches!(vm.items[ordered[k]], ChatItem::Assistant { .. })
+            {
+                k += 1;
             }
-            p += 1;
+            let stretch = ordered[start..k]
+                .iter()
+                .filter_map(|&j| match &vm.items[j] {
+                    ChatItem::Assistant { content, .. } if !content.is_empty() => {
+                        Some(content.as_str())
+                    }
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+                .join("\n\n");
+            if !stretch.is_empty() {
+                segments.push(Segment::Text(stretch));
+            }
         } else {
-            let start = p;
-            while p < run.len() && matches!(vm.items[run[p]], ChatItem::ToolCall { .. }) {
-                p += 1;
+            segments.push(Segment::Item(ordered[k]));
+            k += 1;
+        }
+    }
+
+    let mut s = 0;
+    while s < segments.len() {
+        if let Segment::Text(text) = &segments[s] {
+            text_rows(body, text, raw);
+            s += 1;
+            continue;
+        }
+        // A run of consecutive working items.
+        let start = s;
+        while s < segments.len() && matches!(segments[s], Segment::Item(_)) {
+            s += 1;
+        }
+        let run = &segments[start..s];
+        if run.len() < 2 {
+            for seg in run {
+                segment_rows(body, vm, seg, 0, raw, collapsed, expanded);
             }
-            // Group keys stay stable across renders: first tool's item
-            // index plus the owning card's anchor.
-            let gkey = format!("g{}:{anchor}", run[start]);
-            tool_run_rows(body, vm, &run[start..p], gkey, done, collapsed, expanded);
+            continue;
+        }
+        // A pending approval must be visible to be answered: it holds the
+        // group open regardless of the collapse toggle.
+        let needs_approval = run.iter().any(|seg| {
+            matches!(seg, Segment::Item(j) if matches!(
+                &vm.items[*j],
+                ChatItem::ToolCall { status: ToolCallStatus::AwaitingApproval, .. }
+            ))
+        });
+        // Group keys stay stable across renders: the run's first item
+        // index plus the owning card's anchor.
+        let first = match run[0] {
+            Segment::Item(j) => j,
+            Segment::Text(_) => unreachable!("runs hold only items"),
+        };
+        let gkey = format!("g{first}:{anchor}");
+        let toggled = collapsed.contains(&gkey);
+        let g_open = needs_approval || if done { toggled } else { !toggled };
+        body.push((
+            ChatRowData {
+                kind: 9,
+                text: activity_summary(vm, run),
+                expanded: g_open,
+                card_key: gkey,
+                ..Default::default()
+            },
+            None,
+        ));
+        if g_open {
+            for seg in run {
+                segment_rows(body, vm, seg, 1, raw, collapsed, expanded);
+            }
         }
     }
 }
 
-/// Append a run of tool-call items to a card body. Runs of 2+ consecutive
-/// tool calls fold under one "Called n tools" header (kind 9) — expanded
-/// while the turn streams so progress is visible, collapsed by default once
-/// it's done (`gkey` in `collapsed` flips whichever default applies).
-fn tool_run_rows(
+/// Append the rows of one body segment. `indent` nests tool cards and
+/// thinking pills one level under a group header.
+fn segment_rows(
     body: &mut Vec<(ChatRowData, Option<String>)>,
     vm: &ThreadViewModel,
-    run: &[usize],
-    gkey: String,
-    done: bool,
+    segment: &Segment,
+    indent: i32,
+    raw: bool,
     collapsed: &HashSet<String>,
     expanded: &HashSet<String>,
 ) {
-    let tool_body = |j: usize| {
-        let ChatItem::ToolCall {
-            call_id,
-            tool,
-            args,
-            status,
-            result,
-        } = &vm.items[j]
-        else {
-            unreachable!("tool runs hold only tool-call items");
-        };
-        (
-            tool_row(call_id, tool, args, *status, result, expanded),
-            Some(call_id.clone()),
-        )
-    };
-    if run.len() < 2 {
-        body.extend(run.iter().map(|&j| tool_body(j)));
-        return;
-    }
-    // A pending approval must be visible to be answered: it holds the
-    // group open regardless of the collapse toggle.
-    let needs_approval = run.iter().any(|&j| {
-        matches!(
-            &vm.items[j],
-            ChatItem::ToolCall {
-                status: ToolCallStatus::AwaitingApproval,
-                ..
+    match segment {
+        Segment::Text(text) => text_rows(body, text, raw),
+        Segment::Item(j) => match &vm.items[*j] {
+            ChatItem::Thinking {
+                turn,
+                content,
+                complete,
+            } => {
+                let key = format!("t:{j}");
+                // The toggle set flips whichever default applies: expanded
+                // while its turn is the latest, collapsed once the next
+                // prompt is submitted (the reader has moved on).
+                let toggled = collapsed.contains(&key);
+                let open = if *turn < latest_turn(vm) {
+                    toggled
+                } else {
+                    !toggled
+                };
+                // Header pill; the content follows as ordinary markdown
+                // rows (tone 2), indented one level under it.
+                body.push((
+                    ChatRowData {
+                        kind: 4,
+                        text: if *complete { "Thought" } else { "Thinking" }.into(),
+                        detail: content.clone(),
+                        // Header teaser for the collapsed state.
+                        meta: preview(content),
+                        expanded: open,
+                        card_key: key,
+                        md_indent: indent,
+                        ..Default::default()
+                    },
+                    None,
+                ));
+                if open {
+                    let start = body.len();
+                    push_blocks(body, content);
+                    for (b, _) in &mut body[start..] {
+                        b.tone = 2;
+                    }
+                }
             }
-        )
-    });
-    let toggled = collapsed.contains(&gkey);
-    let g_open = needs_approval || if done { toggled } else { !toggled };
-    body.push((
-        ChatRowData {
-            kind: 9,
-            text: format!("Called {} tools", run.len()),
-            expanded: g_open,
-            card_key: gkey,
-            ..Default::default()
+            ChatItem::ToolCall {
+                call_id,
+                tool,
+                args,
+                status,
+                result,
+            } => {
+                let mut row = tool_row(call_id, tool, args, *status, result, expanded);
+                row.md_indent = indent;
+                body.push((row, Some(call_id.clone())));
+            }
+            _ => {}
         },
-        None,
-    ));
-    if g_open {
-        // One indent level under the group header.
-        body.extend(run.iter().map(|&j| {
-            let (mut row, id) = tool_body(j);
-            row.md_indent = 1;
-            (row, id)
-        }));
     }
+}
+
+/// Append one text stretch: markdown-block rows, or — in raw view — one
+/// selectable plain-text row (StyledText offers no selection, this is the
+/// escape hatch).
+fn text_rows(body: &mut Vec<(ChatRowData, Option<String>)>, text: &str, raw: bool) {
+    if raw {
+        body.push((
+            ChatRowData {
+                kind: 6,
+                text: text.to_string(),
+                ..Default::default()
+            },
+            None,
+        ));
+    } else {
+        push_blocks(body, text);
+    }
+}
+
+/// Group-header summary of a card's working activity: file edits and reads
+/// count distinct paths, shell-style tools count commands, everything else
+/// counts as a generic tool call, plus thinking blocks — e.g.
+/// "Edited 2 files, read 3 files, ran 1 command, thought 2 times".
+fn activity_summary(vm: &ThreadViewModel, segments: &[Segment]) -> String {
+    let mut edited: HashSet<&str> = HashSet::new();
+    let mut edits_unpathed = 0usize;
+    let mut read: HashSet<&str> = HashSet::new();
+    let mut reads_unpathed = 0usize;
+    let mut commands = 0usize;
+    let mut tools = 0usize;
+    let mut thoughts = 0usize;
+    for seg in segments {
+        let Segment::Item(j) = seg else { continue };
+        match &vm.items[*j] {
+            ChatItem::Thinking { .. } => thoughts += 1,
+            ChatItem::ToolCall { tool, args, .. } => {
+                // MCP-mangled names classify by their base name.
+                let base = tool.rsplit("__").next().unwrap_or(tool);
+                let path = args
+                    .get("file_path")
+                    .or_else(|| args.get("path"))
+                    .and_then(serde_json::Value::as_str);
+                match base {
+                    "edit" | "Edit" | "MultiEdit" | "NotebookEdit" | "Write" | "write"
+                    | "edit_file" | "write_file" | "create_file" | "apply_patch"
+                    | "delete" | "delete_file" => match path {
+                        Some(p) => {
+                            edited.insert(p);
+                        }
+                        None => edits_unpathed += 1,
+                    },
+                    "read" | "Read" | "read_file" => match path {
+                        Some(p) => {
+                            read.insert(p);
+                        }
+                        None => reads_unpathed += 1,
+                    },
+                    "shell" | "bash" | "Bash" | "execute" => commands += 1,
+                    _ => tools += 1,
+                }
+            }
+            _ => {}
+        }
+    }
+    let plural = |n: usize, one: &str, many: &str| {
+        if n == 1 {
+            format!("1 {one}")
+        } else {
+            format!("{n} {many}")
+        }
+    };
+    let mut parts: Vec<String> = Vec::new();
+    let edits = edited.len() + edits_unpathed;
+    if edits > 0 {
+        parts.push(format!("edited {}", plural(edits, "file", "files")));
+    }
+    let reads = read.len() + reads_unpathed;
+    if reads > 0 {
+        parts.push(format!("read {}", plural(reads, "file", "files")));
+    }
+    if commands > 0 {
+        parts.push(format!("ran {}", plural(commands, "command", "commands")));
+    }
+    if tools > 0 {
+        parts.push(format!("called {}", plural(tools, "tool", "tools")));
+    }
+    if thoughts > 0 {
+        parts.push(format!("thought {}", plural(thoughts, "time", "times")));
+    }
+    let mut summary = parts.join(", ");
+    // Sentence-case the first part.
+    if let Some(first) = summary.get(..1) {
+        let upper = first.to_uppercase();
+        summary.replace_range(..1, &upper);
+    }
+    summary
 }
 
 /// Append one assistant text segment as markdown-block rows. Each block is
@@ -711,6 +831,156 @@ fn push_blocks(body: &mut Vec<(ChatRowData, Option<String>)>, content: &str) {
     }
 }
 
+/// A file-edit tool call folded for display: header verb + path and the
+/// body's line diff (kinds follow `DiffRow`: 1 separator, 2 context,
+/// 3 add, 4 delete).
+struct EditView {
+    verb: &'static str,
+    path: String,
+    lines: Vec<(i32, String)>,
+}
+
+/// Recognize file-edit tools across backends and extract a line diff.
+/// Claude sends Edit/MultiEdit/Write with old/new strings; cursor's ACP
+/// edit kind carries similar raw input under varying key names; anything
+/// shipping a unified-diff/patch string renders that directly.
+fn edit_view(tool: &str, args: &serde_json::Value) -> Option<EditView> {
+    let str_arg = |keys: &[&str]| {
+        keys.iter()
+            .find_map(|k| args.get(*k).and_then(serde_json::Value::as_str))
+    };
+    let base = tool.rsplit("__").next().unwrap_or(tool);
+    let verb = match base {
+        "edit" | "Edit" | "MultiEdit" | "NotebookEdit" | "edit_file" | "apply_patch"
+        | "fileChange" => "Edit",
+        "write" | "Write" | "write_file" | "create_file" => "Write",
+        _ => return None,
+    };
+    let path = str_arg(&["file_path", "path", "abs_path", "target_file", "filePath"])
+        .unwrap_or_default()
+        .to_string();
+
+    // A ready-made unified diff / patch wins: render its lines as-is.
+    if let Some(patch) = str_arg(&["diff", "patch", "unified_diff", "unifiedDiff", "input"]) {
+        let lines = patch_lines(patch);
+        if !lines.is_empty() {
+            return Some(EditView { verb, path, lines });
+        }
+    }
+
+    let old_new = |v: &serde_json::Value| {
+        let get = |keys: &[&str]| {
+            keys.iter()
+                .find_map(|k| v.get(*k).and_then(serde_json::Value::as_str))
+                .map(str::to_string)
+        };
+        let old = get(&["old_string", "oldText", "old_text", "old_str"]);
+        let new = get(&["new_string", "newText", "new_text", "new_str"]);
+        match (old, new) {
+            (None, None) => None,
+            (old, new) => Some((old.unwrap_or_default(), new.unwrap_or_default())),
+        }
+    };
+    // MultiEdit: several old/new pairs against one file, separated below.
+    let pairs: Vec<(String, String)> = match args.get("edits").and_then(|v| v.as_array()) {
+        Some(edits) => edits.iter().filter_map(old_new).collect(),
+        None => old_new(args)
+            .or_else(|| {
+                // Write-style: the whole new content, no old text.
+                str_arg(&["content", "contents", "file_text", "fileText"])
+                    .map(|c| (String::new(), c.to_string()))
+            })
+            .into_iter()
+            .collect(),
+    };
+    if pairs.is_empty() {
+        return None;
+    }
+    let mut lines = Vec::new();
+    for (i, (old, new)) in pairs.iter().enumerate() {
+        if i > 0 {
+            lines.push((1, "···".to_string()));
+        }
+        lines.extend(line_diff(old, new));
+    }
+    Some(EditView { verb, path, lines })
+}
+
+/// Diff two text snippets line-by-line (LCS): unchanged lines are context,
+/// removals then insertions inside changed blocks. Oversized inputs skip
+/// the LCS and show plain delete-all/add-all.
+fn line_diff(old: &str, new: &str) -> Vec<(i32, String)> {
+    let a: Vec<&str> = old.lines().collect();
+    let b: Vec<&str> = new.lines().collect();
+    let mut out = Vec::new();
+    if a.len() * b.len() > 1_000_000 {
+        out.extend(a.iter().map(|l| (4, l.to_string())));
+        out.extend(b.iter().map(|l| (3, l.to_string())));
+        return out;
+    }
+    // dp[i][j] = LCS length of a[i..] and b[j..].
+    let mut dp = vec![vec![0u32; b.len() + 1]; a.len() + 1];
+    for i in (0..a.len()).rev() {
+        for j in (0..b.len()).rev() {
+            dp[i][j] = if a[i] == b[j] {
+                dp[i + 1][j + 1] + 1
+            } else {
+                dp[i + 1][j].max(dp[i][j + 1])
+            };
+        }
+    }
+    let (mut i, mut j) = (0, 0);
+    while i < a.len() && j < b.len() {
+        if a[i] == b[j] {
+            out.push((2, a[i].to_string()));
+            i += 1;
+            j += 1;
+        } else if dp[i + 1][j] >= dp[i][j + 1] {
+            out.push((4, a[i].to_string()));
+            i += 1;
+        } else {
+            out.push((3, b[j].to_string()));
+            j += 1;
+        }
+    }
+    out.extend(a[i..].iter().map(|l| (4, l.to_string())));
+    out.extend(b[j..].iter().map(|l| (3, l.to_string())));
+    out
+}
+
+/// Map unified-diff/patch text to display lines: +/- prefixes become
+/// add/delete rows, hunk markers become separators, file metadata is
+/// dropped. Returns empty when nothing looks like diff content.
+fn patch_lines(patch: &str) -> Vec<(i32, String)> {
+    let mut out = Vec::new();
+    let mut saw_change = false;
+    for line in patch.lines() {
+        if line.starts_with("+++")
+            || line.starts_with("---")
+            || line.starts_with("diff --git")
+            || line.starts_with("index ")
+        {
+            continue;
+        }
+        if line.starts_with("@@") || line.starts_with("*** ") {
+            out.push((1, line.to_string()));
+        } else if let Some(rest) = line.strip_prefix('+') {
+            out.push((3, rest.to_string()));
+            saw_change = true;
+        } else if let Some(rest) = line.strip_prefix('-') {
+            out.push((4, rest.to_string()));
+            saw_change = true;
+        } else {
+            out.push((2, line.strip_prefix(' ').unwrap_or(line).to_string()));
+        }
+    }
+    if saw_change {
+        out
+    } else {
+        Vec::new()
+    }
+}
+
 /// Build the row for one tool call card (used standalone and inside
 /// assistant card bodies).
 fn tool_row(
@@ -738,8 +1008,35 @@ fn tool_row(
         detail.truncate(detail.floor_boundary(4000));
         detail.push('…');
     }
+    // Edit-style tools title as "Edit <filename>" with a clickable
+    // filename, +/− counts in the header, and the line diff as the body.
+    if let Some(edit) = edit_view(tool, args) {
+        // Cap the rendered diff: one chat row hosts all these lines
+        // un-virtualized, so a full-file rewrite would balloon the row.
+        let mut lines = edit.lines;
+        let adds = lines.iter().filter(|(k, _)| *k == 3).count() as i32;
+        let dels = lines.iter().filter(|(k, _)| *k == 4).count() as i32;
+        if lines.len() > 300 {
+            let more = lines.len() - 300;
+            lines.truncate(300);
+            lines.push((1, format!("… {more} more lines")));
+        }
+        return ChatRowData {
+            kind: 2,
+            tool_name: edit.verb.into(),
+            text: edit.path.rsplit('/').next().unwrap_or_default().to_string(),
+            tool_file: edit.path,
+            tool_adds: adds,
+            tool_dels: dels,
+            diff: lines,
+            tool_status: tool_status(status),
+            detail,
+            expanded: expanded.contains(call_id),
+            ..Default::default()
+        };
+    }
     // Read-style tools (native read_file, Claude Read, cursor read) title
-    // as "Read <filename>", with the filename clickable in the UI.
+    // as "Read <filename> L123-456", with the filename clickable in the UI.
     let file = matches!(tool, "Read" | "read" | "read_file")
         .then(|| {
             args.get("file_path")
@@ -748,6 +1045,7 @@ fn tool_row(
         })
         .flatten()
         .unwrap_or_default();
+    let (from, to) = read_range(args);
     ChatRowData {
         kind: 2,
         tool_name: if file.is_empty() {
@@ -757,10 +1055,40 @@ fn tool_row(
         },
         text: file.rsplit('/').next().unwrap_or_default().to_string(),
         tool_file: file.to_string(),
+        tool_line_from: if file.is_empty() { 0 } else { from },
+        tool_line_to: if file.is_empty() { 0 } else { to },
+        meta: match (file.is_empty(), from, to) {
+            (true, ..) | (_, 0, _) => String::new(),
+            (_, f, t) if t > f => format!("L{f}-{t}"),
+            (_, f, _) => format!("L{f}"),
+        },
         tool_status: tool_status(status),
         detail,
         expanded: expanded.contains(call_id),
         ..Default::default()
+    }
+}
+
+/// The 1-based inclusive line range a read-style call covered, from its
+/// offset/limit or start/end arguments; (0, 0) when it read the whole
+/// file (or the args carry no range).
+fn read_range(args: &serde_json::Value) -> (i32, i32) {
+    let int_arg = |keys: &[&str]| {
+        keys.iter()
+            .find_map(|k| args.get(*k).and_then(serde_json::Value::as_i64))
+            .filter(|n| *n > 0)
+            .map(|n| n as i32)
+    };
+    let start = int_arg(&["offset", "start_line", "startLine", "start"]);
+    let end = int_arg(&["end_line", "endLine", "end"]);
+    let limit = int_arg(&["limit"]);
+    match (start, end, limit) {
+        (Some(s), Some(e), _) => (s, e.max(s)),
+        (Some(s), None, Some(l)) => (s, s + l - 1),
+        (Some(s), None, None) => (s, s),
+        (None, Some(e), _) => (1, e),
+        (None, None, Some(l)) => (1, l),
+        (None, None, None) => (0, 0),
     }
 }
 
@@ -862,6 +1190,17 @@ fn preview(content: &str) -> String {
 }
 
 /// The highest turn number present in the thread (0 when empty).
+/// The agent header's dimmed model tag: "(cursor/claude-fable-5)", empty
+/// when the turn's model isn't known (old threads predating the event
+/// field).
+fn turn_model_label(vm: &ThreadViewModel, turn: u64) -> String {
+    vm.turn_models
+        .get(&turn)
+        .filter(|m| !m.is_empty())
+        .map(|m| format!("({m})"))
+        .unwrap_or_default()
+}
+
 fn latest_turn(vm: &ThreadViewModel) -> u64 {
     vm.items
         .iter()
@@ -1170,8 +1509,8 @@ mod tests {
         };
         let (rows, ids) = chat_rows(&vm, &HashSet::new(), &HashSet::new(), &HashSet::new());
         // Streaming turn: You header, prompt, Assistant header, the 2-tool
-        // run under an expanded group header, text, trailing single tool —
-        // every tool row inside the card outline.
+        // run under an expanded group header, the narration text (never
+        // grouped), then the trailing single tool inline.
         let kinds: Vec<i32> = rows.iter().map(|r| r.kind).collect();
         assert_eq!(kinds, vec![7, 1, 7, 9, 2, 2, 1, 2]);
         assert_eq!(rows[3].text, "Called 2 tools");
@@ -1180,7 +1519,8 @@ mod tests {
         assert_eq!(rows.last().unwrap().card_pos, 3);
         assert_eq!(ids[4].as_deref(), Some("t1"));
         assert_eq!(ids[7].as_deref(), Some("t3"));
-        // Once the turn completes, the run collapses by default.
+        // Once the turn completes, the run collapses by default; the text
+        // and the ungrouped single tool stay visible.
         vm.items.push(ChatItem::TurnStatus {
             turn: 1,
             state: TurnState::Completed {
@@ -1191,7 +1531,7 @@ mod tests {
         let kinds: Vec<i32> = rows.iter().map(|r| r.kind).collect();
         assert_eq!(kinds, vec![7, 1, 7, 9, 1, 2]);
         assert!(!rows[3].expanded);
-        // Toggling the group key (first tool's item index + the owning
+        // Toggling the group key (the run's first item index + the owning
         // card's anchor) reopens it.
         let opened: HashSet<String> = ["g1:3".to_string()].into();
         let (rows, _) = chat_rows(&vm, &HashSet::new(), &HashSet::new(), &opened);
@@ -1246,7 +1586,8 @@ mod tests {
             ..Default::default()
         };
         let (rows, _) = chat_rows(&vm, &HashSet::new(), &HashSet::new(), &HashSet::new());
-        // One You card, one Agent card; each thinking item renders as a
+        // One You card, one Agent card; a lone thinking item between text
+        // stretches stays inline (no group header for a single item): a
         // kind-4 header pill followed by its content as markdown rows
         // (tone 2), in stream order.
         let kinds: Vec<i32> = rows.iter().map(|r| r.kind).collect();
@@ -1339,6 +1680,84 @@ mod tests {
             .filter(|r| r.kind == 7 && r.tool_name == "Agent")
             .count();
         assert_eq!(headers, 1);
+    }
+
+    #[test]
+    fn mixed_thinking_and_tool_runs_group_with_a_summary() {
+        let vm = ThreadViewModel {
+            items: vec![
+                ChatItem::User {
+                    turn: 1,
+                    content: "q".into(),
+                },
+                ChatItem::Thinking {
+                    turn: 1,
+                    content: "hmm".into(),
+                    complete: true,
+                },
+                ChatItem::ToolCall {
+                    call_id: "t1".into(),
+                    tool: "Read".into(),
+                    args: serde_json::json!({"file_path": "a.rs"}),
+                    status: ToolCallStatus::Ok,
+                    result: None,
+                },
+                ChatItem::Assistant {
+                    turn: 1,
+                    content: "answer".into(),
+                    complete: true,
+                },
+            ],
+            ..Default::default()
+        };
+        let (rows, _) = chat_rows(&vm, &HashSet::new(), &HashSet::new(), &HashSet::new());
+        // The thinking + read run groups under one summarized header; the
+        // narration/answer text stays outside the group.
+        let group = rows.iter().find(|r| r.kind == 9).unwrap();
+        assert_eq!(group.text, "Read 1 file, thought 1 time");
+        assert!(group.expanded, "open while streaming");
+        // Both members nest one level under the header.
+        let pill = rows.iter().find(|r| r.kind == 4).unwrap();
+        assert_eq!(pill.md_indent, 1);
+        let tool = rows.iter().find(|r| r.kind == 2).unwrap();
+        assert_eq!(tool.md_indent, 1);
+        // The answer text is a top-level markdown row, not grouped.
+        assert!(rows.iter().any(|r| r.kind == 1 && r.text == "answer"));
+    }
+
+    #[test]
+    fn activity_summary_counts_by_category() {
+        let tool = |name: &str, args: serde_json::Value| ChatItem::ToolCall {
+            call_id: "c".into(),
+            tool: name.into(),
+            args,
+            status: ToolCallStatus::Ok,
+            result: None,
+        };
+        let vm = ThreadViewModel {
+            items: vec![
+                // Two edits of the same file count once; a third distinct
+                // file makes two.
+                tool("Edit", serde_json::json!({"file_path": "a.rs"})),
+                tool("write_file", serde_json::json!({"path": "a.rs"})),
+                tool("Write", serde_json::json!({"file_path": "b.rs"})),
+                tool("Read", serde_json::json!({"file_path": "c.rs"})),
+                tool("read_file", serde_json::json!({"path": "d.rs"})),
+                tool("Bash", serde_json::json!({"command": "ls"})),
+                tool("mcp__trouve__search", serde_json::json!({"query": "x"})),
+                ChatItem::Thinking {
+                    turn: 1,
+                    content: "hmm".into(),
+                    complete: true,
+                },
+            ],
+            ..Default::default()
+        };
+        let segments: Vec<Segment> = (0..vm.items.len()).map(Segment::Item).collect();
+        assert_eq!(
+            activity_summary(&vm, &segments),
+            "Edited 2 files, read 2 files, ran 1 command, called 1 tool, thought 1 time"
+        );
     }
 
     #[test]
@@ -1457,6 +1876,23 @@ mod tests {
         assert_eq!(row.tool_name, "Read");
         assert_eq!(row.text, "main.rs");
         assert_eq!(row.tool_file, "/w/src/app/main.rs");
+        // Whole-file read: no range badge.
+        assert_eq!((row.tool_line_from, row.tool_line_to), (0, 0));
+        assert!(row.meta.is_empty());
+
+        // Ranged read (Claude offset/limit): "L<from>-<to>" in the header.
+        let args = serde_json::json!({
+            "file_path": "/w/src/app/main.rs", "offset": 100, "limit": 50,
+        });
+        let row = tool_row("c1", "Read", &args, ToolCallStatus::Ok, &None, &HashSet::new());
+        assert_eq!((row.tool_line_from, row.tool_line_to), (100, 149));
+        assert_eq!(row.meta, "L100-149");
+
+        // start/end variants map directly.
+        let args = serde_json::json!({"path": "a.rs", "start_line": 3, "end_line": 9});
+        let row = tool_row("c1", "read_file", &args, ToolCallStatus::Ok, &None, &HashSet::new());
+        assert_eq!((row.tool_line_from, row.tool_line_to), (3, 9));
+        assert_eq!(row.meta, "L3-9");
 
         // Cursor / native variants use a "path" argument.
         let args = serde_json::json!({"path": "notes.md"});
@@ -1468,5 +1904,58 @@ mod tests {
         let row = tool_row("c3", "search", &args, ToolCallStatus::Ok, &None, &HashSet::new());
         assert_eq!(row.tool_name, "Code Search notes.md");
         assert!(row.tool_file.is_empty());
+    }
+
+    #[test]
+    fn edit_tools_show_a_line_diff_with_counts() {
+        // Claude Edit: old/new snippets diff line-by-line.
+        let args = serde_json::json!({
+            "file_path": "/w/src/lib.rs",
+            "old_string": "fn a() {}\nfn b() {}",
+            "new_string": "fn a() {}\nfn b2() {}\nfn c() {}",
+        });
+        let row = tool_row("c1", "Edit", &args, ToolCallStatus::Ok, &None, &HashSet::new());
+        assert_eq!(row.tool_name, "Edit");
+        assert_eq!(row.text, "lib.rs");
+        assert_eq!(row.tool_file, "/w/src/lib.rs");
+        assert_eq!((row.tool_adds, row.tool_dels), (2, 1));
+        assert_eq!(
+            row.diff,
+            vec![
+                (2, "fn a() {}".to_string()),
+                (4, "fn b() {}".to_string()),
+                (3, "fn b2() {}".to_string()),
+                (3, "fn c() {}".to_string()),
+            ]
+        );
+
+        // Write: no old text, everything is an addition.
+        let args = serde_json::json!({"path": "new.txt", "content": "one\ntwo"});
+        let row = tool_row("c2", "write_file", &args, ToolCallStatus::Ok, &None, &HashSet::new());
+        assert_eq!(row.tool_name, "Write");
+        assert_eq!((row.tool_adds, row.tool_dels), (2, 0));
+        assert!(row.diff.iter().all(|(k, _)| *k == 3));
+
+        // MultiEdit: pairs separated by a divider row.
+        let args = serde_json::json!({
+            "file_path": "/w/a.rs",
+            "edits": [
+                {"old_string": "x", "new_string": "y"},
+                {"old_string": "p", "new_string": "q"},
+            ],
+        });
+        let row = tool_row("c3", "MultiEdit", &args, ToolCallStatus::Ok, &None, &HashSet::new());
+        assert_eq!((row.tool_adds, row.tool_dels), (2, 2));
+        assert!(row.diff.contains(&(1, "···".to_string())));
+
+        // A unified-diff payload renders its lines directly.
+        let args = serde_json::json!({
+            "path": "b.rs",
+            "diff": "@@ -1,2 +1,2 @@\n context\n-old\n+new",
+        });
+        let row = tool_row("c4", "edit", &args, ToolCallStatus::Ok, &None, &HashSet::new());
+        assert_eq!((row.tool_adds, row.tool_dels), (1, 1));
+        assert_eq!(row.diff[0], (1, "@@ -1,2 +1,2 @@".to_string()));
+        assert_eq!(row.diff[1], (2, "context".to_string()));
     }
 }

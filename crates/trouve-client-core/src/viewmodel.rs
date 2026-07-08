@@ -2,6 +2,8 @@
 //! `ChatItem`s onto their widgets; the folding logic lives here once, and is
 //! plain Rust (testable without any UI).
 
+use std::collections::HashMap;
+
 use trouve_protocol::{ApprovalDecision, Event, EventEnvelope, ToolStatus, Usage};
 
 #[derive(Debug, Clone, PartialEq)]
@@ -70,6 +72,9 @@ pub struct ThreadViewModel {
     /// True while the model is streaming thinking and nothing has followed
     /// it yet ("Thinking…" vs "Processing…" activity label).
     pub thinking: bool,
+    /// The model that ran each turn ("cursor/claude-fable-5"), from
+    /// turn.started — shown in the agent card header.
+    pub turn_models: HashMap<u64, String>,
 }
 
 impl ThreadViewModel {
@@ -103,8 +108,9 @@ impl ThreadViewModel {
     pub fn apply(&mut self, envelope: &EventEnvelope) -> Option<usize> {
         self.cursor = envelope.cursor;
         match &envelope.event {
-            Event::TurnStarted { turn, .. } => {
+            Event::TurnStarted { turn, model, .. } => {
                 self.turn_running = true;
+                self.turn_models.insert(*turn, model.clone());
                 self.items.push(ChatItem::TurnStatus {
                     turn: *turn,
                     state: TurnState::Running,

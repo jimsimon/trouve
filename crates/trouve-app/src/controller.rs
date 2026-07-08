@@ -90,8 +90,9 @@ pub enum UiCommand {
     FileActivated(usize),
     FileUp,
     /// A filename clicked in a chat tool card; path as the tool saw it
-    /// (possibly absolute).
-    OpenChatFile(String),
+    /// (possibly absolute), plus the 1-based line range the tool covered
+    /// (0 = none) to preselect in the file view.
+    OpenChatFile(String, i32, i32),
 
     // Settings window.
     RefreshSettings,
@@ -1321,9 +1322,11 @@ impl Controller {
                     let file = self.client.session_file(&session_id, &joined).await?;
                     let lines = render::highlight_file(&file.path, &file.content);
                     ui::set_file_view(&self.ui, joined, file.content, lines);
+                    // A browser open carries no line range to highlight.
+                    ui::set_file_selection(&self.ui, -1, -1);
                 }
             }
-            UiCommand::OpenChatFile(path) => {
+            UiCommand::OpenChatFile(path, from, to) => {
                 let Some(index) = self.current_session else {
                     return Ok(());
                 };
@@ -1339,6 +1342,13 @@ impl Controller {
                     Ok(file) => {
                         let lines = render::highlight_file(&file.path, &file.content);
                         ui::set_file_view(&self.ui, rel, file.content, lines);
+                        // Preselect the lines the tool covered (1-based in
+                        // the args, 0-based in the view).
+                        if from > 0 {
+                            ui::set_file_selection(&self.ui, from - 1, to.max(from) - 1);
+                        } else {
+                            ui::set_file_selection(&self.ui, -1, -1);
+                        }
                         ui::set_right_tab(&self.ui, 1);
                     }
                     Err(e) => self.status(&format!("could not open {rel}: {e}")),

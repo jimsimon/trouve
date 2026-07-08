@@ -244,8 +244,8 @@ fn main() -> anyhow::Result<()> {
     }
     {
         let tx = tx.clone();
-        window.on_chat_file_opened(move |path| {
-            let _ = tx.send(UiCommand::OpenChatFile(path.to_string()));
+        window.on_chat_file_opened(move |path, from, to| {
+            let _ = tx.send(UiCommand::OpenChatFile(path.to_string(), from, to));
         });
     }
     {

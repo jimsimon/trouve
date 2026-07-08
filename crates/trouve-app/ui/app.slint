@@ -59,6 +59,15 @@ export struct ChatRow {
     // Read-style tools: the file path argument; `text` holds the basename
     // shown (and clickable) in the header.
     tool-file: string,
+    // Read-style tools: the 1-based line range read (0 = whole file);
+    // shown as "L123-456" and preselected when the file is opened.
+    tool-line-from: int,
+    tool-line-to: int,
+    // Edit-style tools: "+x"/"−y" header badges (empty hides them) and
+    // the line diff shown as the expanded body instead of `detail`.
+    tool-adds: string,
+    tool-dels: string,
+    tool-diff: [DiffRow],
     // 0 awaiting approval, 1 running, 2 ok, 3 error, 4 denied, 5 aborted
     tool-status: int,
     detail: string,
@@ -73,6 +82,8 @@ export struct ChatRow {
     card-key: string,
     // Assistant headers: token/cost summary once the turn completed.
     meta: string,
+    // Agent headers: dimmed model tag ("(cursor/claude-fable-5)").
+    subtitle: string,
     // Position in a collapsible card outline: 0 none, 1 header (body
     // follows), 2 body, 3 last body row, 4 standalone header.
     card-pos: int,
@@ -702,8 +713,14 @@ export component AppWindow inherits Window {
     callback tool-toggled(/* row index */ int);
     callback raw-toggled(/* turn */ int);
     callback card-toggled(/* card key */ string);
-    // Filename click on a Read tool card: open the file in the Files tab.
-    callback chat-file-opened(/* path */ string);
+    // Filename click on a Read/Edit tool card: open the file in the Files
+    // tab; a nonzero 1-based line range gets preselected there.
+    callback chat-file-opened(/* path */ string, /* from */ int, /* to */ int);
+    // File-view selection (0-based inclusive lines; from < 0 clears),
+    // applied by the CodeView whenever the seq is bumped.
+    in property <int> file-sel-from: -1;
+    in property <int> file-sel-to: -1;
+    in property <int> file-sel-seq: 0;
     // Right-panel tab (0 diff, 1 files); the controller flips it when a
     // chat click opens a file.
     in-out property <int> right-tab: 0;
@@ -1198,7 +1215,6 @@ export component AppWindow inherits Window {
                         property <color> card-line: row.kind == 2 ? #33503c
                             : row.tool-name == "You" ? #3a4a68
                             : row.tool-name == "Agent" ? #33503c
-                            : row.tool-name == "Thinking" ? #453b63
                             : #3a3f46;
 
                         if row.card-pos == 2 || row.card-pos == 3: Rectangle {
@@ -1238,11 +1254,12 @@ export component AppWindow inherits Window {
                                 || row.kind == 4
                                 || row.kind == 6 || row.kind == 9;
 
-                            // Tool cards under a "Called n tools" header
-                            // (md-indent 1) and thinking content (tone 2)
-                            // nest one level deeper.
+                            // Tool cards and thinking pills under an
+                            // activity-group header (md-indent 1) and
+                            // thinking content (tone 2) nest one level
+                            // deeper.
                             property <length> indent: 16px
-                                + (row.kind == 2 ? row.md-indent * 16px : 0px)
+                                + (row.kind == 2 || row.kind == 4 ? row.md-indent * 16px : 0px)
                                 + (row.kind == 1 && row.tone == 2 ? 16px : 0px);
                             x: self.body ? self.indent : 0px;
                             // The 18px keeps rows clear of the chat
@@ -1257,14 +1274,13 @@ export component AppWindow inherits Window {
                                 - (self.slab ? 10px : 0px);
 
                             // Card headers tint by source: prompt blue,
-                            // assistant green, thinking violet; tool cards
-                            // stay grey.
+                            // assistant green; tool cards and thinking
+                            // pills stay grey.
                             background: hdr && row.tool-name == "You" ? #232c3d
                                 : hdr && row.tool-name == "Agent" ? #1f2a22
-                                : hdr && row.tool-name == "Thinking" ? #272233
-                                : row.kind == 2 || row.kind == 9 || hdr ? #1d1d1d
-                                // Nested thinking keeps its purple tint.
-                                : row.kind == 4 ? #272233
+                                // Thinking pills share the tool-card grey.
+                                : row.kind == 2 || row.kind == 4
+                                    || row.kind == 9 || hdr ? #1d1d1d
                                 // Lighter than the panel (#141414) so the
                                 // block reads as a slab, not an outline.
                                 : row.kind == 1 && row.md-kind == 5 ? #1f2226
@@ -1277,10 +1293,9 @@ export component AppWindow inherits Window {
                             border-bottom-left-radius: hdr && row.card-pos == 1 ? 0px : 6px;
                             border-bottom-right-radius: hdr && row.card-pos == 1 ? 0px : 6px;
                             border-width: (row.kind == 1 && row.md-kind == 5)
-                                || row.kind == 4 || row.kind == 6 || hdr ? 1px : 0px;
+                                || row.kind == 6 || hdr ? 1px : 0px;
                             border-color: hdr && row.tool-name == "You" ? #3a4a68
                                 : hdr && row.tool-name == "Agent" ? #33503c
-                                : row.kind == 4 ? #453b63
                                 : row.kind == 6 ? #2a2d31
                                 : hdr ? #3a3f46
                                 : #35393f;
@@ -1296,14 +1311,14 @@ export component AppWindow inherits Window {
                             padding: 6px;
                             padding-top: row.kind == 7 ? 2px
                                 : row.kind == 8 ? 8px
-                                : row.kind == 2 || row.kind == 9 ? 3px
+                                : row.kind == 2 || row.kind == 4 || row.kind == 9 ? 3px
                                 : md-list ? 2px : md-heading ? 14px : 6px;
                             padding-bottom: row.kind == 7 ? 2px
                                 // The next card header brings its own 8px
                                 // gap; adding more here would double the
                                 // space below the rule.
                                 : row.kind == 8 ? 0px
-                                : row.kind == 2 || row.kind == 9 ? 3px
+                                : row.kind == 2 || row.kind == 4 || row.kind == 9 ? 3px
                                 : md-list ? 2px : md-heading ? 4px : 6px;
                             padding-left: md-list ? 22px + row.md-indent * 18px : 10px;
                             spacing: 4px;
@@ -1323,6 +1338,13 @@ export component AppWindow inherits Window {
                                     color: #d0d0d0;
                                     font-size: 11px;
                                     font-weight: 700;
+                                    vertical-alignment: center;
+                                }
+                                // Agent headers: the model that ran the turn.
+                                if row.subtitle != "": Text {
+                                    text: row.subtitle;
+                                    color: #8a8a8a;
+                                    font-size: 11px;
                                     vertical-alignment: center;
                                 }
                                 if !row.expanded: Text {
@@ -1472,8 +1494,9 @@ export component AppWindow inherits Window {
                                         font-weight: 700;
                                         vertical-alignment: center;
                                     }
-                                    // Read tools: the filename opens the
-                                    // file in the Files tab.
+                                    // Read/edit tools: the filename opens
+                                    // the file in the Files tab (reads
+                                    // preselect the line range there).
                                     if row.tool-file != "": Text {
                                         text: row.text;
                                         color: #6fa8dc;
@@ -1482,9 +1505,33 @@ export component AppWindow inherits Window {
                                         TouchArea {
                                             mouse-cursor: pointer;
                                             clicked => {
-                                                root.chat-file-opened(row.tool-file);
+                                                root.chat-file-opened(
+                                                    row.tool-file,
+                                                    row.tool-line-from,
+                                                    row.tool-line-to);
                                             }
                                         }
+                                    }
+                                    // Read tools: the line range read
+                                    // ("L123-456", built in Rust).
+                                    if row.meta != "": Text {
+                                        text: row.meta;
+                                        color: #8a8a8a;
+                                        font-size: 11px;
+                                        vertical-alignment: center;
+                                    }
+                                    // Edit tools: added/removed line counts.
+                                    if row.tool-adds != "": Text {
+                                        text: row.tool-adds;
+                                        color: #7fd18a;
+                                        font-size: 11px;
+                                        vertical-alignment: center;
+                                    }
+                                    if row.tool-dels != "": Text {
+                                        text: row.tool-dels;
+                                        color: #e39ea6;
+                                        font-size: 11px;
+                                        vertical-alignment: center;
                                     }
                                     Rectangle { horizontal-stretch: 1; }
                                     CopyButton {
@@ -1510,8 +1557,41 @@ export component AppWindow inherits Window {
                                 }
                             }
 
-                            // Tool card detail.
-                            if row.kind == 2 && row.expanded: TextInput {
+                            // Tool card detail: edits show their line
+                            // diff, everything else the humanized
+                            // args/result text.
+                            if row.kind == 2 && row.expanded && row.tool-diff.length > 0: VerticalLayout {
+                                for dline in row.tool-diff: Rectangle {
+                                    height: 18px;
+                                    background: dline.kind == 3 ? #1e3a24
+                                        : dline.kind == 4 ? #42272b
+                                        : transparent;
+                                    HorizontalLayout {
+                                        spacing: 0;
+                                        Text {
+                                            width: 16px;
+                                            text: dline.kind == 3 ? "+"
+                                                : dline.kind == 4 ? "-" : " ";
+                                            color: dline.kind == 3 ? #7fd18a
+                                                : dline.kind == 4 ? #e39ea6
+                                                : #6e6e6e;
+                                            font-family: "monospace";
+                                            font-size: 12px;
+                                            vertical-alignment: center;
+                                        }
+                                        Text {
+                                            text: dline.text;
+                                            color: dline.kind == 1 ? #9cbdde : #d4d4d4;
+                                            font-family: "monospace";
+                                            font-size: 12px;
+                                            vertical-alignment: center;
+                                            overflow: elide;
+                                            horizontal-stretch: 1;
+                                        }
+                                    }
+                                }
+                            }
+                            if row.kind == 2 && row.expanded && row.tool-diff.length == 0: TextInput {
                                 text: row.detail;
                                 read-only: true;
                                 single-line: false;
@@ -1568,15 +1648,16 @@ export component AppWindow inherits Window {
                                 selection-background-color: #3d5a80;
                             }
 
-                            // Model thinking (reasoning stream): a purple
-                            // header pill; the content follows as ordinary
-                            // markdown rows (tone 2) that this toggles.
+                            // Model thinking (reasoning stream): a header
+                            // pill styled like a tool card; the content
+                            // follows as markdown rows (tone 2) that this
+                            // toggles.
                             if row.kind == 4: Rectangle {
-                                height: 18px;
+                                height: think-hdr.preferred-height;
                                 TouchArea {
                                     clicked => { root.card-toggled(row.card-key); }
                                 }
-                                HorizontalLayout {
+                                think-hdr := HorizontalLayout {
                                     spacing: 8px;
                                     Text {
                                         text: row.expanded ? "▾" : "▸";
@@ -1585,15 +1666,17 @@ export component AppWindow inherits Window {
                                         vertical-alignment: center;
                                     }
                                     Text {
-                                        text: "Thinking";
-                                        color: #d0d0d0;
+                                        // "Thinking" while streaming,
+                                        // "Thought" once complete.
+                                        text: row.text;
+                                        color: #d8d8d8;
                                         font-size: 11px;
                                         font-weight: 700;
                                         vertical-alignment: center;
                                     }
                                     if !row.expanded: Text {
                                         text: row.meta;
-                                        color: #8f86ab;
+                                        color: #9a9a9a;
                                         font-size: 11px;
                                         font-italic: true;
                                         vertical-alignment: center;
@@ -2140,6 +2223,9 @@ export component AppWindow inherits Window {
                             vertical-stretch: 1;
                             lines: root.file-lines;
                             line-numbers: root.file-numbers;
+                            select-from: root.file-sel-from;
+                            select-to: root.file-sel-to;
+                            select-seq: root.file-sel-seq;
                         }
                         // Rendered markdown preview: the chat's block rows
                         // (headings, lists, fenced code with highlighting).
