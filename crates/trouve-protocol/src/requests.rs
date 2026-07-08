@@ -346,6 +346,49 @@ pub struct LoginStatus {
     pub error: Option<String>,
 }
 
+// --- vendor CLIs ------------------------------------------------------------
+
+/// A vendor CLI trouve can download and manage (cursor-agent, claude,
+/// codex), with its current install state.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct CliInfo {
+    /// Stable id, also the binary name: "cursor-agent", "claude", "codex".
+    pub id: String,
+    pub display_name: String,
+    /// Provider kinds served by this CLI (e.g. ["cursor-cli"]).
+    pub kinds: Vec<String>,
+    /// Version of the binary trouve would run, when one was resolved.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub installed_version: Option<String>,
+    /// Where that binary comes from: "managed" (trouve-installed),
+    /// "path" (system install), or "none".
+    pub source: String,
+    /// Absolute path of the resolved binary, when known.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+    /// Newest version the vendor serves (None when the check failed).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub latest_version: Option<String>,
+    pub update_available: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct CliList {
+    pub clis: Vec<CliInfo>,
+}
+
+/// State of a CLI install started with `POST /v1/clis/{id}/install`.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct CliInstallStatus {
+    /// "none" (nothing running), "pending", "success", or "failed".
+    pub status: String,
+    /// Version being (or just) installed, when known.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub version: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
 // --- models --------------------------------------------------------------
 
 /// A model a configured provider can run, with enough metadata for clients

@@ -6,7 +6,8 @@ use slint::{ComponentHandle, ModelRc, SharedString, VecModel};
 
 use crate::render::ChatRowData;
 use crate::{
-    AppWindow, ChatRow, DiffRow, FileItem, KnownProviderItem, NavRow, ProviderItem, SettingsWindow,
+    AppWindow, ChatRow, CliItem, DiffRow, FileItem, KnownProviderItem, NavRow, ProviderItem,
+    SettingsWindow,
     TextSegment, ThreadTabItem,
 };
 
@@ -60,12 +61,16 @@ pub fn set_model_knobs(
     ui: &Ui,
     thinking_options: Vec<String>,
     thinking_index: i32,
+    context_options: Vec<String>,
+    context_index: i32,
     fast_visible: bool,
     fast_checked: bool,
 ) {
     let _ = ui.upgrade_in_event_loop(move |ui| {
         ui.set_thinking_options(string_model(thinking_options));
         ui.set_thinking_index(thinking_index);
+        ui.set_context_options(string_model(context_options));
+        ui.set_context_index(context_index);
         ui.set_fast_visible(fast_visible);
         ui.set_fast_checked(fast_checked);
     });
@@ -388,6 +393,26 @@ pub fn set_settings_data(
         ui.set_models(string_model(models));
         ui.set_default_model_index(default_model_index);
         ui.set_modes(string_model(modes));
+    });
+}
+
+/// (id, display_name, version_label, action_label, status, busy) per CLI.
+pub fn set_clis(ui: &SettingsUi, clis: Vec<(String, String, String, String, String, bool)>) {
+    let _ = ui.upgrade_in_event_loop(move |ui| {
+        let items: Vec<CliItem> = clis
+            .into_iter()
+            .map(
+                |(id, display_name, version_label, action_label, status, busy)| CliItem {
+                    id: id.into(),
+                    display_name: display_name.into(),
+                    version_label: version_label.into(),
+                    action_label: action_label.into(),
+                    status: status.into(),
+                    busy,
+                },
+            )
+            .collect();
+        ui.set_clis(ModelRc::new(VecModel::from(items)));
     });
 }
 

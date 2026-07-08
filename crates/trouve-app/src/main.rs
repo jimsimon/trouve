@@ -208,6 +208,12 @@ fn main() -> anyhow::Result<()> {
     }
     {
         let tx = tx.clone();
+        window.on_composer_context_changed(move |i| {
+            let _ = tx.send(UiCommand::ComposerContextChanged(i.max(0) as usize));
+        });
+    }
+    {
+        let tx = tx.clone();
         window.on_composer_fast_toggled(move |on| {
             let _ = tx.send(UiCommand::ComposerFastToggled(on));
         });
@@ -331,6 +337,12 @@ fn main() -> anyhow::Result<()> {
         let tx = tx.clone();
         settings.on_refresh_settings(move || {
             let _ = tx.send(UiCommand::RefreshSettings);
+        });
+    }
+    {
+        let tx = tx.clone();
+        settings.on_cli_install(move |id| {
+            let _ = tx.send(UiCommand::CliInstall(id.to_string()));
         });
     }
 

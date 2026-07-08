@@ -69,6 +69,10 @@ pub struct Engine {
     secrets: Arc<dyn trouve_providers::secrets::SecretStore>,
     /// In-flight OAuth logins, keyed by provider id.
     logins: Mutex<HashMap<String, LoginState>>,
+    /// In-flight managed vendor-CLI installs, keyed by CLI id.
+    cli_installs: Mutex<HashMap<String, CliInstallState>>,
+    /// Latest-version lookups, cached per CLI (network is best-effort).
+    cli_latest: Mutex<HashMap<String, (std::time::Instant, Option<String>)>>,
     /// This server's reachable base URL (e.g. "http://127.0.0.1:7433"), set
     /// once the listener binds; the MCP tool bridge dials back through it.
     base_url: RwLock<Option<String>>,
@@ -83,6 +87,35 @@ enum LoginState {
     Pending,
     Success,
     Failed(String),
+}
+
+#[derive(Debug, Clone)]
+enum CliInstallState {
+    Pending(Option<String>),
+    Success(String),
+    Failed(String),
+}
+
+/// Whether a `--version` report refers to the given vendor version. The
+/// CLIs decorate their output differently ("2.1.34 (Claude Code)",
+/// "codex-cli 0.143.0", "2026.07.01-41b2de7"), so containment beats
+/// equality.
+fn cli_version_matches(reported: &str, version: &str) -> bool {
+    reported == version
+        || reported
+            .split([' ', '(', ')'])
+            .any(|tok| tok == version || tok.strip_prefix('v') == Some(version))
+}
+
+/// The managed CLI serving a backend provider kind, if any.
+fn cli_for_kind(kind: &str) -> Option<trouve_agents::install::CliId> {
+    use trouve_agents::install::CliId;
+    match kind {
+        "cursor-cli" => Some(CliId::CursorAgent),
+        "claude-cli" => Some(CliId::Claude),
+        "codex-app-server" | "codex-responses" => Some(CliId::Codex),
+        _ => None,
+    }
 }
 
 /// Config kinds handled by the [`AgentBackend`] seam rather than a Provider.
@@ -180,10 +213,18 @@ fn build_all_providers(
 fn build_all_backends(
     config: &Config,
     secrets: &Arc<dyn trouve_providers::secrets::SecretStore>,
+    data_dir: &Path,
 ) -> HashMap<String, Arc<dyn AgentBackend>> {
     let mut backends: HashMap<String, Arc<dyn AgentBackend>> = HashMap::new();
     for (id, pc) in &config.providers {
-        let command = pc.command.clone();
+        // Explicit command wins; otherwise a trouve-managed install beats
+        // whatever is on PATH (distro packages lag behind vendor releases).
+        let command = pc.command.clone().or_else(|| {
+            cli_for_kind(&pc.kind)
+                .map(|cli| trouve_agents::install::managed_bin(data_dir, cli))
+                .filter(|bin| bin.exists())
+                .map(|bin| bin.to_string_lossy().into_owned())
+        });
         let backend: Arc<dyn AgentBackend> = match pc.kind.as_str() {
             "codex-app-server" => Arc::new(trouve_agents::codex::CodexBackend::new(id, command)),
             "cursor-cli" => {
@@ -217,7 +258,7 @@ impl Engine {
         let secrets: Arc<dyn trouve_providers::secrets::SecretStore> =
             Arc::from(trouve_providers::secrets::default_store(&data_dir));
         let providers = build_all_providers(config, &secrets);
-        let backends = build_all_backends(config, &secrets);
+        let backends = build_all_backends(config, &secrets, &data_dir);
         Self {
             store,
             data_dir,
@@ -239,6 +280,8 @@ impl Engine {
             ),
             secrets,
             logins: Mutex::new(HashMap::new()),
+            cli_installs: Mutex::new(HashMap::new()),
+            cli_latest: Mutex::new(HashMap::new()),
             base_url: RwLock::new(None),
             index_hooks: false,
         }
@@ -705,6 +748,169 @@ impl Engine {
         })
     }
 
+    // --- managed vendor CLIs ---------------------------------------------------
+
+    /// Install state of every vendor CLI trouve can manage: the binary that
+    /// would run (managed install beats PATH), its version, and whether the
+    /// vendor serves something newer (best-effort network check, cached).
+    pub async fn list_clis(&self) -> trouve_protocol::CliList {
+        use trouve_agents::install as cli;
+
+        let mut clis = Vec::new();
+        for id in cli::ALL_CLIS {
+            let explicit = {
+                // An explicit per-provider `command` overrides resolution;
+                // surface it so the UI doesn't claim "not installed".
+                let config = self.config.lock().unwrap();
+                config
+                    .providers
+                    .values()
+                    .filter(|pc| cli_for_kind(&pc.kind) == Some(id))
+                    .find_map(|pc| pc.command.clone())
+            };
+            let managed = cli::installed(&self.data_dir, id);
+            let (source, path, installed_version) = if let Some(cmd) = explicit {
+                let version = cli::binary_version(&cmd).await;
+                ("path".to_string(), Some(cmd), version)
+            } else if let Some(info) = managed {
+                ("managed".into(), Some(info.bin), Some(info.version))
+            } else if let Some(found) = cli::find_on_path(id.as_str()) {
+                let path = found.to_string_lossy().into_owned();
+                let version = cli::binary_version(&path).await;
+                ("path".into(), Some(path), version)
+            } else {
+                ("none".into(), None, None)
+            };
+
+            let latest_version = self.cli_latest_version(id).await;
+            let update_available = match (&installed_version, &latest_version) {
+                (Some(have), Some(latest)) => !cli_version_matches(have, latest),
+                (None, Some(_)) => true,
+                _ => false,
+            };
+            clis.push(trouve_protocol::CliInfo {
+                id: id.as_str().into(),
+                display_name: id.display_name().into(),
+                kinds: id.provider_kinds().iter().map(|s| s.to_string()).collect(),
+                installed_version,
+                source,
+                path,
+                latest_version,
+                update_available,
+            });
+        }
+        trouve_protocol::CliList { clis }
+    }
+
+    /// Latest vendor version for one CLI, cached for an hour; None when the
+    /// lookup fails (offline is fine — the UI just can't offer updates).
+    async fn cli_latest_version(&self, id: trouve_agents::install::CliId) -> Option<String> {
+        const TTL: std::time::Duration = std::time::Duration::from_secs(3600);
+        {
+            let cache = self.cli_latest.lock().unwrap();
+            if let Some((at, v)) = cache.get(id.as_str()) {
+                if at.elapsed() < TTL {
+                    return v.clone();
+                }
+            }
+        }
+        let fetched = tokio::time::timeout(
+            std::time::Duration::from_secs(8),
+            trouve_agents::install::latest_version(id),
+        )
+        .await;
+        let latest = match fetched {
+            Ok(Ok(v)) => Some(v),
+            Ok(Err(e)) => {
+                tracing::debug!("latest-version check for {} failed: {e}", id.as_str());
+                None
+            }
+            Err(_) => None,
+        };
+        self.cli_latest
+            .lock()
+            .unwrap()
+            .insert(id.as_str().into(), (std::time::Instant::now(), latest.clone()));
+        latest
+    }
+
+    /// Start downloading the newest build of a vendor CLI into trouve's
+    /// managed directory. Progress is reported by `cli_install_status`; on
+    /// success the backend registry reloads so new turns use the new binary.
+    pub fn start_cli_install(self: &Arc<Self>, id: &str) -> Result<(), EngineError> {
+        let cli = trouve_agents::install::CliId::parse(id)
+            .ok_or_else(|| EngineError::NotFound(format!("cli {id}")))?;
+        {
+            let mut installs = self.cli_installs.lock().unwrap();
+            if matches!(installs.get(id), Some(CliInstallState::Pending(_))) {
+                return Err(EngineError::Conflict(format!(
+                    "an install for {id} is already in progress"
+                )));
+            }
+            installs.insert(id.to_string(), CliInstallState::Pending(None));
+        }
+        let engine = self.clone();
+        let id_owned = id.to_string();
+        tokio::spawn(async move {
+            let result = async {
+                let version = trouve_agents::install::latest_version(cli)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                engine.cli_installs.lock().unwrap().insert(
+                    id_owned.clone(),
+                    CliInstallState::Pending(Some(version.clone())),
+                );
+                trouve_agents::install::install(&engine.data_dir, cli, &version)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                Ok::<String, String>(version)
+            }
+            .await;
+            let state = match result {
+                Ok(version) => {
+                    // The managed binary now exists; rebuild backends so it
+                    // takes over from any PATH resolution.
+                    engine.reload_providers();
+                    engine
+                        .cli_latest
+                        .lock()
+                        .unwrap()
+                        .remove(id_owned.as_str());
+                    CliInstallState::Success(version)
+                }
+                Err(e) => CliInstallState::Failed(e),
+            };
+            engine.cli_installs.lock().unwrap().insert(id_owned, state);
+        });
+        Ok(())
+    }
+
+    /// Report the state of an install started with `start_cli_install`.
+    pub fn cli_install_status(&self, id: &str) -> trouve_protocol::CliInstallStatus {
+        match self.cli_installs.lock().unwrap().get(id) {
+            None => trouve_protocol::CliInstallStatus {
+                status: "none".into(),
+                version: None,
+                error: None,
+            },
+            Some(CliInstallState::Pending(version)) => trouve_protocol::CliInstallStatus {
+                status: "pending".into(),
+                version: version.clone(),
+                error: None,
+            },
+            Some(CliInstallState::Success(version)) => trouve_protocol::CliInstallStatus {
+                status: "success".into(),
+                version: Some(version.clone()),
+                error: None,
+            },
+            Some(CliInstallState::Failed(e)) => trouve_protocol::CliInstallStatus {
+                status: "failed".into(),
+                version: None,
+                error: Some(e.clone()),
+            },
+        }
+    }
+
     /// Report the state of an OAuth login started with `start_login`.
     pub fn login_status(&self, id: &str) -> trouve_protocol::LoginStatus {
         match self.logins.lock().unwrap().get(id) {
@@ -783,7 +989,7 @@ impl Engine {
             rebuilt.insert(id.clone(), p.clone());
         }
         *self.providers.write().unwrap() = rebuilt;
-        let mut backends = build_all_backends(&config, &self.secrets);
+        let mut backends = build_all_backends(&config, &self.secrets, &self.data_dir);
         for (id, b) in self.injected_backends.lock().unwrap().iter() {
             backends.insert(id.clone(), b.clone());
         }

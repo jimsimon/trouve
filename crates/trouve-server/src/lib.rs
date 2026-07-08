@@ -19,7 +19,8 @@ use tokio_stream::wrappers::ReceiverStream;
 use trouve_core::engine::EngineError;
 use trouve_core::Engine;
 use trouve_protocol::{
-    AgentMode, BranchList, CreatePrRequest, CreateSessionRequest, CreateThreadRequest, DirEntry,
+    AgentMode, BranchList, CliInfo, CliInstallStatus, CliList, CreatePrRequest,
+    CreateSessionRequest, CreateThreadRequest, DirEntry,
     ErrorBody, FileContent, KnownProvider, LoginStarted, LoginStatus, MergePrRequest, ModelInfo,
     PrInfo, ProviderInfo, ProvidersResponse, RegisterWorkspaceRequest, ResolveApprovalRequest,
     Scope, SendMessageRequest, ServerInfo, Session, SessionDiff, SetDefaultModelRequest, Thread,
@@ -84,6 +85,9 @@ impl IntoResponse for ApiError {
         delete_provider,
         start_login,
         login_status,
+        list_clis,
+        start_cli_install,
+        cli_install_status,
         set_default_model,
         thread_usage,
         session_usage,
@@ -114,6 +118,9 @@ impl IntoResponse for ApiError {
         KnownProvider,
         LoginStarted,
         LoginStatus,
+        CliInfo,
+        CliList,
+        CliInstallStatus,
         UpsertProviderRequest,
         SetDefaultModelRequest,
         UsageSummary,
@@ -184,6 +191,11 @@ pub fn build_router(engine: Arc<Engine>) -> Router {
         .route(
             "/v1/providers/{id}/login",
             post(start_login).get(login_status),
+        )
+        .route("/v1/clis", get(list_clis))
+        .route(
+            "/v1/clis/{id}/install",
+            post(start_cli_install).get(cli_install_status),
         )
         .route(
             "/v1/config/default-model",
@@ -453,6 +465,31 @@ async fn login_status(
     Path(id): Path<String>,
 ) -> Json<LoginStatus> {
     Json(engine.login_status(&id))
+}
+
+#[utoipa::path(get, path = "/v1/clis", responses((status = 200, body = CliList)))]
+async fn list_clis(State(engine): State<Arc<Engine>>) -> Json<CliList> {
+    Json(engine.list_clis().await)
+}
+
+#[utoipa::path(post, path = "/v1/clis/{id}/install", params(("id" = String, Path,)),
+    responses((status = 202), (status = 404, body = ErrorBody),
+              (status = 409, body = ErrorBody)))]
+async fn start_cli_install(
+    State(engine): State<Arc<Engine>>,
+    Path(id): Path<String>,
+) -> Result<axum::http::StatusCode, ApiError> {
+    engine.start_cli_install(&id)?;
+    Ok(axum::http::StatusCode::ACCEPTED)
+}
+
+#[utoipa::path(get, path = "/v1/clis/{id}/install", params(("id" = String, Path,)),
+    responses((status = 200, body = CliInstallStatus)))]
+async fn cli_install_status(
+    State(engine): State<Arc<Engine>>,
+    Path(id): Path<String>,
+) -> Json<CliInstallStatus> {
+    Json(engine.cli_install_status(&id))
 }
 
 // --- internal tool bridge (undocumented; not part of the public protocol) ---

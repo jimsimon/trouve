@@ -252,6 +252,18 @@ impl ProtocolClient {
         self.delete(&format!("/providers/{id}")).await
     }
 
+    pub async fn list_clis(&self) -> Result<CliList> {
+        self.get_json("/clis").await
+    }
+
+    pub async fn start_cli_install(&self, id: &str) -> Result<()> {
+        self.post_empty(&format!("/clis/{id}/install")).await
+    }
+
+    pub async fn cli_install_status(&self, id: &str) -> Result<CliInstallStatus> {
+        self.get_json(&format!("/clis/{id}/install")).await
+    }
+
     pub async fn set_default_model(&self, model: &str) -> Result<()> {
         self.put_empty(
             "/config/default-model",

@@ -1,25 +1,37 @@
-//! Cursor backend, driving the `cursor-agent` CLI.
+//! Cursor backend, driving `cursor-agent acp` (Agent Client Protocol).
 //!
-//! Each trouve thread maps to a Cursor chat (`cursor-agent create-chat`),
-//! and each turn runs `cursor-agent -p --resume <chat> --output-format
-//! stream-json --stream-partial-output` inside the session worktree, parsing
-//! the NDJSON event stream.
+//! One `cursor-agent acp` child is spawned lazily and shared across threads
+//! (JSON-RPC over stdio, like Codex's app-server). Each trouve thread maps
+//! to an ACP session; turns run `session/prompt` and stream
+//! `session/update` notifications.
 //!
-//! Permission mapping (v1, documented limitation): Cursor's headless mode
-//! has no interactive approval bridge yet, so `Yolo` maps to `--force`,
-//! `ReadOnly` to `--sandbox enabled`, and `Ask` runs with Cursor's defaults
-//! (its own sandbox handles risky commands). Hook-based approval gating is a
-//! follow-up.
+//! ACP fixes the two long-standing gaps of the old `-p --output-format
+//! stream-json` integration:
+//! - structured model metadata (`cursor/list_available_models` exposes
+//!   thinking/context/effort/fast knobs per model, including the 300k/1M
+//!   context choice), applied per session via `session/set_config_option`;
+//! - an interactive approval bridge (`session/request_permission`), mapped
+//!   onto [`BackendEvent::ApprovalNeeded`] so trouve's permission layer
+//!   decides instead of cursor's own allowlist prompts dying headless.
 //!
-//! Auth: `cursor-agent login` (subscription) or the `CURSOR_API_KEY` env var
-//! / configured API key (bills the user's plan) — both handled by the CLI.
+//! Model selection needs cursor-agent 2026.07 or newer: older builds accept
+//! `session/set_config_option` but silently keep the previous model. The
+//! adapter detects that from the response snapshot and fails the turn with
+//! a pointer at the managed CLI installer.
+//!
+//! Auth: `cursor-agent login` (subscription) or the `CURSOR_API_KEY` env
+//! var / configured API key — both handled by the CLI.
 
+use std::collections::{HashMap, HashSet};
 use std::process::Stdio;
+use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::Arc;
 
 use futures::StreamExt;
-use serde_json::Value;
-use tokio::io::{AsyncBufReadExt, BufReader};
-use tokio::process::Command;
+use serde_json::{json, Value};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::process::{Child, ChildStdin};
+use tokio::sync::{mpsc, oneshot, Mutex};
 use trouve_protocol::{ModelInfo, Usage};
 
 use crate::{
@@ -31,8 +43,9 @@ pub struct CursorBackend {
     id: String,
     command: String,
     api_key: Option<String>,
-    /// `cursor-agent models` result, cached for [`MODELS_TTL`].
-    models_cache: tokio::sync::Mutex<Option<(std::time::Instant, Vec<ModelInfo>)>>,
+    server: Mutex<Option<Arc<AcpServer>>>,
+    /// `cursor/list_available_models` result, cached for [`MODELS_TTL`].
+    models_cache: Mutex<Option<(std::time::Instant, Vec<ModelInfo>)>>,
 }
 
 /// How long a fetched vendor model list stays fresh.
@@ -44,92 +57,22 @@ impl CursorBackend {
             id: id.into(),
             command: command.unwrap_or_else(|| "cursor-agent".into()),
             api_key,
-            models_cache: tokio::sync::Mutex::new(None),
+            server: Mutex::new(None),
+            models_cache: Mutex::new(None),
         }
     }
 
-    fn base_command(&self) -> Command {
-        let mut cmd = Command::new(&self.command);
-        if let Some(key) = &self.api_key {
-            cmd.env("CURSOR_API_KEY", key);
+    async fn server(&self) -> Result<Arc<AcpServer>, BackendError> {
+        let mut guard = self.server.lock().await;
+        if let Some(s) = guard.as_ref() {
+            if !s.is_closed() {
+                return Ok(s.clone());
+            }
         }
-        cmd
-    }
-
-    /// Ask the CLI for the account's model catalog.
-    async fn fetch_models(&self) -> Result<Vec<ModelInfo>, BackendError> {
-        let mut cmd = self.base_command();
-        cmd.arg("models").stdin(Stdio::null());
-        let out = tokio::time::timeout(std::time::Duration::from_secs(10), cmd.output())
-            .await
-            .map_err(|_| BackendError::Protocol("cursor-agent models timed out".into()))?
-            .map_err(|e| match e.kind() {
-                std::io::ErrorKind::NotFound => BackendError::NotInstalled(self.command.clone()),
-                _ => BackendError::Io(e),
-            })?;
-        if !out.status.success() {
-            return Err(BackendError::Protocol(format!(
-                "cursor-agent models failed: {}",
-                String::from_utf8_lossy(&out.stderr).trim()
-            )));
-        }
-        Ok(parse_models_output(
-            &self.id,
-            &String::from_utf8_lossy(&out.stdout),
-        ))
-    }
-
-    async fn create_chat(&self, worktree: &std::path::Path) -> Result<String, BackendError> {
-        let out = self
-            .base_command()
-            .arg("create-chat")
-            .current_dir(worktree)
-            .stdin(Stdio::null())
-            .output()
-            .await
-            .map_err(|e| match e.kind() {
-                std::io::ErrorKind::NotFound => BackendError::NotInstalled(self.command.clone()),
-                _ => BackendError::Io(e),
-            })?;
-        if !out.status.success() {
-            return Err(BackendError::Protocol(format!(
-                "cursor-agent create-chat failed: {}",
-                String::from_utf8_lossy(&out.stderr).trim()
-            )));
-        }
-        let id = String::from_utf8_lossy(&out.stdout).trim().to_string();
-        if id.is_empty() {
-            return Err(BackendError::Protocol(
-                "cursor-agent create-chat printed no chat id".into(),
-            ));
-        }
-        Ok(id)
-    }
-
-    /// Turn a base model + options into the concrete vendor id. Threads
-    /// created before the variant split may still store a full variant id;
-    /// those pass through unchanged.
-    async fn resolve_model(&self, turn: &BackendTurn) -> String {
-        let (_, level, fast) = split_variant(&turn.model);
-        if level.is_some() || fast {
-            return turn.model.clone();
-        }
-        // The group's default level lives in the cached schema (the bare id
-        // doesn't exist for groups like claude-opus-4-8, whose unlabeled
-        // variant is claude-opus-4-8-high).
-        let default_level = {
-            let cache = self.models_cache.lock().await;
-            cache.as_ref().and_then(|(_, models)| {
-                let qualified = format!("{}/{}", self.id, turn.model);
-                models.iter().find(|m| m.id == qualified).and_then(|m| {
-                    m.options_schema
-                        .pointer("/properties/thinking_level/default")
-                        .and_then(Value::as_str)
-                        .map(str::to_string)
-                })
-            })
-        };
-        compose_model_id(&turn.model, &turn.model_options, default_level.as_deref())
+        let s = Arc::new(AcpServer::spawn(&self.command, self.api_key.as_deref()).await?);
+        s.handshake().await?;
+        *guard = Some(s.clone());
+        Ok(s)
     }
 }
 
@@ -141,25 +84,37 @@ impl AgentBackend for CursorBackend {
 
     fn models(&self) -> Vec<ModelInfo> {
         // Minimal offline fallback; `list_models` asks the vendor for the
-        // real catalog (per-account, includes thinking/effort variants).
-        vec![model(&self.id, "auto", "Cursor Auto", 200_000)]
+        // real catalog (per-account, with per-model config options).
+        vec![model(&self.id, "default", "Cursor Auto", 200_000)]
     }
 
     async fn list_models(&self) -> Vec<ModelInfo> {
-        let mut cache = self.models_cache.lock().await;
-        if let Some((at, models)) = cache.as_ref() {
-            if at.elapsed() < MODELS_TTL {
-                return models.clone();
+        {
+            let cache = self.models_cache.lock().await;
+            if let Some((at, models)) = cache.as_ref() {
+                if at.elapsed() < MODELS_TTL {
+                    return models.clone();
+                }
             }
         }
-        match self.fetch_models().await {
-            Ok(models) if !models.is_empty() => {
-                *cache = Some((std::time::Instant::now(), models.clone()));
+        let fetched = async {
+            let server = self.server().await?;
+            server
+                .request("cursor/list_available_models", json!({}))
+                .await
+        }
+        .await;
+        match fetched {
+            Ok(result) => {
+                let models = parse_acp_models(&self.id, &result);
+                if models.is_empty() {
+                    return self.models();
+                }
+                *self.models_cache.lock().await = Some((std::time::Instant::now(), models.clone()));
                 models
             }
-            Ok(_) => self.models(),
             Err(e) => {
-                tracing::debug!("cursor-agent models failed: {e}; using static list");
+                tracing::debug!("cursor/list_available_models failed: {e}; using static list");
                 self.models()
             }
         }
@@ -186,12 +141,28 @@ impl AgentBackend for CursorBackend {
     }
 
     async fn run_turn(&self, turn: BackendTurn) -> Result<BackendEventStream, BackendError> {
-        let (chat_id, fresh_session) = match &turn.session {
-            Some(id) => (id.clone(), false),
-            None => (self.create_chat(&turn.worktree).await?, true),
+        let server = self.server().await?;
+
+        // Resume the ACP session for this thread, or start a fresh one. A
+        // failed load (e.g. server restarted and lost it) degrades to fresh.
+        let mut fresh_session = false;
+        let session_id = match &turn.session {
+            Some(sid) if server.knows_session(sid).await => sid.clone(),
+            Some(sid) => match server.load_session(sid, &turn.worktree).await {
+                Ok(()) => sid.clone(),
+                Err(e) => {
+                    tracing::warn!("cursor session/load failed ({e}); starting fresh");
+                    fresh_session = true;
+                    server.new_session(&turn.worktree).await?
+                }
+            },
+            None => {
+                fresh_session = true;
+                server.new_session(&turn.worktree).await?
+            }
         };
 
-        let prompt = match (&turn.instructions, fresh_session) {
+        let text = match (&turn.instructions, fresh_session) {
             (Some(instr), true) => format!(
                 "<mode-instructions>\n{instr}\n</mode-instructions>\n\n{}",
                 turn.prompt
@@ -199,101 +170,427 @@ impl AgentBackend for CursorBackend {
             _ => turn.prompt.clone(),
         };
 
-        let mut cmd = self.base_command();
-        cmd.arg("-p")
-            .arg(&prompt)
-            .args(["--resume", &chat_id])
-            .args(["--output-format", "stream-json"])
-            .arg("--stream-partial-output")
-            // Trouve creates the worktree from a workspace the user opened
-            // deliberately; without this, headless runs abort with a
-            // "Workspace Trust Required" prompt.
-            .arg("--trust")
-            .current_dir(&turn.worktree)
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .kill_on_drop(true);
-        if !turn.model.is_empty() && turn.model != "auto" {
-            cmd.args(["--model", &self.resolve_model(&turn).await]);
-        }
-        match turn.permission {
-            BackendPermission::Yolo => {
-                cmd.arg("--force");
-            }
-            BackendPermission::ReadOnly => {
-                cmd.args(["--sandbox", "enabled"]);
-            }
-            BackendPermission::Ask => {}
-        }
+        // Mode + model config, then the prompt, under the config lock:
+        // cursor applies model selection process-wide (all sessions sync to
+        // the current model), so racing turns must not interleave their
+        // set-model and prompt-start.
+        let (route, prompt_rx) = {
+            let _config = server.config_lock.lock().await;
 
-        let mut child = cmd.spawn().map_err(|e| match e.kind() {
-            std::io::ErrorKind::NotFound => BackendError::NotInstalled(self.command.clone()),
-            _ => BackendError::Io(e),
-        })?;
-        let stdout = child.stdout.take().expect("stdout piped");
-        let stderr = child.stderr.take().expect("stderr piped");
+            let mode = match turn.permission {
+                // Cursor's plan mode is its read-only posture.
+                BackendPermission::ReadOnly => "plan",
+                BackendPermission::Ask | BackendPermission::Yolo => "agent",
+            };
+            if let Err(e) = server.set_config_option(&session_id, "mode", mode).await {
+                tracing::warn!("cursor set mode {mode} failed: {e}");
+            }
 
-        let stream = async_stream(move |tx| async move {
-            if fresh_session {
-                let _ = tx
-                    .send(Ok(BackendEvent::SessionStarted {
-                        session_id: chat_id.clone(),
-                    }))
-                    .await;
+            if !turn.model.is_empty() && !matches!(turn.model.as_str(), "auto" | "default") {
+                apply_model_config(&server, &session_id, &turn).await?;
             }
-            let mut completed = false;
-            let mut lines = BufReader::new(stdout).lines();
-            while let Ok(Some(line)) = lines.next_line().await {
-                let Ok(ev) = serde_json::from_str::<Value>(&line) else {
-                    continue;
-                };
-                for out in map_event(&ev) {
-                    if matches!(out, BackendEvent::Completed { .. }) {
-                        completed = true;
-                    }
-                    let _ = tx.send(Ok(out)).await;
-                }
-            }
-            let status = child.wait().await;
-            let ok = status.as_ref().map(|s| s.success()).unwrap_or(false);
-            if !ok {
-                let mut err = String::new();
-                let mut elines = BufReader::new(stderr).lines();
-                while let Ok(Some(l)) = elines.next_line().await {
-                    err.push_str(&l);
-                    err.push('\n');
-                    if err.len() > 4000 {
-                        break;
-                    }
-                }
-                let _ = tx
-                    .send(Err(BackendError::Protocol(format!(
-                        "cursor-agent exited with {:?}: {}",
-                        status.ok(),
-                        err.trim()
-                    ))))
-                    .await;
-            } else if !completed {
-                let _ = tx
-                    .send(Ok(BackendEvent::Completed {
-                        usage: Usage::default(),
-                    }))
-                    .await;
-            }
-        });
+
+            // Subscribe after session setup so a session/load's history
+            // replay doesn't re-emit old text into the thread.
+            let route = server.subscribe(&session_id).await;
+            let prompt_rx = server
+                .request_deferred(
+                    "session/prompt",
+                    json!({
+                        "sessionId": session_id,
+                        "prompt": [ { "type": "text", "text": text } ],
+                    }),
+                )
+                .await?;
+            (route, prompt_rx)
+        };
+
+        let stream = turn_stream(
+            server.clone(),
+            session_id.clone(),
+            route,
+            prompt_rx,
+            fresh_session,
+            turn.permission,
+        );
         Ok(stream.boxed())
     }
 }
 
-/// Thinking/effort level tokens the catalog uses as id suffixes. `-max`
-/// here is an *effort level* (mirroring Anthropic's effort API); Cursor's
-/// models already run at their full context window.
+/// Set the session's model and its config options (thinking/context/effort/
+/// fast), translating trouve's stored model + options into ACP config calls.
+async fn apply_model_config(
+    server: &AcpServer,
+    session_id: &str,
+    turn: &BackendTurn,
+) -> Result<(), BackendError> {
+    // Threads from before the ACP migration may still store a variant id
+    // like "claude-opus-4-8-high"; peel the level back off.
+    let (base, legacy_level, legacy_fast) = split_variant(&turn.model);
+
+    let result = server
+        .set_config_option(session_id, "model", base)
+        .await
+        .map_err(|e| {
+            BackendError::Protocol(format!(
+                "cursor-agent rejected model {base}: {e} \
+                 (if this persists, update the CLI in Settings → Vendor CLIs)"
+            ))
+        })?;
+    // Old cursor-agent builds (< 2026.07) accept the call but silently keep
+    // the previous model; the response snapshot betrays them.
+    if let Some(current) = config_snapshot_value(&result, "model") {
+        if current != base {
+            return Err(BackendError::Protocol(format!(
+                "cursor-agent ignored the model change to {base} (still {current}); \
+                 this build is too old for ACP model selection — update the CLI in \
+                 Settings → Vendor CLIs"
+            )));
+        }
+    }
+
+    // Options: schema-keyed values from the thread, plus legacy fallbacks.
+    let mut options: Vec<(String, String)> = Vec::new();
+    for (key, value) in &turn.model_options {
+        let value = match value {
+            Value::Bool(b) => b.to_string(),
+            Value::String(s) => s.clone(),
+            other => other.to_string(),
+        };
+        match key.as_str() {
+            // Pre-ACP threads stored the thinking dropdown under
+            // thinking_level (cursor) or reasoning_effort (codex-style).
+            "thinking_level" | "reasoning_effort" => {
+                options.push(("effort".into(), value.clone()));
+                options.push(("reasoning".into(), value));
+            }
+            _ => options.push((key.clone(), value)),
+        }
+    }
+    if let Some(level) = legacy_level {
+        options.push(("effort".into(), level.to_string()));
+        options.push(("reasoning".into(), level.to_string()));
+    }
+    if legacy_fast {
+        options.push(("fast".into(), "true".into()));
+    }
+
+    // Unknown options are expected (effort vs reasoning depends on the
+    // model); failures are logged, not fatal.
+    for (key, value) in options {
+        if let Err(e) = server.set_config_option(session_id, &key, &value).await {
+            tracing::debug!("cursor set_config_option {key}={value}: {e}");
+        }
+    }
+    Ok(())
+}
+
+/// Pull one option's currentValue out of a `set_config_option` response
+/// (`{ configOptions: [ { id, currentValue, ... } ] }`).
+fn config_snapshot_value(result: &Value, id: &str) -> Option<String> {
+    result["configOptions"].as_array()?.iter().find_map(|o| {
+        (o["id"].as_str() == Some(id))
+            .then(|| o["currentValue"].as_str().map(str::to_string))
+            .flatten()
+    })
+}
+
+/// Translate routed ACP messages into `BackendEvent`s until the prompt
+/// request resolves (end of turn).
+fn turn_stream(
+    server: Arc<AcpServer>,
+    session_id: String,
+    mut route: mpsc::Receiver<ServerMsg>,
+    mut prompt_rx: oneshot::Receiver<Result<Value, String>>,
+    fresh_session: bool,
+    permission: BackendPermission,
+) -> impl futures::Stream<Item = Result<BackendEvent, BackendError>> {
+    async_stream(move |tx| async move {
+        if fresh_session {
+            let _ = tx
+                .send(Ok(BackendEvent::SessionStarted {
+                    session_id: session_id.clone(),
+                }))
+                .await;
+        }
+        let mut client_gone = false;
+        loop {
+            tokio::select! {
+                msg = route.recv() => {
+                    let Some(msg) = msg else { break };
+                    if handle_msg(&server, msg, &tx, permission).await.is_err() {
+                        // Receiver dropped (turn cancelled): stop cursor's
+                        // generation instead of letting it run headless.
+                        client_gone = true;
+                        server.notify("session/cancel", json!({ "sessionId": session_id })).await;
+                        break;
+                    }
+                }
+                result = &mut prompt_rx => {
+                    // Reader delivers in wire order, so any updates sent
+                    // before the response are already queued; drain them.
+                    while let Ok(msg) = route.try_recv() {
+                        if handle_msg(&server, msg, &tx, permission).await.is_err() {
+                            client_gone = true;
+                            break;
+                        }
+                    }
+                    match result {
+                        Ok(Ok(value)) => {
+                            let _ = tx.send(Ok(BackendEvent::Completed {
+                                usage: parse_usage(&value["usage"]),
+                            })).await;
+                        }
+                        Ok(Err(e)) => {
+                            let _ = tx.send(Err(BackendError::Protocol(
+                                format!("session/prompt: {e}")))).await;
+                        }
+                        Err(_) => {
+                            let _ = tx.send(Err(BackendError::Protocol(
+                                "cursor-agent closed before the turn completed".into()))).await;
+                        }
+                    }
+                    break;
+                }
+            }
+        }
+        if client_gone {
+            // Best effort; the vendor process keeps running for other threads.
+            tracing::debug!("cursor turn for {session_id} cancelled by client");
+        }
+        server.unsubscribe(&session_id).await;
+    })
+}
+
+/// Map one routed ACP message to backend events. `Err(())` means the
+/// receiving stream is gone.
+async fn handle_msg(
+    server: &AcpServer,
+    msg: ServerMsg,
+    tx: &mpsc::Sender<Result<BackendEvent, BackendError>>,
+    permission: BackendPermission,
+) -> Result<(), ()> {
+    match msg {
+        ServerMsg::Notification { method, params } => {
+            if method != "session/update" {
+                return Ok(());
+            }
+            for ev in map_update(&params["update"]) {
+                tx.send(Ok(ev)).await.map_err(|_| ())?;
+            }
+            Ok(())
+        }
+        ServerMsg::Request { id, method, params } => {
+            if method != "session/request_permission" {
+                // Unknown server request: refuse rather than hang.
+                server
+                    .respond_err(id, -32601, &format!("unsupported method {method}"))
+                    .await;
+                return Ok(());
+            }
+            let allow_option = permission_option(&params, true);
+            let reject_option = permission_option(&params, false);
+            if matches!(permission, BackendPermission::Yolo) {
+                server
+                    .respond(id, permission_outcome(allow_option))
+                    .await;
+                return Ok(());
+            }
+            let tool_call = &params["toolCall"];
+            let (ok_tx, ok_rx) = oneshot::channel();
+            let call_id = tool_call["toolCallId"].as_str().unwrap_or("").to_string();
+            tx.send(Ok(BackendEvent::ApprovalNeeded {
+                call_id,
+                tool: tool_call["kind"]
+                    .as_str()
+                    .or_else(|| tool_call["title"].as_str())
+                    .unwrap_or("tool")
+                    .to_string(),
+                args: tool_call.clone(),
+                responder: ok_tx,
+            }))
+            .await
+            .map_err(|_| ())?;
+            let approved = ok_rx.await.unwrap_or(false);
+            let option = if approved { allow_option } else { reject_option };
+            server.respond(id, permission_outcome(option)).await;
+            Ok(())
+        }
+    }
+}
+
+/// Pick the offered option id for allowing (once, never "always" — trouve's
+/// permission layer owns persistence) or rejecting.
+fn permission_option(params: &Value, allow: bool) -> String {
+    let want = if allow { "allow_once" } else { "reject_once" };
+    params["options"]
+        .as_array()
+        .and_then(|opts| {
+            opts.iter()
+                .find(|o| o["kind"].as_str() == Some(want))
+                .and_then(|o| o["optionId"].as_str())
+        })
+        .unwrap_or(if allow { "allow-once" } else { "reject-once" })
+        .to_string()
+}
+
+fn permission_outcome(option_id: String) -> Value {
+    json!({ "outcome": { "outcome": "selected", "optionId": option_id } })
+}
+
+/// Map one `session/update` payload to zero or more backend events.
+fn map_update(update: &Value) -> Vec<BackendEvent> {
+    match update["sessionUpdate"].as_str() {
+        Some("agent_message_chunk") => update["content"]["text"]
+            .as_str()
+            .filter(|t| !t.is_empty())
+            .map(|t| vec![BackendEvent::TextDelta(t.to_string())])
+            .unwrap_or_default(),
+        Some("agent_thought_chunk") => update["content"]["text"]
+            .as_str()
+            .filter(|t| !t.is_empty())
+            .map(|t| vec![BackendEvent::ThinkingDelta(t.to_string())])
+            .unwrap_or_default(),
+        Some("tool_call") => {
+            let call_id = update["toolCallId"].as_str().unwrap_or("").to_string();
+            // "kind" is the tool family (read/execute/edit/…); the human
+            // title (e.g. "`git status`") rides along in the args.
+            let tool = update["kind"].as_str().unwrap_or("tool").to_string();
+            let mut args = update["rawInput"].clone();
+            if !args.is_object() {
+                args = json!({});
+            }
+            if let Some(title) = update["title"].as_str() {
+                args["title"] = json!(title);
+            }
+            vec![BackendEvent::ToolStarted {
+                call_id,
+                tool,
+                args,
+            }]
+        }
+        Some("tool_call_update") => {
+            let call_id = update["toolCallId"].as_str().unwrap_or("").to_string();
+            match update["status"].as_str() {
+                Some("completed") => vec![BackendEvent::ToolCompleted {
+                    call_id,
+                    ok: true,
+                    result: update["rawOutput"].clone(),
+                }],
+                Some("failed") => vec![BackendEvent::ToolCompleted {
+                    call_id,
+                    ok: false,
+                    result: update["rawOutput"].clone(),
+                }],
+                _ => vec![], // pending / in_progress
+            }
+        }
+        // Plans, title updates, command lists, mode echoes: nothing trouve
+        // renders from these yet.
+        _ => vec![],
+    }
+}
+
+/// Parse the optional `usage` object of a `session/prompt` response.
+/// Current cursor-agent builds omit it; the default keeps the turn valid.
+fn parse_usage(usage: &Value) -> Usage {
+    Usage {
+        input_tokens: usage["inputTokens"].as_u64().unwrap_or(0),
+        output_tokens: usage["outputTokens"].as_u64().unwrap_or(0),
+        cached_input_tokens: usage["cachedReadTokens"].as_u64().unwrap_or(0),
+        cost_usd: None,
+    }
+}
+
+// --- model catalog -----------------------------------------------------------
+
+/// Map a `cursor/list_available_models` result to ModelInfos: one entry per
+/// model with its config options (thinking/context/effort/reasoning/fast)
+/// as an options schema.
+fn parse_acp_models(backend_id: &str, result: &Value) -> Vec<ModelInfo> {
+    let Some(models) = result["models"].as_array() else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for entry in models {
+        let Some(id) = entry["value"].as_str() else {
+            continue;
+        };
+        let display = entry["name"].as_str().unwrap_or(id);
+        let options = entry["configOptions"].as_array();
+
+        let mut properties = serde_json::Map::new();
+        let mut context_window = None;
+        for opt in options.into_iter().flatten() {
+            let Some(opt_id) = opt["id"].as_str() else {
+                continue;
+            };
+            let values: Vec<&str> = opt["options"]
+                .as_array()
+                .map(|list| list.iter().filter_map(|o| o["value"].as_str()).collect())
+                .unwrap_or_default();
+            let default = opt["currentValue"].as_str().unwrap_or("");
+            let description = opt["description"].as_str().unwrap_or("");
+
+            if opt_id == "context" {
+                // The default context choice is the advertised window; the
+                // schema lets clients pick larger (1M) or smaller.
+                context_window = parse_context_size(default);
+            }
+            // Binary on/off options render as toggles.
+            let is_bool = values.len() == 2
+                && values.contains(&"true")
+                && values.contains(&"false");
+            let prop = if is_bool {
+                json!({
+                    "type": "boolean",
+                    "default": default == "true",
+                    "description": description,
+                })
+            } else {
+                json!({
+                    "type": "string",
+                    "enum": values,
+                    "default": default,
+                    "description": description,
+                })
+            };
+            properties.insert(opt_id.to_string(), prop);
+        }
+
+        let mut info = model(
+            backend_id,
+            id,
+            display,
+            context_window.unwrap_or(200_000),
+        );
+        info.options_schema = json!({
+            "type": "object",
+            "properties": properties,
+        });
+        out.push(info);
+    }
+    out
+}
+
+/// Parse cursor's context-size tokens ("300k", "1m", "272k") into a window.
+fn parse_context_size(token: &str) -> Option<u64> {
+    let token = token.trim().to_lowercase();
+    let (digits, mult) = if let Some(d) = token.strip_suffix('m') {
+        (d, 1_000_000)
+    } else if let Some(d) = token.strip_suffix('k') {
+        (d, 1_000)
+    } else {
+        (token.as_str(), 1)
+    };
+    digits.parse::<u64>().ok().map(|n| n * mult)
+}
+
+/// Thinking/effort level tokens the pre-ACP catalog used as id suffixes.
 const LEVELS: [&str; 6] = ["none", "low", "medium", "high", "xhigh", "max"];
 
-/// Split a raw catalog id into `(base, thinking level, fast)`. The grammar
-/// is `<base>[-<level>][-fast]`; a `-thinking` marker stays part of the
-/// base because Cursor treats thinking/non-thinking as distinct models.
+/// Split a pre-ACP variant id into `(base, level, fast)`; threads created
+/// before the migration may still store "claude-opus-4-8-high-fast".
 fn split_variant(id: &str) -> (&str, Option<&str>, bool) {
     let (rest, fast) = match id.strip_suffix("-fast") {
         Some(rest) => (rest, true),
@@ -307,204 +604,276 @@ fn split_variant(id: &str) -> (&str, Option<&str>, bool) {
     (rest, None, fast)
 }
 
-/// Parse `cursor-agent models` output (one `<id> - <display name>` line per
-/// model) and fold the variant explosion into one entry per base model with
-/// a `thinking_level` / `fast` options schema. The default variant of a
-/// group is the one with the shortest display name ("Opus 4.8 1M" is the
-/// unlabeled default among "Opus 4.8 1M Low/Medium/Extra High/...").
-fn parse_models_output(backend_id: &str, output: &str) -> Vec<ModelInfo> {
-    struct Group {
-        order: usize,
-        levels: Vec<String>, // "default" = the bare (level-less) id
-        has_fast: bool,
-        display: String,
-        default_level: String,
-    }
-    let mut groups: std::collections::BTreeMap<String, Group> = Default::default();
+// --- JSON-RPC plumbing (ACP over stdio) ---------------------------------------
 
-    for (order, line) in output.lines().enumerate() {
-        let Some((id, display)) = line.trim().split_once(" - ") else {
-            continue;
+enum ServerMsg {
+    Notification {
+        method: String,
+        params: Value,
+    },
+    Request {
+        id: Value,
+        method: String,
+        params: Value,
+    },
+}
+
+type Pending = Arc<Mutex<HashMap<i64, oneshot::Sender<Result<Value, String>>>>>;
+
+struct AcpServer {
+    stdin: Mutex<ChildStdin>,
+    next_id: AtomicI64,
+    pending: Pending,
+    routes: Arc<Mutex<HashMap<String, mpsc::Sender<ServerMsg>>>>,
+    /// Sessions this process has created or loaded (session/prompt on an
+    /// unknown session fails, so resumes go through session/load first).
+    sessions: Mutex<HashSet<String>>,
+    /// Serializes model/mode config + prompt start: cursor applies model
+    /// selection process-wide, so concurrent turns must not interleave.
+    config_lock: Mutex<()>,
+    /// Held so the child (kill_on_drop) lives as long as the server handle.
+    _child: Child,
+    closed: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl AcpServer {
+    async fn spawn(command: &str, api_key: Option<&str>) -> Result<Self, BackendError> {
+        let mut cmd = tokio::process::Command::new(command);
+        cmd.arg("acp");
+        if let Some(key) = api_key {
+            cmd.env("CURSOR_API_KEY", key);
+        }
+        let mut child = cmd
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .kill_on_drop(true)
+            .spawn()
+            .map_err(|e| match e.kind() {
+                std::io::ErrorKind::NotFound => BackendError::NotInstalled(command.to_string()),
+                _ => BackendError::Io(e),
+            })?;
+        let stdin = child.stdin.take().expect("stdin piped");
+        let stdout = child.stdout.take().expect("stdout piped");
+
+        let server = Self {
+            stdin: Mutex::new(stdin),
+            next_id: AtomicI64::new(1),
+            pending: Arc::new(Mutex::new(HashMap::new())),
+            routes: Arc::new(Mutex::new(HashMap::new())),
+            sessions: Mutex::new(HashSet::new()),
+            config_lock: Mutex::new(()),
+            _child: child,
+            closed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         };
-        let (id, display) = (id.trim(), display.trim());
-        if id.is_empty() || id.contains(' ') {
-            continue;
-        }
-        let (base, level, fast) = split_variant(id);
-        let level = level.unwrap_or("default").to_string();
-        let group = groups.entry(base.to_string()).or_insert_with(|| Group {
-            order,
-            levels: Vec::new(),
-            has_fast: false,
-            display: display.to_string(),
-            default_level: level.clone(),
-        });
-        group.has_fast |= fast;
-        if !fast {
-            if !group.levels.contains(&level) {
-                group.levels.push(level.clone());
-            }
-            // Shortest display in the group names the base model itself.
-            if display.len() < group.display.len() {
-                group.display = display.to_string();
-                group.default_level = level;
-            }
-        }
+        server.start_reader(stdout);
+        Ok(server)
     }
 
-    let mut models: Vec<(usize, ModelInfo)> = groups
-        .into_iter()
-        .map(|(base, mut group)| {
-            group.levels.sort_by_key(|l| level_rank(l));
-            let mut properties = serde_json::Map::new();
-            if group.levels.len() > 1 {
-                properties.insert(
-                    "thinking_level".into(),
-                    serde_json::json!({
-                        "type": "string",
-                        "enum": group.levels,
-                        "default": group.default_level,
-                        "description": "How much thinking the model does before answering"
-                    }),
-                );
-            }
-            if group.has_fast {
-                properties.insert(
-                    "fast".into(),
-                    serde_json::json!({
-                        "type": "boolean",
-                        "description": "Priority serving (consumes usage faster)"
-                    }),
-                );
-            }
-            // The CLI doesn't report context windows; "1M" in the display
-            // name is the only signal, everything else gets a conservative
-            // default.
-            let window = if group.display.contains("1M") {
-                1_000_000
-            } else {
-                200_000
-            };
-            let mut info = model(backend_id, &base, &group.display, window);
-            info.options_schema = serde_json::json!({
-                "type": "object",
-                "properties": properties,
-            });
-            (group.order, info)
-        })
-        .collect();
-    models.sort_by_key(|(order, _)| *order);
-    models.into_iter().map(|(_, info)| info).collect()
-}
-
-/// Sort order for level tokens; the bare "default" sits at medium.
-fn level_rank(level: &str) -> usize {
-    match level {
-        "none" => 0,
-        "low" => 1,
-        "default" => 2,
-        "medium" => 3,
-        "high" => 4,
-        "xhigh" => 5,
-        "max" => 6,
-        _ => 7,
+    fn is_closed(&self) -> bool {
+        self.closed.load(Ordering::Relaxed)
     }
-}
 
-/// Rebuild the concrete vendor model id from a base model plus options.
-/// `default_level` is the group's unlabeled variant (from the schema);
-/// "default" means the bare base id.
-fn compose_model_id(
-    base: &str,
-    options: &serde_json::Map<String, Value>,
-    default_level: Option<&str>,
-) -> String {
-    let level = options
-        .get("thinking_level")
-        .and_then(Value::as_str)
-        .or(default_level)
-        .unwrap_or("default");
-    let mut id = base.to_string();
-    if level != "default" {
-        id.push('-');
-        id.push_str(level);
-    }
-    if options.get("fast").and_then(Value::as_bool) == Some(true) {
-        id.push_str("-fast");
-    }
-    id
-}
-
-/// Map one cursor-agent stream-json event to zero or more backend events.
-fn map_event(ev: &Value) -> Vec<BackendEvent> {
-    match ev["type"].as_str() {
-        Some("assistant") => {
-            // With --stream-partial-output, assistant events carry text
-            // chunks in message.content[].text; append them in order.
-            let mut out = Vec::new();
-            if let Some(parts) = ev["message"]["content"].as_array() {
-                for p in parts {
-                    if let Some(t) = p["text"].as_str() {
-                        if !t.is_empty() {
-                            out.push(BackendEvent::TextDelta(t.to_string()));
+    fn start_reader(&self, stdout: tokio::process::ChildStdout) {
+        let routes = self.routes.clone();
+        let closed = self.closed.clone();
+        let pending = self.pending.clone();
+        tokio::spawn(async move {
+            let mut lines = BufReader::new(stdout).lines();
+            while let Ok(Some(line)) = lines.next_line().await {
+                let Ok(msg) = serde_json::from_str::<Value>(&line) else {
+                    continue;
+                };
+                let has_id = !msg["id"].is_null();
+                let has_method = msg["method"].is_string();
+                if has_id && !has_method {
+                    // Response to one of our requests.
+                    if let Some(id) = msg["id"].as_i64() {
+                        if let Some(tx) = pending.lock().await.remove(&id) {
+                            let result = if msg.get("error").map(|e| !e.is_null()).unwrap_or(false)
+                            {
+                                let e = &msg["error"];
+                                let detail = e["data"]["message"]
+                                    .as_str()
+                                    .or_else(|| e["message"].as_str())
+                                    .unwrap_or("unknown error");
+                                Err(detail.to_string())
+                            } else {
+                                Ok(msg["result"].clone())
+                            };
+                            let _ = tx.send(result);
                         }
+                    }
+                } else if has_method {
+                    let method = msg["method"].as_str().unwrap_or("").to_string();
+                    let params = msg["params"].clone();
+                    let session_id = params["sessionId"].as_str().unwrap_or("").to_string();
+                    let routed = {
+                        let routes = routes.lock().await;
+                        routes.get(&session_id).cloned()
+                    };
+                    if let Some(tx) = routed {
+                        let m = if has_id {
+                            ServerMsg::Request {
+                                id: msg["id"].clone(),
+                                method,
+                                params,
+                            }
+                        } else {
+                            ServerMsg::Notification { method, params }
+                        };
+                        let _ = tx.send(m).await;
                     }
                 }
             }
-            out
-        }
-        // Reasoning stream (thinking models); deltas coalesce client-side.
-        Some("thinking") => ev["text"]
+            closed.store(true, Ordering::Relaxed);
+        });
+    }
+
+    async fn handshake(&self) -> Result<(), BackendError> {
+        let result = self
+            .request(
+                "initialize",
+                json!({
+                    "protocolVersion": 1,
+                    "clientCapabilities": {
+                        "fs": { "readTextFile": false, "writeTextFile": false },
+                        // Clean model ids + per-parameter config options
+                        // instead of one exploded variant list.
+                        "_meta": { "parameterizedModelPicker": true },
+                    },
+                }),
+            )
+            .await?;
+        let _ = result;
+        Ok(())
+    }
+
+    async fn new_session(&self, worktree: &std::path::Path) -> Result<String, BackendError> {
+        let result = self
+            .request(
+                "session/new",
+                json!({ "cwd": worktree, "mcpServers": [] }),
+            )
+            .await
+            .map_err(auth_hint)?;
+        let id = result["sessionId"]
             .as_str()
-            .filter(|t| !t.is_empty())
-            .map(|t| vec![BackendEvent::ThinkingDelta(t.to_string())])
-            .unwrap_or_default(),
-        Some("tool_call") => {
-            let subtype = ev["subtype"].as_str().unwrap_or("");
-            let call = &ev["tool_call"];
-            // The payload nests the specific call under a single key like
-            // "readToolCall" / "shellToolCall".
-            let (tool, body) = call
-                .as_object()
-                .and_then(|o| o.iter().find(|(k, _)| k.ends_with("ToolCall")))
-                .map(|(k, v)| (k.trim_end_matches("ToolCall").to_string(), v.clone()))
-                .unwrap_or_else(|| ("tool".to_string(), call.clone()));
-            let call_id = ev["call_id"]
-                .as_str()
-                .or_else(|| call["call_id"].as_str())
-                .or_else(|| body["call_id"].as_str())
-                .unwrap_or("cursor-tool")
-                .to_string();
-            match subtype {
-                "started" => vec![BackendEvent::ToolStarted {
-                    call_id,
-                    tool,
-                    args: body["args"].clone(),
-                }],
-                "completed" => {
-                    let result = body["result"].clone();
-                    let ok = result.get("error").map(Value::is_null).unwrap_or(true);
-                    vec![BackendEvent::ToolCompleted {
-                        call_id,
-                        ok,
-                        result,
-                    }]
-                }
-                _ => vec![],
-            }
+            .ok_or_else(|| {
+                BackendError::Protocol("session/new result missing sessionId".into())
+            })?
+            .to_string();
+        self.sessions.lock().await.insert(id.clone());
+        Ok(id)
+    }
+
+    async fn load_session(
+        &self,
+        session_id: &str,
+        worktree: &std::path::Path,
+    ) -> Result<(), BackendError> {
+        self.request(
+            "session/load",
+            json!({ "sessionId": session_id, "cwd": worktree, "mcpServers": [] }),
+        )
+        .await
+        .map_err(auth_hint)?;
+        self.sessions.lock().await.insert(session_id.to_string());
+        Ok(())
+    }
+
+    async fn knows_session(&self, session_id: &str) -> bool {
+        self.sessions.lock().await.contains(session_id)
+    }
+
+    async fn set_config_option(
+        &self,
+        session_id: &str,
+        config_id: &str,
+        value: &str,
+    ) -> Result<Value, BackendError> {
+        self.request(
+            "session/set_config_option",
+            json!({ "sessionId": session_id, "configId": config_id, "value": value }),
+        )
+        .await
+    }
+
+    async fn request(&self, method: &str, params: Value) -> Result<Value, BackendError> {
+        let rx = self.request_deferred(method, params).await?;
+        match rx.await {
+            Ok(Ok(v)) => Ok(v),
+            Ok(Err(e)) => Err(BackendError::Protocol(format!("{method}: {e}"))),
+            Err(_) => Err(BackendError::Protocol(format!(
+                "{method}: cursor-agent closed before responding"
+            ))),
         }
-        Some("result") => {
-            let usage = &ev["usage"];
-            vec![BackendEvent::Completed {
-                usage: Usage {
-                    input_tokens: usage["input_tokens"].as_u64().unwrap_or(0),
-                    output_tokens: usage["output_tokens"].as_u64().unwrap_or(0),
-                    cached_input_tokens: usage["cached_input_tokens"].as_u64().unwrap_or(0),
-                    cost_usd: None,
-                },
-            }]
+    }
+
+    /// Send a request and return the response channel without awaiting it
+    /// (session/prompt resolves only at end of turn).
+    async fn request_deferred(
+        &self,
+        method: &str,
+        params: Value,
+    ) -> Result<oneshot::Receiver<Result<Value, String>>, BackendError> {
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        let (tx, rx) = oneshot::channel();
+        self.pending.lock().await.insert(id, tx);
+        self.write(json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params }))
+            .await?;
+        Ok(rx)
+    }
+
+    async fn notify(&self, method: &str, params: Value) {
+        let _ = self
+            .write(json!({ "jsonrpc": "2.0", "method": method, "params": params }))
+            .await;
+    }
+
+    async fn respond(&self, id: Value, result: Value) {
+        let _ = self
+            .write(json!({ "jsonrpc": "2.0", "id": id, "result": result }))
+            .await;
+    }
+
+    async fn respond_err(&self, id: Value, code: i64, message: &str) {
+        let _ = self
+            .write(json!({
+                "jsonrpc": "2.0", "id": id,
+                "error": { "code": code, "message": message },
+            }))
+            .await;
+    }
+
+    async fn write(&self, msg: Value) -> Result<(), BackendError> {
+        let mut stdin = self.stdin.lock().await;
+        let mut line = serde_json::to_vec(&msg).expect("serializable");
+        line.push(b'\n');
+        stdin.write_all(&line).await.map_err(BackendError::Io)?;
+        stdin.flush().await.map_err(BackendError::Io)
+    }
+
+    async fn subscribe(&self, session_id: &str) -> mpsc::Receiver<ServerMsg> {
+        let (tx, rx) = mpsc::channel(256);
+        self.routes.lock().await.insert(session_id.to_string(), tx);
+        rx
+    }
+
+    async fn unsubscribe(&self, session_id: &str) {
+        self.routes.lock().await.remove(session_id);
+    }
+}
+
+/// Surface auth failures as such (the UI offers the login flow for them).
+fn auth_hint(e: BackendError) -> BackendError {
+    match e {
+        BackendError::Protocol(msg)
+            if msg.to_lowercase().contains("auth") || msg.contains("login") =>
+        {
+            BackendError::Auth(msg)
         }
-        _ => vec![],
+        other => other,
     }
 }
 
@@ -513,110 +882,158 @@ mod tests {
     use super::*;
 
     #[test]
-    fn groups_variant_explosion_into_base_models() {
-        let out = "Available models\n\n\
-            auto - Auto\n\
-            gpt-5.3-codex-low - Codex 5.3 Low\n\
-            gpt-5.3-codex - Codex 5.3\n\
-            gpt-5.3-codex-fast - Codex 5.3 Fast\n\
-            gpt-5.3-codex-high - Codex 5.3 High\n\
-            gpt-5.3-codex-high-fast - Codex 5.3 High Fast\n\
-            claude-opus-4-8-low - Opus 4.8 1M Low\n\
-            claude-opus-4-8-high - Opus 4.8 1M\n\
-            claude-opus-4-8-max - Opus 4.8 1M Max\n\
-            claude-opus-4-8-thinking-high - Opus 4.8 1M Thinking\n\
-            claude-opus-4-8-thinking-low - Opus 4.8 1M Low Thinking\n\
-            grok-4.3 - Grok 4.3 1M\n\n\
-            Tip: use --model <id> to switch.\n";
-        let models = parse_models_output("cursor", out);
+    fn parses_acp_model_catalog() {
+        let result = json!({ "models": [
+            { "value": "default", "name": "Auto", "configOptions": [] },
+            { "value": "claude-fable-5", "name": "Fable 5", "configOptions": [
+                { "id": "thinking", "name": "Thinking", "description": "Thinking on/off",
+                  "type": "select", "currentValue": "true",
+                  "options": [ { "value": "false", "name": "Off" },
+                               { "value": "true", "name": "On" } ] },
+                { "id": "context", "name": "Context", "description": "Context size",
+                  "type": "select", "currentValue": "300k",
+                  "options": [ { "value": "300k", "name": "300K" },
+                               { "value": "1m", "name": "1M" } ] },
+                { "id": "effort", "name": "Effort", "description": "Effort level",
+                  "type": "select", "currentValue": "high",
+                  "options": [ { "value": "low", "name": "Low" },
+                               { "value": "high", "name": "High" },
+                               { "value": "max", "name": "Max" } ] },
+            ]},
+            { "value": "composer-2.5", "name": "Composer 2.5", "configOptions": [
+                { "id": "fast", "name": "Fast", "description": "Faster",
+                  "type": "select", "currentValue": "true",
+                  "options": [ { "value": "false", "name": "Off" },
+                               { "value": "true", "name": "Fast" } ] },
+            ]},
+        ]});
+        let models = parse_acp_models("cursor", &result);
         let ids: Vec<&str> = models.iter().map(|m| m.id.as_str()).collect();
         assert_eq!(
             ids,
-            vec![
-                "cursor/auto",
-                "cursor/gpt-5.3-codex",
-                "cursor/claude-opus-4-8",
-                "cursor/claude-opus-4-8-thinking",
-                "cursor/grok-4.3",
-            ]
+            vec!["cursor/default", "cursor/claude-fable-5", "cursor/composer-2.5"]
         );
 
-        // Bare variant is the default; levels sorted; fast noted.
-        let codex = &models[1];
-        assert_eq!(codex.display_name, "Codex 5.3");
+        let fable = &models[1];
+        assert_eq!(fable.display_name, "Fable 5");
+        // The default context choice (300k) is the advertised window.
+        assert_eq!(fable.context_window, 300_000);
         assert_eq!(
-            codex
+            fable
                 .options_schema
-                .pointer("/properties/thinking_level/enum")
+                .pointer("/properties/context/enum")
                 .unwrap(),
-            &serde_json::json!(["low", "default", "high"])
+            &json!(["300k", "1m"])
         );
         assert_eq!(
-            codex
+            fable
                 .options_schema
-                .pointer("/properties/thinking_level/default")
-                .and_then(Value::as_str),
-            Some("default")
-        );
-        assert!(codex.options_schema.pointer("/properties/fast").is_some());
-
-        // No bare id: the unlabeled display ("Opus 4.8 1M") marks high as
-        // default; `-thinking` stays a separate model; `-max` is a level.
-        let opus = &models[2];
-        assert_eq!(opus.display_name, "Opus 4.8 1M");
-        assert_eq!(opus.context_window, 1_000_000);
-        assert_eq!(
-            opus.options_schema
-                .pointer("/properties/thinking_level/enum")
-                .unwrap(),
-            &serde_json::json!(["low", "high", "max"])
-        );
-        assert_eq!(
-            opus.options_schema
-                .pointer("/properties/thinking_level/default")
+                .pointer("/properties/effort/default")
                 .and_then(Value::as_str),
             Some("high")
         );
-        assert!(opus.options_schema.pointer("/properties/fast").is_none());
+        // Binary options become booleans (rendered as toggles).
+        assert_eq!(
+            fable
+                .options_schema
+                .pointer("/properties/thinking/type")
+                .and_then(Value::as_str),
+            Some("boolean")
+        );
+        assert_eq!(
+            fable
+                .options_schema
+                .pointer("/properties/thinking/default"),
+            Some(&json!(true))
+        );
 
-        // Single-variant models get no thinking knob.
-        assert!(models[4]
-            .options_schema
-            .pointer("/properties/thinking_level")
-            .is_none());
+        let composer = &models[2];
+        assert_eq!(composer.context_window, 200_000); // no context option
+        assert_eq!(
+            composer
+                .options_schema
+                .pointer("/properties/fast/default"),
+            Some(&json!(true))
+        );
     }
 
     #[test]
-    fn composes_variant_ids_from_options() {
-        let opts = |v: Value| v.as_object().unwrap().clone();
+    fn parses_context_sizes() {
+        assert_eq!(parse_context_size("300k"), Some(300_000));
+        assert_eq!(parse_context_size("1m"), Some(1_000_000));
+        assert_eq!(parse_context_size("272K"), Some(272_000));
+        assert_eq!(parse_context_size("full"), None);
+    }
 
-        // Explicit level and fast.
+    #[test]
+    fn splits_legacy_variant_ids() {
         assert_eq!(
-            compose_model_id(
-                "claude-opus-4-8",
-                &opts(serde_json::json!({"thinking_level": "max", "fast": true})),
-                Some("high"),
-            ),
-            "claude-opus-4-8-max-fast"
+            split_variant("claude-opus-4-8-high-fast"),
+            ("claude-opus-4-8", Some("high"), true)
         );
-        // No option set: fall back to the group default.
         assert_eq!(
-            compose_model_id("claude-opus-4-8", &serde_json::Map::new(), Some("high")),
-            "claude-opus-4-8-high"
+            split_variant("claude-fable-5"),
+            ("claude-fable-5", None, false)
         );
-        // "default" maps to the bare id.
+        assert_eq!(split_variant("gpt-5.3-codex"), ("gpt-5.3-codex", None, false));
+    }
+
+    #[test]
+    fn maps_updates_to_events() {
+        let text = json!({ "sessionUpdate": "agent_message_chunk",
+                           "content": { "type": "text", "text": "hi" } });
+        assert!(matches!(
+            map_update(&text).as_slice(),
+            [BackendEvent::TextDelta(t)] if t == "hi"
+        ));
+
+        let thought = json!({ "sessionUpdate": "agent_thought_chunk",
+                              "content": { "type": "text", "text": "hmm" } });
+        assert!(matches!(
+            map_update(&thought).as_slice(),
+            [BackendEvent::ThinkingDelta(t)] if t == "hmm"
+        ));
+
+        let call = json!({ "sessionUpdate": "tool_call", "toolCallId": "t1",
+                           "title": "`ls`", "kind": "execute", "status": "pending",
+                           "rawInput": { "command": "ls" } });
+        match map_update(&call).as_slice() {
+            [BackendEvent::ToolStarted { call_id, tool, args }] => {
+                assert_eq!(call_id, "t1");
+                assert_eq!(tool, "execute");
+                assert_eq!(args["command"], "ls");
+                assert_eq!(args["title"], "`ls`");
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+
+        let done = json!({ "sessionUpdate": "tool_call_update", "toolCallId": "t1",
+                           "status": "completed",
+                           "rawOutput": { "exitCode": 0, "stdout": "a\n" } });
+        assert!(matches!(
+            map_update(&done).as_slice(),
+            [BackendEvent::ToolCompleted { call_id, ok: true, .. }] if call_id == "t1"
+        ));
+
+        let progress = json!({ "sessionUpdate": "tool_call_update", "toolCallId": "t1",
+                               "status": "in_progress" });
+        assert!(map_update(&progress).is_empty());
+
+        let title = json!({ "sessionUpdate": "session_info_update", "title": "T" });
+        assert!(map_update(&title).is_empty());
+    }
+
+    #[test]
+    fn reads_config_snapshot_values() {
+        let result = json!({ "configOptions": [
+            { "id": "mode", "currentValue": "agent" },
+            { "id": "model", "currentValue": "composer-2.5" },
+        ]});
         assert_eq!(
-            compose_model_id(
-                "gpt-5.3-codex",
-                &opts(serde_json::json!({"thinking_level": "default"})),
-                Some("default"),
-            ),
-            "gpt-5.3-codex"
+            config_snapshot_value(&result, "model").as_deref(),
+            Some("composer-2.5")
         );
-        // Unknown group (cold cache): bare id passes through.
-        assert_eq!(
-            compose_model_id("grok-4.3", &serde_json::Map::new(), None),
-            "grok-4.3"
-        );
+        assert_eq!(config_snapshot_value(&result, "context"), None);
+        assert_eq!(config_snapshot_value(&json!({}), "model"), None);
     }
 }

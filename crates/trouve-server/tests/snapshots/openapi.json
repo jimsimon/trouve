@@ -41,6 +41,91 @@
         }
       }
     },
+    "/v1/clis": {
+      "get": {
+        "tags": [],
+        "operationId": "list_clis",
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CliList"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/clis/{id}/install": {
+      "get": {
+        "tags": [],
+        "operationId": "cli_install_status",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CliInstallStatus"
+                }
+              }
+            }
+          }
+        }
+      },
+      "post": {
+        "tags": [],
+        "operationId": "start_cli_install",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "202": {
+            "description": ""
+          },
+          "404": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/v1/config/default-model": {
       "put": {
         "tags": [],
@@ -1311,6 +1396,101 @@
           "status": {
             "type": "string",
             "description": "queued / in_progress / completed"
+          }
+        }
+      },
+      "CliInfo": {
+        "type": "object",
+        "description": "A vendor CLI trouve can download and manage (cursor-agent, claude,\ncodex), with its current install state.",
+        "required": [
+          "id",
+          "display_name",
+          "kinds",
+          "source",
+          "update_available"
+        ],
+        "properties": {
+          "display_name": {
+            "type": "string"
+          },
+          "id": {
+            "type": "string",
+            "description": "Stable id, also the binary name: \"cursor-agent\", \"claude\", \"codex\"."
+          },
+          "installed_version": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Version of the binary trouve would run, when one was resolved."
+          },
+          "kinds": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Provider kinds served by this CLI (e.g. [\"cursor-cli\"])."
+          },
+          "latest_version": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Newest version the vendor serves (None when the check failed)."
+          },
+          "path": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Absolute path of the resolved binary, when known."
+          },
+          "source": {
+            "type": "string",
+            "description": "Where that binary comes from: \"managed\" (trouve-installed),\n\"path\" (system install), or \"none\"."
+          },
+          "update_available": {
+            "type": "boolean"
+          }
+        }
+      },
+      "CliInstallStatus": {
+        "type": "object",
+        "description": "State of a CLI install started with `POST /v1/clis/{id}/install`.",
+        "required": [
+          "status"
+        ],
+        "properties": {
+          "error": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "status": {
+            "type": "string",
+            "description": "\"none\" (nothing running), \"pending\", \"success\", or \"failed\"."
+          },
+          "version": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Version being (or just) installed, when known."
+          }
+        }
+      },
+      "CliList": {
+        "type": "object",
+        "required": [
+          "clis"
+        ],
+        "properties": {
+          "clis": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/CliInfo"
+            }
           }
         }
       },

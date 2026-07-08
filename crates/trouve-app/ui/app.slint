@@ -724,13 +724,16 @@ export component AppWindow inherits Window {
     callback composer-model-changed(int);
 
     // Model knobs, derived from the current model's options schema.
-    // Empty thinking-options hides the dropdown; fast-visible gates the
-    // fast/priority toggle (Cursor only).
+    // Empty thinking-options / context-options hide their dropdowns;
+    // fast-visible gates the fast/priority toggle (Cursor only).
     in property <[string]> thinking-options;
     in-out property <int> thinking-index: -1;
+    in property <[string]> context-options;
+    in-out property <int> context-index: -1;
     in property <bool> fast-visible: false;
     in-out property <bool> fast-checked: false;
     callback composer-thinking-changed(int);
+    callback composer-context-changed(int);
     callback composer-fast-toggled(bool);
 
     // Session usage + context indicator (composer bar).
@@ -1773,6 +1776,18 @@ export component AppWindow inherits Window {
                             enabled: root.composer-enabled;
                             placeholder: "thinking";
                             changed(i) => { root.composer-thinking-changed(i); }
+                        }
+                    }
+                    if root.context-options.length > 0: VerticalLayout {
+                        spacing: 2px;
+                        Text { text: "Context"; color: #7a7a7a; font-size: 10px; }
+                        DropUpPicker {
+                            width: 90px;
+                            options: root.context-options;
+                            current-index <=> root.context-index;
+                            enabled: root.composer-enabled;
+                            placeholder: "context";
+                            changed(i) => { root.composer-context-changed(i); }
                         }
                     }
                     if root.fast-visible: VerticalLayout {

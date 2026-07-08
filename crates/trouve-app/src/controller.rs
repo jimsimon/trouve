@@ -77,6 +77,7 @@ pub enum UiCommand {
     ComposerModeChanged(usize),
     ComposerModelChanged(usize),
     ComposerThinkingChanged(usize),
+    ComposerContextChanged(usize),
     ComposerFastToggled(bool),
 
     // Right column.
@@ -103,6 +104,8 @@ pub enum UiCommand {
     DeleteProvider(String),
     ProviderLogin(String),
     SetDefaultModel(usize),
+    /// Download/update a managed vendor CLI ("cursor-agent", "claude", "codex").
+    CliInstall(String),
 
     /// Internal: an event arrived on some thread's stream.
     Event(String, Box<EventEnvelope>),
@@ -168,6 +171,9 @@ struct Controller {
     /// the displayed labels).
     thinking_key: Option<String>,
     thinking_values: Vec<String>,
+    /// Context-size dropdown values (schema property "context"), when the
+    /// current model offers a choice (e.g. cursor's 300k/1M).
+    context_values: Vec<String>,
 
     new_chat: Option<NewChat>,
     branches: Vec<String>,
@@ -220,6 +226,7 @@ pub async fn run(
         models: Vec::new(),
         thinking_key: None,
         thinking_values: Vec::new(),
+        context_values: Vec::new(),
         new_chat: None,
         branches: Vec::new(),
         diff_files: Vec::new(),
@@ -598,20 +605,38 @@ impl Controller {
             .map(|i| i as i32)
             .unwrap_or(-1);
 
+        let context = info.and_then(|m| context_property(&m.options_schema));
+        let (context_values, context_default) = context.unwrap_or_default();
+        let context_current = thread
+            .and_then(|t| t.model_options.get("context"))
+            .and_then(|v| v.as_str().map(String::from))
+            .or(context_default);
+        let context_index = context_current
+            .and_then(|c| context_values.iter().position(|v| *v == c))
+            .map(|i| i as i32)
+            .unwrap_or(-1);
+
         let fast_visible = info
             .map(|m| m.options_schema.pointer("/properties/fast").is_some())
+            .unwrap_or(false);
+        let fast_default = info
+            .and_then(|m| m.options_schema.pointer("/properties/fast/default"))
+            .and_then(|v| v.as_bool())
             .unwrap_or(false);
         let fast_checked = thread
             .and_then(|t| t.model_options.get("fast"))
             .and_then(|v| v.as_bool())
-            .unwrap_or(false);
+            .unwrap_or(fast_default);
 
         self.thinking_key = key;
         self.thinking_values = values.clone();
+        self.context_values = context_values.clone();
         ui::set_model_knobs(
             &self.ui,
             values.iter().map(|v| level_label(v)).collect(),
             index,
+            context_values.iter().map(|v| context_label(v)).collect(),
+            context_index,
             fast_visible,
             fast_checked,
         );
@@ -948,6 +973,64 @@ impl Controller {
         if let Ok(known) = self.client.known_providers().await {
             ui::set_known_providers(&self.settings_ui, known);
         }
+        self.refresh_clis().await;
+    }
+
+    /// Fetch managed vendor-CLI state and render the settings rows. Install
+    /// progress is stateless: the server's install status drives the busy
+    /// flag and status text on every refresh.
+    async fn refresh_clis(&mut self) {
+        let Ok(list) = self.client.list_clis().await else {
+            return;
+        };
+        let mut rows = Vec::new();
+        for cli in list.clis {
+            let install = self
+                .client
+                .cli_install_status(&cli.id)
+                .await
+                .ok()
+                .filter(|s| s.status != "none");
+            let version_label = match (&cli.installed_version, cli.source.as_str()) {
+                (Some(v), source) => {
+                    let origin = if source == "managed" { "managed" } else { "system" };
+                    match (&cli.latest_version, cli.update_available) {
+                        (Some(latest), true) => format!("{v} ({origin}) — {latest} available"),
+                        _ => format!("{v} ({origin})"),
+                    }
+                }
+                (None, _) => "not installed".to_string(),
+            };
+            let action_label = if cli.installed_version.is_none() {
+                "Install".to_string()
+            } else if cli.update_available {
+                "Update".to_string()
+            } else {
+                String::new()
+            };
+            let (status, busy) = match install.as_ref().map(|s| s.status.as_str()) {
+                Some("pending") => (
+                    match install.as_ref().and_then(|s| s.version.clone()) {
+                        Some(v) => format!("downloading {v}…"),
+                        None => "downloading…".to_string(),
+                    },
+                    true,
+                ),
+                Some("failed") => (
+                    format!(
+                        "install failed: {}",
+                        install
+                            .as_ref()
+                            .and_then(|s| s.error.clone())
+                            .unwrap_or_default()
+                    ),
+                    false,
+                ),
+                _ => (String::new(), false),
+            };
+            rows.push((cli.id, cli.display_name, version_label, action_label, status, busy));
+        }
+        ui::set_clis(&self.settings_ui, rows);
     }
 
     // --- command dispatch --------------------------------------------------------
@@ -1195,6 +1278,17 @@ impl Controller {
                     .await;
                 }
             }
+            UiCommand::ComposerContextChanged(i) => {
+                if let Some(token) = self.context_values.get(i).cloned() {
+                    let mut options = self.current_model_options();
+                    options.insert("context".into(), serde_json::Value::String(token));
+                    self.update_current_thread(UpdateThreadRequest {
+                        model_options: Some(options),
+                        ..Default::default()
+                    })
+                    .await;
+                }
+            }
             UiCommand::ComposerFastToggled(on) => {
                 let mut options = self.current_model_options();
                 options.insert("fast".into(), serde_json::Value::Bool(on));
@@ -1422,6 +1516,51 @@ impl Controller {
                     }
                 }
             }
+            UiCommand::CliInstall(id) => match self.client.start_cli_install(&id).await {
+                Ok(()) => {
+                    ui::set_settings_status(&self.settings_ui, format!("installing {id}…"));
+                    self.refresh_clis().await;
+                    // Poll until the install settles; every refresh re-renders
+                    // the row from the server's install status.
+                    let client = self.client.clone();
+                    let settings_ui = self.settings_ui.clone();
+                    let tx = self.tx.clone();
+                    tokio::spawn(async move {
+                        for _ in 0..600 {
+                            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                            let Ok(status) = client.cli_install_status(&id).await else {
+                                return;
+                            };
+                            match status.status.as_str() {
+                                "pending" => continue,
+                                "success" => {
+                                    ui::set_settings_status(
+                                        &settings_ui,
+                                        format!(
+                                            "installed {id} {}",
+                                            status.version.unwrap_or_default()
+                                        ),
+                                    );
+                                }
+                                _ => {
+                                    ui::set_settings_status(
+                                        &settings_ui,
+                                        format!(
+                                            "install of {id} failed: {}",
+                                            status.error.unwrap_or_default()
+                                        ),
+                                    );
+                                }
+                            }
+                            let _ = tx.send(UiCommand::RefreshSettings);
+                            return;
+                        }
+                    });
+                }
+                Err(e) => {
+                    ui::set_settings_status(&self.settings_ui, format!("{e:#}"));
+                }
+            },
             UiCommand::Event(thread_id, envelope) => {
                 let vm = self.vms.entry(thread_id.clone()).or_default();
                 let changed = vm.apply(&envelope);
@@ -1509,23 +1648,49 @@ fn short_model(model: &str) -> String {
 
 /// The thinking-style enum in a model's options schema, if any: property
 /// name, value tokens, and the schema default. Providers name the knob
-/// differently (cursor/anthropic: thinking_level, codex: reasoning_effort).
+/// differently (anthropic: thinking_level, codex: reasoning_effort,
+/// cursor's ACP catalog: effort or reasoning).
 fn thinking_property(schema: &serde_json::Value) -> Option<(String, Vec<String>, Option<String>)> {
-    for key in ["thinking_level", "reasoning_effort"] {
+    for key in ["thinking_level", "reasoning_effort", "effort", "reasoning"] {
         let Some(prop) = schema.pointer(&format!("/properties/{key}")) else {
             continue;
         };
-        let values: Vec<String> = prop["enum"]
-            .as_array()?
-            .iter()
-            .filter_map(|v| v.as_str().map(String::from))
-            .collect();
+        let Some(values) = enum_values(prop) else {
+            continue;
+        };
         if values.len() > 1 {
             let default = prop["default"].as_str().map(String::from);
             return Some((key.into(), values, default));
         }
     }
     None
+}
+
+/// The context-size enum in a model's options schema, if any (cursor models
+/// with a 300k/1M choice): value tokens and the schema default.
+fn context_property(schema: &serde_json::Value) -> Option<(Vec<String>, Option<String>)> {
+    let prop = schema.pointer("/properties/context")?;
+    let values = enum_values(prop)?;
+    if values.len() > 1 {
+        let default = prop["default"].as_str().map(String::from);
+        return Some((values, default));
+    }
+    None
+}
+
+fn enum_values(prop: &serde_json::Value) -> Option<Vec<String>> {
+    Some(
+        prop["enum"]
+            .as_array()?
+            .iter()
+            .filter_map(|v| v.as_str().map(String::from))
+            .collect(),
+    )
+}
+
+/// Human label for a context-size token ("300k" → "300K", "1m" → "1M").
+fn context_label(token: &str) -> String {
+    token.to_uppercase()
 }
 
 /// Human label for a thinking-level token.

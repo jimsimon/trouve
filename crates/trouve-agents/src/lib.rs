@@ -12,6 +12,7 @@
 pub mod claude;
 pub mod codex;
 pub mod cursor;
+pub mod install;
 mod login;
 
 use std::path::PathBuf;

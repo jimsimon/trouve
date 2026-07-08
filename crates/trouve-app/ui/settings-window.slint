@@ -17,6 +17,19 @@ export struct ProviderItem {
     experimental: bool,
 }
 
+// A vendor CLI (cursor-agent, claude, codex) trouve can download and manage.
+export struct CliItem {
+    id: string,
+    display-name: string,
+    // "not installed" / "1.2.3 (system)" / "1.2.3 (managed)" ...
+    version-label: string,
+    // "Install" / "Update" / "" (hidden when up to date and managed)
+    action-label: string,
+    // In-flight install feedback ("downloading…", "failed: …").
+    status: string,
+    busy: bool,
+}
+
 // A well-known provider preset served by the backend; picking one prefills
 // the add/edit form so nothing has to be typed by hand.
 export struct KnownProviderItem {
@@ -41,6 +54,7 @@ export component SettingsWindow inherits Window {
     background: #181818;
 
     in property <[ProviderItem]> providers;
+    in property <[CliItem]> clis;
     in property <[KnownProviderItem]> known-providers;
     // Preset display names (alphabetical; index i maps to
     // known-providers[i]) followed by "Custom" as the last entry.
@@ -75,6 +89,7 @@ export component SettingsWindow inherits Window {
     callback provider-login(string);
     callback default-model-picked(int);
     callback refresh-settings();
+    callback cli-install(/* id */ string);
 
     ScrollView {
         VerticalLayout {
@@ -262,6 +277,57 @@ export component SettingsWindow inherits Window {
                 color: #9cbdde;
                 font-size: 12px;
                 wrap: word-wrap;
+            }
+
+            // ---------------- vendor CLIs ----------------
+            Text {
+                text: "Vendor CLIs";
+                color: #e8e8e8;
+                font-size: 16px;
+                font-weight: 700;
+            }
+            Text {
+                text: "Agent backends (Cursor, Claude Code, Codex) run through the vendor's CLI. trouve can download and update these directly — managed installs live in trouve's data directory and take precedence over system packages.";
+                color: #8a8a8a;
+                font-size: 11px;
+                wrap: word-wrap;
+            }
+            Rectangle {
+                background: #1e1e1e;
+                border-radius: 6px;
+                height: 118px;
+                ListView {
+                    for cli in root.clis: Rectangle {
+                        height: 38px;
+                        HorizontalLayout {
+                            padding-left: 10px;
+                            padding-right: 6px;
+                            spacing: 8px;
+                            Text {
+                                text: cli.display-name;
+                                color: #e0e0e0;
+                                font-size: 13px;
+                                font-weight: 700;
+                                vertical-alignment: center;
+                                width: 110px;
+                                overflow: elide;
+                            }
+                            Text {
+                                text: cli.status != "" ? cli.status : cli.version-label;
+                                color: cli.status != "" ? #9cbdde : #9a9a9a;
+                                font-size: 12px;
+                                vertical-alignment: center;
+                                overflow: elide;
+                                horizontal-stretch: 1;
+                            }
+                            if cli.action-label != "": Button {
+                                text: cli.action-label;
+                                enabled: !cli.busy;
+                                clicked => { root.cli-install(cli.id); }
+                            }
+                        }
+                    }
+                }
             }
 
             // ---------------- default model ----------------

@@ -160,6 +160,8 @@ fn tool_display_name(tool: &str) -> String {
     match tool {
         "search" => "Code Search".into(),
         "find_related" => "Find Related".into(),
+        // Cursor's ACP kind for shell commands.
+        "execute" => "Shell".into(),
         _ => {
             // snake_case → words; camelCase → split before upper runs.
             let mut words: Vec<String> = Vec::new();
@@ -196,14 +198,16 @@ fn tool_display_name(tool: &str) -> String {
 /// tools show their query — `Code Search markdown renderer` — since the
 /// tool name alone says nothing about what happened.
 fn tool_label(tool: &str, args: &serde_json::Value) -> String {
-    let command = matches!(tool, "shell" | "Bash" | "bash")
+    // "execute" is cursor's ACP kind for shell commands.
+    let command = matches!(tool, "shell" | "Bash" | "bash" | "execute")
         .then(|| args.get("command").and_then(|v| v.as_str()))
         .flatten();
     if let Some(cmd) = command {
         return format!("{} ({})", tool_display_name(tool), title_arg(cmd));
     }
     let display = tool_display_name(tool);
-    let query = ["query", "pattern", "url", "path"]
+    // "title" is the human label ACP tool calls carry (e.g. "`ls`").
+    let query = ["query", "pattern", "url", "path", "title"]
         .iter()
         .find_map(|k| args.get(k).and_then(|v| v.as_str()))
         .filter(|q| !q.trim().is_empty());

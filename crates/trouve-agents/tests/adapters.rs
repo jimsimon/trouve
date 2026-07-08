@@ -127,25 +127,125 @@ EOF
     assert!(args.contains("--thinking-display"), "{args}");
 }
 
-#[tokio::test]
-async fn cursor_adapter_creates_chat_and_maps_events() {
-    let tmp = tempfile::tempdir().unwrap();
-    let stub = write_stub(
-        tmp.path(),
+/// ACP stub for cursor-agent: answers the fixed request sequence of a fresh
+/// turn (initialize, session/new, set mode, set model, prompt), streams a
+/// text delta + tool call, raises one permission request, and records what
+/// it received.
+fn cursor_acp_stub(dir: &Path) -> String {
+    write_stub(
+        dir,
         "cursor-agent",
         r#"#!/bin/bash
-if [ "$1" = "create-chat" ]; then echo "chat-123"; exit 0; fi
-printf '%s\n' "$@" > "$0.args"
-cat <<'EOF'
-{"type":"system","subtype":"init","session_id":"chat-123"}
-{"type":"assistant","message":{"content":[{"type":"text","text":"Hi "}]}}
-{"type":"assistant","message":{"content":[{"type":"text","text":"there"}]}}
-{"type":"tool_call","subtype":"started","call_id":"c1","tool_call":{"readToolCall":{"args":{"path":"a.txt"}}}}
-{"type":"tool_call","subtype":"completed","call_id":"c1","tool_call":{"readToolCall":{"args":{"path":"a.txt"},"result":{"content":"x"}}}}
-{"type":"result","result":"done","usage":{"input_tokens":7,"output_tokens":3}}
-EOF
+echo "$1" > "$0.args"
+read line # initialize
+echo '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":1}}'
+read line # session/new
+echo '{"jsonrpc":"2.0","id":2,"result":{"sessionId":"sess-1"}}'
+read line # set_config_option mode
+echo "$line" > "$0.mode"
+echo '{"jsonrpc":"2.0","id":3,"result":{"configOptions":[{"id":"mode","currentValue":"agent"}]}}'
+read line # set_config_option model
+echo "$line" > "$0.model"
+echo '{"jsonrpc":"2.0","id":4,"result":{"configOptions":[{"id":"model","currentValue":"test-model"}]}}'
+read line # session/prompt
+echo "$line" > "$0.prompt"
+echo '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"sess-1","update":{"sessionUpdate":"agent_thought_chunk","content":{"type":"text","text":"Hmm."}}}}'
+echo '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"sess-1","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"Hi "}}}}'
+echo '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"sess-1","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"there"}}}}'
+echo '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"sess-1","update":{"sessionUpdate":"tool_call","toolCallId":"c1","title":"`ls`","kind":"execute","status":"pending","rawInput":{"command":"ls"}}}}'
+echo '{"jsonrpc":"2.0","id":100,"method":"session/request_permission","params":{"sessionId":"sess-1","toolCall":{"toolCallId":"c1","title":"`ls`","kind":"execute"},"options":[{"optionId":"allow-once","name":"Allow once","kind":"allow_once"},{"optionId":"allow-always","name":"Allow always","kind":"allow_always"},{"optionId":"reject-once","name":"Reject","kind":"reject_once"}]}}'
+read approval
+echo "$approval" > "$0.approval"
+echo '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"sess-1","update":{"sessionUpdate":"tool_call_update","toolCallId":"c1","status":"completed","rawOutput":{"exitCode":0,"stdout":"a.txt\n"}}}}'
+echo '{"jsonrpc":"2.0","id":5,"result":{"stopReason":"end_turn","usage":{"inputTokens":7,"outputTokens":3,"totalTokens":10}}}'
+cat > /dev/null
 "#,
-    );
+    )
+}
+
+#[tokio::test]
+async fn cursor_adapter_speaks_acp_and_bridges_approvals() {
+    let tmp = tempfile::tempdir().unwrap();
+    let stub = cursor_acp_stub(tmp.path());
+    let backend = CursorBackend::new("cursor", Some(stub.clone()), None);
+    let mut stream = backend
+        .run_turn(turn(tmp.path().to_path_buf(), None, BackendPermission::Ask))
+        .await
+        .unwrap();
+
+    let mut events = Vec::new();
+    while let Some(ev) = stream.next().await {
+        let ev = ev.unwrap();
+        if let BackendEvent::ApprovalNeeded {
+            call_id,
+            tool,
+            responder,
+            ..
+        } = ev
+        {
+            assert_eq!(call_id, "c1");
+            assert_eq!(tool, "execute");
+            responder.send(true).unwrap();
+            continue;
+        }
+        events.push(ev);
+    }
+
+    // Fresh thread: the ACP session id is persisted for resume.
+    assert!(events.iter().any(
+        |e| matches!(e, BackendEvent::SessionStarted { session_id } if session_id == "sess-1")
+    ));
+    let text: String = events
+        .iter()
+        .filter_map(|e| match e {
+            BackendEvent::TextDelta(t) => Some(t.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(text, "Hi there");
+    let thinking: String = events
+        .iter()
+        .filter_map(|e| match e {
+            BackendEvent::ThinkingDelta(t) => Some(t.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(thinking, "Hmm.");
+    assert!(events.iter().any(
+        |e| matches!(e, BackendEvent::ToolStarted { call_id, tool, .. } if call_id == "c1" && tool == "execute")
+    ));
+    assert!(events.iter().any(
+        |e| matches!(e, BackendEvent::ToolCompleted { call_id, ok: true, .. } if call_id == "c1")
+    ));
+    assert!(events.iter().any(|e| matches!(
+        e,
+        BackendEvent::Completed { usage } if usage.input_tokens == 7 && usage.output_tokens == 3
+    )));
+
+    // The child ran in ACP mode and got our config before the prompt.
+    let args = std::fs::read_to_string(format!("{stub}.args")).unwrap();
+    assert_eq!(args.trim(), "acp");
+    let mode = std::fs::read_to_string(format!("{stub}.mode")).unwrap();
+    assert!(mode.contains("\"configId\":\"mode\""), "{mode}");
+    assert!(mode.contains("\"value\":\"agent\""), "{mode}");
+    let model = std::fs::read_to_string(format!("{stub}.model")).unwrap();
+    assert!(model.contains("\"configId\":\"model\""), "{model}");
+    assert!(model.contains("\"value\":\"test-model\""), "{model}");
+    // Mode instructions ride in the first prompt of a fresh session.
+    let prompt = std::fs::read_to_string(format!("{stub}.prompt")).unwrap();
+    assert!(prompt.contains("mode-instructions"), "{prompt}");
+    assert!(prompt.contains("do the thing"), "{prompt}");
+
+    // Our approval reply picked the allow-once option.
+    let reply = std::fs::read_to_string(format!("{stub}.approval")).unwrap();
+    assert!(reply.contains("\"id\":100"), "{reply}");
+    assert!(reply.contains("allow-once"), "{reply}");
+}
+
+#[tokio::test]
+async fn cursor_adapter_auto_approves_in_yolo_and_maps_read_only_to_plan() {
+    let tmp = tempfile::tempdir().unwrap();
+    let stub = cursor_acp_stub(tmp.path());
     let backend = CursorBackend::new("cursor", Some(stub.clone()), None);
     let mut stream = backend
         .run_turn(turn(
@@ -156,41 +256,42 @@ EOF
         .await
         .unwrap();
 
-    let mut events = Vec::new();
+    // Yolo: the permission request is answered inside the adapter, so no
+    // ApprovalNeeded ever surfaces.
+    let mut saw_approval = false;
+    let mut completed = false;
     while let Some(ev) = stream.next().await {
-        events.push(ev.unwrap());
+        match ev.unwrap() {
+            BackendEvent::ApprovalNeeded { .. } => saw_approval = true,
+            BackendEvent::Completed { .. } => completed = true,
+            _ => {}
+        }
     }
+    assert!(!saw_approval);
+    assert!(completed);
+    let reply = std::fs::read_to_string(format!("{stub}.approval")).unwrap();
+    assert!(reply.contains("allow-once"), "{reply}");
 
-    // Fresh thread: create-chat ran and its id is persisted for resume.
-    assert!(events.iter().any(
-        |e| matches!(e, BackendEvent::SessionStarted { session_id } if session_id == "chat-123")
-    ));
-    let text: String = events
-        .iter()
-        .filter_map(|e| match e {
-            BackendEvent::TextDelta(t) => Some(t.as_str()),
-            _ => None,
-        })
-        .collect();
-    assert_eq!(text, "Hi there");
-    assert!(events.iter().any(
-        |e| matches!(e, BackendEvent::ToolStarted { call_id, tool, .. } if call_id == "c1" && tool == "read")
-    ));
-    assert!(events.iter().any(
-        |e| matches!(e, BackendEvent::ToolCompleted { call_id, ok: true, .. } if call_id == "c1")
-    ));
-    assert!(events.iter().any(|e| matches!(
-        e,
-        BackendEvent::Completed { usage } if usage.input_tokens == 7 && usage.output_tokens == 3
-    )));
-
-    let args = std::fs::read_to_string(format!("{stub}.args")).unwrap();
-    assert!(args.contains("--resume"), "{args}");
-    assert!(args.contains("chat-123"), "{args}");
-    assert!(args.contains("--force"), "{args}"); // yolo mapping
-    assert!(args.contains("stream-json"), "{args}");
-    // Headless runs abort on the workspace-trust prompt without this.
-    assert!(args.contains("--trust"), "{args}");
+    // Read-only turns run in cursor's plan mode (fresh process: the shared
+    // ACP child is per-backend, so use a new backend instance).
+    let tmp2 = tempfile::tempdir().unwrap();
+    let stub2 = cursor_acp_stub(tmp2.path());
+    let backend2 = CursorBackend::new("cursor", Some(stub2.clone()), None);
+    let mut stream2 = backend2
+        .run_turn(turn(
+            tmp2.path().to_path_buf(),
+            None,
+            BackendPermission::ReadOnly,
+        ))
+        .await
+        .unwrap();
+    while let Some(ev) = stream2.next().await {
+        if let BackendEvent::ApprovalNeeded { responder, .. } = ev.unwrap() {
+            let _ = responder.send(false);
+        }
+    }
+    let mode = std::fs::read_to_string(format!("{stub2}.mode")).unwrap();
+    assert!(mode.contains("\"value\":\"plan\""), "{mode}");
 }
 
 #[tokio::test]
