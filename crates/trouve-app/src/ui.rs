@@ -224,6 +224,10 @@ pub fn set_chat(ui: &Ui, rows: Vec<ChatRowData>, scroll_to_end: bool) {
         });
         if scroll_to_end {
             ui.invoke_scroll_chat_to_end();
+        } else {
+            // In-place re-renders (expand/collapse, raw toggles) must not
+            // yank the view back to the tail when row heights change.
+            ui.set_chat_follow(false);
         }
     });
 }
@@ -249,7 +253,11 @@ pub fn set_show_archived(ui: &Ui, show: bool) {
 
 /// Restore the chat scroll offset (viewport-y; 0 or negative).
 pub fn set_chat_scroll(ui: &Ui, y: f32) {
-    let _ = ui.upgrade_in_event_loop(move |ui| ui.set_chat_scroll(y));
+    let _ = ui.upgrade_in_event_loop(move |ui| {
+        // A restored bookmark is an explicit position; stop tail-following.
+        ui.set_chat_follow(false);
+        ui.set_chat_scroll(y);
+    });
 }
 
 /// How many threads have an agent turn in flight (quit-confirm dialog).

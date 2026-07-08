@@ -798,7 +798,15 @@ export component AppWindow inherits Window {
     in-out property <bool> file-preview: false;
     in property <[ChatRow]> file-preview-rows;
 
+    // While true, the chat stays pinned to its tail as content grows.
+    // scroll-chat-to-end alone isn't enough: it runs before the ListView
+    // re-measures freshly grown rows, so the bottom (activity spinner)
+    // would sit below the fold until the next event. The pin re-applies on
+    // every viewport-height change; renders that must not move the view
+    // (expand/collapse toggles, restored positions) clear it.
+    in-out property <bool> chat-follow: false;
     public function scroll-chat-to-end() {
+        root.chat-follow = true;
         chat-list.viewport-y = min(0px, chat-list.visible-height - chat-list.viewport-height);
     }
 
@@ -1186,6 +1194,14 @@ export component AppWindow inherits Window {
                     // Scrolling can move/recycle a hovered button without a
                     // hover-out; drop any tooltip it left behind.
                     changed viewport-y => { Tip.hide-all(); }
+                    // Keep the tail (activity spinner) on screen as rows
+                    // grow during streaming; see chat-follow.
+                    changed viewport-height => {
+                        if (root.chat-follow) {
+                            self.viewport-y = min(0px,
+                                self.visible-height - self.viewport-height);
+                        }
+                    }
 
                     for row[idx] in root.chat-rows: Rectangle {
                         // Markdown rows manage their own vertical rhythm via
