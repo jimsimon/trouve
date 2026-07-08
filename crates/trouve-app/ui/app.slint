@@ -80,6 +80,8 @@ export struct ChatRow {
     tool-adds: string,
     tool-dels: string,
     tool-diff: [DiffRow],
+    // Whether the diff carries file line numbers (shows the gutter).
+    tool-diff-numbered: bool,
     // 0 awaiting approval, 1 running, 2 ok, 3 error, 4 denied, 5 aborted
     tool-status: int,
     detail: string,
@@ -1640,6 +1642,27 @@ export component AppWindow inherits Window {
                                         : transparent;
                                     HorizontalLayout {
                                         spacing: 0;
+                                        // Old/new line-number gutter, when
+                                        // the diff resolved file positions.
+                                        if row.tool-diff-numbered: Text {
+                                            width: 34px;
+                                            text: dline.old-no;
+                                            color: #6e6e6e;
+                                            horizontal-alignment: right;
+                                            font-family: "monospace";
+                                            font-size: 12px;
+                                            vertical-alignment: center;
+                                        }
+                                        if row.tool-diff-numbered: Text {
+                                            width: 34px;
+                                            text: dline.new-no;
+                                            color: #6e6e6e;
+                                            horizontal-alignment: right;
+                                            font-family: "monospace";
+                                            font-size: 12px;
+                                            vertical-alignment: center;
+                                        }
+                                        if row.tool-diff-numbered: Rectangle { width: 6px; }
                                         Text {
                                             width: 16px;
                                             text: dline.kind == 3 ? "+"

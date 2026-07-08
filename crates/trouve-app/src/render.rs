@@ -44,11 +44,9 @@ pub struct ChatRowData {
     pub tool_line_to: i32,
     /// Edit-style tool cards: added/removed line counts for the header
     /// badge, and the computed line diff shown as the expanded body.
-    /// Line kinds follow `DiffRow`: 1 separator, 2 context, 3 add,
-    /// 4 delete.
     pub tool_adds: i32,
     pub tool_dels: i32,
-    pub diff: Vec<(i32, String)>,
+    pub diff: Vec<DiffLine>,
     pub detail: String,
     pub expanded: bool,
     pub turn_state: i32,
@@ -1042,13 +1040,34 @@ fn push_blocks(body: &mut Vec<(ChatRowData, Option<String>)>, content: &str) {
     }
 }
 
+/// One display line of an edit diff. Kinds follow `DiffRow`: 1 separator,
+/// 2 context, 3 add, 4 delete. Line numbers are 1-based file positions
+/// (0 = unknown, rendered as a blank gutter cell).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct DiffLine {
+    pub kind: i32,
+    pub old_no: i32,
+    pub new_no: i32,
+    pub text: String,
+}
+
+impl DiffLine {
+    fn new(kind: i32, old_no: i32, new_no: i32, text: impl Into<String>) -> Self {
+        Self {
+            kind,
+            old_no,
+            new_no,
+            text: text.into(),
+        }
+    }
+}
+
 /// A file-edit tool call folded for display: header verb + path and the
-/// body's line diff (kinds follow `DiffRow`: 1 separator, 2 context,
-/// 3 add, 4 delete).
+/// body's line diff.
 struct EditView {
     verb: &'static str,
     path: String,
-    lines: Vec<(i32, String)>,
+    lines: Vec<DiffLine>,
 }
 
 /// Recognize file-edit tools across backends and extract a line diff.
@@ -1079,6 +1098,7 @@ fn edit_view(tool: &str, args: &serde_json::Value) -> Option<EditView> {
         }
     }
 
+    // (old, new, 1-based start line — the engine's "_line" hint, 0 unknown).
     let old_new = |v: &serde_json::Value| {
         let get = |keys: &[&str]| {
             keys.iter()
@@ -1087,19 +1107,21 @@ fn edit_view(tool: &str, args: &serde_json::Value) -> Option<EditView> {
         };
         let old = get(&["old_string", "oldText", "old_text", "old_str"]);
         let new = get(&["new_string", "newText", "new_text", "new_str"]);
+        let start = v.get("_line").and_then(serde_json::Value::as_i64).unwrap_or(0) as i32;
         match (old, new) {
             (None, None) => None,
-            (old, new) => Some((old.unwrap_or_default(), new.unwrap_or_default())),
+            (old, new) => Some((old.unwrap_or_default(), new.unwrap_or_default(), start)),
         }
     };
     // MultiEdit: several old/new pairs against one file, separated below.
-    let pairs: Vec<(String, String)> = match args.get("edits").and_then(|v| v.as_array()) {
+    let pairs: Vec<(String, String, i32)> = match args.get("edits").and_then(|v| v.as_array()) {
         Some(edits) => edits.iter().filter_map(old_new).collect(),
         None => old_new(args)
             .or_else(|| {
-                // Write-style: the whole new content, no old text.
+                // Write-style: the whole new content, no old text; a fresh
+                // file always numbers from 1.
                 str_arg(&["content", "contents", "file_text", "fileText"])
-                    .map(|c| (String::new(), c.to_string()))
+                    .map(|c| (String::new(), c.to_string(), 1))
             })
             .into_iter()
             .collect(),
@@ -1108,25 +1130,52 @@ fn edit_view(tool: &str, args: &serde_json::Value) -> Option<EditView> {
         return None;
     }
     let mut lines = Vec::new();
-    for (i, (old, new)) in pairs.iter().enumerate() {
+    for (i, (old, new, start)) in pairs.iter().enumerate() {
         if i > 0 {
-            lines.push((1, "···".to_string()));
+            lines.push(DiffLine::new(1, 0, 0, "···"));
         }
-        lines.extend(line_diff(old, new));
+        lines.extend(line_diff(old, new, *start));
     }
     Some(EditView { verb, path, lines })
 }
 
 /// Diff two text snippets line-by-line (LCS): unchanged lines are context,
 /// removals then insertions inside changed blocks. Oversized inputs skip
-/// the LCS and show plain delete-all/add-all.
-fn line_diff(old: &str, new: &str) -> Vec<(i32, String)> {
+/// the LCS and show plain delete-all/add-all. `start` is the 1-based file
+/// line both sides begin at (0 = unknown: gutters stay blank).
+fn line_diff(old: &str, new: &str, start: i32) -> Vec<DiffLine> {
     let a: Vec<&str> = old.lines().collect();
     let b: Vec<&str> = new.lines().collect();
+    // Line counters tick only when the position is known (start > 0).
+    struct Nums {
+        old_no: i32,
+        new_no: i32,
+        tick: i32,
+    }
+    impl Nums {
+        fn del(&mut self, out: &mut Vec<DiffLine>, l: &str) {
+            out.push(DiffLine::new(4, self.old_no, 0, l));
+            self.old_no += self.tick;
+        }
+        fn add(&mut self, out: &mut Vec<DiffLine>, l: &str) {
+            out.push(DiffLine::new(3, 0, self.new_no, l));
+            self.new_no += self.tick;
+        }
+        fn ctx(&mut self, out: &mut Vec<DiffLine>, l: &str) {
+            out.push(DiffLine::new(2, self.old_no, self.new_no, l));
+            self.old_no += self.tick;
+            self.new_no += self.tick;
+        }
+    }
+    let mut n = Nums {
+        old_no: start,
+        new_no: start,
+        tick: (start > 0) as i32,
+    };
     let mut out = Vec::new();
     if a.len() * b.len() > 1_000_000 {
-        out.extend(a.iter().map(|l| (4, l.to_string())));
-        out.extend(b.iter().map(|l| (3, l.to_string())));
+        a.iter().for_each(|l| n.del(&mut out, l));
+        b.iter().for_each(|l| n.add(&mut out, l));
         return out;
     }
     // dp[i][j] = LCS length of a[i..] and b[j..].
@@ -1143,28 +1192,30 @@ fn line_diff(old: &str, new: &str) -> Vec<(i32, String)> {
     let (mut i, mut j) = (0, 0);
     while i < a.len() && j < b.len() {
         if a[i] == b[j] {
-            out.push((2, a[i].to_string()));
+            n.ctx(&mut out, a[i]);
             i += 1;
             j += 1;
         } else if dp[i + 1][j] >= dp[i][j + 1] {
-            out.push((4, a[i].to_string()));
+            n.del(&mut out, a[i]);
             i += 1;
         } else {
-            out.push((3, b[j].to_string()));
+            n.add(&mut out, b[j]);
             j += 1;
         }
     }
-    out.extend(a[i..].iter().map(|l| (4, l.to_string())));
-    out.extend(b[j..].iter().map(|l| (3, l.to_string())));
+    a[i..].iter().for_each(|l| n.del(&mut out, l));
+    b[j..].iter().for_each(|l| n.add(&mut out, l));
     out
 }
 
 /// Map unified-diff/patch text to display lines: +/- prefixes become
 /// add/delete rows, hunk markers become separators, file metadata is
-/// dropped. Returns empty when nothing looks like diff content.
-fn patch_lines(patch: &str) -> Vec<(i32, String)> {
+/// dropped. `@@ -a,b +c,d @@` headers seed the gutter line numbers.
+/// Returns empty when nothing looks like diff content.
+fn patch_lines(patch: &str) -> Vec<DiffLine> {
     let mut out = Vec::new();
     let mut saw_change = false;
+    let (mut old_no, mut new_no) = (0i32, 0i32);
     for line in patch.lines() {
         if line.starts_with("+++")
             || line.starts_with("---")
@@ -1174,15 +1225,21 @@ fn patch_lines(patch: &str) -> Vec<(i32, String)> {
             continue;
         }
         if line.starts_with("@@") || line.starts_with("*** ") {
-            out.push((1, line.to_string()));
+            (old_no, new_no) = hunk_starts(line).unwrap_or((0, 0));
+            out.push(DiffLine::new(1, 0, 0, line));
         } else if let Some(rest) = line.strip_prefix('+') {
-            out.push((3, rest.to_string()));
+            out.push(DiffLine::new(3, 0, new_no, rest));
+            new_no += (new_no > 0) as i32;
             saw_change = true;
         } else if let Some(rest) = line.strip_prefix('-') {
-            out.push((4, rest.to_string()));
+            out.push(DiffLine::new(4, old_no, 0, rest));
+            old_no += (old_no > 0) as i32;
             saw_change = true;
         } else {
-            out.push((2, line.strip_prefix(' ').unwrap_or(line).to_string()));
+            let text = line.strip_prefix(' ').unwrap_or(line);
+            out.push(DiffLine::new(2, old_no, new_no, text));
+            old_no += (old_no > 0) as i32;
+            new_no += (new_no > 0) as i32;
         }
     }
     if saw_change {
@@ -1190,6 +1247,22 @@ fn patch_lines(patch: &str) -> Vec<(i32, String)> {
     } else {
         Vec::new()
     }
+}
+
+/// Parse the old/new start lines out of a `@@ -a,b +c,d @@` hunk header.
+fn hunk_starts(line: &str) -> Option<(i32, i32)> {
+    let rest = line.strip_prefix("@@")?.trim_start();
+    let num = |s: &str, sigil: char| -> Option<i32> {
+        s.strip_prefix(sigil)?
+            .split([',', ' '])
+            .next()?
+            .parse()
+            .ok()
+    };
+    let mut parts = rest.split_whitespace();
+    let old = num(parts.next()?, '-')?;
+    let new = num(parts.next()?, '+')?;
+    (old > 0 && new > 0).then_some((old, new))
 }
 
 /// Build the row for one tool call card (used standalone and inside
@@ -1225,12 +1298,12 @@ fn tool_row(
         // Cap the rendered diff: one chat row hosts all these lines
         // un-virtualized, so a full-file rewrite would balloon the row.
         let mut lines = edit.lines;
-        let adds = lines.iter().filter(|(k, _)| *k == 3).count() as i32;
-        let dels = lines.iter().filter(|(k, _)| *k == 4).count() as i32;
+        let adds = lines.iter().filter(|l| l.kind == 3).count() as i32;
+        let dels = lines.iter().filter(|l| l.kind == 4).count() as i32;
         if lines.len() > 300 {
             let more = lines.len() - 300;
             lines.truncate(300);
-            lines.push((1, format!("… {more} more lines")));
+            lines.push(DiffLine::new(1, 0, 0, format!("… {more} more lines")));
         }
         return ChatRowData {
             kind: 2,
@@ -2274,7 +2347,9 @@ mod tests {
 
     #[test]
     fn edit_tools_show_a_line_diff_with_counts() {
-        // Claude Edit: old/new snippets diff line-by-line.
+        let dl = DiffLine::new;
+        // Claude Edit: old/new snippets diff line-by-line. No "_line" hint:
+        // the gutter stays blank (all zeros).
         let args = serde_json::json!({
             "file_path": "/w/src/lib.rs",
             "old_string": "fn a() {}\nfn b() {}",
@@ -2288,40 +2363,77 @@ mod tests {
         assert_eq!(
             row.diff,
             vec![
-                (2, "fn a() {}".to_string()),
-                (4, "fn b() {}".to_string()),
-                (3, "fn b2() {}".to_string()),
-                (3, "fn c() {}".to_string()),
+                dl(2, 0, 0, "fn a() {}"),
+                dl(4, 0, 0, "fn b() {}"),
+                dl(3, 0, 0, "fn b2() {}"),
+                dl(3, 0, 0, "fn c() {}"),
             ]
         );
 
-        // Write: no old text, everything is an addition.
+        // With the engine's "_line" hint both gutters number from the
+        // edit's position in the file.
+        let args = serde_json::json!({
+            "file_path": "/w/src/lib.rs",
+            "old_string": "fn a() {}\nfn b() {}",
+            "new_string": "fn a() {}\nfn b2() {}\nfn c() {}",
+            "_line": 40,
+        });
+        let row = tool_row("c1", "Edit", &args, ToolCallStatus::Ok, &None, &HashSet::new());
+        assert_eq!(
+            row.diff,
+            vec![
+                dl(2, 40, 40, "fn a() {}"),
+                dl(4, 41, 0, "fn b() {}"),
+                dl(3, 0, 41, "fn b2() {}"),
+                dl(3, 0, 42, "fn c() {}"),
+            ]
+        );
+
+        // Write: no old text, everything is an addition numbered from 1.
         let args = serde_json::json!({"path": "new.txt", "content": "one\ntwo"});
         let row = tool_row("c2", "write_file", &args, ToolCallStatus::Ok, &None, &HashSet::new());
         assert_eq!(row.tool_name, "Write");
         assert_eq!((row.tool_adds, row.tool_dels), (2, 0));
-        assert!(row.diff.iter().all(|(k, _)| *k == 3));
+        assert_eq!(row.diff, vec![dl(3, 0, 1, "one"), dl(3, 0, 2, "two")]);
 
-        // MultiEdit: pairs separated by a divider row.
+        // MultiEdit: pairs separated by a divider row, each with its own
+        // per-edit line hint.
         let args = serde_json::json!({
             "file_path": "/w/a.rs",
             "edits": [
-                {"old_string": "x", "new_string": "y"},
+                {"old_string": "x", "new_string": "y", "_line": 3},
                 {"old_string": "p", "new_string": "q"},
             ],
         });
         let row = tool_row("c3", "MultiEdit", &args, ToolCallStatus::Ok, &None, &HashSet::new());
         assert_eq!((row.tool_adds, row.tool_dels), (2, 2));
-        assert!(row.diff.contains(&(1, "···".to_string())));
+        assert_eq!(
+            row.diff,
+            vec![
+                dl(4, 3, 0, "x"),
+                dl(3, 0, 3, "y"),
+                dl(1, 0, 0, "···"),
+                dl(4, 0, 0, "p"),
+                dl(3, 0, 0, "q"),
+            ]
+        );
 
-        // A unified-diff payload renders its lines directly.
+        // A unified-diff payload renders its lines directly, with numbers
+        // seeded from the hunk header.
         let args = serde_json::json!({
             "path": "b.rs",
-            "diff": "@@ -1,2 +1,2 @@\n context\n-old\n+new",
+            "diff": "@@ -10,2 +10,2 @@\n context\n-old\n+new",
         });
         let row = tool_row("c4", "edit", &args, ToolCallStatus::Ok, &None, &HashSet::new());
         assert_eq!((row.tool_adds, row.tool_dels), (1, 1));
-        assert_eq!(row.diff[0], (1, "@@ -1,2 +1,2 @@".to_string()));
-        assert_eq!(row.diff[1], (2, "context".to_string()));
+        assert_eq!(
+            row.diff,
+            vec![
+                dl(1, 0, 0, "@@ -10,2 +10,2 @@"),
+                dl(2, 10, 10, "context"),
+                dl(4, 11, 0, "old"),
+                dl(3, 0, 11, "new"),
+            ]
+        );
     }
 }

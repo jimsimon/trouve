@@ -2094,9 +2094,25 @@ impl Engine {
             }
         }
         open.retain(|(id, _)| !gated.contains(id));
+        // Stored args may carry injected "_line" display hints the vendor's
+        // approval request doesn't have; ignore them when matching.
+        let strip = |v: &serde_json::Value| {
+            let mut v = v.clone();
+            if let Some(map) = v.as_object_mut() {
+                map.remove("_line");
+                if let Some(edits) = map.get_mut("edits").and_then(|e| e.as_array_mut()) {
+                    for e in edits {
+                        if let Some(m) = e.as_object_mut() {
+                            m.remove("_line");
+                        }
+                    }
+                }
+            }
+            v
+        };
         open.iter()
             .rev()
-            .find(|(_, a)| a == args)
+            .find(|(_, a)| strip(a) == *args)
             .or(open.last())
             .map(|(id, _)| id.clone())
     }
@@ -2238,7 +2254,7 @@ impl Engine {
                 BackendEvent::ToolStarted {
                     call_id,
                     tool,
-                    args,
+                    mut args,
                 } => {
                     if !segment.is_empty() {
                         self.store.append_event(
@@ -2249,6 +2265,10 @@ impl Engine {
                             },
                         )?;
                     }
+                    // Snippet edits carry no position; the worktree file is
+                    // still un-edited at announcement time, so resolve line
+                    // hints now for the UI's diff gutter.
+                    annotate_edit_lines(Path::new(&session.worktree_path), &mut args);
                     self.store.append_event(
                         scope.clone(),
                         Event::ToolRequested {
@@ -2689,6 +2709,65 @@ impl Engine {
     }
 }
 
+/// Annotate snippet-edit tool args (old/new string pairs, as sent by
+/// Claude's Edit/MultiEdit and cursor's ACP edit calls) with the 1-based
+/// line where each edit applies, resolved by locating the old text in the
+/// pre-edit worktree file. Vendor agents apply the edit themselves right
+/// after announcing it, so this is the one moment the position is knowable.
+/// The hint rides in the args as `"_line"` — display metadata for the
+/// client's diff gutter, never model input. Files that can't be read or
+/// snippets that don't match (or match ambiguously) just skip the hint.
+fn annotate_edit_lines(worktree: &Path, args: &mut serde_json::Value) {
+    let str_of = |v: &serde_json::Value, keys: &[&str]| {
+        keys.iter()
+            .find_map(|k| v.get(*k).and_then(serde_json::Value::as_str))
+            .map(str::to_string)
+    };
+    let Some(path) = str_of(args, &["file_path", "path", "abs_path", "target_file", "filePath"])
+    else {
+        return;
+    };
+    let full = if Path::new(&path).is_absolute() {
+        PathBuf::from(&path)
+    } else {
+        worktree.join(&path)
+    };
+    // Only bother when there is at least one old/new snippet to place.
+    let has_snippets = args.get("edits").map(|e| e.is_array()).unwrap_or(false)
+        || ["old_string", "oldText", "old_text", "old_str"]
+            .iter()
+            .any(|k| args.get(*k).is_some());
+    if !has_snippets {
+        return;
+    }
+    let Ok(mut content) = std::fs::read_to_string(&full) else {
+        return;
+    };
+
+    // Locate one snippet in `content` (must be unambiguous), then apply the
+    // edit so later snippets in a MultiEdit see their predecessors' effect.
+    let mut place = |edit: &mut serde_json::Value| {
+        let old = str_of(edit, &["old_string", "oldText", "old_text", "old_str"]);
+        let new = str_of(edit, &["new_string", "newText", "new_text", "new_str"]);
+        let (Some(old), Some(new)) = (old, new) else {
+            return;
+        };
+        if old.is_empty() || content.matches(old.as_str()).nth(1).is_some() {
+            return;
+        }
+        let Some(pos) = content.find(old.as_str()) else {
+            return;
+        };
+        let line = 1 + content[..pos].matches('\n').count();
+        edit["_line"] = serde_json::json!(line);
+        content = format!("{}{}{}", &content[..pos], new, &content[pos + old.len()..]);
+    };
+    match args.get_mut("edits").and_then(|v| v.as_array_mut()) {
+        Some(edits) => edits.iter_mut().for_each(&mut place),
+        None => place(args),
+    }
+}
+
 /// Tool spec for the engine-served `ask_question` tool (native provider
 /// turns and the MCP bridge expose the same schema).
 pub fn ask_question_spec() -> ToolSpec {
@@ -2918,5 +2997,62 @@ fn build_provider(
             Ok(Arc::new(provider))
         }
         other => anyhow::bail!("unknown provider kind {other:?}"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn annotate_edit_lines_resolves_snippet_positions() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("a.rs"), "one\ntwo\nthree\nfour\n").unwrap();
+
+        // Single edit: hint points at the snippet's first line.
+        let mut args = serde_json::json!({
+            "file_path": "a.rs",
+            "old_string": "two\nthree",
+            "new_string": "TWO",
+        });
+        annotate_edit_lines(tmp.path(), &mut args);
+        assert_eq!(args["_line"], 2);
+
+        // MultiEdit: each edit is placed against the file with earlier
+        // edits already applied ("four" moves up when lines collapse).
+        let mut args = serde_json::json!({
+            "file_path": "a.rs",
+            "edits": [
+                {"old_string": "two\nthree", "new_string": "TWO"},
+                {"old_string": "four", "new_string": "FOUR"},
+            ],
+        });
+        annotate_edit_lines(tmp.path(), &mut args);
+        assert_eq!(args["edits"][0]["_line"], 2);
+        assert_eq!(args["edits"][1]["_line"], 3);
+
+        // Ambiguous or missing snippets get no hint; absolute paths and
+        // unreadable files are handled without touching the args.
+        std::fs::write(tmp.path().join("b.rs"), "dup\ndup\n").unwrap();
+        let mut args = serde_json::json!({
+            "file_path": tmp.path().join("b.rs").to_str().unwrap(),
+            "old_string": "dup",
+            "new_string": "d",
+        });
+        annotate_edit_lines(tmp.path(), &mut args);
+        assert!(args.get("_line").is_none());
+        let mut args = serde_json::json!({
+            "file_path": "missing.rs",
+            "old_string": "x",
+            "new_string": "y",
+        });
+        annotate_edit_lines(tmp.path(), &mut args);
+        assert!(args.get("_line").is_none());
+
+        // Write-style args (no snippets) are left alone entirely.
+        let mut args = serde_json::json!({"path": "a.rs", "content": "all new"});
+        let before = args.clone();
+        annotate_edit_lines(tmp.path(), &mut args);
+        assert_eq!(args, before);
     }
 }

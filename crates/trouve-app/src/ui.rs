@@ -162,13 +162,26 @@ fn to_chat_row(r: &ChatRowData) -> ChatRow {
         tool_diff: ModelRc::new(VecModel::from(
             r.diff
                 .iter()
-                .map(|(kind, text)| DiffRow {
-                    kind: *kind,
-                    text: SharedString::from(text.as_str()),
+                .map(|l| DiffRow {
+                    kind: l.kind,
+                    old_no: if l.old_no > 0 {
+                        l.old_no.to_string().into()
+                    } else {
+                        SharedString::new()
+                    },
+                    new_no: if l.new_no > 0 {
+                        l.new_no.to_string().into()
+                    } else {
+                        SharedString::new()
+                    },
+                    text: SharedString::from(l.text.as_str()),
                     ..Default::default()
                 })
                 .collect::<Vec<_>>(),
         )),
+        // Show gutter columns only when at least one line resolved to a
+        // real file position.
+        tool_diff_numbered: r.diff.iter().any(|l| l.old_no > 0 || l.new_no > 0),
         detail: SharedString::from(r.detail.as_str()),
         expanded: r.expanded,
         turn_state: r.turn_state,
