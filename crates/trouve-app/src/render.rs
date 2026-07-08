@@ -221,11 +221,12 @@ fn tool_label(tool: &str, args: &serde_json::Value) -> String {
         return format!("{} ({})", tool_display_name(tool), title_arg(cmd));
     }
     let display = tool_display_name(tool);
-    // "title" is the human label ACP tool calls carry (e.g. "`ls`").
+    // "title" is the human label ACP tool calls carry (e.g. "`ls`"); when
+    // it just repeats the tool name (cursor's createPlan), skip it.
     let query = ["query", "pattern", "url", "path", "title"]
         .iter()
         .find_map(|k| args.get(k).and_then(|v| v.as_str()))
-        .filter(|q| !q.trim().is_empty());
+        .filter(|q| !q.trim().is_empty() && *q != display);
     match query {
         Some(q) => format!("{display} {}", title_arg(q)),
         None => display,

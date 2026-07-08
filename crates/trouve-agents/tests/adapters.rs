@@ -34,6 +34,26 @@ fn turn(worktree: PathBuf, session: Option<&str>, permission: BackendPermission)
     }
 }
 
+/// Start a turn, retrying the classic parallel-test ETXTBSY race: a fork
+/// in a sibling test can briefly hold this stub's write fd open when we
+/// exec it.
+async fn start_turn<B: AgentBackend>(
+    backend: &B,
+    make_turn: impl Fn() -> BackendTurn,
+) -> trouve_agents::BackendEventStream {
+    for _ in 0..50 {
+        match backend.run_turn(make_turn()).await {
+            Err(trouve_agents::BackendError::Io(e))
+                if e.raw_os_error() == Some(26 /* ETXTBSY */) =>
+            {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+            other => return other.unwrap(),
+        }
+    }
+    panic!("spawn kept hitting ETXTBSY");
+}
+
 #[tokio::test]
 async fn claude_adapter_maps_stream_json() {
     let tmp = tempfile::tempdir().unwrap();
@@ -54,14 +74,14 @@ EOF
 "#,
     );
     let backend = ClaudeBackend::new("claude-code", Some(stub.clone()));
-    let mut stream = backend
-        .run_turn(turn(
+    let mut stream = start_turn(&backend, || {
+        turn(
             tmp.path().to_path_buf(),
             Some("old-sess"),
             BackendPermission::ReadOnly,
-        ))
-        .await
-        .unwrap();
+        )
+    })
+    .await;
 
     let mut events = Vec::new();
     while let Some(ev) = stream.next().await {
@@ -135,7 +155,7 @@ fn cursor_acp_stub(dir: &Path) -> String {
     write_stub(
         dir,
         "cursor-agent",
-        r#"#!/bin/bash
+        r##"#!/bin/bash
 echo "$1" > "$0.args"
 read line # initialize
 echo '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":1}}'
@@ -157,9 +177,14 @@ echo '{"jsonrpc":"2.0","id":100,"method":"session/request_permission","params":{
 read approval
 echo "$approval" > "$0.approval"
 echo '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"sess-1","update":{"sessionUpdate":"tool_call_update","toolCallId":"c1","status":"completed","rawOutput":{"exitCode":0,"stdout":"a.txt\n"}}}}'
+echo '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"sess-1","update":{"sessionUpdate":"tool_call","toolCallId":"c2","title":"Create Plan","kind":"other","status":"pending","rawInput":{"_toolName":"createPlan"}}}}'
+echo '{"jsonrpc":"2.0","id":101,"method":"cursor/create_plan","params":{"toolCallId":"c2","name":"Plan","plan":"# The plan"}}'
+read planack
+echo "$planack" > "$0.planack"
+echo '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"sess-1","update":{"sessionUpdate":"tool_call_update","toolCallId":"c2","status":"completed"}}}'
 echo '{"jsonrpc":"2.0","id":5,"result":{"stopReason":"end_turn","usage":{"inputTokens":7,"outputTokens":3,"totalTokens":10}}}'
 cat > /dev/null
-"#,
+"##,
     )
 }
 
@@ -168,10 +193,10 @@ async fn cursor_adapter_speaks_acp_and_bridges_approvals() {
     let tmp = tempfile::tempdir().unwrap();
     let stub = cursor_acp_stub(tmp.path());
     let backend = CursorBackend::new("cursor", Some(stub.clone()), None);
-    let mut stream = backend
-        .run_turn(turn(tmp.path().to_path_buf(), None, BackendPermission::Ask))
-        .await
-        .unwrap();
+    let mut stream = start_turn(&backend, || {
+        turn(tmp.path().to_path_buf(), None, BackendPermission::Ask)
+    })
+    .await;
 
     let mut events = Vec::new();
     while let Some(ev) = stream.next().await {
@@ -217,6 +242,20 @@ async fn cursor_adapter_speaks_acp_and_bridges_approvals() {
     assert!(events.iter().any(
         |e| matches!(e, BackendEvent::ToolCompleted { call_id, ok: true, .. } if call_id == "c1")
     ));
+    // Plan mode: catch-all "other" calls surface their real tool name, the
+    // cursor/create_plan request is acked (else the turn hangs), and its
+    // stashed content becomes the plan tool's result.
+    assert!(events.iter().any(
+        |e| matches!(e, BackendEvent::ToolStarted { call_id, tool, .. } if call_id == "c2" && tool == "createPlan")
+    ));
+    assert!(events.iter().any(|e| matches!(
+        e,
+        BackendEvent::ToolCompleted { call_id, ok: true, result }
+            if call_id == "c2" && result["plan"] == "# The plan"
+    )));
+    let planack = std::fs::read_to_string(format!("{stub}.planack")).unwrap();
+    assert!(planack.contains("\"id\":101"), "{planack}");
+    assert!(planack.contains("\"result\":{}"), "{planack}");
     assert!(events.iter().any(|e| matches!(
         e,
         BackendEvent::Completed { usage } if usage.input_tokens == 7 && usage.output_tokens == 3
@@ -247,14 +286,10 @@ async fn cursor_adapter_auto_approves_in_yolo_and_maps_read_only_to_plan() {
     let tmp = tempfile::tempdir().unwrap();
     let stub = cursor_acp_stub(tmp.path());
     let backend = CursorBackend::new("cursor", Some(stub.clone()), None);
-    let mut stream = backend
-        .run_turn(turn(
-            tmp.path().to_path_buf(),
-            None,
-            BackendPermission::Yolo,
-        ))
-        .await
-        .unwrap();
+    let mut stream = start_turn(&backend, || {
+        turn(tmp.path().to_path_buf(), None, BackendPermission::Yolo)
+    })
+    .await;
 
     // Yolo: the permission request is answered inside the adapter, so no
     // ApprovalNeeded ever surfaces.
@@ -277,14 +312,10 @@ async fn cursor_adapter_auto_approves_in_yolo_and_maps_read_only_to_plan() {
     let tmp2 = tempfile::tempdir().unwrap();
     let stub2 = cursor_acp_stub(tmp2.path());
     let backend2 = CursorBackend::new("cursor", Some(stub2.clone()), None);
-    let mut stream2 = backend2
-        .run_turn(turn(
-            tmp2.path().to_path_buf(),
-            None,
-            BackendPermission::ReadOnly,
-        ))
-        .await
-        .unwrap();
+    let mut stream2 = start_turn(&backend2, || {
+        turn(tmp2.path().to_path_buf(), None, BackendPermission::ReadOnly)
+    })
+    .await;
     while let Some(ev) = stream2.next().await {
         if let BackendEvent::ApprovalNeeded { responder, .. } = ev.unwrap() {
             let _ = responder.send(false);
@@ -324,10 +355,10 @@ cat > /dev/null
 "#,
     );
     let backend = CodexBackend::new("codex", Some(stub.clone()));
-    let mut stream = backend
-        .run_turn(turn(tmp.path().to_path_buf(), None, BackendPermission::Ask))
-        .await
-        .unwrap();
+    let mut stream = start_turn(&backend, || {
+        turn(tmp.path().to_path_buf(), None, BackendPermission::Ask)
+    })
+    .await;
 
     let mut saw_text = false;
     let mut saw_tool_started = false;
@@ -385,18 +416,21 @@ EOF
 "#,
     );
     let backend = ClaudeBackend::new("claude-code", Some(stub.clone()));
-    let mut t = turn(tmp.path().to_path_buf(), None, BackendPermission::Ask);
-    t.mcp_bridge = Some(trouve_agents::McpBridgeConfig {
-        command: "trouve".into(),
-        args: vec!["mcp-bridge".into()],
-        env: vec![
-            ("TROUVE_SERVER".into(), "http://127.0.0.1:1".into()),
-            ("TROUVE_THREAD_ID".into(), "th_1".into()),
-        ],
-        bridge_tools: true,
-        disallowed_tools: vec!["Bash".into(), "Edit".into(), "Write".into()],
-    });
-    let mut stream = backend.run_turn(t).await.unwrap();
+    let mut stream = start_turn(&backend, || {
+        let mut t = turn(tmp.path().to_path_buf(), None, BackendPermission::Ask);
+        t.mcp_bridge = Some(trouve_agents::McpBridgeConfig {
+            command: "trouve".into(),
+            args: vec!["mcp-bridge".into()],
+            env: vec![
+                ("TROUVE_SERVER".into(), "http://127.0.0.1:1".into()),
+                ("TROUVE_THREAD_ID".into(), "th_1".into()),
+            ],
+            bridge_tools: true,
+            disallowed_tools: vec!["Bash".into(), "Edit".into(), "Write".into()],
+        });
+        t
+    })
+    .await;
     while let Some(ev) = stream.next().await {
         ev.unwrap();
     }
@@ -438,19 +472,22 @@ EOF
 "#,
     );
     let backend = ClaudeBackend::new("claude-code", Some(stub.clone()));
-    let mut t = turn(tmp.path().to_path_buf(), None, BackendPermission::Ask);
-    t.thread_id = "th_2".into();
-    t.mcp_bridge = Some(trouve_agents::McpBridgeConfig {
-        command: "trouve".into(),
-        args: vec!["mcp-bridge".into()],
-        env: vec![
-            ("TROUVE_SERVER".into(), "http://127.0.0.1:1".into()),
-            ("TROUVE_THREAD_ID".into(), "th_2".into()),
-        ],
-        bridge_tools: false,
-        disallowed_tools: Vec::new(),
-    });
-    let mut stream = backend.run_turn(t).await.unwrap();
+    let mut stream = start_turn(&backend, || {
+        let mut t = turn(tmp.path().to_path_buf(), None, BackendPermission::Ask);
+        t.thread_id = "th_2".into();
+        t.mcp_bridge = Some(trouve_agents::McpBridgeConfig {
+            command: "trouve".into(),
+            args: vec!["mcp-bridge".into()],
+            env: vec![
+                ("TROUVE_SERVER".into(), "http://127.0.0.1:1".into()),
+                ("TROUVE_THREAD_ID".into(), "th_2".into()),
+            ],
+            bridge_tools: false,
+            disallowed_tools: Vec::new(),
+        });
+        t
+    })
+    .await;
     while let Some(ev) = stream.next().await {
         ev.unwrap();
     }

@@ -375,7 +375,17 @@ async fn handle_msg(
             if method != "session/update" {
                 return Ok(());
             }
-            for ev in map_update(&params["update"]) {
+            for mut ev in map_update(&params["update"]) {
+                // Plan tool calls complete without a rawOutput; the plan
+                // itself arrived via cursor/create_plan and was stashed by
+                // the reader — attach it as the tool's result.
+                if let BackendEvent::ToolCompleted { call_id, result, .. } = &mut ev {
+                    if result.is_null() {
+                        if let Some(plan) = server.plans.lock().await.remove(call_id) {
+                            *result = plan;
+                        }
+                    }
+                }
                 tx.send(Ok(ev)).await.map_err(|_| ())?;
             }
             Ok(())
@@ -454,8 +464,15 @@ fn map_update(update: &Value) -> Vec<BackendEvent> {
         Some("tool_call") => {
             let call_id = update["toolCallId"].as_str().unwrap_or("").to_string();
             // "kind" is the tool family (read/execute/edit/…); the human
-            // title (e.g. "`git status`") rides along in the args.
-            let tool = update["kind"].as_str().unwrap_or("tool").to_string();
+            // title (e.g. "`git status`") rides along in the args. Catch-all
+            // "other" calls carry their real name in rawInput._toolName
+            // (e.g. createPlan).
+            let kind = update["kind"].as_str().unwrap_or("tool");
+            let tool = match kind {
+                "other" => update["rawInput"]["_toolName"].as_str().unwrap_or(kind),
+                k => k,
+            }
+            .to_string();
             let mut args = update["rawInput"].clone();
             if !args.is_object() {
                 args = json!({});
@@ -621,7 +638,7 @@ enum ServerMsg {
 type Pending = Arc<Mutex<HashMap<i64, oneshot::Sender<Result<Value, String>>>>>;
 
 struct AcpServer {
-    stdin: Mutex<ChildStdin>,
+    stdin: Arc<Mutex<ChildStdin>>,
     next_id: AtomicI64,
     pending: Pending,
     routes: Arc<Mutex<HashMap<String, mpsc::Sender<ServerMsg>>>>,
@@ -631,6 +648,10 @@ struct AcpServer {
     /// Serializes model/mode config + prompt start: cursor applies model
     /// selection process-wide, so concurrent turns must not interleave.
     config_lock: Mutex<()>,
+    /// Plan-mode plans by tool call id: `cursor/create_plan` arrives as a
+    /// session-less request (answered by the reader); the stashed content
+    /// becomes the plan tool's result when its completion update lands.
+    plans: Arc<Mutex<HashMap<String, Value>>>,
     /// Held so the child (kill_on_drop) lives as long as the server handle.
     _child: Child,
     closed: Arc<std::sync::atomic::AtomicBool>,
@@ -657,12 +678,13 @@ impl AcpServer {
         let stdout = child.stdout.take().expect("stdout piped");
 
         let server = Self {
-            stdin: Mutex::new(stdin),
+            stdin: Arc::new(Mutex::new(stdin)),
             next_id: AtomicI64::new(1),
             pending: Arc::new(Mutex::new(HashMap::new())),
             routes: Arc::new(Mutex::new(HashMap::new())),
             sessions: Mutex::new(HashSet::new()),
             config_lock: Mutex::new(()),
+            plans: Arc::new(Mutex::new(HashMap::new())),
             _child: child,
             closed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         };
@@ -678,6 +700,8 @@ impl AcpServer {
         let routes = self.routes.clone();
         let closed = self.closed.clone();
         let pending = self.pending.clone();
+        let plans = self.plans.clone();
+        let stdin = self.stdin.clone();
         tokio::spawn(async move {
             let mut lines = BufReader::new(stdout).lines();
             while let Ok(Some(line)) = lines.next_line().await {
@@ -707,6 +731,27 @@ impl AcpServer {
                 } else if has_method {
                     let method = msg["method"].as_str().unwrap_or("").to_string();
                     let params = msg["params"].clone();
+                    // Plan mode: the agent submits the finished plan as a
+                    // session-less request and blocks the turn on the
+                    // response. Ack it here and stash the content — it
+                    // becomes the plan tool call's result when that call's
+                    // completion update arrives.
+                    if method == "cursor/create_plan" && has_id {
+                        if let Some(call_id) = params["toolCallId"].as_str() {
+                            plans
+                                .lock()
+                                .await
+                                .insert(call_id.to_string(), params.clone());
+                        }
+                        let reply =
+                            json!({ "jsonrpc": "2.0", "id": msg["id"], "result": {} });
+                        let mut line = serde_json::to_vec(&reply).expect("serializable");
+                        line.push(b'\n');
+                        let mut stdin = stdin.lock().await;
+                        let _ = stdin.write_all(&line).await;
+                        let _ = stdin.flush().await;
+                        continue;
+                    }
                     let session_id = params["sessionId"].as_str().unwrap_or("").to_string();
                     let routed = {
                         let routes = routes.lock().await;
@@ -723,6 +768,20 @@ impl AcpServer {
                             ServerMsg::Notification { method, params }
                         };
                         let _ = tx.send(m).await;
+                    } else if has_id {
+                        // A request nobody can answer must still get a
+                        // response — the agent blocks its turn on it.
+                        tracing::warn!("cursor acp: refusing unroutable request {method}");
+                        let reply = json!({
+                            "jsonrpc": "2.0", "id": msg["id"],
+                            "error": { "code": -32601,
+                                       "message": format!("unsupported method {method}") },
+                        });
+                        let mut line = serde_json::to_vec(&reply).expect("serializable");
+                        line.push(b'\n');
+                        let mut stdin = stdin.lock().await;
+                        let _ = stdin.write_all(&line).await;
+                        let _ = stdin.flush().await;
                     }
                 }
             }
