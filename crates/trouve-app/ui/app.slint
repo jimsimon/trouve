@@ -1008,6 +1008,12 @@ export component AppWindow inherits Window {
         root.chat-follow = true;
         chat-list.viewport-y = min(0px, chat-list.visible-height - chat-list.viewport-height);
     }
+    // True while the view rests at the tail. In-place re-renders read it to
+    // keep the bottom anchored: the ListView re-derives viewport-y from
+    // estimated row heights, so collapsing a card at the bottom would
+    // otherwise land the viewport at a visibly wrong spot.
+    out property <bool> chat-at-bottom: chat-list.viewport-y
+        <= chat-list.visible-height - chat-list.viewport-height + 12px;
 
     // Where-you-left-off bookkeeping: the shell polls the live scroll
     // offset into the controller's per-thread resume bookmark, and the

@@ -232,6 +232,11 @@ pub fn set_chat(ui: &Ui, rows: Vec<ChatRowData>, scroll_to_end: bool) {
     }
 
     let _ = ui.upgrade_in_event_loop(move |ui| {
+        // Sampled before the model changes: row add/removes make the
+        // ListView re-derive viewport-y from estimated row heights, so a
+        // toggle at the tail would land the view at a visibly wrong spot
+        // unless we re-pin it below.
+        let was_at_bottom = ui.get_chat_at_bottom();
         LAST_CHAT.with(|cache| {
             let mut cache = cache.borrow_mut();
             let model = ui.get_chat_rows();
@@ -262,11 +267,14 @@ pub fn set_chat(ui: &Ui, rows: Vec<ChatRowData>, scroll_to_end: bool) {
             }
             *cache = rows;
         });
-        if scroll_to_end {
+        if scroll_to_end || was_at_bottom {
+            // At the tail, the bottom edge is the user's anchor: keep it
+            // glued there through the re-layout (collapsing a card at the
+            // bottom must not leave the viewport mid-drift).
             ui.invoke_scroll_chat_to_end();
         } else {
-            // In-place re-renders (expand/collapse, raw toggles) must not
-            // yank the view back to the tail when row heights change.
+            // In-place re-renders (expand/collapse, raw toggles) higher up
+            // must not yank the view back to the tail when heights change.
             ui.set_chat_follow(false);
         }
     });
