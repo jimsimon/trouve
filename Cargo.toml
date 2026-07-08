@@ -46,7 +46,7 @@ uuid = { version = "1", features = ["v4"] }
 
 # Internal crates
 trouve-protocol = { path = "crates/trouve-protocol", version = "0.1.0" }
-trouve-search = { path = "crates/trouve-search", version = "2.0.0" }
+trouve-search = { path = "crates/trouve-search", version = "2.1.0" }
 trouve-agents = { path = "crates/trouve-agents", version = "0.1.0" }
 trouve-core = { path = "crates/trouve-core", version = "0.1.0" }
 trouve-providers = { path = "crates/trouve-providers", version = "0.1.0" }

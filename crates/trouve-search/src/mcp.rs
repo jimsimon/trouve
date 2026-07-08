@@ -11,6 +11,7 @@ use std::collections::HashMap;
 use std::io::{BufRead, Write};
 use std::path::PathBuf;
 use std::process::ExitCode;
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
@@ -226,7 +227,7 @@ pub fn call_tool(cache: &mut IndexCache, name: &str, args: &Value) -> Result<Str
     }
 }
 
-fn handle_request(cache: &mut IndexCache, request: &Value) -> Option<Value> {
+pub(crate) fn handle_request(cache: &Mutex<IndexCache>, request: &Value) -> Option<Value> {
     let id = request.get("id");
     let has_id = !(id.is_none() || id == Some(&Value::Null));
     let Some(method) = request.get("method").and_then(|m| m.as_str()) else {
@@ -271,9 +272,16 @@ fn handle_request(cache: &mut IndexCache, request: &Value) -> Option<Value> {
             let args = request
                 .pointer("/params/arguments")
                 .unwrap_or(&default_args);
+            // The cache is locked per call (not per connection) so that
+            // daemon connections serving other sessions can still answer
+            // ping/initialize while a slow index build runs. Poisoning is
+            // ignored: a panicked call must not wedge every later request.
+            let mut cache = cache
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             // Tool failures are still tool *results* per MCP, but must be
             // flagged so clients treat them as failed calls.
-            let (text, is_error) = match call_tool(cache, name, args) {
+            let (text, is_error) = match call_tool(&mut cache, name, args) {
                 Ok(text) => (text, false),
                 Err(text) => (text, true),
             };
@@ -290,32 +298,46 @@ fn handle_request(cache: &mut IndexCache, request: &Value) -> Option<Value> {
     Some(json!({"jsonrpc": "2.0", "id": id, "result": result}))
 }
 
-/// Start an MCP stdio server (blocks until stdin closes).
-pub fn serve(content: &[ContentType]) -> ExitCode {
-    let mut cache = IndexCache::new(content.to_vec());
-    let stdin = std::io::stdin();
-    let stdout = std::io::stdout();
-    for line in stdin.lock().lines() {
+/// Answer one raw request line, or `None` for notifications.
+pub(crate) fn respond_line(cache: &Mutex<IndexCache>, line: &str) -> Option<Value> {
+    match serde_json::from_str::<Value>(line) {
+        Ok(request) => handle_request(cache, &request),
+        Err(_) => Some(
+            json!({"jsonrpc": "2.0", "id": null, "error": {"code": -32700, "message": "Parse error"}}),
+        ),
+    }
+}
+
+/// Serve newline-delimited JSON-RPC requests from `reader`, writing
+/// responses to `writer`, until `reader` is exhausted. Shared by the stdio
+/// server and each connection of the unix-socket daemon; the cache is behind
+/// a mutex so daemon connections serialize index access exactly like the
+/// harness's in-process tools do.
+pub(crate) fn serve_lines<R: BufRead, W: Write>(
+    cache: &Mutex<IndexCache>,
+    reader: R,
+    mut writer: W,
+) {
+    for line in reader.lines() {
         let Ok(line) = line else { break };
         if line.trim().is_empty() {
             continue;
         }
-        let Ok(request) = serde_json::from_str::<Value>(&line) else {
-            let mut out = stdout.lock();
-            let _ = writeln!(
-                out,
-                "{}",
-                json!({"jsonrpc": "2.0", "id": null, "error": {"code": -32700, "message": "Parse error"}})
-            );
-            let _ = out.flush();
-            continue;
-        };
-        if let Some(response) = handle_request(&mut cache, &request) {
-            let mut out = stdout.lock();
-            let _ = writeln!(out, "{response}");
-            let _ = out.flush();
+        if let Some(response) = respond_line(cache, &line) {
+            if writeln!(writer, "{response}").is_err() {
+                break;
+            }
+            let _ = writer.flush();
         }
     }
+}
+
+/// Start an MCP stdio server (blocks until stdin closes).
+pub fn serve(content: &[ContentType]) -> ExitCode {
+    let cache = Mutex::new(IndexCache::new(content.to_vec()));
+    let stdin = std::io::stdin();
+    let stdout = std::io::stdout();
+    serve_lines(&cache, stdin.lock(), stdout.lock());
     ExitCode::SUCCESS
 }
 
@@ -323,16 +345,20 @@ pub fn serve(content: &[ContentType]) -> ExitCode {
 mod tests {
     use super::*;
 
+    fn test_cache() -> Mutex<IndexCache> {
+        Mutex::new(IndexCache::new(vec![ContentType::Code]))
+    }
+
     #[test]
     fn initialize_and_list_tools() {
-        let mut cache = IndexCache::new(vec![ContentType::Code]);
+        let cache = test_cache();
         let init = json!({"jsonrpc": "2.0", "id": 1, "method": "initialize",
             "params": {"protocolVersion": "2024-11-05"}});
-        let response = handle_request(&mut cache, &init).unwrap();
+        let response = handle_request(&cache, &init).unwrap();
         assert_eq!(response["result"]["serverInfo"]["name"], "trouve-search");
 
         let list = json!({"jsonrpc": "2.0", "id": 2, "method": "tools/list"});
-        let response = handle_request(&mut cache, &list).unwrap();
+        let response = handle_request(&cache, &list).unwrap();
         let tools = response["result"]["tools"].as_array().unwrap();
         assert_eq!(tools.len(), 2);
         assert_eq!(tools[0]["name"], "search");
@@ -341,16 +367,16 @@ mod tests {
 
     #[test]
     fn notifications_get_no_response() {
-        let mut cache = IndexCache::new(vec![ContentType::Code]);
+        let cache = test_cache();
         let note = json!({"jsonrpc": "2.0", "method": "notifications/initialized"});
-        assert!(handle_request(&mut cache, &note).is_none());
+        assert!(handle_request(&cache, &note).is_none());
     }
 
     #[test]
     fn unknown_method_returns_error() {
-        let mut cache = IndexCache::new(vec![ContentType::Code]);
+        let cache = test_cache();
         let req = json!({"jsonrpc": "2.0", "id": 5, "method": "bogus/method"});
-        let response = handle_request(&mut cache, &req).unwrap();
+        let response = handle_request(&cache, &req).unwrap();
         assert_eq!(response["error"]["code"], -32601);
     }
 
@@ -370,7 +396,7 @@ mod tests {
 
     #[test]
     fn tool_failures_are_flagged_as_errors() {
-        let mut cache = IndexCache::new(vec![ContentType::Code]);
+        let cache = test_cache();
         for (params, expect) in [
             (json!({"name": "bogus", "arguments": {}}), "Unknown tool"),
             (
@@ -383,7 +409,7 @@ mod tests {
             ),
         ] {
             let req = json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": params});
-            let response = handle_request(&mut cache, &req).unwrap();
+            let response = handle_request(&cache, &req).unwrap();
             assert_eq!(response["result"]["isError"], true, "params: {params}");
             let text = response["result"]["content"][0]["text"].as_str().unwrap();
             assert!(text.contains(expect), "got: {text}");
@@ -392,14 +418,14 @@ mod tests {
 
     #[test]
     fn request_without_method_gets_invalid_request_error() {
-        let mut cache = IndexCache::new(vec![ContentType::Code]);
+        let cache = test_cache();
         let req = json!({"jsonrpc": "2.0", "id": 7});
-        let response = handle_request(&mut cache, &req).unwrap();
+        let response = handle_request(&cache, &req).unwrap();
         assert_eq!(response["error"]["code"], -32600);
         assert_eq!(response["id"], 7);
         // Without an id it is malformed but unanswerable: no response.
         let note = json!({"jsonrpc": "2.0"});
-        assert!(handle_request(&mut cache, &note).is_none());
+        assert!(handle_request(&cache, &note).is_none());
     }
 
     #[test]

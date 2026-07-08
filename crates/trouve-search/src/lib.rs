@@ -7,6 +7,7 @@
 pub mod bm25;
 pub mod chunk;
 pub mod cli;
+pub mod daemon;
 pub mod dense;
 pub mod embed;
 pub mod index;

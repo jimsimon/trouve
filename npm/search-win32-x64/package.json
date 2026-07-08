@@ -1,6 +1,6 @@
 {
   "name": "@trouve-ai/search-win32-x64",
-  "version": "2.0.0",
+  "version": "2.1.0",
   "description": "trouve-search native binary for x86_64-pc-windows-msvc",
   "license": "MIT",
   "repository": {
