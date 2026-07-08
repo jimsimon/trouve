@@ -680,6 +680,148 @@ component PromptBox inherits Rectangle {
 
 // Drag handle between columns. Dragging integrates mouse deltas into the
 // bound width; `direction` is +1 when dragging right grows the column.
+// New-session / new-thread form. Sessions pick a workspace and a base
+// branch; threads only pick the agent setup (they share the session's
+// worktree, so the form renders inside the session's tab strip).
+component NewChatForm inherits VerticalLayout {
+    in property <bool> session-form;
+    in property <[string]> workspaces;
+    in-out property <int> workspace-index;
+    in property <[string]> branches;
+    in-out property <int> branch-index;
+    in property <[string]> modes;
+    in-out property <int> mode-index;
+    in property <[string]> models;
+    in property <[int]> model-matches;
+    in-out property <int> model-index;
+    in property <string> error-text;
+    callback start(int, int, int, int, string);
+    callback cancel();
+    callback workspace-changed(int);
+    callback register-workspace(string);
+    callback model-filter(string);
+
+    padding: 40px;
+    spacing: 14px;
+    alignment: center;
+
+    Text {
+        text: root.session-form ? "New session" : "New thread";
+        color: #e8e8e8;
+        font-size: 22px;
+        font-weight: 700;
+    }
+    Text {
+        text: root.session-form
+            ? "Pick where to work, what to branch from, and how the agent should run."
+            : "Threads share the session worktree; pick the agent setup for this one.";
+        color: #9a9a9a;
+        font-size: 13px;
+        wrap: word-wrap;
+    }
+
+    if root.session-form: VerticalLayout {
+        spacing: 6px;
+        Text { text: "Workspace"; color: #c8c8c8; font-size: 12px; font-weight: 700; }
+        ComboBox {
+            model: root.workspaces;
+            current-index <=> root.workspace-index;
+            selected => { root.workspace-changed(self.current-index); }
+        }
+        HorizontalLayout {
+            spacing: 6px;
+            ws-path := LineEdit {
+                horizontal-stretch: 1;
+                placeholder-text: "…or register a git repo by absolute path";
+            }
+            Button {
+                text: "Add";
+                enabled: ws-path.text != "";
+                clicked => {
+                    root.register-workspace(ws-path.text);
+                    ws-path.text = "";
+                }
+            }
+        }
+    }
+
+    if root.session-form: VerticalLayout {
+        spacing: 6px;
+        Text { text: "Base branch"; color: #c8c8c8; font-size: 12px; font-weight: 700; }
+        ComboBox {
+            model: root.branches;
+            current-index <=> root.branch-index;
+        }
+    }
+
+    HorizontalLayout {
+        spacing: 12px;
+        VerticalLayout {
+            spacing: 6px;
+            horizontal-stretch: 1;
+            Text { text: "Agent mode"; color: #c8c8c8; font-size: 12px; font-weight: 700; }
+            ComboBox {
+                model: root.modes;
+                current-index <=> root.mode-index;
+            }
+        }
+        VerticalLayout {
+            spacing: 6px;
+            horizontal-stretch: 1;
+            Text { text: "Model"; color: #c8c8c8; font-size: 12px; font-weight: 700; }
+            SearchPicker {
+                up: false;
+                options: root.models;
+                matches: root.model-matches;
+                current-index <=> root.model-index;
+                placeholder: "model";
+                filter-edited(q) => { root.model-filter(q); }
+            }
+        }
+    }
+
+    VerticalLayout {
+        spacing: 6px;
+        Text { text: "First message"; color: #c8c8c8; font-size: 12px; font-weight: 700; }
+        prompt-edit := PromptBox {
+            placeholder: "What should the agent do?  (Shift+Enter for a new line)";
+            submitted(text) => {
+                if (!root.session-form || root.workspace-index >= 0) {
+                    root.start(root.workspace-index, root.branch-index,
+                        root.mode-index, root.model-index, text);
+                    self.text = "";
+                }
+            }
+        }
+    }
+
+    HorizontalLayout {
+        spacing: 8px;
+        Button {
+            text: root.session-form ? "Start session" : "Start thread";
+            primary: true;
+            enabled: prompt-edit.text != ""
+                && (!root.session-form || root.workspace-index >= 0);
+            clicked => {
+                root.start(root.workspace-index, root.branch-index,
+                    root.mode-index, root.model-index, prompt-edit.text);
+                prompt-edit.text = "";
+            }
+        }
+        Button {
+            text: "Cancel";
+            clicked => { root.cancel(); }
+        }
+        Rectangle { horizontal-stretch: 1; }
+    }
+    if root.error-text != "" : Text {
+        text: root.error-text;
+        color: #e39ea6;
+        font-size: 12px;
+        wrap: word-wrap;
+    }
+}
+
 component SplitterHandle inherits Rectangle {
     in-out property <length> value;
     in property <int> direction: 1;
@@ -779,6 +921,8 @@ export component AppWindow inherits Window {
     in-out property <int> right-tab: 0;
     callback send-message(string);
     in property <bool> composer-enabled: false;
+    // Draft survives the composer being swapped out for the new-thread form.
+    property <string> composer-draft;
     in property <string> status-text: "starting…";
     in-out property <string> error-text: "";
 
@@ -1162,9 +1306,12 @@ export component AppWindow inherits Window {
             background: #141414;
 
             // ----- chat screen (kept in the tree so scroll-chat-to-end can
-            // reach the list; hidden while a new-chat screen is up) -----
+            // reach the list; hidden while the new-session screen is up).
+            // The new-thread form (center-screen 2) renders *inside* this
+            // layout so the session's tab strip stays put — the form lives
+            // in a provisional tab instead of replacing the whole screen.
             VerticalLayout {
-                visible: root.center-screen == 0;
+                visible: root.center-screen != 1;
                 padding: 10px;
                 spacing: 8px;
 
@@ -1241,7 +1388,26 @@ export component AppWindow inherits Window {
                 Rectangle {
                     vertical-stretch: 1;
 
+                // New-thread form in the provisional tab: replaces only the
+                // chat stream, leaving the session's tab strip in place.
+                if root.center-screen == 2: NewChatForm {
+                    width: 100%;
+                    height: 100%;
+                    session-form: false;
+                    modes: root.modes;
+                    mode-index <=> root.nc-mode-index;
+                    models: root.models;
+                    model-matches: root.model-filter-matches;
+                    model-index <=> root.nc-model-index;
+                    start(ws, br, mode, model, prompt) => {
+                        root.start-new-chat(ws, br, mode, model, prompt);
+                    }
+                    cancel => { root.cancel-new-chat(); }
+                    model-filter(q) => { root.model-filter-changed(q); }
+                }
+
                 chat-list := ListView {
+                    visible: root.center-screen == 0;
                     width: 100%;
                     height: 100%;
                     // Scrolling can move/recycle a hovered button without a
@@ -2015,7 +2181,7 @@ export component AppWindow inherits Window {
                         self.track * (self.page / max(1px, self.total)));
                     property <bool> scrollable: self.total > self.page;
 
-                    visible: self.scrollable;
+                    visible: self.scrollable && root.center-screen == 0;
                     x: parent.width - self.width;
                     y: 0;
                     width: 14px;
@@ -2084,12 +2250,14 @@ export component AppWindow inherits Window {
                 // Composer: multiline prompt on top (grows with content),
                 // then a controls row — pickers, model knobs, send, dial.
                 // Only the chat list above stretches; the composer sticks
-                // to its preferred height.
-                VerticalLayout {
+                // to its preferred height. Removed (not just hidden) while
+                // the new-thread form is up so it doesn't reserve space.
+                if root.center-screen == 0: VerticalLayout {
                     spacing: 6px;
                     vertical-stretch: 0;
 
                     composer := PromptBox {
+                        text <=> root.composer-draft;
                         placeholder: root.composer-enabled
                             ? "Message the agent…  (Shift+Enter for a new line)"
                             : "Select or create a thread first";
@@ -2244,129 +2412,26 @@ export component AppWindow inherits Window {
                 }
             }
 
-            // ----- new-chat screen (new session / new thread) -----
-            if root.center-screen != 0: VerticalLayout {
-                padding: 40px;
-                spacing: 14px;
-                alignment: center;
-
-                Text {
-                    text: root.center-screen == 1 ? "New session" : "New thread";
-                    color: #e8e8e8;
-                    font-size: 22px;
-                    font-weight: 700;
+            // ----- new-session screen (no session context to keep) -----
+            if root.center-screen == 1: NewChatForm {
+                session-form: true;
+                workspaces: root.nc-workspaces;
+                workspace-index <=> root.nc-workspace-index;
+                branches: root.nc-branches;
+                branch-index <=> root.nc-branch-index;
+                modes: root.modes;
+                mode-index <=> root.nc-mode-index;
+                models: root.models;
+                model-matches: root.model-filter-matches;
+                model-index <=> root.nc-model-index;
+                error-text: root.error-text;
+                start(ws, br, mode, model, prompt) => {
+                    root.start-new-chat(ws, br, mode, model, prompt);
                 }
-                Text {
-                    text: root.center-screen == 1
-                        ? "Pick where to work, what to branch from, and how the agent should run."
-                        : "Threads share the session worktree; pick the agent setup for this one.";
-                    color: #9a9a9a;
-                    font-size: 13px;
-                    wrap: word-wrap;
-                }
-
-                if root.center-screen == 1: VerticalLayout {
-                    spacing: 6px;
-                    Text { text: "Workspace"; color: #c8c8c8; font-size: 12px; font-weight: 700; }
-                    ComboBox {
-                        model: root.nc-workspaces;
-                        current-index <=> root.nc-workspace-index;
-                        selected => { root.nc-workspace-changed(self.current-index); }
-                    }
-                    HorizontalLayout {
-                        spacing: 6px;
-                        ws-path := LineEdit {
-                            horizontal-stretch: 1;
-                            placeholder-text: "…or register a git repo by absolute path";
-                        }
-                        Button {
-                            text: "Add";
-                            enabled: ws-path.text != "";
-                            clicked => {
-                                root.register-workspace-path(ws-path.text);
-                                ws-path.text = "";
-                            }
-                        }
-                    }
-                }
-
-                if root.center-screen == 1: VerticalLayout {
-                    spacing: 6px;
-                    Text { text: "Base branch"; color: #c8c8c8; font-size: 12px; font-weight: 700; }
-                    ComboBox {
-                        model: root.nc-branches;
-                        current-index <=> root.nc-branch-index;
-                    }
-                }
-
-                HorizontalLayout {
-                    spacing: 12px;
-                    VerticalLayout {
-                        spacing: 6px;
-                        horizontal-stretch: 1;
-                        Text { text: "Agent mode"; color: #c8c8c8; font-size: 12px; font-weight: 700; }
-                        ComboBox {
-                            model: root.modes;
-                            current-index <=> root.nc-mode-index;
-                        }
-                    }
-                    VerticalLayout {
-                        spacing: 6px;
-                        horizontal-stretch: 1;
-                        Text { text: "Model"; color: #c8c8c8; font-size: 12px; font-weight: 700; }
-                        SearchPicker {
-                            up: false;
-                            options: root.models;
-                            matches: root.model-filter-matches;
-                            current-index <=> root.nc-model-index;
-                            placeholder: "model";
-                            filter-edited(q) => { root.model-filter-changed(q); }
-                        }
-                    }
-                }
-
-                VerticalLayout {
-                    spacing: 6px;
-                    Text { text: "First message"; color: #c8c8c8; font-size: 12px; font-weight: 700; }
-                    prompt-edit := PromptBox {
-                        placeholder: "What should the agent do?  (Shift+Enter for a new line)";
-                        submitted(text) => {
-                            if (root.center-screen == 2 || root.nc-workspace-index >= 0) {
-                                root.start-new-chat(
-                                    root.nc-workspace-index, root.nc-branch-index,
-                                    root.nc-mode-index, root.nc-model-index, text);
-                                self.text = "";
-                            }
-                        }
-                    }
-                }
-
-                HorizontalLayout {
-                    spacing: 8px;
-                    Button {
-                        text: root.center-screen == 1 ? "Start session" : "Start thread";
-                        primary: true;
-                        enabled: prompt-edit.text != ""
-                            && (root.center-screen == 2 || root.nc-workspace-index >= 0);
-                        clicked => {
-                            root.start-new-chat(
-                                root.nc-workspace-index, root.nc-branch-index,
-                                root.nc-mode-index, root.nc-model-index, prompt-edit.text);
-                            prompt-edit.text = "";
-                        }
-                    }
-                    Button {
-                        text: "Cancel";
-                        clicked => { root.cancel-new-chat(); }
-                    }
-                    Rectangle { horizontal-stretch: 1; }
-                }
-                if root.error-text != "" : Text {
-                    text: root.error-text;
-                    color: #e39ea6;
-                    font-size: 12px;
-                    wrap: word-wrap;
-                }
+                cancel => { root.cancel-new-chat(); }
+                workspace-changed(i) => { root.nc-workspace-changed(i); }
+                register-workspace(path) => { root.register-workspace-path(path); }
+                model-filter(q) => { root.model-filter-changed(q); }
             }
         }
 
