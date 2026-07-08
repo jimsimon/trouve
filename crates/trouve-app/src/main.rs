@@ -37,7 +37,6 @@ fn main() -> anyhow::Result<()> {
         .init();
 
     let window = AppWindow::new()?;
-    let settings = SettingsWindow::new()?;
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<UiCommand>();
 
     // --- main window callbacks → controller commands -------------------------
@@ -365,10 +364,10 @@ fn main() -> anyhow::Result<()> {
         });
     }
 
-    // --- settings window callbacks -------------------------------------------
+    // --- settings screen callbacks -------------------------------------------
     {
         let tx = tx.clone();
-        settings.on_provider_saved(move |id, kind, base_url, api_key| {
+        window.on_provider_saved(move |id, kind, base_url, api_key| {
             let _ = tx.send(UiCommand::SaveProvider {
                 id: id.to_string(),
                 kind: kind.to_string(),
@@ -379,45 +378,50 @@ fn main() -> anyhow::Result<()> {
     }
     {
         let tx = tx.clone();
-        settings.on_provider_deleted(move |id| {
+        window.on_provider_deleted(move |id| {
             let _ = tx.send(UiCommand::DeleteProvider(id.to_string()));
         });
     }
     {
         let tx = tx.clone();
-        settings.on_provider_login(move |id| {
+        window.on_provider_login(move |id| {
             let _ = tx.send(UiCommand::ProviderLogin(id.to_string()));
         });
     }
     {
         let tx = tx.clone();
-        settings.on_default_model_picked(move |i| {
+        window.on_default_model_picked(move |i| {
             let _ = tx.send(UiCommand::SetDefaultModel(i.max(0) as usize));
         });
     }
     {
         let tx = tx.clone();
-        settings.on_refresh_settings(move || {
+        window.on_refresh_settings(move || {
             let _ = tx.send(UiCommand::RefreshSettings);
         });
     }
     {
         let tx = tx.clone();
-        settings.on_cli_install(move |id| {
+        window.on_cli_install(move |id| {
             let _ = tx.send(UiCommand::CliInstall(id.to_string()));
+        });
+    }
+    {
+        let tx = tx.clone();
+        window.on_close_settings(move || {
+            let _ = tx.send(UiCommand::CloseSettings);
         });
     }
 
     // Controller (and spawned server) live on a background tokio runtime.
     let scroll_tx = tx.clone();
     let weak = window.as_weak();
-    let settings_weak = settings.as_weak();
     std::thread::spawn(move || {
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()
             .expect("tokio runtime");
-        runtime.block_on(controller::run(weak, settings_weak, tx, rx));
+        runtime.block_on(controller::run(weak, tx, rx));
     });
 
     // Restore the last window geometry (position picks the monitor too);

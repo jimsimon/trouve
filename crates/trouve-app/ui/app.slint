@@ -11,9 +11,11 @@ import {
 } from "std-widgets.slint";
 import { DiffView, DiffRow } from "diff-view.slint";
 import { CodeView, TextSegment } from "code-view.slint";
-import { SettingsWindow, ProviderItem } from "settings-window.slint";
+import {
+    SettingsScreen, ProviderItem, CliItem, KnownProviderItem
+} from "settings-window.slint";
 
-export { DiffRow, TextSegment, SettingsWindow, ProviderItem }
+export { DiffRow, TextSegment, ProviderItem, CliItem, KnownProviderItem }
 
 // One row of the left nav: workspace headers, sessions, archived toggles.
 export struct NavRow {
@@ -914,8 +916,27 @@ export component AppWindow inherits Window {
     in-out property <string> modal-title: "";
 
     // --- center column ---------------------------------------------------------
-    // 0 chat, 1 new-session screen, 2 new-thread screen
+    // 0 chat, 1 new-session screen, 2 new-thread screen, 3 settings
     in property <int> center-screen: 0;
+
+    // --- settings screen -------------------------------------------------------
+    in property <[ProviderItem]> settings-providers;
+    in property <[CliItem]> settings-clis;
+    in property <[KnownProviderItem]> settings-known-providers;
+    in property <[string]> settings-known-provider-names;
+    in property <[string]> settings-models;
+    in property <int> settings-default-model-index: -1;
+    in property <[string]> settings-modes;
+    in property <string> settings-status: "";
+    in-out property <int> settings-preset-index: 0;
+    callback provider-saved(/* id */ string, /* kind */ string,
+                            /* base-url */ string, /* api-key */ string);
+    callback provider-deleted(string);
+    callback provider-login(string);
+    callback default-model-picked(int);
+    callback refresh-settings();
+    callback cli-install(/* id */ string);
+    callback close-settings();
 
     in property <[ThreadTabItem]> threads;
     in property <int> current-thread: -1;
@@ -1353,12 +1374,13 @@ export component AppWindow inherits Window {
             background: #141414;
 
             // ----- chat screen (kept in the tree so scroll-chat-to-end can
-            // reach the list; hidden while the new-session screen is up).
-            // The new-thread form (center-screen 2) renders *inside* this
-            // layout so the session's tab strip stays put — the form lives
-            // in a provisional tab instead of replacing the whole screen.
+            // reach the list; hidden while the new-session or settings
+            // screen is up). The new-thread form (center-screen 2) renders
+            // *inside* this layout so the session's tab strip stays put —
+            // the form lives in a provisional tab instead of replacing the
+            // whole screen.
             VerticalLayout {
-                visible: root.center-screen != 1;
+                visible: root.center-screen == 0 || root.center-screen == 2;
                 padding: 10px;
                 spacing: 8px;
 
@@ -2534,6 +2556,28 @@ export component AppWindow inherits Window {
                 workspace-changed(i) => { root.nc-workspace-changed(i); }
                 register-workspace(path) => { root.register-workspace-path(path); }
                 model-filter(q) => { root.model-filter-changed(q); }
+            }
+
+            // ----- settings screen (replaces the chat until closed) -----
+            if root.center-screen == 3: SettingsScreen {
+                providers: root.settings-providers;
+                clis: root.settings-clis;
+                known-providers: root.settings-known-providers;
+                known-provider-names: root.settings-known-provider-names;
+                models: root.settings-models;
+                default-model-index: root.settings-default-model-index;
+                modes: root.settings-modes;
+                settings-status: root.settings-status;
+                preset-index <=> root.settings-preset-index;
+                provider-saved(id, kind, url, key) => {
+                    root.provider-saved(id, kind, url, key);
+                }
+                provider-deleted(id) => { root.provider-deleted(id); }
+                provider-login(id) => { root.provider-login(id); }
+                default-model-picked(i) => { root.default-model-picked(i); }
+                refresh-settings => { root.refresh-settings(); }
+                cli-install(id) => { root.cli-install(id); }
+                close => { root.close-settings(); }
             }
         }
 

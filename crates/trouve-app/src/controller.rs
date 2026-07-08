@@ -45,6 +45,7 @@ pub enum UiCommand {
     /// The "+" on a workspace header row: new session there.
     WorkspaceNewSession(usize),
     OpenSettings,
+    CloseSettings,
 
     // New-chat screens.
     NewSession,
@@ -148,7 +149,6 @@ enum NewChat {
 
 struct Controller {
     ui: slint::Weak<crate::AppWindow>,
-    settings_ui: slint::Weak<crate::SettingsWindow>,
     client: ProtocolClient,
     tx: mpsc::UnboundedSender<UiCommand>,
 
@@ -222,7 +222,6 @@ struct FileRow {
 
 pub async fn run(
     ui: slint::Weak<crate::AppWindow>,
-    settings_ui: slint::Weak<crate::SettingsWindow>,
     tx: mpsc::UnboundedSender<UiCommand>,
     mut rx: mpsc::UnboundedReceiver<UiCommand>,
 ) {
@@ -236,7 +235,6 @@ pub async fn run(
 
     let mut ctl = Controller {
         ui,
-        settings_ui,
         client,
         tx,
         workspaces: Vec::new(),
@@ -1056,7 +1054,7 @@ impl Controller {
         let providers = match self.client.list_providers().await {
             Ok(p) => p,
             Err(e) => {
-                ui::set_settings_status(&self.settings_ui, format!("failed to load: {e:#}"));
+                ui::set_settings_status(&self.ui, format!("failed to load: {e:#}"));
                 return;
             }
         };
@@ -1067,7 +1065,7 @@ impl Controller {
             .map(|i| i as i32)
             .unwrap_or(-1);
         ui::set_settings_data(
-            &self.settings_ui,
+            &self.ui,
             providers
                 .providers
                 .into_iter()
@@ -1098,7 +1096,7 @@ impl Controller {
         );
         // Preset catalog is static server data; fetch alongside the rest.
         if let Ok(known) = self.client.known_providers().await {
-            ui::set_known_providers(&self.settings_ui, known);
+            ui::set_known_providers(&self.ui, known);
         }
         self.refresh_clis().await;
     }
@@ -1157,7 +1155,7 @@ impl Controller {
             };
             rows.push((cli.id, cli.display_name, version_label, action_label, status, busy));
         }
-        ui::set_clis(&self.settings_ui, rows);
+        ui::set_clis(&self.ui, rows);
     }
 
     // --- command dispatch --------------------------------------------------------
@@ -1264,7 +1262,18 @@ impl Controller {
             }
             UiCommand::OpenSettings => {
                 self.refresh_settings().await;
-                ui::show_settings(&self.settings_ui);
+                ui::set_center_screen(&self.ui, 3);
+            }
+            UiCommand::CloseSettings => {
+                // Back to whatever the center showed before settings.
+                ui::set_center_screen(
+                    &self.ui,
+                    match self.new_chat {
+                        None => 0,
+                        Some(NewChat::Session) => 1,
+                        Some(NewChat::Thread) => 2,
+                    },
+                );
             }
             UiCommand::NewSession => self.open_new_session_screen(None).await?,
             UiCommand::NewThread => self.open_new_thread_screen(),
@@ -1624,7 +1633,7 @@ impl Controller {
                 match result {
                     Ok(info) => {
                         ui::set_settings_status(
-                            &self.settings_ui,
+                            &self.ui,
                             format!(
                                 "saved provider {}{}",
                                 info.id,
@@ -1639,18 +1648,18 @@ impl Controller {
                         self.refresh_settings().await;
                     }
                     Err(e) => {
-                        ui::set_settings_status(&self.settings_ui, format!("{e:#}"));
+                        ui::set_settings_status(&self.ui, format!("{e:#}"));
                     }
                 }
             }
             UiCommand::DeleteProvider(id) => match self.client.delete_provider(&id).await {
                 Ok(()) => {
-                    ui::set_settings_status(&self.settings_ui, format!("removed {id}"));
+                    ui::set_settings_status(&self.ui, format!("removed {id}"));
                     self.reload_catalogs().await;
                     self.refresh_settings().await;
                 }
                 Err(e) => {
-                    ui::set_settings_status(&self.settings_ui, format!("{e:#}"));
+                    ui::set_settings_status(&self.ui, format!("{e:#}"));
                 }
             },
             UiCommand::ProviderLogin(id) => match self.client.start_login(&id).await {
@@ -1667,14 +1676,14 @@ impl Controller {
                             format!("login started for {id} — follow the vendor's prompts…")
                         }
                     };
-                    ui::set_settings_status(&self.settings_ui, msg);
+                    ui::set_settings_status(&self.ui, msg);
                     if !started.verification_url.is_empty() {
                         open_in_browser(&started.verification_url);
                     }
                     // Poll the login in the background so the UI stays live;
                     // report the outcome and refresh the provider list.
                     let client = self.client.clone();
-                    let settings_ui = self.settings_ui.clone();
+                    let settings_ui = self.ui.clone();
                     let tx = self.tx.clone();
                     tokio::spawn(async move {
                         for _ in 0..300 {
@@ -1706,7 +1715,7 @@ impl Controller {
                     });
                 }
                 Err(e) => {
-                    ui::set_settings_status(&self.settings_ui, format!("{e:#}"));
+                    ui::set_settings_status(&self.ui, format!("{e:#}"));
                 }
             },
             UiCommand::SetDefaultModel(i) => {
@@ -1714,25 +1723,25 @@ impl Controller {
                     match self.client.set_default_model(&model.id).await {
                         Ok(()) => {
                             ui::set_settings_status(
-                                &self.settings_ui,
+                                &self.ui,
                                 format!("default model: {}", model.id),
                             );
                             self.refresh_settings().await;
                         }
                         Err(e) => {
-                            ui::set_settings_status(&self.settings_ui, format!("{e:#}"));
+                            ui::set_settings_status(&self.ui, format!("{e:#}"));
                         }
                     }
                 }
             }
             UiCommand::CliInstall(id) => match self.client.start_cli_install(&id).await {
                 Ok(()) => {
-                    ui::set_settings_status(&self.settings_ui, format!("installing {id}…"));
+                    ui::set_settings_status(&self.ui, format!("installing {id}…"));
                     self.refresh_clis().await;
                     // Poll until the install settles; every refresh re-renders
                     // the row from the server's install status.
                     let client = self.client.clone();
-                    let settings_ui = self.settings_ui.clone();
+                    let settings_ui = self.ui.clone();
                     let tx = self.tx.clone();
                     tokio::spawn(async move {
                         for _ in 0..600 {
@@ -1767,7 +1776,7 @@ impl Controller {
                     });
                 }
                 Err(e) => {
-                    ui::set_settings_status(&self.settings_ui, format!("{e:#}"));
+                    ui::set_settings_status(&self.ui, format!("{e:#}"));
                 }
             },
             UiCommand::Event(thread_id, envelope) => {

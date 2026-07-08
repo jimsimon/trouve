@@ -2,17 +2,15 @@
 //! Slint models. Every function here is safe to call from any thread — the
 //! conversion happens inside `upgrade_in_event_loop`.
 
-use slint::{ComponentHandle, ModelRc, SharedString, VecModel};
+use slint::{ModelRc, SharedString, VecModel};
 
 use crate::render::ChatRowData;
 use crate::{
     AppWindow, ChatRow, CliItem, DiffRow, FileItem, KnownProviderItem, NavRow, ProviderItem,
-    QOption, QPair, SettingsWindow,
-    TextSegment, ThreadTabItem,
+    QOption, QPair, TextSegment, ThreadTabItem,
 };
 
 type Ui = slint::Weak<AppWindow>;
-type SettingsUi = slint::Weak<SettingsWindow>;
 
 /// Plain-data mirror of the `NavRow` Slint struct.
 #[derive(Debug, Clone, Default)]
@@ -466,17 +464,11 @@ pub fn set_file_view(ui: &Ui, name: String, content: String, lines: Vec<Vec<(Str
     });
 }
 
-// --- settings window ---------------------------------------------------------
-
-pub fn show_settings(ui: &SettingsUi) {
-    let _ = ui.upgrade_in_event_loop(move |ui| {
-        let _ = ui.show();
-    });
-}
+// --- settings screen ---------------------------------------------------------
 
 /// (id, kind, base_url, has_credentials, auth, experimental) per provider.
 pub fn set_settings_data(
-    ui: &SettingsUi,
+    ui: &Ui,
     providers: Vec<(String, String, String, bool, String, bool)>,
     models: Vec<String>,
     default_model_index: i32,
@@ -496,15 +488,15 @@ pub fn set_settings_data(
                 },
             )
             .collect();
-        ui.set_providers(ModelRc::new(VecModel::from(items)));
-        ui.set_models(string_model(models));
-        ui.set_default_model_index(default_model_index);
-        ui.set_modes(string_model(modes));
+        ui.set_settings_providers(ModelRc::new(VecModel::from(items)));
+        ui.set_settings_models(string_model(models));
+        ui.set_settings_default_model_index(default_model_index);
+        ui.set_settings_modes(string_model(modes));
     });
 }
 
 /// (id, display_name, version_label, action_label, status, busy) per CLI.
-pub fn set_clis(ui: &SettingsUi, clis: Vec<(String, String, String, String, String, bool)>) {
+pub fn set_clis(ui: &Ui, clis: Vec<(String, String, String, String, String, bool)>) {
     let _ = ui.upgrade_in_event_loop(move |ui| {
         let items: Vec<CliItem> = clis
             .into_iter()
@@ -519,11 +511,11 @@ pub fn set_clis(ui: &SettingsUi, clis: Vec<(String, String, String, String, Stri
                 },
             )
             .collect();
-        ui.set_clis(ModelRc::new(VecModel::from(items)));
+        ui.set_settings_clis(ModelRc::new(VecModel::from(items)));
     });
 }
 
-pub fn set_known_providers(ui: &SettingsUi, mut known: Vec<trouve_protocol::KnownProvider>) {
+pub fn set_known_providers(ui: &Ui, mut known: Vec<trouve_protocol::KnownProvider>) {
     let _ = ui.upgrade_in_event_loop(move |ui| {
         // Presets alphabetically, then "Custom" (hand-entered details) last;
         // preset-index i maps to known-providers[i], Custom is index == len.
@@ -548,17 +540,17 @@ pub fn set_known_providers(ui: &SettingsUi, mut known: Vec<trouve_protocol::Know
             })
             .collect();
         use slint::Model as _;
-        let first_load = ui.get_known_provider_names().row_count() == 0;
-        ui.set_known_providers(ModelRc::new(VecModel::from(items)));
-        ui.set_known_provider_names(string_model(names));
+        let first_load = ui.get_settings_known_provider_names().row_count() == 0;
+        ui.set_settings_known_providers(ModelRc::new(VecModel::from(items)));
+        ui.set_settings_known_provider_names(string_model(names));
         // Start on "Custom"; later refreshes keep the user's selection.
         if first_load {
-            ui.set_preset_index(custom_index);
+            ui.set_settings_preset_index(custom_index);
         }
     });
 }
 
-pub fn set_settings_status(ui: &SettingsUi, text: String) {
+pub fn set_settings_status(ui: &Ui, text: String) {
     let _ = ui
         .upgrade_in_event_loop(move |ui| ui.set_settings_status(SharedString::from(text.as_str())));
 }

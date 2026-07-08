@@ -1,6 +1,8 @@
-// Settings window: provider configuration, default model, agent modes, and
+// Settings screen: provider configuration, default model, agent modes, and
 // the About section (AboutSlint attribution lives here, reachable from the
-// left-column footer — royalty-free license requirement).
+// left-column footer — royalty-free license requirement). Rendered in the
+// main window's center area (replacing the chat) rather than as a separate
+// window; the header's Close button returns to the previous screen.
 //
 // Like the main window, this is dumb: models in, callbacks out.
 
@@ -45,13 +47,8 @@ export struct KnownProviderItem {
     experimental: bool,
 }
 
-export component SettingsWindow inherits Window {
-    preferred-width: 640px;
-    preferred-height: 760px;
-    min-width: 480px;
-    min-height: 500px;
-    title: "trouve — Settings";
-    background: #181818;
+export component SettingsScreen inherits Rectangle {
+    background: #141414;
 
     in property <[ProviderItem]> providers;
     in property <[CliItem]> clis;
@@ -90,6 +87,34 @@ export component SettingsWindow inherits Window {
     callback default-model-picked(int);
     callback refresh-settings();
     callback cli-install(/* id */ string);
+    callback close();
+
+    VerticalLayout {
+        // Header: title + a way back to wherever the user came from.
+        Rectangle {
+            height: 44px;
+            background: #181818;
+            HorizontalLayout {
+                padding-left: 16px;
+                padding-right: 10px;
+                spacing: 8px;
+                Text {
+                    text: "Settings";
+                    color: #e8e8e8;
+                    font-size: 16px;
+                    font-weight: 700;
+                    vertical-alignment: center;
+                    horizontal-stretch: 1;
+                }
+                VerticalLayout {
+                    alignment: center;
+                    Button {
+                        text: "✕ Close";
+                        clicked => { root.close(); }
+                    }
+                }
+            }
+        }
 
     ScrollView {
         VerticalLayout {
@@ -394,5 +419,6 @@ export component SettingsWindow inherits Window {
             }
             AboutSlint { }
         }
+    }
     }
 }
