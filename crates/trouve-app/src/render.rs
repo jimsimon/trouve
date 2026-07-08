@@ -6,6 +6,7 @@ use std::collections::{HashMap, HashSet};
 
 use slint_markdown::{parse_blocks, BlockKind};
 use trouve_client_core::viewmodel::{ChatItem, ThreadViewModel, ToolCallStatus, TurnState};
+use trouve_protocol::QuestionAnswer;
 
 /// Mirrors the `ChatRow` struct in `app.slint`.
 /// Kinds: 0 user, 1 markdown block, 2 tool card, 3 turn status (failures),
@@ -13,7 +14,8 @@ use trouve_client_core::viewmodel::{ChatItem, ThreadViewModel, ToolCallStatus, T
 /// 5 activity (spinner + label), 6 raw response text,
 /// 7 card header (collapsible group for user/agent items),
 /// 8 horizontal rule between turns, 9 grouped tool-run header
-/// ("Called n tools").
+/// ("Called n tools"), 10 question wizard (pending questions or the
+/// answered summary).
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct ChatRowData {
     pub kind: i32,
@@ -67,6 +69,67 @@ pub struct ChatRowData {
     pub card_pos: i32,
     /// First body row of its card (slab rows pad down from the header).
     pub card_first: bool,
+    /// Question wizard (kind 10): the current page's prompt, its options
+    /// (label, selected), and page/nav state. `q_summary` carries the
+    /// review page (and answered-summary) prompt/answer pairs.
+    pub q_prompt: String,
+    pub q_options: Vec<(String, bool)>,
+    pub q_multi: bool,
+    pub q_other: bool,
+    pub q_other_text: String,
+    pub q_review: bool,
+    pub q_done: bool,
+    pub q_summary: Vec<(String, String)>,
+    pub q_can_back: bool,
+    pub q_can_next: bool,
+    pub q_last: bool,
+}
+
+/// UI-side state of one question wizard, keyed by request id in the
+/// controller. `step == questions.len()` is the review page.
+#[derive(Debug, Clone, Default)]
+pub struct WizardState {
+    pub step: usize,
+    /// Selected option ids per question; [`OTHER_ID`] marks "Other".
+    pub selections: Vec<Vec<String>>,
+    /// Free-form "Other" text per question.
+    pub other_texts: Vec<String>,
+}
+
+/// Synthetic option id for the wizard's trailing free-form choice.
+pub const OTHER_ID: &str = "__other__";
+
+impl WizardState {
+    pub fn new(question_count: usize) -> Self {
+        Self {
+            step: 0,
+            selections: vec![Vec::new(); question_count],
+            other_texts: vec![String::new(); question_count],
+        }
+    }
+
+    /// The submission payload, once every question has a selection.
+    pub fn answers(&self, questions: &[trouve_protocol::Question]) -> Vec<QuestionAnswer> {
+        questions
+            .iter()
+            .enumerate()
+            .map(|(qi, q)| {
+                let selected = &self.selections[qi];
+                QuestionAnswer {
+                    question_id: q.id.clone(),
+                    selected_option_ids: selected
+                        .iter()
+                        .filter(|id| *id != OTHER_ID)
+                        .cloned()
+                        .collect(),
+                    other_text: selected
+                        .iter()
+                        .any(|id| id == OTHER_ID)
+                        .then(|| self.other_texts[qi].clone()),
+                }
+            })
+            .collect()
+    }
 }
 
 /// Wrap inline code spans (backtick runs, CommonMark-style: closed by a run
@@ -243,6 +306,7 @@ pub fn chat_rows(
     expanded: &HashSet<String>,
     raw_turns: &HashSet<u64>,
     collapsed: &HashSet<String>,
+    wizards: &HashMap<String, WizardState>,
 ) -> (Vec<ChatRowData>, Vec<Option<String>>) {
     let mut rows: Vec<ChatRowData> = Vec::new();
     let mut call_ids: Vec<Option<String>> = Vec::new();
@@ -258,7 +322,7 @@ pub fn chat_rows(
             match item {
                 ChatItem::Assistant { .. } => prev = Some(i),
                 ChatItem::User { .. } | ChatItem::TurnStatus { .. } => prev = None,
-                ChatItem::ToolCall { .. } | ChatItem::Thinking { .. } => {
+                ChatItem::ToolCall { .. } | ChatItem::Thinking { .. } | ChatItem::Questions { .. } => {
                     if let Some(a) = prev {
                         owner.insert(i, a);
                     }
@@ -270,7 +334,7 @@ pub fn chat_rows(
             match item {
                 ChatItem::Assistant { .. } => next = Some(i),
                 ChatItem::User { .. } | ChatItem::TurnStatus { .. } => next = None,
-                ChatItem::ToolCall { .. } | ChatItem::Thinking { .. } => {
+                ChatItem::ToolCall { .. } | ChatItem::Thinking { .. } | ChatItem::Questions { .. } => {
                     if let (None, Some(a)) = (owner.get(&i), next) {
                         owner.insert(i, a);
                     }
@@ -333,7 +397,9 @@ pub fn chat_rows(
                             merged.insert(k);
                             end = k;
                         }
-                        ChatItem::ToolCall { .. } | ChatItem::Thinking { .. } => end = k,
+                        ChatItem::ToolCall { .. }
+                        | ChatItem::Thinking { .. }
+                        | ChatItem::Questions { .. } => end = k,
                         _ => break,
                     }
                     k += 1;
@@ -363,7 +429,9 @@ pub fn chat_rows(
                         .collect();
                     ordered.sort_unstable();
                     ordered.extend(i..=end);
-                    card_body_rows(&mut body, vm, &ordered, i, raw, done, collapsed, expanded);
+                    card_body_rows(
+                        &mut body, vm, &ordered, i, raw, done, collapsed, expanded, wizards,
+                    );
                 }
                 // The turn's token/cost summary shows in the header of the
                 // turn's last card (where the status row used to sit).
@@ -395,7 +463,7 @@ pub fn chat_rows(
                 };
                 push_card(&mut rows, &mut call_ids, header, body);
             }
-            ChatItem::ToolCall { .. } | ChatItem::Thinking { .. } => {
+            ChatItem::ToolCall { .. } | ChatItem::Thinking { .. } | ChatItem::Questions { .. } => {
                 // Owned tool calls / thinking were rendered inside their
                 // assistant card; ones folded into an earlier synthesized
                 // card below are done too.
@@ -412,7 +480,9 @@ pub fn chat_rows(
                 while k < vm.items.len() && !owner.contains_key(&k) {
                     if matches!(
                         vm.items[k],
-                        ChatItem::ToolCall { .. } | ChatItem::Thinking { .. }
+                        ChatItem::ToolCall { .. }
+                            | ChatItem::Thinking { .. }
+                            | ChatItem::Questions { .. }
                     ) {
                         merged.insert(k);
                         run.push(k);
@@ -436,7 +506,7 @@ pub fn chat_rows(
                 let raw = raw_turns.contains(&turn);
                 let mut body = Vec::new();
                 if open {
-                    card_body_rows(&mut body, vm, &run, i, raw, done, collapsed, expanded);
+                    card_body_rows(&mut body, vm, &run, i, raw, done, collapsed, expanded, wizards);
                 }
                 // Orphan items mean no assistant item in this turn, so this
                 // card is where the turn summary lands once it completes.
@@ -539,6 +609,7 @@ fn card_body_rows(
     done: bool,
     collapsed: &HashSet<String>,
     expanded: &HashSet<String>,
+    wizards: &HashMap<String, WizardState>,
 ) {
     let mut segments: Vec<Segment> = Vec::new();
     let mut k = 0;
@@ -569,6 +640,11 @@ fn card_body_rows(
         }
     }
 
+    // Question items stay out of activity groups: the wizard needs to be
+    // answered, so it always renders at the card's top level, like text.
+    let groupable = |seg: &Segment| {
+        matches!(seg, Segment::Item(j) if !matches!(vm.items[*j], ChatItem::Questions { .. }))
+    };
     let mut s = 0;
     while s < segments.len() {
         if let Segment::Text(text) = &segments[s] {
@@ -576,15 +652,20 @@ fn card_body_rows(
             s += 1;
             continue;
         }
+        if !groupable(&segments[s]) {
+            segment_rows(body, vm, &segments[s], 0, raw, collapsed, expanded, wizards);
+            s += 1;
+            continue;
+        }
         // A run of consecutive working items.
         let start = s;
-        while s < segments.len() && matches!(segments[s], Segment::Item(_)) {
+        while s < segments.len() && groupable(&segments[s]) {
             s += 1;
         }
         let run = &segments[start..s];
         if run.len() < 2 {
             for seg in run {
-                segment_rows(body, vm, seg, 0, raw, collapsed, expanded);
+                segment_rows(body, vm, seg, 0, raw, collapsed, expanded, wizards);
             }
             continue;
         }
@@ -617,7 +698,7 @@ fn card_body_rows(
         ));
         if g_open {
             for seg in run {
-                segment_rows(body, vm, seg, 1, raw, collapsed, expanded);
+                segment_rows(body, vm, seg, 1, raw, collapsed, expanded, wizards);
             }
         }
     }
@@ -625,6 +706,7 @@ fn card_body_rows(
 
 /// Append the rows of one body segment. `indent` nests tool cards and
 /// thinking pills one level under a group header.
+#[allow(clippy::too_many_arguments)]
 fn segment_rows(
     body: &mut Vec<(ChatRowData, Option<String>)>,
     vm: &ThreadViewModel,
@@ -633,6 +715,7 @@ fn segment_rows(
     raw: bool,
     collapsed: &HashSet<String>,
     expanded: &HashSet<String>,
+    wizards: &HashMap<String, WizardState>,
 ) {
     match segment {
         Segment::Text(text) => text_rows(body, text, raw),
@@ -687,9 +770,136 @@ fn segment_rows(
                 row.md_indent = indent;
                 body.push((row, Some(call_id.clone())));
             }
+            ChatItem::Questions {
+                request_id,
+                title,
+                questions,
+                answers,
+            } => {
+                let mut row = question_row(title, questions, answers, wizards.get(request_id));
+                row.md_indent = indent;
+                body.push((row, Some(request_id.clone())));
+            }
             _ => {}
         },
     }
+}
+
+/// Build the kind-10 question row: the wizard while answers are pending
+/// (current question page or the review page), or a compact prompt/answer
+/// summary once resolved.
+fn question_row(
+    title: &Option<String>,
+    questions: &[trouve_protocol::Question],
+    answers: &Option<Option<Vec<QuestionAnswer>>>,
+    wizard: Option<&WizardState>,
+) -> ChatRowData {
+    let heading = title.clone().unwrap_or_else(|| "Questions".into());
+    let mut row = ChatRowData {
+        kind: 10,
+        text: heading,
+        ..Default::default()
+    };
+    // The label an answer shows for one selected option id.
+    let option_label = |q: &trouve_protocol::Question, id: &str| {
+        q.options
+            .iter()
+            .find(|o| o.id == id)
+            .map(|o| o.label.clone())
+            .unwrap_or_else(|| id.to_string())
+    };
+    if let Some(resolved) = answers {
+        row.q_done = true;
+        row.q_review = true;
+        match resolved {
+            Some(list) => {
+                row.meta = "Answered".into();
+                row.q_summary = questions
+                    .iter()
+                    .map(|q| {
+                        let mut parts: Vec<String> = list
+                            .iter()
+                            .find(|a| a.question_id == q.id)
+                            .map(|a| {
+                                let mut p: Vec<String> = a
+                                    .selected_option_ids
+                                    .iter()
+                                    .map(|id| option_label(q, id))
+                                    .collect();
+                                if let Some(other) = &a.other_text {
+                                    p.push(if other.trim().is_empty() {
+                                        "Other".into()
+                                    } else {
+                                        format!("Other: {other}")
+                                    });
+                                }
+                                p
+                            })
+                            .unwrap_or_default();
+                        if parts.is_empty() {
+                            parts.push("—".into());
+                        }
+                        (q.prompt.clone(), parts.join(", "))
+                    })
+                    .collect();
+            }
+            None => row.meta = "Skipped".into(),
+        }
+        return row;
+    }
+    // Pending: wizard state drives the page. A missing state (first render)
+    // acts like a fresh wizard on question 1.
+    let fresh = WizardState::new(questions.len());
+    let w = wizard.unwrap_or(&fresh);
+    let step = w.step.min(questions.len());
+    if step == questions.len() {
+        // Review page.
+        row.q_review = true;
+        row.meta = "Review your answers".into();
+        row.q_can_back = true;
+        row.q_can_next = true;
+        row.q_last = true;
+        row.q_summary = questions
+            .iter()
+            .enumerate()
+            .map(|(qi, q)| {
+                let parts: Vec<String> = w.selections[qi]
+                    .iter()
+                    .map(|id| {
+                        if id == OTHER_ID {
+                            let t = w.other_texts[qi].trim();
+                            if t.is_empty() {
+                                "Other".into()
+                            } else {
+                                format!("Other: {t}")
+                            }
+                        } else {
+                            option_label(q, id)
+                        }
+                    })
+                    .collect();
+                (q.prompt.clone(), parts.join(", "))
+            })
+            .collect();
+        return row;
+    }
+    let q = &questions[step];
+    let selected = &w.selections[step];
+    row.meta = format!("Question {} of {}", step + 1, questions.len());
+    row.q_prompt = q.prompt.clone();
+    row.q_multi = q.allow_multiple;
+    row.q_options = q
+        .options
+        .iter()
+        .map(|o| (o.label.clone(), selected.contains(&o.id)))
+        .collect();
+    row.q_other = selected.iter().any(|id| id == OTHER_ID);
+    row.q_other_text = w.other_texts[step].clone();
+    row.q_can_back = step > 0;
+    row.q_can_next = !selected.is_empty()
+        && (!row.q_other || !w.other_texts[step].trim().is_empty());
+    row.q_last = step + 1 == questions.len();
+    row
 }
 
 /// Append one text stretch: markdown-block rows, or — in raw view — one
@@ -1210,7 +1420,7 @@ fn latest_turn(vm: &ThreadViewModel) -> u64 {
             | ChatItem::Assistant { turn, .. }
             | ChatItem::Thinking { turn, .. }
             | ChatItem::TurnStatus { turn, .. } => Some(*turn),
-            ChatItem::ToolCall { .. } => None,
+            ChatItem::ToolCall { .. } | ChatItem::Questions { .. } => None,
         })
         .max()
         .unwrap_or(0)
@@ -1393,16 +1603,171 @@ mod tests {
             turn_running: true,
             ..Default::default()
         };
-        let (rows, _) = chat_rows(&vm, &HashSet::new(), &HashSet::new(), &HashSet::new());
+        let (rows, _) = chat_rows(&vm, &HashSet::new(), &HashSet::new(), &HashSet::new(), &HashMap::new());
         assert_eq!(rows.last().unwrap().kind, 5);
         assert_eq!(rows.last().unwrap().text, "Processing…");
         vm.thinking = true;
-        let (rows, _) = chat_rows(&vm, &HashSet::new(), &HashSet::new(), &HashSet::new());
+        let (rows, _) = chat_rows(&vm, &HashSet::new(), &HashSet::new(), &HashSet::new(), &HashMap::new());
         assert_eq!(rows.last().unwrap().text, "Thinking…");
         vm.turn_running = false;
         vm.thinking = false;
-        let (rows, _) = chat_rows(&vm, &HashSet::new(), &HashSet::new(), &HashSet::new());
+        let (rows, _) = chat_rows(&vm, &HashSet::new(), &HashSet::new(), &HashSet::new(), &HashMap::new());
         assert!(rows.is_empty());
+    }
+
+    fn two_questions() -> Vec<trouve_protocol::Question> {
+        let opt = |id: &str, label: &str| trouve_protocol::QuestionOption {
+            id: id.into(),
+            label: label.into(),
+        };
+        vec![
+            trouve_protocol::Question {
+                id: "q1".into(),
+                prompt: "Favorite color?".into(),
+                options: vec![opt("red", "Red"), opt("blue", "Blue")],
+                allow_multiple: false,
+            },
+            trouve_protocol::Question {
+                id: "q2".into(),
+                prompt: "Fruits you like?".into(),
+                options: vec![opt("apple", "Apple"), opt("banana", "Banana")],
+                allow_multiple: true,
+            },
+        ]
+    }
+
+    #[test]
+    fn question_wizard_pages_review_and_summary() {
+        let questions = two_questions();
+        let vm = ThreadViewModel {
+            items: vec![ChatItem::Questions {
+                request_id: "qr_1".into(),
+                title: Some("Preferences".into()),
+                questions: questions.clone(),
+                answers: None,
+            }],
+            ..Default::default()
+        };
+
+        // Fresh wizard: page 1 with radio options and no Back.
+        let mut wizards = HashMap::new();
+        wizards.insert("qr_1".to_string(), WizardState::new(2));
+        let (rows, ids) = chat_rows(
+            &vm,
+            &HashSet::new(),
+            &HashSet::new(),
+            &HashSet::new(),
+            &wizards,
+        );
+        let w = rows.iter().find(|r| r.kind == 10).unwrap();
+        assert_eq!(w.text, "Preferences");
+        assert_eq!(w.meta, "Question 1 of 2");
+        assert_eq!(w.q_prompt, "Favorite color?");
+        assert_eq!(
+            w.q_options,
+            vec![("Red".to_string(), false), ("Blue".to_string(), false)]
+        );
+        assert!(!w.q_multi && !w.q_can_back && !w.q_can_next && !w.q_review);
+        // The wizard row maps back to its request id.
+        let widx = rows.iter().position(|r| r.kind == 10).unwrap();
+        assert_eq!(ids[widx].as_deref(), Some("qr_1"));
+
+        // A selection enables Next; the second page is multi-choice; the
+        // review page lists both answers including the "Other" text.
+        let mut state = WizardState::new(2);
+        state.selections[0] = vec!["red".to_string()];
+        state.selections[1] = vec!["apple".to_string(), OTHER_ID.to_string()];
+        state.other_texts[1] = "mango".into();
+        state.step = 1;
+        wizards.insert("qr_1".to_string(), state.clone());
+        let (rows, _) = chat_rows(
+            &vm,
+            &HashSet::new(),
+            &HashSet::new(),
+            &HashSet::new(),
+            &wizards,
+        );
+        let w = rows.iter().find(|r| r.kind == 10).unwrap();
+        assert_eq!(w.meta, "Question 2 of 2");
+        assert!(w.q_multi && w.q_can_back && w.q_can_next && w.q_last && w.q_other);
+        assert_eq!(w.q_other_text, "mango");
+
+        state.step = 2;
+        wizards.insert("qr_1".to_string(), state.clone());
+        let (rows, _) = chat_rows(
+            &vm,
+            &HashSet::new(),
+            &HashSet::new(),
+            &HashSet::new(),
+            &wizards,
+        );
+        let w = rows.iter().find(|r| r.kind == 10).unwrap();
+        assert!(w.q_review && !w.q_done);
+        assert_eq!(w.q_summary[0], ("Favorite color?".into(), "Red".into()));
+        assert_eq!(
+            w.q_summary[1],
+            ("Fruits you like?".into(), "Apple, Other: mango".into())
+        );
+
+        // The submission payload strips the marker and carries the text.
+        let answers = state.answers(&questions);
+        assert_eq!(answers[0].selected_option_ids, vec!["red".to_string()]);
+        assert_eq!(answers[0].other_text, None);
+        assert_eq!(answers[1].selected_option_ids, vec!["apple".to_string()]);
+        assert_eq!(answers[1].other_text.as_deref(), Some("mango"));
+    }
+
+    #[test]
+    fn resolved_questions_render_an_answer_summary() {
+        let questions = two_questions();
+        let answered = ChatItem::Questions {
+            request_id: "qr_1".into(),
+            title: None,
+            questions: questions.clone(),
+            answers: Some(Some(vec![trouve_protocol::QuestionAnswer {
+                question_id: "q1".into(),
+                selected_option_ids: vec!["blue".into()],
+                other_text: None,
+            }])),
+        };
+        let vm = ThreadViewModel {
+            items: vec![answered],
+            ..Default::default()
+        };
+        let (rows, _) = chat_rows(
+            &vm,
+            &HashSet::new(),
+            &HashSet::new(),
+            &HashSet::new(),
+            &HashMap::new(),
+        );
+        let w = rows.iter().find(|r| r.kind == 10).unwrap();
+        assert!(w.q_done && w.q_review);
+        assert_eq!(w.meta, "Answered");
+        assert_eq!(w.q_summary[0], ("Favorite color?".into(), "Blue".into()));
+        // Unanswered questions show a placeholder.
+        assert_eq!(w.q_summary[1], ("Fruits you like?".into(), "—".into()));
+
+        // Skipped requests summarize as such (empty summary + meta).
+        let vm = ThreadViewModel {
+            items: vec![ChatItem::Questions {
+                request_id: "qr_2".into(),
+                title: None,
+                questions,
+                answers: Some(None),
+            }],
+            ..Default::default()
+        };
+        let (rows, _) = chat_rows(
+            &vm,
+            &HashSet::new(),
+            &HashSet::new(),
+            &HashSet::new(),
+            &HashMap::new(),
+        );
+        let w = rows.iter().find(|r| r.kind == 10).unwrap();
+        assert!(w.q_done && w.q_summary.is_empty());
+        assert_eq!(w.meta, "Skipped");
     }
 
     #[test]
@@ -1416,18 +1781,18 @@ mod tests {
             ..Default::default()
         };
         // Styled: a card header, then one row per markdown block.
-        let (rows, _) = chat_rows(&vm, &HashSet::new(), &HashSet::new(), &HashSet::new());
+        let (rows, _) = chat_rows(&vm, &HashSet::new(), &HashSet::new(), &HashSet::new(), &HashMap::new());
         assert_eq!(rows[0].kind, 7);
         assert!(rows.len() > 2);
         // Raw: header plus a single kind-6 row of markdown source.
         let raw: HashSet<u64> = [3].into();
-        let (rows, _) = chat_rows(&vm, &HashSet::new(), &raw, &HashSet::new());
+        let (rows, _) = chat_rows(&vm, &HashSet::new(), &raw, &HashSet::new(), &HashMap::new());
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[1].kind, 6);
         assert_eq!(rows[1].text, "# heading\n\nbody `code`");
         // Collapsed: the header alone, with a one-line preview.
         let collapsed: HashSet<String> = ["a:0".to_string()].into();
-        let (rows, _) = chat_rows(&vm, &HashSet::new(), &HashSet::new(), &collapsed);
+        let (rows, _) = chat_rows(&vm, &HashSet::new(), &HashSet::new(), &collapsed, &HashMap::new());
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].kind, 7);
         assert!(!rows[0].expanded);
@@ -1457,7 +1822,7 @@ mod tests {
             ],
             ..Default::default()
         };
-        let (rows, _) = chat_rows(&vm, &HashSet::new(), &HashSet::new(), &HashSet::new());
+        let (rows, _) = chat_rows(&vm, &HashSet::new(), &HashSet::new(), &HashSet::new(), &HashMap::new());
         // Completed turns no longer emit a status row; the summary rides in
         // the merged assistant card's header.
         assert!(!rows.iter().any(|r| r.kind == 3));
@@ -1473,7 +1838,7 @@ mod tests {
         assert_eq!(headers[0].detail, "part one\npart two");
         // Raw view: the copy payload is the joined markdown source.
         let raw: HashSet<u64> = [1].into();
-        let (rows, _) = chat_rows(&vm, &HashSet::new(), &raw, &HashSet::new());
+        let (rows, _) = chat_rows(&vm, &HashSet::new(), &raw, &HashSet::new(), &HashMap::new());
         let header = rows
             .iter()
             .find(|r| r.kind == 7 && r.tool_name == "Agent")
@@ -1508,7 +1873,7 @@ mod tests {
             ],
             ..Default::default()
         };
-        let (rows, ids) = chat_rows(&vm, &HashSet::new(), &HashSet::new(), &HashSet::new());
+        let (rows, ids) = chat_rows(&vm, &HashSet::new(), &HashSet::new(), &HashSet::new(), &HashMap::new());
         // Streaming turn: You header, prompt, Assistant header, the 2-tool
         // run under an expanded group header, the narration text (never
         // grouped), then the trailing single tool inline.
@@ -1528,14 +1893,14 @@ mod tests {
                 usage: Default::default(),
             },
         });
-        let (rows, _) = chat_rows(&vm, &HashSet::new(), &HashSet::new(), &HashSet::new());
+        let (rows, _) = chat_rows(&vm, &HashSet::new(), &HashSet::new(), &HashSet::new(), &HashMap::new());
         let kinds: Vec<i32> = rows.iter().map(|r| r.kind).collect();
         assert_eq!(kinds, vec![7, 1, 7, 9, 1, 2]);
         assert!(!rows[3].expanded);
         // Toggling the group key (the run's first item index + the owning
         // card's anchor) reopens it.
         let opened: HashSet<String> = ["g1:3".to_string()].into();
-        let (rows, _) = chat_rows(&vm, &HashSet::new(), &HashSet::new(), &opened);
+        let (rows, _) = chat_rows(&vm, &HashSet::new(), &HashSet::new(), &opened, &HashMap::new());
         let kinds: Vec<i32> = rows.iter().map(|r| r.kind).collect();
         assert_eq!(kinds, vec![7, 1, 7, 9, 2, 2, 1, 2]);
         // A tool call with no assistant item (yet) still gets an Assistant
@@ -1544,7 +1909,7 @@ mod tests {
             items: vec![tool("t9")],
             ..Default::default()
         };
-        let (rows, ids) = chat_rows(&vm, &HashSet::new(), &HashSet::new(), &HashSet::new());
+        let (rows, ids) = chat_rows(&vm, &HashSet::new(), &HashSet::new(), &HashSet::new(), &HashMap::new());
         let kinds: Vec<i32> = rows.iter().map(|r| r.kind).collect();
         assert_eq!(kinds, vec![7, 2]);
         assert_eq!(rows[0].tool_name, "Agent");
@@ -1586,7 +1951,7 @@ mod tests {
             ],
             ..Default::default()
         };
-        let (rows, _) = chat_rows(&vm, &HashSet::new(), &HashSet::new(), &HashSet::new());
+        let (rows, _) = chat_rows(&vm, &HashSet::new(), &HashSet::new(), &HashSet::new(), &HashMap::new());
         // One You card, one Agent card; a lone thinking item between text
         // stretches stays inline (no group header for a single item): a
         // kind-4 header pill followed by its content as markdown rows
@@ -1602,7 +1967,7 @@ mod tests {
         assert!(rows[3..].iter().all(|r| r.card_pos >= 2), "all nested");
         // Collapsing one thinking block keeps its header pill only.
         let collapsed: HashSet<String> = ["t:1".to_string()].into();
-        let (rows, _) = chat_rows(&vm, &HashSet::new(), &HashSet::new(), &collapsed);
+        let (rows, _) = chat_rows(&vm, &HashSet::new(), &HashSet::new(), &collapsed, &HashMap::new());
         let kinds: Vec<i32> = rows.iter().map(|r| r.kind).collect();
         assert_eq!(kinds, vec![7, 1, 7, 4, 1, 4, 1, 1]);
         let think: Vec<_> = rows.iter().filter(|r| r.kind == 4).collect();
@@ -1611,7 +1976,7 @@ mod tests {
         // Raw view keeps stream order too: each text stretch becomes a
         // kind-6 row in place, not one blob hoisted to the top.
         let raw: HashSet<u64> = [1].into();
-        let (rows, _) = chat_rows(&vm, &HashSet::new(), &raw, &HashSet::new());
+        let (rows, _) = chat_rows(&vm, &HashSet::new(), &raw, &HashSet::new(), &HashMap::new());
         let kinds: Vec<i32> = rows.iter().map(|r| r.kind).collect();
         assert_eq!(kinds, vec![7, 1, 7, 4, 1, 6, 4, 1, 6]);
         assert_eq!(rows[5].text, "part one");
@@ -1624,12 +1989,12 @@ mod tests {
             turn: 2,
             content: "next question".into(),
         });
-        let (rows, _) = chat_rows(&vm, &HashSet::new(), &HashSet::new(), &HashSet::new());
+        let (rows, _) = chat_rows(&vm, &HashSet::new(), &HashSet::new(), &HashSet::new(), &HashMap::new());
         let think: Vec<_> = rows.iter().filter(|r| r.kind == 4).collect();
         assert!(think.iter().all(|r| !r.expanded), "collapsed once superseded");
         // …and the toggle set now re-expands instead of collapsing.
         let toggled: HashSet<String> = ["t:1".to_string()].into();
-        let (rows, _) = chat_rows(&vm, &HashSet::new(), &HashSet::new(), &toggled);
+        let (rows, _) = chat_rows(&vm, &HashSet::new(), &HashSet::new(), &toggled, &HashMap::new());
         let think: Vec<_> = rows.iter().filter(|r| r.kind == 4).collect();
         assert!(think[0].expanded);
         assert!(!think[1].expanded);
@@ -1659,7 +2024,7 @@ mod tests {
             turn_running: true,
             ..Default::default()
         };
-        let (rows, _) = chat_rows(&vm, &HashSet::new(), &HashSet::new(), &HashSet::new());
+        let (rows, _) = chat_rows(&vm, &HashSet::new(), &HashSet::new(), &HashSet::new(), &HashMap::new());
         // You card, then a synthesized Assistant card wrapping the grouped
         // run, then the activity row.
         let kinds: Vec<i32> = rows.iter().map(|r| r.kind).collect();
@@ -1675,7 +2040,7 @@ mod tests {
             content: "Sunny.".into(),
             complete: false,
         });
-        let (rows, _) = chat_rows(&vm, &HashSet::new(), &HashSet::new(), &HashSet::new());
+        let (rows, _) = chat_rows(&vm, &HashSet::new(), &HashSet::new(), &HashSet::new(), &HashMap::new());
         let headers = rows
             .iter()
             .filter(|r| r.kind == 7 && r.tool_name == "Agent")
@@ -1711,7 +2076,7 @@ mod tests {
             ],
             ..Default::default()
         };
-        let (rows, _) = chat_rows(&vm, &HashSet::new(), &HashSet::new(), &HashSet::new());
+        let (rows, _) = chat_rows(&vm, &HashSet::new(), &HashSet::new(), &HashSet::new(), &HashMap::new());
         // The thinking + read run groups under one summarized header; the
         // narration/answer text stays outside the group.
         let group = rows.iter().find(|r| r.kind == 9).unwrap();
@@ -1781,7 +2146,7 @@ mod tests {
             ],
             ..Default::default()
         };
-        let (rows, _) = chat_rows(&vm, &HashSet::new(), &HashSet::new(), &HashSet::new());
+        let (rows, _) = chat_rows(&vm, &HashSet::new(), &HashSet::new(), &HashSet::new(), &HashMap::new());
         assert_ne!(rows[0].kind, 8, "no rule before the first turn");
         let rules: Vec<_> = rows.iter().enumerate().filter(|(_, r)| r.kind == 8).collect();
         assert_eq!(rules.len(), 1);

@@ -172,6 +172,42 @@ fn main() -> anyhow::Result<()> {
     }
     {
         let tx = tx.clone();
+        window.on_question_option_toggled(move |row, option| {
+            let _ = tx.send(UiCommand::QuestionOption {
+                row: row as usize,
+                option: option.max(0) as usize,
+            });
+        });
+    }
+    {
+        let tx = tx.clone();
+        window.on_question_other_edited(move |row, text| {
+            let _ = tx.send(UiCommand::QuestionOtherEdited {
+                row: row as usize,
+                text: text.to_string(),
+            });
+        });
+    }
+    {
+        let tx = tx.clone();
+        window.on_question_back(move |row| {
+            let _ = tx.send(UiCommand::QuestionBack(row as usize));
+        });
+    }
+    {
+        let tx = tx.clone();
+        window.on_question_next(move |row| {
+            let _ = tx.send(UiCommand::QuestionNext(row as usize));
+        });
+    }
+    {
+        let tx = tx.clone();
+        window.on_question_skip(move |row| {
+            let _ = tx.send(UiCommand::QuestionSkip(row as usize));
+        });
+    }
+    {
+        let tx = tx.clone();
         window.on_tool_toggled(move |row| {
             let _ = tx.send(UiCommand::ToggleTool(row as usize));
         });

@@ -23,7 +23,8 @@ use trouve_protocol::{
     CreateSessionRequest, CreateThreadRequest, DirEntry,
     ErrorBody, FileContent, KnownProvider, LoginStarted, LoginStatus, MergePrRequest, ModelInfo,
     PrInfo, ProviderInfo, ProvidersResponse, RegisterWorkspaceRequest, ResolveApprovalRequest,
-    Scope, SendMessageRequest, ServerInfo, Session, SessionDiff, SetDefaultModelRequest, Thread,
+    ResolveQuestionRequest, Scope, SendMessageRequest, ServerInfo, Session, SessionDiff,
+    SetDefaultModelRequest, Thread,
     TurnAccepted, UpdateSessionRequest, UpdateThreadRequest, UpsertProviderRequest, UsageSummary,
     Workspace, PROTOCOL_VERSION,
 };
@@ -77,6 +78,7 @@ impl IntoResponse for ApiError {
         update_thread,
         send_message,
         resolve_approval,
+        resolve_question,
         list_models,
         list_modes,
         list_providers,
@@ -112,6 +114,10 @@ impl IntoResponse for ApiError {
         SendMessageRequest,
         TurnAccepted,
         ResolveApprovalRequest,
+        ResolveQuestionRequest,
+        trouve_protocol::Question,
+        trouve_protocol::QuestionOption,
+        trouve_protocol::QuestionAnswer,
         ModelInfo,
         ProviderInfo,
         ProvidersResponse,
@@ -207,6 +213,7 @@ pub fn build_router(engine: Arc<Engine>) -> Router {
         .route("/v1/threads/{id}/events", get(thread_events))
         .route("/v1/threads/{id}/usage", get(thread_usage))
         .route("/v1/approvals", post(resolve_approval))
+        .route("/v1/questions", post(resolve_question))
         .route("/v1/events", get(server_events))
         // Internal (undocumented, same-host trust domain): tool bridge for
         // external agent backends running with trouve's ToolExecutor.
@@ -419,6 +426,16 @@ async fn resolve_approval(
     Json(req): Json<ResolveApprovalRequest>,
 ) -> Result<StatusCode, ApiError> {
     engine.resolve_approval(&req.call_id, req.decision)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+#[utoipa::path(post, path = "/v1/questions", request_body = ResolveQuestionRequest,
+    responses((status = 204), (status = 404, body = ErrorBody)))]
+async fn resolve_question(
+    State(engine): State<Arc<Engine>>,
+    Json(req): Json<ResolveQuestionRequest>,
+) -> Result<StatusCode, ApiError> {
+    engine.resolve_question(&req.request_id, req.answers)?;
     Ok(StatusCode::NO_CONTENT)
 }
 

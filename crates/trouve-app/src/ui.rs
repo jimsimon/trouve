@@ -7,7 +7,7 @@ use slint::{ComponentHandle, ModelRc, SharedString, VecModel};
 use crate::render::ChatRowData;
 use crate::{
     AppWindow, ChatRow, CliItem, DiffRow, FileItem, KnownProviderItem, NavRow, ProviderItem,
-    SettingsWindow,
+    QOption, QPair, SettingsWindow,
     TextSegment, ThreadTabItem,
 };
 
@@ -179,6 +179,33 @@ fn to_chat_row(r: &ChatRowData) -> ChatRow {
         card_first: r.card_first,
         meta: SharedString::from(r.meta.as_str()),
         subtitle: SharedString::from(r.subtitle.as_str()),
+        q_prompt: SharedString::from(r.q_prompt.as_str()),
+        q_options: ModelRc::new(VecModel::from(
+            r.q_options
+                .iter()
+                .map(|(label, selected)| QOption {
+                    label: SharedString::from(label.as_str()),
+                    selected: *selected,
+                })
+                .collect::<Vec<_>>(),
+        )),
+        q_multi: r.q_multi,
+        q_other: r.q_other,
+        q_other_text: SharedString::from(r.q_other_text.as_str()),
+        q_review: r.q_review,
+        q_done: r.q_done,
+        q_summary: ModelRc::new(VecModel::from(
+            r.q_summary
+                .iter()
+                .map(|(prompt, answer)| QPair {
+                    prompt: SharedString::from(prompt.as_str()),
+                    answer: SharedString::from(answer.as_str()),
+                })
+                .collect::<Vec<_>>(),
+        )),
+        q_can_back: r.q_can_back,
+        q_can_next: r.q_can_next,
+        q_last: r.q_last,
     }
 }
 

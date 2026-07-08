@@ -85,10 +85,11 @@ pub async fn run() -> Result<()> {
     Ok(())
 }
 
-/// Read-only tools served even without full tool bridging: the vendor
-/// agent keeps its own built-ins, but trouve's native semantic search (a
-/// core harness feature the vendor has no equivalent of) is always offered.
-const ALWAYS_BRIDGED: &[&str] = &["search", "find_related"];
+/// Tools served even without full tool bridging: the vendor agent keeps its
+/// own built-ins, but trouve's native semantic search and the interactive
+/// question tool (harness features the vendor has no equivalent of) are
+/// always offered.
+const ALWAYS_BRIDGED: &[&str] = &["search", "find_related", "ask_question"];
 
 async fn tools_list(
     http: &reqwest::Client,

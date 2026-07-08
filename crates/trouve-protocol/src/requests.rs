@@ -172,6 +172,17 @@ pub struct ResolveApprovalRequest {
     pub decision: ApprovalDecision,
 }
 
+// --- questions -------------------------------------------------------------
+
+/// Answers for a pending `question.requested`. `answers: null` skips the
+/// questions (the agent is told the user declined to answer).
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct ResolveQuestionRequest {
+    pub request_id: CallId,
+    #[serde(default)]
+    pub answers: Option<Vec<crate::QuestionAnswer>>,
+}
+
 // --- worktree inspection ---------------------------------------------------
 
 /// The session's unified diff against its base ref.

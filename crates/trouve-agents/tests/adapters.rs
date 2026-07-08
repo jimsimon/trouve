@@ -182,6 +182,11 @@ echo '{"jsonrpc":"2.0","id":101,"method":"cursor/create_plan","params":{"toolCal
 read planack
 echo "$planack" > "$0.planack"
 echo '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"sess-1","update":{"sessionUpdate":"tool_call_update","toolCallId":"c2","status":"completed"}}}'
+echo '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"sess-1","update":{"sessionUpdate":"tool_call","toolCallId":"c3","title":"Ask Question","kind":"think","status":"pending","rawInput":{"_toolName":"askQuestion"}}}}'
+echo '{"jsonrpc":"2.0","id":102,"method":"cursor/ask_question","params":{"toolCallId":"c3","title":"Prefs","questions":[{"id":"q1","prompt":"Color?","options":[{"id":"red","label":"Red"},{"id":"blue","label":"Blue"}],"allowMultiple":false}]}}'
+read qans
+echo "$qans" > "$0.qans"
+echo '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"sess-1","update":{"sessionUpdate":"tool_call_update","toolCallId":"c3","status":"completed"}}}'
 echo '{"jsonrpc":"2.0","id":5,"result":{"stopReason":"end_turn","usage":{"inputTokens":7,"outputTokens":3,"totalTokens":10}}}'
 cat > /dev/null
 "##,
@@ -199,6 +204,7 @@ async fn cursor_adapter_speaks_acp_and_bridges_approvals() {
     .await;
 
     let mut events = Vec::new();
+    let mut asked = None;
     while let Some(ev) = stream.next().await {
         let ev = ev.unwrap();
         if let BackendEvent::ApprovalNeeded {
@@ -211,6 +217,23 @@ async fn cursor_adapter_speaks_acp_and_bridges_approvals() {
             assert_eq!(call_id, "c1");
             assert_eq!(tool, "execute");
             responder.send(true).unwrap();
+            continue;
+        }
+        if let BackendEvent::QuestionsNeeded {
+            request_id,
+            title,
+            questions,
+            responder,
+        } = ev
+        {
+            asked = Some((request_id, title, questions.clone()));
+            responder
+                .send(Some(vec![trouve_protocol::QuestionAnswer {
+                    question_id: questions[0].id.clone(),
+                    selected_option_ids: vec!["red".into()],
+                    other_text: Some("crimson, really".into()),
+                }]))
+                .unwrap();
             continue;
         }
         events.push(ev);
@@ -256,6 +279,21 @@ async fn cursor_adapter_speaks_acp_and_bridges_approvals() {
     let planack = std::fs::read_to_string(format!("{stub}.planack")).unwrap();
     assert!(planack.contains("\"id\":101"), "{planack}");
     assert!(planack.contains("\"result\":{}"), "{planack}");
+    // The session-less cursor/ask_question request routed to the turn via
+    // its toolCallId, surfaced as QuestionsNeeded, and our answers went
+    // back in cursor's outcome shape.
+    let (request_id, title, questions) = asked.expect("QuestionsNeeded surfaced");
+    assert_eq!(request_id, "c3");
+    assert_eq!(title.as_deref(), Some("Prefs"));
+    assert_eq!(questions.len(), 1);
+    assert_eq!(questions[0].prompt, "Color?");
+    assert_eq!(questions[0].options[1].label, "Blue");
+    assert!(!questions[0].allow_multiple);
+    let qans = std::fs::read_to_string(format!("{stub}.qans")).unwrap();
+    assert!(qans.contains("\"id\":102"), "{qans}");
+    assert!(qans.contains("\"outcome\":\"answered\""), "{qans}");
+    assert!(qans.contains("\"selectedOptionIds\":[\"red\"]"), "{qans}");
+    assert!(qans.contains("\"freeformText\":\"crimson, really\""), "{qans}");
     assert!(events.iter().any(|e| matches!(
         e,
         BackendEvent::Completed { usage } if usage.input_tokens == 7 && usage.output_tokens == 3
@@ -386,7 +424,7 @@ cat > /dev/null
                 responder.send(true).unwrap();
             }
             BackendEvent::Completed { usage: u } => usage = Some(u),
-            BackendEvent::ThinkingDelta(_) => {}
+            BackendEvent::ThinkingDelta(_) | BackendEvent::QuestionsNeeded { .. } => {}
         }
     }
 

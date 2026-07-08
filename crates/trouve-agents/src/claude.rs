@@ -164,11 +164,12 @@ impl AgentBackend for ClaudeBackend {
                 cmd.args(["--allowedTools", "mcp__trouve"]);
             } else {
                 // Approvals-only: Claude keeps its built-ins, but trouve's
-                // read-only semantic search tools ride along on the bridge
-                // and are pre-allowed (they are gated inside trouve).
+                // read-only semantic search tools and the interactive
+                // question tool ride along on the bridge and are pre-allowed
+                // (they are gated inside trouve).
                 cmd.args([
                     "--allowedTools",
-                    "mcp__trouve__search,mcp__trouve__find_related",
+                    "mcp__trouve__search,mcp__trouve__find_related,mcp__trouve__ask_question",
                 ]);
             }
             if matches!(

@@ -69,6 +69,23 @@ pub enum UiCommand {
         row: usize,
         approved: bool,
     },
+    /// Question wizard: toggle option `option` (options.len() = "Other") of
+    /// the current page of the wizard at `row`.
+    QuestionOption {
+        row: usize,
+        option: usize,
+    },
+    /// Question wizard: the "Other" free-form text changed.
+    QuestionOtherEdited {
+        row: usize,
+        text: String,
+    },
+    /// Question wizard: back to the previous question.
+    QuestionBack(usize),
+    /// Question wizard: advance (next question / review page / submit).
+    QuestionNext(usize),
+    /// Question wizard: skip the whole request unanswered.
+    QuestionSkip(usize),
     ToggleTool(usize),
     /// Toggle a turn between styled markdown and raw selectable text.
     ToggleRawTurn(u64),
@@ -160,6 +177,9 @@ struct Controller {
     /// (thread id, card key) pairs whose card body is collapsed.
     collapsed_cards: HashSet<(String, String)>,
     row_call_ids: Vec<Option<String>>,
+    /// Question-wizard state per pending request id (page, selections,
+    /// "Other" texts); dropped once the request resolves.
+    wizards: HashMap<String, render::WizardState>,
 
     /// Where-you-left-off bookmark (last session, per-session last thread,
     /// per-thread scroll), persisted to resume.json as it changes.
@@ -222,6 +242,7 @@ pub async fn run(
         raw_turns: HashSet::new(),
         collapsed_cards: HashSet::new(),
         row_call_ids: Vec::new(),
+        wizards: HashMap::new(),
         resume: crate::winstate::load_resume(),
         modes: Vec::new(),
         models: Vec::new(),
@@ -479,6 +500,21 @@ impl Controller {
         self.current_thread.map(|i| self.threads[i].id.clone())
     }
 
+    /// The question request behind a wizard row: its request id and the
+    /// questions it poses.
+    fn question_at(&self, row: usize) -> Option<(String, Vec<trouve_protocol::Question>)> {
+        let request_id = self.row_call_ids.get(row)?.clone()?;
+        let vm = self.vms.get(&self.current_thread_id()?)?;
+        vm.items.iter().find_map(|item| match item {
+            trouve_client_core::viewmodel::ChatItem::Questions {
+                request_id: r,
+                questions,
+                ..
+            } if *r == request_id => Some((request_id.clone(), questions.clone())),
+            _ => None,
+        })
+    }
+
     async fn select_session(&mut self, index: usize) -> Result<()> {
         if index >= self.sessions.len() {
             return Ok(());
@@ -691,8 +727,32 @@ impl Controller {
             .map(|(_, key)| key.clone())
             .collect();
         let vm = self.vms.entry(thread_id).or_default();
-        let (rows, call_ids) =
-            render::chat_rows(vm, &self.expanded_tools, &raw_turns, &collapsed);
+        // Wizard state tracks the thread's pending question requests: fresh
+        // state when one appears, dropped once it resolves.
+        for item in &vm.items {
+            if let trouve_client_core::viewmodel::ChatItem::Questions {
+                request_id,
+                questions,
+                answers,
+                ..
+            } = item
+            {
+                if answers.is_none() {
+                    self.wizards
+                        .entry(request_id.clone())
+                        .or_insert_with(|| render::WizardState::new(questions.len()));
+                } else {
+                    self.wizards.remove(request_id);
+                }
+            }
+        }
+        let (rows, call_ids) = render::chat_rows(
+            vm,
+            &self.expanded_tools,
+            &raw_turns,
+            &collapsed,
+            &self.wizards,
+        );
         self.row_call_ids = call_ids;
         ui::set_chat(&self.ui, rows, scroll);
         ui::set_composer_enabled(&self.ui, true);
@@ -1220,6 +1280,80 @@ impl Controller {
                         ApprovalDecision::Deny
                     };
                     self.client.resolve_approval(call_id, decision).await?;
+                }
+            }
+            UiCommand::QuestionOption { row, option } => {
+                if let Some((request_id, questions)) = self.question_at(row) {
+                    if let Some(w) = self.wizards.get_mut(&request_id) {
+                        if w.step < questions.len() {
+                            let q = &questions[w.step];
+                            let id = if option >= q.options.len() {
+                                render::OTHER_ID.to_string()
+                            } else {
+                                q.options[option].id.clone()
+                            };
+                            let sel = &mut w.selections[w.step];
+                            if q.allow_multiple {
+                                match sel.iter().position(|s| *s == id) {
+                                    Some(pos) => {
+                                        sel.remove(pos);
+                                    }
+                                    None => sel.push(id),
+                                }
+                            } else if sel.first() == Some(&id) {
+                                sel.clear();
+                            } else {
+                                *sel = vec![id];
+                            }
+                            self.render_chat(false);
+                        }
+                    }
+                }
+            }
+            UiCommand::QuestionOtherEdited { row, text } => {
+                if let Some((request_id, questions)) = self.question_at(row) {
+                    if let Some(w) = self.wizards.get_mut(&request_id) {
+                        if w.step < questions.len() {
+                            let was_empty = w.other_texts[w.step].trim().is_empty();
+                            w.other_texts[w.step] = text;
+                            // Only the Next button's enabled state depends on
+                            // this text; re-render just when it flips so the
+                            // input isn't reset mid-typing.
+                            if was_empty != w.other_texts[w.step].trim().is_empty() {
+                                self.render_chat(false);
+                            }
+                        }
+                    }
+                }
+            }
+            UiCommand::QuestionBack(row) => {
+                if let Some((request_id, _)) = self.question_at(row) {
+                    if let Some(w) = self.wizards.get_mut(&request_id) {
+                        w.step = w.step.saturating_sub(1);
+                        self.render_chat(false);
+                    }
+                }
+            }
+            UiCommand::QuestionNext(row) => {
+                if let Some((request_id, questions)) = self.question_at(row) {
+                    if let Some(w) = self.wizards.get_mut(&request_id) {
+                        if w.step < questions.len() {
+                            w.step += 1;
+                            self.render_chat(false);
+                        } else {
+                            // Review page: submit. The wizard state stays
+                            // until question.resolved lands and prunes it.
+                            let answers = w.answers(&questions);
+                            self.client
+                                .resolve_question(&request_id, Some(answers))
+                                .await?;
+                        }
+                    }
+                }
+            }
+            UiCommand::QuestionSkip(row) => {
+                if let Some((request_id, _)) = self.question_at(row) {
+                    self.client.resolve_question(&request_id, None).await?;
                 }
             }
             UiCommand::ToggleTool(row) => {

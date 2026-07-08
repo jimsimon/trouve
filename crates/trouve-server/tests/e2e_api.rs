@@ -790,6 +790,196 @@ async fn read_only_mode_denies_mutations_without_prompting() {
     assert!(!Path::new(worktree).join("hello.txt").exists());
 }
 
+/// Turn 1: asks the user two questions via the engine-served ask_question
+/// tool; turn 2: records the tool result it was fed and finishes.
+struct QuestionProvider {
+    calls: AtomicUsize,
+    fed_back: std::sync::Mutex<Vec<Message>>,
+}
+
+#[async_trait::async_trait]
+impl Provider for QuestionProvider {
+    fn id(&self) -> &str {
+        "questions"
+    }
+
+    async fn stream_chat(
+        &self,
+        _model: &str,
+        messages: &[Message],
+        tools: &[ToolSpec],
+        _options: &serde_json::Map<String, serde_json::Value>,
+    ) -> Result<EventStream, ProviderError> {
+        let call = self.calls.fetch_add(1, Ordering::SeqCst);
+        let events: Vec<Result<ProviderEvent, ProviderError>> = match call {
+            0 => {
+                // The engine always offers the ask_question tool.
+                assert!(
+                    tools.iter().any(|t| t.name == "ask_question"),
+                    "ask_question must be in the tool specs"
+                );
+                vec![
+                    Ok(ProviderEvent::ToolCall(ToolCallRequest {
+                        id: "q_call_1".into(),
+                        name: "ask_question".into(),
+                        // Bare-string options exercise id synthesis.
+                        arguments: serde_json::json!({
+                            "title": "Preferences",
+                            "questions": [
+                                {"prompt": "Favorite color?", "options": ["Red", "Blue"]},
+                                {"prompt": "Fruits?", "options": ["Apple", "Banana"],
+                                 "allow_multiple": true},
+                            ],
+                        }),
+                    })),
+                    Ok(ProviderEvent::Completed {
+                        usage: Usage::default(),
+                    }),
+                ]
+            }
+            _ => {
+                *self.fed_back.lock().unwrap() = messages.to_vec();
+                vec![
+                    Ok(ProviderEvent::TextDelta("Noted.".into())),
+                    Ok(ProviderEvent::Completed {
+                        usage: Usage::default(),
+                    }),
+                ]
+            }
+        };
+        Ok(Box::pin(futures::stream::iter(events)))
+    }
+}
+
+#[tokio::test]
+async fn ask_question_tool_round_trips_answers() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path().join("repo");
+    std::fs::create_dir(&repo).unwrap();
+    init_repo(&repo);
+
+    let provider = Arc::new(QuestionProvider {
+        calls: AtomicUsize::new(0),
+        fed_back: std::sync::Mutex::new(Vec::new()),
+    });
+    let store = Store::open(&tmp.path().join("db/trouve.db")).unwrap();
+    let engine = Arc::new(
+        Engine::new(store, tmp.path().join("data"), &Config::default())
+            .with_config_dir(None)
+            .with_provider("questions", provider.clone())
+            .with_default_model("questions/test-model"),
+    );
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let router = trouve_server::build_router(engine);
+    tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+    let base = format!("http://{addr}/v1");
+    let client = reqwest::Client::new();
+
+    let ws: serde_json::Value = client
+        .post(format!("{base}/workspaces"))
+        .json(&serde_json::json!({"path": repo.to_str().unwrap()}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let session: serde_json::Value = client
+        .post(format!("{base}/sessions"))
+        .json(&serde_json::json!({"workspace_id": ws["id"], "title": "Question session"}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let thread: serde_json::Value = client
+        .post(format!("{base}/threads"))
+        .json(&serde_json::json!({"session_id": session["id"]}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let thread_id = thread["id"].as_str().unwrap();
+
+    client
+        .post(format!("{base}/threads/{thread_id}/messages"))
+        .json(&serde_json::json!({"content": "ask me things"}))
+        .send()
+        .await
+        .unwrap();
+
+    // The turn blocks on question.requested (ungated: no approval events).
+    let events_url = format!("{base}/threads/{thread_id}/events");
+    let events =
+        wait_for_event(&client, &events_url, |e| e["type"] == "question.requested").await;
+    let req = events
+        .iter()
+        .find(|e| e["type"] == "question.requested")
+        .unwrap();
+    assert_eq!(req["title"], "Preferences");
+    let questions = req["questions"].as_array().unwrap();
+    assert_eq!(questions.len(), 2);
+    // Ids were synthesized for the bare-string options.
+    assert_eq!(questions[0]["id"], "q1");
+    assert_eq!(questions[0]["options"][0], serde_json::json!({"id": "opt1", "label": "Red"}));
+    assert_eq!(questions[1]["allow_multiple"], true);
+    assert!(!events.iter().any(|e| e["type"] == "approval.requested"));
+    let request_id = req["request_id"].as_str().unwrap();
+
+    // Unknown request ids are a 404.
+    let resp = client
+        .post(format!("{base}/questions"))
+        .json(&serde_json::json!({"request_id": "bogus", "answers": []}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 404);
+
+    // Answer: single choice + a multi-choice with an "Other" free-form.
+    let resp = client
+        .post(format!("{base}/questions"))
+        .json(&serde_json::json!({
+            "request_id": request_id,
+            "answers": [
+                {"question_id": "q1", "selected_option_ids": ["opt1"]},
+                {"question_id": "q2", "selected_option_ids": ["opt2"],
+                 "other_text": "mango"},
+            ],
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 204);
+
+    let events = wait_for_event(&client, &events_url, |e| e["type"] == "turn.completed").await;
+    let resolved = events
+        .iter()
+        .find(|e| e["type"] == "question.resolved")
+        .unwrap();
+    assert_eq!(resolved["answers"][0]["selected_option_ids"][0], "opt1");
+    assert_eq!(resolved["answers"][1]["other_text"], "mango");
+
+    // The model got the answers back as labels (ids were synthetic).
+    let fed = provider.fed_back.lock().unwrap().clone();
+    let result = fed
+        .iter()
+        .find_map(|m| match m {
+            Message::ToolResult { call_id, content } if call_id == "q_call_1" => Some(content),
+            _ => None,
+        })
+        .expect("ask_question result fed back to the model");
+    let result: serde_json::Value = serde_json::from_str(result).unwrap();
+    assert_eq!(result["status"], "answered");
+    assert_eq!(result["answers"][0]["selected"][0], "Red");
+    assert_eq!(result["answers"][1]["selected"][0], "Banana");
+    assert_eq!(result["answers"][1]["other"], "mango");
+}
+
 // --- external agent backends -------------------------------------------------
 
 /// Scripted `AgentBackend`: every turn asks for approval of one "command",

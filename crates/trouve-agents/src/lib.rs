@@ -106,6 +106,14 @@ pub enum BackendEvent {
         args: serde_json::Value,
         responder: tokio::sync::oneshot::Sender<bool>,
     },
+    /// The vendor harness asked the user questions and blocked its turn on
+    /// the answers. Send `None` when the user skips.
+    QuestionsNeeded {
+        request_id: String,
+        title: Option<String>,
+        questions: Vec<trouve_protocol::Question>,
+        responder: tokio::sync::oneshot::Sender<Option<Vec<trouve_protocol::QuestionAnswer>>>,
+    },
     Completed {
         usage: Usage,
     },
@@ -125,6 +133,13 @@ impl std::fmt::Debug for BackendEvent {
             Self::ToolOutput { call_id, .. } => write!(f, "ToolOutput({call_id})"),
             Self::ToolCompleted { call_id, ok, .. } => {
                 write!(f, "ToolCompleted({call_id}, ok={ok})")
+            }
+            Self::QuestionsNeeded {
+                request_id,
+                questions,
+                ..
+            } => {
+                write!(f, "QuestionsNeeded({request_id}, {} qs)", questions.len())
             }
             Self::ApprovalNeeded { call_id, tool, .. } => {
                 write!(f, "ApprovalNeeded({call_id}, {tool})")

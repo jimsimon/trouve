@@ -5,7 +5,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
 
 use tokio::sync::oneshot;
-use trouve_protocol::{ApprovalDecision, PermissionMode};
+use trouve_protocol::{ApprovalDecision, PermissionMode, QuestionAnswer};
 
 /// What the permission engine decided for a tool call.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -102,6 +102,33 @@ impl ApprovalHub {
             .entry(session_id.to_string())
             .or_default()
             .insert(key);
+    }
+}
+
+/// Pending agent questions, mirroring [`ApprovalHub`]: one oneshot per
+/// outstanding `question.requested`, resolved by the answers endpoint
+/// (`None` = the user skipped).
+#[derive(Default)]
+pub struct QuestionHub {
+    pending: Mutex<HashMap<String, oneshot::Sender<Option<Vec<QuestionAnswer>>>>>,
+}
+
+impl QuestionHub {
+    pub fn request(&self, request_id: &str) -> oneshot::Receiver<Option<Vec<QuestionAnswer>>> {
+        let (tx, rx) = oneshot::channel();
+        self.pending
+            .lock()
+            .unwrap()
+            .insert(request_id.to_string(), tx);
+        rx
+    }
+
+    /// Returns false when the request id is unknown (already resolved).
+    pub fn resolve(&self, request_id: &str, answers: Option<Vec<QuestionAnswer>>) -> bool {
+        match self.pending.lock().unwrap().remove(request_id) {
+            Some(tx) => tx.send(answers).is_ok(),
+            None => false,
+        }
     }
 }
 

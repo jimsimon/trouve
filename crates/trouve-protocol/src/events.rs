@@ -42,6 +42,38 @@ pub enum ApprovalDecision {
     Deny,
 }
 
+/// One choice offered by a [`Question`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct QuestionOption {
+    pub id: String,
+    pub label: String,
+}
+
+/// A single question inside a `question.requested` event. Clients always
+/// offer a trailing free-form "Other" choice in addition to the listed
+/// options; its text comes back in [`QuestionAnswer::other_text`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct Question {
+    pub id: String,
+    pub prompt: String,
+    pub options: Vec<QuestionOption>,
+    /// Multiple options may be selected (checkboxes instead of radios).
+    #[serde(default)]
+    pub allow_multiple: bool,
+}
+
+/// The user's answer to one [`Question`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct QuestionAnswer {
+    pub question_id: String,
+    /// Ids of the selected options (at most one unless `allow_multiple`).
+    #[serde(default)]
+    pub selected_option_ids: Vec<String>,
+    /// Free-form text when the user picked "Other".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub other_text: Option<String>,
+}
+
 /// Token/cost usage for a turn.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, ToSchema)]
 pub struct Usage {
@@ -125,6 +157,24 @@ pub enum Event {
         call_id: CallId,
         status: ToolStatus,
         result: serde_json::Value,
+    },
+
+    /// The agent asked the user one or more questions; the turn is blocked
+    /// until `question.resolved`. Clients render an answer wizard.
+    #[serde(rename = "question.requested")]
+    QuestionRequested {
+        turn: u64,
+        request_id: CallId,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        title: Option<String>,
+        questions: Vec<Question>,
+    },
+    /// Answers submitted (or `answers: null` when the user skipped).
+    #[serde(rename = "question.resolved")]
+    QuestionResolved {
+        request_id: CallId,
+        #[serde(default)]
+        answers: Option<Vec<QuestionAnswer>>,
     },
 
     /// The thread's transcript neared the model's context window; the engine

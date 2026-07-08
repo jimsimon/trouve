@@ -33,6 +33,18 @@ export struct ThreadTabItem {
     label: string,
 }
 
+// One selectable option in a question-wizard page.
+export struct QOption {
+    label: string,
+    selected: bool,
+}
+
+// One prompt/answer line on the wizard's review page or answered summary.
+export struct QPair {
+    prompt: string,
+    answer: string,
+}
+
 export struct ChatRow {
     // 0 user, 1 markdown block, 2 tool card, 3 turn status,
     // 4 thinking, 5 activity (spinner + label),
@@ -89,6 +101,23 @@ export struct ChatRow {
     card-pos: int,
     // First body row of its card (slab rows pad down from the header).
     card-first: bool,
+    // Question wizard (kind 10). `text` holds the title, `meta` the page
+    // label ("Question 1 of 3" / "Review your answers" / "Answered").
+    q-prompt: string,
+    q-options: [QOption],
+    // Checkbox-style question (multiple selections allowed).
+    q-multi: bool,
+    // The trailing "Other" free-form choice: selected flag + its text.
+    q-other: bool,
+    q-other-text: string,
+    // Review page (pending) or answered summary (done).
+    q-review: bool,
+    q-done: bool,
+    q-summary: [QPair],
+    q-can-back: bool,
+    q-can-next: bool,
+    // Last question page ("Review" button) vs earlier ones ("Next").
+    q-last: bool,
 }
 
 export struct FileItem {
@@ -388,27 +417,31 @@ component IconButton inherits Rectangle {
 component PillButton inherits Rectangle {
     in property <string> label;
     in property <bool> primary: false;
+    in property <bool> enabled: true;
     callback clicked;
 
     width: pill-label.preferred-width + 16px;
     height: 18px;
     border-radius: 4px;
-    background: root.primary
+    background: !root.enabled ? #262626
+        : root.primary
         ? (pill-ta.has-hover ? #3f6db3 : #35598f)
         : (pill-ta.has-hover ? #3a3a3a : #2a2a2a);
     border-width: 1px;
-    border-color: root.primary ? #4f7dc3 : #454545;
+    border-color: !root.enabled ? #383838 : root.primary ? #4f7dc3 : #454545;
 
     pill-label := Text {
         width: 100%;
         height: 100%;
         text: root.label;
-        color: root.primary ? #e8eef8 : #c8c8c8;
+        color: !root.enabled ? #6a6a6a : root.primary ? #e8eef8 : #c8c8c8;
         font-size: 11px;
         horizontal-alignment: center;
         vertical-alignment: center;
     }
     pill-ta := TouchArea {
+        enabled: root.enabled;
+        mouse-cursor: root.enabled ? pointer : default;
         clicked => { root.clicked(); }
     }
 }
@@ -721,6 +754,13 @@ export component AppWindow inherits Window {
 
     in property <[ChatRow]> chat-rows;
     callback approval-resolved(/* row index */ int, /* approved */ bool);
+    // Question wizard (kind 10): option toggles (index == options.length is
+    // the "Other" choice), free-form text edits, and page navigation.
+    callback question-option-toggled(/* row index */ int, /* option */ int);
+    callback question-other-edited(/* row index */ int, /* text */ string);
+    callback question-back(/* row index */ int);
+    callback question-next(/* row index */ int);
+    callback question-skip(/* row index */ int);
     callback tool-toggled(/* row index */ int);
     callback raw-toggled(/* turn */ int);
     callback card-toggled(/* card key */ string);
@@ -1263,7 +1303,7 @@ export component AppWindow inherits Window {
                             property <bool> hdr: row.kind == 7;
                             property <bool> body: row.kind == 0 || row.kind == 1
                                 || row.kind == 3 || row.kind == 4 || row.kind == 6
-                                || row.kind == 9
+                                || row.kind == 9 || row.kind == 10
                                 // Tool cards nested in an assistant card
                                 // indent with the rest of the body.
                                 || (row.kind == 2 && row.card-pos >= 2);
@@ -1279,7 +1319,8 @@ export component AppWindow inherits Window {
                             property <bool> slab: row.kind == 2
                                 || (row.kind == 1 && row.md-kind == 5)
                                 || row.kind == 4
-                                || row.kind == 6 || row.kind == 9;
+                                || row.kind == 6 || row.kind == 9
+                                || row.kind == 10;
 
                             // Tool cards and thinking pills under an
                             // activity-group header (md-indent 1) and
@@ -1305,6 +1346,9 @@ export component AppWindow inherits Window {
                             // pills stay grey.
                             background: hdr && row.tool-name == "You" ? #232c3d
                                 : hdr && row.tool-name == "Agent" ? #1f2a22
+                                // Question wizard: amber while it wants an
+                                // answer, settling to card grey once done.
+                                : row.kind == 10 ? (row.q-done ? #1d1d1d : #262117)
                                 // Thinking pills share the tool-card grey.
                                 : row.kind == 2 || row.kind == 4
                                     || row.kind == 9 || hdr ? #1d1d1d
@@ -1320,9 +1364,10 @@ export component AppWindow inherits Window {
                             border-bottom-left-radius: hdr && row.card-pos == 1 ? 0px : 6px;
                             border-bottom-right-radius: hdr && row.card-pos == 1 ? 0px : 6px;
                             border-width: (row.kind == 1 && row.md-kind == 5)
-                                || row.kind == 6 || hdr ? 1px : 0px;
+                                || row.kind == 6 || row.kind == 10 || hdr ? 1px : 0px;
                             border-color: hdr && row.tool-name == "You" ? #3a4a68
                                 : hdr && row.tool-name == "Agent" ? #33503c
+                                : row.kind == 10 ? (row.q-done ? #3a3f46 : #5a4d2e)
                                 : row.kind == 6 ? #2a2d31
                                 : hdr ? #3a3f46
                                 : #35393f;
@@ -1744,6 +1789,191 @@ export component AppWindow inherits Window {
                                     vertical-alignment: center;
                                 }
                                 Rectangle { horizontal-stretch: 1; }
+                            }
+
+                            // Question wizard: the agent's questions,
+                            // answered one page at a time (radio/checkbox
+                            // options plus a free-form "Other"), with a
+                            // review page before submitting. Once resolved
+                            // it settles into a compact answer summary.
+                            if row.kind == 10: VerticalLayout {
+                                spacing: 8px;
+                                padding: 4px;
+                                // Title bar: form title, page indicator,
+                                // and a skip escape hatch while pending.
+                                HorizontalLayout {
+                                    spacing: 8px;
+                                    Text {
+                                        text: row.text;
+                                        color: row.q-done ? #d0d0d0 : #e5c07b;
+                                        font-size: 11px;
+                                        font-weight: 700;
+                                        vertical-alignment: center;
+                                    }
+                                    Text {
+                                        text: row.meta;
+                                        color: #9a9a9a;
+                                        font-size: 11px;
+                                        vertical-alignment: center;
+                                    }
+                                    Rectangle { horizontal-stretch: 1; }
+                                    if !row.q-done: Text {
+                                        text: "Skip";
+                                        color: skip-ta.has-hover ? #b8b8b8 : #7a7a7a;
+                                        font-size: 11px;
+                                        vertical-alignment: center;
+                                        skip-ta := TouchArea {
+                                            mouse-cursor: pointer;
+                                            clicked => { root.question-skip(idx); }
+                                        }
+                                    }
+                                }
+                                // Question page: prompt + options.
+                                if !row.q-review: Text {
+                                    text: row.q-prompt;
+                                    color: #e8e8e8;
+                                    font-size: 13px;
+                                    font-weight: 600;
+                                    wrap: word-wrap;
+                                }
+                                if !row.q-review: VerticalLayout {
+                                    spacing: 4px;
+                                    for opt[oi] in row.q-options: Rectangle {
+                                        border-radius: 5px;
+                                        border-width: 1px;
+                                        border-color: opt.selected ? #6fa8dc : #3a3f46;
+                                        background: opt.selected ? #24344a
+                                            : opt-ta.has-hover ? #2a2d31 : #202226;
+                                        height: opt-line.preferred-height + 10px;
+                                        opt-ta := TouchArea {
+                                            mouse-cursor: pointer;
+                                            clicked => {
+                                                root.question-option-toggled(idx, oi);
+                                            }
+                                        }
+                                        opt-line := HorizontalLayout {
+                                            padding-left: 10px;
+                                            padding-right: 10px;
+                                            spacing: 8px;
+                                            Text {
+                                                text: row.q-multi
+                                                    ? (opt.selected ? "☑" : "☐")
+                                                    : (opt.selected ? "◉" : "○");
+                                                color: opt.selected ? #6fa8dc : #8a8a8a;
+                                                font-size: 13px;
+                                                vertical-alignment: center;
+                                            }
+                                            Text {
+                                                text: opt.label;
+                                                color: #d4d4d4;
+                                                font-size: 13px;
+                                                vertical-alignment: center;
+                                                wrap: word-wrap;
+                                                horizontal-stretch: 1;
+                                            }
+                                        }
+                                    }
+                                    // The trailing free-form choice.
+                                    Rectangle {
+                                        border-radius: 5px;
+                                        border-width: 1px;
+                                        border-color: row.q-other ? #6fa8dc : #3a3f46;
+                                        background: row.q-other ? #24344a
+                                            : other-ta.has-hover ? #2a2d31 : #202226;
+                                        height: other-line.preferred-height + 10px;
+                                        other-ta := TouchArea {
+                                            mouse-cursor: pointer;
+                                            clicked => {
+                                                root.question-option-toggled(
+                                                    idx, row.q-options.length);
+                                            }
+                                        }
+                                        other-line := HorizontalLayout {
+                                            padding-left: 10px;
+                                            padding-right: 10px;
+                                            spacing: 8px;
+                                            Text {
+                                                text: row.q-multi
+                                                    ? (row.q-other ? "☑" : "☐")
+                                                    : (row.q-other ? "◉" : "○");
+                                                color: row.q-other ? #6fa8dc : #8a8a8a;
+                                                font-size: 13px;
+                                                vertical-alignment: center;
+                                            }
+                                            Text {
+                                                text: "Other";
+                                                color: #d4d4d4;
+                                                font-size: 13px;
+                                                font-italic: true;
+                                                vertical-alignment: center;
+                                                horizontal-stretch: 1;
+                                            }
+                                        }
+                                    }
+                                    if row.q-other: Rectangle {
+                                        border-radius: 5px;
+                                        border-width: 1px;
+                                        border-color: #3a3f46;
+                                        background: #17191c;
+                                        height: other-input.preferred-height + 12px;
+                                        other-input := TextInput {
+                                            x: 10px;
+                                            y: 6px;
+                                            width: parent.width - 20px;
+                                            text: row.q-other-text;
+                                            single-line: false;
+                                            wrap: word-wrap;
+                                            color: #d4d4d4;
+                                            font-size: 13px;
+                                            selection-background-color: #3d5a80;
+                                            edited => {
+                                                root.question-other-edited(idx, self.text);
+                                            }
+                                        }
+                                    }
+                                }
+                                // Review page (pending) / answered summary.
+                                if row.q-review: VerticalLayout {
+                                    spacing: 6px;
+                                    for pair in row.q-summary: VerticalLayout {
+                                        spacing: 1px;
+                                        Text {
+                                            text: pair.prompt;
+                                            color: #9a9a9a;
+                                            font-size: 12px;
+                                            wrap: word-wrap;
+                                        }
+                                        Text {
+                                            text: pair.answer;
+                                            color: #d4d4d4;
+                                            font-size: 13px;
+                                            wrap: word-wrap;
+                                        }
+                                    }
+                                    if row.q-done && row.q-summary.length == 0: Text {
+                                        text: "The questions were skipped.";
+                                        color: #9a9a9a;
+                                        font-size: 12px;
+                                        font-italic: true;
+                                    }
+                                }
+                                // Navigation: Back / Next (last question
+                                // page says Review; the review page Submit).
+                                if !row.q-done: HorizontalLayout {
+                                    alignment: end;
+                                    spacing: 6px;
+                                    if row.q-can-back: PillButton {
+                                        label: "Back";
+                                        clicked => { root.question-back(idx); }
+                                    }
+                                    PillButton {
+                                        label: row.q-review ? "Submit"
+                                            : row.q-last ? "Review" : "Next";
+                                        primary: true;
+                                        enabled: row.q-can-next;
+                                        clicked => { root.question-next(idx); }
+                                    }
+                                }
                             }
                             }
                         }

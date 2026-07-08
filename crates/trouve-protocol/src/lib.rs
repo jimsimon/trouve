@@ -20,7 +20,9 @@ pub use requests::*;
 // (PATCH + session.updated), thread mode/model updates (PATCH +
 // thread.updated), workspace branch listing, and context compaction
 // events (all additive).
-pub const PROTOCOL_VERSION: &str = "0.4";
+// 0.5: added the interactive question flow — question.requested /
+// question.resolved events and POST /v1/questions (additive).
+pub const PROTOCOL_VERSION: &str = "0.5";
 
 pub type WorkspaceId = String;
 pub type SessionId = String;

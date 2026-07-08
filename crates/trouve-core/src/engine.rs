@@ -20,7 +20,7 @@ use trouve_protocol::{
 use trouve_providers::{Message, Provider, ProviderEvent, ToolSpec};
 
 use crate::config::{Config, ProviderConfig};
-use crate::permissions::{allow_key, gate, ApprovalHub, Gate};
+use crate::permissions::{allow_key, gate, ApprovalHub, Gate, QuestionHub};
 use crate::store::{CheckpointRow, Store};
 use crate::tools::{LocalToolExecutor, ToolCtx, ToolExecutor};
 use crate::{context, git, modes, new_id};
@@ -60,6 +60,7 @@ pub struct Engine {
     injected_backends: Mutex<HashMap<String, Arc<dyn AgentBackend>>>,
     executor: Arc<dyn ToolExecutor>,
     approvals: Arc<ApprovalHub>,
+    questions: Arc<QuestionHub>,
     session_locks: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
     config: Mutex<Config>,
     /// Where provider configuration changes are persisted. `None` disables
@@ -269,6 +270,7 @@ impl Engine {
             injected_backends: Mutex::new(HashMap::new()),
             executor: Arc::new(LocalToolExecutor::default()),
             approvals: Arc::new(ApprovalHub::default()),
+            questions: Arc::new(QuestionHub::default()),
             session_locks: Mutex::new(HashMap::new()),
             config: Mutex::new(config.clone()),
             config_file: Some(crate::config::config_path()),
@@ -1560,6 +1562,55 @@ impl Engine {
         }
     }
 
+    // --- questions --------------------------------------------------------------
+
+    /// Answer (or skip, `answers: None`) a pending `question.requested`.
+    pub fn resolve_question(
+        &self,
+        request_id: &str,
+        answers: Option<Vec<trouve_protocol::QuestionAnswer>>,
+    ) -> Result<(), EngineError> {
+        if self.questions.resolve(request_id, answers) {
+            Ok(())
+        } else {
+            Err(EngineError::NotFound(format!(
+                "pending question {request_id}"
+            )))
+        }
+    }
+
+    /// Pose questions to the user and block until they answer or skip.
+    /// Emits `question.requested` / `question.resolved` around the wait.
+    async fn ask_user_questions(
+        &self,
+        thread_id: &str,
+        turn: u64,
+        request_id: &str,
+        title: Option<String>,
+        questions: Vec<trouve_protocol::Question>,
+    ) -> Result<Option<Vec<trouve_protocol::QuestionAnswer>>> {
+        let scope = Scope::Thread(thread_id.to_string());
+        let rx = self.questions.request(request_id);
+        self.store.append_event(
+            scope.clone(),
+            Event::QuestionRequested {
+                turn,
+                request_id: request_id.to_string(),
+                title,
+                questions,
+            },
+        )?;
+        let answers = rx.await.unwrap_or(None);
+        self.store.append_event(
+            scope,
+            Event::QuestionResolved {
+                request_id: request_id.to_string(),
+                answers: answers.clone(),
+            },
+        )?;
+        Ok(answers)
+    }
+
     // --- undo/redo --------------------------------------------------------------
 
     pub async fn undo(self: &Arc<Self>, session_id: &str) -> Result<(), EngineError> {
@@ -1721,14 +1772,17 @@ impl Engine {
         self.store
             .append_message(&thread.id, &serde_json::to_value(Message::User(content))?)?;
 
-        // Tool policy: empty allowed_tools = all registered tools.
-        let specs: Vec<ToolSpec> = self
+        // Tool policy: empty allowed_tools = all registered tools. The
+        // engine-served ask_question tool always rides along (deferring to
+        // the user is an interaction primitive, not a capability).
+        let mut specs: Vec<ToolSpec> = self
             .executor
             .specs(&ctx)
             .await
             .into_iter()
             .filter(|s| mode.allowed_tools.is_empty() || mode.allowed_tools.contains(&s.name))
             .collect();
+        specs.push(ask_question_spec());
 
         let system = context::system_prompt(&mode, self.config_dir.as_deref(), Path::new(&ws.path));
         let mut usage_total = Usage::default();
@@ -1911,13 +1965,16 @@ impl Engine {
     /// (filtered by the thread's mode, same as native turns).
     pub async fn bridged_tool_specs(&self, thread_id: &str) -> Result<Vec<ToolSpec>, EngineError> {
         let (_, _, mode, ctx) = self.bridged_context(thread_id)?;
-        Ok(self
+        let mut specs: Vec<ToolSpec> = self
             .executor
             .specs(&ctx)
             .await
             .into_iter()
             .filter(|s| mode.allowed_tools.is_empty() || mode.allowed_tools.contains(&s.name))
-            .collect())
+            .collect();
+        // Engine-served, always available (see handle_tool_call).
+        specs.push(ask_question_spec());
+        Ok(specs)
     }
 
     /// Execute one tool call on behalf of a bridged vendor agent, through
@@ -2247,6 +2304,26 @@ impl Engine {
                         .await?;
                     let _ = responder.send(approved);
                 }
+                BackendEvent::QuestionsNeeded {
+                    request_id,
+                    title,
+                    questions,
+                    responder,
+                } => {
+                    if !segment.is_empty() {
+                        self.store.append_event(
+                            scope.clone(),
+                            Event::AssistantMessage {
+                                turn,
+                                content: std::mem::take(&mut segment),
+                            },
+                        )?;
+                    }
+                    let answers = self
+                        .ask_user_questions(&thread.id, turn, &request_id, title, questions)
+                        .await?;
+                    let _ = responder.send(answers);
+                }
                 BackendEvent::Completed { usage } => {
                     usage_total.input_tokens += usage.input_tokens;
                     usage_total.output_tokens += usage.output_tokens;
@@ -2449,6 +2526,23 @@ impl Engine {
             call.id.clone()
         };
 
+        // ask_question is engine-served (it blocks on the QuestionHub, which
+        // tools can't reach) and never gated — asking is how the agent defers
+        // to the user, so it works even in read-only modes. No tool card is
+        // emitted: the question wizard is its representation in the UI.
+        if call.name == "ask_question" {
+            let result = match parse_question_args(&call.arguments) {
+                Ok((title, questions)) => {
+                    let answers = self
+                        .ask_user_questions(&thread.id, turn, &call_id, title, questions.clone())
+                        .await?;
+                    question_result_json(&questions, answers)
+                }
+                Err(e) => serde_json::json!({ "error": e }),
+            };
+            return Ok(result.to_string());
+        }
+
         let known = self.executor.tool_mutates(&call.name);
         let allowed_by_mode =
             mode.allowed_tools.is_empty() || mode.allowed_tools.contains(&call.name);
@@ -2593,6 +2687,166 @@ impl Engine {
         )?;
         Ok(Some(checkpoint_id))
     }
+}
+
+/// Tool spec for the engine-served `ask_question` tool (native provider
+/// turns and the MCP bridge expose the same schema).
+pub fn ask_question_spec() -> ToolSpec {
+    ToolSpec {
+        name: "ask_question".into(),
+        description: "Ask the user one or more multiple-choice questions and wait for their \
+                      answers. Use this when you are blocked on a decision only the user can \
+                      make. Each question offers your listed options plus an automatic \
+                      free-form \"Other\" choice; set allow_multiple for checkbox-style \
+                      questions. The user may also skip answering entirely."
+            .into(),
+        parameters: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "title": {
+                    "type": "string",
+                    "description": "Optional short title for the question form."
+                },
+                "questions": {
+                    "type": "array",
+                    "minItems": 1,
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "id": { "type": "string", "description": "Stable id; generated when omitted." },
+                            "prompt": { "type": "string", "description": "The question text." },
+                            "options": {
+                                "type": "array",
+                                "minItems": 2,
+                                "items": {
+                                    "type": "object",
+                                    "properties": {
+                                        "id": { "type": "string" },
+                                        "label": { "type": "string" }
+                                    },
+                                    "required": ["label"]
+                                }
+                            },
+                            "allow_multiple": {
+                                "type": "boolean",
+                                "description": "Allow selecting more than one option."
+                            }
+                        },
+                        "required": ["prompt", "options"]
+                    }
+                }
+            },
+            "required": ["questions"]
+        }),
+    }
+}
+
+/// Parse `ask_question` tool arguments into protocol questions, synthesizing
+/// ids where the model omitted them.
+pub fn parse_question_args(
+    args: &serde_json::Value,
+) -> std::result::Result<(Option<String>, Vec<trouve_protocol::Question>), String> {
+    let title = args
+        .get("title")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.trim().is_empty())
+        .map(str::to_string);
+    let raw = args
+        .get("questions")
+        .and_then(|v| v.as_array())
+        .ok_or("missing questions array")?;
+    let mut questions = Vec::new();
+    for (qi, q) in raw.iter().enumerate() {
+        let prompt = q
+            .get("prompt")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.trim().is_empty())
+            .ok_or_else(|| format!("question {} has no prompt", qi + 1))?;
+        let id = q
+            .get("id")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .unwrap_or_else(|| format!("q{}", qi + 1));
+        let mut options = Vec::new();
+        for (oi, o) in q
+            .get("options")
+            .and_then(|v| v.as_array())
+            .into_iter()
+            .flatten()
+            .enumerate()
+        {
+            // Accept both {id,label} objects and bare strings.
+            let label = o
+                .get("label")
+                .and_then(|v| v.as_str())
+                .or_else(|| o.as_str())
+                .unwrap_or_default()
+                .to_string();
+            if label.trim().is_empty() {
+                continue;
+            }
+            let oid = o
+                .get("id")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+                .unwrap_or_else(|| format!("opt{}", oi + 1));
+            options.push(trouve_protocol::QuestionOption { id: oid, label });
+        }
+        if options.is_empty() {
+            return Err(format!("question {} has no options", qi + 1));
+        }
+        questions.push(trouve_protocol::Question {
+            id,
+            prompt: prompt.to_string(),
+            options,
+            allow_multiple: q
+                .get("allow_multiple")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false),
+        });
+    }
+    if questions.is_empty() {
+        return Err("questions array is empty".into());
+    }
+    Ok((title, questions))
+}
+
+/// Fold question answers into the JSON fed back to the model. Selected
+/// options are echoed as labels (ids may have been synthesized, so labels
+/// are what the model recognizes).
+pub fn question_result_json(
+    questions: &[trouve_protocol::Question],
+    answers: Option<Vec<trouve_protocol::QuestionAnswer>>,
+) -> serde_json::Value {
+    let Some(answers) = answers else {
+        return serde_json::json!({
+            "status": "skipped",
+            "message": "The user declined to answer the questions.",
+        });
+    };
+    let items: Vec<serde_json::Value> = answers
+        .iter()
+        .map(|a| {
+            let q = questions.iter().find(|q| q.id == a.question_id);
+            let selected: Vec<String> = a
+                .selected_option_ids
+                .iter()
+                .map(|id| {
+                    q.and_then(|q| q.options.iter().find(|o| &o.id == id))
+                        .map(|o| o.label.clone())
+                        .unwrap_or_else(|| id.clone())
+                })
+                .collect();
+            serde_json::json!({
+                "question": q.map(|q| q.prompt.as_str()).unwrap_or(a.question_id.as_str()),
+                "selected": selected,
+                "other": a.other_text,
+            })
+        })
+        .collect();
+    serde_json::json!({ "status": "answered", "answers": items })
 }
 
 /// Build a provider from config. Credential resolution order: inline

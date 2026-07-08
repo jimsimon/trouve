@@ -7,7 +7,7 @@
       "name": "MIT",
       "identifier": "MIT"
     },
-    "version": "0.4"
+    "version": "0.5"
   },
   "paths": {
     "/v1/approvals": {
@@ -406,6 +406,37 @@
             }
           },
           "409": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/questions": {
+      "post": {
+        "tags": [],
+        "operationId": "resolve_question",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ResolveQuestionRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "204": {
+            "description": ""
+          },
+          "404": {
             "description": "",
             "content": {
               "application/json": {
@@ -1950,6 +1981,72 @@
           },
           {
             "type": "object",
+            "description": "The agent asked the user one or more questions; the turn is blocked\nuntil `question.resolved`. Clients render an answer wizard.",
+            "required": [
+              "turn",
+              "request_id",
+              "questions",
+              "type"
+            ],
+            "properties": {
+              "questions": {
+                "type": "array",
+                "items": {
+                  "$ref": "#/components/schemas/Question"
+                }
+              },
+              "request_id": {
+                "$ref": "#/components/schemas/String"
+              },
+              "title": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "turn": {
+                "type": "integer",
+                "format": "int64",
+                "minimum": 0
+              },
+              "type": {
+                "type": "string",
+                "enum": [
+                  "question.requested"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "description": "Answers submitted (or `answers: null` when the user skipped).",
+            "required": [
+              "request_id",
+              "type"
+            ],
+            "properties": {
+              "answers": {
+                "type": [
+                  "array",
+                  "null"
+                ],
+                "items": {
+                  "$ref": "#/components/schemas/QuestionAnswer"
+                }
+              },
+              "request_id": {
+                "$ref": "#/components/schemas/String"
+              },
+              "type": {
+                "type": "string",
+                "enum": [
+                  "question.resolved"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
             "description": "The thread's transcript neared the model's context window; the engine\nis summarizing older messages. Clients show a busy indicator.",
             "required": [
               "turn",
@@ -2577,6 +2674,75 @@
           }
         }
       },
+      "Question": {
+        "type": "object",
+        "description": "A single question inside a `question.requested` event. Clients always\noffer a trailing free-form \"Other\" choice in addition to the listed\noptions; its text comes back in [`QuestionAnswer::other_text`].",
+        "required": [
+          "id",
+          "prompt",
+          "options"
+        ],
+        "properties": {
+          "allow_multiple": {
+            "type": "boolean",
+            "description": "Multiple options may be selected (checkboxes instead of radios)."
+          },
+          "id": {
+            "type": "string"
+          },
+          "options": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/QuestionOption"
+            }
+          },
+          "prompt": {
+            "type": "string"
+          }
+        }
+      },
+      "QuestionAnswer": {
+        "type": "object",
+        "description": "The user's answer to one [`Question`].",
+        "required": [
+          "question_id"
+        ],
+        "properties": {
+          "other_text": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Free-form text when the user picked \"Other\"."
+          },
+          "question_id": {
+            "type": "string"
+          },
+          "selected_option_ids": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Ids of the selected options (at most one unless `allow_multiple`)."
+          }
+        }
+      },
+      "QuestionOption": {
+        "type": "object",
+        "description": "One choice offered by a [`Question`].",
+        "required": [
+          "id",
+          "label"
+        ],
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "label": {
+            "type": "string"
+          }
+        }
+      },
       "RegisterWorkspaceRequest": {
         "type": "object",
         "required": [
@@ -2607,6 +2773,27 @@
           },
           "decision": {
             "$ref": "#/components/schemas/ApprovalDecision"
+          }
+        }
+      },
+      "ResolveQuestionRequest": {
+        "type": "object",
+        "description": "Answers for a pending `question.requested`. `answers: null` skips the\nquestions (the agent is told the user declined to answer).",
+        "required": [
+          "request_id"
+        ],
+        "properties": {
+          "answers": {
+            "type": [
+              "array",
+              "null"
+            ],
+            "items": {
+              "$ref": "#/components/schemas/QuestionAnswer"
+            }
+          },
+          "request_id": {
+            "$ref": "#/components/schemas/String"
           }
         }
       },

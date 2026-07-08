@@ -391,6 +391,9 @@ async fn handle_msg(
             Ok(())
         }
         ServerMsg::Request { id, method, params } => {
+            if method == "cursor/ask_question" {
+                return handle_ask_question(server, id, &params, tx).await;
+            }
             if method != "session/request_permission" {
                 // Unknown server request: refuse rather than hang.
                 server
@@ -446,6 +449,99 @@ fn permission_option(params: &Value, allow: bool) -> String {
 
 fn permission_outcome(option_id: String) -> Value {
     json!({ "outcome": { "outcome": "selected", "optionId": option_id } })
+}
+
+/// Bridge a `cursor/ask_question` extension request into
+/// [`BackendEvent::QuestionsNeeded`] and answer with cursor's outcome shape.
+/// The agent blocks its turn on this response.
+///
+/// As of cursor-agent 2026.07.01, Cursor's backend does not include the
+/// AskQuestion tool in the model's toolset on the ACP surface (any mode, any
+/// model — probed empirically; there is no client-side capability to request
+/// it, and the `ask_question_all_modes` flag is server-assigned). This
+/// handler is ready for when Cursor enables it; until then cursor models
+/// ask questions as plain text.
+async fn handle_ask_question(
+    server: &AcpServer,
+    id: Value,
+    params: &Value,
+    tx: &mpsc::Sender<Result<BackendEvent, BackendError>>,
+) -> Result<(), ()> {
+    let questions: Vec<trouve_protocol::Question> = params["questions"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .enumerate()
+        .filter_map(|(qi, q)| {
+            let prompt = q["prompt"].as_str()?.to_string();
+            let options: Vec<trouve_protocol::QuestionOption> = q["options"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|o| {
+                    Some(trouve_protocol::QuestionOption {
+                        id: o["id"].as_str()?.to_string(),
+                        label: o["label"].as_str().unwrap_or_default().to_string(),
+                    })
+                })
+                .collect();
+            Some(trouve_protocol::Question {
+                id: q["id"]
+                    .as_str()
+                    .map(str::to_string)
+                    .unwrap_or_else(|| format!("q{}", qi + 1)),
+                prompt,
+                options,
+                allow_multiple: q["allowMultiple"].as_bool().unwrap_or(false),
+            })
+        })
+        .collect();
+    if questions.is_empty() {
+        server
+            .respond(
+                id,
+                json!({ "outcome": { "outcome": "skipped", "reason": "no questions" } }),
+            )
+            .await;
+        return Ok(());
+    }
+    let title = params["title"]
+        .as_str()
+        .filter(|t| !t.trim().is_empty())
+        .map(str::to_string);
+    let request_id = params["toolCallId"]
+        .as_str()
+        .filter(|c| !c.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| format!("q_{}", std::process::id()));
+    let (ans_tx, ans_rx) = oneshot::channel();
+    tx.send(Ok(BackendEvent::QuestionsNeeded {
+        request_id,
+        title,
+        questions,
+        responder: ans_tx,
+    }))
+    .await
+    .map_err(|_| ())?;
+    let outcome = match ans_rx.await.unwrap_or(None) {
+        Some(answers) => {
+            let answers: Vec<Value> = answers
+                .into_iter()
+                .map(|a| {
+                    json!({
+                        "questionId": a.question_id,
+                        "selectedOptionIds": a.selected_option_ids,
+                        // Older cursor-agent builds drop this; harmless.
+                        "freeformText": a.other_text,
+                    })
+                })
+                .collect();
+            json!({ "outcome": { "outcome": "answered", "answers": answers } })
+        }
+        None => json!({ "outcome": { "outcome": "skipped", "reason": "User skipped questions" } }),
+    };
+    server.respond(id, outcome).await;
+    Ok(())
 }
 
 /// Map one `session/update` payload to zero or more backend events.
@@ -652,6 +748,10 @@ struct AcpServer {
     /// session-less request (answered by the reader); the stashed content
     /// becomes the plan tool's result when its completion update lands.
     plans: Arc<Mutex<HashMap<String, Value>>>,
+    /// Tool call id → session id, recorded from `session/update`
+    /// notifications: session-less requests like `cursor/ask_question` only
+    /// carry a toolCallId, so this is how they find their session's route.
+    calls: Arc<Mutex<HashMap<String, String>>>,
     /// Held so the child (kill_on_drop) lives as long as the server handle.
     _child: Child,
     closed: Arc<std::sync::atomic::AtomicBool>,
@@ -685,6 +785,7 @@ impl AcpServer {
             sessions: Mutex::new(HashSet::new()),
             config_lock: Mutex::new(()),
             plans: Arc::new(Mutex::new(HashMap::new())),
+            calls: Arc::new(Mutex::new(HashMap::new())),
             _child: child,
             closed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         };
@@ -701,6 +802,7 @@ impl AcpServer {
         let closed = self.closed.clone();
         let pending = self.pending.clone();
         let plans = self.plans.clone();
+        let calls = self.calls.clone();
         let stdin = self.stdin.clone();
         tokio::spawn(async move {
             let mut lines = BufReader::new(stdout).lines();
@@ -752,7 +854,26 @@ impl AcpServer {
                         let _ = stdin.flush().await;
                         continue;
                     }
-                    let session_id = params["sessionId"].as_str().unwrap_or("").to_string();
+                    let mut session_id = params["sessionId"].as_str().unwrap_or("").to_string();
+                    // Remember which session owns each tool call: extension
+                    // requests like cursor/ask_question are session-less and
+                    // find their route through the toolCallId.
+                    if method == "session/update" && !session_id.is_empty() {
+                        if let Some(call_id) = params["update"]["toolCallId"].as_str() {
+                            let mut calls = calls.lock().await;
+                            calls.insert(call_id.to_string(), session_id.clone());
+                            if calls.len() > 4096 {
+                                calls.clear(); // crude bound; live calls re-register
+                            }
+                        }
+                    }
+                    if session_id.is_empty() {
+                        if let Some(call_id) = params["toolCallId"].as_str() {
+                            if let Some(owner) = calls.lock().await.get(call_id) {
+                                session_id = owner.clone();
+                            }
+                        }
+                    }
                     let routed = {
                         let routes = routes.lock().await;
                         routes.get(&session_id).cloned()

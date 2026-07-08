@@ -202,6 +202,27 @@ impl ProtocolClient {
         Ok(())
     }
 
+    /// Answer (or skip, `answers: None`) a pending question request.
+    pub async fn resolve_question(
+        &self,
+        request_id: &str,
+        answers: Option<Vec<trouve_protocol::QuestionAnswer>>,
+    ) -> Result<()> {
+        let resp = self
+            .http
+            .post(format!("{}/questions", self.base))
+            .json(&trouve_protocol::ResolveQuestionRequest {
+                request_id: request_id.into(),
+                answers,
+            })
+            .send()
+            .await?;
+        if !resp.status().is_success() {
+            bail!("question answer failed: {}", resp.status());
+        }
+        Ok(())
+    }
+
     pub async fn undo(&self, session_id: &str) -> Result<()> {
         self.post_empty(&format!("/sessions/{session_id}/undo"))
             .await

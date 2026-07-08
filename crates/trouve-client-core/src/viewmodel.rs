@@ -4,7 +4,9 @@
 
 use std::collections::HashMap;
 
-use trouve_protocol::{ApprovalDecision, Event, EventEnvelope, ToolStatus, Usage};
+use trouve_protocol::{
+    ApprovalDecision, Event, EventEnvelope, Question, QuestionAnswer, ToolStatus, Usage,
+};
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum ChatItem {
@@ -35,6 +37,15 @@ pub enum ChatItem {
         turn: u64,
         state: TurnState,
     },
+    /// The agent asked the user questions; while `answers` is `None` the
+    /// turn is blocked and clients render the answer wizard.
+    Questions {
+        request_id: String,
+        title: Option<String>,
+        questions: Vec<Question>,
+        /// Populated by `question.resolved` (inner `None` = skipped).
+        answers: Option<Option<Vec<QuestionAnswer>>>,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -62,6 +73,8 @@ pub struct ThreadViewModel {
     pub cursor: u64,
     /// Call ids currently waiting for approval (newest last).
     pub pending_approvals: Vec<String>,
+    /// Question request ids currently waiting for answers (newest last).
+    pub pending_questions: Vec<String>,
     /// Usage of the most recently completed turn; its input token count is
     /// the best available proxy for current context size.
     pub last_usage: Option<Usage>,
@@ -279,10 +292,44 @@ impl ThreadViewModel {
                 self.pending_approvals.retain(|c| c != call_id);
                 idx
             }
+            Event::QuestionRequested {
+                request_id,
+                title,
+                questions,
+                ..
+            } => {
+                self.finish_thinking();
+                if !self.pending_questions.contains(request_id) {
+                    self.pending_questions.push(request_id.clone());
+                }
+                self.items.push(ChatItem::Questions {
+                    request_id: request_id.clone(),
+                    title: title.clone(),
+                    questions: questions.clone(),
+                    answers: None,
+                });
+                Some(self.items.len() - 1)
+            }
+            Event::QuestionResolved {
+                request_id,
+                answers,
+            } => {
+                self.pending_questions.retain(|r| r != request_id);
+                let idx = self.items.iter().rposition(|i| {
+                    matches!(i, ChatItem::Questions { request_id: r, .. } if r == request_id)
+                });
+                if let Some(idx) = idx {
+                    if let ChatItem::Questions { answers: a, .. } = &mut self.items[idx] {
+                        *a = Some(answers.clone());
+                    }
+                }
+                idx
+            }
             Event::TurnCompleted { turn, usage, .. } => {
                 self.turn_running = false;
                 self.compacting = false;
                 self.finish_thinking();
+                self.pending_questions.clear();
                 self.last_usage = Some(usage.clone());
                 let idx = self.items.iter().rposition(|i| {
                     matches!(i, ChatItem::TurnStatus { turn: t, state: TurnState::Running } if t == turn)
@@ -301,6 +348,7 @@ impl ThreadViewModel {
                 self.turn_running = false;
                 self.compacting = false;
                 self.finish_thinking();
+                self.pending_questions.clear();
                 let idx = self.items.iter().rposition(|i| {
                     matches!(i, ChatItem::TurnStatus { turn: t, state: TurnState::Running } if t == turn)
                 });
@@ -554,6 +602,71 @@ mod tests {
             .filter(|i| matches!(i, ChatItem::Thinking { .. }))
             .count();
         assert_eq!(thinking_blocks, 2);
+    }
+
+    #[test]
+    fn questions_fold_into_a_wizard_item_and_resolve() {
+        let mut vm = ThreadViewModel::new();
+        let questions = vec![Question {
+            id: "q1".into(),
+            prompt: "Favorite color?".into(),
+            options: vec![
+                trouve_protocol::QuestionOption {
+                    id: "red".into(),
+                    label: "Red".into(),
+                },
+                trouve_protocol::QuestionOption {
+                    id: "blue".into(),
+                    label: "Blue".into(),
+                },
+            ],
+            allow_multiple: false,
+        }];
+        vm.apply(&env(Event::QuestionRequested {
+            turn: 1,
+            request_id: "qr_1".into(),
+            title: Some("Quick check".into()),
+            questions: questions.clone(),
+        }));
+        assert_eq!(vm.pending_questions, vec!["qr_1".to_string()]);
+        assert!(matches!(
+            vm.items.last().unwrap(),
+            ChatItem::Questions { answers: None, .. }
+        ));
+
+        let answers = vec![QuestionAnswer {
+            question_id: "q1".into(),
+            selected_option_ids: vec!["red".into()],
+            other_text: None,
+        }];
+        vm.apply(&env(Event::QuestionResolved {
+            request_id: "qr_1".into(),
+            answers: Some(answers.clone()),
+        }));
+        assert!(vm.pending_questions.is_empty());
+        assert!(matches!(
+            vm.items.last().unwrap(),
+            ChatItem::Questions { answers: Some(Some(a)), .. } if *a == answers
+        ));
+
+        // A skipped request resolves with inner None.
+        vm.apply(&env(Event::QuestionRequested {
+            turn: 1,
+            request_id: "qr_2".into(),
+            title: None,
+            questions,
+        }));
+        vm.apply(&env(Event::QuestionResolved {
+            request_id: "qr_2".into(),
+            answers: None,
+        }));
+        assert!(matches!(
+            vm.items.last().unwrap(),
+            ChatItem::Questions {
+                answers: Some(None),
+                ..
+            }
+        ));
     }
 
     #[test]
