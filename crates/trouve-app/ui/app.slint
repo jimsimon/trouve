@@ -14,6 +14,7 @@ import { CodeView, TextSegment } from "code-view.slint";
 import {
     SettingsScreen, ProviderItem, CliItem, KnownProviderItem
 } from "settings-window.slint";
+import { ScrollKeys } from "scroll-keys.slint";
 
 export { DiffRow, TextSegment, ProviderItem, CliItem, KnownProviderItem }
 
@@ -1088,6 +1089,10 @@ export component AppWindow inherits Window {
     callback quit-when-idle();
 
     HorizontalLayout {
+        // Hidden (not removed — the chat list keeps its scroll state) while
+        // the full-window settings screen is up.
+        visible: root.center-screen != 3;
+
         // ---------------- left: sessions ----------------
         Rectangle {
             width: root.left-width;
@@ -1112,8 +1117,12 @@ export component AppWindow inherits Window {
                     }
                 }
 
-                ListView {
+                ScrollKeys {
                     vertical-stretch: 1;
+                    target-y <=> nav-list.viewport-y;
+                    page: nav-list.visible-height;
+                    total: nav-list.viewport-height;
+                nav-list := ListView {
                     // Scrolling can move/recycle a hovered button without a
                     // hover-out; drop any tooltip it left behind.
                     changed viewport-y => { Tip.hide-all(); }
@@ -1342,6 +1351,7 @@ export component AppWindow inherits Window {
                         }
                     }
                 }
+                }
 
                 // Footer: settings + status.
                 HorizontalLayout {
@@ -1379,6 +1389,13 @@ export component AppWindow inherits Window {
             // *inside* this layout so the session's tab strip stays put —
             // the form lives in a provisional tab instead of replacing the
             // whole screen.
+            // Wrapping the composer too means paging keys rejected by the
+            // prompt's TextInput bubble here and scroll the chat.
+            ScrollKeys {
+            active: root.center-screen == 0;
+            target-y <=> chat-list.viewport-y;
+            page: chat-list.visible-height;
+            total: chat-list.viewport-height;
             VerticalLayout {
                 visible: root.center-screen == 0 || root.center-screen == 2;
                 padding: 10px;
@@ -1481,7 +1498,17 @@ export component AppWindow inherits Window {
                     height: 100%;
                     // Scrolling can move/recycle a hovered button without a
                     // hover-out; drop any tooltip it left behind.
-                    changed viewport-y => { Tip.hide-all(); }
+                    changed viewport-y => {
+                        Tip.hide-all();
+                        // A scroll that leaves the tail ends following.
+                        // Without this the height re-estimation pin below
+                        // keeps snapping the view back to the bottom,
+                        // fighting the scrollbar (it looks stuck and
+                        // wiggles) after any at-the-tail re-render.
+                        if (root.chat-follow && !root.chat-at-bottom) {
+                            root.chat-follow = false;
+                        }
+                    }
                     // Keep the tail (activity spinner) on screen as rows
                     // grow during streaming; see chat-follow.
                     changed viewport-height => {
@@ -2535,6 +2562,7 @@ export component AppWindow inherits Window {
                     }
                 }
             }
+            }
 
             // ----- new-session screen (no session context to keep) -----
             if root.center-screen == 1: NewChatForm {
@@ -2558,27 +2586,6 @@ export component AppWindow inherits Window {
                 model-filter(q) => { root.model-filter-changed(q); }
             }
 
-            // ----- settings screen (replaces the chat until closed) -----
-            if root.center-screen == 3: SettingsScreen {
-                providers: root.settings-providers;
-                clis: root.settings-clis;
-                known-providers: root.settings-known-providers;
-                known-provider-names: root.settings-known-provider-names;
-                models: root.settings-models;
-                default-model-index: root.settings-default-model-index;
-                modes: root.settings-modes;
-                settings-status: root.settings-status;
-                preset-index <=> root.settings-preset-index;
-                provider-saved(id, kind, url, key) => {
-                    root.provider-saved(id, kind, url, key);
-                }
-                provider-deleted(id) => { root.provider-deleted(id); }
-                provider-login(id) => { root.provider-login(id); }
-                default-model-picked(i) => { root.default-model-picked(i); }
-                refresh-settings => { root.refresh-settings(); }
-                cli-install(id) => { root.cli-install(id); }
-                close => { root.close-settings(); }
-            }
         }
 
         SplitterHandle {
@@ -2653,8 +2660,12 @@ export component AppWindow inherits Window {
                         spacing: 6px;
                         // Worktree tree: folders expand in place, children
                         // indented underneath (IDE-style explorer).
-                        ListView {
+                        ScrollKeys {
                             height: 220px;
+                            target-y <=> file-tree.viewport-y;
+                            page: file-tree.visible-height;
+                            total: file-tree.viewport-height;
+                        file-tree := ListView {
                             for entry[idx] in root.file-entries: Rectangle {
                                 height: 22px;
                                 background: entry-ta.has-hover ? #26282c : transparent;
@@ -2689,6 +2700,7 @@ export component AppWindow inherits Window {
                                     }
                                 }
                             }
+                        }
                         }
                         HorizontalLayout {
                             spacing: 6px;
@@ -2729,8 +2741,12 @@ export component AppWindow inherits Window {
                         }
                         // Rendered markdown preview: the chat's block rows
                         // (headings, lists, fenced code with highlighting).
-                        if root.file-preview: ListView {
+                        if root.file-preview: ScrollKeys {
                             vertical-stretch: 1;
+                            target-y <=> md-preview.viewport-y;
+                            page: md-preview.visible-height;
+                            total: md-preview.viewport-height;
+                        md-preview := ListView {
                             changed viewport-y => { Tip.hide-all(); }
                             for row in root.file-preview-rows: VerticalLayout {
                                 padding-top: 3px;
@@ -2792,10 +2808,35 @@ export component AppWindow inherits Window {
                                 }
                             }
                         }
+                        }
                     }
                 }
             }
         }
+    }
+
+    // ---------------- settings screen (full-window) ----------------
+    if root.center-screen == 3: SettingsScreen {
+        width: 100%;
+        height: 100%;
+        providers: root.settings-providers;
+        clis: root.settings-clis;
+        known-providers: root.settings-known-providers;
+        known-provider-names: root.settings-known-provider-names;
+        models: root.settings-models;
+        default-model-index: root.settings-default-model-index;
+        modes: root.settings-modes;
+        settings-status: root.settings-status;
+        preset-index <=> root.settings-preset-index;
+        provider-saved(id, kind, url, key) => {
+            root.provider-saved(id, kind, url, key);
+        }
+        provider-deleted(id) => { root.provider-deleted(id); }
+        provider-login(id) => { root.provider-login(id); }
+        default-model-picked(i) => { root.default-model-picked(i); }
+        refresh-settings => { root.refresh-settings(); }
+        cli-install(id) => { root.cli-install(id); }
+        close => { root.close-settings(); }
     }
 
     // ---------------- modal overlays (rename / delete) ----------------

@@ -109,10 +109,43 @@ export component CodeView inherits Rectangle {
         }
     }
 
+    // Keyboard scrolling (viewer gains focus on click). Home/End and the
+    // macOS ⌘↑/⌘↓ equivalents jump; PageUp/PageDown page; arrows nudge.
+    function scroll-to(y: length) {
+        list.viewport-y = clamp(
+            y, min(0px, list.visible-height - list.viewport-height), 0px);
+    }
+
     focus-scope := FocusScope {
         key-pressed(event) => {
             if (event.text == "c" && event.modifiers.control && root.has-selection) {
                 root.copy-requested();
+                return accept;
+            }
+            if (event.text == Key.PageDown) {
+                root.scroll-to(list.viewport-y - max(40px, list.visible-height - 40px));
+                return accept;
+            }
+            if (event.text == Key.PageUp) {
+                root.scroll-to(list.viewport-y + max(40px, list.visible-height - 40px));
+                return accept;
+            }
+            if (event.text == Key.Home
+                || (event.text == Key.UpArrow && event.modifiers.meta)) {
+                root.scroll-to(0px);
+                return accept;
+            }
+            if (event.text == Key.End
+                || (event.text == Key.DownArrow && event.modifiers.meta)) {
+                root.scroll-to(list.visible-height - list.viewport-height);
+                return accept;
+            }
+            if (event.text == Key.UpArrow) {
+                root.scroll-to(list.viewport-y + root.line-height * 3);
+                return accept;
+            }
+            if (event.text == Key.DownArrow) {
+                root.scroll-to(list.viewport-y - root.line-height * 3);
                 return accept;
             }
             reject

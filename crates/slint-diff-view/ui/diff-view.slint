@@ -28,8 +28,47 @@ export component DiffView inherits Rectangle {
     callback file-toggled(int);
 
     background: #1e1e1e;
+    forward-focus: keys;
 
-    ListView {
+    // Keyboard scrolling (the view gains focus when clicked). Home/End and
+    // the macOS ⌘↑/⌘↓ equivalents jump; PageUp/PageDown page; arrows nudge.
+    function scroll-to(y: length) {
+        list.viewport-y = clamp(
+            y, min(0px, list.visible-height - list.viewport-height), 0px);
+    }
+
+    keys := FocusScope {
+        key-pressed(event) => {
+            if (event.text == Key.PageDown) {
+                root.scroll-to(list.viewport-y - max(40px, list.visible-height - 40px));
+                return accept;
+            }
+            if (event.text == Key.PageUp) {
+                root.scroll-to(list.viewport-y + max(40px, list.visible-height - 40px));
+                return accept;
+            }
+            if (event.text == Key.Home
+                || (event.text == Key.UpArrow && event.modifiers.meta)) {
+                root.scroll-to(0px);
+                return accept;
+            }
+            if (event.text == Key.End
+                || (event.text == Key.DownArrow && event.modifiers.meta)) {
+                root.scroll-to(list.visible-height - list.viewport-height);
+                return accept;
+            }
+            if (event.text == Key.UpArrow) {
+                root.scroll-to(list.viewport-y + root.line-height * 3);
+                return accept;
+            }
+            if (event.text == Key.DownArrow) {
+                root.scroll-to(list.viewport-y - root.line-height * 3);
+                return accept;
+            }
+            reject
+        }
+
+    list := ListView {
         for row[idx] in root.rows: Rectangle {
             height: root.line-height;
             background: row.kind == 0 ? #2d2d2d
@@ -88,5 +127,6 @@ export component DiffView inherits Rectangle {
                 }
             }
         }
+    }
     }
 }

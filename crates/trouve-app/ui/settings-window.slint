@@ -1,14 +1,16 @@
-// Settings screen: provider configuration, default model, agent modes, and
-// the About section (AboutSlint attribution lives here, reachable from the
-// left-column footer — royalty-free license requirement). Rendered in the
-// main window's center area (replacing the chat) rather than as a separate
-// window; the header's Close button returns to the previous screen.
+// Settings screen: provider configuration (incl. vendor CLIs), default
+// model, agent modes, and the About section (AboutSlint attribution lives
+// here, reachable from the left-column footer — royalty-free license
+// requirement). Rendered full-window over the main layout; a side nav
+// switches between sections and the header's Close button returns to the
+// previous screen.
 //
 // Like the main window, this is dumb: models in, callbacks out.
 
 import {
     AboutSlint, Button, ComboBox, LineEdit, ListView, ScrollView
 } from "std-widgets.slint";
+import { ScrollKeys } from "scroll-keys.slint";
 
 export struct ProviderItem {
     id: string,
@@ -89,6 +91,10 @@ export component SettingsScreen inherits Rectangle {
     callback cli-install(/* id */ string);
     callback close();
 
+    // Side-nav selection: 0 providers, 1 models, 2 modes, 3 about.
+    property <int> section: 0;
+    property <[string]> section-names: ["Providers", "Models", "Modes", "About"];
+
     VerticalLayout {
         // Header: title + a way back to wherever the user came from.
         Rectangle {
@@ -116,309 +122,381 @@ export component SettingsScreen inherits Rectangle {
             }
         }
 
-    ScrollView {
-        VerticalLayout {
-            padding: 16px;
-            spacing: 12px;
+        // Centered fixed-width block: section nav on the left, the active
+        // section's content beside it.
+        HorizontalLayout {
+            vertical-stretch: 1;
+            Rectangle { horizontal-stretch: 1; }
 
-            // ---------------- providers ----------------
-            HorizontalLayout {
-                Text {
-                    text: "Providers";
-                    color: #e8e8e8;
-                    font-size: 16px;
-                    font-weight: 700;
-                    vertical-alignment: center;
-                    horizontal-stretch: 1;
-                }
-                Button {
-                    text: "Refresh";
-                    clicked => { root.refresh-settings(); }
+            // ---------------- section nav ----------------
+            VerticalLayout {
+                width: 170px;
+                padding-top: 20px;
+                padding-right: 12px;
+                spacing: 2px;
+                alignment: start;
+                for name[i] in root.section-names: Rectangle {
+                    height: 32px;
+                    border-radius: 6px;
+                    background: root.section == i ? #2b3d55
+                        : section-ta.has-hover ? #242424 : transparent;
+                    section-ta := TouchArea {
+                        clicked => { root.section = i; }
+                    }
+                    Text {
+                        x: 12px;
+                        width: parent.width - 24px;
+                        height: 100%;
+                        text: name;
+                        color: root.section == i ? #e8eef8 : #b8b8b8;
+                        font-size: 13px;
+                        vertical-alignment: center;
+                        overflow: elide;
+                    }
                 }
             }
 
+            // ---------------- section content ----------------
             Rectangle {
-                background: #1e1e1e;
-                border-radius: 6px;
-                height: 150px;
-                ListView {
-                    for provider in root.providers: Rectangle {
-                        height: 34px;
-                        HorizontalLayout {
-                            padding-left: 10px;
-                            padding-right: 6px;
-                            spacing: 8px;
-                            Text {
-                                text: provider.id;
-                                color: #e0e0e0;
-                                font-size: 13px;
-                                font-weight: 700;
-                                vertical-alignment: center;
-                                width: 110px;
-                                overflow: elide;
-                            }
-                            Text {
-                                text: provider.kind
-                                    + (provider.base-url != "" ? "  ·  " + provider.base-url : "");
-                                color: #9a9a9a;
-                                font-size: 12px;
-                                vertical-alignment: center;
-                                overflow: elide;
-                                horizontal-stretch: 1;
-                            }
-                            if provider.experimental: Text {
-                                text: "⚠ experimental";
-                                color: #e08787;
-                                font-size: 11px;
-                                vertical-alignment: center;
-                            }
-                            Text {
-                                text: provider.auth == "oauth"
-                                    ? (provider.has-credentials ? "✓ logged in" : "not logged in")
-                                    : (provider.auth == "cli"
-                                        ? (provider.has-credentials ? "✓ CLI ready" : "CLI not set up")
-                                        : (provider.has-credentials ? "✓ credentials" : "no credentials"));
-                                color: provider.has-credentials ? #7fd18a : #e5c07b;
-                                font-size: 11px;
-                                vertical-alignment: center;
-                            }
-                            if provider.auth == "oauth" || provider.auth == "cli": Button {
-                                text: provider.has-credentials ? "Re-login" : "Log in";
-                                clicked => { root.provider-login(provider.id); }
-                            }
-                            Button {
-                                text: "Edit";
-                                clicked => {
-                                    root.preset-index = root.known-providers.length;
-                                    root.form-id = provider.id;
-                                    root.form-base-url = provider.base-url;
-                                    root.form-kind-index = provider.kind == "anthropic" ? 1 : 0;
-                                    root.form-kind = provider.kind;
-                                    root.form-hint = "";
-                                    root.form-warning = false;
+                width: 640px;
+                ScrollKeys {
+                    target-y <=> body.viewport-y;
+                    page: body.visible-height;
+                    total: body.viewport-height;
+                body := ScrollView {
+                    width: 100%;
+                    height: 100%;
+                    VerticalLayout {
+                        padding: 16px;
+                        spacing: 12px;
+                        alignment: start;
+
+                        // ---------------- providers ----------------
+                        if root.section == 0: VerticalLayout {
+                            spacing: 12px;
+
+                            HorizontalLayout {
+                                Text {
+                                    text: "Providers";
+                                    color: #e8e8e8;
+                                    font-size: 16px;
+                                    font-weight: 700;
+                                    vertical-alignment: center;
+                                    horizontal-stretch: 1;
+                                }
+                                Button {
+                                    text: "Refresh";
+                                    clicked => { root.refresh-settings(); }
                                 }
                             }
-                            Button {
-                                text: "Remove";
-                                clicked => { root.provider-deleted(provider.id); }
+
+                            Rectangle {
+                                background: #1e1e1e;
+                                border-radius: 6px;
+                                height: 150px;
+                                ListView {
+                                    for provider in root.providers: Rectangle {
+                                        height: 34px;
+                                        HorizontalLayout {
+                                            padding-left: 10px;
+                                            padding-right: 6px;
+                                            spacing: 8px;
+                                            Text {
+                                                text: provider.id;
+                                                color: #e0e0e0;
+                                                font-size: 13px;
+                                                font-weight: 700;
+                                                vertical-alignment: center;
+                                                width: 110px;
+                                                overflow: elide;
+                                            }
+                                            Text {
+                                                text: provider.kind
+                                                    + (provider.base-url != "" ? "  ·  " + provider.base-url : "");
+                                                color: #9a9a9a;
+                                                font-size: 12px;
+                                                vertical-alignment: center;
+                                                overflow: elide;
+                                                horizontal-stretch: 1;
+                                            }
+                                            if provider.experimental: Text {
+                                                text: "⚠ experimental";
+                                                color: #e08787;
+                                                font-size: 11px;
+                                                vertical-alignment: center;
+                                            }
+                                            Text {
+                                                text: provider.auth == "oauth"
+                                                    ? (provider.has-credentials ? "✓ logged in" : "not logged in")
+                                                    : (provider.auth == "cli"
+                                                        ? (provider.has-credentials ? "✓ CLI ready" : "CLI not set up")
+                                                        : (provider.has-credentials ? "✓ credentials" : "no credentials"));
+                                                color: provider.has-credentials ? #7fd18a : #e5c07b;
+                                                font-size: 11px;
+                                                vertical-alignment: center;
+                                            }
+                                            if provider.auth == "oauth" || provider.auth == "cli": Button {
+                                                text: provider.has-credentials ? "Re-login" : "Log in";
+                                                clicked => { root.provider-login(provider.id); }
+                                            }
+                                            Button {
+                                                text: "Edit";
+                                                clicked => {
+                                                    root.preset-index = root.known-providers.length;
+                                                    root.form-id = provider.id;
+                                                    root.form-base-url = provider.base-url;
+                                                    root.form-kind-index = provider.kind == "anthropic" ? 1 : 0;
+                                                    root.form-kind = provider.kind;
+                                                    root.form-hint = "";
+                                                    root.form-warning = false;
+                                                }
+                                            }
+                                            Button {
+                                                text: "Remove";
+                                                clicked => { root.provider-deleted(provider.id); }
+                                            }
+                                        }
+                                    }
+                                }
                             }
-                        }
-                    }
-                }
-            }
 
-            // Provider add/edit form.
-            Text {
-                text: "Add or edit a provider";
-                color: #c8c8c8;
-                font-size: 13px;
-                font-weight: 700;
-            }
-            // Provider picker: a known preset prefills (and hides) the id /
-            // protocol / URL details; "Custom" shows them for hand entry.
-            preset-box := ComboBox {
-                model: root.known-provider-names;
-                current-index <=> root.preset-index;
-                selected => {
-                    if (!root.preset-is-custom) {
-                        root.form-id = root.known-providers[root.preset-index].id;
-                        root.form-base-url = root.known-providers[root.preset-index].base-url;
-                        root.form-kind = root.known-providers[root.preset-index].kind;
-                        root.form-kind-index =
-                            root.known-providers[root.preset-index].kind == "anthropic" ? 1 : 0;
-                        root.form-warning = root.known-providers[root.preset-index].experimental;
-                        root.form-hint =
-                            root.known-providers[root.preset-index].experimental
-                            ? "Experimental: talks to an undocumented vendor endpoint using your `codex login` token. OpenAI may break or restrict it at any time — use at your own risk. Save, then log in via the Codex CLI."
-                            : (root.known-providers[root.preset-index].auth == "cli"
-                                ? "Subscription via the vendor's CLI: install it, save, then click \"Log in\" in the list above (or log in from a terminal)."
-                                : (root.known-providers[root.preset-index].auth == "oauth"
-                                    ? "Subscription login: save, then click \"Log in\" in the list above."
-                                    : (root.known-providers[root.preset-index].auth == "api-key"
-                                        ? "Paste your API key below and save. Also honors the "
-                                            + root.known-providers[root.preset-index].api-key-env
-                                            + " environment variable."
-                                        : "No API key needed — just save.")));
-                    } else {
-                        root.form-kind = root.form-kind-index == 1 ? "anthropic" : "openai-compat";
-                        root.form-hint = "";
-                        root.form-warning = false;
-                    }
-                }
-            }
-            if root.preset-is-custom: HorizontalLayout {
-                spacing: 8px;
-                LineEdit {
-                    width: 150px;
-                    placeholder-text: "id (e.g. openai)";
-                    text <=> root.form-id;
-                }
-                ComboBox {
-                    width: 150px;
-                    model: ["openai-compat", "anthropic"];
-                    current-index <=> root.form-kind-index;
-                    selected => {
-                        root.form-kind = root.form-kind-index == 1 ? "anthropic" : "openai-compat";
-                    }
-                }
-                LineEdit {
-                    horizontal-stretch: 1;
-                    placeholder-text: "base URL (optional)";
-                    text <=> root.form-base-url;
-                }
-            }
-            HorizontalLayout {
-                spacing: 8px;
-                key-edit := LineEdit {
-                    horizontal-stretch: 1;
-                    visible: root.preset-auth == "api-key";
-                    placeholder-text: "API key (stored in the OS keychain; leave empty to keep)";
-                    input-type: password;
-                }
-                Button {
-                    text: "Save provider";
-                    primary: true;
-                    enabled: root.form-id != "";
-                    clicked => {
-                        root.provider-saved(
-                            root.form-id,
-                            root.form-kind,
-                            root.form-base-url,
-                            key-edit.text);
-                        key-edit.text = "";
-                        root.form-hint = "";
-                        root.form-warning = false;
-                    }
-                }
-            }
-            if root.form-hint != "": Text {
-                text: root.form-hint;
-                color: root.form-warning ? #e08787 : #8fae8f;
-                font-size: 12px;
-                wrap: word-wrap;
-            }
-            if root.settings-status != "": Text {
-                text: root.settings-status;
-                color: #9cbdde;
-                font-size: 12px;
-                wrap: word-wrap;
-            }
-
-            // ---------------- vendor CLIs ----------------
-            Text {
-                text: "Vendor CLIs";
-                color: #e8e8e8;
-                font-size: 16px;
-                font-weight: 700;
-            }
-            Text {
-                text: "Agent backends (Cursor, Claude Code, Codex) run through the vendor's CLI. trouve can download and update these directly — managed installs live in trouve's data directory and take precedence over system packages.";
-                color: #8a8a8a;
-                font-size: 11px;
-                wrap: word-wrap;
-            }
-            Rectangle {
-                background: #1e1e1e;
-                border-radius: 6px;
-                height: 118px;
-                ListView {
-                    for cli in root.clis: Rectangle {
-                        height: 38px;
-                        HorizontalLayout {
-                            padding-left: 10px;
-                            padding-right: 6px;
-                            spacing: 8px;
+                            // Provider add/edit form.
                             Text {
-                                text: cli.display-name;
-                                color: #e0e0e0;
+                                text: "Add or edit a provider";
+                                color: #c8c8c8;
                                 font-size: 13px;
                                 font-weight: 700;
-                                vertical-alignment: center;
-                                width: 110px;
-                                overflow: elide;
+                            }
+                            // Provider picker: a known preset prefills (and
+                            // hides) the id / protocol / URL details;
+                            // "Custom" shows them for hand entry.
+                            preset-box := ComboBox {
+                                model: root.known-provider-names;
+                                current-index <=> root.preset-index;
+                                selected => {
+                                    if (!root.preset-is-custom) {
+                                        root.form-id = root.known-providers[root.preset-index].id;
+                                        root.form-base-url = root.known-providers[root.preset-index].base-url;
+                                        root.form-kind = root.known-providers[root.preset-index].kind;
+                                        root.form-kind-index =
+                                            root.known-providers[root.preset-index].kind == "anthropic" ? 1 : 0;
+                                        root.form-warning = root.known-providers[root.preset-index].experimental;
+                                        root.form-hint =
+                                            root.known-providers[root.preset-index].experimental
+                                            ? "Experimental: talks to an undocumented vendor endpoint using your `codex login` token. OpenAI may break or restrict it at any time — use at your own risk. Save, then log in via the Codex CLI."
+                                            : (root.known-providers[root.preset-index].auth == "cli"
+                                                ? "Subscription via the vendor's CLI: install it, save, then click \"Log in\" in the list above (or log in from a terminal)."
+                                                : (root.known-providers[root.preset-index].auth == "oauth"
+                                                    ? "Subscription login: save, then click \"Log in\" in the list above."
+                                                    : (root.known-providers[root.preset-index].auth == "api-key"
+                                                        ? "Paste your API key below and save. Also honors the "
+                                                            + root.known-providers[root.preset-index].api-key-env
+                                                            + " environment variable."
+                                                        : "No API key needed — just save.")));
+                                    } else {
+                                        root.form-kind = root.form-kind-index == 1 ? "anthropic" : "openai-compat";
+                                        root.form-hint = "";
+                                        root.form-warning = false;
+                                    }
+                                }
+                            }
+                            if root.preset-is-custom: HorizontalLayout {
+                                spacing: 8px;
+                                LineEdit {
+                                    width: 150px;
+                                    placeholder-text: "id (e.g. openai)";
+                                    text <=> root.form-id;
+                                }
+                                ComboBox {
+                                    width: 150px;
+                                    model: ["openai-compat", "anthropic"];
+                                    current-index <=> root.form-kind-index;
+                                    selected => {
+                                        root.form-kind = root.form-kind-index == 1 ? "anthropic" : "openai-compat";
+                                    }
+                                }
+                                LineEdit {
+                                    horizontal-stretch: 1;
+                                    placeholder-text: "base URL (optional)";
+                                    text <=> root.form-base-url;
+                                }
+                            }
+                            HorizontalLayout {
+                                spacing: 8px;
+                                key-edit := LineEdit {
+                                    horizontal-stretch: 1;
+                                    visible: root.preset-auth == "api-key";
+                                    placeholder-text: "API key (stored in the OS keychain; leave empty to keep)";
+                                    input-type: password;
+                                }
+                                Button {
+                                    text: "Save provider";
+                                    primary: true;
+                                    enabled: root.form-id != "";
+                                    clicked => {
+                                        root.provider-saved(
+                                            root.form-id,
+                                            root.form-kind,
+                                            root.form-base-url,
+                                            key-edit.text);
+                                        key-edit.text = "";
+                                        root.form-hint = "";
+                                        root.form-warning = false;
+                                    }
+                                }
+                            }
+                            if root.form-hint != "": Text {
+                                text: root.form-hint;
+                                color: root.form-warning ? #e08787 : #8fae8f;
+                                font-size: 12px;
+                                wrap: word-wrap;
+                            }
+                            if root.settings-status != "": Text {
+                                text: root.settings-status;
+                                color: #9cbdde;
+                                font-size: 12px;
+                                wrap: word-wrap;
+                            }
+
+                            // ---------------- vendor CLIs ----------------
+                            Text {
+                                text: "Vendor CLIs";
+                                color: #e8e8e8;
+                                font-size: 16px;
+                                font-weight: 700;
                             }
                             Text {
-                                text: cli.status != "" ? cli.status : cli.version-label;
-                                color: cli.status != "" ? #9cbdde : #9a9a9a;
+                                text: "Agent backends (Cursor, Claude Code, Codex) run through the vendor's CLI. trouve can download and update these directly — managed installs live in trouve's data directory and take precedence over system packages.";
+                                color: #8a8a8a;
+                                font-size: 11px;
+                                wrap: word-wrap;
+                            }
+                            Rectangle {
+                                background: #1e1e1e;
+                                border-radius: 6px;
+                                height: 118px;
+                                ListView {
+                                    for cli in root.clis: Rectangle {
+                                        height: 38px;
+                                        HorizontalLayout {
+                                            padding-left: 10px;
+                                            padding-right: 6px;
+                                            spacing: 8px;
+                                            Text {
+                                                text: cli.display-name;
+                                                color: #e0e0e0;
+                                                font-size: 13px;
+                                                font-weight: 700;
+                                                vertical-alignment: center;
+                                                width: 110px;
+                                                overflow: elide;
+                                            }
+                                            Text {
+                                                text: cli.status != "" ? cli.status : cli.version-label;
+                                                color: cli.status != "" ? #9cbdde : #9a9a9a;
+                                                font-size: 12px;
+                                                vertical-alignment: center;
+                                                overflow: elide;
+                                                horizontal-stretch: 1;
+                                            }
+                                            if cli.action-label != "": Button {
+                                                text: cli.action-label;
+                                                enabled: !cli.busy;
+                                                clicked => { root.cli-install(cli.id); }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
+                        // ---------------- models ----------------
+                        if root.section == 1: VerticalLayout {
+                            spacing: 12px;
+
+                            Text {
+                                text: "Default model";
+                                color: #e8e8e8;
+                                font-size: 16px;
+                                font-weight: 700;
+                            }
+                            Text {
+                                text: "Preselected for new sessions and threads; each thread can still pick its own model in the composer.";
+                                color: #8a8a8a;
+                                font-size: 11px;
+                                wrap: word-wrap;
+                            }
+                            HorizontalLayout {
+                                spacing: 8px;
+                                model-box := ComboBox {
+                                    horizontal-stretch: 1;
+                                    model: root.models;
+                                    current-index: root.default-model-index;
+                                }
+                                Button {
+                                    text: "Set default";
+                                    enabled: model-box.current-index >= 0;
+                                    clicked => { root.default-model-picked(model-box.current-index); }
+                                }
+                            }
+                        }
+
+                        // ---------------- agent modes ----------------
+                        if root.section == 2: VerticalLayout {
+                            spacing: 12px;
+
+                            Text {
+                                text: "Agent modes";
+                                color: #e8e8e8;
+                                font-size: 16px;
+                                font-weight: 700;
+                            }
+                            Rectangle {
+                                background: #1e1e1e;
+                                border-radius: 6px;
+                                height: 220px;
+                                ListView {
+                                    for mode in root.modes: Text {
+                                        height: 24px;
+                                        x: 10px;
+                                        text: mode;
+                                        color: #c8c8c8;
+                                        font-size: 12px;
+                                        vertical-alignment: center;
+                                    }
+                                }
+                            }
+                            Text {
+                                text: "Custom modes and mode overrides live in ~/.config/trouve/modes/ and .agents/modes/.";
+                                color: #8a8a8a;
+                                font-size: 11px;
+                                wrap: word-wrap;
+                            }
+                        }
+
+                        // ---------------- about ----------------
+                        if root.section == 3: VerticalLayout {
+                            spacing: 12px;
+
+                            Text {
+                                text: "About";
+                                color: #e8e8e8;
+                                font-size: 16px;
+                                font-weight: 700;
+                            }
+                            Text {
+                                text: "trouve — a protocol-first AI coding harness.";
+                                color: #9a9a9a;
                                 font-size: 12px;
-                                vertical-alignment: center;
-                                overflow: elide;
-                                horizontal-stretch: 1;
                             }
-                            if cli.action-label != "": Button {
-                                text: cli.action-label;
-                                enabled: !cli.busy;
-                                clicked => { root.cli-install(cli.id); }
-                            }
+                            AboutSlint { }
                         }
                     }
                 }
-            }
-
-            // ---------------- default model ----------------
-            Text {
-                text: "Default model";
-                color: #e8e8e8;
-                font-size: 16px;
-                font-weight: 700;
-            }
-            HorizontalLayout {
-                spacing: 8px;
-                model-box := ComboBox {
-                    horizontal-stretch: 1;
-                    model: root.models;
-                    current-index: root.default-model-index;
-                }
-                Button {
-                    text: "Set default";
-                    enabled: model-box.current-index >= 0;
-                    clicked => { root.default-model-picked(model-box.current-index); }
                 }
             }
 
-            // ---------------- agent modes ----------------
-            Text {
-                text: "Agent modes";
-                color: #e8e8e8;
-                font-size: 16px;
-                font-weight: 700;
-            }
-            Rectangle {
-                background: #1e1e1e;
-                border-radius: 6px;
-                height: 130px;
-                ListView {
-                    for mode in root.modes: Text {
-                        height: 24px;
-                        x: 10px;
-                        text: mode;
-                        color: #c8c8c8;
-                        font-size: 12px;
-                        vertical-alignment: center;
-                    }
-                }
-            }
-            Text {
-                text: "Custom modes and mode overrides live in ~/.config/trouve/modes/ and .agents/modes/.";
-                color: #8a8a8a;
-                font-size: 11px;
-                wrap: word-wrap;
-            }
-
-            // ---------------- about ----------------
-            Text {
-                text: "About";
-                color: #e8e8e8;
-                font-size: 16px;
-                font-weight: 700;
-            }
-            Text {
-                text: "trouve — a protocol-first AI coding harness.";
-                color: #9a9a9a;
-                font-size: 12px;
-            }
-            AboutSlint { }
+            Rectangle { horizontal-stretch: 1; }
         }
-    }
     }
 }
