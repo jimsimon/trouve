@@ -379,7 +379,10 @@ async fn handle_msg(
                 // Plan tool calls complete without a rawOutput; the plan
                 // itself arrived via cursor/create_plan and was stashed by
                 // the reader — attach it as the tool's result.
-                if let BackendEvent::ToolCompleted { call_id, result, .. } = &mut ev {
+                if let BackendEvent::ToolCompleted {
+                    call_id, result, ..
+                } = &mut ev
+                {
                     if result.is_null() {
                         if let Some(plan) = server.plans.lock().await.remove(call_id) {
                             *result = plan;
@@ -404,9 +407,7 @@ async fn handle_msg(
             let allow_option = permission_option(&params, true);
             let reject_option = permission_option(&params, false);
             if matches!(permission, BackendPermission::Yolo) {
-                server
-                    .respond(id, permission_outcome(allow_option))
-                    .await;
+                server.respond(id, permission_outcome(allow_option)).await;
                 return Ok(());
             }
             let tool_call = &params["toolCall"];
@@ -425,7 +426,11 @@ async fn handle_msg(
             .await
             .map_err(|_| ())?;
             let approved = ok_rx.await.unwrap_or(false);
-            let option = if approved { allow_option } else { reject_option };
+            let option = if approved {
+                allow_option
+            } else {
+                reject_option
+            };
             server.respond(id, permission_outcome(option)).await;
             Ok(())
         }
@@ -669,9 +674,8 @@ fn parse_acp_models(backend_id: &str, result: &Value) -> Vec<ModelInfo> {
                 context_window = parse_context_size(default);
             }
             // Binary on/off options render as toggles.
-            let is_bool = values.len() == 2
-                && values.contains(&"true")
-                && values.contains(&"false");
+            let is_bool =
+                values.len() == 2 && values.contains(&"true") && values.contains(&"false");
             let prop = if is_bool {
                 json!({
                     "type": "boolean",
@@ -689,12 +693,7 @@ fn parse_acp_models(backend_id: &str, result: &Value) -> Vec<ModelInfo> {
             properties.insert(opt_id.to_string(), prop);
         }
 
-        let mut info = model(
-            backend_id,
-            id,
-            display,
-            context_window.unwrap_or(200_000),
-        );
+        let mut info = model(backend_id, id, display, context_window.unwrap_or(200_000));
         info.options_schema = json!({
             "type": "object",
             "properties": properties,
@@ -863,8 +862,7 @@ impl AcpServer {
                                 .await
                                 .insert(call_id.to_string(), params.clone());
                         }
-                        let reply =
-                            json!({ "jsonrpc": "2.0", "id": msg["id"], "result": {} });
+                        let reply = json!({ "jsonrpc": "2.0", "id": msg["id"], "result": {} });
                         let mut line = serde_json::to_vec(&reply).expect("serializable");
                         line.push(b'\n');
                         let mut stdin = stdin.lock().await;
@@ -949,17 +947,12 @@ impl AcpServer {
 
     async fn new_session(&self, worktree: &std::path::Path) -> Result<String, BackendError> {
         let result = self
-            .request(
-                "session/new",
-                json!({ "cwd": worktree, "mcpServers": [] }),
-            )
+            .request("session/new", json!({ "cwd": worktree, "mcpServers": [] }))
             .await
             .map_err(auth_hint)?;
         let id = result["sessionId"]
             .as_str()
-            .ok_or_else(|| {
-                BackendError::Protocol("session/new result missing sessionId".into())
-            })?
+            .ok_or_else(|| BackendError::Protocol("session/new result missing sessionId".into()))?
             .to_string();
         self.sessions.lock().await.insert(id.clone());
         Ok(id)
@@ -1109,7 +1102,11 @@ mod tests {
         let ids: Vec<&str> = models.iter().map(|m| m.id.as_str()).collect();
         assert_eq!(
             ids,
-            vec!["cursor/default", "cursor/claude-fable-5", "cursor/composer-2.5"]
+            vec![
+                "cursor/default",
+                "cursor/claude-fable-5",
+                "cursor/composer-2.5"
+            ]
         );
 
         let fable = &models[1];
@@ -1139,18 +1136,14 @@ mod tests {
             Some("boolean")
         );
         assert_eq!(
-            fable
-                .options_schema
-                .pointer("/properties/thinking/default"),
+            fable.options_schema.pointer("/properties/thinking/default"),
             Some(&json!(true))
         );
 
         let composer = &models[2];
         assert_eq!(composer.context_window, 200_000); // no context option
         assert_eq!(
-            composer
-                .options_schema
-                .pointer("/properties/fast/default"),
+            composer.options_schema.pointer("/properties/fast/default"),
             Some(&json!(true))
         );
     }
@@ -1173,7 +1166,10 @@ mod tests {
             split_variant("claude-fable-5"),
             ("claude-fable-5", None, false)
         );
-        assert_eq!(split_variant("gpt-5.3-codex"), ("gpt-5.3-codex", None, false));
+        assert_eq!(
+            split_variant("gpt-5.3-codex"),
+            ("gpt-5.3-codex", None, false)
+        );
     }
 
     #[test]
@@ -1196,7 +1192,11 @@ mod tests {
                            "title": "`ls`", "kind": "execute", "status": "pending",
                            "rawInput": { "command": "ls" } });
         match map_update(&call).as_slice() {
-            [BackendEvent::ToolStarted { call_id, tool, args }] => {
+            [BackendEvent::ToolStarted {
+                call_id,
+                tool,
+                args,
+            }] => {
                 assert_eq!(call_id, "t1");
                 assert_eq!(tool, "execute");
                 assert_eq!(args["command"], "ls");

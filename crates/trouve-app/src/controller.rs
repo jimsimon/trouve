@@ -546,7 +546,11 @@ impl Controller {
             .session_threads
             .get(&session_id)
             .and_then(|tid| self.threads.iter().position(|t| t.id == *tid))
-            .or(if self.threads.is_empty() { None } else { Some(0) });
+            .or(if self.threads.is_empty() {
+                None
+            } else {
+                Some(0)
+            });
         self.push_threads();
         self.push_picker_indices();
         self.follow_current();
@@ -898,13 +902,7 @@ impl Controller {
             }
         }
         let mut rows = Vec::new();
-        walk(
-            ".",
-            0,
-            &self.file_children,
-            &self.file_expanded,
-            &mut rows,
-        );
+        walk(".", 0, &self.file_children, &self.file_expanded, &mut rows);
         ui::set_file_list(
             &self.ui,
             rows.iter()
@@ -1120,7 +1118,11 @@ impl Controller {
                 .filter(|s| s.status != "none");
             let version_label = match (&cli.installed_version, cli.source.as_str()) {
                 (Some(v), source) => {
-                    let origin = if source == "managed" { "managed" } else { "system" };
+                    let origin = if source == "managed" {
+                        "managed"
+                    } else {
+                        "system"
+                    };
                     match (&cli.latest_version, cli.update_available) {
                         (Some(latest), true) => format!("{v} ({origin}) — {latest} available"),
                         _ => format!("{v} ({origin})"),
@@ -1155,7 +1157,14 @@ impl Controller {
                 ),
                 _ => (String::new(), false),
             };
-            rows.push((cli.id, cli.display_name, version_label, action_label, status, busy));
+            rows.push((
+                cli.id,
+                cli.display_name,
+                version_label,
+                action_label,
+                status,
+                busy,
+            ));
         }
         ui::set_clis(&self.ui, rows);
     }

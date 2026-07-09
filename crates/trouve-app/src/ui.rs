@@ -109,26 +109,24 @@ pub fn set_threads(ui: &Ui, threads: Vec<(String, String)>, current: i32) {
 fn to_chat_row(r: &ChatRowData) -> ChatRow {
     // Highlighting runs here — after the diff in `set_chat` — so only new
     // or changed code blocks pay for syntect, not every block every frame.
-    let code_lines: ModelRc<ModelRc<TextSegment>> =
-        if r.kind == 1 && r.md_kind == 5 {
-            let lines: Vec<ModelRc<TextSegment>> =
-                crate::render::highlight_code(&r.md_lang, &r.text)
+    let code_lines: ModelRc<ModelRc<TextSegment>> = if r.kind == 1 && r.md_kind == 5 {
+        let lines: Vec<ModelRc<TextSegment>> = crate::render::highlight_code(&r.md_lang, &r.text)
+            .into_iter()
+            .map(|segments| {
+                let segs: Vec<TextSegment> = segments
                     .into_iter()
-                    .map(|segments| {
-                        let segs: Vec<TextSegment> = segments
-                            .into_iter()
-                            .map(|(text, rgb)| TextSegment {
-                                text: SharedString::from(text.as_str()),
-                                color: slint::Color::from_argb_encoded(0xff00_0000 | rgb),
-                            })
-                            .collect();
-                        ModelRc::new(VecModel::from(segs))
+                    .map(|(text, rgb)| TextSegment {
+                        text: SharedString::from(text.as_str()),
+                        color: slint::Color::from_argb_encoded(0xff00_0000 | rgb),
                     })
                     .collect();
-            ModelRc::new(VecModel::from(lines))
-        } else {
-            ModelRc::default()
-        };
+                ModelRc::new(VecModel::from(segs))
+            })
+            .collect();
+        ModelRc::new(VecModel::from(lines))
+    } else {
+        ModelRc::default()
+    };
     ChatRow {
         kind: r.kind,
         md_kind: r.md_kind,
@@ -288,7 +286,12 @@ pub fn set_slash_commands(ui: &Ui, commands: Vec<(String, String)>) {
     let _ = ui.upgrade_in_event_loop(move |ui| {
         let (names, details): (Vec<SharedString>, Vec<SharedString>) = commands
             .into_iter()
-            .map(|(n, d)| (SharedString::from(n.as_str()), SharedString::from(d.as_str())))
+            .map(|(n, d)| {
+                (
+                    SharedString::from(n.as_str()),
+                    SharedString::from(d.as_str()),
+                )
+            })
             .unzip();
         ui.set_slash_commands(ModelRc::new(VecModel::from(names)));
         ui.set_slash_details(ModelRc::new(VecModel::from(details)));

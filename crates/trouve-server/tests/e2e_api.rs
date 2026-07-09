@@ -915,8 +915,7 @@ async fn ask_question_tool_round_trips_answers() {
 
     // The turn blocks on question.requested (ungated: no approval events).
     let events_url = format!("{base}/threads/{thread_id}/events");
-    let events =
-        wait_for_event(&client, &events_url, |e| e["type"] == "question.requested").await;
+    let events = wait_for_event(&client, &events_url, |e| e["type"] == "question.requested").await;
     let req = events
         .iter()
         .find(|e| e["type"] == "question.requested")
@@ -926,7 +925,10 @@ async fn ask_question_tool_round_trips_answers() {
     assert_eq!(questions.len(), 2);
     // Ids were synthesized for the bare-string options.
     assert_eq!(questions[0]["id"], "q1");
-    assert_eq!(questions[0]["options"][0], serde_json::json!({"id": "opt1", "label": "Red"}));
+    assert_eq!(
+        questions[0]["options"][0],
+        serde_json::json!({"id": "opt1", "label": "Red"})
+    );
     assert_eq!(questions[1]["allow_multiple"], true);
     assert!(!events.iter().any(|e| e["type"] == "approval.requested"));
     let request_id = req["request_id"].as_str().unwrap();

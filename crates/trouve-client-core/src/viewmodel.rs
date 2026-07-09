@@ -322,9 +322,9 @@ impl ThreadViewModel {
                 answers,
             } => {
                 self.pending_questions.retain(|r| r != request_id);
-                let idx = self.items.iter().rposition(|i| {
-                    matches!(i, ChatItem::Questions { request_id: r, .. } if r == request_id)
-                });
+                let idx = self.items.iter().rposition(
+                    |i| matches!(i, ChatItem::Questions { request_id: r, .. } if r == request_id),
+                );
                 if let Some(idx) = idx {
                     if let ChatItem::Questions { answers: a, .. } = &mut self.items[idx] {
                         *a = Some(answers.clone());
@@ -547,7 +547,10 @@ mod tests {
         assert_eq!(vm.items.len(), 1, "no duplicate card for the approval");
         assert!(matches!(
             &vm.items[0],
-            ChatItem::ToolCall { status: ToolCallStatus::AwaitingApproval, .. }
+            ChatItem::ToolCall {
+                status: ToolCallStatus::AwaitingApproval,
+                ..
+            }
         ));
         // Denial sticks even after the vendor's error tool_result.
         vm.apply(&env(Event::ApprovalResolved {
@@ -561,7 +564,11 @@ mod tests {
         }));
         assert!(matches!(
             &vm.items[0],
-            ChatItem::ToolCall { status: ToolCallStatus::Denied, result: Some(_), .. }
+            ChatItem::ToolCall {
+                status: ToolCallStatus::Denied,
+                result: Some(_),
+                ..
+            }
         ));
     }
 

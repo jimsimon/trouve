@@ -20,11 +20,10 @@ use trouve_core::engine::EngineError;
 use trouve_core::Engine;
 use trouve_protocol::{
     AgentMode, BranchList, CliInfo, CliInstallStatus, CliList, CreatePrRequest,
-    CreateSessionRequest, CreateThreadRequest, DirEntry,
-    ErrorBody, FileContent, KnownProvider, LoginStarted, LoginStatus, MergePrRequest, ModelInfo,
-    PrInfo, ProviderInfo, ProvidersResponse, RegisterWorkspaceRequest, ResolveApprovalRequest,
-    ResolveQuestionRequest, Scope, SendMessageRequest, ServerInfo, Session, SessionDiff,
-    SetDefaultModelRequest, Thread,
+    CreateSessionRequest, CreateThreadRequest, DirEntry, ErrorBody, FileContent, KnownProvider,
+    LoginStarted, LoginStatus, MergePrRequest, ModelInfo, PrInfo, ProviderInfo, ProvidersResponse,
+    RegisterWorkspaceRequest, ResolveApprovalRequest, ResolveQuestionRequest, Scope,
+    SendMessageRequest, ServerInfo, Session, SessionDiff, SetDefaultModelRequest, Thread,
     TurnAccepted, UpdateSessionRequest, UpdateThreadRequest, UpsertProviderRequest, UsageSummary,
     Workspace, PROTOCOL_VERSION,
 };

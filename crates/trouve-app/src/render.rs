@@ -320,7 +320,9 @@ pub fn chat_rows(
             match item {
                 ChatItem::Assistant { .. } => prev = Some(i),
                 ChatItem::User { .. } | ChatItem::TurnStatus { .. } => prev = None,
-                ChatItem::ToolCall { .. } | ChatItem::Thinking { .. } | ChatItem::Questions { .. } => {
+                ChatItem::ToolCall { .. }
+                | ChatItem::Thinking { .. }
+                | ChatItem::Questions { .. } => {
                     if let Some(a) = prev {
                         owner.insert(i, a);
                     }
@@ -332,7 +334,9 @@ pub fn chat_rows(
             match item {
                 ChatItem::Assistant { .. } => next = Some(i),
                 ChatItem::User { .. } | ChatItem::TurnStatus { .. } => next = None,
-                ChatItem::ToolCall { .. } | ChatItem::Thinking { .. } | ChatItem::Questions { .. } => {
+                ChatItem::ToolCall { .. }
+                | ChatItem::Thinking { .. }
+                | ChatItem::Questions { .. } => {
                     if let (None, Some(a)) = (owner.get(&i), next) {
                         owner.insert(i, a);
                     }
@@ -433,9 +437,9 @@ pub fn chat_rows(
                 }
                 // The turn's token/cost summary shows in the header of the
                 // turn's last card (where the status row used to sit).
-                let last_of_turn = !vm.items[end + 1..].iter().any(
-                    |it| matches!(it, ChatItem::Assistant { turn: t, .. } if t == turn),
-                );
+                let last_of_turn = !vm.items[end + 1..]
+                    .iter()
+                    .any(|it| matches!(it, ChatItem::Assistant { turn: t, .. } if t == turn));
                 let meta = match (last_of_turn, turn_state(vm, *turn)) {
                     (true, Some(TurnState::Completed { usage })) => turn_summary(usage),
                     _ => String::new(),
@@ -504,7 +508,9 @@ pub fn chat_rows(
                 let raw = raw_turns.contains(&turn);
                 let mut body = Vec::new();
                 if open {
-                    card_body_rows(&mut body, vm, &run, i, raw, done, collapsed, expanded, wizards);
+                    card_body_rows(
+                        &mut body, vm, &run, i, raw, done, collapsed, expanded, wizards,
+                    );
                 }
                 // Orphan items mean no assistant item in this turn, so this
                 // card is where the turn summary lands once it completes.
@@ -614,9 +620,7 @@ fn card_body_rows(
     while k < ordered.len() {
         if matches!(vm.items[ordered[k]], ChatItem::Assistant { .. }) {
             let start = k;
-            while k < ordered.len()
-                && matches!(vm.items[ordered[k]], ChatItem::Assistant { .. })
-            {
+            while k < ordered.len() && matches!(vm.items[ordered[k]], ChatItem::Assistant { .. }) {
                 k += 1;
             }
             let stretch = ordered[start..k]
@@ -640,9 +644,7 @@ fn card_body_rows(
 
     // Question items stay out of activity groups: the wizard needs to be
     // answered, so it always renders at the card's top level, like text.
-    let groupable = |seg: &Segment| {
-        matches!(seg, Segment::Item(j) if !matches!(vm.items[*j], ChatItem::Questions { .. }))
-    };
+    let groupable = |seg: &Segment| matches!(seg, Segment::Item(j) if !matches!(vm.items[*j], ChatItem::Questions { .. }));
     let mut s = 0;
     while s < segments.len() {
         if let Segment::Text(text) = &segments[s] {
@@ -894,8 +896,8 @@ fn question_row(
     row.q_other = selected.iter().any(|id| id == OTHER_ID);
     row.q_other_text = w.other_texts[step].clone();
     row.q_can_back = step > 0;
-    row.q_can_next = !selected.is_empty()
-        && (!row.q_other || !w.other_texts[step].trim().is_empty());
+    row.q_can_next =
+        !selected.is_empty() && (!row.q_other || !w.other_texts[step].trim().is_empty());
     row.q_last = step + 1 == questions.len();
     row
 }
@@ -943,8 +945,8 @@ fn activity_summary(vm: &ThreadViewModel, segments: &[Segment]) -> String {
                     .and_then(serde_json::Value::as_str);
                 match base {
                     "edit" | "Edit" | "MultiEdit" | "NotebookEdit" | "Write" | "write"
-                    | "edit_file" | "write_file" | "create_file" | "apply_patch"
-                    | "delete" | "delete_file" => match path {
+                    | "edit_file" | "write_file" | "create_file" | "apply_patch" | "delete"
+                    | "delete_file" => match path {
                         Some(p) => {
                             edited.insert(p);
                         }
@@ -1107,7 +1109,10 @@ fn edit_view(tool: &str, args: &serde_json::Value) -> Option<EditView> {
         };
         let old = get(&["old_string", "oldText", "old_text", "old_str"]);
         let new = get(&["new_string", "newText", "new_text", "new_str"]);
-        let start = v.get("_line").and_then(serde_json::Value::as_i64).unwrap_or(0) as i32;
+        let start = v
+            .get("_line")
+            .and_then(serde_json::Value::as_i64)
+            .unwrap_or(0) as i32;
         match (old, new) {
             (None, None) => None,
             (old, new) => Some((old.unwrap_or_default(), new.unwrap_or_default(), start)),
@@ -1516,11 +1521,7 @@ fn plain_text(md: &str) -> String {
         .iter()
         .map(|b| match b.kind {
             BlockKind::Code => b.text.clone(),
-            BlockKind::Bullet => format!(
-                "{}•  {}",
-                "  ".repeat(b.indent as usize),
-                strip(&b.text)
-            ),
+            BlockKind::Bullet => format!("{}•  {}", "  ".repeat(b.indent as usize), strip(&b.text)),
             _ => strip(&b.text),
         })
         .collect::<Vec<_>>()
@@ -1676,15 +1677,33 @@ mod tests {
             turn_running: true,
             ..Default::default()
         };
-        let (rows, _) = chat_rows(&vm, &HashSet::new(), &HashSet::new(), &HashSet::new(), &HashMap::new());
+        let (rows, _) = chat_rows(
+            &vm,
+            &HashSet::new(),
+            &HashSet::new(),
+            &HashSet::new(),
+            &HashMap::new(),
+        );
         assert_eq!(rows.last().unwrap().kind, 5);
         assert_eq!(rows.last().unwrap().text, "Processing…");
         vm.thinking = true;
-        let (rows, _) = chat_rows(&vm, &HashSet::new(), &HashSet::new(), &HashSet::new(), &HashMap::new());
+        let (rows, _) = chat_rows(
+            &vm,
+            &HashSet::new(),
+            &HashSet::new(),
+            &HashSet::new(),
+            &HashMap::new(),
+        );
         assert_eq!(rows.last().unwrap().text, "Thinking…");
         vm.turn_running = false;
         vm.thinking = false;
-        let (rows, _) = chat_rows(&vm, &HashSet::new(), &HashSet::new(), &HashSet::new(), &HashMap::new());
+        let (rows, _) = chat_rows(
+            &vm,
+            &HashSet::new(),
+            &HashSet::new(),
+            &HashSet::new(),
+            &HashMap::new(),
+        );
         assert!(rows.is_empty());
     }
 
@@ -1854,7 +1873,13 @@ mod tests {
             ..Default::default()
         };
         // Styled: a card header, then one row per markdown block.
-        let (rows, _) = chat_rows(&vm, &HashSet::new(), &HashSet::new(), &HashSet::new(), &HashMap::new());
+        let (rows, _) = chat_rows(
+            &vm,
+            &HashSet::new(),
+            &HashSet::new(),
+            &HashSet::new(),
+            &HashMap::new(),
+        );
         assert_eq!(rows[0].kind, 7);
         assert!(rows.len() > 2);
         // Raw: header plus a single kind-6 row of markdown source.
@@ -1865,7 +1890,13 @@ mod tests {
         assert_eq!(rows[1].text, "# heading\n\nbody `code`");
         // Collapsed: the header alone, with a one-line preview.
         let collapsed: HashSet<String> = ["a:0".to_string()].into();
-        let (rows, _) = chat_rows(&vm, &HashSet::new(), &HashSet::new(), &collapsed, &HashMap::new());
+        let (rows, _) = chat_rows(
+            &vm,
+            &HashSet::new(),
+            &HashSet::new(),
+            &collapsed,
+            &HashMap::new(),
+        );
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].kind, 7);
         assert!(!rows[0].expanded);
@@ -1895,7 +1926,13 @@ mod tests {
             ],
             ..Default::default()
         };
-        let (rows, _) = chat_rows(&vm, &HashSet::new(), &HashSet::new(), &HashSet::new(), &HashMap::new());
+        let (rows, _) = chat_rows(
+            &vm,
+            &HashSet::new(),
+            &HashSet::new(),
+            &HashSet::new(),
+            &HashMap::new(),
+        );
         // Completed turns no longer emit a status row; the summary rides in
         // the merged assistant card's header.
         assert!(!rows.iter().any(|r| r.kind == 3));
@@ -1946,7 +1983,13 @@ mod tests {
             ],
             ..Default::default()
         };
-        let (rows, ids) = chat_rows(&vm, &HashSet::new(), &HashSet::new(), &HashSet::new(), &HashMap::new());
+        let (rows, ids) = chat_rows(
+            &vm,
+            &HashSet::new(),
+            &HashSet::new(),
+            &HashSet::new(),
+            &HashMap::new(),
+        );
         // Streaming turn: You header, prompt, Assistant header, the 2-tool
         // run under an expanded group header, the narration text (never
         // grouped), then the trailing single tool inline.
@@ -1966,14 +2009,26 @@ mod tests {
                 usage: Default::default(),
             },
         });
-        let (rows, _) = chat_rows(&vm, &HashSet::new(), &HashSet::new(), &HashSet::new(), &HashMap::new());
+        let (rows, _) = chat_rows(
+            &vm,
+            &HashSet::new(),
+            &HashSet::new(),
+            &HashSet::new(),
+            &HashMap::new(),
+        );
         let kinds: Vec<i32> = rows.iter().map(|r| r.kind).collect();
         assert_eq!(kinds, vec![7, 1, 7, 9, 1, 2]);
         assert!(!rows[3].expanded);
         // Toggling the group key (the run's first item index + the owning
         // card's anchor) reopens it.
         let opened: HashSet<String> = ["g1:3".to_string()].into();
-        let (rows, _) = chat_rows(&vm, &HashSet::new(), &HashSet::new(), &opened, &HashMap::new());
+        let (rows, _) = chat_rows(
+            &vm,
+            &HashSet::new(),
+            &HashSet::new(),
+            &opened,
+            &HashMap::new(),
+        );
         let kinds: Vec<i32> = rows.iter().map(|r| r.kind).collect();
         assert_eq!(kinds, vec![7, 1, 7, 9, 2, 2, 1, 2]);
         // A tool call with no assistant item (yet) still gets an Assistant
@@ -1982,7 +2037,13 @@ mod tests {
             items: vec![tool("t9")],
             ..Default::default()
         };
-        let (rows, ids) = chat_rows(&vm, &HashSet::new(), &HashSet::new(), &HashSet::new(), &HashMap::new());
+        let (rows, ids) = chat_rows(
+            &vm,
+            &HashSet::new(),
+            &HashSet::new(),
+            &HashSet::new(),
+            &HashMap::new(),
+        );
         let kinds: Vec<i32> = rows.iter().map(|r| r.kind).collect();
         assert_eq!(kinds, vec![7, 2]);
         assert_eq!(rows[0].tool_name, "Agent");
@@ -2024,7 +2085,13 @@ mod tests {
             ],
             ..Default::default()
         };
-        let (rows, _) = chat_rows(&vm, &HashSet::new(), &HashSet::new(), &HashSet::new(), &HashMap::new());
+        let (rows, _) = chat_rows(
+            &vm,
+            &HashSet::new(),
+            &HashSet::new(),
+            &HashSet::new(),
+            &HashMap::new(),
+        );
         // One You card, one Agent card; a lone thinking item between text
         // stretches stays inline (no group header for a single item): a
         // kind-4 header pill followed by its content as markdown rows
@@ -2040,7 +2107,13 @@ mod tests {
         assert!(rows[3..].iter().all(|r| r.card_pos >= 2), "all nested");
         // Collapsing one thinking block keeps its header pill only.
         let collapsed: HashSet<String> = ["t:1".to_string()].into();
-        let (rows, _) = chat_rows(&vm, &HashSet::new(), &HashSet::new(), &collapsed, &HashMap::new());
+        let (rows, _) = chat_rows(
+            &vm,
+            &HashSet::new(),
+            &HashSet::new(),
+            &collapsed,
+            &HashMap::new(),
+        );
         let kinds: Vec<i32> = rows.iter().map(|r| r.kind).collect();
         assert_eq!(kinds, vec![7, 1, 7, 4, 1, 4, 1, 1]);
         let think: Vec<_> = rows.iter().filter(|r| r.kind == 4).collect();
@@ -2062,12 +2135,27 @@ mod tests {
             turn: 2,
             content: "next question".into(),
         });
-        let (rows, _) = chat_rows(&vm, &HashSet::new(), &HashSet::new(), &HashSet::new(), &HashMap::new());
+        let (rows, _) = chat_rows(
+            &vm,
+            &HashSet::new(),
+            &HashSet::new(),
+            &HashSet::new(),
+            &HashMap::new(),
+        );
         let think: Vec<_> = rows.iter().filter(|r| r.kind == 4).collect();
-        assert!(think.iter().all(|r| !r.expanded), "collapsed once superseded");
+        assert!(
+            think.iter().all(|r| !r.expanded),
+            "collapsed once superseded"
+        );
         // …and the toggle set now re-expands instead of collapsing.
         let toggled: HashSet<String> = ["t:1".to_string()].into();
-        let (rows, _) = chat_rows(&vm, &HashSet::new(), &HashSet::new(), &toggled, &HashMap::new());
+        let (rows, _) = chat_rows(
+            &vm,
+            &HashSet::new(),
+            &HashSet::new(),
+            &toggled,
+            &HashMap::new(),
+        );
         let think: Vec<_> = rows.iter().filter(|r| r.kind == 4).collect();
         assert!(think[0].expanded);
         assert!(!think[1].expanded);
@@ -2097,7 +2185,13 @@ mod tests {
             turn_running: true,
             ..Default::default()
         };
-        let (rows, _) = chat_rows(&vm, &HashSet::new(), &HashSet::new(), &HashSet::new(), &HashMap::new());
+        let (rows, _) = chat_rows(
+            &vm,
+            &HashSet::new(),
+            &HashSet::new(),
+            &HashSet::new(),
+            &HashMap::new(),
+        );
         // You card, then a synthesized Assistant card wrapping the grouped
         // run, then the activity row.
         let kinds: Vec<i32> = rows.iter().map(|r| r.kind).collect();
@@ -2113,7 +2207,13 @@ mod tests {
             content: "Sunny.".into(),
             complete: false,
         });
-        let (rows, _) = chat_rows(&vm, &HashSet::new(), &HashSet::new(), &HashSet::new(), &HashMap::new());
+        let (rows, _) = chat_rows(
+            &vm,
+            &HashSet::new(),
+            &HashSet::new(),
+            &HashSet::new(),
+            &HashMap::new(),
+        );
         let headers = rows
             .iter()
             .filter(|r| r.kind == 7 && r.tool_name == "Agent")
@@ -2149,7 +2249,13 @@ mod tests {
             ],
             ..Default::default()
         };
-        let (rows, _) = chat_rows(&vm, &HashSet::new(), &HashSet::new(), &HashSet::new(), &HashMap::new());
+        let (rows, _) = chat_rows(
+            &vm,
+            &HashSet::new(),
+            &HashSet::new(),
+            &HashSet::new(),
+            &HashMap::new(),
+        );
         // The thinking + read run groups under one summarized header; the
         // narration/answer text stays outside the group.
         let group = rows.iter().find(|r| r.kind == 9).unwrap();
@@ -2219,9 +2325,19 @@ mod tests {
             ],
             ..Default::default()
         };
-        let (rows, _) = chat_rows(&vm, &HashSet::new(), &HashSet::new(), &HashSet::new(), &HashMap::new());
+        let (rows, _) = chat_rows(
+            &vm,
+            &HashSet::new(),
+            &HashSet::new(),
+            &HashSet::new(),
+            &HashMap::new(),
+        );
         assert_ne!(rows[0].kind, 8, "no rule before the first turn");
-        let rules: Vec<_> = rows.iter().enumerate().filter(|(_, r)| r.kind == 8).collect();
+        let rules: Vec<_> = rows
+            .iter()
+            .enumerate()
+            .filter(|(_, r)| r.kind == 8)
+            .collect();
         assert_eq!(rules.len(), 1);
         // The rule sits directly above the second prompt's header.
         assert_eq!(rows[rules[0].0 + 1].kind, 7);
@@ -2252,7 +2368,10 @@ mod tests {
         );
         assert_eq!(tool_label("search", &q), "Code Search markdown renderer");
         // Vendor camelCase names split into words, with the query appended.
-        assert_eq!(tool_label("ToolSearch", &q), "Tool Search markdown renderer");
+        assert_eq!(
+            tool_label("ToolSearch", &q),
+            "Tool Search markdown renderer"
+        );
         assert_eq!(tool_label("WebSearch", &q), "Web Search markdown renderer");
         assert_eq!(
             tool_label("WebFetch", &serde_json::json!({"url": "https://a.io"})),
@@ -2311,7 +2430,14 @@ mod tests {
     #[test]
     fn read_tools_title_with_a_clickable_filename() {
         let args = serde_json::json!({"file_path": "/w/src/app/main.rs"});
-        let row = tool_row("c1", "Read", &args, ToolCallStatus::Ok, &None, &HashSet::new());
+        let row = tool_row(
+            "c1",
+            "Read",
+            &args,
+            ToolCallStatus::Ok,
+            &None,
+            &HashSet::new(),
+        );
         assert_eq!(row.tool_name, "Read");
         assert_eq!(row.text, "main.rs");
         assert_eq!(row.tool_file, "/w/src/app/main.rs");
@@ -2323,24 +2449,55 @@ mod tests {
         let args = serde_json::json!({
             "file_path": "/w/src/app/main.rs", "offset": 100, "limit": 50,
         });
-        let row = tool_row("c1", "Read", &args, ToolCallStatus::Ok, &None, &HashSet::new());
+        let row = tool_row(
+            "c1",
+            "Read",
+            &args,
+            ToolCallStatus::Ok,
+            &None,
+            &HashSet::new(),
+        );
         assert_eq!((row.tool_line_from, row.tool_line_to), (100, 149));
         assert_eq!(row.meta, "L100-149");
 
         // start/end variants map directly.
         let args = serde_json::json!({"path": "a.rs", "start_line": 3, "end_line": 9});
-        let row = tool_row("c1", "read_file", &args, ToolCallStatus::Ok, &None, &HashSet::new());
+        let row = tool_row(
+            "c1",
+            "read_file",
+            &args,
+            ToolCallStatus::Ok,
+            &None,
+            &HashSet::new(),
+        );
         assert_eq!((row.tool_line_from, row.tool_line_to), (3, 9));
         assert_eq!(row.meta, "L3-9");
 
         // Cursor / native variants use a "path" argument.
         let args = serde_json::json!({"path": "notes.md"});
-        let row = tool_row("c2", "read_file", &args, ToolCallStatus::Ok, &None, &HashSet::new());
+        let row = tool_row(
+            "c2",
+            "read_file",
+            &args,
+            ToolCallStatus::Ok,
+            &None,
+            &HashSet::new(),
+        );
         assert_eq!(row.tool_name, "Read");
-        assert_eq!((row.text.as_str(), row.tool_file.as_str()), ("notes.md", "notes.md"));
+        assert_eq!(
+            (row.text.as_str(), row.tool_file.as_str()),
+            ("notes.md", "notes.md")
+        );
 
         // Non-read tools get their display label and no file link.
-        let row = tool_row("c3", "search", &args, ToolCallStatus::Ok, &None, &HashSet::new());
+        let row = tool_row(
+            "c3",
+            "search",
+            &args,
+            ToolCallStatus::Ok,
+            &None,
+            &HashSet::new(),
+        );
         assert_eq!(row.tool_name, "Code Search notes.md");
         assert!(row.tool_file.is_empty());
     }
@@ -2355,7 +2512,14 @@ mod tests {
             "old_string": "fn a() {}\nfn b() {}",
             "new_string": "fn a() {}\nfn b2() {}\nfn c() {}",
         });
-        let row = tool_row("c1", "Edit", &args, ToolCallStatus::Ok, &None, &HashSet::new());
+        let row = tool_row(
+            "c1",
+            "Edit",
+            &args,
+            ToolCallStatus::Ok,
+            &None,
+            &HashSet::new(),
+        );
         assert_eq!(row.tool_name, "Edit");
         assert_eq!(row.text, "lib.rs");
         assert_eq!(row.tool_file, "/w/src/lib.rs");
@@ -2378,7 +2542,14 @@ mod tests {
             "new_string": "fn a() {}\nfn b2() {}\nfn c() {}",
             "_line": 40,
         });
-        let row = tool_row("c1", "Edit", &args, ToolCallStatus::Ok, &None, &HashSet::new());
+        let row = tool_row(
+            "c1",
+            "Edit",
+            &args,
+            ToolCallStatus::Ok,
+            &None,
+            &HashSet::new(),
+        );
         assert_eq!(
             row.diff,
             vec![
@@ -2391,7 +2562,14 @@ mod tests {
 
         // Write: no old text, everything is an addition numbered from 1.
         let args = serde_json::json!({"path": "new.txt", "content": "one\ntwo"});
-        let row = tool_row("c2", "write_file", &args, ToolCallStatus::Ok, &None, &HashSet::new());
+        let row = tool_row(
+            "c2",
+            "write_file",
+            &args,
+            ToolCallStatus::Ok,
+            &None,
+            &HashSet::new(),
+        );
         assert_eq!(row.tool_name, "Write");
         assert_eq!((row.tool_adds, row.tool_dels), (2, 0));
         assert_eq!(row.diff, vec![dl(3, 0, 1, "one"), dl(3, 0, 2, "two")]);
@@ -2405,7 +2583,14 @@ mod tests {
                 {"old_string": "p", "new_string": "q"},
             ],
         });
-        let row = tool_row("c3", "MultiEdit", &args, ToolCallStatus::Ok, &None, &HashSet::new());
+        let row = tool_row(
+            "c3",
+            "MultiEdit",
+            &args,
+            ToolCallStatus::Ok,
+            &None,
+            &HashSet::new(),
+        );
         assert_eq!((row.tool_adds, row.tool_dels), (2, 2));
         assert_eq!(
             row.diff,
@@ -2424,7 +2609,14 @@ mod tests {
             "path": "b.rs",
             "diff": "@@ -10,2 +10,2 @@\n context\n-old\n+new",
         });
-        let row = tool_row("c4", "edit", &args, ToolCallStatus::Ok, &None, &HashSet::new());
+        let row = tool_row(
+            "c4",
+            "edit",
+            &args,
+            ToolCallStatus::Ok,
+            &None,
+            &HashSet::new(),
+        );
         assert_eq!((row.tool_adds, row.tool_dels), (1, 1));
         assert_eq!(
             row.diff,

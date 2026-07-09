@@ -353,7 +353,10 @@ mod tests {
         let blocks = parse_blocks("1. top\n  - nested\n    - deeper\n- flat");
         assert_eq!(blocks[0].indent, 0);
         assert_eq!(blocks[1].indent, 1);
-        assert_eq!((blocks[1].kind, blocks[1].text.as_str()), (BlockKind::Bullet, "nested"));
+        assert_eq!(
+            (blocks[1].kind, blocks[1].text.as_str()),
+            (BlockKind::Bullet, "nested")
+        );
         assert_eq!(blocks[2].indent, 2);
         assert_eq!(blocks[3].indent, 0);
     }

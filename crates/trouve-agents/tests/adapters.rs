@@ -293,7 +293,10 @@ async fn cursor_adapter_speaks_acp_and_bridges_approvals() {
     assert!(qans.contains("\"id\":102"), "{qans}");
     assert!(qans.contains("\"outcome\":\"answered\""), "{qans}");
     assert!(qans.contains("\"selectedOptionIds\":[\"red\"]"), "{qans}");
-    assert!(qans.contains("\"freeformText\":\"crimson, really\""), "{qans}");
+    assert!(
+        qans.contains("\"freeformText\":\"crimson, really\""),
+        "{qans}"
+    );
     assert!(events.iter().any(|e| matches!(
         e,
         BackendEvent::Completed { usage } if usage.input_tokens == 7 && usage.output_tokens == 3

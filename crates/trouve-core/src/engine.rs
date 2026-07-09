@@ -829,10 +829,10 @@ impl Engine {
             }
             Err(_) => None,
         };
-        self.cli_latest
-            .lock()
-            .unwrap()
-            .insert(id.as_str().into(), (std::time::Instant::now(), latest.clone()));
+        self.cli_latest.lock().unwrap().insert(
+            id.as_str().into(),
+            (std::time::Instant::now(), latest.clone()),
+        );
         latest
     }
 
@@ -873,11 +873,7 @@ impl Engine {
                     // The managed binary now exists; rebuild backends so it
                     // takes over from any PATH resolution.
                     engine.reload_providers();
-                    engine
-                        .cli_latest
-                        .lock()
-                        .unwrap()
-                        .remove(id_owned.as_str());
+                    engine.cli_latest.lock().unwrap().remove(id_owned.as_str());
                     CliInstallState::Success(version)
                 }
                 Err(e) => CliInstallState::Failed(e),
@@ -2727,8 +2723,10 @@ fn annotate_edit_lines(worktree: &Path, args: &mut serde_json::Value) {
             .find_map(|k| v.get(*k).and_then(serde_json::Value::as_str))
             .map(str::to_string)
     };
-    let Some(path) = str_of(args, &["file_path", "path", "abs_path", "target_file", "filePath"])
-    else {
+    let Some(path) = str_of(
+        args,
+        &["file_path", "path", "abs_path", "target_file", "filePath"],
+    ) else {
         return;
     };
     let full = if Path::new(&path).is_absolute() {

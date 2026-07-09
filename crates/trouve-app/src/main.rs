@@ -100,8 +100,7 @@ fn main() -> anyhow::Result<()> {
             match matches.first() {
                 Some(&top) => {
                     window.set_slash_completion(format!("/{}", names[top as usize]).into());
-                    window
-                        .set_slash_matches(slint::ModelRc::new(slint::VecModel::from(matches)));
+                    window.set_slash_matches(slint::ModelRc::new(slint::VecModel::from(matches)));
                     window.set_slash_active(true);
                 }
                 None => window.set_slash_active(false),

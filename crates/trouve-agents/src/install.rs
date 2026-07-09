@@ -229,7 +229,11 @@ fn codex_triple() -> Result<String, InstallError> {
 /// Download and activate `version` of `id` under `data_dir`. Returns the
 /// activated install. Idempotent: re-installing the active version just
 /// re-downloads and re-points the symlink.
-pub async fn install(data_dir: &Path, id: CliId, version: &str) -> Result<InstalledCli, InstallError> {
+pub async fn install(
+    data_dir: &Path,
+    id: CliId,
+    version: &str,
+) -> Result<InstalledCli, InstallError> {
     let root = cli_root(data_dir, id);
     let version_dir = root.join(version);
     // Stage into a temp sibling so a failed install never half-replaces an
