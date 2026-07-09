@@ -1050,6 +1050,8 @@ export component AppWindow inherits Window {
 
     in property <[FileItem]> file-entries;
     callback file-activated(int);
+    // Files tab: whether the file-list drawer beside the viewer is open.
+    in-out property <bool> files-drawer-open: true;
     in property <[[TextSegment]]> file-lines;
     in property <[int]> file-numbers;
     in property <string> open-file-name: "";
@@ -1057,6 +1059,8 @@ export component AppWindow inherits Window {
     in property <bool> file-is-markdown: false;
     in-out property <bool> file-preview: false;
     in property <[ChatRow]> file-preview-rows;
+    // Open the file in the user's preferred (system default) editor.
+    callback file-opened-externally(/* worktree-relative path */ string);
 
     // While true, the chat stays pinned to its tail as content grows.
     // scroll-chat-to-end alone isn't enough: it runs before the ListView
@@ -2655,55 +2659,80 @@ export component AppWindow inherits Window {
                 }
                 Tab {
                     title: "Files";
-                    VerticalLayout {
+                    HorizontalLayout {
                         padding: 6px;
                         spacing: 6px;
-                        // Worktree tree: folders expand in place, children
+
+                        // Collapsible drawer: the worktree tree sits beside
+                        // the viewer; folders expand in place, children
                         // indented underneath (IDE-style explorer).
-                        ScrollKeys {
-                            height: 220px;
-                            target-y <=> file-tree.viewport-y;
-                            page: file-tree.visible-height;
-                            total: file-tree.viewport-height;
-                        file-tree := ListView {
-                            for entry[idx] in root.file-entries: Rectangle {
-                                height: 22px;
-                                background: entry-ta.has-hover ? #26282c : transparent;
-                                border-radius: 4px;
-                                entry-ta := TouchArea {
-                                    clicked => { root.file-activated(idx); }
-                                }
-                                HorizontalLayout {
-                                    padding-left: 4px + entry.depth * 16px;
-                                    spacing: 4px;
-                                    // Chevron gutter: twists open for
-                                    // expanded folders, blank for files so
-                                    // names in one folder line up.
-                                    Text {
-                                        width: 12px;
-                                        text: !entry.is-dir ? ""
-                                            : entry.expanded ? "▾" : "▸";
-                                        color: #8a8a8a;
-                                        font-size: 11px;
-                                        vertical-alignment: center;
-                                        horizontal-alignment: center;
+                        if root.files-drawer-open: Rectangle {
+                            width: 210px;
+                            background: #1b1c1f;
+                            border-radius: 6px;
+                            ScrollKeys {
+                                target-y <=> file-tree.viewport-y;
+                                page: file-tree.visible-height;
+                                total: file-tree.viewport-height;
+                            file-tree := ListView {
+                                for entry[idx] in root.file-entries: Rectangle {
+                                    height: 22px;
+                                    background: entry-ta.has-hover ? #26282c : transparent;
+                                    border-radius: 4px;
+                                    entry-ta := TouchArea {
+                                        clicked => { root.file-activated(idx); }
                                     }
-                                    Text {
-                                        text: (entry.is-dir
-                                            ? (entry.expanded ? "📂 " : "📁 ")
-                                            : "📄 ") + entry.name;
-                                        color: #d0d0d0;
-                                        font-size: 12px;
-                                        vertical-alignment: center;
-                                        overflow: elide;
-                                        horizontal-stretch: 1;
+                                    HorizontalLayout {
+                                        padding-left: 4px + entry.depth * 16px;
+                                        spacing: 4px;
+                                        // Chevron gutter: twists open for
+                                        // expanded folders, blank for files so
+                                        // names in one folder line up.
+                                        Text {
+                                            width: 12px;
+                                            text: !entry.is-dir ? ""
+                                                : entry.expanded ? "▾" : "▸";
+                                            color: #8a8a8a;
+                                            font-size: 11px;
+                                            vertical-alignment: center;
+                                            horizontal-alignment: center;
+                                        }
+                                        Text {
+                                            text: (entry.is-dir
+                                                ? (entry.expanded ? "📂 " : "📁 ")
+                                                : "📄 ") + entry.name;
+                                            color: #d0d0d0;
+                                            font-size: 12px;
+                                            vertical-alignment: center;
+                                            overflow: elide;
+                                            horizontal-stretch: 1;
+                                        }
                                     }
                                 }
                             }
+                            }
                         }
-                        }
+
+                        // Viewer column: header (drawer toggle, open file
+                        // name, actions) above the file contents.
+                        VerticalLayout {
+                        spacing: 6px;
+                        horizontal-stretch: 1;
                         HorizontalLayout {
                             spacing: 6px;
+                            VerticalLayout {
+                                alignment: center;
+                                IconButton {
+                                    icon: "▤";
+                                    icon-size: 13px;
+                                    icon-color: root.files-drawer-open ? #6fa8dc : #8a8a8a;
+                                    tip: root.files-drawer-open
+                                        ? "Hide file list" : "Show file list";
+                                    clicked => {
+                                        root.files-drawer-open = !root.files-drawer-open;
+                                    }
+                                }
+                            }
                             Text {
                                 text: root.open-file-name;
                                 color: #9a9a9a;
@@ -2711,6 +2740,17 @@ export component AppWindow inherits Window {
                                 vertical-alignment: center;
                                 overflow: elide;
                                 horizontal-stretch: 1;
+                            }
+                            if root.open-file-name != "": VerticalLayout {
+                                alignment: center;
+                                IconButton {
+                                    icon: "↗";
+                                    icon-size: 13px;
+                                    tip: "Open in editor";
+                                    clicked => {
+                                        root.file-opened-externally(root.open-file-name);
+                                    }
+                                }
                             }
                             if root.file-is-markdown: VerticalLayout {
                                 alignment: center;
@@ -2807,6 +2847,7 @@ export component AppWindow inherits Window {
                                     link-clicked(url) => { root.open-link(url); }
                                 }
                             }
+                        }
                         }
                         }
                     }

@@ -106,6 +106,8 @@ pub enum UiCommand {
     CreatePr,
     RefreshPr,
     FileActivated(usize),
+    /// Open a worktree-relative file in the user's preferred editor.
+    OpenFileExternally(String),
     /// A filename clicked in a chat tool card; path as the tool saw it
     /// (possibly absolute), plus the 1-based line range the tool covered
     /// (0 = none) to preselect in the file view.
@@ -1539,6 +1541,18 @@ impl Controller {
                     ui::set_file_view(&self.ui, row.path, file.content, lines);
                     // A browser open carries no line range to highlight.
                     ui::set_file_selection(&self.ui, -1, -1);
+                }
+            }
+            UiCommand::OpenFileExternally(path) => {
+                // Hand the absolute worktree path to the system's default
+                // handler (xdg-open / open / start) — whatever editor the
+                // user has associated with the file type.
+                if let Some(index) = self.current_session {
+                    let full = std::path::Path::new(&self.sessions[index].worktree_path)
+                        .join(path.trim_start_matches('/'));
+                    if let Err(e) = open::that_detached(&full) {
+                        self.error(&format!("cannot open {}: {e:#}", full.display()));
+                    }
                 }
             }
             UiCommand::OpenChatFile(path, from, to) => {
