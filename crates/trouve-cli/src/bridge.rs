@@ -22,6 +22,9 @@ pub async fn run() -> Result<()> {
     let thread_id =
         std::env::var("TROUVE_THREAD_ID").context("TROUVE_THREAD_ID env var not set")?;
     let bridge_tools = std::env::var("TROUVE_BRIDGE_TOOLS").is_ok_and(|v| v == "1");
+    // Claude needs the approval-prompt gate; agents with native approval
+    // flows (Codex) set this to "0" so the tool isn't even listed.
+    let serve_approval = std::env::var("TROUVE_BRIDGE_APPROVAL").map_or(true, |v| v != "0");
     let base = format!(
         "{}/internal/threads/{}",
         server.trim_end_matches('/'),
@@ -62,7 +65,7 @@ pub async fn run() -> Result<()> {
                     result's file_path and line to discover similar code.",
             })),
             "ping" => Ok(json!({})),
-            "tools/list" => tools_list(&http, &base, bridge_tools).await,
+            "tools/list" => tools_list(&http, &base, bridge_tools, serve_approval).await,
             "tools/call" if msg["params"]["name"] == "approval_prompt" => {
                 approval_prompt(&http, &base, &msg["params"]).await
             }
@@ -95,23 +98,27 @@ async fn tools_list(
     http: &reqwest::Client,
     base: &str,
     bridge_tools: bool,
+    serve_approval: bool,
 ) -> Result<Value, String> {
-    // The approval gate is always served (Claude's permission-prompt tool
-    // is invoked by name and must exist on the configured MCP server).
-    let mut tools = vec![json!({
-        "name": "approval_prompt",
-        "description": "Permission gate: asks the trouve user to approve a tool call. \
-                        Invoked automatically by the harness, not meant to be called directly.",
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "tool_name": { "type": "string" },
-                "input": { "type": "object" },
-                "tool_use_id": { "type": "string" },
+    // The approval gate is served for Claude (its permission-prompt tool is
+    // invoked by name and must exist on the configured MCP server).
+    let mut tools = Vec::new();
+    if serve_approval {
+        tools.push(json!({
+            "name": "approval_prompt",
+            "description": "Permission gate: asks the trouve user to approve a tool call. \
+                            Invoked automatically by the harness, not meant to be called directly.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "tool_name": { "type": "string" },
+                    "input": { "type": "object" },
+                    "tool_use_id": { "type": "string" },
+                },
+                "required": ["tool_name", "input"],
             },
-            "required": ["tool_name", "input"],
-        },
-    })];
+        }));
+    }
     // Best-effort: the approval gate must exist even when the engine is
     // briefly unreachable, so a failed spec fetch just serves fewer tools.
     let specs = fetch_tool_specs(http, base).await.unwrap_or_else(|e| {

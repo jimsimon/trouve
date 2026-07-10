@@ -70,28 +70,31 @@ pub fn gc_index_store_in_background(repo: PathBuf) {
     });
 }
 
-/// System-prompt guidance for external vendor agents (Claude Code) that
-/// reach trouve's search tools over the MCP bridge. Vendor agents strongly
-/// prefer their built-in Bash/Grep/Glob; this steers them to the semantic
-/// index first (wording adapted from trouve-search's agent plugin docs).
+/// System-prompt guidance for external vendor agents (Claude Code, Codex)
+/// that reach trouve's search tools over the MCP bridge. Vendor agents
+/// strongly prefer their built-in shell/grep/glob tools; this steers them to
+/// the semantic index first (wording adapted from trouve-search's agent
+/// plugin docs). Tool references stay vendor-neutral — Claude sees the tools
+/// as `mcp__trouve__search`, Codex under its own MCP naming — so they are
+/// described by server + tool name.
 pub const VENDOR_SEARCH_GUIDANCE: &str = "\
 ## Code search (IMPORTANT)
 
-This workspace has a pre-built semantic code index. The mcp__trouve__search \
-tool is your PRIMARY tool for exploring this codebase: finding code by \
-intent or by symbol name, locating implementations, or understanding how \
-something works.
+This workspace has a pre-built semantic code index, exposed as the `search` \
+tool on the `trouve` MCP server. It is your PRIMARY tool for exploring this \
+codebase: finding code, files, or configuration by intent or by symbol name, \
+locating implementations, or understanding how something works.
 
-- Do NOT explore with `find`, `grep`, `rg`, `ls -R`, or `cat` via Bash, and \
-  do NOT use the Grep/Glob tools for discovery. Call mcp__trouve__search \
-  first; it returns file paths with exact line numbers.
-- Navigate (Read) directly to the returned file and line. Never grep for \
-  content a search result already located.
-- Call mcp__trouve__find_related with a result's file_path and line to find \
-  similar implementations, callers, or tests.
+- Do NOT explore with shell scans (`find`, `grep`, `rg`, `ls -R`, `cat`) or \
+  built-in grep/glob tools for discovery. Call `search` first; it returns \
+  file paths with exact line numbers.
+- Read the returned file at the given line directly. Never grep for content \
+  a search result already located.
+- Call `find_related` on the `trouve` server with a result's file_path and \
+  line to find similar implementations, callers, or tests.
 - Plain grep is appropriate only for exhaustive literal matches (e.g. every \
-  occurrence of an exact string before a rename) after \
-  mcp__trouve__search has located the primary definition.";
+  occurrence of an exact string before a rename) after `search` has located \
+  the primary definition.";
 
 /// One cache for the whole executor: indexes are expensive to build and
 /// cheap to re-validate, so every session shares them.

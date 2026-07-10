@@ -192,56 +192,54 @@ impl AgentBackend for CodexBackend {
             BackendPermission::Yolo => ("never", "workspace-write", "workspaceWrite"),
         };
 
+        // Per-thread config overrides: the trouve MCP bridge rides along so
+        // codex gets trouve's semantic search / question tools (both
+        // thread/start and thread/resume accept `config`, and resumed
+        // threads re-spawn their MCP servers from it).
+        let config_override = turn.mcp_bridge.as_ref().map(bridge_config_override);
+        let with_config = |mut params: Value| {
+            if let Some(config) = &config_override {
+                params["config"] = config.clone();
+            }
+            params
+        };
+
         // Start or resume the vendor-side thread.
+        let start_params = with_config(json!({
+            "model": model_or_default(model_name),
+            "cwd": turn.worktree,
+            "approvalPolicy": approval_policy,
+            "sandbox": sandbox,
+            "serviceName": "trouve",
+        }));
         let mut fresh_session = false;
         let codex_thread_id = match &turn.session {
             Some(sid) => {
                 let resumed = server
-                    .request("thread/resume", json!({ "threadId": sid }))
+                    .request("thread/resume", with_config(json!({ "threadId": sid })))
                     .await;
                 match resumed {
                     Ok(v) => thread_id_of(&v)?,
                     Err(e) => {
                         tracing::warn!("codex thread/resume failed ({e}); starting fresh");
                         fresh_session = true;
-                        let v = server
-                            .request(
-                                "thread/start",
-                                json!({
-                                    "model": model_or_default(model_name),
-                                    "cwd": turn.worktree,
-                                    "approvalPolicy": approval_policy,
-                                    "sandbox": sandbox,
-                                    "serviceName": "trouve",
-                                }),
-                            )
-                            .await?;
+                        let v = server.request("thread/start", start_params.clone()).await?;
                         thread_id_of(&v)?
                     }
                 }
             }
             None => {
                 fresh_session = true;
-                let v = server
-                    .request(
-                        "thread/start",
-                        json!({
-                            "model": model_or_default(model_name),
-                            "cwd": turn.worktree,
-                            "approvalPolicy": approval_policy,
-                            "sandbox": sandbox,
-                            "serviceName": "trouve",
-                        }),
-                    )
-                    .await?;
+                let v = server.request("thread/start", start_params.clone()).await?;
                 thread_id_of(&v)?
             }
         };
 
         let route = server.subscribe(&codex_thread_id).await;
 
-        // Mode instructions ride along in the first user message of a fresh
-        // vendor session (app-server owns the system prompt).
+        // Mode instructions (which include the search-tool guidance when
+        // the bridge is mounted) ride along in the first user message of a
+        // fresh vendor session (app-server owns the system prompt).
         let text = match (&turn.instructions, fresh_session) {
             (Some(instr), true) => format!(
                 "<mode-instructions>\n{instr}\n</mode-instructions>\n\n{}",
@@ -272,6 +270,25 @@ impl AgentBackend for CodexBackend {
         );
         Ok(stream.boxed())
     }
+}
+
+/// Codex config overrides that mount the trouve MCP bridge as a per-thread
+/// MCP server (same shape as `mcp_servers` in codex's config.toml).
+fn bridge_config_override(bridge: &crate::McpBridgeConfig) -> Value {
+    let env: serde_json::Map<String, Value> = bridge
+        .env
+        .iter()
+        .map(|(k, v)| (k.clone(), Value::String(v.clone())))
+        .collect();
+    json!({
+        "mcp_servers": {
+            "trouve": {
+                "command": bridge.command,
+                "args": bridge.args,
+                "env": env,
+            }
+        }
+    })
 }
 
 fn model_or_default(model: &str) -> &str {

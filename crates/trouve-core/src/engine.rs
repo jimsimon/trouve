@@ -2117,8 +2117,11 @@ impl Engine {
         Some((backend, model_name.to_string()))
     }
 
-    /// MCP tool-bridge config for a backend turn, when the backend opted in
-    /// (`tool_bridge = true`, claude-cli only) and the server URL is known.
+    /// MCP tool-bridge config for a backend turn. Claude Code always gets
+    /// the bridge (it carries the approval-prompt gate for Ask mode, and
+    /// optionally — `tool_bridge = true` — trouve's tools in place of
+    /// Claude's built-ins). Codex gets it too, for trouve's semantic search
+    /// and question tools; its approvals stay native app-server RPCs.
     fn mcp_bridge_for(
         &self,
         model: &str,
@@ -2134,12 +2137,11 @@ impl Engine {
                 pc.bridge_command.clone(),
             )
         };
-        // Claude Code always gets the bridge: it carries the approval-prompt
-        // gate for Ask mode, and optionally (tool_bridge = true) trouve's
-        // tools in place of Claude's built-ins.
-        if kind != "claude-cli" {
+        if kind != "claude-cli" && kind != "codex-app-server" {
             return None;
         }
+        // Full tool bridging (vendor built-ins stand down) is Claude-only.
+        let bridge_tools = bridge_tools && kind == "claude-cli";
         let Some(base_url) = self.base_url.read().unwrap().clone() else {
             tracing::warn!(
                 "MCP bridge wanted for {backend_id} but the server base URL is unknown; \
@@ -2153,6 +2155,11 @@ impl Engine {
         ];
         if bridge_tools {
             env.push(("TROUVE_BRIDGE_TOOLS".into(), "1".into()));
+        }
+        if kind == "codex-app-server" {
+            // Codex approvals are native RPCs; serving Claude's
+            // permission-gate tool would only tempt the model to call it.
+            env.push(("TROUVE_BRIDGE_APPROVAL".into(), "0".into()));
         }
         Some(trouve_agents::McpBridgeConfig {
             command: bridge_command.unwrap_or_else(default_bridge_command),
