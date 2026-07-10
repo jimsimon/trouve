@@ -7,7 +7,7 @@
 // folding happens in Rust (client-core view models + the app controller).
 
 import {
-    Button, ComboBox, LineEdit, ListView, Spinner, TabWidget
+    Button, ComboBox, LineEdit, ListView, ScrollView, Spinner, TabWidget
 } from "std-widgets.slint";
 import { DiffView, DiffRow } from "diff-view.slint";
 import { CodeView, TextSegment } from "code-view.slint";
@@ -38,6 +38,19 @@ export struct NavRow {
 export struct ThreadTabItem {
     id: string,
     label: string,
+}
+
+// One pull request in the Pull Requests tab. Checks and reviews come
+// pre-rendered as multi-line text (one entry per line).
+export struct PrItem {
+    title: string,
+    // "open" / "merged" / "closed" (+ " · draft").
+    state: string,
+    // "#42 · feature-branch → main".
+    meta: string,
+    url: string,
+    checks: string,
+    reviews: string,
 }
 
 // One selectable option in a question-wizard page.
@@ -946,6 +959,12 @@ export component AppWindow inherits Window {
     in property <[string]> settings-modes;
     in property <string> settings-status: "";
     in-out property <int> settings-preset-index: 0;
+    // Which settings section shows when the screen opens (0 providers …
+    // 3 integrations); the controller sets it before flipping center-screen.
+    in-out property <int> settings-section: 0;
+    in property <bool> settings-github-configured: false;
+    in property <string> settings-github-source: "";
+    callback github-token-saved(string);
     callback provider-saved(/* id */ string, /* kind */ string,
                             /* base-url */ string, /* api-key */ string);
     callback provider-deleted(string);
@@ -993,8 +1012,8 @@ export component AppWindow inherits Window {
     in property <int> file-sel-from: -1;
     in property <int> file-sel-to: -1;
     in property <int> file-sel-seq: 0;
-    // Right-panel tab (0 diff, 1 files); the controller flips it when a
-    // chat click opens a file.
+    // Right-panel tab (0 diff, 1 files, 2 pull requests); the controller
+    // flips it when a chat click opens a file.
     in-out property <int> right-tab: 0;
     callback send-message(string);
     in property <bool> composer-enabled: false;
@@ -1072,9 +1091,21 @@ export component AppWindow inherits Window {
     callback undo-turn();
     callback redo-turn();
 
-    in property <string> pr-status: "";
+    // --- pull requests tab -------------------------------------------------
+    // Whether the GitHub integration can authenticate (setup prompt when
+    // false), the PRs detected for the current session branch, and which
+    // one the detail view shows.
+    in property <bool> pr-configured: false;
+    in property <[string]> pr-labels;
+    in property <[PrItem]> pr-items;
+    in-out property <int> pr-selected: 0;
+    // Fetch failure or "loading…" note; empty when the list is live.
+    in property <string> pr-error: "";
     callback create-pr();
-    callback refresh-pr();
+    callback refresh-prs();
+    callback pr-picked(int);
+    callback open-pr-url(string);
+    callback open-integrations-settings();
 
     in property <[FileItem]> file-entries;
     callback file-activated(int);
@@ -2711,20 +2742,6 @@ export component AppWindow inherits Window {
                                 }
                             }
                             Rectangle { horizontal-stretch: 1; }
-                            Button {
-                                text: "Create PR";
-                                clicked => { root.create-pr(); }
-                            }
-                            Button {
-                                text: "PR status";
-                                clicked => { root.refresh-pr(); }
-                            }
-                        }
-                        if root.pr-status != "": Text {
-                            text: root.pr-status;
-                            color: Theme.c.accent-tint;
-                            font-size: Theme.fs(12px);
-                            wrap: word-wrap;
                         }
                         DiffView {
                             vertical-stretch: 1;
@@ -2946,6 +2963,193 @@ export component AppWindow inherits Window {
                         }
                     }
                 }
+                Tab {
+                    title: "Pull Requests";
+
+                    // Setup prompt: the GitHub integration is unconfigured.
+                    if !root.pr-configured: VerticalLayout {
+                        alignment: center;
+                        padding: 24px;
+                        spacing: 12px;
+                        Text {
+                            text: "Connect GitHub to see this session's pull requests";
+                            color: Theme.c.text-hi;
+                            font-size: Theme.fs(14px);
+                            font-weight: 700;
+                            horizontal-alignment: center;
+                            wrap: word-wrap;
+                        }
+                        Text {
+                            text: "trouve looks up the pull requests opened from each session's branch and shows their checks and reviews here. It needs a GitHub personal access token to do that.";
+                            color: Theme.c.text-mid;
+                            font-size: Theme.fs(12px);
+                            horizontal-alignment: center;
+                            wrap: word-wrap;
+                        }
+                        HorizontalLayout {
+                            alignment: center;
+                            Button {
+                                text: "Set up GitHub integration";
+                                primary: true;
+                                clicked => { root.open-integrations-settings(); }
+                            }
+                        }
+                    }
+
+                    if root.pr-configured: VerticalLayout {
+                        padding: 6px;
+                        spacing: 6px;
+
+                        HorizontalLayout {
+                            spacing: 6px;
+                            // Switcher between the session's PRs (hidden
+                            // for the common single-PR case).
+                            if root.pr-labels.length > 1: ComboBox {
+                                model: root.pr-labels;
+                                current-index <=> root.pr-selected;
+                                selected => { root.pr-picked(self.current-index); }
+                                horizontal-stretch: 1;
+                            }
+                            if root.pr-labels.length <= 1: Rectangle {
+                                horizontal-stretch: 1;
+                            }
+                            Button {
+                                text: "⟳ Refresh";
+                                clicked => { root.refresh-prs(); }
+                            }
+                            Button {
+                                text: "Create PR";
+                                clicked => { root.create-pr(); }
+                            }
+                        }
+
+                        if root.pr-error != "": Text {
+                            text: root.pr-error;
+                            color: Theme.c.text-soft;
+                            font-size: Theme.fs(12px);
+                            wrap: word-wrap;
+                        }
+
+                        if root.pr-items.length == 0 && root.pr-error == "": VerticalLayout {
+                            alignment: center;
+                            vertical-stretch: 1;
+                            Text {
+                                text: "No pull requests for this session's branch yet.";
+                                color: Theme.c.text-soft;
+                                font-size: Theme.fs(12px);
+                                horizontal-alignment: center;
+                                wrap: word-wrap;
+                            }
+                        }
+
+                        // Detail card for the selected PR.
+                        if root.pr-items.length > 0
+                            && root.pr-selected >= 0
+                            && root.pr-selected < root.pr-items.length: Rectangle {
+                            vertical-stretch: 1;
+                            background: Theme.c.surface;
+                            border-radius: 6px;
+                            ScrollKeys {
+                                target-y <=> pr-scroll.viewport-y;
+                                page: pr-scroll.visible-height;
+                                total: pr-scroll.viewport-height;
+                            pr-scroll := ScrollView {
+                                width: 100%;
+                                height: 100%;
+                                VerticalLayout {
+                                    padding: 14px;
+                                    spacing: 10px;
+                                    alignment: start;
+
+                                    Text {
+                                        text: root.pr-items[root.pr-selected].title;
+                                        color: Theme.c.text-hi;
+                                        font-size: Theme.fs(15px);
+                                        font-weight: 700;
+                                        wrap: word-wrap;
+                                    }
+                                    HorizontalLayout {
+                                        spacing: 8px;
+                                        Rectangle {
+                                            width: pr-state.preferred-width + 16px;
+                                            height: Theme.fs(22px);
+                                            border-radius: 11px;
+                                            background: root.pr-items[root.pr-selected].state == "open"
+                                                ? Theme.c.diff-add-bg
+                                                : root.pr-items[root.pr-selected].state == "merged"
+                                                    ? Theme.c.accent-bg
+                                                    : Theme.c.err-bg;
+                                            pr-state := Text {
+                                                width: 100%;
+                                                height: 100%;
+                                                text: root.pr-items[root.pr-selected].state;
+                                                color: root.pr-items[root.pr-selected].state == "open"
+                                                    ? Theme.c.ok
+                                                    : root.pr-items[root.pr-selected].state == "merged"
+                                                        ? Theme.c.accent-tint
+                                                        : Theme.c.err-soft;
+                                                font-size: Theme.fs(11px);
+                                                font-weight: 700;
+                                                horizontal-alignment: center;
+                                                vertical-alignment: center;
+                                            }
+                                        }
+                                        Text {
+                                            text: root.pr-items[root.pr-selected].meta;
+                                            color: Theme.c.text-mid;
+                                            font-size: Theme.fs(12px);
+                                            vertical-alignment: center;
+                                            horizontal-stretch: 1;
+                                            overflow: elide;
+                                        }
+                                    }
+                                    HorizontalLayout {
+                                        spacing: 6px;
+                                        Button {
+                                            text: "Open on GitHub ↗";
+                                            clicked => {
+                                                root.open-pr-url(root.pr-items[root.pr-selected].url);
+                                            }
+                                        }
+                                        Rectangle { horizontal-stretch: 1; }
+                                    }
+
+                                    if root.pr-items[root.pr-selected].checks != "": VerticalLayout {
+                                        spacing: 4px;
+                                        Text {
+                                            text: "Checks";
+                                            color: Theme.c.text-mid;
+                                            font-size: Theme.fs(12px);
+                                            font-weight: 700;
+                                        }
+                                        Text {
+                                            text: root.pr-items[root.pr-selected].checks;
+                                            color: Theme.c.text;
+                                            font-size: Theme.fs(12px);
+                                            wrap: word-wrap;
+                                        }
+                                    }
+                                    if root.pr-items[root.pr-selected].reviews != "": VerticalLayout {
+                                        spacing: 4px;
+                                        Text {
+                                            text: "Reviews";
+                                            color: Theme.c.text-mid;
+                                            font-size: Theme.fs(12px);
+                                            font-weight: 700;
+                                        }
+                                        Text {
+                                            text: root.pr-items[root.pr-selected].reviews;
+                                            color: Theme.c.text;
+                                            font-size: Theme.fs(12px);
+                                            wrap: word-wrap;
+                                        }
+                                    }
+                                }
+                            }
+                            }
+                        }
+                    }
+                }
             }
         }
     }
@@ -2963,6 +3167,10 @@ export component AppWindow inherits Window {
         modes: root.settings-modes;
         settings-status: root.settings-status;
         preset-index <=> root.settings-preset-index;
+        section <=> root.settings-section;
+        github-configured: root.settings-github-configured;
+        github-source: root.settings-github-source;
+        github-token-saved(token) => { root.github-token-saved(token); }
         theme-names: root.appearance-theme-names;
         theme-index <=> root.appearance-theme-index;
         font-size-names: root.appearance-font-size-names;

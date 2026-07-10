@@ -1077,6 +1077,51 @@ impl Engine {
             .map_err(EngineError::Internal)
     }
 
+    /// Every PR spawned from the session branch (open first, newest first).
+    pub async fn session_prs(
+        &self,
+        session_id: &str,
+    ) -> Result<Vec<trouve_protocol::PrInfo>, EngineError> {
+        let session = self.get_session(session_id)?;
+        let github = self.github_for_session(&session)?;
+        github
+            .prs_for_branch(&session.branch)
+            .await
+            .map_err(EngineError::Internal)
+    }
+
+    /// Whether GitHub calls can authenticate, and where the token lives.
+    pub fn github_integration(&self) -> trouve_protocol::GithubIntegration {
+        let (configured, source) = if crate::github::token_from_env().is_some() {
+            (true, "environment")
+        } else if matches!(
+            self.secrets
+                .get(&trouve_providers::secrets::api_key_secret("github")),
+            Ok(Some(_))
+        ) {
+            (true, "settings")
+        } else {
+            (false, "")
+        };
+        trouve_protocol::GithubIntegration {
+            configured,
+            source: source.to_string(),
+        }
+    }
+
+    /// Store the GitHub token in the secret store; empty removes it.
+    pub fn set_github_token(&self, token: &str) -> Result<(), EngineError> {
+        let key = trouve_providers::secrets::api_key_secret("github");
+        if token.trim().is_empty() {
+            self.secrets.delete(&key).map_err(EngineError::Internal)?;
+        } else {
+            self.secrets
+                .set(&key, token.trim())
+                .map_err(EngineError::Internal)?;
+        }
+        Ok(())
+    }
+
     /// Push the session branch and open a PR for it.
     pub async fn create_session_pr(
         &self,

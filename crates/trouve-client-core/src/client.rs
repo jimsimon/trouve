@@ -324,6 +324,26 @@ impl ProtocolClient {
         self.get_json(&format!("/sessions/{session_id}/pr")).await
     }
 
+    /// All PRs spawned from the session branch (open first, newest first).
+    pub async fn session_prs(&self, session_id: &str) -> Result<Vec<PrInfo>> {
+        self.get_json(&format!("/sessions/{session_id}/prs")).await
+    }
+
+    pub async fn github_integration(&self) -> Result<GithubIntegration> {
+        self.get_json("/integrations/github").await
+    }
+
+    /// Store the GitHub token server-side; an empty token removes it.
+    pub async fn set_github_token(&self, token: &str) -> Result<GithubIntegration> {
+        self.put_json(
+            "/integrations/github",
+            &SetGithubTokenRequest {
+                token: token.to_string(),
+            },
+        )
+        .await
+    }
+
     pub async fn create_session_pr(
         &self,
         session_id: &str,

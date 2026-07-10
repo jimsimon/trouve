@@ -175,6 +175,60 @@
         }
       }
     },
+    "/v1/integrations/github": {
+      "get": {
+        "tags": [],
+        "operationId": "get_github_integration",
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GithubIntegration"
+                }
+              }
+            }
+          }
+        }
+      },
+      "put": {
+        "tags": [],
+        "operationId": "set_github_integration",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SetGithubTokenRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GithubIntegration"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/v1/models": {
       "get": {
         "tags": [],
@@ -883,6 +937,47 @@
         "responses": {
           "204": {
             "description": ""
+          },
+          "400": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/sessions/{id}/prs": {
+      "get": {
+        "tags": [],
+        "operationId": "list_session_prs",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/PrInfo"
+                  }
+                }
+              }
+            }
           },
           "400": {
             "description": "",
@@ -2438,6 +2533,22 @@
           }
         }
       },
+      "GithubIntegration": {
+        "type": "object",
+        "description": "Whether the GitHub integration can authenticate, and where the token\ncame from (\"environment\", \"settings\", or \"\" when unconfigured).",
+        "required": [
+          "configured",
+          "source"
+        ],
+        "properties": {
+          "configured": {
+            "type": "boolean"
+          },
+          "source": {
+            "type": "string"
+          }
+        }
+      },
       "KnownProvider": {
         "type": "object",
         "description": "A well-known provider preset: clients offer these for one-click setup\ninstead of hand-typed base URLs.",
@@ -2968,6 +3079,18 @@
           "model": {
             "type": "string",
             "description": "Provider-qualified id, e.g. \"openai/gpt-4.1-mini\"."
+          }
+        }
+      },
+      "SetGithubTokenRequest": {
+        "type": "object",
+        "description": "Store (or, with an empty token, remove) the GitHub personal access\ntoken in the server's secret store.",
+        "required": [
+          "token"
+        ],
+        "properties": {
+          "token": {
+            "type": "string"
           }
         }
       },

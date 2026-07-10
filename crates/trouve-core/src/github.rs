@@ -70,6 +70,27 @@ impl GitHub {
         }
     }
 
+    /// Every PR (open, merged, or closed) whose head is `branch`, open ones
+    /// first, newest first within each group.
+    pub async fn prs_for_branch(&self, branch: &str) -> Result<Vec<PrInfo>> {
+        let page = self
+            .client
+            .pulls(&self.owner, &self.repo)
+            .list()
+            .state(octocrab::params::State::All)
+            .head(format!("{}:{branch}", self.owner))
+            .per_page(20)
+            .send()
+            .await
+            .context("listing PRs")?;
+        let mut prs = Vec::new();
+        for pr in page.items {
+            prs.push(self.enrich(pr).await?);
+        }
+        prs.sort_by_key(|pr| (pr.state != "open", std::cmp::Reverse(pr.number)));
+        Ok(prs)
+    }
+
     pub async fn create_pr(
         &self,
         branch: &str,
@@ -169,10 +190,14 @@ impl GitHub {
             number,
             url: pr.html_url.map(|u| u.to_string()).unwrap_or_default(),
             title: pr.title.unwrap_or_default(),
-            state: pr
-                .state
-                .map(|s| format!("{s:?}").to_lowercase())
-                .unwrap_or_default(),
+            // GitHub reports merged PRs as "closed"; distinguish them.
+            state: if pr.merged_at.is_some() {
+                "merged".to_string()
+            } else {
+                pr.state
+                    .map(|s| format!("{s:?}").to_lowercase())
+                    .unwrap_or_default()
+            },
             draft: pr.draft.unwrap_or(false),
             base: pr.base.ref_field,
             head: pr.head.ref_field,

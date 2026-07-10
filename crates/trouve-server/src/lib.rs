@@ -20,12 +20,12 @@ use trouve_core::engine::EngineError;
 use trouve_core::Engine;
 use trouve_protocol::{
     AgentMode, BranchList, CliInfo, CliInstallStatus, CliList, CreatePrRequest,
-    CreateSessionRequest, CreateThreadRequest, DirEntry, ErrorBody, FileContent, KnownProvider,
-    LoginStarted, LoginStatus, MergePrRequest, ModelInfo, PrInfo, ProviderInfo, ProvidersResponse,
-    RegisterWorkspaceRequest, ResolveApprovalRequest, ResolveQuestionRequest, Scope,
-    SendMessageRequest, ServerInfo, Session, SessionDiff, SetDefaultModelRequest, Thread,
-    TurnAccepted, UpdateSessionRequest, UpdateThreadRequest, UpsertProviderRequest, UsageSummary,
-    Workspace, PROTOCOL_VERSION,
+    CreateSessionRequest, CreateThreadRequest, DirEntry, ErrorBody, FileContent, GithubIntegration,
+    KnownProvider, LoginStarted, LoginStatus, MergePrRequest, ModelInfo, PrInfo, ProviderInfo,
+    ProvidersResponse, RegisterWorkspaceRequest, ResolveApprovalRequest, ResolveQuestionRequest,
+    Scope, SendMessageRequest, ServerInfo, Session, SessionDiff, SetDefaultModelRequest,
+    SetGithubTokenRequest, Thread, TurnAccepted, UpdateSessionRequest, UpdateThreadRequest,
+    UpsertProviderRequest, UsageSummary, Workspace, PROTOCOL_VERSION,
 };
 use utoipa::OpenApi;
 
@@ -98,6 +98,9 @@ impl IntoResponse for ApiError {
         get_session_pr,
         create_session_pr,
         merge_session_pr,
+        list_session_prs,
+        get_github_integration,
+        set_github_integration,
     ),
     components(schemas(
         ServerInfo,
@@ -136,6 +139,8 @@ impl IntoResponse for ApiError {
         PrInfo,
         CreatePrRequest,
         MergePrRequest,
+        GithubIntegration,
+        SetGithubTokenRequest,
         ErrorBody,
         trouve_protocol::EventEnvelope,
         trouve_protocol::Event,
@@ -186,6 +191,11 @@ pub fn build_router(engine: Arc<Engine>) -> Router {
             get(get_session_pr).post(create_session_pr),
         )
         .route("/v1/sessions/{id}/pr/merge", post(merge_session_pr))
+        .route("/v1/sessions/{id}/prs", get(list_session_prs))
+        .route(
+            "/v1/integrations/github",
+            get(get_github_integration).put(set_github_integration),
+        )
         .route("/v1/models", get(list_models))
         .route("/v1/modes", get(list_modes))
         .route("/v1/providers", get(list_providers))
@@ -690,6 +700,34 @@ async fn merge_session_pr(
 ) -> Result<axum::http::StatusCode, ApiError> {
     engine.merge_session_pr(&id, req.method.as_deref()).await?;
     Ok(axum::http::StatusCode::NO_CONTENT)
+}
+
+#[utoipa::path(get, path = "/v1/sessions/{id}/prs", params(("id" = String, Path,)),
+    responses((status = 200, body = [PrInfo]), (status = 400, body = ErrorBody)))]
+async fn list_session_prs(
+    State(engine): State<Arc<Engine>>,
+    Path(id): Path<String>,
+) -> Result<Json<Vec<PrInfo>>, ApiError> {
+    Ok(Json(engine.session_prs(&id).await?))
+}
+
+#[utoipa::path(get, path = "/v1/integrations/github",
+    responses((status = 200, body = GithubIntegration)))]
+async fn get_github_integration(
+    State(engine): State<Arc<Engine>>,
+) -> Json<GithubIntegration> {
+    Json(engine.github_integration())
+}
+
+#[utoipa::path(put, path = "/v1/integrations/github",
+    request_body = SetGithubTokenRequest,
+    responses((status = 200, body = GithubIntegration), (status = 400, body = ErrorBody)))]
+async fn set_github_integration(
+    State(engine): State<Arc<Engine>>,
+    Json(req): Json<SetGithubTokenRequest>,
+) -> Result<Json<GithubIntegration>, ApiError> {
+    engine.set_github_token(&req.token)?;
+    Ok(Json(engine.github_integration()))
 }
 
 // --- SSE -------------------------------------------------------------------

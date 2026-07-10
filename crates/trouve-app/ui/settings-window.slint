@@ -106,10 +106,18 @@ export component SettingsScreen inherits Rectangle {
     callback reduce-motion-toggled(bool);
     callback close();
 
-    // Side-nav selection: 0 providers, 1 models, 2 modes, 3 appearance,
-    // 4 about.
-    property <int> section: 0;
-    property <[string]> section-names: ["Providers", "Models", "Modes", "Appearance", "About"];
+    // Integrations: GitHub token state comes from the server; saving an
+    // empty token removes it.
+    in property <bool> github-configured: false;
+    // "environment" (GITHUB_TOKEN/GH_TOKEN) or "settings" (secret store).
+    in property <string> github-source: "";
+    callback github-token-saved(string);
+
+    // Side-nav selection: 0 providers, 1 models, 2 modes, 3 integrations,
+    // 4 appearance, 5 about. in-out so the app can open straight to a
+    // section (e.g. the PR tab's "set up GitHub" button).
+    in-out property <int> section: 0;
+    property <[string]> section-names: ["Providers", "Models", "Modes", "Integrations", "Appearance", "About"];
 
     VerticalLayout {
         // Header: title + a way back to wherever the user came from.
@@ -492,8 +500,86 @@ export component SettingsScreen inherits Rectangle {
                             }
                         }
 
-                        // ---------------- appearance ----------------
+                        // ---------------- integrations ----------------
                         if root.section == 3: VerticalLayout {
+                            spacing: 12px;
+
+                            Text {
+                                text: "Integrations";
+                                color: Theme.c.text-hi;
+                                font-size: Theme.fs(16px);
+                                font-weight: 700;
+                            }
+
+                            Rectangle {
+                                background: Theme.c.surface;
+                                border-radius: 6px;
+                                VerticalLayout {
+                                    padding: 14px;
+                                    spacing: 10px;
+
+                                    HorizontalLayout {
+                                        spacing: 8px;
+                                        Text {
+                                            text: "GitHub";
+                                            color: Theme.c.text-hi;
+                                            font-size: Theme.fs(14px);
+                                            font-weight: 700;
+                                            vertical-alignment: center;
+                                            horizontal-stretch: 1;
+                                        }
+                                        Text {
+                                            text: root.github-configured
+                                                ? (root.github-source == "environment"
+                                                    ? "● connected (environment)"
+                                                    : "● connected")
+                                                : "○ not configured";
+                                            color: root.github-configured ? Theme.c.ok : Theme.c.text-soft;
+                                            font-size: Theme.fs(12px);
+                                            vertical-alignment: center;
+                                        }
+                                    }
+                                    Text {
+                                        text: "Powers the Pull Requests tab and PR creation. Create a fine-grained personal access token with read/write access to Pull requests (and read access to Checks) on github.com → Settings → Developer settings.";
+                                        color: Theme.c.text-soft;
+                                        font-size: Theme.fs(11px);
+                                        wrap: word-wrap;
+                                    }
+                                    if root.github-source == "environment": Text {
+                                        text: "The token currently comes from the GITHUB_TOKEN / GH_TOKEN environment variable, which takes precedence over one saved here.";
+                                        color: Theme.c.warn;
+                                        font-size: Theme.fs(11px);
+                                        wrap: word-wrap;
+                                    }
+                                    HorizontalLayout {
+                                        spacing: 8px;
+                                        gh-token := LineEdit {
+                                            placeholder-text: root.github-configured && root.github-source == "settings"
+                                                ? "••••••••  (saved — enter a new token to replace)"
+                                                : "ghp_… or github_pat_…";
+                                            input-type: password;
+                                            horizontal-stretch: 1;
+                                        }
+                                        Button {
+                                            text: "Save";
+                                            primary: true;
+                                            enabled: gh-token.text != "";
+                                            clicked => {
+                                                root.github-token-saved(gh-token.text);
+                                                gh-token.text = "";
+                                            }
+                                        }
+                                        if root.github-configured && root.github-source == "settings": Button {
+                                            text: "Remove";
+                                            clicked => { root.github-token-saved(""); }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
+                        // ---------------- appearance ----------------
+                        if root.section == 4: VerticalLayout {
                             spacing: 12px;
 
                             Text {
@@ -600,7 +686,7 @@ export component SettingsScreen inherits Rectangle {
                         }
 
                         // ---------------- about ----------------
-                        if root.section == 4: VerticalLayout {
+                        if root.section == 5: VerticalLayout {
                             spacing: 12px;
 
                             Text {

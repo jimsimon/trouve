@@ -108,7 +108,12 @@ pub enum UiCommand {
     Undo,
     Redo,
     CreatePr,
-    RefreshPr,
+    RefreshPrs,
+    SelectPr(usize),
+    OpenPrUrl(String),
+    /// Internal: a background PR fetch finished (session it was for, PRs or
+    /// an error message).
+    PrsLoaded(String, Result<Vec<trouve_protocol::PrInfo>, String>),
     FileActivated(usize),
     /// Open a worktree-relative file in the user's preferred editor.
     OpenFileExternally(String),
@@ -130,6 +135,10 @@ pub enum UiCommand {
     SetDefaultModel(usize),
     /// Download/update a managed vendor CLI ("cursor-agent", "claude", "codex").
     CliInstall(String),
+    /// Open settings straight to the Integrations section.
+    OpenIntegrationsSettings,
+    /// Store/remove the GitHub token (empty = remove).
+    SaveGithubToken(String),
 
     /// Internal: an event arrived on some thread's stream.
     Event(String, Box<EventEnvelope>),
@@ -173,6 +182,14 @@ struct Controller {
 
     threads: Vec<Thread>,
     current_thread: Option<usize>,
+
+    /// GitHub integration state (None until the first fetch answers).
+    github_configured: bool,
+    github_source: String,
+    /// PRs detected for the current session's branch, and the one shown.
+    prs: Vec<trouve_protocol::PrInfo>,
+    pr_selected: usize,
+    pr_error: String,
 
     vms: HashMap<String, ThreadViewModel>,
     followed: HashSet<String>,
@@ -257,6 +274,11 @@ pub async fn run(
         quit_when_idle: false,
         threads: Vec::new(),
         current_thread: None,
+        github_configured: false,
+        github_source: String::new(),
+        prs: Vec::new(),
+        pr_selected: 0,
+        pr_error: String::new(),
         vms: HashMap::new(),
         followed: HashSet::new(),
         expanded_tools: HashSet::new(),
@@ -387,6 +409,13 @@ impl Controller {
 
         self.reload_catalogs().await;
         self.reload_sessions().await?;
+
+        if let Ok(gh) = self.client.github_integration().await {
+            self.github_configured = gh.configured;
+            self.github_source = gh.source;
+        }
+        self.push_github_integration();
+        self.push_prs();
 
         // Reopen the last open session (select_session then restores its
         // last thread and scroll); fall back to the most recent active
@@ -580,6 +609,9 @@ impl Controller {
         self.refresh_usage_text().await;
         let _ = self.load_files().await;
         let _ = self.refresh_diff().await;
+        self.prs.clear();
+        self.pr_selected = 0;
+        self.refresh_prs();
         Ok(())
     }
 
@@ -898,6 +930,73 @@ impl Controller {
         );
     }
 
+    /// Kick off a background fetch of the session's PRs (GitHub round-trips
+    /// are too slow for the command loop); lands back as `PrsLoaded`.
+    fn refresh_prs(&mut self) {
+        let Some(session_id) = self.current_session_id() else {
+            self.prs.clear();
+            self.pr_selected = 0;
+            self.pr_error.clear();
+            self.push_prs();
+            return;
+        };
+        if !self.github_configured {
+            self.push_prs();
+            return;
+        }
+        if self.prs.is_empty() {
+            self.pr_error = "looking for pull requests…".into();
+        }
+        self.push_prs();
+        let client = self.client.clone();
+        let tx = self.tx.clone();
+        tokio::spawn(async move {
+            let result = client
+                .session_prs(&session_id)
+                .await
+                .map_err(|e| format!("{e:#}"));
+            let _ = tx.send(UiCommand::PrsLoaded(session_id, result));
+        });
+    }
+
+    fn push_prs(&self) {
+        let labels = self
+            .prs
+            .iter()
+            .map(|pr| format!("#{} · {} ({})", pr.number, pr.title, pr.state))
+            .collect();
+        let items = self
+            .prs
+            .iter()
+            .map(|pr| ui::PrView {
+                title: pr.title.clone(),
+                state: pr.state.clone(),
+                meta: format!(
+                    "#{}{} · {} → {}",
+                    pr.number,
+                    if pr.draft { " · draft" } else { "" },
+                    pr.head,
+                    pr.base,
+                ),
+                url: pr.url.clone(),
+                checks: format_checks(&pr.checks),
+                reviews: format_reviews(&pr.reviews),
+            })
+            .collect();
+        ui::set_prs(
+            &self.ui,
+            self.github_configured,
+            &self.pr_error,
+            labels,
+            items,
+            self.pr_selected,
+        );
+    }
+
+    fn push_github_integration(&self) {
+        ui::set_github_integration(&self.ui, self.github_configured, &self.github_source);
+    }
+
     /// Reload the Files tree from scratch (session switch, refresh).
     async fn load_files(&mut self) -> Result<()> {
         self.file_children.clear();
@@ -1094,6 +1193,11 @@ impl Controller {
     // --- settings --------------------------------------------------------------
 
     async fn refresh_settings(&mut self) {
+        if let Ok(gh) = self.client.github_integration().await {
+            self.github_configured = gh.configured;
+            self.github_source = gh.source;
+            self.push_github_integration();
+        }
         let providers = match self.client.list_providers().await {
             Ok(p) => p,
             Err(e) => {
@@ -1327,6 +1431,9 @@ impl Controller {
                         Some(NewChat::Thread) => 2,
                     },
                 );
+                // The visit may have (un)configured GitHub; the PR tab
+                // reflects it immediately. No-op when unconfigured.
+                self.refresh_prs();
             }
             UiCommand::AppearanceChanged => {
                 // Chat rows bake syntax-highlight and inline-code colors at
@@ -1673,8 +1780,7 @@ impl Controller {
                     (self.current_session_id(), self.current_session)
                 {
                     let title = self.sessions[index].title.clone();
-                    let pr = self
-                        .client
+                    self.client
                         .create_session_pr(
                             &session_id,
                             &trouve_protocol::CreatePrRequest {
@@ -1685,16 +1791,62 @@ impl Controller {
                             },
                         )
                         .await?;
-                    ui::set_pr_status(&self.ui, format_pr(&pr));
+                    self.refresh_prs();
                 }
             }
-            UiCommand::RefreshPr => {
-                if let Some(session_id) = self.current_session_id() {
-                    let status = match self.client.session_pr(&session_id).await? {
-                        Some(pr) => format_pr(&pr),
-                        None => "no open PR for this session".to_string(),
-                    };
-                    ui::set_pr_status(&self.ui, status);
+            UiCommand::RefreshPrs => self.refresh_prs(),
+            UiCommand::SelectPr(i) => {
+                if i < self.prs.len() {
+                    self.pr_selected = i;
+                    self.push_prs();
+                }
+            }
+            UiCommand::OpenPrUrl(url) => {
+                if !url.is_empty() {
+                    if let Err(e) = open::that_detached(&url) {
+                        self.error(&format!("could not open {url}: {e}"));
+                    }
+                }
+            }
+            UiCommand::PrsLoaded(session_id, result) => {
+                // Ignore answers for a session the user has since left.
+                if self.current_session_id().as_deref() == Some(&session_id) {
+                    match result {
+                        Ok(prs) => {
+                            // Keep the selection on the same PR across
+                            // refreshes when it still exists.
+                            let keep = self
+                                .prs
+                                .get(self.pr_selected)
+                                .and_then(|cur| prs.iter().position(|p| p.number == cur.number));
+                            self.prs = prs;
+                            self.pr_selected = keep.unwrap_or(0);
+                            self.pr_error.clear();
+                        }
+                        Err(e) => {
+                            self.prs.clear();
+                            self.pr_selected = 0;
+                            self.pr_error = e;
+                        }
+                    }
+                    self.push_prs();
+                }
+            }
+            UiCommand::OpenIntegrationsSettings => {
+                ui::set_settings_section(&self.ui, 3);
+                self.refresh_settings().await;
+                ui::set_center_screen(&self.ui, 3);
+            }
+            UiCommand::SaveGithubToken(token) => {
+                match self.client.set_github_token(&token).await {
+                    Ok(integration) => {
+                        self.github_configured = integration.configured;
+                        self.github_source = integration.source;
+                        self.push_github_integration();
+                        // A fresh token usually means the PR tab was waiting.
+                        self.refresh_prs();
+                    }
+                    Err(e) => self.error(&format!("saving GitHub token: {e:#}")),
                 }
             }
             UiCommand::RefreshSettings => {
@@ -2074,30 +2226,29 @@ fn open_in_browser(url: &str) {
         .spawn();
 }
 
-fn format_pr(pr: &trouve_protocol::PrInfo) -> String {
-    let checks = if pr.checks.is_empty() {
-        "no checks".to_string()
-    } else {
-        let done = pr
-            .checks
-            .iter()
-            .filter(|c| c.conclusion.as_deref() == Some("success"))
-            .count();
-        format!("{done}/{} checks green", pr.checks.len())
-    };
-    let reviews = if pr.reviews.is_empty() {
-        "no reviews".to_string()
-    } else {
-        pr.reviews
-            .iter()
-            .map(|r| format!("{}: {}", r.reviewer, r.state))
-            .collect::<Vec<_>>()
-            .join(", ")
-    };
-    format!(
-        "PR #{} ({}) — {}\n{}\n{checks} · {reviews}",
-        pr.number, pr.state, pr.title, pr.url
-    )
+/// One line per check run: status glyph, name, conclusion.
+fn format_checks(checks: &[trouve_protocol::CheckRun]) -> String {
+    checks
+        .iter()
+        .map(|c| match c.conclusion.as_deref() {
+            Some("success") => format!("✓ {}", c.name),
+            Some(conclusion @ ("failure" | "timed_out" | "startup_failure")) => {
+                format!("✗ {} — {conclusion}", c.name)
+            }
+            Some(conclusion) => format!("• {} — {conclusion}", c.name),
+            None => format!("… {} — {}", c.name, c.status),
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// One line per review: reviewer and their verdict.
+fn format_reviews(reviews: &[trouve_protocol::PrReview]) -> String {
+    reviews
+        .iter()
+        .map(|r| format!("{} — {}", r.reviewer, r.state))
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 #[cfg(test)]

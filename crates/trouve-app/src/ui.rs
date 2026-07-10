@@ -382,8 +382,59 @@ pub fn set_usage_text(ui: &Ui, text: String) {
         ui.upgrade_in_event_loop(move |ui| ui.set_usage_text(SharedString::from(text.as_str())));
 }
 
-pub fn set_pr_status(ui: &Ui, text: String) {
-    let _ = ui.upgrade_in_event_loop(move |ui| ui.set_pr_status(SharedString::from(text.as_str())));
+/// Plain-data mirror of the Slint PrItem struct.
+pub struct PrView {
+    pub title: String,
+    pub state: String,
+    pub meta: String,
+    pub url: String,
+    pub checks: String,
+    pub reviews: String,
+}
+
+pub fn set_prs(
+    ui: &Ui,
+    configured: bool,
+    error: &str,
+    labels: Vec<String>,
+    items: Vec<PrView>,
+    selected: usize,
+) {
+    let error = error.to_string();
+    let _ = ui.upgrade_in_event_loop(move |ui| {
+        let labels: Vec<SharedString> = labels
+            .into_iter()
+            .map(|l| SharedString::from(l.as_str()))
+            .collect();
+        let items: Vec<crate::PrItem> = items
+            .into_iter()
+            .map(|p| crate::PrItem {
+                title: SharedString::from(p.title.as_str()),
+                state: SharedString::from(p.state.as_str()),
+                meta: SharedString::from(p.meta.as_str()),
+                url: SharedString::from(p.url.as_str()),
+                checks: SharedString::from(p.checks.as_str()),
+                reviews: SharedString::from(p.reviews.as_str()),
+            })
+            .collect();
+        ui.set_pr_configured(configured);
+        ui.set_pr_error(SharedString::from(error.as_str()));
+        ui.set_pr_labels(ModelRc::new(VecModel::from(labels)));
+        ui.set_pr_items(ModelRc::new(VecModel::from(items)));
+        ui.set_pr_selected(selected as i32);
+    });
+}
+
+pub fn set_github_integration(ui: &Ui, configured: bool, source: &str) {
+    let source = source.to_string();
+    let _ = ui.upgrade_in_event_loop(move |ui| {
+        ui.set_settings_github_configured(configured);
+        ui.set_settings_github_source(SharedString::from(source.as_str()));
+    });
+}
+
+pub fn set_settings_section(ui: &Ui, section: i32) {
+    let _ = ui.upgrade_in_event_loop(move |ui| ui.set_settings_section(section));
 }
 
 pub fn set_diff(ui: &Ui, rows: Vec<slint_diff_view::RowData>, raw: String) {

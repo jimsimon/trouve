@@ -254,6 +254,23 @@ pub struct MergePrRequest {
     pub method: Option<String>,
 }
 
+// --- integrations ----------------------------------------------------------
+
+/// Whether the GitHub integration can authenticate, and where the token
+/// came from ("environment", "settings", or "" when unconfigured).
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct GithubIntegration {
+    pub configured: bool,
+    pub source: String,
+}
+
+/// Store (or, with an empty token, remove) the GitHub personal access
+/// token in the server's secret store.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct SetGithubTokenRequest {
+    pub token: String,
+}
+
 // --- branches --------------------------------------------------------------
 
 /// Local branches of a workspace repository, for base-ref selection.

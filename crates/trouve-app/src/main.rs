@@ -462,8 +462,32 @@ fn main() -> anyhow::Result<()> {
     }
     {
         let tx = tx.clone();
-        window.on_refresh_pr(move || {
-            let _ = tx.send(UiCommand::RefreshPr);
+        window.on_refresh_prs(move || {
+            let _ = tx.send(UiCommand::RefreshPrs);
+        });
+    }
+    {
+        let tx = tx.clone();
+        window.on_pr_picked(move |i| {
+            let _ = tx.send(UiCommand::SelectPr(i as usize));
+        });
+    }
+    {
+        let tx = tx.clone();
+        window.on_open_pr_url(move |url| {
+            let _ = tx.send(UiCommand::OpenPrUrl(url.to_string()));
+        });
+    }
+    {
+        let tx = tx.clone();
+        window.on_open_integrations_settings(move || {
+            let _ = tx.send(UiCommand::OpenIntegrationsSettings);
+        });
+    }
+    {
+        let tx = tx.clone();
+        window.on_github_token_saved(move |token| {
+            let _ = tx.send(UiCommand::SaveGithubToken(token.to_string()));
         });
     }
 
