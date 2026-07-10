@@ -20,7 +20,11 @@ pub struct OpenAiCompatProvider {
     base_url: String,
     token: Arc<dyn TokenSource>,
     client: reqwest::Client,
+    /// Live `/models` result, cached for [`MODELS_TTL`].
+    models_cache: tokio::sync::Mutex<Option<(std::time::Instant, Vec<trouve_protocol::ModelInfo>)>>,
 }
+
+const MODELS_TTL: std::time::Duration = std::time::Duration::from_secs(300);
 
 impl OpenAiCompatProvider {
     pub fn new(
@@ -43,7 +47,31 @@ impl OpenAiCompatProvider {
             base_url: base_url.into().trim_end_matches('/').to_string(),
             token,
             client: reqwest::Client::new(),
+            models_cache: tokio::sync::Mutex::new(None),
         }
+    }
+
+    /// Fetch the gateway's `/models` list (the OpenAI-standard endpoint,
+    /// also served by OpenRouter-style gateways with richer metadata:
+    /// display name, context length, pricing, tool support).
+    async fn fetch_models(&self) -> Result<Vec<trouve_protocol::ModelInfo>, ProviderError> {
+        let key = self.token.bearer().await?;
+        let mut req = self.client.get(format!("{}/models", self.base_url));
+        if !key.is_empty() {
+            req = req.bearer_auth(key);
+        }
+        let resp = req
+            .send()
+            .await
+            .map_err(|e| ProviderError::Request(e.to_string()))?;
+        if !resp.status().is_success() {
+            return Err(ProviderError::Api(format!("{}", resp.status())));
+        }
+        let body: Value = resp
+            .json()
+            .await
+            .map_err(|e| ProviderError::Request(e.to_string()))?;
+        Ok(parse_gateway_models(&self.id, &body))
     }
 
     /// Standard OpenAI endpoint with the key from `OPENAI_API_KEY`.
@@ -91,6 +119,50 @@ impl OpenAiCompatProvider {
     }
 }
 
+/// Map a gateway `/models` response to ModelInfos. OpenRouter-style
+/// entries carry display name, context length, pricing (USD per token, as
+/// strings), and a `supported_parameters` capability list; plain
+/// OpenAI-shaped gateways return bare ids, which get permissive defaults.
+/// Models that declare no tool support are dropped — trouve's agent loop
+/// needs tools.
+fn parse_gateway_models(provider_id: &str, body: &Value) -> Vec<trouve_protocol::ModelInfo> {
+    let Some(data) = body["data"].as_array() else {
+        return Vec::new();
+    };
+    data.iter()
+        .filter_map(|entry| {
+            let name = entry["id"].as_str()?;
+            let window = entry["context_length"]
+                .as_u64()
+                .or_else(|| entry.pointer("/top_provider/context_length")?.as_u64())
+                .filter(|w| *w > 0)
+                .unwrap_or(128_000);
+            let supports_tools = entry["supported_parameters"]
+                .as_array()
+                .map(|p| p.iter().any(|v| v.as_str() == Some("tools")))
+                // No capability metadata: assume tools and let the gateway
+                // reject if not.
+                .unwrap_or(true);
+            let price = |k: &str| -> Option<f64> {
+                entry["pricing"][k]
+                    .as_str()?
+                    .parse::<f64>()
+                    .ok()
+                    .map(|v| v * 1e6)
+            };
+            supports_tools.then(|| trouve_protocol::ModelInfo {
+                id: format!("{provider_id}/{name}"),
+                display_name: entry["name"].as_str().unwrap_or(name).to_string(),
+                context_window: window,
+                supports_tools,
+                input_price_per_mtok: price("prompt"),
+                output_price_per_mtok: price("completion"),
+                options_schema: serde_json::json!({}),
+            })
+        })
+        .collect()
+}
+
 /// Accumulates streamed tool-call fragments (OpenAI sends name/arguments in
 /// pieces keyed by index).
 #[derive(Default)]
@@ -113,6 +185,31 @@ impl Provider for OpenAiCompatProvider {
             catalog::openai_models(&self.id)
         } else {
             Vec::new()
+        }
+    }
+
+    async fn list_models(&self) -> Vec<trouve_protocol::ModelInfo> {
+        // OpenAI proper: the static catalog carries curated options
+        // schemas the live listing can't provide.
+        if self.base_url.contains("api.openai.com") {
+            return self.models();
+        }
+        let mut cache = self.models_cache.lock().await;
+        if let Some((at, models)) = cache.as_ref() {
+            if at.elapsed() < MODELS_TTL {
+                return models.clone();
+            }
+        }
+        match self.fetch_models().await {
+            Ok(models) if !models.is_empty() => {
+                *cache = Some((std::time::Instant::now(), models.clone()));
+                models
+            }
+            Ok(_) => self.models(),
+            Err(e) => {
+                tracing::debug!("{} model list failed: {e}; using static catalog", self.id);
+                self.models()
+            }
         }
     }
 
@@ -285,4 +382,51 @@ fn async_stream(
         let _ = tx.send(Ok(ProviderEvent::Completed { usage })).await;
     });
     Box::pin(tokio_stream::wrappers::ReceiverStream::new(rx))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_openrouter_style_gateway_models() {
+        // Kilo Code / OpenRouter shape: rich metadata, string prices per
+        // token, capability list.
+        let body = json!({ "data": [
+            {
+                "id": "anthropic/claude-sonnet-4.5",
+                "name": "Claude Sonnet 4.5",
+                "context_length": 1_000_000,
+                "pricing": { "prompt": "0.000003", "completion": "0.000015" },
+                "supported_parameters": ["max_tokens", "tools", "temperature"],
+            },
+            {
+                "id": "some/no-tools-model",
+                "name": "No Tools",
+                "context_length": 8192,
+                "supported_parameters": ["max_tokens"],
+            },
+        ]});
+        let models = parse_gateway_models("kilocode", &body);
+        assert_eq!(models.len(), 1, "tool-less models are dropped");
+        let m = &models[0];
+        assert_eq!(m.id, "kilocode/anthropic/claude-sonnet-4.5");
+        assert_eq!(m.display_name, "Claude Sonnet 4.5");
+        assert_eq!(m.context_window, 1_000_000);
+        assert_eq!(m.input_price_per_mtok, Some(3.0));
+        assert_eq!(m.output_price_per_mtok, Some(15.0));
+    }
+
+    #[test]
+    fn parses_bare_openai_shaped_model_list() {
+        // Plain gateways (ollama, vllm) return ids only: permissive
+        // defaults apply.
+        let body = json!({ "data": [ { "id": "qwen2.5-coder:7b" } ] });
+        let models = parse_gateway_models("ollama", &body);
+        assert_eq!(models.len(), 1);
+        assert_eq!(models[0].id, "ollama/qwen2.5-coder:7b");
+        assert_eq!(models[0].context_window, 128_000);
+        assert!(models[0].supports_tools);
+        assert_eq!(models[0].input_price_per_mtok, None);
+    }
 }

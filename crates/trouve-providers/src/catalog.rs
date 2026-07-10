@@ -103,6 +103,14 @@ pub fn known_providers() -> Vec<KnownProvider> {
             "api-key",
         ),
         p(
+            "kilocode",
+            "Kilo Code",
+            "openai-compat",
+            Some("https://api.kilo.ai/api/gateway"),
+            Some("KILO_API_KEY"),
+            "api-key",
+        ),
+        p(
             "perplexity",
             "Perplexity",
             "openai-compat",

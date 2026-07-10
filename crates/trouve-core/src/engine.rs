@@ -2460,14 +2460,20 @@ impl Engine {
         provider: &Arc<dyn Provider>,
         model_name: &str,
     ) -> Result<()> {
-        let Some(context_window) = provider
-            .models()
+        // The live listing knows gateway models (kilocode, openrouter, ...)
+        // the static catalog doesn't; it is cached, so this is cheap. A
+        // model absent from both still compacts, against a conservative
+        // default window — never compacting would let the transcript grow
+        // until requests fail or the model degrades.
+        let live = provider.list_models().await;
+        let known = provider.models();
+        let context_window = live
             .iter()
+            .chain(known.iter())
             .find(|m| m.id == thread.model)
             .map(|m| m.context_window)
-        else {
-            return Ok(()); // Unknown model: no window to compact against.
-        };
+            .filter(|w| *w > 0)
+            .unwrap_or(100_000);
         let payloads = self.store.messages(&thread.id)?;
         if payloads.len() < 2 {
             return Ok(());
