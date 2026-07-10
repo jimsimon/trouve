@@ -36,6 +36,36 @@ pub struct AgentMode {
     pub read_only: bool,
     #[serde(default)]
     pub default_permission_mode: PermissionMode,
+    /// Preferred model for threads started in this mode ("provider/model").
+    /// None falls back to the global default model.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_model: Option<String>,
+}
+
+/// A mode plus where it came from, for the settings UI.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct ModeInfo {
+    pub mode: AgentMode,
+    /// "builtin" (untouched), "customized" (builtin with a user override
+    /// file), "custom" (user-added), or "workspace" (defined in the
+    /// workspace's .agents/modes — file-managed, read-only in settings).
+    pub origin: String,
+}
+
+/// Create or update a user-level mode (`<config>/modes/<id>.toml`). Saving
+/// under a built-in id customizes that built-in.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct UpsertModeRequest {
+    pub display_name: String,
+    pub system_prompt: String,
+    #[serde(default)]
+    pub allowed_tools: Vec<String>,
+    #[serde(default)]
+    pub read_only: bool,
+    #[serde(default)]
+    pub default_permission_mode: PermissionMode,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_model: Option<String>,
 }
 
 // --- server info ---------------------------------------------------------

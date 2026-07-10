@@ -19,7 +19,8 @@ use tokio_stream::wrappers::ReceiverStream;
 use trouve_core::engine::EngineError;
 use trouve_core::Engine;
 use trouve_protocol::{
-    AgentMode, BranchList, CliInfo, CliInstallStatus, CliList, CreatePrRequest,
+    AgentMode, BranchList, CliInfo, CliInstallStatus, CliList, CreatePrRequest, ModeInfo,
+    UpsertModeRequest,
     CreateSessionRequest, CreateThreadRequest, DirEntry, ErrorBody, FileContent, GithubIntegration,
     KnownProvider, LoginStarted, LoginStatus, McpLogs, McpServerInfo, MergePrRequest, ModelInfo,
     PrInfo, ProviderInfo, ProvidersResponse, RegisterWorkspaceRequest, ResolveApprovalRequest,
@@ -81,6 +82,9 @@ impl IntoResponse for ApiError {
         resolve_question,
         list_models,
         list_modes,
+        list_mode_infos,
+        upsert_mode,
+        delete_mode,
         list_providers,
         known_providers,
         upsert_provider,
@@ -162,6 +166,8 @@ impl IntoResponse for ApiError {
         trouve_protocol::RestoreDirection,
         trouve_protocol::PermissionMode,
         trouve_protocol::AgentMode,
+        ModeInfo,
+        UpsertModeRequest,
     ))
 )]
 struct ApiDoc;
@@ -216,6 +222,11 @@ pub fn build_router(engine: Arc<Engine>) -> Router {
         .route("/v1/subscriptions", get(subscription_health))
         .route("/v1/models", get(list_models))
         .route("/v1/modes", get(list_modes))
+        .route("/v1/mode-infos", get(list_mode_infos))
+        .route(
+            "/v1/modes/{id}",
+            axum::routing::put(upsert_mode).delete(delete_mode),
+        )
         .route("/v1/providers", get(list_providers))
         .route("/v1/providers/known", get(known_providers))
         .route(
@@ -639,6 +650,38 @@ async fn list_modes(
     Query(q): Query<ListModesQuery>,
 ) -> Result<Json<Vec<AgentMode>>, ApiError> {
     Ok(Json(engine.list_modes(q.workspace_id.as_deref())?))
+}
+
+#[utoipa::path(get, path = "/v1/mode-infos",
+    params(("workspace_id" = Option<String>, Query, description = "Include the workspace's .agents modes")),
+    responses((status = 200, body = [ModeInfo])))]
+async fn list_mode_infos(
+    State(engine): State<Arc<Engine>>,
+    Query(q): Query<ListModesQuery>,
+) -> Result<Json<Vec<ModeInfo>>, ApiError> {
+    Ok(Json(engine.list_mode_infos(q.workspace_id.as_deref())?))
+}
+
+#[utoipa::path(put, path = "/v1/modes/{id}", params(("id" = String, Path,)),
+    request_body = UpsertModeRequest,
+    responses((status = 204), (status = 400, body = ErrorBody)))]
+async fn upsert_mode(
+    State(engine): State<Arc<Engine>>,
+    Path(id): Path<String>,
+    Json(req): Json<UpsertModeRequest>,
+) -> Result<axum::http::StatusCode, ApiError> {
+    engine.upsert_mode(&id, req)?;
+    Ok(axum::http::StatusCode::NO_CONTENT)
+}
+
+#[utoipa::path(delete, path = "/v1/modes/{id}", params(("id" = String, Path,)),
+    responses((status = 204), (status = 400, body = ErrorBody)))]
+async fn delete_mode(
+    State(engine): State<Arc<Engine>>,
+    Path(id): Path<String>,
+) -> Result<axum::http::StatusCode, ApiError> {
+    engine.delete_mode(&id)?;
+    Ok(axum::http::StatusCode::NO_CONTENT)
 }
 
 #[utoipa::path(get, path = "/v1/sessions/{id}/diff", params(("id" = String, Path,)),

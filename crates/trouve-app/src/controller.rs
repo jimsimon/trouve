@@ -14,8 +14,8 @@ use trouve_client_core::client::ProtocolClient;
 use trouve_client_core::viewmodel::ThreadViewModel;
 use trouve_protocol::{
     AgentMode, ApprovalDecision, CreateSessionRequest, CreateThreadRequest, DirEntry,
-    EventEnvelope, ModelInfo, Session, Thread, UpdateSessionRequest, UpdateThreadRequest,
-    UpsertProviderRequest, Workspace,
+    EventEnvelope, ModelInfo, PermissionMode, Session, Thread, UpdateSessionRequest,
+    UpdateThreadRequest, UpsertModeRequest, UpsertProviderRequest, Workspace,
 };
 
 use crate::render;
@@ -133,6 +133,15 @@ pub enum UiCommand {
     DeleteProvider(String),
     ProviderLogin(String),
     SetDefaultModel(usize),
+    /// Create/update a user-level mode (a built-in id customizes it).
+    /// Fields: id, display name, system prompt, comma-separated allowed
+    /// tools, read-only, permission index (0 ask/1 allow-list/2 yolo),
+    /// model index into the models catalog (-1 = global default).
+    SaveMode(String, String, String, String, bool, i32, i32),
+    /// Remove a custom mode / reset a customized built-in.
+    DeleteMode(String),
+    /// Quick per-row change of a mode's default model (-1 = global).
+    SetModeModel(String, i32),
     /// Download/update a managed vendor CLI ("cursor-agent", "claude", "codex").
     CliInstall(String),
     /// Open settings straight to the Integrations section.
@@ -228,6 +237,9 @@ struct Controller {
     resume: crate::winstate::Resume,
 
     modes: Vec<AgentMode>,
+    /// Provenance per mode, aligned with `modes` (builtin / customized /
+    /// custom / workspace) — drives the settings Modes & Models section.
+    mode_origins: Vec<String>,
     models: Vec<ModelInfo>,
     /// Thinking dropdown state for the current thread's model: the schema
     /// property the values belong to and the raw value tokens (parallel to
@@ -308,6 +320,7 @@ pub async fn run(
         wizards: HashMap::new(),
         resume: crate::winstate::load_resume(),
         modes: Vec::new(),
+        mode_origins: Vec::new(),
         models: Vec::new(),
         thinking_key: None,
         thinking_values: Vec::new(),
@@ -457,11 +470,13 @@ impl Controller {
 
     /// Refresh modes/models (after provider changes) and push all pickers.
     async fn reload_catalogs(&mut self) {
-        self.modes = self
+        let infos = self
             .client
-            .list_modes(Some(&self.home_workspace_id))
+            .list_mode_infos(Some(&self.home_workspace_id))
             .await
             .unwrap_or_default();
+        self.modes = infos.iter().map(|i| i.mode.clone()).collect();
+        self.mode_origins = infos.into_iter().map(|i| i.origin).collect();
         self.models = self.client.list_models().await.unwrap_or_default();
         let mode_names = self
             .modes
@@ -473,7 +488,24 @@ impl Controller {
             mode_names,
             self.models.iter().map(|m| m.id.clone()).collect(),
         );
+        // Each mode's default model, so mode pickers can jump the model
+        // picker to it.
+        ui::set_mode_model_indices(
+            &self.ui,
+            self.modes
+                .iter()
+                .map(|m| self.model_index_of(m.default_model.as_deref()))
+                .collect(),
+        );
         self.push_picker_indices();
+    }
+
+    /// Index of a provider-qualified model id in the models catalog.
+    fn model_index_of(&self, model: Option<&str>) -> i32 {
+        model
+            .and_then(|id| self.models.iter().position(|m| m.id == id))
+            .map(|i| i as i32)
+            .unwrap_or(-1)
     }
 
     async fn reload_sessions(&mut self) -> Result<()> {
@@ -1296,20 +1328,29 @@ impl Controller {
                     )
                 })
                 .collect(),
-            model_ids,
+            model_ids.clone(),
             default_index,
-            self.modes
-                .iter()
-                .map(|m| {
-                    format!(
-                        "{}  ·  {}{}",
-                        m.id,
-                        m.display_name,
-                        if m.read_only { "  ·  read-only" } else { "" }
-                    )
-                })
-                .collect(),
         );
+        let mode_views = self
+            .modes
+            .iter()
+            .zip(&self.mode_origins)
+            .map(|(m, origin)| ui::ModeView {
+                id: m.id.clone(),
+                display_name: m.display_name.clone(),
+                origin: origin.clone(),
+                read_only: m.read_only,
+                system_prompt: m.system_prompt.clone(),
+                allowed_tools: m.allowed_tools.join(", "),
+                permission_index: match m.default_permission_mode {
+                    PermissionMode::Ask => 0,
+                    PermissionMode::AllowList => 1,
+                    PermissionMode::Yolo => 2,
+                },
+                model_index: self.model_index_of(m.default_model.as_deref()),
+            })
+            .collect();
+        ui::set_settings_modes(&self.ui, mode_views, model_ids);
         // Preset catalog is static server data; fetch alongside the rest.
         if let Ok(known) = self.client.known_providers().await {
             ui::set_known_providers(&self.ui, known);
@@ -1706,8 +1747,17 @@ impl Controller {
             }
             UiCommand::ComposerModeChanged(i) => {
                 let mode = self.modes.get(i).map(|m| m.id.clone());
+                // Switching modes also applies the mode's default model,
+                // when it has one; the user can still re-pick afterwards.
+                let model = self
+                    .modes
+                    .get(i)
+                    .and_then(|m| m.default_model.clone())
+                    .filter(|m| self.models.iter().any(|known| known.id == *m));
                 self.update_current_thread(UpdateThreadRequest {
                     mode,
+                    model_options: model.is_some().then(serde_json::Map::new),
+                    model,
                     ..Default::default()
                 })
                 .await;
@@ -1904,7 +1954,7 @@ impl Controller {
                 }
             }
             UiCommand::OpenIntegrationsSettings => {
-                ui::set_settings_section(&self.ui, 4);
+                ui::set_settings_section(&self.ui, 3);
                 self.refresh_settings().await;
                 self.refresh_mcp();
                 self.refresh_subscriptions();
@@ -2132,6 +2182,75 @@ impl Controller {
                         Err(e) => {
                             ui::set_settings_status(&self.ui, format!("{e:#}"));
                         }
+                    }
+                }
+            }
+            UiCommand::SaveMode(id, display, prompt, tools, read_only, perm, model) => {
+                let req = UpsertModeRequest {
+                    display_name: display,
+                    system_prompt: prompt,
+                    allowed_tools: tools
+                        .split(',')
+                        .map(str::trim)
+                        .filter(|t| !t.is_empty())
+                        .map(String::from)
+                        .collect(),
+                    read_only,
+                    default_permission_mode: match perm {
+                        1 => PermissionMode::AllowList,
+                        2 => PermissionMode::Yolo,
+                        _ => PermissionMode::Ask,
+                    },
+                    default_model: usize::try_from(model)
+                        .ok()
+                        .and_then(|i| self.models.get(i))
+                        .map(|m| m.id.clone()),
+                };
+                match self.client.upsert_mode(&id, &req).await {
+                    Ok(()) => {
+                        ui::set_settings_status(&self.ui, format!("saved mode {id}"));
+                        self.reload_catalogs().await;
+                        self.refresh_settings().await;
+                    }
+                    Err(e) => ui::set_settings_status(&self.ui, format!("{e:#}")),
+                }
+            }
+            UiCommand::DeleteMode(id) => match self.client.delete_mode(&id).await {
+                Ok(()) => {
+                    ui::set_settings_status(&self.ui, format!("removed mode override {id}"));
+                    self.reload_catalogs().await;
+                    self.refresh_settings().await;
+                }
+                Err(e) => ui::set_settings_status(&self.ui, format!("{e:#}")),
+            },
+            UiCommand::SetModeModel(id, model_idx) => {
+                // PUT replaces the whole mode file, so carry the current
+                // fields and only swap the default model.
+                if let Some(mode) = self.modes.iter().find(|m| m.id == id).cloned() {
+                    let req = UpsertModeRequest {
+                        display_name: mode.display_name,
+                        system_prompt: mode.system_prompt,
+                        allowed_tools: mode.allowed_tools,
+                        read_only: mode.read_only,
+                        default_permission_mode: mode.default_permission_mode,
+                        default_model: usize::try_from(model_idx)
+                            .ok()
+                            .and_then(|i| self.models.get(i))
+                            .map(|m| m.id.clone()),
+                    };
+                    match self.client.upsert_mode(&id, &req).await {
+                        Ok(()) => {
+                            ui::set_settings_status(
+                                &self.ui,
+                                match &req.default_model {
+                                    Some(m) => format!("{id} default model: {m}"),
+                                    None => format!("{id} uses the global default model"),
+                                },
+                            );
+                            self.reload_catalogs().await;
+                            self.refresh_settings().await;
+                        }
+                        Err(e) => ui::set_settings_status(&self.ui, format!("{e:#}")),
                     }
                 }
             }

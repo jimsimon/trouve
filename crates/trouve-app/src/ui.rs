@@ -622,7 +622,6 @@ pub fn set_settings_data(
     providers: Vec<(String, String, String, bool, String, bool)>,
     models: Vec<String>,
     default_model_index: i32,
-    modes: Vec<String>,
 ) {
     let _ = ui.upgrade_in_event_loop(move |ui| {
         let items: Vec<ProviderItem> = providers
@@ -641,7 +640,49 @@ pub fn set_settings_data(
         ui.set_settings_providers(ModelRc::new(VecModel::from(items)));
         ui.set_settings_models(string_model(models));
         ui.set_settings_default_model_index(default_model_index);
-        ui.set_settings_modes(string_model(modes));
+    });
+}
+
+/// Plain-data mirror of the Slint ModeItem struct.
+pub struct ModeView {
+    pub id: String,
+    pub display_name: String,
+    pub origin: String,
+    pub read_only: bool,
+    pub system_prompt: String,
+    pub allowed_tools: String,
+    pub permission_index: i32,
+    pub model_index: i32,
+}
+
+/// Mode cards for the Modes & Models section, plus the per-mode model
+/// picker options ("Global default" + every model id).
+pub fn set_settings_modes(ui: &Ui, modes: Vec<ModeView>, mut model_names: Vec<String>) {
+    let _ = ui.upgrade_in_event_loop(move |ui| {
+        let items: Vec<crate::ModeItem> = modes
+            .into_iter()
+            .map(|m| crate::ModeItem {
+                id: SharedString::from(m.id.as_str()),
+                display_name: SharedString::from(m.display_name.as_str()),
+                origin: SharedString::from(m.origin.as_str()),
+                read_only: m.read_only,
+                system_prompt: SharedString::from(m.system_prompt.as_str()),
+                allowed_tools: SharedString::from(m.allowed_tools.as_str()),
+                permission_index: m.permission_index,
+                model_index: m.model_index,
+            })
+            .collect();
+        ui.set_settings_mode_items(ModelRc::new(VecModel::from(items)));
+        model_names.insert(0, "Global default".into());
+        ui.set_settings_mode_model_names(string_model(model_names));
+    });
+}
+
+/// Aligned with the composer/new-chat mode picker: each mode's default
+/// model as an index into the models list (-1 = none).
+pub fn set_mode_model_indices(ui: &Ui, indices: Vec<i32>) {
+    let _ = ui.upgrade_in_event_loop(move |ui| {
+        ui.set_mode_model_indices(ModelRc::new(VecModel::from(indices)));
     });
 }
 

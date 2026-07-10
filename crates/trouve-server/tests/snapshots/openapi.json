@@ -395,6 +395,38 @@
         }
       }
     },
+    "/v1/mode-infos": {
+      "get": {
+        "tags": [],
+        "operationId": "list_mode_infos",
+        "parameters": [
+          {
+            "name": "workspace_id",
+            "in": "query",
+            "description": "Include the workspace's .agents modes",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/ModeInfo"
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/v1/models": {
       "get": {
         "tags": [],
@@ -441,6 +473,76 @@
                   "items": {
                     "$ref": "#/components/schemas/AgentMode"
                   }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/modes/{id}": {
+      "put": {
+        "tags": [],
+        "operationId": "upsert_mode",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UpsertModeRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "204": {
+            "description": ""
+          },
+          "400": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      },
+      "delete": {
+        "tags": [],
+        "operationId": "delete_mode",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": ""
+          },
+          "400": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
                 }
               }
             }
@@ -1639,6 +1741,13 @@
               "type": "string"
             },
             "description": "Tool names this mode may use; empty means all registered tools."
+          },
+          "default_model": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Preferred model for threads started in this mode (\"provider/model\").\nNone falls back to the global default model."
           },
           "default_permission_mode": {
             "$ref": "#/components/schemas/PermissionMode"
@@ -2893,6 +3002,23 @@
           }
         }
       },
+      "ModeInfo": {
+        "type": "object",
+        "description": "A mode plus where it came from, for the settings UI.",
+        "required": [
+          "mode",
+          "origin"
+        ],
+        "properties": {
+          "mode": {
+            "$ref": "#/components/schemas/AgentMode"
+          },
+          "origin": {
+            "type": "string",
+            "description": "\"builtin\" (untouched), \"customized\" (builtin with a user override\nfile), \"custom\" (user-added), or \"workspace\" (defined in the\nworkspace's .agents/modes — file-managed, read-only in settings)."
+          }
+        }
+      },
       "ModelInfo": {
         "type": "object",
         "description": "A model a configured provider can run, with enough metadata for clients\nto render selection and options UIs generically.",
@@ -3568,6 +3694,40 @@
               "null"
             ],
             "description": "Required for workspace scope: whose `.agents/.mcp.json` to edit."
+          }
+        }
+      },
+      "UpsertModeRequest": {
+        "type": "object",
+        "description": "Create or update a user-level mode (`<config>/modes/<id>.toml`). Saving\nunder a built-in id customizes that built-in.",
+        "required": [
+          "display_name",
+          "system_prompt"
+        ],
+        "properties": {
+          "allowed_tools": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "default_model": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "default_permission_mode": {
+            "$ref": "#/components/schemas/PermissionMode"
+          },
+          "display_name": {
+            "type": "string"
+          },
+          "read_only": {
+            "type": "boolean"
+          },
+          "system_prompt": {
+            "type": "string"
           }
         }
       },

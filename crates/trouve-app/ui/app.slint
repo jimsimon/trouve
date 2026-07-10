@@ -13,7 +13,7 @@ import { DiffView, DiffRow } from "diff-view.slint";
 import { CodeView, TextSegment } from "code-view.slint";
 import {
     SettingsScreen, ProviderItem, CliItem, KnownProviderItem, McpServerItem,
-    SubscriptionItem
+    SubscriptionItem, ModeItem
 } from "settings-window.slint";
 import { ScrollKeys } from "scroll-keys.slint";
 import { Theme, ThemePalette } from "theme.slint";
@@ -22,7 +22,7 @@ import { Palette } from "std-widgets.slint";
 // Theme re-exported so Rust can push the selected palette.
 export {
     DiffRow, TextSegment, ProviderItem, CliItem, KnownProviderItem, McpServerItem,
-    SubscriptionItem
+    SubscriptionItem, ModeItem
 }
 export { Theme, ThemePalette }
 
@@ -741,6 +741,9 @@ component NewChatForm inherits VerticalLayout {
     in-out property <int> branch-index;
     in property <[string]> modes;
     in-out property <int> mode-index;
+    // Per-mode default model as an index into models (-1 = none); picking
+    // a mode jumps the model picker to its default.
+    in property <[int]> mode-model-indices;
     in property <[string]> models;
     in property <[int]> model-matches;
     in-out property <int> model-index;
@@ -813,6 +816,13 @@ component NewChatForm inherits VerticalLayout {
             ComboBox {
                 model: root.modes;
                 current-index <=> root.mode-index;
+                selected => {
+                    if (root.mode-index >= 0
+                        && root.mode-index < root.mode-model-indices.length
+                        && root.mode-model-indices[root.mode-index] >= 0) {
+                        root.model-index = root.mode-model-indices[root.mode-index];
+                    }
+                }
             }
         }
         VerticalLayout {
@@ -994,7 +1004,8 @@ export component AppWindow inherits Window {
     in property <[string]> settings-known-provider-names;
     in property <[string]> settings-models;
     in property <int> settings-default-model-index: -1;
-    in property <[string]> settings-modes;
+    in property <[ModeItem]> settings-mode-items;
+    in property <[string]> settings-mode-model-names;
     in property <string> settings-status: "";
     in-out property <int> settings-preset-index: 0;
     // Which settings section shows when the screen opens (0 providers …
@@ -1020,6 +1031,9 @@ export component AppWindow inherits Window {
     callback provider-deleted(string);
     callback provider-login(string);
     callback default-model-picked(int);
+    callback mode-saved(string, string, string, string, bool, int, int);
+    callback mode-deleted(string);
+    callback mode-model-picked(string, int);
     callback refresh-settings();
     callback cli-install(/* id */ string);
     callback close-settings();
@@ -1089,6 +1103,9 @@ export component AppWindow inherits Window {
     in-out property <string> error-text: "";
 
     in property <[string]> modes;
+    // Aligned with modes: each mode's default model as an index into
+    // models (-1 = none/global default).
+    in property <[int]> mode-model-indices;
     in property <[string]> models;
     // Fuzzy-filtered model indices for the search pickers (Rust computes;
     // only one picker popup is ever open, so the state is shared).
@@ -1631,6 +1648,7 @@ export component AppWindow inherits Window {
                     height: 100%;
                     session-form: false;
                     modes: root.modes;
+                    mode-model-indices: root.mode-model-indices;
                     mode-index <=> root.nc-mode-index;
                     models: root.models;
                     model-matches: root.model-filter-matches;
@@ -2754,6 +2772,7 @@ export component AppWindow inherits Window {
                 branches: root.nc-branches;
                 branch-index <=> root.nc-branch-index;
                 modes: root.modes;
+                mode-model-indices: root.mode-model-indices;
                 mode-index <=> root.nc-mode-index;
                 models: root.models;
                 model-matches: root.model-filter-matches;
@@ -3231,7 +3250,8 @@ export component AppWindow inherits Window {
         known-provider-names: root.settings-known-provider-names;
         models: root.settings-models;
         default-model-index: root.settings-default-model-index;
-        modes: root.settings-modes;
+        mode-items: root.settings-mode-items;
+        mode-model-names: root.settings-mode-model-names;
         settings-status: root.settings-status;
         preset-index <=> root.settings-preset-index;
         section <=> root.settings-section;
@@ -3264,6 +3284,11 @@ export component AppWindow inherits Window {
         provider-deleted(id) => { root.provider-deleted(id); }
         provider-login(id) => { root.provider-login(id); }
         default-model-picked(i) => { root.default-model-picked(i); }
+        mode-saved(id, name, prompt, tools, ro, perm, model) => {
+            root.mode-saved(id, name, prompt, tools, ro, perm, model);
+        }
+        mode-deleted(id) => { root.mode-deleted(id); }
+        mode-model-picked(id, model) => { root.mode-model-picked(id, model); }
         refresh-settings => { root.refresh-settings(); }
         cli-install(id) => { root.cli-install(id); }
         theme-picked(i) => { root.appearance-theme-picked(i); }

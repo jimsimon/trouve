@@ -244,6 +244,43 @@ impl ProtocolClient {
         }
     }
 
+    /// Modes with provenance (builtin / customized / custom / workspace).
+    pub async fn list_mode_infos(&self, workspace_id: Option<&str>) -> Result<Vec<ModeInfo>> {
+        match workspace_id {
+            Some(id) => {
+                self.get_json(&format!("/mode-infos?workspace_id={id}"))
+                    .await
+            }
+            None => self.get_json("/mode-infos").await,
+        }
+    }
+
+    /// Create or update a user-level mode; a built-in id customizes that
+    /// built-in.
+    pub async fn upsert_mode(&self, id: &str, req: &UpsertModeRequest) -> Result<()> {
+        let resp = self
+            .http
+            .put(format!("{}/modes/{id}", self.base))
+            .json(req)
+            .send()
+            .await?;
+        let status = resp.status();
+        if !status.is_success() {
+            let message = resp
+                .json::<ErrorBody>()
+                .await
+                .map(|e| e.message)
+                .unwrap_or_else(|_| status.to_string());
+            bail!("saving mode failed: {message}");
+        }
+        Ok(())
+    }
+
+    /// Delete a custom mode / reset a customized built-in.
+    pub async fn delete_mode(&self, id: &str) -> Result<()> {
+        self.delete(&format!("/modes/{id}")).await
+    }
+
     pub async fn list_providers(&self) -> Result<ProvidersResponse> {
         self.get_json("/providers").await
     }

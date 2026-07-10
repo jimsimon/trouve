@@ -564,6 +564,32 @@ fn main() -> anyhow::Result<()> {
     }
     {
         let tx = tx.clone();
+        window.on_mode_saved(move |id, display, prompt, tools, read_only, perm, model| {
+            let _ = tx.send(UiCommand::SaveMode(
+                id.to_string(),
+                display.to_string(),
+                prompt.to_string(),
+                tools.to_string(),
+                read_only,
+                perm,
+                model,
+            ));
+        });
+    }
+    {
+        let tx = tx.clone();
+        window.on_mode_deleted(move |id| {
+            let _ = tx.send(UiCommand::DeleteMode(id.to_string()));
+        });
+    }
+    {
+        let tx = tx.clone();
+        window.on_mode_model_picked(move |id, model| {
+            let _ = tx.send(UiCommand::SetModeModel(id.to_string(), model));
+        });
+    }
+    {
+        let tx = tx.clone();
         window.on_refresh_settings(move || {
             let _ = tx.send(UiCommand::RefreshSettings);
         });

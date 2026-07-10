@@ -1043,6 +1043,70 @@ impl Engine {
         ))
     }
 
+    /// Modes with provenance (builtin / customized / custom / workspace)
+    /// for the settings screen.
+    pub fn list_mode_infos(
+        &self,
+        workspace_id: Option<&str>,
+    ) -> Result<Vec<trouve_protocol::ModeInfo>, EngineError> {
+        let root = match workspace_id {
+            Some(id) => {
+                let ws = self
+                    .store
+                    .workspace(id)?
+                    .ok_or_else(|| EngineError::NotFound(format!("workspace {id}")))?;
+                Some(PathBuf::from(ws.path))
+            }
+            None => None,
+        };
+        Ok(modes::resolve_mode_infos(
+            self.config_dir.as_deref(),
+            root.as_deref(),
+        ))
+    }
+
+    /// Create or update a user-level mode. Saving under a built-in id
+    /// customizes that built-in; the file lands in `<config>/modes/`.
+    pub fn upsert_mode(
+        &self,
+        id: &str,
+        req: trouve_protocol::UpsertModeRequest,
+    ) -> Result<(), EngineError> {
+        let config_dir = self
+            .config_dir
+            .as_deref()
+            .ok_or_else(|| EngineError::BadRequest("no config dir".into()))?;
+        if let Some(model) = req.default_model.as_deref() {
+            if !model.contains('/') {
+                return Err(EngineError::BadRequest(format!(
+                    "default_model must be provider-qualified (\"provider/model\"), got {model}"
+                )));
+            }
+        }
+        let mode = AgentMode {
+            id: id.to_string(),
+            display_name: req.display_name,
+            system_prompt: req.system_prompt,
+            allowed_tools: req.allowed_tools,
+            read_only: req.read_only,
+            default_permission_mode: req.default_permission_mode,
+            default_model: req.default_model,
+        };
+        modes::upsert_user_mode(config_dir, &mode)
+            .map_err(|e| EngineError::BadRequest(format!("{e:#}")))
+    }
+
+    /// Remove a user-level mode file: deletes a custom mode, or resets a
+    /// customized built-in to its defaults.
+    pub fn delete_mode(&self, id: &str) -> Result<(), EngineError> {
+        let config_dir = self
+            .config_dir
+            .as_deref()
+            .ok_or_else(|| EngineError::BadRequest("no config dir".into()))?;
+        modes::delete_user_mode(config_dir, id)
+            .map_err(|e| EngineError::BadRequest(format!("{e:#}")))
+    }
+
     /// GitHub client for the session's origin remote.
     fn github_for_session(
         &self,
@@ -1670,8 +1734,11 @@ impl Engine {
             .ok_or_else(|| EngineError::BadRequest(format!("unknown mode: {mode_id}")))?;
         // Provider availability is validated when a message is sent, not
         // here: a thread must be creatable before any provider is configured.
+        // Model precedence: explicit request > the mode's default model >
+        // the global default.
         let model = req
             .model
+            .or_else(|| mode.default_model.clone())
             .unwrap_or_else(|| self.default_model.read().unwrap().clone());
         let thread = Thread {
             id: new_id("th"),

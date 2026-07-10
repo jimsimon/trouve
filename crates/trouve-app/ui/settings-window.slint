@@ -8,7 +8,7 @@
 // Like the main window, this is dumb: models in, callbacks out.
 
 import {
-    AboutSlint, Button, ComboBox, LineEdit, ListView, ScrollView, TextEdit
+    AboutSlint, Button, CheckBox, ComboBox, LineEdit, ListView, ScrollView, TextEdit
 } from "std-widgets.slint";
 import { ScrollKeys } from "scroll-keys.slint";
 import { Theme } from "theme.slint";
@@ -53,6 +53,23 @@ export struct SubscriptionItem {
     w2-label: string,
     w2-pct: int,
     w2-resets: string,
+}
+
+// One agent mode for the Modes & Models section. allowed-tools is
+// comma-joined for display and the edit form; model-index is the mode's
+// default model as an index into the models list (-1 = global default).
+export struct ModeItem {
+    id: string,
+    display-name: string,
+    // "builtin" (pristine), "customized" (built-in with a user override),
+    // "custom" (user-added), "workspace" (.agents/modes — file-managed).
+    origin: string,
+    read-only: bool,
+    system-prompt: string,
+    allowed-tools: string,
+    // 0 ask, 1 allow-list, 2 yolo.
+    permission-index: int,
+    model-index: int,
 }
 
 // A user-managed MCP server (first-party servers trouve injects itself are
@@ -133,7 +150,10 @@ export component SettingsScreen inherits Rectangle {
     in property <[string]> known-provider-names;
     in property <[string]> models;
     in property <int> default-model-index: -1;
-    in property <[string]> modes;
+    // Modes & Models section: full mode cards plus the per-mode model
+    // picker options ("Global default" followed by every model id).
+    in property <[ModeItem]> mode-items;
+    in property <[string]> mode-model-names;
     in property <string> settings-status: "";
 
     // Provider form state (prefilled by "Edit" or a preset).
@@ -170,6 +190,14 @@ export component SettingsScreen inherits Rectangle {
     callback provider-deleted(string);
     callback provider-login(string);
     callback default-model-picked(int);
+    // Mode CRUD. mode-deleted covers both "Remove" (custom modes) and
+    // "Reset to defaults" (customized built-ins) — both drop the user file.
+    callback mode-saved(/* id */ string, /* display-name */ string,
+                        /* system-prompt */ string, /* allowed-tools */ string,
+                        /* read-only */ bool, /* permission-index */ int,
+                        /* model-index */ int);
+    callback mode-deleted(string);
+    callback mode-model-picked(/* id */ string, /* model-index */ int);
     callback refresh-settings();
     callback cli-install(/* id */ string);
     callback theme-picked(int);
@@ -210,11 +238,23 @@ export component SettingsScreen inherits Rectangle {
     callback mcp-logs-requested(string);
     callback mcp-logs-closed();
 
-    // Side-nav selection: 0 providers, 1 models, 2 modes, 3 mcp servers,
-    // 4 integrations, 5 appearance, 6 about. in-out so the app can open
+    // Mode add/edit form state. Editing locks the id (it is the file key);
+    // saving under a built-in id customizes that built-in.
+    in-out property <bool> mode-form-open: false;
+    in-out property <bool> mode-form-editing: false;
+    in-out property <string> mode-form-id: "";
+    in-out property <string> mode-form-display: "";
+    in-out property <string> mode-form-prompt: "";
+    in-out property <string> mode-form-tools: "";
+    in-out property <bool> mode-form-readonly: false;
+    in-out property <int> mode-form-permission: 0;
+    in-out property <int> mode-form-model: -1;
+
+    // Side-nav selection: 0 providers, 1 modes & models, 2 mcp servers,
+    // 3 integrations, 4 appearance, 5 about. in-out so the app can open
     // straight to a section (e.g. the PR tab's "set up GitHub" button).
     in-out property <int> section: 0;
-    property <[string]> section-names: ["Providers", "Models", "Modes", "MCP Servers", "Integrations", "Appearance", "About"];
+    property <[string]> section-names: ["Providers", "Modes & Models", "MCP Servers", "Integrations", "Appearance", "About"];
 
     VerticalLayout {
         // Header: title + a way back to wherever the user came from.
@@ -604,18 +644,44 @@ export component SettingsScreen inherits Rectangle {
                             }
                         }
 
-                        // ---------------- models ----------------
+                        // ---------------- modes & models ----------------
                         if root.section == 1: VerticalLayout {
                             spacing: 12px;
 
                             Text {
-                                text: "Default model";
+                                text: "Modes & Models";
                                 color: Theme.c.text-hi;
                                 font-size: Theme.fs(16px);
                                 font-weight: 700;
                             }
+
+                            // No providers → every model selector below is
+                            // disabled; send the user to fix that first.
+                            if root.models.length == 0: Rectangle {
+                                background: Theme.c.surface;
+                                border-radius: 6px;
+                                height: no-models.preferred-height + 20px;
+                                no-models := HorizontalLayout {
+                                    padding: 10px;
+                                    spacing: 10px;
+                                    Text {
+                                        text: "No models available — configure a provider to enable the model selectors.";
+                                        color: Theme.c.warn;
+                                        font-size: Theme.fs(12px);
+                                        wrap: word-wrap;
+                                        vertical-alignment: center;
+                                        horizontal-stretch: 1;
+                                    }
+                                    Button {
+                                        text: "Configure providers";
+                                        primary: true;
+                                        clicked => { root.section = 0; }
+                                    }
+                                }
+                            }
+
                             Text {
-                                text: "Preselected for new sessions and threads; each thread can still pick its own model in the composer.";
+                                text: "Global default model — used by new threads whose mode has no default of its own.";
                                 color: Theme.c.text-soft;
                                 font-size: Theme.fs(11px);
                                 wrap: word-wrap;
@@ -626,50 +692,250 @@ export component SettingsScreen inherits Rectangle {
                                     horizontal-stretch: 1;
                                     model: root.models;
                                     current-index: root.default-model-index;
+                                    enabled: root.models.length > 0;
                                 }
                                 Button {
                                     text: "Set default";
-                                    enabled: model-box.current-index >= 0;
+                                    enabled: root.models.length > 0 && model-box.current-index >= 0;
                                     clicked => { root.default-model-picked(model-box.current-index); }
                                 }
                             }
-                        }
-
-                        // ---------------- agent modes ----------------
-                        if root.section == 2: VerticalLayout {
-                            spacing: 12px;
 
                             Text {
-                                text: "Agent modes";
+                                text: "Modes";
                                 color: Theme.c.text-hi;
-                                font-size: Theme.fs(16px);
+                                font-size: Theme.fs(14px);
                                 font-weight: 700;
                             }
+                            Text {
+                                text: "A mode is a prompt, a tool policy, and default permissions. Editing a built-in saves an override in ~/.config/trouve/modes/; Reset removes it. Workspace modes (.agents/modes/) are file-managed and read-only here.";
+                                color: Theme.c.text-soft;
+                                font-size: Theme.fs(11px);
+                                wrap: word-wrap;
+                            }
+
                             Rectangle {
                                 background: Theme.c.surface;
                                 border-radius: 6px;
-                                height: 220px;
+                                height: 240px;
                                 ListView {
-                                    for mode in root.modes: Text {
-                                        height: Theme.fs(24px);
-                                        x: 10px;
-                                        text: mode;
-                                        color: Theme.c.text-mid;
-                                        font-size: Theme.fs(12px);
-                                        vertical-alignment: center;
+                                    for mode in root.mode-items: Rectangle {
+                                        height: Theme.fs(44px);
+                                        HorizontalLayout {
+                                            padding-left: 10px;
+                                            padding-right: 6px;
+                                            spacing: 8px;
+                                            VerticalLayout {
+                                                alignment: center;
+                                                horizontal-stretch: 1;
+                                                HorizontalLayout {
+                                                    spacing: 6px;
+                                                    alignment: start;
+                                                    Text {
+                                                        text: mode.display-name;
+                                                        color: Theme.c.text-hi;
+                                                        font-size: Theme.fs(13px);
+                                                        font-weight: 700;
+                                                        overflow: elide;
+                                                    }
+                                                    Text {
+                                                        text: mode.id
+                                                            + (mode.origin == "builtin" ? "" : "  ·  " + mode.origin)
+                                                            + (mode.read-only ? "  ·  read-only" : "");
+                                                        color: mode.origin == "customized" || mode.origin == "custom"
+                                                            ? Theme.c.accent-tint : Theme.c.text-dim;
+                                                        font-size: Theme.fs(11px);
+                                                        vertical-alignment: center;
+                                                    }
+                                                }
+                                                Text {
+                                                    text: mode.system-prompt;
+                                                    color: Theme.c.text-dim;
+                                                    font-size: Theme.fs(11px);
+                                                    overflow: elide;
+                                                }
+                                            }
+                                            // Per-mode default model; entry 0
+                                            // is "Global default".
+                                            VerticalLayout {
+                                                alignment: center;
+                                                ComboBox {
+                                                    width: 190px;
+                                                    model: root.mode-model-names;
+                                                    current-index: mode.model-index + 1;
+                                                    enabled: root.models.length > 0
+                                                        && mode.origin != "workspace";
+                                                    selected => {
+                                                        root.mode-model-picked(mode.id, self.current-index - 1);
+                                                    }
+                                                }
+                                            }
+                                            if mode.origin != "workspace": Button {
+                                                text: "Edit";
+                                                clicked => {
+                                                    root.mode-form-open = true;
+                                                    root.mode-form-editing = true;
+                                                    root.mode-form-id = mode.id;
+                                                    root.mode-form-display = mode.display-name;
+                                                    root.mode-form-prompt = mode.system-prompt;
+                                                    root.mode-form-tools = mode.allowed-tools;
+                                                    root.mode-form-readonly = mode.read-only;
+                                                    root.mode-form-permission = mode.permission-index;
+                                                    root.mode-form-model = mode.model-index;
+                                                }
+                                            }
+                                            if mode.origin == "customized": Button {
+                                                text: "Reset";
+                                                clicked => { root.mode-deleted(mode.id); }
+                                            }
+                                            if mode.origin == "custom": Button {
+                                                text: "Remove";
+                                                clicked => { root.mode-deleted(mode.id); }
+                                            }
+                                        }
                                     }
                                 }
                             }
-                            Text {
-                                text: "Custom modes and mode overrides live in ~/.config/trouve/modes/ and .agents/modes/.";
-                                color: Theme.c.text-soft;
-                                font-size: Theme.fs(11px);
+
+                            if !root.mode-form-open: HorizontalLayout {
+                                alignment: start;
+                                Button {
+                                    text: "+ Add mode";
+                                    clicked => {
+                                        root.mode-form-open = true;
+                                        root.mode-form-editing = false;
+                                        root.mode-form-id = "";
+                                        root.mode-form-display = "";
+                                        root.mode-form-prompt = "";
+                                        root.mode-form-tools = "";
+                                        root.mode-form-readonly = false;
+                                        root.mode-form-permission = 0;
+                                        root.mode-form-model = -1;
+                                    }
+                                }
+                            }
+
+                            // ----- add / edit form -----
+                            if root.mode-form-open: Rectangle {
+                                background: Theme.c.surface;
+                                border-radius: 6px;
+                                height: mode-form.preferred-height + 24px;
+                                mode-form := VerticalLayout {
+                                    padding: 12px;
+                                    spacing: 8px;
+                                    Text {
+                                        text: root.mode-form-editing
+                                            ? "Edit mode \"" + root.mode-form-id + "\""
+                                            : "Add mode";
+                                        color: Theme.c.text-mid;
+                                        font-size: Theme.fs(13px);
+                                        font-weight: 700;
+                                    }
+                                    HorizontalLayout {
+                                        spacing: 8px;
+                                        if !root.mode-form-editing: LineEdit {
+                                            width: 150px;
+                                            placeholder-text: "id (e.g. docs)";
+                                            text <=> root.mode-form-id;
+                                        }
+                                        LineEdit {
+                                            horizontal-stretch: 1;
+                                            placeholder-text: "display name";
+                                            text <=> root.mode-form-display;
+                                        }
+                                    }
+                                    Text {
+                                        text: "System prompt (appended to the base prompt):";
+                                        color: Theme.c.text-soft;
+                                        font-size: Theme.fs(11px);
+                                    }
+                                    TextEdit {
+                                        height: 90px;
+                                        text <=> root.mode-form-prompt;
+                                        wrap: word-wrap;
+                                    }
+                                    LineEdit {
+                                        placeholder-text: "allowed tools, comma-separated (empty = all tools)";
+                                        text <=> root.mode-form-tools;
+                                    }
+                                    HorizontalLayout {
+                                        spacing: 12px;
+                                        CheckBox {
+                                            text: "Read-only (never mutates the worktree)";
+                                            checked <=> root.mode-form-readonly;
+                                        }
+                                        Rectangle { horizontal-stretch: 1; }
+                                    }
+                                    HorizontalLayout {
+                                        spacing: 8px;
+                                        VerticalLayout {
+                                            spacing: 2px;
+                                            Text {
+                                                text: "Default permissions";
+                                                color: Theme.c.text-soft;
+                                                font-size: Theme.fs(10px);
+                                            }
+                                            ComboBox {
+                                                width: 150px;
+                                                model: ["Ask", "Allow list", "Yolo"];
+                                                current-index <=> root.mode-form-permission;
+                                            }
+                                        }
+                                        VerticalLayout {
+                                            spacing: 2px;
+                                            horizontal-stretch: 1;
+                                            Text {
+                                                text: "Default model";
+                                                color: Theme.c.text-soft;
+                                                font-size: Theme.fs(10px);
+                                            }
+                                            form-model-box := ComboBox {
+                                                model: root.mode-model-names;
+                                                current-index: root.mode-form-model + 1;
+                                                enabled: root.models.length > 0;
+                                                selected => {
+                                                    root.mode-form-model = self.current-index - 1;
+                                                }
+                                            }
+                                        }
+                                    }
+                                    HorizontalLayout {
+                                        spacing: 8px;
+                                        alignment: start;
+                                        Button {
+                                            text: root.mode-form-editing ? "Save mode" : "Add mode";
+                                            primary: true;
+                                            enabled: root.mode-form-id != "" && root.mode-form-display != "";
+                                            clicked => {
+                                                root.mode-saved(
+                                                    root.mode-form-id,
+                                                    root.mode-form-display,
+                                                    root.mode-form-prompt,
+                                                    root.mode-form-tools,
+                                                    root.mode-form-readonly,
+                                                    root.mode-form-permission,
+                                                    root.mode-form-model);
+                                                root.mode-form-open = false;
+                                            }
+                                        }
+                                        Button {
+                                            text: "Cancel";
+                                            clicked => { root.mode-form-open = false; }
+                                        }
+                                    }
+                                }
+                            }
+
+                            if root.settings-status != "": Text {
+                                text: root.settings-status;
+                                color: Theme.c.accent-tint;
+                                font-size: Theme.fs(12px);
                                 wrap: word-wrap;
                             }
                         }
 
                         // ---------------- mcp servers ----------------
-                        if root.section == 3: VerticalLayout {
+                        if root.section == 2: VerticalLayout {
                             spacing: 12px;
 
                             HorizontalLayout {
@@ -914,7 +1180,7 @@ export component SettingsScreen inherits Rectangle {
                         }
 
                         // ---------------- integrations ----------------
-                        if root.section == 4: VerticalLayout {
+                        if root.section == 3: VerticalLayout {
                             spacing: 12px;
 
                             Text {
@@ -992,7 +1258,7 @@ export component SettingsScreen inherits Rectangle {
                         }
 
                         // ---------------- appearance ----------------
-                        if root.section == 5: VerticalLayout {
+                        if root.section == 4: VerticalLayout {
                             spacing: 12px;
 
                             Text {
@@ -1099,7 +1365,7 @@ export component SettingsScreen inherits Rectangle {
                         }
 
                         // ---------------- about ----------------
-                        if root.section == 6: VerticalLayout {
+                        if root.section == 5: VerticalLayout {
                             spacing: 12px;
 
                             Text {
