@@ -872,6 +872,40 @@ component NewChatForm inherits VerticalLayout {
     }
 }
 
+// Activity indicator: three accent dots doing a soft sine wave — each one
+// rises and brightens in sequence, with a faint halo behind the crest.
+// Quieter than a spinner ring but visibly "alive"; with animate off
+// (reduce motion) the dots rest as static faint marks.
+component PulseDots inherits Rectangle {
+    in property <bool> animate: true;
+    width: 38px;
+    height: 16px;
+    property <float> t: root.animate ? animation-tick() / 1.4s : 0.0;
+    for i in [0, 1, 2]: Rectangle {
+        // Half-wave per dot, staggered: sin clipped at 0 so each dot rests
+        // between pulses instead of dipping below the baseline.
+        property <float> wave: Math.max(0.0, Math.sin(360deg * (t - i * 0.15)));
+        property <length> size: 6px + 2px * wave;
+        width: self.size;
+        height: self.size;
+        border-radius: self.size / 2;
+        x: 3px + i * 12px + (6px - self.size) / 2;
+        y: parent.height - self.size - wave * 6px;
+        background: Theme.c.accent;
+        opacity: root.animate ? 0.25 + 0.75 * wave : 0.4;
+        // Halo: a soft ring that swells with the dot's crest.
+        Rectangle {
+            x: (parent.width - self.width) / 2;
+            y: (parent.height - self.height) / 2;
+            width: parent.width + 8px * wave;
+            height: self.width;
+            border-radius: self.width / 2;
+            background: Theme.c.accent;
+            opacity: 0.18 * wave;
+        }
+    }
+}
+
 component SplitterHandle inherits Rectangle {
     in-out property <length> value;
     in property <int> direction: 1;
@@ -1703,8 +1737,9 @@ export component AppWindow inherits Window {
                                 || row.kind == 3 || row.kind == 4 || row.kind == 6
                                 || row.kind == 9 || row.kind == 10
                                 // Tool cards nested in an assistant card
-                                // indent with the rest of the body.
-                                || (row.kind == 2 && row.card-pos >= 2);
+                                // indent with the rest of the body, as does
+                                // a nested activity row.
+                                || ((row.kind == 2 || row.kind == 5) && row.card-pos >= 2);
                             property <bool> md-list: row.kind == 1
                                 && (row.md-kind == 4 || row.md-kind == 6);
                             property <bool> md-heading: row.kind == 1
@@ -2195,28 +2230,14 @@ export component AppWindow inherits Window {
                                 }
                             }
 
-                            // Activity: indeterminate spinner + label while
-                            // the agent works ("Processing…"/"Thinking…").
+                            // Activity: pulsing dots + label while the agent
+                            // works ("Processing…"/"Thinking…"); nests at the
+                            // bottom of the streaming Agent card when open.
                             if row.kind == 5: HorizontalLayout {
                                 spacing: 8px;
-                                Rectangle {
-                                    width: 16px;
-                                    height: 16px;
-                                    // Reduce motion: static glyph, no spin.
-                                    if !Theme.reduce-motion: Spinner {
-                                        width: 16px;
-                                        height: 16px;
-                                        indeterminate: true;
-                                    }
-                                    if Theme.reduce-motion: Text {
-                                        width: 16px;
-                                        height: 16px;
-                                        text: "◌";
-                                        color: Theme.c.text-dim;
-                                        font-size: Theme.fs(13px);
-                                        horizontal-alignment: center;
-                                        vertical-alignment: center;
-                                    }
+                                PulseDots {
+                                    // Reduce motion: dots rest as static marks.
+                                    animate: !Theme.reduce-motion;
                                 }
                                 Text {
                                     text: row.text;

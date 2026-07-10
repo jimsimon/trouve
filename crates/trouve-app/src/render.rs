@@ -554,11 +554,40 @@ pub fn chat_rows(
         } else {
             "Processing…"
         };
-        rows.push(ChatRowData {
+        let mut activity = ChatRowData {
             kind: 5,
             text: label.into(),
             ..Default::default()
-        });
+        };
+        // Nest the activity row at the bottom of the Agent card being
+        // streamed into, when one is open at the tail of the chat — it then
+        // reads as "this card is still being populated". With no open card
+        // yet (turn just started, or the card was collapsed) it stands
+        // alone as before.
+        let agent_card_open = rows
+            .iter()
+            .rev()
+            .find(|r| r.kind == 7)
+            .is_some_and(|h| h.tool_name == "Agent" && h.expanded);
+        if agent_card_open {
+            match rows.last_mut() {
+                // Take over as the card's last body row.
+                Some(last) if last.card_pos == 3 => {
+                    last.card_pos = 2;
+                    activity.card_pos = 3;
+                    activity.tool_name = "Agent".into();
+                }
+                // Header-only card: become its first (and only) body row.
+                Some(last) if last.card_pos == 4 && last.kind == 7 => {
+                    last.card_pos = 1;
+                    activity.card_pos = 3;
+                    activity.card_first = true;
+                    activity.tool_name = "Agent".into();
+                }
+                _ => {}
+            }
+        }
+        rows.push(activity);
         call_ids.push(None);
     }
     (rows, call_ids)
@@ -1721,6 +1750,41 @@ mod tests {
             &HashMap::new(),
         );
         assert_eq!(rows.last().unwrap().text, "Thinking…");
+
+        // With an open Agent card at the tail, the activity row nests as
+        // the card's last body row instead of standing alone.
+        vm.items = vec![ChatItem::Assistant {
+            turn: 0,
+            content: "streaming…".into(),
+            complete: false,
+        }];
+        let (rows, _) = chat_rows(
+            &vm,
+            &HashSet::new(),
+            &HashSet::new(),
+            &HashSet::new(),
+            &HashMap::new(),
+        );
+        let last = rows.last().unwrap();
+        assert_eq!(last.kind, 5);
+        assert_eq!(last.card_pos, 3);
+        assert_eq!(last.tool_name, "Agent");
+        assert_eq!(rows[rows.len() - 2].card_pos, 2);
+
+        // Collapsed card: the activity row stands alone again.
+        let collapsed: HashSet<String> = ["a:0".to_string()].into();
+        let (rows, _) = chat_rows(
+            &vm,
+            &HashSet::new(),
+            &HashSet::new(),
+            &collapsed,
+            &HashMap::new(),
+        );
+        let last = rows.last().unwrap();
+        assert_eq!(last.kind, 5);
+        assert_eq!(last.card_pos, 0);
+
+        vm.items.clear();
         vm.turn_running = false;
         vm.thinking = false;
         let (rows, _) = chat_rows(
