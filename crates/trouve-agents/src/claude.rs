@@ -1,25 +1,32 @@
 //! Claude Code backend, driving the `claude` CLI in print mode.
 //!
-//! Each turn runs `claude -p <prompt> --output-format stream-json --verbose`
-//! in the session worktree, resuming the vendor session with `--resume`.
+//! One persistent `claude -p --input-format stream-json` process is kept per
+//! trouve thread (see [`Pool`]): turns after the first skip the CLI's cold
+//! start, the transcript re-read, and the MCP bridge re-handshake. The pool
+//! is bounded (LRU cap + idle reaping); killing a process loses nothing
+//! because Claude Code persists the transcript and `--resume` restores it.
 //! Claude Code rotates its session id on every resume, so we re-persist the
-//! id from each turn's `system/init` event.
+//! id from each turn's `system/init` / `result` events.
 //!
 //! Permission mapping: `Yolo` → `--dangerously-skip-permissions`,
-//! `ReadOnly` → `--permission-mode plan`, `Ask` → the trouve MCP bridge's
-//! `approval_prompt` tool via `--permission-prompt-tool`, so headless print
-//! mode routes permission requests to trouve's approval flow instead of
-//! failing them.
+//! `ReadOnly` → disallowed mutating built-ins + trouve's approval gate,
+//! `Ask` → the trouve MCP bridge's `approval_prompt` tool via
+//! `--permission-prompt-tool`, so headless print mode routes permission
+//! requests to trouve's approval flow instead of failing them.
 //!
 //! Login is an interactive TUI (`/login` inside `claude`); we detect
 //! credentials but can't orchestrate the flow headlessly.
 
+use std::collections::HashMap;
 use std::process::Stdio;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use futures::StreamExt;
-use serde_json::Value;
-use tokio::io::{AsyncBufReadExt, BufReader};
-use tokio::process::Command;
+use serde_json::{json, Value};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::process::{Child, ChildStdin, Command};
+use tokio::sync::{mpsc, Mutex};
 use trouve_protocol::{ModelInfo, Usage};
 
 use crate::{
@@ -27,9 +34,17 @@ use crate::{
     BackendLogin, BackendPermission, BackendStatus, BackendTurn,
 };
 
+/// Most live processes kept at once; the least recently used is evicted.
+const POOL_CAP: usize = 3;
+/// Idle time after which a pooled process is reaped.
+const IDLE_TIMEOUT: Duration = Duration::from_secs(300);
+/// How often the reaper scans the pool.
+const REAP_INTERVAL: Duration = Duration::from_secs(60);
+
 pub struct ClaudeBackend {
     id: String,
     command: String,
+    pool: Arc<Pool>,
 }
 
 impl ClaudeBackend {
@@ -37,8 +52,107 @@ impl ClaudeBackend {
         Self {
             id: id.into(),
             command: command.unwrap_or_else(|| "claude".into()),
+            pool: Arc::new(Pool::default()),
         }
     }
+}
+
+/// Live `claude` processes keyed by trouve thread id.
+#[derive(Default)]
+struct Pool {
+    procs: Mutex<HashMap<String, Arc<ClaudeProc>>>,
+    reaper_started: std::sync::atomic::AtomicBool,
+}
+
+impl Pool {
+    async fn remove(&self, thread_id: &str, proc_: &Arc<ClaudeProc>) {
+        let mut procs = self.procs.lock().await;
+        // Only remove the entry if it is still this process (a respawn may
+        // have replaced it already).
+        if procs.get(thread_id).is_some_and(|p| Arc::ptr_eq(p, proc_)) {
+            procs.remove(thread_id);
+        }
+    }
+
+    /// Kill processes idle past the timeout, skipping any with a turn in
+    /// flight (their line receiver is locked).
+    async fn reap_idle(&self) {
+        let mut procs = self.procs.lock().await;
+        let mut dead = Vec::new();
+        for (id, p) in procs.iter() {
+            if p.lines.try_lock().is_err() {
+                continue; // turn in flight
+            }
+            if p.last_used.lock().unwrap().elapsed() > IDLE_TIMEOUT {
+                dead.push(id.clone());
+            }
+        }
+        for id in dead {
+            if let Some(p) = procs.remove(&id) {
+                p.kill().await;
+            }
+        }
+    }
+
+    /// Evict the least recently used idle process while over capacity.
+    async fn enforce_cap(procs: &mut HashMap<String, Arc<ClaudeProc>>) {
+        while procs.len() >= POOL_CAP {
+            let lru = procs
+                .iter()
+                .filter(|(_, p)| p.lines.try_lock().is_ok())
+                .min_by_key(|(_, p)| *p.last_used.lock().unwrap())
+                .map(|(id, _)| id.clone());
+            let Some(id) = lru else { break }; // all busy: allow overflow
+            if let Some(p) = procs.remove(&id) {
+                p.kill().await;
+            }
+        }
+    }
+}
+
+/// One persistent `claude` process serving one trouve thread.
+struct ClaudeProc {
+    stdin: Mutex<ChildStdin>,
+    /// Stdout lines; locked by the active turn for its whole duration.
+    lines: Mutex<mpsc::Receiver<String>>,
+    child: Mutex<Child>,
+    /// Spawn-time configuration; a differing turn forces a respawn.
+    config_fp: String,
+    /// Vendor session id the process is holding, updated from its events.
+    /// A turn arriving with a different id (e.g. after undo) respawns.
+    session: std::sync::Mutex<Option<String>>,
+    last_used: std::sync::Mutex<Instant>,
+    /// Rolling stderr tail for error reporting.
+    stderr_tail: Arc<std::sync::Mutex<String>>,
+}
+
+impl ClaudeProc {
+    async fn kill(&self) {
+        let _ = self.child.lock().await.kill().await;
+    }
+
+    fn touch(&self) {
+        *self.last_used.lock().unwrap() = Instant::now();
+    }
+}
+
+/// Spawn-time configuration that must match for a process to be reused.
+fn config_fingerprint(turn: &BackendTurn) -> String {
+    let bridge = turn.mcp_bridge.as_ref().map(|b| {
+        format!(
+            "{}|{:?}|{:?}|{}|{:?}",
+            b.command, b.args, b.env, b.bridge_tools, b.disallowed_tools
+        )
+    });
+    format!(
+        "{:?}|{}|{:?}|{:?}|{:?}|{:?}",
+        turn.worktree,
+        turn.model,
+        Value::Object(turn.model_options.clone()),
+        turn.instructions,
+        turn.permission,
+        bridge,
+    )
 }
 
 #[async_trait::async_trait]
@@ -93,9 +207,139 @@ impl AgentBackend for ClaudeBackend {
     }
 
     async fn run_turn(&self, turn: BackendTurn) -> Result<BackendEventStream, BackendError> {
+        self.start_reaper();
+        let proc_ = self.proc_for(&turn).await?;
+        let pool = self.pool.clone();
+        let thread_id = turn.thread_id.clone();
+        let prompt = turn.prompt.clone();
+
+        let stream = async_stream(move |tx| async move {
+            // Exclusive claim on the process for this turn.
+            let mut lines = proc_.lines.lock().await;
+            proc_.touch();
+
+            let msg = json!({
+                "type": "user",
+                "message": {
+                    "role": "user",
+                    "content": [ { "type": "text", "text": prompt } ],
+                }
+            });
+            let sent = {
+                let mut stdin = proc_.stdin.lock().await;
+                async {
+                    stdin.write_all(msg.to_string().as_bytes()).await?;
+                    stdin.write_all(b"\n").await?;
+                    stdin.flush().await
+                }
+                .await
+            };
+            if let Err(e) = sent {
+                // Likely the process died between turns; keep reading — the
+                // no-result exit path below reports it (with stderr) and
+                // drops it from the pool so the next turn respawns.
+                tracing::debug!("claude stdin write failed: {e}");
+            }
+
+            let mut completed = false;
+            while let Some(line) = lines.recv().await {
+                let Ok(ev) = serde_json::from_str::<Value>(&line) else {
+                    continue;
+                };
+                let events = map_event(&ev);
+                // Track the session the process is holding so the next
+                // turn's reuse check compares against the current id.
+                for out in &events {
+                    if let BackendEvent::SessionStarted { session_id } = out {
+                        *proc_.session.lock().unwrap() = Some(session_id.clone());
+                    }
+                }
+                let is_result = ev["type"].as_str() == Some("result");
+                for out in events {
+                    if tx.send(Ok(out)).await.is_err() {
+                        // Consumer dropped mid-turn (cancel): the CLI has no
+                        // per-turn abort in this mode, so kill the process.
+                        // The transcript is on disk; next turn resumes it.
+                        pool.remove(&thread_id, &proc_).await;
+                        proc_.kill().await;
+                        return;
+                    }
+                }
+                if is_result {
+                    completed = true;
+                    break;
+                }
+            }
+            proc_.touch();
+
+            if !completed {
+                // Stdout closed without a result: the process died.
+                pool.remove(&thread_id, &proc_).await;
+                let status = proc_.child.lock().await.wait().await;
+                let _ = tx
+                    .send(Err(BackendError::Protocol(format!(
+                        "claude exited with {:?}: {}",
+                        status.ok(),
+                        proc_.stderr_tail.lock().unwrap().trim()
+                    ))))
+                    .await;
+            }
+        });
+        Ok(stream.boxed())
+    }
+}
+
+impl ClaudeBackend {
+    fn start_reaper(&self) {
+        if self
+            .pool
+            .reaper_started
+            .swap(true, std::sync::atomic::Ordering::SeqCst)
+        {
+            return;
+        }
+        let pool = Arc::downgrade(&self.pool);
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(REAP_INTERVAL).await;
+                let Some(pool) = pool.upgrade() else { break };
+                pool.reap_idle().await;
+            }
+        });
+    }
+
+    /// Fetch the pooled process for this thread, or (re)spawn one when there
+    /// is none, it died, or the turn's spawn-time config / session id no
+    /// longer matches.
+    async fn proc_for(&self, turn: &BackendTurn) -> Result<Arc<ClaudeProc>, BackendError> {
+        let fp = config_fingerprint(turn);
+        let mut procs = self.pool.procs.lock().await;
+        if let Some(p) = procs.get(&turn.thread_id) {
+            let alive = p.child.lock().await.try_wait().ok().flatten().is_none();
+            let session_matches = match (&turn.session, p.session.lock().unwrap().as_ref()) {
+                (Some(want), Some(have)) => want == have,
+                (None, _) => false, // explicit fresh session: start over
+                (Some(_), None) => false,
+            };
+            if alive && p.config_fp == fp && session_matches {
+                return Ok(p.clone());
+            }
+            let p = procs.remove(&turn.thread_id).expect("checked above");
+            p.kill().await;
+        }
+
+        Pool::enforce_cap(&mut procs).await;
+        let proc_ = Arc::new(self.spawn(turn, fp)?);
+        procs.insert(turn.thread_id.clone(), proc_.clone());
+        Ok(proc_)
+    }
+
+    /// Spawn a persistent `claude` process configured for this turn's
+    /// thread. The prompt is NOT passed here; turns arrive over stdin.
+    fn spawn(&self, turn: &BackendTurn, config_fp: String) -> Result<ClaudeProc, BackendError> {
         let mut cmd = Command::new(&self.command);
         cmd.arg("-p")
-            .arg(&turn.prompt)
+            .args(["--input-format", "stream-json"])
             .args(["--output-format", "stream-json"])
             .arg("--verbose")
             // Stream text/thinking deltas live instead of whole blocks.
@@ -109,7 +353,7 @@ impl AgentBackend for ClaudeBackend {
             // code search, and no failures while the bridge reconnects.
             .env("ENABLE_TOOL_SEARCH", "false")
             .current_dir(&turn.worktree)
-            .stdin(Stdio::null())
+            .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true);
@@ -202,56 +446,50 @@ impl AgentBackend for ClaudeBackend {
             BackendPermission::Ask => {}
         }
 
-        let command_name = self.command.clone();
         let mut child = cmd.spawn().map_err(|e| match e.kind() {
-            std::io::ErrorKind::NotFound => BackendError::NotInstalled(command_name.clone()),
+            std::io::ErrorKind::NotFound => BackendError::NotInstalled(self.command.clone()),
             _ => BackendError::Io(e),
         })?;
+        let stdin = child.stdin.take().expect("stdin piped");
         let stdout = child.stdout.take().expect("stdout piped");
         let stderr = child.stderr.take().expect("stderr piped");
 
-        let stream = async_stream(move |tx| async move {
-            let mut completed = false;
+        // Stdout pump: lines flow into the channel the active turn drains.
+        let (line_tx, line_rx) = mpsc::channel::<String>(256);
+        tokio::spawn(async move {
             let mut lines = BufReader::new(stdout).lines();
             while let Ok(Some(line)) = lines.next_line().await {
-                let Ok(ev) = serde_json::from_str::<Value>(&line) else {
-                    continue;
-                };
-                for out in map_event(&ev) {
-                    if matches!(out, BackendEvent::Completed { .. }) {
-                        completed = true;
-                    }
-                    let _ = tx.send(Ok(out)).await;
+                if line_tx.send(line).await.is_err() {
+                    break;
                 }
-            }
-            let status = child.wait().await;
-            let ok = status.as_ref().map(|s| s.success()).unwrap_or(false);
-            if !ok {
-                let mut err = String::new();
-                let mut elines = BufReader::new(stderr).lines();
-                while let Ok(Some(l)) = elines.next_line().await {
-                    err.push_str(&l);
-                    err.push('\n');
-                    if err.len() > 4000 {
-                        break;
-                    }
-                }
-                let _ = tx
-                    .send(Err(BackendError::Protocol(format!(
-                        "claude exited with {:?}: {}",
-                        status.ok(),
-                        err.trim()
-                    ))))
-                    .await;
-            } else if !completed {
-                let _ = tx
-                    .send(Ok(BackendEvent::Completed {
-                        usage: Usage::default(),
-                    }))
-                    .await;
             }
         });
-        Ok(stream.boxed())
+
+        // Stderr pump: keep a bounded tail for error reporting.
+        let stderr_tail = Arc::new(std::sync::Mutex::new(String::new()));
+        let tail = stderr_tail.clone();
+        tokio::spawn(async move {
+            let mut lines = BufReader::new(stderr).lines();
+            while let Ok(Some(line)) = lines.next_line().await {
+                let mut t = tail.lock().unwrap();
+                t.push_str(&line);
+                t.push('\n');
+                if t.len() > 4000 {
+                    let cut = t.len() - 4000;
+                    t.drain(..cut);
+                }
+            }
+        });
+
+        Ok(ClaudeProc {
+            stdin: Mutex::new(stdin),
+            lines: Mutex::new(line_rx),
+            child: Mutex::new(child),
+            config_fp,
+            session: std::sync::Mutex::new(turn.session.clone()),
+            last_used: std::sync::Mutex::new(Instant::now()),
+            stderr_tail,
+        })
     }
 }
 

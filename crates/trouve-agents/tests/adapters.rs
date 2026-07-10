@@ -551,6 +551,86 @@ EOF
 }
 
 #[tokio::test]
+async fn claude_adapter_reuses_process_across_turns() {
+    let tmp = tempfile::tempdir().unwrap();
+    // Persistent stub: one spawn serves many stdin turns, like the real
+    // CLI in stream-json input mode.
+    let stub = write_stub(
+        tmp.path(),
+        "claude",
+        r#"#!/bin/bash
+printf '%s\n' "$@" > "$0.args"
+echo spawned >> "$0.spawns"
+while IFS= read -r line; do
+  echo "$line" >> "$0.stdin"
+  echo '{"type":"system","subtype":"init","session_id":"sess-A"}'
+  echo '{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"ok"}}}'
+  echo '{"type":"result","subtype":"success","session_id":"sess-A","usage":{"input_tokens":1,"output_tokens":1}}'
+done
+"#,
+    );
+    let backend = ClaudeBackend::new("claude-code", Some(stub.clone()));
+
+    // First turn: fresh session, spawns the process.
+    let mut stream = start_turn(&backend, || {
+        turn(tmp.path().to_path_buf(), None, BackendPermission::Ask)
+    })
+    .await;
+    let mut first = Vec::new();
+    while let Some(ev) = stream.next().await {
+        first.push(ev.unwrap());
+    }
+    assert!(first
+        .iter()
+        .any(|e| matches!(e, BackendEvent::Completed { .. })));
+
+    // Second turn resumes the session the process holds: no new spawn.
+    let mut stream = start_turn(&backend, || {
+        turn(
+            tmp.path().to_path_buf(),
+            Some("sess-A"),
+            BackendPermission::Ask,
+        )
+    })
+    .await;
+    let mut second = Vec::new();
+    while let Some(ev) = stream.next().await {
+        second.push(ev.unwrap());
+    }
+    assert!(second
+        .iter()
+        .any(|e| matches!(e, BackendEvent::Completed { .. })));
+
+    let spawns = std::fs::read_to_string(format!("{stub}.spawns")).unwrap();
+    assert_eq!(spawns.lines().count(), 1, "expected one spawn: {spawns}");
+    // Both prompts arrived over the same process's stdin.
+    let stdin = std::fs::read_to_string(format!("{stub}.stdin")).unwrap();
+    assert_eq!(stdin.lines().count(), 2, "{stdin}");
+    assert!(stdin.contains("do the thing"), "{stdin}");
+    // Stream-json input mode is on; the prompt is not in argv.
+    let args = std::fs::read_to_string(format!("{stub}.args")).unwrap();
+    assert!(args.contains("--input-format"), "{args}");
+    assert!(!args.contains("do the thing"), "{args}");
+
+    // A turn with a different config (model) forces a respawn.
+    let mut stream = start_turn(&backend, || {
+        let mut t = turn(
+            tmp.path().to_path_buf(),
+            Some("sess-A"),
+            BackendPermission::Ask,
+        );
+        t.model = "other-model".into();
+        t
+    })
+    .await;
+    while let Some(ev) = stream.next().await {
+        ev.unwrap();
+    }
+    let spawns = std::fs::read_to_string(format!("{stub}.spawns")).unwrap();
+    assert_eq!(spawns.lines().count(), 2, "{spawns}");
+}
+
+#[tokio::test]
 async fn status_reports_missing_binary() {
     let backend = ClaudeBackend::new("claude-code", Some("/nonexistent/claude".into()));
     assert!(!backend.status().installed);

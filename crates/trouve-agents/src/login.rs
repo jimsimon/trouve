@@ -29,12 +29,10 @@ pub async fn spawn_login(command: &str, args: &[&str]) -> Result<BackendLogin, B
     // (xdg-open / open).
     #[cfg(unix)]
     cmd.env("BROWSER", "true");
-    let mut child = cmd
-        .spawn()
-        .map_err(|e| match e.kind() {
-            std::io::ErrorKind::NotFound => BackendError::NotInstalled(command.to_string()),
-            _ => BackendError::Io(e),
-        })?;
+    let mut child = cmd.spawn().map_err(|e| match e.kind() {
+        std::io::ErrorKind::NotFound => BackendError::NotInstalled(command.to_string()),
+        _ => BackendError::Io(e),
+    })?;
 
     let stdout = child.stdout.take().expect("stdout piped");
     let stderr = child.stderr.take().expect("stderr piped");
