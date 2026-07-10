@@ -14,7 +14,7 @@
 //!   `turn/completed`
 //! - server-initiated approval requests:
 //!   `item/commandExecution/requestApproval`, `item/fileChange/requestApproval`
-//!   answered with `{ decision: "accept" | "decline" }`
+//!   answered with `{ decision: "approved" | "denied" }`
 
 use std::collections::HashMap;
 use std::process::Stdio;
@@ -138,10 +138,15 @@ impl AgentBackend for CodexBackend {
             .get("reasoning_effort")
             .and_then(Value::as_str)
             .or(id_effort);
-        let (approval_policy, sandbox) = match turn.permission {
-            BackendPermission::ReadOnly => ("never", "readOnly"),
-            BackendPermission::Ask => ("unlessTrusted", "workspaceWrite"),
-            BackendPermission::Yolo => ("never", "workspaceWrite"),
+        let (approval_policy, sandbox, sandbox_policy_type) = match turn.permission {
+            // Approval policy: untrusted | on-request | granular | never;
+            // "untrusted" = ask before anything not on the trusted list.
+            // The two sandbox strings are the same mode in the protocol's
+            // two casings: thread/start's `sandbox` enum is kebab-case
+            // while turn/start's `sandboxPolicy` type tag is camelCase.
+            BackendPermission::ReadOnly => ("never", "read-only", "readOnly"),
+            BackendPermission::Ask => ("untrusted", "workspace-write", "workspaceWrite"),
+            BackendPermission::Yolo => ("never", "workspace-write", "workspaceWrite"),
         };
 
         // Start or resume the vendor-side thread.
@@ -206,7 +211,7 @@ impl AgentBackend for CodexBackend {
             "threadId": codex_thread_id,
             "model": model_or_default(model_name),
             "approvalPolicy": approval_policy,
-            "sandboxPolicy": { "type": sandbox },
+            "sandboxPolicy": { "type": sandbox_policy_type },
             "input": [ { "type": "text", "text": text } ],
         });
         if let Some(effort) = effort {
@@ -377,7 +382,14 @@ fn turn_stream(
                         }
                     }
                     "thread/tokenUsage/updated" => {
-                        usage = parse_usage(&params);
+                        // One update per model call. The input span of the
+                        // newest call is the whole conversation context, so
+                        // it replaces; output is per-call, so it accumulates
+                        // across the calls of a multi-step turn.
+                        let u = parse_usage(&params);
+                        usage.input_tokens = u.input_tokens;
+                        usage.cached_input_tokens = u.cached_input_tokens;
+                        usage.output_tokens += u.output_tokens;
                     }
                     "turn/completed" => {
                         let status = params["turn"]["status"].as_str().unwrap_or("completed");
@@ -403,8 +415,8 @@ fn turn_stream(
                         "item/commandExecution/requestApproval" => "commandExecution",
                         "item/fileChange/requestApproval" => "fileChange",
                         _ => {
-                            // Unknown server request: decline rather than hang.
-                            server.respond(id, json!({ "decision": "decline" })).await;
+                            // Unknown server request: deny rather than hang.
+                            server.respond(id, json!({ "decision": "denied" })).await;
                             continue;
                         }
                     };
@@ -419,7 +431,9 @@ fn turn_stream(
                         }))
                         .await;
                     let approved = ok_rx.await.unwrap_or(false);
-                    let decision = if approved { "accept" } else { "decline" };
+                    // ReviewDecision: "denied" (vs "abort") lets the agent
+                    // continue and explain instead of killing the turn.
+                    let decision = if approved { "approved" } else { "denied" };
                     server.respond(id, json!({ "decision": decision })).await;
                 }
             }
@@ -435,6 +449,9 @@ fn parse_usage(params: &Value) -> Usage {
         .get("tokenUsage")
         .or_else(|| params.get("usage"))
         .unwrap_or(params);
+    // Current app-servers nest per-call usage under "last" (a thread-wide
+    // "total" sits alongside); older builds put the fields at the top level.
+    let u = u.get("last").unwrap_or(u);
     let get = |keys: &[&str]| -> u64 {
         for k in keys {
             if let Some(n) = u.get(*k).and_then(Value::as_u64) {
@@ -632,6 +649,42 @@ impl AppServer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parses_nested_token_usage() {
+        // Current app-server shape: per-call usage under tokenUsage.last.
+        let params = json!({
+            "threadId": "t1",
+            "turnId": "u1",
+            "tokenUsage": {
+                "last": {
+                    "inputTokens": 1200,
+                    "cachedInputTokens": 1000,
+                    "outputTokens": 50,
+                    "reasoningOutputTokens": 10,
+                    "totalTokens": 1250,
+                },
+                "total": {
+                    "inputTokens": 9999,
+                    "cachedInputTokens": 9000,
+                    "outputTokens": 500,
+                    "reasoningOutputTokens": 100,
+                    "totalTokens": 10499,
+                },
+                "modelContextWindow": 272000,
+            },
+        });
+        let u = parse_usage(&params);
+        assert_eq!(u.input_tokens, 1200);
+        assert_eq!(u.cached_input_tokens, 1000);
+        assert_eq!(u.output_tokens, 50);
+
+        // Older flat shape still parses.
+        let flat = json!({ "usage": { "inputTokens": 7, "outputTokens": 3 } });
+        let u = parse_usage(&flat);
+        assert_eq!(u.input_tokens, 7);
+        assert_eq!(u.output_tokens, 3);
+    }
 
     #[test]
     fn splits_effort_suffix() {

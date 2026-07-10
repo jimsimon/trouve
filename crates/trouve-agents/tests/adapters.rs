@@ -439,10 +439,10 @@ cat > /dev/null
     assert_eq!(usage.input_tokens, 11);
     assert_eq!(usage.output_tokens, 4);
 
-    // Our approval reply reached the vendor with an accept decision.
+    // Our approval reply reached the vendor with an approved decision.
     let reply = std::fs::read_to_string(format!("{stub}.approval")).unwrap();
     assert!(reply.contains("\"id\":100"), "{reply}");
-    assert!(reply.contains("accept"), "{reply}");
+    assert!(reply.contains("approved"), "{reply}");
 }
 
 #[tokio::test]
