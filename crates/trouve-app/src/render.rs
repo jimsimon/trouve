@@ -135,7 +135,10 @@ impl WizardState {
 /// monospace but offers no color knob, and monospace alone doesn't stand
 /// out from prose.
 fn tint_code_spans(md: &str) -> String {
-    const OPEN: &str = "<font color=\"#e5c07b\">";
+    let open = format!(
+        "<font color=\"#{:06x}\">",
+        INLINE_CODE_TINT.load(std::sync::atomic::Ordering::Relaxed) & 0xff_ffff
+    );
     const CLOSE: &str = "</font>";
     let bytes = md.as_bytes();
     let mut out = String::with_capacity(md.len());
@@ -173,7 +176,7 @@ fn tint_code_spans(md: &str) -> String {
         }
         match close {
             Some(end) => {
-                out.push_str(OPEN);
+                out.push_str(&open);
                 out.push_str(&md[start..end]);
                 out.push_str(CLOSE);
                 i = end;
@@ -1567,6 +1570,24 @@ fn syntect_assets() -> &'static (syntect::parsing::SyntaxSet, syntect::highlight
     })
 }
 
+/// Whether code highlights use the dark syntect theme; flipped with the UI
+/// theme so code blocks stay readable on light surfaces. Existing rows keep
+/// their baked colors until the caller re-renders them.
+static SYNTAX_DARK: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
+/// Inline-code span tint, baked into styled markup (the theme's `warn`
+/// color; defaults to the dark theme's amber).
+static INLINE_CODE_TINT: std::sync::atomic::AtomicU32 =
+    std::sync::atomic::AtomicU32::new(0xffe5_c07b);
+
+pub fn set_syntax_dark(dark: bool) {
+    SYNTAX_DARK.store(dark, std::sync::atomic::Ordering::Relaxed);
+}
+
+pub fn set_inline_code_tint(argb: u32) {
+    INLINE_CODE_TINT.store(argb, std::sync::atomic::Ordering::Relaxed);
+}
+
 /// Syntax-highlight file content into per-line `(text, rgb)` segments.
 pub fn highlight_file(path: &str, content: &str) -> Vec<Vec<(String, u32)>> {
     let (syntaxes, _) = syntect_assets();
@@ -1605,7 +1626,12 @@ fn highlight_lines(
     use syntect::util::LinesWithEndings;
 
     let (syntaxes, themes) = syntect_assets();
-    let theme = &themes.themes["base16-ocean.dark"];
+    let dark = SYNTAX_DARK.load(std::sync::atomic::Ordering::Relaxed);
+    let theme = &themes.themes[if dark {
+        "base16-ocean.dark"
+    } else {
+        "base16-ocean.light"
+    }];
     let mut highlighter = HighlightLines::new(syntax, theme);
     let mut lines = Vec::new();
     for line in LinesWithEndings::from(content) {

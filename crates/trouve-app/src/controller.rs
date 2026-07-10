@@ -46,6 +46,10 @@ pub enum UiCommand {
     WorkspaceNewSession(usize),
     OpenSettings,
     CloseSettings,
+    /// Theme / font changed: re-render everything with baked colors
+    /// (syntax-highlight segments, inline-code tints). The palette itself
+    /// was already swapped on the UI thread.
+    AppearanceChanged,
 
     // New-chat screens.
     NewSession,
@@ -209,6 +213,9 @@ struct Controller {
     file_expanded: HashSet<String>,
     /// The tree flattened in display order; indices match the UI rows.
     file_rows: Vec<FileRow>,
+    /// Worktree-relative path of the file open in the Files tab, for
+    /// re-highlighting after a theme change.
+    open_file: Option<String>,
 }
 
 /// One visible row of the Files tree.
@@ -271,6 +278,7 @@ pub async fn run(
         file_children: HashMap::new(),
         file_expanded: HashSet::new(),
         file_rows: Vec::new(),
+        open_file: None,
     };
 
     if let Err(e) = ctl.bootstrap().await {
@@ -1286,6 +1294,23 @@ impl Controller {
                     },
                 );
             }
+            UiCommand::AppearanceChanged => {
+                // Chat rows bake syntax-highlight and inline-code colors at
+                // conversion time; drop the diff cache and re-fold so they
+                // pick up the new theme.
+                ui::invalidate_chat_cache(&self.ui);
+                self.render_chat(false);
+                // Same for the open file's highlight segments (and the
+                // markdown preview rows behind it).
+                if let (Some(path), Some(session_id)) =
+                    (self.open_file.clone(), self.current_session_id())
+                {
+                    if let Ok(file) = self.client.session_file(&session_id, &path).await {
+                        let lines = render::highlight_file(&file.path, &file.content);
+                        ui::set_file_view(&self.ui, path, file.content, lines);
+                    }
+                }
+            }
             UiCommand::NewSession => self.open_new_session_screen(None).await?,
             UiCommand::NewThread => self.open_new_thread_screen(),
             UiCommand::CancelNewChat => {
@@ -1547,6 +1572,7 @@ impl Controller {
                 } else if let Some(session_id) = self.current_session_id() {
                     let file = self.client.session_file(&session_id, &row.path).await?;
                     let lines = render::highlight_file(&file.path, &file.content);
+                    self.open_file = Some(row.path.clone());
                     ui::set_file_view(&self.ui, row.path, file.content, lines);
                     // A browser open carries no line range to highlight.
                     ui::set_file_selection(&self.ui, -1, -1);
@@ -1579,6 +1605,7 @@ impl Controller {
                 match self.client.session_file(&session_id, &rel).await {
                     Ok(file) => {
                         let lines = render::highlight_file(&file.path, &file.content);
+                        self.open_file = Some(rel.clone());
                         ui::set_file_view(&self.ui, rel, file.content, lines);
                         // Preselect the lines the tool covered (1-based in
                         // the args, 0-based in the view).

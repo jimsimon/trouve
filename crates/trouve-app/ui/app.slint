@@ -15,8 +15,12 @@ import {
     SettingsScreen, ProviderItem, CliItem, KnownProviderItem
 } from "settings-window.slint";
 import { ScrollKeys } from "scroll-keys.slint";
+import { Theme, ThemePalette } from "theme.slint";
+import { Palette } from "std-widgets.slint";
 
+// Theme re-exported so Rust can push the selected palette.
 export { DiffRow, TextSegment, ProviderItem, CliItem, KnownProviderItem }
+export { Theme, ThemePalette }
 
 // One row of the left nav: workspace headers, sessions, archived toggles.
 export struct NavRow {
@@ -143,25 +147,25 @@ component DropUpPicker inherits Rectangle {
     in property <string> placeholder: "select…";
     callback changed(int);
 
-    height: 30px;
-    background: #222222;
+    height: Theme.fs(30px);
+    background: Theme.c.control-bg;
     border-radius: 6px;
 
     popup := PopupWindow {
         x: 0;
-        y: -min(root.options.length, 10) * 28px - 8px;
+        y: -min(root.options.length, 10) * Theme.fs(28px) - 8px;
         width: max(root.width, 260px);
-        height: min(root.options.length, 10) * 28px + 2px;
+        height: min(root.options.length, 10) * Theme.fs(28px) + 2px;
 
         Rectangle {
-            background: #262626;
+            background: Theme.c.popup-bg;
             border-radius: 6px;
             border-width: 1px;
-            border-color: #3a3a3a;
+            border-color: Theme.c.border;
             ListView {
                 for option[idx] in root.options: Rectangle {
-                    height: 28px;
-                    background: idx == root.current-index ? #2b3d55 : transparent;
+                    height: Theme.fs(28px);
+                    background: idx == root.current-index ? Theme.c.accent-bg : transparent;
                     TouchArea {
                         clicked => {
                             root.current-index = idx;
@@ -172,8 +176,8 @@ component DropUpPicker inherits Rectangle {
                         x: 8px;
                         width: parent.width - 16px;
                         text: option;
-                        color: #d8d8d8;
-                        font-size: 12px;
+                        color: Theme.c.text;
+                        font-size: Theme.fs(12px);
                         vertical-alignment: center;
                         overflow: elide;
                     }
@@ -193,16 +197,16 @@ component DropUpPicker inherits Rectangle {
             text: root.current-index >= 0 && root.current-index < root.options.length
                 ? root.options[root.current-index]
                 : root.placeholder;
-            color: root.enabled ? #d8d8d8 : #6a6a6a;
-            font-size: 12px;
+            color: root.enabled ? Theme.c.text : Theme.c.text-disabled;
+            font-size: Theme.fs(12px);
             vertical-alignment: center;
             overflow: elide;
             horizontal-stretch: 1;
         }
         Text {
             text: "▴";
-            color: #8a8a8a;
-            font-size: 10px;
+            color: Theme.c.text-soft;
+            font-size: Theme.fs(10px);
             vertical-alignment: center;
         }
     }
@@ -223,11 +227,11 @@ component SearchPicker inherits Rectangle {
     callback filter-edited(string);
 
     in-out property <string> query: "";
-    property <length> list-h: max(min(root.matches.length, 10), 1) * 28px;
+    property <length> list-h: max(min(root.matches.length, 10), 1) * Theme.fs(28px);
     property <length> popup-h: list-h + 40px;
 
-    height: 30px;
-    background: #222222;
+    height: Theme.fs(30px);
+    background: Theme.c.control-bg;
     border-radius: 6px;
 
     popup := PopupWindow {
@@ -238,16 +242,16 @@ component SearchPicker inherits Rectangle {
         height: root.popup-h;
 
         Rectangle {
-            background: #262626;
+            background: Theme.c.popup-bg;
             border-radius: 6px;
             border-width: 1px;
-            border-color: #3a3a3a;
+            border-color: Theme.c.border;
             VerticalLayout {
                 padding: 4px;
                 spacing: 4px;
                 search := LineEdit {
-                    height: 28px;
-                    font-size: 12px;
+                    height: Theme.fs(28px);
+                    font-size: Theme.fs(12px);
                     placeholder-text: "Search models…";
                     text <=> root.query;
                     init => { self.focus(); }
@@ -262,20 +266,20 @@ component SearchPicker inherits Rectangle {
                     }
                 }
                 if root.matches.length == 0: Rectangle {
-                    height: 28px;
+                    height: Theme.fs(28px);
                     Text {
                         x: 8px;
                         text: "no matches";
-                        color: #6a6a6a;
-                        font-size: 12px;
+                        color: Theme.c.text-disabled;
+                        font-size: Theme.fs(12px);
                         vertical-alignment: center;
                     }
                 }
                 ListView {
                     for oi[k] in root.matches: Rectangle {
-                        height: 28px;
-                        background: oi == root.current-index ? #2b3d55
-                            : opt-ta.has-hover ? #2e2e2e : transparent;
+                        height: Theme.fs(28px);
+                        background: oi == root.current-index ? Theme.c.accent-bg
+                            : opt-ta.has-hover ? Theme.c.hover-bg : transparent;
                         opt-ta := TouchArea {
                             clicked => {
                                 root.current-index = oi;
@@ -287,8 +291,8 @@ component SearchPicker inherits Rectangle {
                             x: 8px;
                             width: parent.width - 16px;
                             text: root.options[oi];
-                            color: #d8d8d8;
-                            font-size: 12px;
+                            color: Theme.c.text;
+                            font-size: Theme.fs(12px);
                             vertical-alignment: center;
                             overflow: elide;
                         }
@@ -314,16 +318,16 @@ component SearchPicker inherits Rectangle {
             text: root.current-index >= 0 && root.current-index < root.options.length
                 ? root.options[root.current-index]
                 : root.placeholder;
-            color: root.enabled ? #d8d8d8 : #6a6a6a;
-            font-size: 12px;
+            color: root.enabled ? Theme.c.text : Theme.c.text-disabled;
+            font-size: Theme.fs(12px);
             vertical-alignment: center;
             overflow: elide;
             horizontal-stretch: 1;
         }
         Text {
             text: root.up ? "▴" : "▾";
-            color: #8a8a8a;
-            font-size: 10px;
+            color: Theme.c.text-soft;
+            font-size: Theme.fs(10px);
             vertical-alignment: center;
         }
     }
@@ -369,19 +373,19 @@ component IconButton inherits Rectangle {
     in property <string> icon;
     in property <string> tip;
     in property <bool> enabled: true;
-    in property <length> icon-size: 12px;
-    in property <color> icon-color: #8a8a8a;
-    in property <color> hover-icon-color: #e8e8e8;
+    in property <length> icon-size: Theme.fs(12px);
+    in property <color> icon-color: Theme.c.text-soft;
+    in property <color> hover-icon-color: Theme.c.text-hi;
     in property <color> idle-bg: transparent;
-    in property <color> hover-bg: #3a3a3a;
+    in property <color> hover-bg: Theme.c.border;
     callback clicked;
 
-    width: 22px;
-    height: 18px;
+    width: Theme.fs(22px);
+    height: Theme.fs(18px);
     border-radius: 4px;
     background: ta.has-hover && root.enabled ? root.hover-bg : root.idle-bg;
     border-width: fs.has-focus ? 1px : 0px;
-    border-color: #6fa8dc;
+    border-color: Theme.c.accent;
 
     property <int> tip-token: -1;
     function tip-changed(on: bool) {
@@ -412,7 +416,7 @@ component IconButton inherits Rectangle {
         width: 100%;
         height: 100%;
         text: root.icon;
-        color: !root.enabled ? #5a5a5a
+        color: !root.enabled ? Theme.c.text-ghost
             : ta.has-hover ? root.hover-icon-color
             : root.icon-color;
         font-size: root.icon-size;
@@ -430,21 +434,21 @@ component PillButton inherits Rectangle {
     callback clicked;
 
     width: pill-label.preferred-width + 16px;
-    height: 18px;
+    height: Theme.fs(18px);
     border-radius: 4px;
-    background: !root.enabled ? #262626
+    background: !root.enabled ? Theme.c.popup-bg
         : root.primary
-        ? (pill-ta.has-hover ? #3f6db3 : #35598f)
-        : (pill-ta.has-hover ? #3a3a3a : #2a2a2a);
+        ? (pill-ta.has-hover ? Theme.c.primary-hover : Theme.c.primary-bg)
+        : (pill-ta.has-hover ? Theme.c.border : Theme.c.pill-bg);
     border-width: 1px;
-    border-color: !root.enabled ? #383838 : root.primary ? #4f7dc3 : #454545;
+    border-color: !root.enabled ? Theme.c.border : root.primary ? Theme.c.primary-border : Theme.c.border-strong;
 
     pill-label := Text {
         width: 100%;
         height: 100%;
         text: root.label;
-        color: !root.enabled ? #6a6a6a : root.primary ? #e8eef8 : #c8c8c8;
-        font-size: 11px;
+        color: !root.enabled ? Theme.c.text-disabled : root.primary ? Theme.c.on-accent : Theme.c.text-mid;
+        font-size: Theme.fs(11px);
         horizontal-alignment: center;
         vertical-alignment: center;
     }
@@ -465,12 +469,12 @@ component CopyButton inherits Rectangle {
     in property <string> tip: "Copy";
     property <bool> copied: false;
 
-    height: 22px;
+    height: Theme.fs(22px);
     width: content.preferred-width;
     border-radius: 4px;
-    background: ta.has-hover ? #333333 : transparent;
+    background: ta.has-hover ? Theme.c.hover-strong : transparent;
     border-width: fs.has-focus ? 1px : 0px;
-    border-color: #6fa8dc;
+    border-color: Theme.c.accent;
 
     function do-copy() {
         clip-src.text = root.payload;
@@ -506,19 +510,19 @@ component CopyButton inherits Rectangle {
         spacing: 4px;
         Text {
             text: root.copied ? "✓" : "⧉";
-            color: root.copied ? #7fd18a
-                : ta.has-hover ? #d8d8d8
-                : #8a8a8a;
-            font-size: 12px;
+            color: root.copied ? Theme.c.ok
+                : ta.has-hover ? Theme.c.text
+                : Theme.c.text-soft;
+            font-size: Theme.fs(12px);
             horizontal-alignment: center;
             vertical-alignment: center;
         }
         if root.label != "": Text {
             text: root.copied ? "copied" : root.label;
-            color: root.copied ? #7fd18a
-                : ta.has-hover ? #d8d8d8
-                : #8a8a8a;
-            font-size: 11px;
+            color: root.copied ? Theme.c.ok
+                : ta.has-hover ? Theme.c.text
+                : Theme.c.text-soft;
+            font-size: Theme.fs(11px);
             vertical-alignment: center;
         }
     }
@@ -561,18 +565,18 @@ component PromptBox inherits Rectangle {
     }
 
     property <length> pad: 8px;
-    property <length> line-height: 18px;
-    property <length> max-input-height: 162px; // ~8 lines
+    property <length> line-height: Theme.fs(18px);
+    property <length> max-input-height: Theme.fs(162px); // ~8 lines
     // Desired scroll offset (<= 0); the binding on `input.y` clamps it so
     // shrinking content snaps back into view.
     property <length> scroll-y: 0px;
 
     height: clamp(input.preferred-height + 2 * root.pad,
         34px, root.max-input-height);
-    background: #1d1d1d;
+    background: Theme.c.surface;
     border-radius: 6px;
     border-width: 1px;
-    border-color: input.has-focus ? #3d5a80 : #3a3a3a;
+    border-color: input.has-focus ? Theme.c.selection : Theme.c.border;
 
     // Focus the input when the padding area is clicked; wheel-scroll the
     // overflowing content (the TextInput above doesn't consume wheel
@@ -605,9 +609,9 @@ component PromptBox inherits Rectangle {
             single-line: false;
             wrap: word-wrap;
             enabled: root.enabled;
-            color: root.enabled ? #e0e0e0 : #6a6a6a;
-            font-size: 13px;
-            selection-background-color: #3d5a80;
+            color: root.enabled ? Theme.c.text-hi : Theme.c.text-disabled;
+            font-size: Theme.fs(13px);
+            selection-background-color: Theme.c.selection;
 
             key-pressed(event) => {
                 if (root.completion-active && event.text == Key.Tab) {
@@ -643,8 +647,8 @@ component PromptBox inherits Rectangle {
         y: root.pad;
         width: parent.width - 2 * root.pad;
         text: root.placeholder;
-        color: #6a6a6a;
-        font-size: 13px;
+        color: Theme.c.text-disabled;
+        font-size: Theme.fs(13px);
         overflow: elide;
     }
 
@@ -680,9 +684,9 @@ component PromptBox inherits Rectangle {
             y: (parent.track - parent.thumb-h) * parent.frac();
             height: parent.thumb-h;
             border-radius: 3px;
-            background: pb-sb-ta.pressed ? #6a6f78
-                : pb-sb-ta.has-hover ? #565b63
-                : #3a3e44;
+            background: pb-sb-ta.pressed ? Theme.c.scroll-thumb-active
+                : pb-sb-ta.has-hover ? Theme.c.scroll-thumb-hover
+                : Theme.c.scroll-thumb;
         }
         pb-sb-ta := TouchArea {
             property <length> grab;
@@ -736,22 +740,22 @@ component NewChatForm inherits VerticalLayout {
 
     Text {
         text: root.session-form ? "New session" : "New thread";
-        color: #e8e8e8;
-        font-size: 22px;
+        color: Theme.c.text-hi;
+        font-size: Theme.fs(22px);
         font-weight: 700;
     }
     Text {
         text: root.session-form
             ? "Pick where to work, what to branch from, and how the agent should run."
             : "Threads share the session worktree; pick the agent setup for this one.";
-        color: #9a9a9a;
-        font-size: 13px;
+        color: Theme.c.text-dim;
+        font-size: Theme.fs(13px);
         wrap: word-wrap;
     }
 
     if root.session-form: VerticalLayout {
         spacing: 6px;
-        Text { text: "Workspace"; color: #c8c8c8; font-size: 12px; font-weight: 700; }
+        Text { text: "Workspace"; color: Theme.c.text-mid; font-size: Theme.fs(12px); font-weight: 700; }
         ComboBox {
             model: root.workspaces;
             current-index <=> root.workspace-index;
@@ -776,7 +780,7 @@ component NewChatForm inherits VerticalLayout {
 
     if root.session-form: VerticalLayout {
         spacing: 6px;
-        Text { text: "Base branch"; color: #c8c8c8; font-size: 12px; font-weight: 700; }
+        Text { text: "Base branch"; color: Theme.c.text-mid; font-size: Theme.fs(12px); font-weight: 700; }
         ComboBox {
             model: root.branches;
             current-index <=> root.branch-index;
@@ -788,7 +792,7 @@ component NewChatForm inherits VerticalLayout {
         VerticalLayout {
             spacing: 6px;
             horizontal-stretch: 1;
-            Text { text: "Agent mode"; color: #c8c8c8; font-size: 12px; font-weight: 700; }
+            Text { text: "Agent mode"; color: Theme.c.text-mid; font-size: Theme.fs(12px); font-weight: 700; }
             ComboBox {
                 model: root.modes;
                 current-index <=> root.mode-index;
@@ -797,7 +801,7 @@ component NewChatForm inherits VerticalLayout {
         VerticalLayout {
             spacing: 6px;
             horizontal-stretch: 1;
-            Text { text: "Model"; color: #c8c8c8; font-size: 12px; font-weight: 700; }
+            Text { text: "Model"; color: Theme.c.text-mid; font-size: Theme.fs(12px); font-weight: 700; }
             SearchPicker {
                 up: false;
                 options: root.models;
@@ -811,7 +815,7 @@ component NewChatForm inherits VerticalLayout {
 
     VerticalLayout {
         spacing: 6px;
-        Text { text: "First message"; color: #c8c8c8; font-size: 12px; font-weight: 700; }
+        Text { text: "First message"; color: Theme.c.text-mid; font-size: Theme.fs(12px); font-weight: 700; }
         prompt-edit := PromptBox {
             placeholder: "What should the agent do?  (Shift+Enter for a new line)";
             submitted(text) => {
@@ -845,8 +849,8 @@ component NewChatForm inherits VerticalLayout {
     }
     if root.error-text != "" : Text {
         text: root.error-text;
-        color: #e39ea6;
-        font-size: 12px;
+        color: Theme.c.err;
+        font-size: Theme.fs(12px);
         wrap: word-wrap;
     }
 }
@@ -858,7 +862,7 @@ component SplitterHandle inherits Rectangle {
     in property <length> max-value: 700px;
 
     width: 5px;
-    background: ta.has-hover || ta.pressed ? #3d5a80 : #242424;
+    background: ta.has-hover || ta.pressed ? Theme.c.selection : Theme.c.raised-bg;
 
     ta := TouchArea {
         mouse-cursor: col-resize;
@@ -876,7 +880,19 @@ export component AppWindow inherits Window {
     min-width: 900px;
     min-height: 560px;
     title: "trouve";
-    background: #141414;
+    background: Theme.c.win-bg;
+    // Texts without an explicit font-size inherit these; explicit sizes
+    // route through Theme.fs() so everything follows the user's base size.
+    default-font-family: Theme.font-family;
+    default-font-size: Theme.fs(13px);
+
+    // Built-in widgets (buttons, combo boxes, scrollbars) follow the theme
+    // through the std-widgets Palette. Invoked from Rust on theme switch —
+    // the ColorScheme enum isn't reachable from the Rust API, so the switch
+    // lives here.
+    public function set-widget-scheme(dark: bool) {
+        Palette.color-scheme = dark ? ColorScheme.dark : ColorScheme.light;
+    }
 
     // --- layout -------------------------------------------------------------
     in-out property <length> left-width: 260px;
@@ -938,6 +954,19 @@ export component AppWindow inherits Window {
     callback refresh-settings();
     callback cli-install(/* id */ string);
     callback close-settings();
+
+    // Appearance (handled on the Rust UI thread; see src/theme.rs).
+    in property <[string]> appearance-theme-names;
+    in-out property <int> appearance-theme-index: 0;
+    in property <[string]> appearance-font-size-names;
+    in-out property <int> appearance-font-size-index: 0;
+    in property <[string]> appearance-font-names;
+    in-out property <int> appearance-font-index: 0;
+    in-out property <bool> appearance-reduce-motion: false;
+    callback appearance-theme-picked(int);
+    callback appearance-font-size-picked(int);
+    callback appearance-font-picked(int);
+    callback appearance-reduce-motion-toggled(bool);
 
     in property <[ThreadTabItem]> threads;
     in property <int> current-thread: -1;
@@ -1111,7 +1140,7 @@ export component AppWindow inherits Window {
         // ---------------- left: sessions ----------------
         Rectangle {
             width: root.left-width;
-            background: #1a1a1a;
+            background: Theme.c.sidebar-bg;
 
             VerticalLayout {
                 padding: 10px;
@@ -1120,8 +1149,8 @@ export component AppWindow inherits Window {
                 HorizontalLayout {
                     Text {
                         text: "Workspaces";
-                        color: #e8e8e8;
-                        font-size: 15px;
+                        color: Theme.c.text-hi;
+                        font-size: Theme.fs(15px);
                         font-weight: 700;
                         vertical-alignment: center;
                         horizontal-stretch: 1;
@@ -1142,27 +1171,27 @@ export component AppWindow inherits Window {
                     // hover-out; drop any tooltip it left behind.
                     changed viewport-y => { Tip.hide-all(); }
                     for row[idx] in root.nav-rows: Rectangle {
-                        height: row.kind == 1 ? 52px : row.kind == 0 ? 34px : 30px;
+                        height: Theme.fs(row.kind == 1 ? 52px : row.kind == 0 ? 34px : 30px);
                         background: row.kind == 0
-                            ? (row-ta.has-hover ? #2b2b2b : #232323)
-                            : row.kind == 1 && row.selected ? #2b3d55 : transparent;
+                            ? (row-ta.has-hover ? Theme.c.hover-bg : Theme.c.raised-bg)
+                            : row.kind == 1 && row.selected ? Theme.c.accent-bg : transparent;
                         border-radius: 6px;
 
                         row-menu := PopupWindow {
                             x: parent.width - 150px;
                             y: 28px;
                             width: 150px;
-                            height: 100px;
+                            height: 3 * Theme.fs(30px) + 10px;
                             Rectangle {
-                                background: #262626;
+                                background: Theme.c.popup-bg;
                                 border-radius: 6px;
                                 border-width: 1px;
-                                border-color: #3a3a3a;
+                                border-color: Theme.c.border;
                                 VerticalLayout {
                                     padding: 4px;
                                     Rectangle {
-                                        height: 30px;
-                                        background: rename-ta.has-hover ? #2b3d55 : transparent;
+                                        height: Theme.fs(30px);
+                                        background: rename-ta.has-hover ? Theme.c.accent-bg : transparent;
                                         border-radius: 4px;
                                         rename-ta := TouchArea {
                                             clicked => {
@@ -1173,14 +1202,14 @@ export component AppWindow inherits Window {
                                         Text {
                                             x: 8px;
                                             text: "Rename";
-                                            color: #d8d8d8;
-                                            font-size: 12px;
+                                            color: Theme.c.text;
+                                            font-size: Theme.fs(12px);
                                             vertical-alignment: center;
                                         }
                                     }
                                     Rectangle {
-                                        height: 30px;
-                                        background: archive-ta.has-hover ? #2b3d55 : transparent;
+                                        height: Theme.fs(30px);
+                                        background: archive-ta.has-hover ? Theme.c.accent-bg : transparent;
                                         border-radius: 4px;
                                         archive-ta := TouchArea {
                                             clicked => {
@@ -1190,14 +1219,14 @@ export component AppWindow inherits Window {
                                         Text {
                                             x: 8px;
                                             text: row.archived ? "Unarchive" : "Archive";
-                                            color: #d8d8d8;
-                                            font-size: 12px;
+                                            color: Theme.c.text;
+                                            font-size: Theme.fs(12px);
                                             vertical-alignment: center;
                                         }
                                     }
                                     Rectangle {
-                                        height: 30px;
-                                        background: delete-ta.has-hover ? #6b2b33 : transparent;
+                                        height: Theme.fs(30px);
+                                        background: delete-ta.has-hover ? Theme.c.err-hover : transparent;
                                         border-radius: 4px;
                                         delete-ta := TouchArea {
                                             clicked => {
@@ -1208,8 +1237,8 @@ export component AppWindow inherits Window {
                                         Text {
                                             x: 8px;
                                             text: "Delete…";
-                                            color: #e39ea6;
-                                            font-size: 12px;
+                                            color: Theme.c.err;
+                                            font-size: Theme.fs(12px);
                                             vertical-alignment: center;
                                         }
                                     }
@@ -1227,12 +1256,12 @@ export component AppWindow inherits Window {
                             x: parent.width - 190px;
                             y: 32px;
                             width: 180px;
-                            height: 70px;
+                            height: Theme.fs(24px) + Theme.fs(30px) + 16px;
                             Rectangle {
-                                background: #262626;
+                                background: Theme.c.popup-bg;
                                 border-radius: 6px;
                                 border-width: 1px;
-                                border-color: #3a3a3a;
+                                border-color: Theme.c.border;
                                 VerticalLayout {
                                     padding: 4px;
                                     Rectangle {
@@ -1240,15 +1269,15 @@ export component AppWindow inherits Window {
                                         Text {
                                             x: 8px;
                                             text: "Filters";
-                                            color: #8a8a8a;
-                                            font-size: 11px;
+                                            color: Theme.c.text-soft;
+                                            font-size: Theme.fs(11px);
                                             vertical-alignment: center;
                                         }
                                     }
                                     Rectangle {
-                                        height: 30px;
+                                        height: Theme.fs(30px);
                                         background: archived-filter-ta.has-hover
-                                            ? #2b3d55 : transparent;
+                                            ? Theme.c.accent-bg : transparent;
                                         border-radius: 4px;
                                         archived-filter-ta := TouchArea {
                                             clicked => {
@@ -1260,15 +1289,15 @@ export component AppWindow inherits Window {
                                             padding-right: 8px;
                                             Text {
                                                 text: "Archived";
-                                                color: #d8d8d8;
-                                                font-size: 12px;
+                                                color: Theme.c.text;
+                                                font-size: Theme.fs(12px);
                                                 vertical-alignment: center;
                                                 horizontal-stretch: 1;
                                             }
                                             if root.show-archived: Text {
                                                 text: "✓";
-                                                color: #d8d8d8;
-                                                font-size: 12px;
+                                                color: Theme.c.text;
+                                                font-size: Theme.fs(12px);
                                                 vertical-alignment: center;
                                             }
                                         }
@@ -1286,14 +1315,14 @@ export component AppWindow inherits Window {
                             spacing: 6px;
                             Text {
                                 text: row.expanded ? "⌄" : "›";
-                                color: #8a8a8a;
-                                font-size: 12px;
+                                color: Theme.c.text-soft;
+                                font-size: Theme.fs(12px);
                                 vertical-alignment: center;
                             }
                             Text {
                                 text: row.title;
-                                color: #d8d8d8;
-                                font-size: 13px;
+                                color: Theme.c.text;
+                                font-size: Theme.fs(13px);
                                 font-weight: 700;
                                 vertical-alignment: center;
                                 overflow: elide;
@@ -1305,7 +1334,7 @@ export component AppWindow inherits Window {
                                 y: (parent.height - self.height) / 2;
                                 border-radius: 5px;
                                 icon: "▽";
-                                icon-size: 13px;
+                                icon-size: Theme.fs(13px);
                                 tip: "Filter sessions";
                                 clicked => { filter-menu.show(); }
                             }
@@ -1315,7 +1344,7 @@ export component AppWindow inherits Window {
                                 y: (parent.height - self.height) / 2;
                                 border-radius: 5px;
                                 icon: "+";
-                                icon-size: 15px;
+                                icon-size: Theme.fs(15px);
                                 tip: "New session in this workspace";
                                 clicked => { root.workspace-new-session(idx); }
                             }
@@ -1331,14 +1360,14 @@ export component AppWindow inherits Window {
                                 horizontal-stretch: 1;
                                 Text {
                                     text: row.title;
-                                    color: row.archived ? #8a8a8a : #e0e0e0;
-                                    font-size: 13px;
+                                    color: row.archived ? Theme.c.text-soft : Theme.c.text-hi;
+                                    font-size: Theme.fs(13px);
                                     overflow: elide;
                                 }
                                 Text {
                                     text: row.subtitle;
-                                    color: #8a8a8a;
-                                    font-size: 11px;
+                                    color: Theme.c.text-soft;
+                                    font-size: Theme.fs(11px);
                                     overflow: elide;
                                 }
                             }
@@ -1346,9 +1375,9 @@ export component AppWindow inherits Window {
                                 width: 26px;
                                 height: 100%;
                                 icon: "⋯";
-                                icon-size: 15px;
-                                icon-color: #6a6a6a;
-                                hover-icon-color: #e0e0e0;
+                                icon-size: Theme.fs(15px);
+                                icon-color: Theme.c.text-disabled;
+                                hover-icon-color: Theme.c.text-hi;
                                 hover-bg: transparent;
                                 tip: "Session actions";
                                 clicked => { row-menu.show(); }
@@ -1359,8 +1388,8 @@ export component AppWindow inherits Window {
                         if row.kind == 2: Text {
                             x: 22px;
                             text: (row.expanded ? "▾ " : "▸ ") + row.title;
-                            color: #7a7a7a;
-                            font-size: 11px;
+                            color: Theme.c.text-faint;
+                            font-size: Theme.fs(11px);
                             vertical-alignment: center;
                             height: 100%;
                         }
@@ -1379,8 +1408,8 @@ export component AppWindow inherits Window {
                 }
                 Text {
                     text: root.status-text;
-                    color: #7a7a7a;
-                    font-size: 11px;
+                    color: Theme.c.text-faint;
+                    font-size: Theme.fs(11px);
                     wrap: word-wrap;
                 }
             }
@@ -1396,7 +1425,7 @@ export component AppWindow inherits Window {
         // ---------------- center ----------------
         Rectangle {
             horizontal-stretch: 1;
-            background: #141414;
+            background: Theme.c.win-bg;
 
             // ----- chat screen (kept in the tree so scroll-chat-to-end can
             // reach the list; hidden while the new-session or settings
@@ -1418,7 +1447,7 @@ export component AppWindow inherits Window {
 
                 // Error banner.
                 if root.error-text != "": Rectangle {
-                    background: #4a2328;
+                    background: Theme.c.err-bg;
                     border-radius: 6px;
                     height: banner.preferred-height + 12px;
                     banner := HorizontalLayout {
@@ -1427,8 +1456,8 @@ export component AppWindow inherits Window {
                         spacing: 8px;
                         Text {
                             text: root.error-text;
-                            color: #f2c4ca;
-                            font-size: 12px;
+                            color: Theme.c.err-soft;
+                            font-size: Theme.fs(12px);
                             wrap: word-wrap;
                             vertical-alignment: center;
                             horizontal-stretch: 1;
@@ -1437,8 +1466,8 @@ export component AppWindow inherits Window {
                             width: 24px;
                             height: 24px;
                             icon: "✕";
-                            icon-color: #f2c4ca;
-                            hover-bg: #5d2e35;
+                            icon-color: Theme.c.err-soft;
+                            hover-bg: Theme.c.err-hover;
                             tip: "Dismiss";
                             clicked => { root.error-text = ""; }
                         }
@@ -1450,16 +1479,16 @@ export component AppWindow inherits Window {
                     spacing: 6px;
                     for thread[idx] in root.threads: Rectangle {
                         width: 130px;
-                        height: 30px;
-                        background: idx == root.current-thread ? #2b3d55 : #222222;
+                        height: Theme.fs(30px);
+                        background: idx == root.current-thread ? Theme.c.accent-bg : Theme.c.control-bg;
                         border-radius: 6px;
                         TouchArea {
                             clicked => { root.thread-selected(idx); }
                         }
                         Text {
                             text: thread.label;
-                            color: #d8d8d8;
-                            font-size: 12px;
+                            color: Theme.c.text;
+                            font-size: Theme.fs(12px);
                             horizontal-alignment: center;
                             vertical-alignment: center;
                             overflow: elide;
@@ -1469,11 +1498,11 @@ export component AppWindow inherits Window {
                     }
                     IconButton {
                         width: 30px;
-                        height: 30px;
+                        height: Theme.fs(30px);
                         border-radius: 6px;
                         icon: "+";
-                        icon-size: 15px;
-                        idle-bg: #222222;
+                        icon-size: Theme.fs(15px);
+                        idle-bg: Theme.c.control-bg;
                         tip: "New thread";
                         enabled: root.threads.length > 0 || root.composer-enabled;
                         clicked => { root.new-thread(); }
@@ -1576,10 +1605,10 @@ export component AppWindow inherits Window {
 
                         // Tool rows keep their label in tool-name, but only
                         // nest inside assistant cards, so hardcode green.
-                        property <color> card-line: row.kind == 2 ? #33503c
-                            : row.tool-name == "You" ? #3a4a68
-                            : row.tool-name == "Agent" ? #33503c
-                            : #3a3f46;
+                        property <color> card-line: row.kind == 2 ? Theme.c.agent-border
+                            : row.tool-name == "You" ? Theme.c.user-border
+                            : row.tool-name == "Agent" ? Theme.c.agent-border
+                            : Theme.c.card-border;
 
                         if row.card-pos == 2 || row.card-pos == 3: Rectangle {
                             x: 0;
@@ -1641,18 +1670,18 @@ export component AppWindow inherits Window {
                             // Card headers tint by source: prompt blue,
                             // assistant green; tool cards and thinking
                             // pills stay grey.
-                            background: hdr && row.tool-name == "You" ? #232c3d
-                                : hdr && row.tool-name == "Agent" ? #1f2a22
+                            background: hdr && row.tool-name == "You" ? Theme.c.user-bg
+                                : hdr && row.tool-name == "Agent" ? Theme.c.agent-bg
                                 // Question wizard: amber while it wants an
                                 // answer, settling to card grey once done.
-                                : row.kind == 10 ? (row.q-done ? #1d1d1d : #262117)
+                                : row.kind == 10 ? (row.q-done ? Theme.c.surface : Theme.c.warn-bg)
                                 // Thinking pills share the tool-card grey.
                                 : row.kind == 2 || row.kind == 4
-                                    || row.kind == 9 || hdr ? #1d1d1d
-                                // Lighter than the panel (#141414) so the
+                                    || row.kind == 9 || hdr ? Theme.c.surface
+                                // Lighter than the window background so the
                                 // block reads as a slab, not an outline.
-                                : row.kind == 1 && row.md-kind == 5 ? #1f2226
-                                : row.kind == 6 ? #17191c
+                                : row.kind == 1 && row.md-kind == 5 ? Theme.c.code-bg
+                                : row.kind == 6 ? Theme.c.inset-bg
                                 : transparent;
                             // Headers with a body keep square bottom corners
                             // so they merge into the card outline below.
@@ -1662,12 +1691,12 @@ export component AppWindow inherits Window {
                             border-bottom-right-radius: hdr && row.card-pos == 1 ? 0px : 6px;
                             border-width: (row.kind == 1 && row.md-kind == 5)
                                 || row.kind == 6 || row.kind == 10 || hdr ? 1px : 0px;
-                            border-color: hdr && row.tool-name == "You" ? #3a4a68
-                                : hdr && row.tool-name == "Agent" ? #33503c
-                                : row.kind == 10 ? (row.q-done ? #3a3f46 : #5a4d2e)
-                                : row.kind == 6 ? #2a2d31
-                                : hdr ? #3a3f46
-                                : #35393f;
+                            border-color: hdr && row.tool-name == "You" ? Theme.c.user-border
+                                : hdr && row.tool-name == "Agent" ? Theme.c.agent-border
+                                : row.kind == 10 ? (row.q-done ? Theme.c.card-border : Theme.c.warn-border)
+                                : row.kind == 6 ? Theme.c.hover-bg
+                                : hdr ? Theme.c.card-border
+                                : Theme.c.card-border;
 
                             // Card and tool-group headers toggle their body
                             // on click anywhere that isn't a nested control
@@ -1698,28 +1727,28 @@ export component AppWindow inherits Window {
                                 spacing: 8px;
                                 Text {
                                     text: row.expanded ? "▾" : "▸";
-                                    color: #8a8a8a;
-                                    font-size: 10px;
+                                    color: Theme.c.text-soft;
+                                    font-size: Theme.fs(10px);
                                     vertical-alignment: center;
                                 }
                                 Text {
                                     text: row.tool-name;
-                                    color: #d0d0d0;
-                                    font-size: 11px;
+                                    color: Theme.c.text;
+                                    font-size: Theme.fs(11px);
                                     font-weight: 700;
                                     vertical-alignment: center;
                                 }
                                 // Agent headers: the model that ran the turn.
                                 if row.subtitle != "": Text {
                                     text: row.subtitle;
-                                    color: #8a8a8a;
-                                    font-size: 11px;
+                                    color: Theme.c.text-soft;
+                                    font-size: Theme.fs(11px);
                                     vertical-alignment: center;
                                 }
                                 if !row.expanded: Text {
                                     text: row.text;
-                                    color: #8a8a8a;
-                                    font-size: 11px;
+                                    color: Theme.c.text-soft;
+                                    font-size: Theme.fs(11px);
                                     vertical-alignment: center;
                                     overflow: elide;
                                     horizontal-stretch: 1;
@@ -1729,8 +1758,8 @@ export component AppWindow inherits Window {
                                 // styled-vs-raw view switch live in the header.
                                 if row.meta != "": Text {
                                     text: row.meta;
-                                    color: #7a7a7a;
-                                    font-size: 10px;
+                                    color: Theme.c.text-faint;
+                                    font-size: Theme.fs(10px);
                                     vertical-alignment: center;
                                 }
                                 // Fixed-height icon buttons center on the
@@ -1745,19 +1774,19 @@ export component AppWindow inherits Window {
                                     // source.
                                     if row.tool-name == "Agent": IconButton {
                                         width: 20px;
-                                        height: 18px;
+                                        height: Theme.fs(18px);
                                         icon: "👁";
-                                        icon-color: row.raw ? #6a6a6a : #8fb8e8;
-                                        hover-icon-color: row.raw ? #8a8a8a : #a8ccf0;
-                                        idle-bg: row.raw ? transparent : #2b3d5533;
-                                        hover-bg: #333333;
+                                        icon-color: row.raw ? Theme.c.text-disabled : Theme.c.accent;
+                                        hover-icon-color: row.raw ? Theme.c.text-soft : Theme.c.accent-hover;
+                                        idle-bg: row.raw ? transparent : Theme.c.accent-veil;
+                                        hover-bg: Theme.c.hover-strong;
                                         tip: row.raw ? "Show styled view"
                                             : "Show raw markdown";
                                         clicked => { root.raw-toggled(row.turn); }
                                     }
                                     CopyButton {
                                         payload: row.detail;
-                                        height: 18px;
+                                        height: Theme.fs(18px);
                                         tip: row.tool-name == "You" ? "Copy message"
                                             : row.tool-name == "Agent" ? "Copy response"
                                             : "Copy thinking";
@@ -1776,8 +1805,8 @@ export component AppWindow inherits Window {
                                 spacing: 6px;
                                 Text {
                                     text: row.md-lang == "" ? "code" : row.md-lang;
-                                    color: #6f6f6f;
-                                    font-size: 11px;
+                                    color: Theme.c.text-disabled;
+                                    font-size: Theme.fs(11px);
                                     vertical-alignment: center;
                                     horizontal-stretch: 1;
                                 }
@@ -1788,7 +1817,7 @@ export component AppWindow inherits Window {
                             // (empty lines would otherwise collapse).
                             if row.kind == 1 && row.md-kind == 5: VerticalLayout {
                                 for line in row.code-lines: Rectangle {
-                                    height: 19px;
+                                    height: Theme.fs(19px);
                                     clip: true;
                                     HorizontalLayout {
                                         alignment: start;
@@ -1798,9 +1827,9 @@ export component AppWindow inherits Window {
                                             // carry black; use the default
                                             // code foreground instead.
                                             color: seg.color == #000000
-                                                ? #d8d8c8 : seg.color;
+                                                ? Theme.c.code-fg : seg.color;
                                             font-family: "monospace";
-                                            font-size: 13px;
+                                            font-size: Theme.fs(13px);
                                             vertical-alignment: center;
                                         }
                                     }
@@ -1808,14 +1837,14 @@ export component AppWindow inherits Window {
                             }
                             if row.kind == 1 && row.md-kind != 5: StyledText {
                                 text: row.styled;
-                                default-color: row.tone == 1 ? #dbe6f5
-                                    : row.tone == 2 ? #8f8f8f
-                                    : #d4d4d4;
-                                link-color: #6fa8dc;
-                                default-font-size: row.md-kind == 1 ? 22px
+                                default-color: row.tone == 1 ? Theme.c.text-accent-soft
+                                    : row.tone == 2 ? Theme.c.text-dim
+                                    : Theme.c.text;
+                                link-color: Theme.c.accent;
+                                default-font-size: Theme.fs(row.md-kind == 1 ? 22px
                                     : row.md-kind == 2 ? 19px
                                     : row.md-kind == 3 ? 16px
-                                    : 14px;
+                                    : 14px);
                                 link-clicked(url) => { root.open-link(url); }
                             }
 
@@ -1831,13 +1860,14 @@ export component AppWindow inherits Window {
                                     spacing: 8px;
                                     Text {
                                         text: row.expanded ? "▾" : "▸";
-                                        color: #8a8a8a;
-                                        font-size: 10px;
+                                        color: Theme.c.text-soft;
+                                        font-size: Theme.fs(10px);
                                         vertical-alignment: center;
                                     }
                                     // Running tools show an indeterminate
                                     // spinner; settled ones a status glyph.
-                                    if row.tool-status == 1: VerticalLayout {
+                                    // Reduce motion: a static glyph instead.
+                                    if row.tool-status == 1 && !Theme.reduce-motion: VerticalLayout {
                                         alignment: center;
                                         Spinner {
                                             width: 12px;
@@ -1845,21 +1875,27 @@ export component AppWindow inherits Window {
                                             indeterminate: true;
                                         }
                                     }
+                                    if row.tool-status == 1 && Theme.reduce-motion: Text {
+                                        text: "◌";
+                                        color: Theme.c.text-dim;
+                                        font-size: Theme.fs(12px);
+                                        vertical-alignment: center;
+                                    }
                                     if row.tool-status != 1: Text {
                                         text: row.tool-status == 0 ? "⏸"
                                             : row.tool-status == 2 ? "✓"
                                             : row.tool-status == 4 ? "⊘"
                                             : "✗";
-                                        color: row.tool-status == 2 ? #7fd18a
-                                            : row.tool-status == 0 ? #e5c07b
-                                            : #e39ea6;
-                                        font-size: 12px;
+                                        color: row.tool-status == 2 ? Theme.c.ok
+                                            : row.tool-status == 0 ? Theme.c.warn
+                                            : Theme.c.err;
+                                        font-size: Theme.fs(12px);
                                         vertical-alignment: center;
                                     }
                                     Text {
                                         text: row.tool-name;
-                                        color: #d8d8d8;
-                                        font-size: 11px;
+                                        color: Theme.c.text;
+                                        font-size: Theme.fs(11px);
                                         font-weight: 700;
                                         vertical-alignment: center;
                                     }
@@ -1868,8 +1904,8 @@ export component AppWindow inherits Window {
                                     // preselect the line range there).
                                     if row.tool-file != "": Text {
                                         text: row.text;
-                                        color: #6fa8dc;
-                                        font-size: 11px;
+                                        color: Theme.c.accent;
+                                        font-size: Theme.fs(11px);
                                         vertical-alignment: center;
                                         TouchArea {
                                             mouse-cursor: pointer;
@@ -1885,27 +1921,27 @@ export component AppWindow inherits Window {
                                     // ("L123-456", built in Rust).
                                     if row.meta != "": Text {
                                         text: row.meta;
-                                        color: #8a8a8a;
-                                        font-size: 11px;
+                                        color: Theme.c.text-soft;
+                                        font-size: Theme.fs(11px);
                                         vertical-alignment: center;
                                     }
                                     // Edit tools: added/removed line counts.
                                     if row.tool-adds != "": Text {
                                         text: row.tool-adds;
-                                        color: #7fd18a;
-                                        font-size: 11px;
+                                        color: Theme.c.ok;
+                                        font-size: Theme.fs(11px);
                                         vertical-alignment: center;
                                     }
                                     if row.tool-dels != "": Text {
                                         text: row.tool-dels;
-                                        color: #e39ea6;
-                                        font-size: 11px;
+                                        color: Theme.c.err;
+                                        font-size: Theme.fs(11px);
                                         vertical-alignment: center;
                                     }
                                     Rectangle { horizontal-stretch: 1; }
                                     CopyButton {
                                         payload: row.detail;
-                                        height: 18px;
+                                        height: Theme.fs(18px);
                                         tip: "Copy tool call";
                                     }
                                     if row.tool-status == 0: VerticalLayout {
@@ -1931,9 +1967,9 @@ export component AppWindow inherits Window {
                             // args/result text.
                             if row.kind == 2 && row.expanded && row.tool-diff.length > 0: VerticalLayout {
                                 for dline in row.tool-diff: Rectangle {
-                                    height: 18px;
-                                    background: dline.kind == 3 ? #1e3a24
-                                        : dline.kind == 4 ? #42272b
+                                    height: Theme.fs(18px);
+                                    background: dline.kind == 3 ? Theme.c.diff-add-bg
+                                        : dline.kind == 4 ? Theme.c.diff-del-bg
                                         : transparent;
                                     HorizontalLayout {
                                         spacing: 0;
@@ -1942,19 +1978,19 @@ export component AppWindow inherits Window {
                                         if row.tool-diff-numbered: Text {
                                             width: 34px;
                                             text: dline.old-no;
-                                            color: #6e6e6e;
+                                            color: Theme.c.gutter;
                                             horizontal-alignment: right;
                                             font-family: "monospace";
-                                            font-size: 12px;
+                                            font-size: Theme.fs(12px);
                                             vertical-alignment: center;
                                         }
                                         if row.tool-diff-numbered: Text {
                                             width: 34px;
                                             text: dline.new-no;
-                                            color: #6e6e6e;
+                                            color: Theme.c.gutter;
                                             horizontal-alignment: right;
                                             font-family: "monospace";
-                                            font-size: 12px;
+                                            font-size: Theme.fs(12px);
                                             vertical-alignment: center;
                                         }
                                         if row.tool-diff-numbered: Rectangle { width: 6px; }
@@ -1962,18 +1998,18 @@ export component AppWindow inherits Window {
                                             width: 16px;
                                             text: dline.kind == 3 ? "+"
                                                 : dline.kind == 4 ? "-" : " ";
-                                            color: dline.kind == 3 ? #7fd18a
-                                                : dline.kind == 4 ? #e39ea6
-                                                : #6e6e6e;
+                                            color: dline.kind == 3 ? Theme.c.ok
+                                                : dline.kind == 4 ? Theme.c.err
+                                                : Theme.c.gutter;
                                             font-family: "monospace";
-                                            font-size: 12px;
+                                            font-size: Theme.fs(12px);
                                             vertical-alignment: center;
                                         }
                                         Text {
                                             text: dline.text;
-                                            color: dline.kind == 1 ? #9cbdde : #d4d4d4;
+                                            color: dline.kind == 1 ? Theme.c.accent-tint : Theme.c.text;
                                             font-family: "monospace";
-                                            font-size: 12px;
+                                            font-size: Theme.fs(12px);
                                             vertical-alignment: center;
                                             overflow: elide;
                                             horizontal-stretch: 1;
@@ -1985,25 +2021,25 @@ export component AppWindow inherits Window {
                                 text: row.detail;
                                 read-only: true;
                                 single-line: false;
-                                color: #a8a8a8;
-                                font-size: 12px;
+                                color: Theme.c.text-dim;
+                                font-size: Theme.fs(12px);
                                 font-family: "monospace";
                                 wrap: word-wrap;
-                                selection-background-color: #3d5a80;
+                                selection-background-color: Theme.c.selection;
                             }
 
                             // Turn status: failures only (completed turns
                             // summarize in their assistant card header).
                             if row.kind == 3: Text {
                                 text: row.text;
-                                color: #e39ea6;
-                                font-size: 11px;
+                                color: Theme.c.err;
+                                font-size: Theme.fs(11px);
                             }
 
                             // Horizontal rule separating turns.
                             if row.kind == 8: Rectangle {
                                 height: 1px;
-                                background: #33363b;
+                                background: Theme.c.rule;
                             }
 
                             // Grouped tool-run header: "Called n tools",
@@ -2012,14 +2048,14 @@ export component AppWindow inherits Window {
                                 spacing: 8px;
                                 Text {
                                     text: row.expanded ? "▾" : "▸";
-                                    color: #8a8a8a;
-                                    font-size: 10px;
+                                    color: Theme.c.text-soft;
+                                    font-size: Theme.fs(10px);
                                     vertical-alignment: center;
                                 }
                                 Text {
                                     text: row.text;
-                                    color: #b8b8b8;
-                                    font-size: 11px;
+                                    color: Theme.c.text-mid;
+                                    font-size: Theme.fs(11px);
                                     font-weight: 700;
                                     vertical-alignment: center;
                                 }
@@ -2032,10 +2068,10 @@ export component AppWindow inherits Window {
                                 text: row.text;
                                 read-only: true;
                                 single-line: false;
-                                color: #d4d4d4;
-                                font-size: 13px;
+                                color: Theme.c.text;
+                                font-size: Theme.fs(13px);
                                 wrap: word-wrap;
-                                selection-background-color: #3d5a80;
+                                selection-background-color: Theme.c.selection;
                             }
 
                             // Model thinking (reasoning stream): a header
@@ -2051,23 +2087,23 @@ export component AppWindow inherits Window {
                                     spacing: 8px;
                                     Text {
                                         text: row.expanded ? "▾" : "▸";
-                                        color: #8a8a8a;
-                                        font-size: 10px;
+                                        color: Theme.c.text-soft;
+                                        font-size: Theme.fs(10px);
                                         vertical-alignment: center;
                                     }
                                     Text {
                                         // "Thinking" while streaming,
                                         // "Thought" once complete.
                                         text: row.text;
-                                        color: #d8d8d8;
-                                        font-size: 11px;
+                                        color: Theme.c.text;
+                                        font-size: Theme.fs(11px);
                                         font-weight: 700;
                                         vertical-alignment: center;
                                     }
                                     if !row.expanded: Text {
                                         text: row.meta;
-                                        color: #9a9a9a;
-                                        font-size: 11px;
+                                        color: Theme.c.text-dim;
+                                        font-size: Theme.fs(11px);
                                         font-italic: true;
                                         vertical-alignment: center;
                                         overflow: elide;
@@ -2080,7 +2116,7 @@ export component AppWindow inherits Window {
                                         alignment: center;
                                         CopyButton {
                                             payload: row.detail;
-                                            height: 18px;
+                                            height: Theme.fs(18px);
                                             tip: "Copy thinking";
                                         }
                                     }
@@ -2094,16 +2130,26 @@ export component AppWindow inherits Window {
                                 Rectangle {
                                     width: 16px;
                                     height: 16px;
-                                    Spinner {
+                                    // Reduce motion: static glyph, no spin.
+                                    if !Theme.reduce-motion: Spinner {
                                         width: 16px;
                                         height: 16px;
                                         indeterminate: true;
                                     }
+                                    if Theme.reduce-motion: Text {
+                                        width: 16px;
+                                        height: 16px;
+                                        text: "◌";
+                                        color: Theme.c.text-dim;
+                                        font-size: Theme.fs(13px);
+                                        horizontal-alignment: center;
+                                        vertical-alignment: center;
+                                    }
                                 }
                                 Text {
                                     text: row.text;
-                                    color: #9a9a9a;
-                                    font-size: 13px;
+                                    color: Theme.c.text-dim;
+                                    font-size: Theme.fs(13px);
                                     vertical-alignment: center;
                                 }
                                 Rectangle { horizontal-stretch: 1; }
@@ -2123,22 +2169,22 @@ export component AppWindow inherits Window {
                                     spacing: 8px;
                                     Text {
                                         text: row.text;
-                                        color: row.q-done ? #d0d0d0 : #e5c07b;
-                                        font-size: 11px;
+                                        color: row.q-done ? Theme.c.text : Theme.c.warn;
+                                        font-size: Theme.fs(11px);
                                         font-weight: 700;
                                         vertical-alignment: center;
                                     }
                                     Text {
                                         text: row.meta;
-                                        color: #9a9a9a;
-                                        font-size: 11px;
+                                        color: Theme.c.text-dim;
+                                        font-size: Theme.fs(11px);
                                         vertical-alignment: center;
                                     }
                                     Rectangle { horizontal-stretch: 1; }
                                     if !row.q-done: Text {
                                         text: "Skip";
-                                        color: skip-ta.has-hover ? #b8b8b8 : #7a7a7a;
-                                        font-size: 11px;
+                                        color: skip-ta.has-hover ? Theme.c.text-mid : Theme.c.text-faint;
+                                        font-size: Theme.fs(11px);
                                         vertical-alignment: center;
                                         skip-ta := TouchArea {
                                             mouse-cursor: pointer;
@@ -2149,8 +2195,8 @@ export component AppWindow inherits Window {
                                 // Question page: prompt + options.
                                 if !row.q-review: Text {
                                     text: row.q-prompt;
-                                    color: #e8e8e8;
-                                    font-size: 13px;
+                                    color: Theme.c.text-hi;
+                                    font-size: Theme.fs(13px);
                                     font-weight: 600;
                                     wrap: word-wrap;
                                 }
@@ -2159,9 +2205,9 @@ export component AppWindow inherits Window {
                                     for opt[oi] in row.q-options: Rectangle {
                                         border-radius: 5px;
                                         border-width: 1px;
-                                        border-color: opt.selected ? #6fa8dc : #3a3f46;
-                                        background: opt.selected ? #24344a
-                                            : opt-ta.has-hover ? #2a2d31 : #202226;
+                                        border-color: opt.selected ? Theme.c.accent : Theme.c.card-border;
+                                        background: opt.selected ? Theme.c.accent-dim
+                                            : opt-ta.has-hover ? Theme.c.hover-bg : Theme.c.code-bg;
                                         height: opt-line.preferred-height + 10px;
                                         opt-ta := TouchArea {
                                             mouse-cursor: pointer;
@@ -2177,14 +2223,14 @@ export component AppWindow inherits Window {
                                                 text: row.q-multi
                                                     ? (opt.selected ? "☑" : "☐")
                                                     : (opt.selected ? "◉" : "○");
-                                                color: opt.selected ? #6fa8dc : #8a8a8a;
-                                                font-size: 13px;
+                                                color: opt.selected ? Theme.c.accent : Theme.c.text-soft;
+                                                font-size: Theme.fs(13px);
                                                 vertical-alignment: center;
                                             }
                                             Text {
                                                 text: opt.label;
-                                                color: #d4d4d4;
-                                                font-size: 13px;
+                                                color: Theme.c.text;
+                                                font-size: Theme.fs(13px);
                                                 vertical-alignment: center;
                                                 wrap: word-wrap;
                                                 horizontal-stretch: 1;
@@ -2195,9 +2241,9 @@ export component AppWindow inherits Window {
                                     Rectangle {
                                         border-radius: 5px;
                                         border-width: 1px;
-                                        border-color: row.q-other ? #6fa8dc : #3a3f46;
-                                        background: row.q-other ? #24344a
-                                            : other-ta.has-hover ? #2a2d31 : #202226;
+                                        border-color: row.q-other ? Theme.c.accent : Theme.c.card-border;
+                                        background: row.q-other ? Theme.c.accent-dim
+                                            : other-ta.has-hover ? Theme.c.hover-bg : Theme.c.code-bg;
                                         height: other-line.preferred-height + 10px;
                                         other-ta := TouchArea {
                                             mouse-cursor: pointer;
@@ -2214,14 +2260,14 @@ export component AppWindow inherits Window {
                                                 text: row.q-multi
                                                     ? (row.q-other ? "☑" : "☐")
                                                     : (row.q-other ? "◉" : "○");
-                                                color: row.q-other ? #6fa8dc : #8a8a8a;
-                                                font-size: 13px;
+                                                color: row.q-other ? Theme.c.accent : Theme.c.text-soft;
+                                                font-size: Theme.fs(13px);
                                                 vertical-alignment: center;
                                             }
                                             Text {
                                                 text: "Other";
-                                                color: #d4d4d4;
-                                                font-size: 13px;
+                                                color: Theme.c.text;
+                                                font-size: Theme.fs(13px);
                                                 font-italic: true;
                                                 vertical-alignment: center;
                                                 horizontal-stretch: 1;
@@ -2231,8 +2277,8 @@ export component AppWindow inherits Window {
                                     if row.q-other: Rectangle {
                                         border-radius: 5px;
                                         border-width: 1px;
-                                        border-color: #3a3f46;
-                                        background: #17191c;
+                                        border-color: Theme.c.card-border;
+                                        background: Theme.c.inset-bg;
                                         height: other-input.preferred-height + 12px;
                                         other-input := TextInput {
                                             x: 10px;
@@ -2241,9 +2287,9 @@ export component AppWindow inherits Window {
                                             text: row.q-other-text;
                                             single-line: false;
                                             wrap: word-wrap;
-                                            color: #d4d4d4;
-                                            font-size: 13px;
-                                            selection-background-color: #3d5a80;
+                                            color: Theme.c.text;
+                                            font-size: Theme.fs(13px);
+                                            selection-background-color: Theme.c.selection;
                                             edited => {
                                                 root.question-other-edited(idx, self.text);
                                             }
@@ -2257,21 +2303,21 @@ export component AppWindow inherits Window {
                                         spacing: 1px;
                                         Text {
                                             text: pair.prompt;
-                                            color: #9a9a9a;
-                                            font-size: 12px;
+                                            color: Theme.c.text-dim;
+                                            font-size: Theme.fs(12px);
                                             wrap: word-wrap;
                                         }
                                         Text {
                                             text: pair.answer;
-                                            color: #d4d4d4;
-                                            font-size: 13px;
+                                            color: Theme.c.text;
+                                            font-size: Theme.fs(13px);
                                             wrap: word-wrap;
                                         }
                                     }
                                     if row.q-done && row.q-summary.length == 0: Text {
                                         text: "The questions were skipped.";
-                                        color: #9a9a9a;
-                                        font-size: 12px;
+                                        color: Theme.c.text-dim;
+                                        font-size: Theme.fs(12px);
                                         font-italic: true;
                                     }
                                 }
@@ -2315,7 +2361,7 @@ export component AppWindow inherits Window {
                     y: 0;
                     width: 14px;
                     height: parent.height;
-                    background: #141414;
+                    background: Theme.c.win-bg;
 
                     function frac() -> float {
                         return self.scrollable
@@ -2343,9 +2389,9 @@ export component AppWindow inherits Window {
                             + (parent.track - parent.thumb-h) * parent.frac();
                         height: parent.thumb-h;
                         border-radius: 3px;
-                        background: sb-ta.pressed ? #6a6f78
-                            : sb-ta.has-hover ? #565b63
-                            : #3a3e44;
+                        background: sb-ta.pressed ? Theme.c.scroll-thumb-active
+                            : sb-ta.has-hover ? Theme.c.scroll-thumb-hover
+                            : Theme.c.scroll-thumb;
                     }
                     sb-ta := TouchArea {
                         property <length> grab;
@@ -2402,17 +2448,17 @@ export component AppWindow inherits Window {
                             y: -self.height - 6px;
                             width: min(parent.width, 480px);
                             height: slash-list.preferred-height;
-                            background: #262626;
+                            background: Theme.c.popup-bg;
                             border-radius: 8px;
                             border-width: 1px;
-                            border-color: #3a3a3a;
+                            border-color: Theme.c.border;
                             slash-list := VerticalLayout {
                                 padding: 6px;
                                 for cmd[rank] in root.slash-matches: Rectangle {
-                                    height: 26px;
+                                    height: Theme.fs(26px);
                                     border-radius: 5px;
-                                    background: rank == 0 ? #2b3d55
-                                        : slash-ta.has-hover ? #303030 : transparent;
+                                    background: rank == 0 ? Theme.c.accent-bg
+                                        : slash-ta.has-hover ? Theme.c.hover-strong : transparent;
                                     slash-ta := TouchArea {
                                         clicked => {
                                             composer.apply-completion(
@@ -2425,14 +2471,14 @@ export component AppWindow inherits Window {
                                         spacing: 10px;
                                         Text {
                                             text: "/" + root.slash-commands[cmd];
-                                            color: #e8e8e8;
-                                            font-size: 12px;
+                                            color: Theme.c.text-hi;
+                                            font-size: Theme.fs(12px);
                                             vertical-alignment: center;
                                         }
                                         Text {
                                             text: root.slash-details[cmd];
-                                            color: #8a8a8a;
-                                            font-size: 11px;
+                                            color: Theme.c.text-soft;
+                                            font-size: Theme.fs(11px);
                                             vertical-alignment: center;
                                             overflow: elide;
                                             horizontal-stretch: 1;
@@ -2463,7 +2509,7 @@ export component AppWindow inherits Window {
                     vertical-stretch: 0;
                     VerticalLayout {
                         spacing: 2px;
-                        Text { text: "Mode"; color: #7a7a7a; font-size: 10px; }
+                        Text { text: "Mode"; color: Theme.c.text-faint; font-size: Theme.fs(10px); }
                         DropUpPicker {
                             width: 130px;
                             options: root.modes;
@@ -2475,7 +2521,7 @@ export component AppWindow inherits Window {
                     }
                     VerticalLayout {
                         spacing: 2px;
-                        Text { text: "Model"; color: #7a7a7a; font-size: 10px; }
+                        Text { text: "Model"; color: Theme.c.text-faint; font-size: Theme.fs(10px); }
                         SearchPicker {
                             width: 210px;
                             options: root.models;
@@ -2489,7 +2535,7 @@ export component AppWindow inherits Window {
                     }
                     if root.thinking-options.length > 0: VerticalLayout {
                         spacing: 2px;
-                        Text { text: "Thinking"; color: #7a7a7a; font-size: 10px; }
+                        Text { text: "Thinking"; color: Theme.c.text-faint; font-size: Theme.fs(10px); }
                         DropUpPicker {
                             width: 110px;
                             options: root.thinking-options;
@@ -2501,7 +2547,7 @@ export component AppWindow inherits Window {
                     }
                     if root.context-options.length > 0: VerticalLayout {
                         spacing: 2px;
-                        Text { text: "Context"; color: #7a7a7a; font-size: 10px; }
+                        Text { text: "Context"; color: Theme.c.text-faint; font-size: Theme.fs(10px); }
                         DropUpPicker {
                             width: 90px;
                             options: root.context-options;
@@ -2513,14 +2559,14 @@ export component AppWindow inherits Window {
                     }
                     if root.fast-visible: VerticalLayout {
                         spacing: 2px;
-                        Text { text: "Fast"; color: #7a7a7a; font-size: 10px; }
+                        Text { text: "Fast"; color: Theme.c.text-faint; font-size: Theme.fs(10px); }
                         Rectangle {
                             width: 44px;
-                            height: 30px;
-                            background: root.fast-checked ? #2b3d55 : #222222;
+                            height: Theme.fs(30px);
+                            background: root.fast-checked ? Theme.c.accent-bg : Theme.c.control-bg;
                             border-radius: 6px;
                             border-width: 1px;
-                            border-color: root.fast-checked ? #4a6a97 : #3a3a3a;
+                            border-color: root.fast-checked ? Theme.c.primary-border : Theme.c.border;
                             TouchArea {
                                 enabled: root.composer-enabled;
                                 clicked => {
@@ -2530,8 +2576,8 @@ export component AppWindow inherits Window {
                             }
                             Text {
                                 text: root.fast-checked ? "On" : "Off";
-                                color: root.fast-checked ? #dbe6f5 : #8a8a8a;
-                                font-size: 12px;
+                                color: root.fast-checked ? Theme.c.text-accent-soft : Theme.c.text-soft;
+                                font-size: Theme.fs(12px);
                                 horizontal-alignment: center;
                                 vertical-alignment: center;
                             }
@@ -2540,7 +2586,7 @@ export component AppWindow inherits Window {
                     Rectangle { horizontal-stretch: 1; }
                     VerticalLayout {
                         spacing: 2px;
-                        Text { text: " "; font-size: 10px; }
+                        Text { text: " "; font-size: Theme.fs(10px); }
                         Button {
                             text: "Send";
                             primary: true;
@@ -2554,17 +2600,20 @@ export component AppWindow inherits Window {
                     // Context usage dial; indeterminate while compacting.
                     VerticalLayout {
                         spacing: 2px;
-                        Text { text: " "; font-size: 10px; }
+                        Text { text: " "; font-size: Theme.fs(10px); }
                     dial := Rectangle {
                         width: 30px;
                         height: 30px;
+                        // Reduce motion: freeze the compacting animation at a
+                        // full ring (the tooltip still says "compacting…").
                         Spinner {
                             width: 26px;
                             height: 26px;
                             x: 2px;
                             y: 2px;
-                            progress: root.context-fill;
-                            indeterminate: root.context-compacting;
+                            progress: root.context-compacting && Theme.reduce-motion
+                                ? 1.0 : root.context-fill;
+                            indeterminate: root.context-compacting && !Theme.reduce-motion;
                         }
                         dial-ta := TouchArea { }
                         if dial-ta.has-hover: Rectangle {
@@ -2572,10 +2621,10 @@ export component AppWindow inherits Window {
                             y: -self.height - 6px;
                             width: min(tooltip-text.preferred-width + 16px, 340px);
                             height: tooltip-text.preferred-height + 12px;
-                            background: #262626;
+                            background: Theme.c.popup-bg;
                             border-radius: 6px;
                             border-width: 1px;
-                            border-color: #3a3a3a;
+                            border-color: Theme.c.border;
                             tooltip-text := Text {
                                 x: 8px;
                                 y: 6px;
@@ -2583,8 +2632,8 @@ export component AppWindow inherits Window {
                                 text: root.context-compacting
                                     ? "compacting context…\n" + root.context-tooltip
                                     : root.context-tooltip;
-                                color: #d8d8d8;
-                                font-size: 11px;
+                                color: Theme.c.text;
+                                font-size: Theme.fs(11px);
                                 wrap: word-wrap;
                             }
                         }
@@ -2592,8 +2641,8 @@ export component AppWindow inherits Window {
                     }
                     Text {
                         text: root.usage-text;
-                        color: #8a8a8a;
-                        font-size: 11px;
+                        color: Theme.c.text-soft;
+                        font-size: Theme.fs(11px);
                         vertical-alignment: center;
                         max-width: 190px;
                         overflow: elide;
@@ -2638,7 +2687,7 @@ export component AppWindow inherits Window {
         // ---------------- right: inspection ----------------
         Rectangle {
             width: root.right-width;
-            background: #181818;
+            background: Theme.c.panel-bg;
 
             TabWidget {
                 current-index <=> root.right-tab;
@@ -2681,13 +2730,25 @@ export component AppWindow inherits Window {
                         }
                         if root.pr-status != "": Text {
                             text: root.pr-status;
-                            color: #9cbdde;
-                            font-size: 12px;
+                            color: Theme.c.accent-tint;
+                            font-size: Theme.fs(12px);
                             wrap: word-wrap;
                         }
                         DiffView {
                             vertical-stretch: 1;
                             rows: root.diff-rows;
+                            background: Theme.c.surface;
+                            code-font-size: Theme.fs(13px);
+                            file-header-bg: Theme.c.hover-bg;
+                            file-header-fg: Theme.c.text-hi;
+                            hunk-bg: Theme.c.accent-dim;
+                            hunk-fg: Theme.c.accent-tint;
+                            add-bg: Theme.c.diff-add-bg;
+                            add-fg: Theme.c.ok;
+                            del-bg: Theme.c.diff-del-bg;
+                            del-fg: Theme.c.err;
+                            gutter-fg: Theme.c.gutter;
+                            text-fg: Theme.c.text;
                             file-toggled(i) => { root.diff-file-toggled(i); }
                         }
                     }
@@ -2703,7 +2764,7 @@ export component AppWindow inherits Window {
                         // indented underneath (IDE-style explorer).
                         if root.files-drawer-open: Rectangle {
                             width: 210px;
-                            background: #1b1c1f;
+                            background: Theme.c.sidebar-bg;
                             border-radius: 6px;
                             ScrollKeys {
                                 target-y <=> file-tree.viewport-y;
@@ -2711,8 +2772,8 @@ export component AppWindow inherits Window {
                                 total: file-tree.viewport-height;
                             file-tree := ListView {
                                 for entry[idx] in root.file-entries: Rectangle {
-                                    height: 22px;
-                                    background: entry-ta.has-hover ? #26282c : transparent;
+                                    height: Theme.fs(22px);
+                                    background: entry-ta.has-hover ? Theme.c.popup-bg : transparent;
                                     border-radius: 4px;
                                     entry-ta := TouchArea {
                                         clicked => { root.file-activated(idx); }
@@ -2727,8 +2788,8 @@ export component AppWindow inherits Window {
                                             width: 12px;
                                             text: !entry.is-dir ? ""
                                                 : entry.expanded ? "▾" : "▸";
-                                            color: #8a8a8a;
-                                            font-size: 11px;
+                                            color: Theme.c.text-soft;
+                                            font-size: Theme.fs(11px);
                                             vertical-alignment: center;
                                             horizontal-alignment: center;
                                         }
@@ -2736,8 +2797,8 @@ export component AppWindow inherits Window {
                                             text: (entry.is-dir
                                                 ? (entry.expanded ? "📂 " : "📁 ")
                                                 : "📄 ") + entry.name;
-                                            color: #d0d0d0;
-                                            font-size: 12px;
+                                            color: Theme.c.text;
+                                            font-size: Theme.fs(12px);
                                             vertical-alignment: center;
                                             overflow: elide;
                                             horizontal-stretch: 1;
@@ -2759,8 +2820,8 @@ export component AppWindow inherits Window {
                                 alignment: center;
                                 IconButton {
                                     icon: "▤";
-                                    icon-size: 13px;
-                                    icon-color: root.files-drawer-open ? #6fa8dc : #8a8a8a;
+                                    icon-size: Theme.fs(13px);
+                                    icon-color: root.files-drawer-open ? Theme.c.accent : Theme.c.text-soft;
                                     tip: root.files-drawer-open
                                         ? "Hide file list" : "Show file list";
                                     clicked => {
@@ -2770,8 +2831,8 @@ export component AppWindow inherits Window {
                             }
                             Text {
                                 text: root.open-file-name;
-                                color: #9a9a9a;
-                                font-size: 12px;
+                                color: Theme.c.text-dim;
+                                font-size: Theme.fs(12px);
                                 vertical-alignment: center;
                                 overflow: elide;
                                 horizontal-stretch: 1;
@@ -2780,7 +2841,7 @@ export component AppWindow inherits Window {
                                 alignment: center;
                                 IconButton {
                                     icon: "↗";
-                                    icon-size: 13px;
+                                    icon-size: Theme.fs(13px);
                                     tip: "Open in editor";
                                     clicked => {
                                         root.file-opened-externally(root.open-file-name);
@@ -2791,8 +2852,8 @@ export component AppWindow inherits Window {
                                 alignment: center;
                                 IconButton {
                                     icon: "👁";
-                                    icon-size: 13px;
-                                    icon-color: root.file-preview ? #6fa8dc : #8a8a8a;
+                                    icon-size: Theme.fs(13px);
+                                    icon-color: root.file-preview ? Theme.c.accent : Theme.c.text-soft;
                                     tip: root.file-preview
                                         ? "Show source" : "Preview markdown";
                                     clicked => {
@@ -2810,6 +2871,11 @@ export component AppWindow inherits Window {
                             vertical-stretch: 1;
                             lines: root.file-lines;
                             line-numbers: root.file-numbers;
+                            background: Theme.c.surface;
+                            code-font-size: Theme.fs(13px);
+                            foreground: Theme.c.code-fg;
+                            gutter-color: Theme.c.gutter;
+                            selection-color: Theme.c.selection.with-alpha(0.35);
                             select-from: root.file-sel-from;
                             select-to: root.file-sel-to;
                             select-seq: root.file-sel-seq;
@@ -2830,10 +2896,10 @@ export component AppWindow inherits Window {
                                     ? 10px + row.md-indent * 18px : 0px;
                                 padding-right: 6px;
                                 if row.md-kind == 5: Rectangle {
-                                    background: #1f2226;
+                                    background: Theme.c.code-bg;
                                     border-radius: 6px;
                                     border-width: 1px;
-                                    border-color: #35393f;
+                                    border-color: Theme.c.card-border;
                                     VerticalLayout {
                                         padding: 8px;
                                         spacing: 4px;
@@ -2842,8 +2908,8 @@ export component AppWindow inherits Window {
                                             Text {
                                                 text: row.md-lang == ""
                                                     ? "code" : row.md-lang;
-                                                color: #6f6f6f;
-                                                font-size: 11px;
+                                                color: Theme.c.text-disabled;
+                                                font-size: Theme.fs(11px);
                                                 vertical-alignment: center;
                                                 horizontal-stretch: 1;
                                             }
@@ -2854,16 +2920,16 @@ export component AppWindow inherits Window {
                                         }
                                         VerticalLayout {
                                             for line in row.code-lines: Rectangle {
-                                                height: 19px;
+                                                height: Theme.fs(19px);
                                                 clip: true;
                                                 HorizontalLayout {
                                                     alignment: start;
                                                     for seg in line: Text {
                                                         text: seg.text;
                                                         color: seg.color == #000000
-                                                            ? #d8d8c8 : seg.color;
+                                                            ? Theme.c.code-fg : seg.color;
                                                         font-family: "monospace";
-                                                        font-size: 13px;
+                                                        font-size: Theme.fs(13px);
                                                         vertical-alignment: center;
                                                     }
                                                 }
@@ -2873,12 +2939,12 @@ export component AppWindow inherits Window {
                                 }
                                 if row.md-kind != 5: StyledText {
                                     text: row.styled;
-                                    default-color: #d4d4d4;
-                                    link-color: #6fa8dc;
-                                    default-font-size: row.md-kind == 1 ? 22px
+                                    default-color: Theme.c.text;
+                                    link-color: Theme.c.accent;
+                                    default-font-size: Theme.fs(row.md-kind == 1 ? 22px
                                         : row.md-kind == 2 ? 19px
                                         : row.md-kind == 3 ? 16px
-                                        : 14px;
+                                        : 14px);
                                     link-clicked(url) => { root.open-link(url); }
                                 }
                             }
@@ -2904,6 +2970,13 @@ export component AppWindow inherits Window {
         modes: root.settings-modes;
         settings-status: root.settings-status;
         preset-index <=> root.settings-preset-index;
+        theme-names: root.appearance-theme-names;
+        theme-index <=> root.appearance-theme-index;
+        font-size-names: root.appearance-font-size-names;
+        font-size-index <=> root.appearance-font-size-index;
+        font-names: root.appearance-font-names;
+        font-index <=> root.appearance-font-index;
+        reduce-motion <=> root.appearance-reduce-motion;
         provider-saved(id, kind, url, key) => {
             root.provider-saved(id, kind, url, key);
         }
@@ -2912,6 +2985,10 @@ export component AppWindow inherits Window {
         default-model-picked(i) => { root.default-model-picked(i); }
         refresh-settings => { root.refresh-settings(); }
         cli-install(id) => { root.cli-install(id); }
+        theme-picked(i) => { root.appearance-theme-picked(i); }
+        font-size-picked(i) => { root.appearance-font-size-picked(i); }
+        font-picked(i) => { root.appearance-font-picked(i); }
+        reduce-motion-toggled(on) => { root.appearance-reduce-motion-toggled(on); }
         close => { root.close-settings(); }
     }
 
@@ -2919,7 +2996,7 @@ export component AppWindow inherits Window {
     if root.rename-row >= 0 || root.delete-row >= 0: Rectangle {
         width: 100%;
         height: 100%;
-        background: #000000aa;
+        background: Theme.c.scrim;
         TouchArea { } // swallow clicks behind the modal
 
         Rectangle {
@@ -2927,10 +3004,10 @@ export component AppWindow inherits Window {
             height: modal-layout.preferred-height + 32px;
             x: (parent.width - self.width) / 2;
             y: (parent.height - self.height) / 2;
-            background: #232323;
+            background: Theme.c.raised-bg;
             border-radius: 8px;
             border-width: 1px;
-            border-color: #3a3a3a;
+            border-color: Theme.c.border;
 
             modal-layout := VerticalLayout {
                 padding: 16px;
@@ -2940,8 +3017,8 @@ export component AppWindow inherits Window {
                     text: root.rename-row >= 0
                         ? "Rename session"
                         : "Delete session \"" + root.modal-title + "\"?";
-                    color: #e8e8e8;
-                    font-size: 15px;
+                    color: Theme.c.text-hi;
+                    font-size: Theme.fs(15px);
                     font-weight: 700;
                     wrap: word-wrap;
                 }
@@ -2959,8 +3036,8 @@ export component AppWindow inherits Window {
 
                 if root.delete-row >= 0: Text {
                     text: "This removes the session's worktree, branch history in trouve, and its event log. The git branch itself is kept.";
-                    color: #9a9a9a;
-                    font-size: 12px;
+                    color: Theme.c.text-dim;
+                    font-size: Theme.fs(12px);
                     wrap: word-wrap;
                 }
 
@@ -2999,7 +3076,7 @@ export component AppWindow inherits Window {
     if root.quit-dialog: Rectangle {
         width: 100%;
         height: 100%;
-        background: #000000aa;
+        background: Theme.c.scrim;
         TouchArea { } // swallow clicks behind the modal
 
         Rectangle {
@@ -3007,10 +3084,10 @@ export component AppWindow inherits Window {
             height: quit-layout.preferred-height + 32px;
             x: (parent.width - self.width) / 2;
             y: (parent.height - self.height) / 2;
-            background: #232323;
+            background: Theme.c.raised-bg;
             border-radius: 8px;
             border-width: 1px;
-            border-color: #3a3a3a;
+            border-color: Theme.c.border;
 
             quit-layout := VerticalLayout {
                 padding: 16px;
@@ -3020,15 +3097,15 @@ export component AppWindow inherits Window {
                     text: root.agents-running == 1
                         ? "An agent is still running"
                         : root.agents-running + " agents are still running";
-                    color: #e8e8e8;
-                    font-size: 15px;
+                    color: Theme.c.text-hi;
+                    font-size: Theme.fs(15px);
                     font-weight: 700;
                     wrap: word-wrap;
                 }
                 Text {
                     text: "Quitting now stops the running work mid-turn. You can also let the agents finish and quit automatically.";
-                    color: #9a9a9a;
-                    font-size: 12px;
+                    color: Theme.c.text-dim;
+                    font-size: Theme.fs(12px);
                     wrap: word-wrap;
                 }
 
@@ -3069,16 +3146,16 @@ export component AppWindow inherits Window {
         y: clamp(Tip.tip-y, 4px, root.height - self.height - 4px);
         width: tip-label.preferred-width + 12px;
         height: tip-label.preferred-height + 8px;
-        background: #2e2e2e;
+        background: Theme.c.hover-bg;
         border-radius: 4px;
         border-width: 1px;
-        border-color: #4a4a4a;
+        border-color: Theme.c.border-strong;
         tip-label := Text {
             x: 6px;
             y: 4px;
             text: Tip.text;
-            color: #d8d8d8;
-            font-size: 11px;
+            color: Theme.c.text;
+            font-size: Theme.fs(11px);
         }
     }
 }

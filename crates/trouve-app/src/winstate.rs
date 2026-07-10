@@ -67,6 +67,50 @@ pub struct Resume {
     pub thread_scroll: HashMap<String, f32>,
 }
 
+/// Appearance preferences: theme id, base font size/family, reduce motion.
+/// Client-side like the window geometry — themes restyle this frontend, not
+/// the protocol.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Appearance {
+    #[serde(default = "default_theme")]
+    pub theme: String,
+    /// Base (body) size in px; the design's 13px scales everything else.
+    #[serde(default = "default_font_size")]
+    pub font_size: u32,
+    /// Empty = the system default font.
+    #[serde(default)]
+    pub font_family: String,
+    #[serde(default)]
+    pub reduce_motion: bool,
+}
+
+fn default_theme() -> String {
+    "dark".into()
+}
+
+fn default_font_size() -> u32 {
+    13
+}
+
+impl Default for Appearance {
+    fn default() -> Self {
+        Self {
+            theme: default_theme(),
+            font_size: default_font_size(),
+            font_family: String::new(),
+            reduce_motion: false,
+        }
+    }
+}
+
+impl Appearance {
+    /// Clamp a hand-edited or corrupt file back to something renderable.
+    fn sanitized(mut self) -> Self {
+        self.font_size = self.font_size.clamp(9, 24);
+        self
+    }
+}
+
 fn config_path(file: &str) -> Option<PathBuf> {
     dirs::config_dir().map(|d| d.join("trouve").join(file))
 }
@@ -89,6 +133,18 @@ pub fn load() -> Option<WindowState> {
 /// Best-effort persist; a failed write only costs restore-on-next-launch.
 pub fn save(state: &WindowState) {
     write_json(state_path(), state);
+}
+
+pub fn load_appearance() -> Appearance {
+    let read = || {
+        let text = std::fs::read_to_string(config_path("appearance.json")?).ok()?;
+        serde_json::from_str::<Appearance>(&text).ok()
+    };
+    read().unwrap_or_default().sanitized()
+}
+
+pub fn save_appearance(appearance: &Appearance) {
+    write_json(config_path("appearance.json"), appearance);
 }
 
 pub fn load_resume() -> Resume {

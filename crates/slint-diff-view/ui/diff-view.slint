@@ -24,6 +24,17 @@ export component DiffView inherits Rectangle {
     in property <length> code-font-size: 13px;
     in property <length> line-height: code-font-size * 1.5;
     in property <string> font-family: "monospace";
+    // Themable colors (defaults match the built-in dark look).
+    in property <color> file-header-bg: #2d2d2d;
+    in property <color> file-header-fg: #e8e8e8;
+    in property <color> hunk-bg: #253547;
+    in property <color> hunk-fg: #9cbdde;
+    in property <color> add-bg: #1e3a24;
+    in property <color> add-fg: #7fd18a;
+    in property <color> del-bg: #42272b;
+    in property <color> del-fg: #e39ea6;
+    in property <color> gutter-fg: #6e6e6e;
+    in property <color> text-fg: #d4d4d4;
 
     callback file-toggled(int);
 
@@ -71,10 +82,10 @@ export component DiffView inherits Rectangle {
     list := ListView {
         for row[idx] in root.rows: Rectangle {
             height: root.line-height;
-            background: row.kind == 0 ? #2d2d2d
-                : row.kind == 1 ? #253547
-                : row.kind == 3 ? #1e3a24
-                : row.kind == 4 ? #42272b
+            background: row.kind == 0 ? root.file-header-bg
+                : row.kind == 1 ? root.hunk-bg
+                : row.kind == 3 ? root.add-bg
+                : row.kind == 4 ? root.del-bg
                 : transparent;
 
             if row.kind == 0: TouchArea {
@@ -85,7 +96,7 @@ export component DiffView inherits Rectangle {
                 spacing: 0;
                 if row.kind == 0: Text {
                     text: (row.collapsed ? "▸ " : "▾ ") + row.text;
-                    color: #e8e8e8;
+                    color: root.file-header-fg;
                     font-family: root.font-family;
                     font-size: root.code-font-size;
                     font-weight: 700;
@@ -94,7 +105,7 @@ export component DiffView inherits Rectangle {
                 if row.kind != 0: Text {
                     width: 44px;
                     text: row.old-no;
-                    color: #6e6e6e;
+                    color: root.gutter-fg;
                     horizontal-alignment: right;
                     vertical-alignment: center;
                     font-family: root.font-family;
@@ -103,7 +114,7 @@ export component DiffView inherits Rectangle {
                 if row.kind != 0: Text {
                     width: 44px;
                     text: row.new-no;
-                    color: #6e6e6e;
+                    color: root.gutter-fg;
                     horizontal-alignment: right;
                     vertical-alignment: center;
                     font-family: root.font-family;
@@ -112,7 +123,8 @@ export component DiffView inherits Rectangle {
                 if row.kind != 0: Text {
                     width: 20px;
                     text: row.kind == 3 ? "+" : row.kind == 4 ? "-" : " ";
-                    color: row.kind == 3 ? #7fd18a : row.kind == 4 ? #e39ea6 : #6e6e6e;
+                    color: row.kind == 3 ? root.add-fg
+                        : row.kind == 4 ? root.del-fg : root.gutter-fg;
                     horizontal-alignment: center;
                     vertical-alignment: center;
                     font-family: root.font-family;
@@ -120,7 +132,7 @@ export component DiffView inherits Rectangle {
                 }
                 if row.kind != 0: Text {
                     text: row.text;
-                    color: row.kind == 1 ? #9cbdde : #d4d4d4;
+                    color: row.kind == 1 ? root.hunk-fg : root.text-fg;
                     vertical-alignment: center;
                     font-family: root.font-family;
                     font-size: root.code-font-size;

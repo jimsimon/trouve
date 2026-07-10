@@ -11,6 +11,7 @@ import {
     AboutSlint, Button, ComboBox, LineEdit, ListView, ScrollView
 } from "std-widgets.slint";
 import { ScrollKeys } from "scroll-keys.slint";
+import { Theme } from "theme.slint";
 
 export struct ProviderItem {
     id: string,
@@ -50,7 +51,7 @@ export struct KnownProviderItem {
 }
 
 export component SettingsScreen inherits Rectangle {
-    background: #141414;
+    background: Theme.c.win-bg;
 
     in property <[ProviderItem]> providers;
     in property <[CliItem]> clis;
@@ -82,6 +83,16 @@ export component SettingsScreen inherits Rectangle {
             ? root.known-providers[root.preset-index].auth
             : "api-key";
 
+    // Appearance: built-in theme names, font sizes, and font families come
+    // from Rust; the pickers report index selections back.
+    in property <[string]> theme-names;
+    in-out property <int> theme-index: 0;
+    in property <[string]> font-size-names;
+    in-out property <int> font-size-index: 0;
+    in property <[string]> font-names;
+    in-out property <int> font-index: 0;
+    in-out property <bool> reduce-motion: false;
+
     callback provider-saved(/* id */ string, /* kind */ string,
                             /* base-url */ string, /* api-key */ string);
     callback provider-deleted(string);
@@ -89,25 +100,30 @@ export component SettingsScreen inherits Rectangle {
     callback default-model-picked(int);
     callback refresh-settings();
     callback cli-install(/* id */ string);
+    callback theme-picked(int);
+    callback font-size-picked(int);
+    callback font-picked(int);
+    callback reduce-motion-toggled(bool);
     callback close();
 
-    // Side-nav selection: 0 providers, 1 models, 2 modes, 3 about.
+    // Side-nav selection: 0 providers, 1 models, 2 modes, 3 appearance,
+    // 4 about.
     property <int> section: 0;
-    property <[string]> section-names: ["Providers", "Models", "Modes", "About"];
+    property <[string]> section-names: ["Providers", "Models", "Modes", "Appearance", "About"];
 
     VerticalLayout {
         // Header: title + a way back to wherever the user came from.
         Rectangle {
-            height: 44px;
-            background: #181818;
+            height: Theme.fs(44px);
+            background: Theme.c.panel-bg;
             HorizontalLayout {
                 padding-left: 16px;
                 padding-right: 10px;
                 spacing: 8px;
                 Text {
                     text: "Settings";
-                    color: #e8e8e8;
-                    font-size: 16px;
+                    color: Theme.c.text-hi;
+                    font-size: Theme.fs(16px);
                     font-weight: 700;
                     vertical-alignment: center;
                     horizontal-stretch: 1;
@@ -136,10 +152,10 @@ export component SettingsScreen inherits Rectangle {
                 spacing: 2px;
                 alignment: start;
                 for name[i] in root.section-names: Rectangle {
-                    height: 32px;
+                    height: Theme.fs(32px);
                     border-radius: 6px;
-                    background: root.section == i ? #2b3d55
-                        : section-ta.has-hover ? #242424 : transparent;
+                    background: root.section == i ? Theme.c.accent-bg
+                        : section-ta.has-hover ? Theme.c.raised-bg : transparent;
                     section-ta := TouchArea {
                         clicked => { root.section = i; }
                     }
@@ -148,8 +164,10 @@ export component SettingsScreen inherits Rectangle {
                         width: parent.width - 24px;
                         height: 100%;
                         text: name;
-                        color: root.section == i ? #e8eef8 : #b8b8b8;
-                        font-size: 13px;
+                        // accent-bg pairs with the normal text ramp (not
+                        // on-accent, which is tuned for primary-bg).
+                        color: root.section == i ? Theme.c.text-hi : Theme.c.text-mid;
+                        font-size: Theme.fs(13px);
                         vertical-alignment: center;
                         overflow: elide;
                     }
@@ -178,8 +196,8 @@ export component SettingsScreen inherits Rectangle {
                             HorizontalLayout {
                                 Text {
                                     text: "Providers";
-                                    color: #e8e8e8;
-                                    font-size: 16px;
+                                    color: Theme.c.text-hi;
+                                    font-size: Theme.fs(16px);
                                     font-weight: 700;
                                     vertical-alignment: center;
                                     horizontal-stretch: 1;
@@ -191,20 +209,20 @@ export component SettingsScreen inherits Rectangle {
                             }
 
                             Rectangle {
-                                background: #1e1e1e;
+                                background: Theme.c.surface;
                                 border-radius: 6px;
                                 height: 150px;
                                 ListView {
                                     for provider in root.providers: Rectangle {
-                                        height: 34px;
+                                        height: Theme.fs(34px);
                                         HorizontalLayout {
                                             padding-left: 10px;
                                             padding-right: 6px;
                                             spacing: 8px;
                                             Text {
                                                 text: provider.id;
-                                                color: #e0e0e0;
-                                                font-size: 13px;
+                                                color: Theme.c.text-hi;
+                                                font-size: Theme.fs(13px);
                                                 font-weight: 700;
                                                 vertical-alignment: center;
                                                 width: 110px;
@@ -213,16 +231,16 @@ export component SettingsScreen inherits Rectangle {
                                             Text {
                                                 text: provider.kind
                                                     + (provider.base-url != "" ? "  ·  " + provider.base-url : "");
-                                                color: #9a9a9a;
-                                                font-size: 12px;
+                                                color: Theme.c.text-dim;
+                                                font-size: Theme.fs(12px);
                                                 vertical-alignment: center;
                                                 overflow: elide;
                                                 horizontal-stretch: 1;
                                             }
                                             if provider.experimental: Text {
                                                 text: "⚠ experimental";
-                                                color: #e08787;
-                                                font-size: 11px;
+                                                color: Theme.c.err;
+                                                font-size: Theme.fs(11px);
                                                 vertical-alignment: center;
                                             }
                                             Text {
@@ -231,8 +249,8 @@ export component SettingsScreen inherits Rectangle {
                                                     : (provider.auth == "cli"
                                                         ? (provider.has-credentials ? "✓ CLI ready" : "CLI not set up")
                                                         : (provider.has-credentials ? "✓ credentials" : "no credentials"));
-                                                color: provider.has-credentials ? #7fd18a : #e5c07b;
-                                                font-size: 11px;
+                                                color: provider.has-credentials ? Theme.c.ok : Theme.c.warn;
+                                                font-size: Theme.fs(11px);
                                                 vertical-alignment: center;
                                             }
                                             if provider.auth == "oauth" || provider.auth == "cli": Button {
@@ -263,8 +281,8 @@ export component SettingsScreen inherits Rectangle {
                             // Provider add/edit form.
                             Text {
                                 text: "Add or edit a provider";
-                                color: #c8c8c8;
-                                font-size: 13px;
+                                color: Theme.c.text-mid;
+                                font-size: Theme.fs(13px);
                                 font-weight: 700;
                             }
                             // Provider picker: a known preset prefills (and
@@ -347,45 +365,45 @@ export component SettingsScreen inherits Rectangle {
                             }
                             if root.form-hint != "": Text {
                                 text: root.form-hint;
-                                color: root.form-warning ? #e08787 : #8fae8f;
-                                font-size: 12px;
+                                color: root.form-warning ? Theme.c.err : Theme.c.ok-dim;
+                                font-size: Theme.fs(12px);
                                 wrap: word-wrap;
                             }
                             if root.settings-status != "": Text {
                                 text: root.settings-status;
-                                color: #9cbdde;
-                                font-size: 12px;
+                                color: Theme.c.accent-tint;
+                                font-size: Theme.fs(12px);
                                 wrap: word-wrap;
                             }
 
                             // ---------------- vendor CLIs ----------------
                             Text {
                                 text: "Vendor CLIs";
-                                color: #e8e8e8;
-                                font-size: 16px;
+                                color: Theme.c.text-hi;
+                                font-size: Theme.fs(16px);
                                 font-weight: 700;
                             }
                             Text {
                                 text: "Agent backends (Cursor, Claude Code, Codex) run through the vendor's CLI. trouve can download and update these directly — managed installs live in trouve's data directory and take precedence over system packages.";
-                                color: #8a8a8a;
-                                font-size: 11px;
+                                color: Theme.c.text-soft;
+                                font-size: Theme.fs(11px);
                                 wrap: word-wrap;
                             }
                             Rectangle {
-                                background: #1e1e1e;
+                                background: Theme.c.surface;
                                 border-radius: 6px;
                                 height: 118px;
                                 ListView {
                                     for cli in root.clis: Rectangle {
-                                        height: 38px;
+                                        height: Theme.fs(38px);
                                         HorizontalLayout {
                                             padding-left: 10px;
                                             padding-right: 6px;
                                             spacing: 8px;
                                             Text {
                                                 text: cli.display-name;
-                                                color: #e0e0e0;
-                                                font-size: 13px;
+                                                color: Theme.c.text-hi;
+                                                font-size: Theme.fs(13px);
                                                 font-weight: 700;
                                                 vertical-alignment: center;
                                                 width: 110px;
@@ -393,8 +411,8 @@ export component SettingsScreen inherits Rectangle {
                                             }
                                             Text {
                                                 text: cli.status != "" ? cli.status : cli.version-label;
-                                                color: cli.status != "" ? #9cbdde : #9a9a9a;
-                                                font-size: 12px;
+                                                color: cli.status != "" ? Theme.c.accent-tint : Theme.c.text-dim;
+                                                font-size: Theme.fs(12px);
                                                 vertical-alignment: center;
                                                 overflow: elide;
                                                 horizontal-stretch: 1;
@@ -416,14 +434,14 @@ export component SettingsScreen inherits Rectangle {
 
                             Text {
                                 text: "Default model";
-                                color: #e8e8e8;
-                                font-size: 16px;
+                                color: Theme.c.text-hi;
+                                font-size: Theme.fs(16px);
                                 font-weight: 700;
                             }
                             Text {
                                 text: "Preselected for new sessions and threads; each thread can still pick its own model in the composer.";
-                                color: #8a8a8a;
-                                font-size: 11px;
+                                color: Theme.c.text-soft;
+                                font-size: Theme.fs(11px);
                                 wrap: word-wrap;
                             }
                             HorizontalLayout {
@@ -447,47 +465,154 @@ export component SettingsScreen inherits Rectangle {
 
                             Text {
                                 text: "Agent modes";
-                                color: #e8e8e8;
-                                font-size: 16px;
+                                color: Theme.c.text-hi;
+                                font-size: Theme.fs(16px);
                                 font-weight: 700;
                             }
                             Rectangle {
-                                background: #1e1e1e;
+                                background: Theme.c.surface;
                                 border-radius: 6px;
                                 height: 220px;
                                 ListView {
                                     for mode in root.modes: Text {
-                                        height: 24px;
+                                        height: Theme.fs(24px);
                                         x: 10px;
                                         text: mode;
-                                        color: #c8c8c8;
-                                        font-size: 12px;
+                                        color: Theme.c.text-mid;
+                                        font-size: Theme.fs(12px);
                                         vertical-alignment: center;
                                     }
                                 }
                             }
                             Text {
                                 text: "Custom modes and mode overrides live in ~/.config/trouve/modes/ and .agents/modes/.";
-                                color: #8a8a8a;
-                                font-size: 11px;
+                                color: Theme.c.text-soft;
+                                font-size: Theme.fs(11px);
                                 wrap: word-wrap;
                             }
                         }
 
-                        // ---------------- about ----------------
+                        // ---------------- appearance ----------------
                         if root.section == 3: VerticalLayout {
                             spacing: 12px;
 
                             Text {
+                                text: "Appearance";
+                                color: Theme.c.text-hi;
+                                font-size: Theme.fs(16px);
+                                font-weight: 700;
+                            }
+
+                            VerticalLayout {
+                                spacing: 6px;
+                                Text {
+                                    text: "Theme";
+                                    color: Theme.c.text-mid;
+                                    font-size: Theme.fs(12px);
+                                    font-weight: 700;
+                                }
+                                ComboBox {
+                                    model: root.theme-names;
+                                    current-index <=> root.theme-index;
+                                    selected => { root.theme-picked(self.current-index); }
+                                }
+                                Text {
+                                    text: "Every theme is contrast-checked as a whole (WCAG AA), so individual colors can't be overridden. The colorblind themes put success and errors on a blue/orange axis instead of green/red.";
+                                    color: Theme.c.text-soft;
+                                    font-size: Theme.fs(11px);
+                                    wrap: word-wrap;
+                                }
+                            }
+
+                            HorizontalLayout {
+                                spacing: 12px;
+                                VerticalLayout {
+                                    spacing: 6px;
+                                    horizontal-stretch: 0;
+                                    Text {
+                                        text: "Base font size";
+                                        color: Theme.c.text-mid;
+                                        font-size: Theme.fs(12px);
+                                        font-weight: 700;
+                                    }
+                                    ComboBox {
+                                        width: 120px;
+                                        model: root.font-size-names;
+                                        current-index <=> root.font-size-index;
+                                        selected => { root.font-size-picked(self.current-index); }
+                                    }
+                                }
+                                VerticalLayout {
+                                    spacing: 6px;
+                                    horizontal-stretch: 1;
+                                    Text {
+                                        text: "Font";
+                                        color: Theme.c.text-mid;
+                                        font-size: Theme.fs(12px);
+                                        font-weight: 700;
+                                    }
+                                    ComboBox {
+                                        model: root.font-names;
+                                        current-index <=> root.font-index;
+                                        selected => { root.font-picked(self.current-index); }
+                                    }
+                                }
+                            }
+                            Text {
+                                text: "The size scales the whole interface; code keeps its monospace font.";
+                                color: Theme.c.text-soft;
+                                font-size: Theme.fs(11px);
+                                wrap: word-wrap;
+                            }
+
+                            HorizontalLayout {
+                                spacing: 10px;
+                                Rectangle {
+                                    width: 44px;
+                                    height: Theme.fs(26px);
+                                    background: root.reduce-motion ? Theme.c.accent-bg : Theme.c.control-bg;
+                                    border-radius: 6px;
+                                    border-width: 1px;
+                                    border-color: root.reduce-motion ? Theme.c.primary-border : Theme.c.border;
+                                    TouchArea {
+                                        clicked => {
+                                            root.reduce-motion = !root.reduce-motion;
+                                            root.reduce-motion-toggled(root.reduce-motion);
+                                        }
+                                    }
+                                    Text {
+                                        text: root.reduce-motion ? "On" : "Off";
+                                        color: root.reduce-motion ? Theme.c.text-hi : Theme.c.text-soft;
+                                        font-size: Theme.fs(12px);
+                                        horizontal-alignment: center;
+                                        vertical-alignment: center;
+                                    }
+                                }
+                                Text {
+                                    text: "Reduce motion — replace spinners and other animation with static indicators.";
+                                    color: Theme.c.text-mid;
+                                    font-size: Theme.fs(12px);
+                                    vertical-alignment: center;
+                                    wrap: word-wrap;
+                                    horizontal-stretch: 1;
+                                }
+                            }
+                        }
+
+                        // ---------------- about ----------------
+                        if root.section == 4: VerticalLayout {
+                            spacing: 12px;
+
+                            Text {
                                 text: "About";
-                                color: #e8e8e8;
-                                font-size: 16px;
+                                color: Theme.c.text-hi;
+                                font-size: Theme.fs(16px);
                                 font-weight: 700;
                             }
                             Text {
                                 text: "trouve — a protocol-first AI coding harness.";
-                                color: #9a9a9a;
-                                font-size: 12px;
+                                color: Theme.c.text-dim;
+                                font-size: Theme.fs(12px);
                             }
                             AboutSlint { }
                         }

@@ -218,14 +218,26 @@ fn to_chat_row(r: &ChatRowData) -> ChatRow {
     }
 }
 
+// The previous render's source rows, for diffing (UI thread only).
+thread_local! {
+    static LAST_CHAT: std::cell::RefCell<Vec<ChatRowData>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Drop the chat diff cache so the next `set_chat` rebuilds every row.
+/// Needed when row conversion itself changed meaning — e.g. a theme switch
+/// re-bakes syntax-highlight and inline-code colors — and identical source
+/// rows must still be re-converted.
+pub fn invalidate_chat_cache(ui: &Ui) {
+    let _ = ui.upgrade_in_event_loop(move |ui| {
+        LAST_CHAT.with(|cache| cache.borrow_mut().clear());
+        // Zero-length model forces the wholesale-replace path in set_chat.
+        ui.set_chat_rows(ModelRc::new(VecModel::<ChatRow>::default()));
+    });
+}
+
 pub fn set_chat(ui: &Ui, rows: Vec<ChatRowData>, scroll_to_end: bool) {
     use slint::Model as _;
-    use std::cell::RefCell;
-
-    // The previous render's source rows, for diffing (UI thread only).
-    thread_local! {
-        static LAST_CHAT: RefCell<Vec<ChatRowData>> = const { RefCell::new(Vec::new()) };
-    }
 
     let _ = ui.upgrade_in_event_loop(move |ui| {
         // Sampled before the model changes: row add/removes make the

@@ -3,6 +3,7 @@
 
 mod controller;
 mod render;
+mod theme;
 mod ui;
 mod winstate;
 
@@ -38,6 +39,109 @@ fn main() -> anyhow::Result<()> {
 
     let window = AppWindow::new()?;
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<UiCommand>();
+
+    // --- appearance: restore, populate the pickers, wire the callbacks ------
+    // All handled here on the UI thread (palette swaps are direct property
+    // writes); the controller is only pinged to re-render baked colors.
+    let appearance = std::rc::Rc::new(std::cell::RefCell::new(winstate::load_appearance()));
+    let font_families = std::rc::Rc::new(theme::font_families());
+    {
+        let a = appearance.borrow();
+        window.set_appearance_theme_names(slint::ModelRc::new(slint::VecModel::from(
+            theme::THEMES
+                .iter()
+                .map(|t| slint::SharedString::from(t.name))
+                .collect::<Vec<_>>(),
+        )));
+        window.set_appearance_theme_index(
+            theme::THEMES
+                .iter()
+                .position(|t| t.id == a.theme)
+                .unwrap_or(0) as i32,
+        );
+        window.set_appearance_font_size_names(slint::ModelRc::new(slint::VecModel::from(
+            theme::FONT_SIZES
+                .iter()
+                .map(|s| slint::SharedString::from(format!("{s} px")))
+                .collect::<Vec<_>>(),
+        )));
+        window.set_appearance_font_size_index(
+            theme::FONT_SIZES
+                .iter()
+                .position(|s| *s == a.font_size)
+                .unwrap_or(2) as i32,
+        );
+        let mut font_names = vec![slint::SharedString::from("System default")];
+        font_names.extend(
+            font_families
+                .iter()
+                .map(|f| slint::SharedString::from(f.as_str())),
+        );
+        window.set_appearance_font_names(slint::ModelRc::new(slint::VecModel::from(font_names)));
+        window.set_appearance_font_index(
+            font_families
+                .iter()
+                .position(|f| *f == a.font_family)
+                .map(|i| i as i32 + 1)
+                .unwrap_or(0),
+        );
+        window.set_appearance_reduce_motion(a.reduce_motion);
+        theme::apply(&window, &a);
+    }
+    // Shared handler: mutate one field, re-apply, persist, and have the
+    // controller re-render rows with baked (syntax/inline-code) colors.
+    let on_appearance = {
+        let appearance = appearance.clone();
+        let weak = window.as_weak();
+        let tx = tx.clone();
+        move |change: &dyn Fn(&mut winstate::Appearance)| {
+            let window = weak.unwrap();
+            let mut a = appearance.borrow_mut();
+            change(&mut a);
+            theme::apply(&window, &a);
+            winstate::save_appearance(&a);
+            let _ = tx.send(UiCommand::AppearanceChanged);
+        }
+    };
+    {
+        let on_appearance = on_appearance.clone();
+        window.on_appearance_theme_picked(move |i| {
+            on_appearance(&|a| {
+                if let Some(t) = theme::THEMES.get(i.max(0) as usize) {
+                    a.theme = t.id.to_string();
+                }
+            });
+        });
+    }
+    {
+        let on_appearance = on_appearance.clone();
+        window.on_appearance_font_size_picked(move |i| {
+            on_appearance(&|a| {
+                if let Some(s) = theme::FONT_SIZES.get(i.max(0) as usize) {
+                    a.font_size = *s;
+                }
+            });
+        });
+    }
+    {
+        let on_appearance = on_appearance.clone();
+        let font_families = font_families.clone();
+        window.on_appearance_font_picked(move |i| {
+            on_appearance(&|a| {
+                // Index 0 is "System default" (empty family).
+                a.font_family = match i.max(0) as usize {
+                    0 => String::new(),
+                    i => font_families.get(i - 1).cloned().unwrap_or_default(),
+                };
+            });
+        });
+    }
+    {
+        let on_appearance = on_appearance.clone();
+        window.on_appearance_reduce_motion_toggled(move |on| {
+            on_appearance(&|a| a.reduce_motion = on);
+        });
+    }
 
     // --- main window callbacks → controller commands -------------------------
     {
