@@ -1635,7 +1635,12 @@ impl Controller {
                     ui::set_pr_status(&self.ui, status);
                 }
             }
-            UiCommand::RefreshSettings => self.refresh_settings().await,
+            UiCommand::RefreshSettings => {
+                // Sent after a login or CLI install completes — both can
+                // unlock backend models, so refresh the pickers too.
+                self.reload_catalogs().await;
+                self.refresh_settings().await
+            }
             UiCommand::SaveProvider {
                 id,
                 kind,
