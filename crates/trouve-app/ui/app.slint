@@ -12,14 +12,18 @@ import {
 import { DiffView, DiffRow } from "diff-view.slint";
 import { CodeView, TextSegment } from "code-view.slint";
 import {
-    SettingsScreen, ProviderItem, CliItem, KnownProviderItem, McpServerItem
+    SettingsScreen, ProviderItem, CliItem, KnownProviderItem, McpServerItem,
+    SubscriptionItem
 } from "settings-window.slint";
 import { ScrollKeys } from "scroll-keys.slint";
 import { Theme, ThemePalette } from "theme.slint";
 import { Palette } from "std-widgets.slint";
 
 // Theme re-exported so Rust can push the selected palette.
-export { DiffRow, TextSegment, ProviderItem, CliItem, KnownProviderItem, McpServerItem }
+export {
+    DiffRow, TextSegment, ProviderItem, CliItem, KnownProviderItem, McpServerItem,
+    SubscriptionItem
+}
 export { Theme, ThemePalette }
 
 // One row of the left nav: workspace headers, sessions, archived toggles.
@@ -965,6 +969,8 @@ export component AppWindow inherits Window {
     in property <bool> settings-github-configured: false;
     in property <string> settings-github-source: "";
     callback github-token-saved(string);
+    in property <[SubscriptionItem]> settings-subscriptions;
+    in property <string> settings-subscriptions-status: "";
     in property <[McpServerItem]> settings-mcp-servers;
     in property <string> settings-mcp-status: "";
     in property <string> settings-mcp-logs-name: "";
@@ -3181,6 +3187,8 @@ export component AppWindow inherits Window {
         github-configured: root.settings-github-configured;
         github-source: root.settings-github-source;
         github-token-saved(token) => { root.github-token-saved(token); }
+        subscriptions: root.settings-subscriptions;
+        subscriptions-status: root.settings-subscriptions-status;
         mcp-servers: root.settings-mcp-servers;
         mcp-status: root.settings-mcp-status;
         mcp-logs-name: root.settings-mcp-logs-name;

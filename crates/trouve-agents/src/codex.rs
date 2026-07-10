@@ -147,6 +147,25 @@ impl AgentBackend for CodexBackend {
         }
     }
 
+    async fn subscription_health(&self) -> Option<trouve_protocol::SubscriptionHealth> {
+        let result = async {
+            let server = self.server().await?;
+            server.request("account/rateLimits/read", Value::Null).await
+        }
+        .await;
+        Some(match result {
+            Ok(value) => parse_rate_limits(&self.id, &value),
+            Err(e) => trouve_protocol::SubscriptionHealth {
+                provider_id: self.id.clone(),
+                status: "unavailable".into(),
+                plan: String::new(),
+                windows: Vec::new(),
+                credits: String::new(),
+                note: format!("could not read usage from the Codex app-server: {e}"),
+            },
+        })
+    }
+
     async fn start_login(&self) -> Result<BackendLogin, BackendError> {
         spawn_login(&self.command, &["login"]).await
     }
@@ -474,6 +493,103 @@ fn turn_stream(
     })
 }
 
+/// Turn an `account/rateLimits/read` response into subscription health.
+fn parse_rate_limits(provider_id: &str, value: &Value) -> trouve_protocol::SubscriptionHealth {
+    let snapshot = value.get("rateLimits").unwrap_or(&Value::Null);
+    let plan = snapshot
+        .get("planType")
+        .and_then(|p| p.as_str())
+        .filter(|p| *p != "unknown")
+        .unwrap_or("")
+        .to_string();
+
+    let mut windows = Vec::new();
+    for key in ["primary", "secondary"] {
+        let Some(window) = snapshot.get(key).filter(|w| !w.is_null()) else {
+            continue;
+        };
+        let Some(used) = window.get("usedPercent").and_then(|u| u.as_i64()) else {
+            continue;
+        };
+        windows.push(trouve_protocol::SubscriptionWindow {
+            label: window_label(window.get("windowDurationMins").and_then(|m| m.as_i64())),
+            used_percent: used.clamp(0, 100),
+            resets: window
+                .get("resetsAt")
+                .and_then(|r| r.as_i64())
+                .map(format_reset)
+                .unwrap_or_default(),
+        });
+    }
+
+    let credits = snapshot
+        .get("credits")
+        .filter(|c| !c.is_null())
+        .map(|c| {
+            if c.get("unlimited").and_then(|u| u.as_bool()).unwrap_or(false) {
+                "unlimited credits".to_string()
+            } else if c.get("hasCredits").and_then(|h| h.as_bool()).unwrap_or(false) {
+                match c.get("balance").and_then(|b| b.as_str()) {
+                    Some(balance) => format!("credits: {balance}"),
+                    None => String::new(),
+                }
+            } else {
+                String::new()
+            }
+        })
+        .unwrap_or_default();
+
+    if windows.is_empty() && plan.is_empty() {
+        return trouve_protocol::SubscriptionHealth {
+            provider_id: provider_id.to_string(),
+            status: "unavailable".into(),
+            plan,
+            windows,
+            credits,
+            note: "the app-server reported no usage data — is codex logged in?".into(),
+        };
+    }
+    trouve_protocol::SubscriptionHealth {
+        provider_id: provider_id.to_string(),
+        status: "ok".into(),
+        plan,
+        windows,
+        credits,
+        note: String::new(),
+    }
+}
+
+/// "5h window" / "Weekly" / "3d window" from a window duration.
+fn window_label(mins: Option<i64>) -> String {
+    match mins {
+        Some(10080) => "Weekly".to_string(),
+        Some(m) if m > 0 && m % 1440 == 0 => format!("{}d window", m / 1440),
+        Some(m) if m > 0 && m % 60 == 0 => format!("{}h window", m / 60),
+        Some(m) if m > 0 => format!("{m}m window"),
+        _ => "Usage window".to_string(),
+    }
+}
+
+/// "resets in 2h 10m" from a unix timestamp (seconds; tolerates millis).
+fn format_reset(at: i64) -> String {
+    let at = if at > 100_000_000_000 { at / 1000 } else { at };
+    let now = chrono::Utc::now().timestamp();
+    let secs = at - now;
+    if secs <= 0 {
+        return "resets shortly".to_string();
+    }
+    let days = secs / 86_400;
+    let hours = (secs % 86_400) / 3600;
+    let mins = (secs % 3600) / 60;
+    if days > 0 {
+        format!("resets in {days}d {hours}h")
+    } else if hours > 0 {
+        format!("resets in {hours}h {mins}m")
+    } else {
+        format!("resets in {}m", mins.max(1))
+    }
+}
+
 /// Best-effort parse of `thread/tokenUsage/updated` payloads (field naming
 /// has shifted across app-server versions).
 fn parse_usage(params: &Value) -> Usage {
@@ -726,6 +842,35 @@ mod tests {
         assert_eq!(u.input_tokens, 7);
         assert_eq!(u.output_tokens, 3);
         assert_eq!(u.context_window, None);
+    }
+
+    #[test]
+    fn parses_rate_limit_snapshots() {
+        let soon = chrono::Utc::now().timestamp() + 2 * 3600 + 600;
+        let value = json!({
+            "rateLimits": {
+                "planType": "plus",
+                "primary": { "usedPercent": 62, "resetsAt": soon, "windowDurationMins": 300 },
+                "secondary": { "usedPercent": 31, "resetsAt": soon + 86400, "windowDurationMins": 10080 },
+                "credits": { "hasCredits": true, "unlimited": false, "balance": "12.50" },
+            },
+        });
+        let health = parse_rate_limits("codex", &value);
+        assert_eq!(health.status, "ok");
+        assert_eq!(health.plan, "plus");
+        assert_eq!(health.credits, "credits: 12.50");
+        assert_eq!(health.windows.len(), 2);
+        assert_eq!(health.windows[0].label, "5h window");
+        assert_eq!(health.windows[0].used_percent, 62);
+        assert!(health.windows[0].resets.starts_with("resets in 2h"));
+        assert_eq!(health.windows[1].label, "Weekly");
+        assert_eq!(health.windows[1].used_percent, 31);
+        assert!(health.windows[1].resets.starts_with("resets in 1d"));
+
+        // Empty payload → unavailable (typically not logged in).
+        let health = parse_rate_limits("codex", &json!({ "rateLimits": {} }));
+        assert_eq!(health.status, "unavailable");
+        assert!(health.note.contains("logged in"));
     }
 
     #[test]

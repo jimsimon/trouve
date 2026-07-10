@@ -254,6 +254,35 @@ pub struct MergePrRequest {
     pub method: Option<String>,
 }
 
+// --- subscription health -----------------------------------------------------
+
+/// One metered rate-limit window of a vendor subscription (e.g. Codex's
+/// 5-hour and weekly buckets).
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct SubscriptionWindow {
+    /// "5h window", "Weekly", …
+    pub label: String,
+    pub used_percent: i64,
+    /// Pre-rendered reset note ("resets in 2h 10m"), "" when unknown.
+    pub resets: String,
+}
+
+/// Subscription usage for one configured agent-backend provider.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct SubscriptionHealth {
+    pub provider_id: String,
+    /// "ok" (windows below), "unavailable" (vendor query failed / not
+    /// logged in), or "unsupported" (vendor doesn't share the data).
+    pub status: String,
+    /// Plan name as reported ("plus", "pro", …); "" when unknown.
+    pub plan: String,
+    pub windows: Vec<SubscriptionWindow>,
+    /// Credits summary ("credits: 42.50", "unlimited credits"); "" if n/a.
+    pub credits: String,
+    /// Human explanation for unavailable/unsupported; "" when ok.
+    pub note: String,
+}
+
 // --- MCP servers -------------------------------------------------------------
 
 /// One user-managed MCP server (from `mcp.json` in the trouve config dir or

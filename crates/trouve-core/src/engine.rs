@@ -1222,6 +1222,51 @@ impl Engine {
         }
     }
 
+    /// Subscription usage for every configured agent-backend provider.
+    /// Codex answers live via its app-server; Cursor and Claude do not
+    /// expose subscription data to third parties, so their entries carry
+    /// an explanatory note instead.
+    pub async fn subscription_health(&self) -> Vec<trouve_protocol::SubscriptionHealth> {
+        let backends: Vec<(String, Arc<dyn AgentBackend>)> = {
+            let map = self.backends.read().unwrap();
+            let mut list: Vec<_> = map.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+            list.sort_by(|a, b| a.0.cmp(&b.0));
+            list
+        };
+        let kinds: HashMap<String, String> = {
+            let config = self.config.lock().unwrap();
+            config
+                .providers
+                .iter()
+                .map(|(id, pc)| (id.clone(), pc.kind.clone()))
+                .collect()
+        };
+        let mut out = Vec::new();
+        for (id, backend) in backends {
+            match backend.subscription_health().await {
+                Some(health) => out.push(health),
+                None => {
+                    let vendor = match kinds.get(&id).map(String::as_str) {
+                        Some("cursor-cli") => "Cursor",
+                        Some("claude-cli") => "Anthropic",
+                        _ => "This vendor",
+                    };
+                    out.push(trouve_protocol::SubscriptionHealth {
+                        provider_id: id,
+                        status: "unsupported".into(),
+                        plan: String::new(),
+                        windows: Vec::new(),
+                        credits: String::new(),
+                        note: format!(
+                            "{vendor} does not provide subscription usage to third-party apps."
+                        ),
+                    });
+                }
+            }
+        }
+        out
+    }
+
     /// Whether GitHub calls can authenticate, and where the token lives.
     pub fn github_integration(&self) -> trouve_protocol::GithubIntegration {
         let (configured, source) = if crate::github::token_from_env().is_some() {

@@ -35,6 +35,26 @@ export struct CliItem {
     busy: bool,
 }
 
+// Subscription usage for one agent-backend provider (flat: up to two
+// metered windows, which is all any vendor reports today).
+export struct SubscriptionItem {
+    provider: string,
+    // "ok" / "unavailable" / "unsupported"
+    status: string,
+    plan: string,
+    credits: string,
+    // Explanation for unavailable/unsupported entries.
+    note: string,
+    has-w1: bool,
+    w1-label: string,
+    w1-pct: int,
+    w1-resets: string,
+    has-w2: bool,
+    w2-label: string,
+    w2-pct: int,
+    w2-resets: string,
+}
+
 // A user-managed MCP server (first-party servers trouve injects itself are
 // never listed). command-line and env-lines are pre-rendered for display
 // and round-trip through the edit form.
@@ -65,6 +85,41 @@ export struct KnownProviderItem {
     auth: string,
     // Undocumented vendor endpoint; may break or be restricted at any time.
     experimental: bool,
+}
+
+// One metered subscription window: label, usage bar, reset note. The bar
+// shifts to warn/err colors as the window fills up.
+component SubscriptionMeter inherits VerticalLayout {
+    in property <string> label;
+    in property <int> pct;
+    in property <string> resets;
+    spacing: 3px;
+    HorizontalLayout {
+        Text {
+            text: root.label;
+            color: Theme.c.text-mid;
+            font-size: Theme.fs(11px);
+            horizontal-stretch: 1;
+        }
+        Text {
+            text: root.pct + "% used" + (root.resets != "" ? " · " + root.resets : "");
+            color: root.pct >= 90 ? Theme.c.err : Theme.c.text-mid;
+            font-size: Theme.fs(11px);
+        }
+    }
+    Rectangle {
+        height: 6px;
+        border-radius: 3px;
+        background: Theme.c.control-bg;
+        Rectangle {
+            x: 0;
+            width: max(parent.width * root.pct / 100, root.pct > 0 ? 6px : 0px);
+            height: parent.height;
+            border-radius: 3px;
+            background: root.pct >= 90 ? Theme.c.err
+                : root.pct >= 70 ? Theme.c.warn : Theme.c.ok;
+        }
+    }
 }
 
 export component SettingsScreen inherits Rectangle {
@@ -129,6 +184,10 @@ export component SettingsScreen inherits Rectangle {
     // "environment" (GITHUB_TOKEN/GH_TOKEN) or "settings" (secret store).
     in property <string> github-source: "";
     callback github-token-saved(string);
+
+    // Subscription health (Providers section).
+    in property <[SubscriptionItem]> subscriptions;
+    in property <string> subscriptions-status: "";
 
     // MCP servers (user config + current workspace).
     in property <[McpServerItem]> mcp-servers;
@@ -469,6 +528,77 @@ export component SettingsScreen inherits Rectangle {
                                                 clicked => { root.cli-install(cli.id); }
                                             }
                                         }
+                                    }
+                                }
+                            }
+
+                            // ---------------- subscription health ----------------
+                            Text {
+                                text: "Subscription health";
+                                color: Theme.c.text-hi;
+                                font-size: Theme.fs(16px);
+                                font-weight: 700;
+                            }
+                            Text {
+                                text: "How much of each subscription's metered allowance is used. Only Codex shares this with third-party apps — Cursor and Claude do not provide subscription information to third parties.";
+                                color: Theme.c.text-soft;
+                                font-size: Theme.fs(11px);
+                                wrap: word-wrap;
+                            }
+                            if root.subscriptions-status != "": Text {
+                                text: root.subscriptions-status;
+                                color: Theme.c.text-soft;
+                                font-size: Theme.fs(12px);
+                            }
+                            if root.subscriptions.length == 0 && root.subscriptions-status == "": Text {
+                                text: "No agent-backend providers configured.";
+                                color: Theme.c.text-soft;
+                                font-size: Theme.fs(12px);
+                            }
+                            for sub in root.subscriptions: Rectangle {
+                                background: Theme.c.surface;
+                                border-radius: 6px;
+                                VerticalLayout {
+                                    padding: 12px;
+                                    spacing: 8px;
+                                    HorizontalLayout {
+                                        spacing: 8px;
+                                        Text {
+                                            text: sub.provider;
+                                            color: Theme.c.text-hi;
+                                            font-size: Theme.fs(13px);
+                                            font-weight: 700;
+                                            vertical-alignment: center;
+                                            horizontal-stretch: 1;
+                                        }
+                                        if sub.plan != "": Text {
+                                            text: sub.plan + " plan";
+                                            color: Theme.c.accent-tint;
+                                            font-size: Theme.fs(11px);
+                                            vertical-alignment: center;
+                                        }
+                                        if sub.credits != "": Text {
+                                            text: sub.credits;
+                                            color: Theme.c.text-mid;
+                                            font-size: Theme.fs(11px);
+                                            vertical-alignment: center;
+                                        }
+                                    }
+                                    if sub.status != "ok": Text {
+                                        text: sub.note;
+                                        color: sub.status == "unavailable" ? Theme.c.warn : Theme.c.text-soft;
+                                        font-size: Theme.fs(11px);
+                                        wrap: word-wrap;
+                                    }
+                                    if sub.has-w1: SubscriptionMeter {
+                                        label: sub.w1-label;
+                                        pct: sub.w1-pct;
+                                        resets: sub.w1-resets;
+                                    }
+                                    if sub.has-w2: SubscriptionMeter {
+                                        label: sub.w2-label;
+                                        pct: sub.w2-pct;
+                                        resets: sub.w2-resets;
                                     }
                                 }
                             }

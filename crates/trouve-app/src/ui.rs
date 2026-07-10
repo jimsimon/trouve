@@ -425,6 +425,50 @@ pub fn set_prs(
     });
 }
 
+/// Plain-data mirror of the Slint SubscriptionItem struct; windows are
+/// (label, used-percent, resets) tuples.
+pub struct SubscriptionView {
+    pub provider: String,
+    pub status: String,
+    pub plan: String,
+    pub credits: String,
+    pub note: String,
+    pub w1: Option<(String, i64, String)>,
+    pub w2: Option<(String, i64, String)>,
+}
+
+pub fn set_subscriptions(ui: &Ui, items: Vec<SubscriptionView>, status: String) {
+    let _ = ui.upgrade_in_event_loop(move |ui| {
+        let items: Vec<crate::SubscriptionItem> = items
+            .into_iter()
+            .map(|s| {
+                let window = |w: &Option<(String, i64, String)>| {
+                    w.clone().unwrap_or((String::new(), 0, String::new()))
+                };
+                let (w1_label, w1_pct, w1_resets) = window(&s.w1);
+                let (w2_label, w2_pct, w2_resets) = window(&s.w2);
+                crate::SubscriptionItem {
+                    provider: SharedString::from(s.provider.as_str()),
+                    status: SharedString::from(s.status.as_str()),
+                    plan: SharedString::from(s.plan.as_str()),
+                    credits: SharedString::from(s.credits.as_str()),
+                    note: SharedString::from(s.note.as_str()),
+                    has_w1: s.w1.is_some(),
+                    w1_label: SharedString::from(w1_label.as_str()),
+                    w1_pct: w1_pct as i32,
+                    w1_resets: SharedString::from(w1_resets.as_str()),
+                    has_w2: s.w2.is_some(),
+                    w2_label: SharedString::from(w2_label.as_str()),
+                    w2_pct: w2_pct as i32,
+                    w2_resets: SharedString::from(w2_resets.as_str()),
+                }
+            })
+            .collect();
+        ui.set_settings_subscriptions(ModelRc::new(VecModel::from(items)));
+        ui.set_settings_subscriptions_status(SharedString::from(status.as_str()));
+    });
+}
+
 /// Plain-data mirror of the Slint McpServerItem struct.
 pub struct McpView {
     pub name: String,

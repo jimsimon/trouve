@@ -24,9 +24,9 @@ use trouve_protocol::{
     KnownProvider, LoginStarted, LoginStatus, McpLogs, McpServerInfo, MergePrRequest, ModelInfo,
     PrInfo, ProviderInfo, ProvidersResponse, RegisterWorkspaceRequest, ResolveApprovalRequest,
     ResolveQuestionRequest, Scope, SendMessageRequest, ServerInfo, Session, SessionDiff,
-    SetDefaultModelRequest, SetGithubTokenRequest, Thread, TurnAccepted, UpdateSessionRequest,
-    UpdateThreadRequest, UpsertMcpServerRequest, UpsertProviderRequest, UsageSummary, Workspace,
-    PROTOCOL_VERSION,
+    SetDefaultModelRequest, SetGithubTokenRequest, SubscriptionHealth, Thread, TurnAccepted,
+    UpdateSessionRequest, UpdateThreadRequest, UpsertMcpServerRequest, UpsertProviderRequest,
+    UsageSummary, Workspace, PROTOCOL_VERSION,
 };
 use utoipa::OpenApi;
 
@@ -106,6 +106,7 @@ impl IntoResponse for ApiError {
         upsert_mcp_server,
         delete_mcp_server,
         mcp_server_logs,
+        subscription_health,
     ),
     components(schemas(
         ServerInfo,
@@ -149,6 +150,8 @@ impl IntoResponse for ApiError {
         McpServerInfo,
         UpsertMcpServerRequest,
         McpLogs,
+        SubscriptionHealth,
+        trouve_protocol::SubscriptionWindow,
         ErrorBody,
         trouve_protocol::EventEnvelope,
         trouve_protocol::Event,
@@ -210,6 +213,7 @@ pub fn build_router(engine: Arc<Engine>) -> Router {
             axum::routing::put(upsert_mcp_server).delete(delete_mcp_server),
         )
         .route("/v1/mcp-servers/{name}/logs", get(mcp_server_logs))
+        .route("/v1/subscriptions", get(subscription_health))
         .route("/v1/models", get(list_models))
         .route("/v1/modes", get(list_modes))
         .route("/v1/providers", get(list_providers))
@@ -791,6 +795,14 @@ async fn mcp_server_logs(
     Path(name): Path<String>,
 ) -> Json<McpLogs> {
     Json(engine.mcp_server_logs(&name))
+}
+
+#[utoipa::path(get, path = "/v1/subscriptions",
+    responses((status = 200, body = [SubscriptionHealth])))]
+async fn subscription_health(
+    State(engine): State<Arc<Engine>>,
+) -> Json<Vec<SubscriptionHealth>> {
+    Json(engine.subscription_health().await)
 }
 
 #[utoipa::path(get, path = "/v1/integrations/github",

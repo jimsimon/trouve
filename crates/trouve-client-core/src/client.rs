@@ -383,6 +383,12 @@ impl ProtocolClient {
         self.get_json(&format!("/mcp-servers/{name}/logs")).await
     }
 
+    /// Subscription usage per configured agent backend. Codex answers via
+    /// its app-server (may spawn it), so this can take a couple of seconds.
+    pub async fn subscription_health(&self) -> Result<Vec<SubscriptionHealth>> {
+        self.get_json("/subscriptions").await
+    }
+
     pub async fn github_integration(&self) -> Result<GithubIntegration> {
         self.get_json("/integrations/github").await
     }

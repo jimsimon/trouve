@@ -208,6 +208,13 @@ pub trait AgentBackend: Send + Sync {
 
     fn status(&self) -> BackendStatus;
 
+    /// Live subscription usage (plan, metered rate-limit windows) where the
+    /// vendor exposes it to third-party apps. `None` means the vendor does
+    /// not share this data (Cursor, Claude); only Codex supports it today.
+    async fn subscription_health(&self) -> Option<trouve_protocol::SubscriptionHealth> {
+        None
+    }
+
     /// Start the vendor's own login flow (spawns the vendor CLI).
     async fn start_login(&self) -> Result<BackendLogin, BackendError>;
 

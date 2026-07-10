@@ -7989,6 +7989,7 @@ name = "trouve-agents"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "chrono",
  "dirs",
  "flate2",
  "futures",

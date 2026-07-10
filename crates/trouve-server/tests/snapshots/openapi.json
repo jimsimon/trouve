@@ -1258,6 +1258,27 @@
         }
       }
     },
+    "/v1/subscriptions": {
+      "get": {
+        "tags": [],
+        "operationId": "subscription_health",
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/SubscriptionHealth"
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/v1/threads": {
       "get": {
         "tags": [],
@@ -3324,6 +3345,68 @@
       },
       "String": {
         "type": "string"
+      },
+      "SubscriptionHealth": {
+        "type": "object",
+        "description": "Subscription usage for one configured agent-backend provider.",
+        "required": [
+          "provider_id",
+          "status",
+          "plan",
+          "windows",
+          "credits",
+          "note"
+        ],
+        "properties": {
+          "credits": {
+            "type": "string",
+            "description": "Credits summary (\"credits: 42.50\", \"unlimited credits\"); \"\" if n/a."
+          },
+          "note": {
+            "type": "string",
+            "description": "Human explanation for unavailable/unsupported; \"\" when ok."
+          },
+          "plan": {
+            "type": "string",
+            "description": "Plan name as reported (\"plus\", \"pro\", …); \"\" when unknown."
+          },
+          "provider_id": {
+            "type": "string"
+          },
+          "status": {
+            "type": "string",
+            "description": "\"ok\" (windows below), \"unavailable\" (vendor query failed / not\nlogged in), or \"unsupported\" (vendor doesn't share the data)."
+          },
+          "windows": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/SubscriptionWindow"
+            }
+          }
+        }
+      },
+      "SubscriptionWindow": {
+        "type": "object",
+        "description": "One metered rate-limit window of a vendor subscription (e.g. Codex's\n5-hour and weekly buckets).",
+        "required": [
+          "label",
+          "used_percent",
+          "resets"
+        ],
+        "properties": {
+          "label": {
+            "type": "string",
+            "description": "\"5h window\", \"Weekly\", …"
+          },
+          "resets": {
+            "type": "string",
+            "description": "Pre-rendered reset note (\"resets in 2h 10m\"), \"\" when unknown."
+          },
+          "used_percent": {
+            "type": "integer",
+            "format": "int64"
+          }
+        }
       },
       "Thread": {
         "type": "object",

@@ -157,6 +157,8 @@ pub enum UiCommand {
     McpLogs(String),
     /// Internal: an MCP list fetch finished (true = with health probes).
     McpLoaded(Vec<trouve_protocol::McpServerInfo>, bool),
+    /// Internal: the subscription health fetch finished.
+    SubscriptionsLoaded(Vec<trouve_protocol::SubscriptionHealth>),
 
     /// Internal: an event arrived on some thread's stream.
     Event(String, Box<EventEnvelope>),
@@ -1015,6 +1017,27 @@ impl Controller {
         ui::set_github_integration(&self.ui, self.github_configured, &self.github_source);
     }
 
+    /// Fetch subscription health in the background (the Codex query may
+    /// spawn its app-server, which takes a moment).
+    fn refresh_subscriptions(&self) {
+        let client = self.client.clone();
+        let tx = self.tx.clone();
+        let ui = self.ui.clone();
+        ui::set_subscriptions(&self.ui, Vec::new(), "checking subscription usage…".into());
+        tokio::spawn(async move {
+            match client.subscription_health().await {
+                Ok(subs) => {
+                    let _ = tx.send(UiCommand::SubscriptionsLoaded(subs));
+                }
+                Err(e) => ui::set_subscriptions(
+                    &ui,
+                    Vec::new(),
+                    format!("failed to load subscription usage: {e:#}"),
+                ),
+            }
+        });
+    }
+
     /// Reload the MCP server list in the background: a quick unprobed list
     /// paints immediately, then health probes fill in (they spawn every
     /// server, which can take seconds).
@@ -1466,6 +1489,7 @@ impl Controller {
             UiCommand::OpenSettings => {
                 self.refresh_settings().await;
                 self.refresh_mcp();
+                self.refresh_subscriptions();
                 ui::set_center_screen(&self.ui, 3);
             }
             UiCommand::CloseSettings => {
@@ -1883,6 +1907,7 @@ impl Controller {
                 ui::set_settings_section(&self.ui, 4);
                 self.refresh_settings().await;
                 self.refresh_mcp();
+                self.refresh_subscriptions();
                 ui::set_center_screen(&self.ui, 3);
             }
             UiCommand::RefreshMcp => self.refresh_mcp(),
@@ -1951,6 +1976,25 @@ impl Controller {
                 Ok(logs) => ui::set_mcp_logs(&self.ui, name, logs.lines.join("\n")),
                 Err(e) => self.error(&format!("loading MCP logs: {e:#}")),
             },
+            UiCommand::SubscriptionsLoaded(subs) => {
+                let items = subs
+                    .into_iter()
+                    .map(|s| {
+                        let w1 = s.windows.first();
+                        let w2 = s.windows.get(1);
+                        ui::SubscriptionView {
+                            provider: s.provider_id,
+                            status: s.status,
+                            plan: s.plan,
+                            credits: s.credits,
+                            note: s.note,
+                            w1: w1.map(|w| (w.label.clone(), w.used_percent, w.resets.clone())),
+                            w2: w2.map(|w| (w.label.clone(), w.used_percent, w.resets.clone())),
+                        }
+                    })
+                    .collect();
+                ui::set_subscriptions(&self.ui, items, String::new());
+            }
             UiCommand::SaveGithubToken(token) => {
                 match self.client.set_github_token(&token).await {
                     Ok(integration) => {
@@ -1967,7 +2011,8 @@ impl Controller {
                 // Sent after a login or CLI install completes — both can
                 // unlock backend models, so refresh the pickers too.
                 self.reload_catalogs().await;
-                self.refresh_settings().await
+                self.refresh_settings().await;
+                self.refresh_subscriptions();
             }
             UiCommand::SaveProvider {
                 id,
