@@ -285,6 +285,22 @@ pub async fn run(
         ctl.error(&format!("startup error: {e:#}"));
     }
 
+    // Auto-refresh the diff panel: picks up agent edits mid-turn and
+    // external edits alike. refresh_diff repaints only on real change.
+    tokio::spawn({
+        let tx = ctl.tx.clone();
+        async move {
+            let mut tick = tokio::time::interval(std::time::Duration::from_secs(2));
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                tick.tick().await;
+                if tx.send(UiCommand::RefreshDiff).is_err() {
+                    break;
+                }
+            }
+        }
+    });
+
     while let Some(command) = rx.recv().await {
         let result = ctl.handle(command).await;
         if let Err(e) = result {
@@ -845,13 +861,30 @@ impl Controller {
         }
     }
 
+    /// Fetch the session diff and repaint only when it actually changed
+    /// (the auto-refresh poller calls this every couple of seconds).
+    /// Collapsed state carries over by file path.
     async fn refresh_diff(&mut self) -> Result<()> {
         let Some(session_id) = self.current_session_id() else {
             return Ok(());
         };
         let diff = self.client.session_diff(&session_id).await?;
+        if diff.diff == self.diff_raw {
+            return Ok(());
+        }
+        let collapsed_paths: HashSet<String> = self
+            .diff_files
+            .iter()
+            .zip(&self.diff_collapsed)
+            .filter(|(_, c)| **c)
+            .map(|(f, _)| f.path.clone())
+            .collect();
         self.diff_files = slint_diff_view::parse_unified_diff(&diff.diff);
-        self.diff_collapsed = vec![false; self.diff_files.len()];
+        self.diff_collapsed = self
+            .diff_files
+            .iter()
+            .map(|f| collapsed_paths.contains(&f.path))
+            .collect();
         self.diff_raw = diff.diff;
         self.push_diff();
         Ok(())
@@ -1544,7 +1577,11 @@ impl Controller {
                 })
                 .await;
             }
-            UiCommand::RefreshDiff => self.refresh_diff().await?,
+            // Background poll: swallow transient errors rather than flashing
+            // the error banner every tick.
+            UiCommand::RefreshDiff => {
+                let _ = self.refresh_diff().await;
+            }
             UiCommand::ToggleDiffFile(i) => {
                 if let Some(flag) = self.diff_collapsed.get_mut(i) {
                     *flag = !*flag;

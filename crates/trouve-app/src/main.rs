@@ -390,12 +390,6 @@ fn main() -> anyhow::Result<()> {
     }
     {
         let tx = tx.clone();
-        window.on_refresh_diff(move || {
-            let _ = tx.send(UiCommand::RefreshDiff);
-        });
-    }
-    {
-        let tx = tx.clone();
         window.on_diff_file_toggled(move |i| {
             let _ = tx.send(UiCommand::ToggleDiffFile(i as usize));
         });
