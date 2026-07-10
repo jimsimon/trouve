@@ -273,7 +273,12 @@ impl Engine {
             questions: Arc::new(QuestionHub::default()),
             session_locks: Mutex::new(HashMap::new()),
             config: Mutex::new(config.clone()),
-            config_file: Some(crate::config::config_path()),
+            // No write-back by default: only a caller that loaded `config`
+            // from disk should enable persisting to that file (see
+            // `with_config_file`). Defaulting to the real config path here
+            // let test/embedded engines built from synthetic configs
+            // clobber the user's config.toml on any provider change.
+            config_file: None,
             default_model: RwLock::new(
                 config
                     .default_model

@@ -114,7 +114,12 @@ async fn main() -> Result<()> {
             let data = trouve_core::config::data_dir();
             let store = trouve_core::store::Store::open(&data.join("trouve.db"))?;
             let config = trouve_core::config::Config::load();
-            let engine = std::sync::Arc::new(trouve_core::Engine::new(store, data, &config));
+            let engine = std::sync::Arc::new(
+                trouve_core::Engine::new(store, data, &config)
+                    // This engine loaded the real config file, so provider
+                    // changes write back to it.
+                    .with_config_file(Some(trouve_core::config::config_path())),
+            );
             trouve_server::serve(engine, addr).await
         }
         Cmd::Workspace(cmd) => {
