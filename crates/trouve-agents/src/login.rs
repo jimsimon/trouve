@@ -15,11 +15,21 @@ use crate::{BackendError, BackendLogin};
 const URL_WAIT: Duration = Duration::from_secs(15);
 
 pub async fn spawn_login(command: &str, args: &[&str]) -> Result<BackendLogin, BackendError> {
-    let mut child = Command::new(command)
-        .args(args)
+    let mut cmd = Command::new(command);
+    cmd.args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
+        .stderr(Stdio::piped());
+    // Vendor CLIs auto-open a browser and honor $BROWSER over the
+    // desktop's default handler, which launches the wrong browser when
+    // the variable points elsewhere (e.g. BROWSER=firefox on a KDE
+    // session whose default is another browser). Neutralize their launch
+    // — `true` swallows the URL argument — and let the client open the
+    // scraped verification URL once, through the desktop default
+    // (xdg-open / open).
+    #[cfg(unix)]
+    cmd.env("BROWSER", "true");
+    let mut child = cmd
         .spawn()
         .map_err(|e| match e.kind() {
             std::io::ErrorKind::NotFound => BackendError::NotInstalled(command.to_string()),
@@ -41,8 +51,16 @@ pub async fn spawn_login(command: &str, args: &[&str]) -> Result<BackendLogin, B
         // a full pipe.
         while let Some(line) = line_rx.recv().await {
             tracing::debug!(target: "trouve_agents::login", "{line}");
-            if let (Some(url), Some(tx)) = (find_url(&line), url_tx.take()) {
-                let _ = tx.send((url, find_user_code(&line)));
+            // Only consume the one-shot sender when this line actually
+            // holds a URL; taking it eagerly in a tuple pattern burned it
+            // on the first URL-less line, dropping the real URL later.
+            if url_tx.is_some() {
+                if let Some(url) = find_url(&line) {
+                    let _ = url_tx
+                        .take()
+                        .expect("checked above")
+                        .send((url, find_user_code(&line)));
+                }
             }
         }
     });
@@ -89,7 +107,22 @@ fn find_url(line: &str) -> Option<String> {
         .take_while(|c| !c.is_whitespace() && *c != '"' && *c != '\'')
         .collect();
     // Trim trailing punctuation that often follows URLs in prose.
-    Some(url.trim_end_matches(['.', ',', ')', ']']).to_string())
+    let url = url.trim_end_matches(['.', ',', ')', ']']);
+    // Loopback URLs are the CLI's own redirect listener, not the page the
+    // user must visit (codex prints "Starting local login server on
+    // http://localhost:1455." before the real auth URL; opening it renders
+    // "Not found"). Skip them and keep scanning for a remote URL.
+    let host = url
+        .split_once("://")
+        .map(|(_, rest)| rest)
+        .unwrap_or(url)
+        .split(['/', ':', '?', '#'])
+        .next()
+        .unwrap_or("");
+    if matches!(host, "localhost" | "127.0.0.1" | "0.0.0.0" | "[::1]") {
+        return None;
+    }
+    Some(url.to_string())
 }
 
 /// Device-flow style codes ("Enter code: ABCD-1234").
@@ -116,6 +149,27 @@ mod tests {
             Some("https://auth.example.com/x?y=1".to_string())
         );
         assert_eq!(find_url("no url here"), None);
+    }
+
+    #[test]
+    fn skips_loopback_urls() {
+        // codex prints its redirect listener before the real auth URL.
+        assert_eq!(
+            find_url("Starting local login server on http://localhost:1455."),
+            None
+        );
+        assert_eq!(find_url("listening on http://127.0.0.1:8080/cb"), None);
+        // A localhost redirect_uri inside the query must not disqualify
+        // the remote auth URL that carries it.
+        assert_eq!(
+            find_url(
+                "https://auth.openai.com/oauth/authorize?redirect_uri=http%3A%2F%2Flocalhost%3A1455%2Fauth%2Fcallback&state=x"
+            ),
+            Some(
+                "https://auth.openai.com/oauth/authorize?redirect_uri=http%3A%2F%2Flocalhost%3A1455%2Fauth%2Fcallback&state=x"
+                    .to_string()
+            )
+        );
     }
 
     #[test]

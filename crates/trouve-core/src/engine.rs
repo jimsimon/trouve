@@ -85,7 +85,10 @@ pub struct Engine {
 
 #[derive(Debug, Clone)]
 enum LoginState {
-    Pending,
+    /// In flight; carries what the user was told to do so a repeated
+    /// start_login can re-present it (e.g. after closing the browser tab)
+    /// instead of refusing while the flow is still valid.
+    Pending(trouve_protocol::LoginStarted),
     Success,
     Failed(String),
 }
@@ -617,13 +620,11 @@ impl Engine {
                     EngineError::BadRequest(format!("provider {id} has no OAuth configuration"))
                 })?
         };
-        if matches!(
-            self.logins.lock().unwrap().get(id),
-            Some(LoginState::Pending)
-        ) {
-            return Err(EngineError::Conflict(format!(
-                "a login for {id} is already in progress"
-            )));
+        // A login is already in flight (the user may have closed the
+        // browser tab): re-present the same instructions — the URL/code
+        // stay valid while the flow waits — instead of refusing.
+        if let Some(LoginState::Pending(started)) = self.logins.lock().unwrap().get(id) {
+            return Ok(started.clone());
         }
 
         if oauth.device_authorization_url.is_some() {
@@ -641,7 +642,7 @@ impl Engine {
             self.logins
                 .lock()
                 .unwrap()
-                .insert(id.to_string(), LoginState::Pending);
+                .insert(id.to_string(), LoginState::Pending(started.clone()));
             let engine = self.clone();
             let id = id.to_string();
             tokio::spawn(async move {
@@ -666,10 +667,14 @@ impl Engine {
             let state = uuid::Uuid::new_v4().simple().to_string();
             let url = oauth_flow::pkce_authorize_url(&oauth, &challenge, &redirect_uri, &state)
                 .map_err(|e| EngineError::BadRequest(e.to_string()))?;
+            let started = trouve_protocol::LoginStarted {
+                verification_url: url,
+                user_code: None,
+            };
             self.logins
                 .lock()
                 .unwrap()
-                .insert(id.to_string(), LoginState::Pending);
+                .insert(id.to_string(), LoginState::Pending(started.clone()));
             let engine = self.clone();
             let id = id.to_string();
             tokio::spawn(async move {
@@ -688,10 +693,7 @@ impl Engine {
                 .await;
                 engine.finish_login(&id, result);
             });
-            Ok(trouve_protocol::LoginStarted {
-                verification_url: url,
-                user_code: None,
-            })
+            Ok(started)
         } else {
             Err(EngineError::BadRequest(format!(
                 "provider {id} OAuth config has neither device_authorization_url \
@@ -708,13 +710,11 @@ impl Engine {
         kind: &str,
         command: Option<String>,
     ) -> Result<trouve_protocol::LoginStarted, EngineError> {
-        if matches!(
-            self.logins.lock().unwrap().get(id),
-            Some(LoginState::Pending)
-        ) {
-            return Err(EngineError::Conflict(format!(
-                "a login for {id} is already in progress"
-            )));
+        // The vendor CLI is still waiting on its verification URL (the
+        // user may have closed the browser tab): hand the same URL back
+        // so the client can reopen it, rather than refusing.
+        if let Some(LoginState::Pending(started)) = self.logins.lock().unwrap().get(id) {
+            return Ok(started.clone());
         }
         let login = if is_backend_kind(kind) {
             let backend = self
@@ -732,10 +732,14 @@ impl Engine {
         }
         .map_err(|e| EngineError::BadRequest(e.to_string()))?;
 
+        let started = trouve_protocol::LoginStarted {
+            verification_url: login.verification_url.clone().unwrap_or_default(),
+            user_code: login.user_code.clone(),
+        };
         self.logins
             .lock()
             .unwrap()
-            .insert(id.to_string(), LoginState::Pending);
+            .insert(id.to_string(), LoginState::Pending(started.clone()));
         let engine = self.clone();
         let id_owned = id.to_string();
         tokio::spawn(async move {
@@ -749,10 +753,7 @@ impl Engine {
                 .unwrap()
                 .insert(id_owned.clone(), state);
         });
-        Ok(trouve_protocol::LoginStarted {
-            verification_url: login.verification_url.unwrap_or_default(),
-            user_code: login.user_code,
-        })
+        Ok(started)
     }
 
     // --- managed vendor CLIs ---------------------------------------------------
@@ -921,7 +922,7 @@ impl Engine {
                 status: "none".into(),
                 error: None,
             },
-            Some(LoginState::Pending) => trouve_protocol::LoginStatus {
+            Some(LoginState::Pending(_)) => trouve_protocol::LoginStatus {
                 status: "pending".into(),
                 error: None,
             },
