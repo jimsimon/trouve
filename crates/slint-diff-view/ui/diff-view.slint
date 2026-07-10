@@ -21,6 +21,9 @@ export struct DiffRow {
 
 export component DiffView inherits Rectangle {
     in property <[DiffRow]> rows;
+    // Raw per-file diff text, parallel to file indices (for the header
+    // copy buttons; see split_file_diffs in the Rust helpers).
+    in property <[string]> file-diffs;
     in property <length> code-font-size: 13px;
     in property <length> line-height: code-font-size * 1.5;
     in property <string> font-family: "monospace";
@@ -40,6 +43,29 @@ export component DiffView inherits Rectangle {
 
     background: #1e1e1e;
     forward-focus: keys;
+
+    // Clipboard plumbing for the per-file copy buttons: Slint only exposes
+    // the clipboard through TextInput, so copies route through this hidden
+    // one. copied-file drives the transient ✓ feedback on the header icon.
+    property <int> copied-file: -1;
+    function copy-file-diff(i: int) {
+        clip.text = root.file-diffs[i];
+        clip.select-all();
+        clip.copy();
+        clip.text = "";
+        root.copied-file = i;
+    }
+    clip := TextInput {
+        visible: false;
+        width: 0;
+        height: 0;
+        single-line: false;
+    }
+    Timer {
+        interval: 1.2s;
+        running: root.copied-file >= 0;
+        triggered => { root.copied-file = -1; }
+    }
 
     // Keyboard scrolling (the view gains focus when clicked). Home/End and
     // the macOS ⌘↑/⌘↓ equivalents jump; PageUp/PageDown page; arrows nudge.
@@ -101,6 +127,26 @@ export component DiffView inherits Rectangle {
                     font-size: root.code-font-size;
                     font-weight: 700;
                     vertical-alignment: center;
+                    horizontal-stretch: 1;
+                }
+                // Right-aligned copy button; sits above the row's collapse
+                // TouchArea (declared later = on top).
+                if row.kind == 0: Rectangle {
+                    width: root.line-height * 1.4;
+                    border-radius: 4px;
+                    background: copy-ta.has-hover ? root.hunk-bg : transparent;
+                    copy-ta := TouchArea {
+                        clicked => { root.copy-file-diff(row.file-index); }
+                    }
+                    Text {
+                        text: root.copied-file == row.file-index ? "✓" : "⧉";
+                        color: root.copied-file == row.file-index ? root.add-fg
+                            : copy-ta.has-hover ? root.file-header-fg
+                            : root.gutter-fg;
+                        font-size: root.code-font-size;
+                        horizontal-alignment: center;
+                        vertical-alignment: center;
+                    }
                 }
                 if row.kind != 0: Text {
                     width: 44px;

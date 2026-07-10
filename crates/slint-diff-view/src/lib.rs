@@ -110,6 +110,25 @@ pub fn parse_unified_diff(diff: &str) -> Vec<FileDiff> {
     files
 }
 
+/// Split raw diff text into one segment per file, aligned with
+/// `parse_unified_diff`'s output (segment i is the raw text of file i).
+/// Feeds per-file copy buttons in the diff view.
+pub fn split_file_diffs(diff: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for line in diff.lines() {
+        // Same file boundaries as the parser: a git header starts a file,
+        // and a bare hunk header starts one for headerless unified diffs.
+        if line.starts_with("diff --git ") || (out.is_empty() && line.starts_with("@@")) {
+            out.push(String::new());
+        }
+        if let Some(cur) = out.last_mut() {
+            cur.push_str(line);
+            cur.push('\n');
+        }
+    }
+    out
+}
+
 fn parse_hunk_header(header: &str) -> (u32, u32) {
     let mut old = 1;
     let mut new = 1;
@@ -264,6 +283,18 @@ diff --git a/README.md b/README.md
         assert_eq!(lines[3].new_no, Some(3));
         assert_eq!(files[1].hunks[0].lines[0].old_no, Some(10));
         assert_eq!(file_stats(&files[0]), (2, 1));
+    }
+
+    #[test]
+    fn splits_per_file_segments_aligned_with_parse() {
+        let segments = split_file_diffs(SAMPLE);
+        let files = parse_unified_diff(SAMPLE);
+        assert_eq!(segments.len(), files.len());
+        assert!(segments[0].starts_with("diff --git a/src/a.rs"));
+        assert!(segments[0].contains("println!(\"extra\");"));
+        assert!(!segments[0].contains("README"));
+        assert!(segments[1].starts_with("diff --git a/README.md"));
+        assert!(segments[1].ends_with("+added\n"));
     }
 
     #[test]

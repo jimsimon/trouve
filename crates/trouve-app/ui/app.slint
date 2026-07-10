@@ -1064,6 +1064,7 @@ export component AppWindow inherits Window {
 
     // --- right column -------------------------------------------------------
     in property <[DiffRow]> diff-rows;
+    in property <[string]> diff-file-texts;
     // Raw unified diff / raw file content backing the views, for copying.
     in property <string> diff-text: "";
     in property <string> open-file-text: "";
@@ -2728,6 +2729,7 @@ export component AppWindow inherits Window {
                         DiffView {
                             vertical-stretch: 1;
                             rows: root.diff-rows;
+                            file-diffs: root.diff-file-texts;
                             background: Theme.c.surface;
                             code-font-size: Theme.fs(13px);
                             file-header-bg: Theme.c.hover-bg;

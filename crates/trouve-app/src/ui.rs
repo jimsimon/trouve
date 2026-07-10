@@ -399,7 +399,12 @@ pub fn set_diff(ui: &Ui, rows: Vec<slint_diff_view::RowData>, raw: String) {
                 collapsed: r.collapsed,
             })
             .collect();
+        let file_texts: Vec<SharedString> = slint_diff_view::split_file_diffs(&raw)
+            .into_iter()
+            .map(|s| SharedString::from(s.as_str()))
+            .collect();
         ui.set_diff_rows(ModelRc::new(VecModel::from(items)));
+        ui.set_diff_file_texts(ModelRc::new(VecModel::from(file_texts)));
         ui.set_diff_text(SharedString::from(raw.as_str()));
     });
 }
