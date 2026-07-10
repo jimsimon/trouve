@@ -95,6 +95,10 @@ pub struct Usage {
     /// Estimated cost in USD, when list pricing for the model is known.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cost_usd: Option<f64>,
+    /// The model's context window as reported live by the provider during
+    /// the turn. Authoritative over any static catalog value.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_window: Option<u64>,
 }
 
 /// Terminal status of a tool call.

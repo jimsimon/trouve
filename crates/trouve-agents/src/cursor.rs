@@ -635,6 +635,7 @@ fn parse_usage(usage: &Value) -> Usage {
         output_tokens: usage["outputTokens"].as_u64().unwrap_or(0),
         cached_input_tokens: usage["cachedReadTokens"].as_u64().unwrap_or(0),
         cost_usd: None,
+        context_window: None,
     }
 }
 

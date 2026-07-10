@@ -39,6 +39,9 @@ pub struct CodexBackend {
     server: Mutex<Option<Arc<AppServer>>>,
     /// `model/list` result, cached for [`MODELS_TTL`].
     models_cache: Mutex<Option<(std::time::Instant, Vec<ModelInfo>)>>,
+    /// Real context windows by model name, learned from
+    /// `thread/tokenUsage/updated` (`model/list` doesn't report them).
+    observed_windows: Arc<std::sync::Mutex<HashMap<String, u64>>>,
 }
 
 /// How long a fetched vendor model list stays fresh.
@@ -51,6 +54,22 @@ impl CodexBackend {
             command: command.unwrap_or_else(|| "codex".into()),
             server: Mutex::new(None),
             models_cache: Mutex::new(None),
+            observed_windows: Arc::new(std::sync::Mutex::new(HashMap::new())),
+        }
+    }
+
+    /// Replace catalog context windows with real values observed from live
+    /// turns, matched on the model name after the backend prefix.
+    fn apply_observed_windows(&self, models: &mut [ModelInfo]) {
+        let observed = self.observed_windows.lock().unwrap();
+        if observed.is_empty() {
+            return;
+        }
+        for m in models {
+            let name = m.id.rsplit_once('/').map_or(m.id.as_str(), |(_, n)| n);
+            if let Some(n) = observed.get(name) {
+                m.context_window = *n;
+            }
         }
     }
 
@@ -77,10 +96,12 @@ impl AgentBackend for CodexBackend {
     fn models(&self) -> Vec<ModelInfo> {
         // Minimal offline fallback; `list_models` asks the app-server for
         // the real catalog (with per-model reasoning-effort variants).
-        vec![
+        let mut models = vec![
             model(&self.id, "gpt-5.4-codex", "GPT-5.4 Codex", 272_000),
             model(&self.id, "gpt-5.4", "GPT-5.4", 272_000),
-        ]
+        ];
+        self.apply_observed_windows(&mut models);
+        models
     }
 
     async fn list_models(&self) -> Vec<ModelInfo> {
@@ -88,7 +109,9 @@ impl AgentBackend for CodexBackend {
             let cache = self.models_cache.lock().await;
             if let Some((at, models)) = cache.as_ref() {
                 if at.elapsed() < MODELS_TTL {
-                    return models.clone();
+                    let mut models = models.clone();
+                    self.apply_observed_windows(&mut models);
+                    return models;
                 }
             }
         }
@@ -99,11 +122,12 @@ impl AgentBackend for CodexBackend {
         .await;
         match fetched {
             Ok(result) => {
-                let models = parse_model_list(&self.id, &result);
+                let mut models = parse_model_list(&self.id, &result);
                 if models.is_empty() {
                     return self.models();
                 }
                 *self.models_cache.lock().await = Some((std::time::Instant::now(), models.clone()));
+                self.apply_observed_windows(&mut models);
                 models
             }
             Err(e) => {
@@ -224,6 +248,8 @@ impl AgentBackend for CodexBackend {
             codex_thread_id.clone(),
             route,
             fresh_session,
+            model_or_default(model_name).to_string(),
+            self.observed_windows.clone(),
         );
         Ok(stream.boxed())
     }
@@ -305,6 +331,8 @@ fn turn_stream(
     codex_thread_id: String,
     mut route: mpsc::Receiver<ServerMsg>,
     fresh_session: bool,
+    model_name: String,
+    observed_windows: Arc<std::sync::Mutex<HashMap<String, u64>>>,
 ) -> impl futures::Stream<Item = Result<BackendEvent, BackendError>> {
     async_stream(move |tx| async move {
         if fresh_session {
@@ -390,6 +418,10 @@ fn turn_stream(
                         usage.input_tokens = u.input_tokens;
                         usage.cached_input_tokens = u.cached_input_tokens;
                         usage.output_tokens += u.output_tokens;
+                        if let Some(n) = u.context_window {
+                            usage.context_window = Some(n);
+                            observed_windows.lock().unwrap().insert(model_name.clone(), n);
+                        }
                     }
                     "turn/completed" => {
                         let status = params["turn"]["status"].as_str().unwrap_or("completed");
@@ -449,6 +481,13 @@ fn parse_usage(params: &Value) -> Usage {
         .get("tokenUsage")
         .or_else(|| params.get("usage"))
         .unwrap_or(params);
+    // The model's real context window rides along at the tokenUsage level;
+    // `model/list` never reports it, so this is the only source of truth.
+    let context_window = u
+        .get("modelContextWindow")
+        .or_else(|| u.get("model_context_window"))
+        .and_then(Value::as_u64)
+        .filter(|n| *n > 0);
     // Current app-servers nest per-call usage under "last" (a thread-wide
     // "total" sits alongside); older builds put the fields at the top level.
     let u = u.get("last").unwrap_or(u);
@@ -469,6 +508,7 @@ fn parse_usage(params: &Value) -> Usage {
             "cacheReadTokens",
         ]),
         cost_usd: None,
+        context_window,
     }
 }
 
@@ -678,12 +718,37 @@ mod tests {
         assert_eq!(u.input_tokens, 1200);
         assert_eq!(u.cached_input_tokens, 1000);
         assert_eq!(u.output_tokens, 50);
+        assert_eq!(u.context_window, Some(272000));
 
-        // Older flat shape still parses.
+        // Older flat shape still parses; no window reported means None.
         let flat = json!({ "usage": { "inputTokens": 7, "outputTokens": 3 } });
         let u = parse_usage(&flat);
         assert_eq!(u.input_tokens, 7);
         assert_eq!(u.output_tokens, 3);
+        assert_eq!(u.context_window, None);
+    }
+
+    #[test]
+    fn observed_windows_override_catalog_sizes() {
+        let backend = CodexBackend::new("codex", None);
+        let before = backend.models();
+        assert!(before.iter().all(|m| m.context_window == 272_000));
+
+        backend
+            .observed_windows
+            .lock()
+            .unwrap()
+            .insert("gpt-5.4-codex".into(), 400_000);
+        let after = backend.models();
+        let by_id = |id: &str| {
+            after
+                .iter()
+                .find(|m| m.id == id)
+                .map(|m| m.context_window)
+                .unwrap()
+        };
+        assert_eq!(by_id("codex/gpt-5.4-codex"), 400_000);
+        assert_eq!(by_id("codex/gpt-5.4"), 272_000);
     }
 
     #[test]

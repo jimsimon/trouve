@@ -3138,6 +3138,15 @@
             "description": "Cached/read tokens where the provider reports them.",
             "minimum": 0
           },
+          "context_window": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "The model's context window as reported live by the provider during\nthe turn. Authoritative over any static catalog value.",
+            "minimum": 0
+          },
           "cost_usd": {
             "type": [
               "number",

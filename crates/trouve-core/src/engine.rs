@@ -2357,6 +2357,9 @@ impl Engine {
                     if let Some(cost) = usage.cost_usd {
                         usage_total.cost_usd = Some(usage_total.cost_usd.unwrap_or(0.0) + cost);
                     }
+                    if usage.context_window.is_some() {
+                        usage_total.context_window = usage.context_window;
+                    }
                 }
             }
         }

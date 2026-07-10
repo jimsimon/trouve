@@ -596,6 +596,7 @@ fn map_event(ev: &Value) -> Vec<BackendEvent> {
                     // plans, where nothing is billed per turn; suppress it
                     // like the other subscription backends.
                     cost_usd: None,
+                    context_window: None,
                 },
             });
             events

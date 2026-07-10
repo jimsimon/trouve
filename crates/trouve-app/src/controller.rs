@@ -798,12 +798,19 @@ impl Controller {
             ui::set_context(&self.ui, 0.0, false, "no thread selected".into());
             return;
         };
-        let window = self
+        let catalog_window = self
             .models
             .iter()
             .find(|m| m.id == thread.model)
             .map(|m| m.context_window);
         let vm = self.vms.entry(thread.id.clone()).or_default();
+        // A window reported live by the provider (codex sends the real one
+        // with token usage) beats the static catalog guess.
+        let window = vm
+            .last_usage
+            .as_ref()
+            .and_then(|u| u.context_window)
+            .or(catalog_window);
         let used = vm
             .last_usage
             .as_ref()
