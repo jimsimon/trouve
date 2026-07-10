@@ -1069,9 +1069,20 @@ export component AppWindow inherits Window {
     // every viewport-height change; renders that must not move the view
     // (expand/collapse toggles, restored positions) clear it.
     in-out property <bool> chat-follow: false;
+    // The viewport-y/viewport-height the tail pin last wrote. The
+    // viewport-y watcher compares against them to tell user scrolls
+    // (which end following) from pin writes and the ListView's own
+    // layout adjustments (which don't). A jump from far away converges
+    // over several frames: each one instantiates rows near the new
+    // offset, re-measures them, and may re-derive viewport-y — only a
+    // move with the content height unchanged is a real user scroll.
+    property <length> chat-pin-y: 0px;
+    property <length> chat-pin-h: 0px;
     public function scroll-chat-to-end() {
         root.chat-follow = true;
         chat-list.viewport-y = min(0px, chat-list.visible-height - chat-list.viewport-height);
+        root.chat-pin-y = chat-list.viewport-y;
+        root.chat-pin-h = chat-list.viewport-height;
     }
     // True while the view rests at the tail. In-place re-renders read it to
     // keep the bottom anchored: the ListView re-derives viewport-y from
@@ -1504,13 +1515,29 @@ export component AppWindow inherits Window {
                     // hover-out; drop any tooltip it left behind.
                     changed viewport-y => {
                         Tip.hide-all();
-                        // A scroll that leaves the tail ends following.
-                        // Without this the height re-estimation pin below
-                        // keeps snapping the view back to the bottom,
-                        // fighting the scrollbar (it looks stuck and
-                        // wiggles) after any at-the-tail re-render.
-                        if (root.chat-follow && !root.chat-at-bottom) {
-                            root.chat-follow = false;
+                        // A user scroll that leaves the tail ends
+                        // following — without this the tail pin keeps
+                        // snapping the view back to the bottom, fighting
+                        // the scrollbar (it looks stuck and wiggles)
+                        // after any at-the-tail re-render. But only a
+                        // move with the content height unchanged is a
+                        // user scroll: the pin's own writes and the
+                        // ListView's layout adjustments (it re-derives
+                        // viewport-y while re-measuring freshly
+                        // instantiated rows) coincide with a
+                        // viewport-height change, and must re-pin
+                        // instead so a jump from far away converges on
+                        // the bottom over a few frames.
+                        if (root.chat-follow && !root.chat-at-bottom
+                                && self.viewport-y != root.chat-pin-y) {
+                            if (self.viewport-height == root.chat-pin-h) {
+                                root.chat-follow = false;
+                            } else {
+                                self.viewport-y = min(0px,
+                                    self.visible-height - self.viewport-height);
+                                root.chat-pin-y = self.viewport-y;
+                                root.chat-pin-h = self.viewport-height;
+                            }
                         }
                     }
                     // Keep the tail (activity spinner) on screen as rows
@@ -1519,6 +1546,8 @@ export component AppWindow inherits Window {
                         if (root.chat-follow) {
                             self.viewport-y = min(0px,
                                 self.visible-height - self.viewport-height);
+                            root.chat-pin-y = self.viewport-y;
+                            root.chat-pin-h = self.viewport-height;
                         }
                     }
 
@@ -2294,6 +2323,12 @@ export component AppWindow inherits Window {
                             : 0;
                     }
                     function set-from-y(y: length, grab: length) {
+                        // An explicit scrollbar move is always a user
+                        // scroll: end tail-following outright (the
+                        // viewport-y watcher's height heuristic could
+                        // mistake a drag for layout noise while rows are
+                        // still re-measuring).
+                        root.chat-follow = false;
                         chat-list.viewport-y = -clamp(
                             ((y - self.margin - grab)
                                 / max(1px, self.track - self.thumb-h))
