@@ -8,7 +8,7 @@
 // Like the main window, this is dumb: models in, callbacks out.
 
 import {
-    AboutSlint, Button, ComboBox, LineEdit, ListView, ScrollView
+    AboutSlint, Button, ComboBox, LineEdit, ListView, ScrollView, TextEdit
 } from "std-widgets.slint";
 import { ScrollKeys } from "scroll-keys.slint";
 import { Theme } from "theme.slint";
@@ -33,6 +33,23 @@ export struct CliItem {
     // In-flight install feedback ("downloading…", "failed: …").
     status: string,
     busy: bool,
+}
+
+// A user-managed MCP server (first-party servers trouve injects itself are
+// never listed). command-line and env-lines are pre-rendered for display
+// and round-trip through the edit form.
+export struct McpServerItem {
+    name: string,
+    // "user" (config dir) or "workspace" (.agents/.mcp.json).
+    scope: string,
+    // Command plus args, shell-quoted.
+    command-line: string,
+    // One KEY=VALUE per line ("" when none).
+    env-lines: string,
+    // "ok" / "error" / "checking"
+    health: string,
+    // "5 tools" or the failure reason.
+    detail: string,
 }
 
 // A well-known provider preset served by the backend; picking one prefills
@@ -113,11 +130,32 @@ export component SettingsScreen inherits Rectangle {
     in property <string> github-source: "";
     callback github-token-saved(string);
 
-    // Side-nav selection: 0 providers, 1 models, 2 modes, 3 integrations,
-    // 4 appearance, 5 about. in-out so the app can open straight to a
-    // section (e.g. the PR tab's "set up GitHub" button).
+    // MCP servers (user config + current workspace).
+    in property <[McpServerItem]> mcp-servers;
+    in property <string> mcp-status: "";
+    // Logs viewer: non-empty name shows the panel.
+    in property <string> mcp-logs-name: "";
+    in property <string> mcp-logs-text: "";
+    // Add/edit form state. scope is fixed by the button that opened the
+    // form; editing locks the name (it is the file key).
+    in-out property <bool> mcp-form-open: false;
+    in-out property <bool> mcp-form-editing: false;
+    in-out property <string> mcp-form-scope: "user";
+    in-out property <string> mcp-form-name: "";
+    in-out property <string> mcp-form-command: "";
+    in-out property <string> mcp-form-env: "";
+    callback mcp-refresh();
+    callback mcp-saved(/* name */ string, /* scope */ string,
+                       /* command-line */ string, /* env-lines */ string);
+    callback mcp-deleted(/* name */ string, /* scope */ string);
+    callback mcp-logs-requested(string);
+    callback mcp-logs-closed();
+
+    // Side-nav selection: 0 providers, 1 models, 2 modes, 3 mcp servers,
+    // 4 integrations, 5 appearance, 6 about. in-out so the app can open
+    // straight to a section (e.g. the PR tab's "set up GitHub" button).
     in-out property <int> section: 0;
-    property <[string]> section-names: ["Providers", "Models", "Modes", "Integrations", "Appearance", "About"];
+    property <[string]> section-names: ["Providers", "Models", "Modes", "MCP Servers", "Integrations", "Appearance", "About"];
 
     VerticalLayout {
         // Header: title + a way back to wherever the user came from.
@@ -500,8 +538,253 @@ export component SettingsScreen inherits Rectangle {
                             }
                         }
 
-                        // ---------------- integrations ----------------
+                        // ---------------- mcp servers ----------------
                         if root.section == 3: VerticalLayout {
+                            spacing: 12px;
+
+                            HorizontalLayout {
+                                Text {
+                                    text: "MCP Servers";
+                                    color: Theme.c.text-hi;
+                                    font-size: Theme.fs(16px);
+                                    font-weight: 700;
+                                    vertical-alignment: center;
+                                    horizontal-stretch: 1;
+                                }
+                                Button {
+                                    text: "⟳ Refresh";
+                                    clicked => { root.mcp-refresh(); }
+                                }
+                            }
+                            Text {
+                                text: "External tool servers offered to the agent as mcp__<server>__<tool>. Each one needs first-use approval per session. trouve's own built-in servers are not listed.";
+                                color: Theme.c.text-soft;
+                                font-size: Theme.fs(11px);
+                                wrap: word-wrap;
+                            }
+                            if root.mcp-status != "": Text {
+                                text: root.mcp-status;
+                                color: Theme.c.text-soft;
+                                font-size: Theme.fs(12px);
+                                wrap: word-wrap;
+                            }
+
+                            Rectangle {
+                                background: Theme.c.surface;
+                                border-radius: 6px;
+                                height: 180px;
+                                if root.mcp-servers.length == 0: Text {
+                                    text: "No MCP servers configured.";
+                                    color: Theme.c.text-soft;
+                                    font-size: Theme.fs(12px);
+                                    horizontal-alignment: center;
+                                    vertical-alignment: center;
+                                }
+                                ListView {
+                                    for server in root.mcp-servers: Rectangle {
+                                        height: Theme.fs(40px);
+                                        HorizontalLayout {
+                                            padding-left: 10px;
+                                            padding-right: 6px;
+                                            spacing: 8px;
+                                            Text {
+                                                text: server.health == "ok" ? "●"
+                                                    : server.health == "error" ? "●" : "○";
+                                                color: server.health == "ok" ? Theme.c.ok
+                                                    : server.health == "error" ? Theme.c.err
+                                                    : Theme.c.text-soft;
+                                                font-size: Theme.fs(12px);
+                                                vertical-alignment: center;
+                                            }
+                                            VerticalLayout {
+                                                alignment: center;
+                                                horizontal-stretch: 1;
+                                                HorizontalLayout {
+                                                    spacing: 6px;
+                                                    alignment: start;
+                                                    Text {
+                                                        text: server.name;
+                                                        color: Theme.c.text-hi;
+                                                        font-size: Theme.fs(13px);
+                                                        font-weight: 700;
+                                                        overflow: elide;
+                                                    }
+                                                    Text {
+                                                        text: server.scope;
+                                                        color: Theme.c.accent-tint;
+                                                        font-size: Theme.fs(10px);
+                                                        vertical-alignment: center;
+                                                    }
+                                                }
+                                                Text {
+                                                    text: server.command-line
+                                                        + (server.detail != "" ? "  ·  " + server.detail : "");
+                                                    color: server.health == "error"
+                                                        ? Theme.c.err-soft : Theme.c.text-dim;
+                                                    font-size: Theme.fs(11px);
+                                                    overflow: elide;
+                                                }
+                                            }
+                                            Button {
+                                                text: "Logs";
+                                                clicked => { root.mcp-logs-requested(server.name); }
+                                            }
+                                            Button {
+                                                text: "Edit";
+                                                clicked => {
+                                                    root.mcp-form-open = true;
+                                                    root.mcp-form-editing = true;
+                                                    root.mcp-form-scope = server.scope;
+                                                    root.mcp-form-name = server.name;
+                                                    root.mcp-form-command = server.command-line;
+                                                    root.mcp-form-env = server.env-lines;
+                                                }
+                                            }
+                                            Button {
+                                                text: "Remove";
+                                                clicked => { root.mcp-deleted(server.name, server.scope); }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+
+                            HorizontalLayout {
+                                spacing: 8px;
+                                Button {
+                                    text: "+ Add to user config";
+                                    clicked => {
+                                        root.mcp-form-open = true;
+                                        root.mcp-form-editing = false;
+                                        root.mcp-form-scope = "user";
+                                        root.mcp-form-name = "";
+                                        root.mcp-form-command = "";
+                                        root.mcp-form-env = "";
+                                    }
+                                }
+                                Button {
+                                    text: "+ Add to workspace";
+                                    clicked => {
+                                        root.mcp-form-open = true;
+                                        root.mcp-form-editing = false;
+                                        root.mcp-form-scope = "workspace";
+                                        root.mcp-form-name = "";
+                                        root.mcp-form-command = "";
+                                        root.mcp-form-env = "";
+                                    }
+                                }
+                                Rectangle { horizontal-stretch: 1; }
+                            }
+
+                            // Add/edit form.
+                            if root.mcp-form-open: Rectangle {
+                                background: Theme.c.surface;
+                                border-radius: 6px;
+                                VerticalLayout {
+                                    padding: 14px;
+                                    spacing: 8px;
+                                    Text {
+                                        text: (root.mcp-form-editing ? "Edit " : "New ")
+                                            + (root.mcp-form-scope == "user"
+                                                ? "user server (~/.config/trouve/mcp.json)"
+                                                : "workspace server (.agents/.mcp.json)");
+                                        color: Theme.c.text-mid;
+                                        font-size: Theme.fs(12px);
+                                        font-weight: 700;
+                                    }
+                                    HorizontalLayout {
+                                        spacing: 8px;
+                                        LineEdit {
+                                            text <=> root.mcp-form-name;
+                                            placeholder-text: "name (e.g. jira)";
+                                            enabled: !root.mcp-form-editing;
+                                            width: 160px;
+                                        }
+                                        LineEdit {
+                                            text <=> root.mcp-form-command;
+                                            placeholder-text: "command and args (e.g. npx -y jira-mcp --stdio)";
+                                            horizontal-stretch: 1;
+                                        }
+                                    }
+                                    TextEdit {
+                                        text <=> root.mcp-form-env;
+                                        placeholder-text: "environment, one KEY=VALUE per line; ${VAR} expands at launch";
+                                        height: Theme.fs(64px);
+                                        wrap: no-wrap;
+                                    }
+                                    HorizontalLayout {
+                                        spacing: 8px;
+                                        Button {
+                                            text: root.mcp-form-editing ? "Save changes" : "Add server";
+                                            primary: true;
+                                            enabled: root.mcp-form-name != "" && root.mcp-form-command != "";
+                                            clicked => {
+                                                root.mcp-saved(root.mcp-form-name, root.mcp-form-scope,
+                                                    root.mcp-form-command, root.mcp-form-env);
+                                                root.mcp-form-open = false;
+                                            }
+                                        }
+                                        Button {
+                                            text: "Cancel";
+                                            clicked => { root.mcp-form-open = false; }
+                                        }
+                                        Rectangle { horizontal-stretch: 1; }
+                                    }
+                                }
+                            }
+
+                            // Logs viewer.
+                            if root.mcp-logs-name != "": Rectangle {
+                                background: Theme.c.surface;
+                                border-radius: 6px;
+                                VerticalLayout {
+                                    padding: 10px;
+                                    spacing: 6px;
+                                    HorizontalLayout {
+                                        Text {
+                                            text: "Logs — " + root.mcp-logs-name;
+                                            color: Theme.c.text-hi;
+                                            font-size: Theme.fs(12px);
+                                            font-weight: 700;
+                                            vertical-alignment: center;
+                                            horizontal-stretch: 1;
+                                        }
+                                        Button {
+                                            text: "⟳";
+                                            clicked => { root.mcp-logs-requested(root.mcp-logs-name); }
+                                        }
+                                        Button {
+                                            text: "✕";
+                                            clicked => { root.mcp-logs-closed(); }
+                                        }
+                                    }
+                                    Rectangle {
+                                        background: Theme.c.code-bg;
+                                        border-radius: 4px;
+                                        height: 180px;
+                                        mcp-log-scroll := ScrollView {
+                                            width: 100%;
+                                            height: 100%;
+                                            VerticalLayout {
+                                                padding: 8px;
+                                                Text {
+                                                    text: root.mcp-logs-text == ""
+                                                        ? "No log lines yet — logs appear after a health check or the first tool call."
+                                                        : root.mcp-logs-text;
+                                                    color: Theme.c.code-fg;
+                                                    font-family: "monospace";
+                                                    font-size: Theme.fs(11px);
+                                                    wrap: word-wrap;
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
+                        // ---------------- integrations ----------------
+                        if root.section == 4: VerticalLayout {
                             spacing: 12px;
 
                             Text {
@@ -579,7 +862,7 @@ export component SettingsScreen inherits Rectangle {
                         }
 
                         // ---------------- appearance ----------------
-                        if root.section == 4: VerticalLayout {
+                        if root.section == 5: VerticalLayout {
                             spacing: 12px;
 
                             Text {
@@ -686,7 +969,7 @@ export component SettingsScreen inherits Rectangle {
                         }
 
                         // ---------------- about ----------------
-                        if root.section == 5: VerticalLayout {
+                        if root.section == 6: VerticalLayout {
                             spacing: 12px;
 
                             Text {

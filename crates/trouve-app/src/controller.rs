@@ -139,6 +139,24 @@ pub enum UiCommand {
     OpenIntegrationsSettings,
     /// Store/remove the GitHub token (empty = remove).
     SaveGithubToken(String),
+    /// Re-list MCP servers (quick list, then health probes).
+    RefreshMcp,
+    SaveMcpServer {
+        name: String,
+        scope: String,
+        /// Command plus args as one shell-quoted line.
+        command_line: String,
+        /// One KEY=VALUE per line.
+        env_lines: String,
+    },
+    DeleteMcpServer {
+        name: String,
+        scope: String,
+    },
+    /// Fetch recent log lines for one MCP server.
+    McpLogs(String),
+    /// Internal: an MCP list fetch finished (true = with health probes).
+    McpLoaded(Vec<trouve_protocol::McpServerInfo>, bool),
 
     /// Internal: an event arrived on some thread's stream.
     Event(String, Box<EventEnvelope>),
@@ -997,6 +1015,34 @@ impl Controller {
         ui::set_github_integration(&self.ui, self.github_configured, &self.github_source);
     }
 
+    /// Reload the MCP server list in the background: a quick unprobed list
+    /// paints immediately, then health probes fill in (they spawn every
+    /// server, which can take seconds).
+    fn refresh_mcp(&self) {
+        let client = self.client.clone();
+        let tx = self.tx.clone();
+        let ui = self.ui.clone();
+        let workspace_id = self.home_workspace_id.clone();
+        tokio::spawn(async move {
+            let ws = (!workspace_id.is_empty()).then_some(workspace_id);
+            match client.list_mcp_servers(ws.as_deref(), false).await {
+                Ok(list) => {
+                    let _ = tx.send(UiCommand::McpLoaded(list, false));
+                }
+                Err(e) => {
+                    ui::set_mcp_status(&ui, format!("failed to load MCP servers: {e:#}"));
+                    return;
+                }
+            }
+            match client.list_mcp_servers(ws.as_deref(), true).await {
+                Ok(list) => {
+                    let _ = tx.send(UiCommand::McpLoaded(list, true));
+                }
+                Err(e) => ui::set_mcp_status(&ui, format!("health check failed: {e:#}")),
+            }
+        });
+    }
+
     /// Reload the Files tree from scratch (session switch, refresh).
     async fn load_files(&mut self) -> Result<()> {
         self.file_children.clear();
@@ -1419,6 +1465,7 @@ impl Controller {
             }
             UiCommand::OpenSettings => {
                 self.refresh_settings().await;
+                self.refresh_mcp();
                 ui::set_center_screen(&self.ui, 3);
             }
             UiCommand::CloseSettings => {
@@ -1833,10 +1880,77 @@ impl Controller {
                 }
             }
             UiCommand::OpenIntegrationsSettings => {
-                ui::set_settings_section(&self.ui, 3);
+                ui::set_settings_section(&self.ui, 4);
                 self.refresh_settings().await;
+                self.refresh_mcp();
                 ui::set_center_screen(&self.ui, 3);
             }
+            UiCommand::RefreshMcp => self.refresh_mcp(),
+            UiCommand::McpLoaded(servers, probed) => {
+                let items = servers
+                    .into_iter()
+                    .map(|s| ui::McpView {
+                        name: s.name,
+                        scope: s.scope,
+                        command_line: render_command_line(&s.command, &s.args),
+                        env_lines: s
+                            .env
+                            .iter()
+                            .map(|(k, v)| format!("{k}={v}"))
+                            .collect::<Vec<_>>()
+                            .join("\n"),
+                        health: if probed { s.health } else { "checking".into() },
+                        detail: s.detail,
+                    })
+                    .collect();
+                ui::set_mcp_servers(&self.ui, items);
+                ui::set_mcp_status(
+                    &self.ui,
+                    if probed {
+                        String::new()
+                    } else {
+                        "checking server health…".into()
+                    },
+                );
+            }
+            UiCommand::SaveMcpServer {
+                name,
+                scope,
+                command_line,
+                env_lines,
+            } => match parse_mcp_form(&command_line, &env_lines) {
+                Ok((command, args, env)) => {
+                    let req = trouve_protocol::UpsertMcpServerRequest {
+                        workspace_id: (scope == "workspace")
+                            .then(|| self.home_workspace_id.clone()),
+                        scope,
+                        command,
+                        args,
+                        env,
+                    };
+                    match self.client.upsert_mcp_server(&name, &req).await {
+                        Ok(()) => self.refresh_mcp(),
+                        Err(e) => ui::set_mcp_status(&self.ui, format!("{e:#}")),
+                    }
+                }
+                Err(e) => ui::set_mcp_status(&self.ui, e),
+            },
+            UiCommand::DeleteMcpServer { name, scope } => {
+                let workspace_id =
+                    (scope == "workspace").then(|| self.home_workspace_id.clone());
+                match self
+                    .client
+                    .delete_mcp_server(&name, &scope, workspace_id.as_deref())
+                    .await
+                {
+                    Ok(()) => self.refresh_mcp(),
+                    Err(e) => ui::set_mcp_status(&self.ui, format!("{e:#}")),
+                }
+            }
+            UiCommand::McpLogs(name) => match self.client.mcp_server_logs(&name).await {
+                Ok(logs) => ui::set_mcp_logs(&self.ui, name, logs.lines.join("\n")),
+                Err(e) => self.error(&format!("loading MCP logs: {e:#}")),
+            },
             UiCommand::SaveGithubToken(token) => {
                 match self.client.set_github_token(&token).await {
                     Ok(integration) => {
@@ -2249,6 +2363,49 @@ fn format_reviews(reviews: &[trouve_protocol::PrReview]) -> String {
         .map(|r| format!("{} — {}", r.reviewer, r.state))
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+/// Command + args as one shell-quoted line (round-trips through the MCP
+/// edit form and `parse_mcp_form`).
+fn render_command_line(command: &str, args: &[String]) -> String {
+    std::iter::once(command)
+        .chain(args.iter().map(String::as_str))
+        .map(|part| {
+            shlex::try_quote(part)
+                .map(|q| q.into_owned())
+                .unwrap_or_else(|_| part.to_string())
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Split the MCP form's command line and KEY=VALUE env block.
+#[allow(clippy::type_complexity)]
+fn parse_mcp_form(
+    command_line: &str,
+    env_lines: &str,
+) -> Result<(String, Vec<String>, std::collections::BTreeMap<String, String>), String> {
+    let mut parts = shlex::split(command_line)
+        .ok_or_else(|| "command line has unbalanced quotes".to_string())?;
+    if parts.is_empty() {
+        return Err("command is required".to_string());
+    }
+    let command = parts.remove(0);
+    let mut env = std::collections::BTreeMap::new();
+    for line in env_lines.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let (key, value) = line
+            .split_once('=')
+            .ok_or_else(|| format!("environment line '{line}' is not KEY=VALUE"))?;
+        if key.trim().is_empty() {
+            return Err(format!("environment line '{line}' has an empty key"));
+        }
+        env.insert(key.trim().to_string(), value.to_string());
+    }
+    Ok((command, parts, env))
 }
 
 #[cfg(test)]

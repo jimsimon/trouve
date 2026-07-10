@@ -329,6 +329,60 @@ impl ProtocolClient {
         self.get_json(&format!("/sessions/{session_id}/prs")).await
     }
 
+    /// User + workspace MCP servers; `probe` spawns each one for a health
+    /// check, so expect the call to take a few seconds.
+    pub async fn list_mcp_servers(
+        &self,
+        workspace_id: Option<&str>,
+        probe: bool,
+    ) -> Result<Vec<McpServerInfo>> {
+        let mut path = format!("/mcp-servers?probe={probe}");
+        if let Some(id) = workspace_id {
+            path.push_str(&format!("&workspace_id={id}"));
+        }
+        self.get_json(&path).await
+    }
+
+    pub async fn upsert_mcp_server(
+        &self,
+        name: &str,
+        req: &UpsertMcpServerRequest,
+    ) -> Result<()> {
+        let resp = self
+            .http
+            .put(format!("{}/mcp-servers/{name}", self.base))
+            .json(req)
+            .send()
+            .await?;
+        let status = resp.status();
+        if !status.is_success() {
+            let message = resp
+                .json::<ErrorBody>()
+                .await
+                .map(|e| e.message)
+                .unwrap_or_else(|_| status.to_string());
+            bail!("saving MCP server failed: {message}");
+        }
+        Ok(())
+    }
+
+    pub async fn delete_mcp_server(
+        &self,
+        name: &str,
+        scope: &str,
+        workspace_id: Option<&str>,
+    ) -> Result<()> {
+        let mut path = format!("/mcp-servers/{name}?scope={scope}");
+        if let Some(id) = workspace_id {
+            path.push_str(&format!("&workspace_id={id}"));
+        }
+        self.delete(&path).await
+    }
+
+    pub async fn mcp_server_logs(&self, name: &str) -> Result<McpLogs> {
+        self.get_json(&format!("/mcp-servers/{name}/logs")).await
+    }
+
     pub async fn github_integration(&self) -> Result<GithubIntegration> {
         self.get_json("/integrations/github").await
     }

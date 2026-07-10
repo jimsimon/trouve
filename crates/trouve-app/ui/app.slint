@@ -12,14 +12,14 @@ import {
 import { DiffView, DiffRow } from "diff-view.slint";
 import { CodeView, TextSegment } from "code-view.slint";
 import {
-    SettingsScreen, ProviderItem, CliItem, KnownProviderItem
+    SettingsScreen, ProviderItem, CliItem, KnownProviderItem, McpServerItem
 } from "settings-window.slint";
 import { ScrollKeys } from "scroll-keys.slint";
 import { Theme, ThemePalette } from "theme.slint";
 import { Palette } from "std-widgets.slint";
 
 // Theme re-exported so Rust can push the selected palette.
-export { DiffRow, TextSegment, ProviderItem, CliItem, KnownProviderItem }
+export { DiffRow, TextSegment, ProviderItem, CliItem, KnownProviderItem, McpServerItem }
 export { Theme, ThemePalette }
 
 // One row of the left nav: workspace headers, sessions, archived toggles.
@@ -965,6 +965,16 @@ export component AppWindow inherits Window {
     in property <bool> settings-github-configured: false;
     in property <string> settings-github-source: "";
     callback github-token-saved(string);
+    in property <[McpServerItem]> settings-mcp-servers;
+    in property <string> settings-mcp-status: "";
+    in property <string> settings-mcp-logs-name: "";
+    in property <string> settings-mcp-logs-text: "";
+    callback mcp-refresh();
+    callback mcp-saved(/* name */ string, /* scope */ string,
+                       /* command-line */ string, /* env-lines */ string);
+    callback mcp-deleted(/* name */ string, /* scope */ string);
+    callback mcp-logs-requested(string);
+    callback mcp-logs-closed();
     callback provider-saved(/* id */ string, /* kind */ string,
                             /* base-url */ string, /* api-key */ string);
     callback provider-deleted(string);
@@ -3171,6 +3181,17 @@ export component AppWindow inherits Window {
         github-configured: root.settings-github-configured;
         github-source: root.settings-github-source;
         github-token-saved(token) => { root.github-token-saved(token); }
+        mcp-servers: root.settings-mcp-servers;
+        mcp-status: root.settings-mcp-status;
+        mcp-logs-name: root.settings-mcp-logs-name;
+        mcp-logs-text: root.settings-mcp-logs-text;
+        mcp-refresh => { root.mcp-refresh(); }
+        mcp-saved(name, scope, command, env) => {
+            root.mcp-saved(name, scope, command, env);
+        }
+        mcp-deleted(name, scope) => { root.mcp-deleted(name, scope); }
+        mcp-logs-requested(name) => { root.mcp-logs-requested(name); }
+        mcp-logs-closed => { root.mcp-logs-closed(); }
         theme-names: root.appearance-theme-names;
         theme-index <=> root.appearance-theme-index;
         font-size-names: root.appearance-font-size-names;

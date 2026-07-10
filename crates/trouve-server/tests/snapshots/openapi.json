@@ -229,6 +229,172 @@
         }
       }
     },
+    "/v1/mcp-servers": {
+      "get": {
+        "tags": [],
+        "operationId": "list_mcp_servers",
+        "parameters": [
+          {
+            "name": "workspace_id",
+            "in": "query",
+            "description": "Include the workspace's .agents servers",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "probe",
+            "in": "query",
+            "description": "Health-check each server",
+            "required": false,
+            "schema": {
+              "type": "boolean"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/McpServerInfo"
+                  }
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/mcp-servers/{name}": {
+      "put": {
+        "tags": [],
+        "operationId": "upsert_mcp_server",
+        "parameters": [
+          {
+            "name": "name",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UpsertMcpServerRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "204": {
+            "description": ""
+          },
+          "400": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      },
+      "delete": {
+        "tags": [],
+        "operationId": "delete_mcp_server",
+        "parameters": [
+          {
+            "name": "name",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "scope",
+            "in": "query",
+            "description": "user or workspace",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "workspace_id",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": ""
+          },
+          "400": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/mcp-servers/{name}/logs": {
+      "get": {
+        "tags": [],
+        "operationId": "mcp_server_logs",
+        "parameters": [
+          {
+            "name": "name",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/McpLogs"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/v1/models": {
       "get": {
         "tags": [],
@@ -2632,6 +2798,68 @@
           }
         }
       },
+      "McpLogs": {
+        "type": "object",
+        "description": "Recent stderr and lifecycle lines for one MCP server.",
+        "required": [
+          "lines"
+        ],
+        "properties": {
+          "lines": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          }
+        }
+      },
+      "McpServerInfo": {
+        "type": "object",
+        "description": "One user-managed MCP server (from `mcp.json` in the trouve config dir or\n`.agents/.mcp.json` in a workspace). First-party servers trouve injects\nitself (the Claude approval bridge) never appear here.",
+        "required": [
+          "name",
+          "scope",
+          "command",
+          "health",
+          "detail"
+        ],
+        "properties": {
+          "args": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "command": {
+            "type": "string"
+          },
+          "detail": {
+            "type": "string",
+            "description": "\"5 tools\" when healthy, the failure reason when not, \"\" for unknown."
+          },
+          "env": {
+            "type": "object",
+            "description": "Values may be `${VAR}` references resolved at spawn time.",
+            "additionalProperties": {
+              "type": "string"
+            },
+            "propertyNames": {
+              "type": "string"
+            }
+          },
+          "health": {
+            "type": "string",
+            "description": "\"ok\" / \"error\" / \"unknown\" (unknown when listing skipped the probe)."
+          },
+          "name": {
+            "type": "string"
+          },
+          "scope": {
+            "type": "string",
+            "description": "\"user\" (config dir) or \"workspace\" (.agents/.mcp.json)."
+          }
+        }
+      },
       "MergePrRequest": {
         "type": "object",
         "properties": {
@@ -3219,6 +3447,44 @@
                 "$ref": "#/components/schemas/PermissionMode"
               }
             ]
+          }
+        }
+      },
+      "UpsertMcpServerRequest": {
+        "type": "object",
+        "required": [
+          "scope",
+          "command"
+        ],
+        "properties": {
+          "args": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "command": {
+            "type": "string"
+          },
+          "env": {
+            "type": "object",
+            "additionalProperties": {
+              "type": "string"
+            },
+            "propertyNames": {
+              "type": "string"
+            }
+          },
+          "scope": {
+            "type": "string",
+            "description": "\"user\" or \"workspace\"."
+          },
+          "workspace_id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Required for workspace scope: whose `.agents/.mcp.json` to edit."
           }
         }
       },

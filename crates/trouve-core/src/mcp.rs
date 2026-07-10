@@ -13,13 +13,14 @@
 //! serialized request/response): enough for `initialize`, `tools/list`, and
 //! `tools/call`, which is the entire surface trouve needs today.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::path::Path;
 use std::process::Stdio;
 use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::Arc;
 
 use anyhow::{bail, Context, Result};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, ChildStdout};
@@ -30,13 +31,13 @@ use trouve_providers::ToolSpec;
 pub const TOOL_PREFIX: &str = "mcp__";
 
 /// One entry under `mcpServers` in `.mcp.json`.
-#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct McpServerConfig {
     pub command: String,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub args: Vec<String>,
     /// Values may be `${VAR}` references resolved from the environment.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub env: BTreeMap<String, String>,
 }
 
@@ -44,6 +45,39 @@ pub struct McpServerConfig {
 struct McpFile {
     #[serde(default, rename = "mcpServers")]
     mcp_servers: BTreeMap<String, McpServerConfig>,
+}
+
+// --- logs ---------------------------------------------------------------
+
+const LOG_CAP: usize = 400;
+
+/// Rolling per-server log buffers (stderr lines + lifecycle events), shared
+/// between the runtime `McpManager` and settings health probes so the
+/// settings "View logs" button sees both.
+#[derive(Default, Clone)]
+pub struct McpLogStore {
+    buffers: Arc<std::sync::Mutex<HashMap<String, VecDeque<String>>>>,
+}
+
+impl McpLogStore {
+    pub fn push(&self, server: &str, line: impl AsRef<str>) {
+        let stamp = chrono::Local::now().format("%H:%M:%S");
+        let mut buffers = self.buffers.lock().unwrap();
+        let buffer = buffers.entry(server.to_string()).or_default();
+        if buffer.len() >= LOG_CAP {
+            buffer.pop_front();
+        }
+        buffer.push_back(format!("[{stamp}] {}", line.as_ref()));
+    }
+
+    pub fn lines(&self, server: &str) -> Vec<String> {
+        self.buffers
+            .lock()
+            .unwrap()
+            .get(server)
+            .map(|b| b.iter().cloned().collect())
+            .unwrap_or_default()
+    }
 }
 
 /// Expand `${VAR}` references from the process environment. Missing vars
@@ -69,24 +103,95 @@ fn expand_env(value: &str) -> String {
     out
 }
 
-/// Discover MCP server configs. Workspace config wins on name collision.
+/// The user-scoped MCP config file inside trouve's config dir.
+pub fn user_config_path(config_dir: &Path) -> std::path::PathBuf {
+    config_dir.join("mcp.json")
+}
+
+/// The workspace-scoped MCP config file inside a repo (or worktree) root.
+pub fn workspace_config_path(root: &Path) -> std::path::PathBuf {
+    root.join(".agents").join(".mcp.json")
+}
+
+/// Servers from one config file; empty when missing or malformed.
+pub fn read_servers(path: &Path) -> BTreeMap<String, McpServerConfig> {
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return BTreeMap::new();
+    };
+    match serde_json::from_str::<McpFile>(&text) {
+        Ok(file) => file.mcp_servers,
+        Err(e) => {
+            tracing::warn!("ignoring malformed {}: {e}", path.display());
+            BTreeMap::new()
+        }
+    }
+}
+
+/// Add or replace one server in a config file, preserving any unrelated
+/// keys the file may carry. Creates the file (and parent dir) if missing.
+pub fn upsert_server(path: &Path, name: &str, config: &McpServerConfig) -> Result<()> {
+    edit_file(path, |servers| {
+        servers.insert(
+            name.to_string(),
+            serde_json::to_value(config).expect("mcp config serializes"),
+        );
+    })
+}
+
+/// Remove one server from a config file. Missing file or name is a no-op.
+pub fn remove_server(path: &Path, name: &str) -> Result<()> {
+    if !path.exists() {
+        return Ok(());
+    }
+    edit_file(path, |servers| {
+        servers.remove(name);
+    })
+}
+
+fn edit_file(
+    path: &Path,
+    mutate: impl FnOnce(&mut serde_json::Map<String, Value>),
+) -> Result<()> {
+    let mut doc: Value = match std::fs::read_to_string(path) {
+        Ok(text) => serde_json::from_str(&text)
+            .with_context(|| format!("{} is not valid JSON", path.display()))?,
+        Err(_) => json!({}),
+    };
+    let root = doc
+        .as_object_mut()
+        .with_context(|| format!("{} is not a JSON object", path.display()))?;
+    let servers = root
+        .entry("mcpServers")
+        .or_insert_with(|| json!({}))
+        .as_object_mut()
+        .with_context(|| format!("mcpServers in {} is not an object", path.display()))?;
+    mutate(servers);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(path, serde_json::to_string_pretty(&doc)? + "\n")
+        .with_context(|| format!("writing {}", path.display()))?;
+    Ok(())
+}
+
+/// Discover MCP server configs: user config, overlaid by the workspace
+/// repo's `.agents/.mcp.json`, overlaid by the session worktree's (so
+/// settings edits apply immediately and committed files still win).
 pub fn discover_configs(
     config_dir: Option<&Path>,
+    workspace_root: Option<&Path>,
     worktree: &Path,
 ) -> BTreeMap<String, McpServerConfig> {
     let mut servers = BTreeMap::new();
-    let mut load = |path: &Path| {
-        if let Ok(text) = std::fs::read_to_string(path) {
-            match serde_json::from_str::<McpFile>(&text) {
-                Ok(file) => servers.extend(file.mcp_servers),
-                Err(e) => tracing::warn!("ignoring malformed {}: {e}", path.display()),
-            }
-        }
-    };
     if let Some(dir) = config_dir {
-        load(&dir.join("mcp.json"));
+        servers.extend(read_servers(&user_config_path(dir)));
     }
-    load(&worktree.join(".agents").join(".mcp.json"));
+    if let Some(root) = workspace_root {
+        if root != worktree {
+            servers.extend(read_servers(&workspace_config_path(root)));
+        }
+    }
+    servers.extend(read_servers(&workspace_config_path(worktree)));
     servers
 }
 
@@ -112,13 +217,23 @@ pub struct McpConnection {
 
 impl McpConnection {
     /// Spawn the server, run the `initialize` handshake, and list tools.
-    pub async fn connect(server: &str, config: &McpServerConfig) -> Result<Self> {
+    /// The server's stderr streams into `logs` when given (settings "View
+    /// logs"); otherwise it is discarded.
+    pub async fn connect(
+        server: &str,
+        config: &McpServerConfig,
+        logs: Option<&McpLogStore>,
+    ) -> Result<Self> {
         let mut command = tokio::process::Command::new(&config.command);
         command
             .args(&config.args)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null())
+            .stderr(if logs.is_some() {
+                Stdio::piped()
+            } else {
+                Stdio::null()
+            })
             .kill_on_drop(true);
         for (key, value) in &config.env {
             command.env(key, expand_env(value));
@@ -128,6 +243,16 @@ impl McpConnection {
             .with_context(|| format!("spawning MCP server '{server}' ({})", config.command))?;
         let stdin = child.stdin.take().context("mcp stdin")?;
         let stdout = BufReader::new(child.stdout.take().context("mcp stdout")?).lines();
+        if let (Some(logs), Some(stderr)) = (logs, child.stderr.take()) {
+            let logs = logs.clone();
+            let server = server.to_string();
+            tokio::spawn(async move {
+                let mut lines = BufReader::new(stderr).lines();
+                while let Ok(Some(line)) = lines.next_line().await {
+                    logs.push(&server, line);
+                }
+            });
+        }
 
         let mut connection = Self {
             _child: child,
@@ -243,16 +368,50 @@ impl McpConnection {
     }
 }
 
+/// Connect with a deadline and report the number of tools served — the
+/// settings health check. The connection (and its process) is dropped
+/// afterwards; stderr and lifecycle lines land in `logs`.
+pub async fn probe(server: &str, config: &McpServerConfig, logs: &McpLogStore) -> Result<usize> {
+    logs.push(server, format!("health check: spawning {}", config.command));
+    let connection = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        McpConnection::connect(server, config, Some(logs)),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("timed out after 10s during the MCP handshake"))?;
+    match &connection {
+        Ok(c) => logs.push(server, format!("health check: ok ({} tools)", c.tools().len())),
+        Err(e) => logs.push(server, format!("health check: failed: {e:#}")),
+    }
+    Ok(connection?.tools().len())
+}
+
 /// Lazily-connected MCP servers, keyed by (worktree, server name).
 #[derive(Default)]
 pub struct McpManager {
     connections: Mutex<HashMap<(String, String), std::sync::Arc<McpConnection>>>,
+    logs: McpLogStore,
 }
 
 impl McpManager {
+    /// A manager whose connections log into an externally-owned store (the
+    /// engine shares it with settings health probes).
+    pub fn with_logs(logs: McpLogStore) -> Self {
+        Self {
+            connections: Mutex::default(),
+            logs,
+        }
+    }
+
+    /// The shared log store (also fed by settings health probes).
+    pub fn logs(&self) -> &McpLogStore {
+        &self.logs
+    }
+
     async fn connection(
         &self,
         config_dir: Option<&Path>,
+        workspace_root: Option<&Path>,
         worktree: &Path,
         server: &str,
     ) -> Result<std::sync::Arc<McpConnection>> {
@@ -261,23 +420,38 @@ impl McpManager {
         if let Some(existing) = connections.get(&key) {
             return Ok(existing.clone());
         }
-        let configs = discover_configs(config_dir, worktree);
+        let configs = discover_configs(config_dir, workspace_root, worktree);
         let config = configs
             .get(server)
             .with_context(|| format!("no MCP server '{server}' configured"))?;
-        let connection = std::sync::Arc::new(McpConnection::connect(server, config).await?);
+        let connection = std::sync::Arc::new(
+            McpConnection::connect(server, config, Some(&self.logs)).await?,
+        );
+        self.logs
+            .push(server, format!("connected ({} tools)", connection.tools().len()));
         connections.insert(key, connection.clone());
         Ok(connection)
     }
 
     /// All MCP tool specs visible from this worktree. Connection failures
     /// are logged and skipped so a broken server doesn't block turns.
-    pub async fn specs(&self, config_dir: Option<&Path>, worktree: &Path) -> Vec<ToolSpec> {
+    pub async fn specs(
+        &self,
+        config_dir: Option<&Path>,
+        workspace_root: Option<&Path>,
+        worktree: &Path,
+    ) -> Vec<ToolSpec> {
         let mut specs = Vec::new();
-        for server in discover_configs(config_dir, worktree).keys() {
-            match self.connection(config_dir, worktree, server).await {
+        for server in discover_configs(config_dir, workspace_root, worktree).keys() {
+            match self
+                .connection(config_dir, workspace_root, worktree, server)
+                .await
+            {
                 Ok(connection) => specs.extend(connection.tools().iter().cloned()),
-                Err(e) => tracing::warn!("MCP server '{server}' unavailable: {e:#}"),
+                Err(e) => {
+                    self.logs.push(server, format!("unavailable: {e:#}"));
+                    tracing::warn!("MCP server '{server}' unavailable: {e:#}");
+                }
             }
         }
         specs
@@ -287,13 +461,16 @@ impl McpManager {
     pub async fn call(
         &self,
         config_dir: Option<&Path>,
+        workspace_root: Option<&Path>,
         worktree: &Path,
         name: &str,
         args: &Value,
     ) -> Result<(bool, Value)> {
         let (server, tool) =
             split_tool_name(name).with_context(|| format!("malformed MCP tool name: {name}"))?;
-        let connection = self.connection(config_dir, worktree, server).await?;
+        let connection = self
+            .connection(config_dir, workspace_root, worktree, server)
+            .await?;
         connection.call_tool(tool, args).await
     }
 }
@@ -313,7 +490,7 @@ mod tests {
                 "env": {"TOKEN": "${TROUVE_TEST_JIRA_TOKEN}"}}}}"#,
         )
         .unwrap();
-        let configs = discover_configs(None, tmp.path());
+        let configs = discover_configs(None, None, tmp.path());
         assert_eq!(configs.len(), 1);
         let jira = &configs["jira"];
         assert_eq!(jira.command, "jira-mcp");
@@ -326,6 +503,56 @@ mod tests {
             "Bearer sekrit!"
         );
         assert_eq!(expand_env("${MISSING_VAR_XYZ}"), "");
+    }
+
+    #[test]
+    fn upsert_and_remove_edit_files_preserving_other_keys() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("mcp.json");
+        std::fs::write(
+            &path,
+            r#"{"other": {"keep": true}, "mcpServers": {"jira": {"command": "jira-mcp"}}}"#,
+        )
+        .unwrap();
+
+        let config = McpServerConfig {
+            command: "linear-mcp".into(),
+            args: vec!["--stdio".into()],
+            env: BTreeMap::from([("TOKEN".into(), "${LINEAR_TOKEN}".into())]),
+        };
+        upsert_server(&path, "linear", &config).unwrap();
+
+        let servers = read_servers(&path);
+        assert_eq!(servers.len(), 2);
+        assert_eq!(servers["linear"], config);
+        // Unrelated top-level keys survive the edit.
+        let doc: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(doc["other"]["keep"], Value::Bool(true));
+
+        remove_server(&path, "jira").unwrap();
+        let servers = read_servers(&path);
+        assert_eq!(servers.len(), 1);
+        assert!(servers.contains_key("linear"));
+
+        // Creating a fresh file (and parent dir) from nothing also works.
+        let fresh = tmp.path().join("sub").join("new.json");
+        upsert_server(&fresh, "solo", &config).unwrap();
+        assert_eq!(read_servers(&fresh).len(), 1);
+        // Removing from a missing file is a no-op.
+        remove_server(&tmp.path().join("missing.json"), "x").unwrap();
+    }
+
+    #[test]
+    fn log_store_caps_and_returns_lines() {
+        let logs = McpLogStore::default();
+        assert!(logs.lines("nope").is_empty());
+        for i in 0..450 {
+            logs.push("s", format!("line {i}"));
+        }
+        let lines = logs.lines("s");
+        assert_eq!(lines.len(), 400);
+        assert!(lines[0].ends_with("line 50"));
+        assert!(lines[399].ends_with("line 449"));
     }
 
     #[test]
@@ -381,12 +608,12 @@ for line in sys.stdin:
         .unwrap();
 
         let manager = McpManager::default();
-        let specs = manager.specs(None, tmp.path()).await;
+        let specs = manager.specs(None, None, tmp.path()).await;
         assert_eq!(specs.len(), 1);
         assert_eq!(specs[0].name, "mcp__fake__echo");
 
         let (is_error, value) = manager
-            .call(None, tmp.path(), "mcp__fake__echo", &json!({"text": "hi"}))
+            .call(None, None, tmp.path(), "mcp__fake__echo", &json!({"text": "hi"}))
             .await
             .unwrap();
         assert!(!is_error);

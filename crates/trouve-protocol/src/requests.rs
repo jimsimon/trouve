@@ -254,6 +254,48 @@ pub struct MergePrRequest {
     pub method: Option<String>,
 }
 
+// --- MCP servers -------------------------------------------------------------
+
+/// One user-managed MCP server (from `mcp.json` in the trouve config dir or
+/// `.agents/.mcp.json` in a workspace). First-party servers trouve injects
+/// itself (the Claude approval bridge) never appear here.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct McpServerInfo {
+    pub name: String,
+    /// "user" (config dir) or "workspace" (.agents/.mcp.json).
+    pub scope: String,
+    pub command: String,
+    #[serde(default)]
+    pub args: Vec<String>,
+    /// Values may be `${VAR}` references resolved at spawn time.
+    #[serde(default)]
+    pub env: std::collections::BTreeMap<String, String>,
+    /// "ok" / "error" / "unknown" (unknown when listing skipped the probe).
+    pub health: String,
+    /// "5 tools" when healthy, the failure reason when not, "" for unknown.
+    pub detail: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct UpsertMcpServerRequest {
+    /// "user" or "workspace".
+    pub scope: String,
+    /// Required for workspace scope: whose `.agents/.mcp.json` to edit.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_id: Option<String>,
+    pub command: String,
+    #[serde(default)]
+    pub args: Vec<String>,
+    #[serde(default)]
+    pub env: std::collections::BTreeMap<String, String>,
+}
+
+/// Recent stderr and lifecycle lines for one MCP server.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct McpLogs {
+    pub lines: Vec<String>,
+}
+
 // --- integrations ----------------------------------------------------------
 
 /// Whether the GitHub integration can authenticate, and where the token

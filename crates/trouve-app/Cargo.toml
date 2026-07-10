@@ -33,6 +33,7 @@ rfd = { version = "0.17.2", default-features = false, features = ["xdg-portal", 
 open = "5.3.6"
 # Fuzzy filtering for the model search picker.
 fuzzy-matcher = "0.3"
+shlex = "2.0.1"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 # PR_SET_PDEATHSIG so the spawned server dies with the app.

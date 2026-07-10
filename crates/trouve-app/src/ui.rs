@@ -425,6 +425,46 @@ pub fn set_prs(
     });
 }
 
+/// Plain-data mirror of the Slint McpServerItem struct.
+pub struct McpView {
+    pub name: String,
+    pub scope: String,
+    pub command_line: String,
+    pub env_lines: String,
+    pub health: String,
+    pub detail: String,
+}
+
+pub fn set_mcp_servers(ui: &Ui, items: Vec<McpView>) {
+    let _ = ui.upgrade_in_event_loop(move |ui| {
+        let items: Vec<crate::McpServerItem> = items
+            .into_iter()
+            .map(|s| crate::McpServerItem {
+                name: SharedString::from(s.name.as_str()),
+                scope: SharedString::from(s.scope.as_str()),
+                command_line: SharedString::from(s.command_line.as_str()),
+                env_lines: SharedString::from(s.env_lines.as_str()),
+                health: SharedString::from(s.health.as_str()),
+                detail: SharedString::from(s.detail.as_str()),
+            })
+            .collect();
+        ui.set_settings_mcp_servers(ModelRc::new(VecModel::from(items)));
+    });
+}
+
+pub fn set_mcp_status(ui: &Ui, status: String) {
+    let _ = ui.upgrade_in_event_loop(move |ui| {
+        ui.set_settings_mcp_status(SharedString::from(status.as_str()));
+    });
+}
+
+pub fn set_mcp_logs(ui: &Ui, name: String, text: String) {
+    let _ = ui.upgrade_in_event_loop(move |ui| {
+        ui.set_settings_mcp_logs_name(SharedString::from(name.as_str()));
+        ui.set_settings_mcp_logs_text(SharedString::from(text.as_str()));
+    });
+}
+
 pub fn set_github_integration(ui: &Ui, configured: bool, source: &str) {
     let source = source.to_string();
     let _ = ui.upgrade_in_event_loop(move |ui| {

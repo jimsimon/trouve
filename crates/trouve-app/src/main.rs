@@ -490,6 +490,47 @@ fn main() -> anyhow::Result<()> {
             let _ = tx.send(UiCommand::SaveGithubToken(token.to_string()));
         });
     }
+    {
+        let tx = tx.clone();
+        window.on_mcp_refresh(move || {
+            let _ = tx.send(UiCommand::RefreshMcp);
+        });
+    }
+    {
+        let tx = tx.clone();
+        window.on_mcp_saved(move |name, scope, command, env| {
+            let _ = tx.send(UiCommand::SaveMcpServer {
+                name: name.to_string(),
+                scope: scope.to_string(),
+                command_line: command.to_string(),
+                env_lines: env.to_string(),
+            });
+        });
+    }
+    {
+        let tx = tx.clone();
+        window.on_mcp_deleted(move |name, scope| {
+            let _ = tx.send(UiCommand::DeleteMcpServer {
+                name: name.to_string(),
+                scope: scope.to_string(),
+            });
+        });
+    }
+    {
+        let tx = tx.clone();
+        window.on_mcp_logs_requested(move |name| {
+            let _ = tx.send(UiCommand::McpLogs(name.to_string()));
+        });
+    }
+    {
+        let ui = window.as_weak();
+        window.on_mcp_logs_closed(move || {
+            if let Some(ui) = ui.upgrade() {
+                ui.set_settings_mcp_logs_name(Default::default());
+                ui.set_settings_mcp_logs_text(Default::default());
+            }
+        });
+    }
 
     // --- settings screen callbacks -------------------------------------------
     {

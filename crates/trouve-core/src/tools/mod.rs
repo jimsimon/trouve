@@ -27,6 +27,9 @@ pub struct ToolCtx {
     pub worktree: PathBuf,
     /// Config dir for global tool discovery (MCP servers); None in tests.
     pub config_dir: Option<PathBuf>,
+    /// Registered workspace repo root: its `.agents/.mcp.json` applies even
+    /// before it is committed to the session branch.
+    pub workspace_root: Option<PathBuf>,
 }
 
 impl ToolCtx {
@@ -99,6 +102,14 @@ pub struct LocalToolExecutor {
 
 impl Default for LocalToolExecutor {
     fn default() -> Self {
+        Self::with_mcp_logs(crate::mcp::McpLogStore::default())
+    }
+}
+
+impl LocalToolExecutor {
+    /// Build with an externally-owned MCP log store so the engine can serve
+    /// "view logs" for runtime connections too.
+    pub fn with_mcp_logs(logs: crate::mcp::McpLogStore) -> Self {
         // Both search tools share one index cache (indexes are expensive to
         // build, cheap to re-validate, and identical across tools).
         let search_cache = search::shared_cache();
@@ -116,12 +127,10 @@ impl Default for LocalToolExecutor {
                     cache: search_cache,
                 }),
             ],
-            mcp: crate::mcp::McpManager::default(),
+            mcp: crate::mcp::McpManager::with_logs(logs),
         }
     }
-}
 
-impl LocalToolExecutor {
     fn find(&self, name: &str) -> Option<&Arc<dyn Tool>> {
         self.tools.iter().find(|t| t.name() == name)
     }
@@ -141,7 +150,11 @@ impl ToolExecutor for LocalToolExecutor {
             .collect();
         specs.extend(
             self.mcp
-                .specs(ctx.config_dir.as_deref(), &ctx.worktree)
+                .specs(
+                    ctx.config_dir.as_deref(),
+                    ctx.workspace_root.as_deref(),
+                    &ctx.worktree,
+                )
                 .await,
         );
         specs
@@ -160,7 +173,13 @@ impl ToolExecutor for LocalToolExecutor {
         if name.starts_with(crate::mcp::TOOL_PREFIX) {
             return match self
                 .mcp
-                .call(ctx.config_dir.as_deref(), &ctx.worktree, name, args)
+                .call(
+                    ctx.config_dir.as_deref(),
+                    ctx.workspace_root.as_deref(),
+                    &ctx.worktree,
+                    name,
+                    args,
+                )
                 .await
             {
                 Ok((false, value)) => ToolResult::ok(value),

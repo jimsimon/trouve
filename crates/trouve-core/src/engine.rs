@@ -81,6 +81,9 @@ pub struct Engine {
     /// store on archive/delete. Off by default so tests never touch the
     /// embedding model; the server enables it (`with_index_hooks`).
     index_hooks: bool,
+    /// Per-server MCP logs, shared with the executor's `McpManager` so both
+    /// runtime connections and settings health probes land in one place.
+    mcp_logs: crate::mcp::McpLogStore,
 }
 
 #[derive(Debug, Clone)]
@@ -263,6 +266,7 @@ impl Engine {
             Arc::from(trouve_providers::secrets::default_store(&data_dir));
         let providers = build_all_providers(config, &secrets);
         let backends = build_all_backends(config, &secrets, &data_dir);
+        let mcp_logs = crate::mcp::McpLogStore::default();
         Self {
             store,
             data_dir,
@@ -271,7 +275,7 @@ impl Engine {
             injected_providers: Mutex::new(HashMap::new()),
             backends: RwLock::new(backends),
             injected_backends: Mutex::new(HashMap::new()),
-            executor: Arc::new(LocalToolExecutor::default()),
+            executor: Arc::new(LocalToolExecutor::with_mcp_logs(mcp_logs.clone())),
             approvals: Arc::new(ApprovalHub::default()),
             questions: Arc::new(QuestionHub::default()),
             session_locks: Mutex::new(HashMap::new()),
@@ -294,6 +298,7 @@ impl Engine {
             cli_latest: Mutex::new(HashMap::new()),
             base_url: RwLock::new(None),
             index_hooks: false,
+            mcp_logs,
         }
     }
 
@@ -1090,6 +1095,133 @@ impl Engine {
             .map_err(EngineError::Internal)
     }
 
+    /// Path of the MCP config file for a scope; workspace scope requires
+    /// a workspace id.
+    fn mcp_config_path(
+        &self,
+        scope: &str,
+        workspace_id: Option<&str>,
+    ) -> Result<PathBuf, EngineError> {
+        match scope {
+            "user" => {
+                let dir = self
+                    .config_dir
+                    .as_deref()
+                    .ok_or_else(|| EngineError::BadRequest("no config dir available".into()))?;
+                Ok(crate::mcp::user_config_path(dir))
+            }
+            "workspace" => {
+                let id = workspace_id.ok_or_else(|| {
+                    EngineError::BadRequest("workspace scope needs workspace_id".into())
+                })?;
+                let ws = self
+                    .store
+                    .workspace(id)?
+                    .ok_or_else(|| EngineError::NotFound(format!("workspace {id}")))?;
+                Ok(crate::mcp::workspace_config_path(Path::new(&ws.path)))
+            }
+            other => Err(EngineError::BadRequest(format!(
+                "unknown MCP scope '{other}' (use \"user\" or \"workspace\")"
+            ))),
+        }
+    }
+
+    /// User-managed MCP servers from the config dir plus (when a workspace
+    /// is given) the workspace's `.agents/.mcp.json`. With `probe`, every
+    /// server is spawned and handshaken concurrently to report health.
+    pub async fn list_mcp_servers(
+        &self,
+        workspace_id: Option<&str>,
+        probe: bool,
+    ) -> Result<Vec<trouve_protocol::McpServerInfo>, EngineError> {
+        let mut entries: Vec<(String, String, crate::mcp::McpServerConfig)> = Vec::new();
+        if let Some(dir) = self.config_dir.as_deref() {
+            for (name, config) in crate::mcp::read_servers(&crate::mcp::user_config_path(dir)) {
+                entries.push((name, "user".into(), config));
+            }
+        }
+        if let Some(id) = workspace_id {
+            let ws = self
+                .store
+                .workspace(id)?
+                .ok_or_else(|| EngineError::NotFound(format!("workspace {id}")))?;
+            let path = crate::mcp::workspace_config_path(Path::new(&ws.path));
+            for (name, config) in crate::mcp::read_servers(&path) {
+                entries.push((name, "workspace".into(), config));
+            }
+        }
+        let probes = futures::future::join_all(entries.iter().map(|(name, _, config)| async {
+            if probe {
+                Some(crate::mcp::probe(name, config, &self.mcp_logs).await)
+            } else {
+                None
+            }
+        }))
+        .await;
+        Ok(entries
+            .into_iter()
+            .zip(probes)
+            .map(|((name, scope, config), probed)| {
+                let (health, detail) = match probed {
+                    Some(Ok(tools)) => ("ok".to_string(), format!("{tools} tools")),
+                    Some(Err(e)) => ("error".to_string(), format!("{e:#}")),
+                    None => ("unknown".to_string(), String::new()),
+                };
+                trouve_protocol::McpServerInfo {
+                    name,
+                    scope,
+                    command: config.command,
+                    args: config.args,
+                    env: config.env,
+                    health,
+                    detail,
+                }
+            })
+            .collect())
+    }
+
+    /// Add or replace an MCP server in the scope's config file.
+    pub fn upsert_mcp_server(
+        &self,
+        name: &str,
+        req: &trouve_protocol::UpsertMcpServerRequest,
+    ) -> Result<(), EngineError> {
+        let name = name.trim();
+        if name.is_empty() || name.contains("__") || name.contains('/') {
+            return Err(EngineError::BadRequest(
+                "server name must be non-empty and free of '__' and '/'".into(),
+            ));
+        }
+        if req.command.trim().is_empty() {
+            return Err(EngineError::BadRequest("command is required".into()));
+        }
+        let path = self.mcp_config_path(&req.scope, req.workspace_id.as_deref())?;
+        let config = crate::mcp::McpServerConfig {
+            command: req.command.trim().to_string(),
+            args: req.args.clone(),
+            env: req.env.clone(),
+        };
+        crate::mcp::upsert_server(&path, name, &config).map_err(EngineError::Internal)
+    }
+
+    /// Remove an MCP server from the scope's config file.
+    pub fn delete_mcp_server(
+        &self,
+        name: &str,
+        scope: &str,
+        workspace_id: Option<&str>,
+    ) -> Result<(), EngineError> {
+        let path = self.mcp_config_path(scope, workspace_id)?;
+        crate::mcp::remove_server(&path, name).map_err(EngineError::Internal)
+    }
+
+    /// Recent log lines (stderr + lifecycle) for one MCP server.
+    pub fn mcp_server_logs(&self, name: &str) -> trouve_protocol::McpLogs {
+        trouve_protocol::McpLogs {
+            lines: self.mcp_logs.lines(name),
+        }
+    }
+
     /// Whether GitHub calls can authenticate, and where the token lives.
     pub fn github_integration(&self) -> trouve_protocol::GithubIntegration {
         let (configured, source) = if crate::github::token_from_env().is_some() {
@@ -1766,6 +1898,7 @@ impl Engine {
         let ctx = ToolCtx {
             worktree: worktree.clone(),
             config_dir: self.config_dir.clone(),
+            workspace_root: Some(PathBuf::from(&ws.path)),
         };
 
         // Serialize worktree mutations across the session's threads.
@@ -2182,6 +2315,7 @@ impl Engine {
         let ctx = ToolCtx {
             worktree: PathBuf::from(&session.worktree_path),
             config_dir: self.config_dir.clone(),
+            workspace_root: Some(PathBuf::from(&ws.path)),
         };
         Ok((session, thread, mode, ctx))
     }

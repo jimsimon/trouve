@@ -21,11 +21,12 @@ use trouve_core::Engine;
 use trouve_protocol::{
     AgentMode, BranchList, CliInfo, CliInstallStatus, CliList, CreatePrRequest,
     CreateSessionRequest, CreateThreadRequest, DirEntry, ErrorBody, FileContent, GithubIntegration,
-    KnownProvider, LoginStarted, LoginStatus, MergePrRequest, ModelInfo, PrInfo, ProviderInfo,
-    ProvidersResponse, RegisterWorkspaceRequest, ResolveApprovalRequest, ResolveQuestionRequest,
-    Scope, SendMessageRequest, ServerInfo, Session, SessionDiff, SetDefaultModelRequest,
-    SetGithubTokenRequest, Thread, TurnAccepted, UpdateSessionRequest, UpdateThreadRequest,
-    UpsertProviderRequest, UsageSummary, Workspace, PROTOCOL_VERSION,
+    KnownProvider, LoginStarted, LoginStatus, McpLogs, McpServerInfo, MergePrRequest, ModelInfo,
+    PrInfo, ProviderInfo, ProvidersResponse, RegisterWorkspaceRequest, ResolveApprovalRequest,
+    ResolveQuestionRequest, Scope, SendMessageRequest, ServerInfo, Session, SessionDiff,
+    SetDefaultModelRequest, SetGithubTokenRequest, Thread, TurnAccepted, UpdateSessionRequest,
+    UpdateThreadRequest, UpsertMcpServerRequest, UpsertProviderRequest, UsageSummary, Workspace,
+    PROTOCOL_VERSION,
 };
 use utoipa::OpenApi;
 
@@ -101,6 +102,10 @@ impl IntoResponse for ApiError {
         list_session_prs,
         get_github_integration,
         set_github_integration,
+        list_mcp_servers,
+        upsert_mcp_server,
+        delete_mcp_server,
+        mcp_server_logs,
     ),
     components(schemas(
         ServerInfo,
@@ -141,6 +146,9 @@ impl IntoResponse for ApiError {
         MergePrRequest,
         GithubIntegration,
         SetGithubTokenRequest,
+        McpServerInfo,
+        UpsertMcpServerRequest,
+        McpLogs,
         ErrorBody,
         trouve_protocol::EventEnvelope,
         trouve_protocol::Event,
@@ -196,6 +204,12 @@ pub fn build_router(engine: Arc<Engine>) -> Router {
             "/v1/integrations/github",
             get(get_github_integration).put(set_github_integration),
         )
+        .route("/v1/mcp-servers", get(list_mcp_servers))
+        .route(
+            "/v1/mcp-servers/{name}",
+            axum::routing::put(upsert_mcp_server).delete(delete_mcp_server),
+        )
+        .route("/v1/mcp-servers/{name}/logs", get(mcp_server_logs))
         .route("/v1/models", get(list_models))
         .route("/v1/modes", get(list_modes))
         .route("/v1/providers", get(list_providers))
@@ -709,6 +723,74 @@ async fn list_session_prs(
     Path(id): Path<String>,
 ) -> Result<Json<Vec<PrInfo>>, ApiError> {
     Ok(Json(engine.session_prs(&id).await?))
+}
+
+#[derive(Deserialize)]
+struct McpListQuery {
+    workspace_id: Option<String>,
+    /// Spawn each server and run the MCP handshake to report health.
+    #[serde(default)]
+    probe: bool,
+}
+
+#[utoipa::path(get, path = "/v1/mcp-servers",
+    params(
+        ("workspace_id" = Option<String>, Query, description = "Include the workspace's .agents servers"),
+        ("probe" = Option<bool>, Query, description = "Health-check each server"),
+    ),
+    responses((status = 200, body = [McpServerInfo]), (status = 404, body = ErrorBody)))]
+async fn list_mcp_servers(
+    State(engine): State<Arc<Engine>>,
+    Query(q): Query<McpListQuery>,
+) -> Result<Json<Vec<McpServerInfo>>, ApiError> {
+    Ok(Json(
+        engine
+            .list_mcp_servers(q.workspace_id.as_deref(), q.probe)
+            .await?,
+    ))
+}
+
+#[utoipa::path(put, path = "/v1/mcp-servers/{name}", params(("name" = String, Path,)),
+    request_body = UpsertMcpServerRequest,
+    responses((status = 204), (status = 400, body = ErrorBody)))]
+async fn upsert_mcp_server(
+    State(engine): State<Arc<Engine>>,
+    Path(name): Path<String>,
+    Json(req): Json<UpsertMcpServerRequest>,
+) -> Result<axum::http::StatusCode, ApiError> {
+    engine.upsert_mcp_server(&name, &req)?;
+    Ok(axum::http::StatusCode::NO_CONTENT)
+}
+
+#[derive(Deserialize)]
+struct McpDeleteQuery {
+    scope: String,
+    workspace_id: Option<String>,
+}
+
+#[utoipa::path(delete, path = "/v1/mcp-servers/{name}",
+    params(
+        ("name" = String, Path,),
+        ("scope" = String, Query, description = "user or workspace"),
+        ("workspace_id" = Option<String>, Query,),
+    ),
+    responses((status = 204), (status = 400, body = ErrorBody)))]
+async fn delete_mcp_server(
+    State(engine): State<Arc<Engine>>,
+    Path(name): Path<String>,
+    Query(q): Query<McpDeleteQuery>,
+) -> Result<axum::http::StatusCode, ApiError> {
+    engine.delete_mcp_server(&name, &q.scope, q.workspace_id.as_deref())?;
+    Ok(axum::http::StatusCode::NO_CONTENT)
+}
+
+#[utoipa::path(get, path = "/v1/mcp-servers/{name}/logs", params(("name" = String, Path,)),
+    responses((status = 200, body = McpLogs)))]
+async fn mcp_server_logs(
+    State(engine): State<Arc<Engine>>,
+    Path(name): Path<String>,
+) -> Json<McpLogs> {
+    Json(engine.mcp_server_logs(&name))
 }
 
 #[utoipa::path(get, path = "/v1/integrations/github",
