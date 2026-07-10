@@ -1017,7 +1017,6 @@ export component AppWindow inherits Window {
         root.slash-suppressed = false;
         root.slash-filter-changed(root.composer-draft);
     }
-    in property <string> status-text: "starting…";
     in-out property <string> error-text: "";
 
     in property <[string]> modes;
@@ -1397,20 +1396,17 @@ export component AppWindow inherits Window {
                 }
                 }
 
-                // Footer: settings + status.
+                // Footer: settings gear (bottom-left, app-level convention).
                 HorizontalLayout {
-                    spacing: 6px;
-                    Button {
-                        text: "⚙ Settings";
+                    IconButton {
+                        icon: "⚙";
+                        tip: "Settings";
+                        width: 28px;
+                        height: 28px;
+                        icon-size: Theme.fs(18px);
                         clicked => { root.open-settings(); }
                     }
                     Rectangle { horizontal-stretch: 1; }
-                }
-                Text {
-                    text: root.status-text;
-                    color: Theme.c.text-faint;
-                    font-size: Theme.fs(11px);
-                    wrap: word-wrap;
                 }
             }
         }

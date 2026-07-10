@@ -237,7 +237,7 @@ pub async fn run(
     let (client, _server) = match start_local_server().await {
         Ok(pair) => pair,
         Err(e) => {
-            ui::set_status(&ui, &format!("failed to start server: {e:#}"));
+            ui::set_error(&ui, &format!("failed to start server: {e:#}"));
             return;
         }
     };
@@ -356,10 +356,6 @@ fn server_binary() -> Result<std::path::PathBuf> {
 }
 
 impl Controller {
-    fn status(&self, text: &str) {
-        ui::set_status(&self.ui, text);
-    }
-
     fn error(&self, text: &str) {
         ui::set_error(&self.ui, text);
     }
@@ -391,7 +387,6 @@ impl Controller {
         if let Some(index) = initial {
             self.select_session(index).await?;
         }
-        self.status(&format!("workspace: {}", workspace.name));
         Ok(())
     }
 
@@ -1262,7 +1257,6 @@ impl Controller {
                         self.render_chat(true);
                     }
                     self.reload_sessions().await?;
-                    self.status("session deleted");
                 }
             }
             UiCommand::OpenWorkspaceDialog => {
@@ -1347,7 +1341,6 @@ impl Controller {
                     );
                     self.load_branches(index).await;
                 }
-                self.status(&format!("registered workspace: {}", ws.name));
             }
             UiCommand::StartNewChat {
                 workspace_idx,
@@ -1623,21 +1616,19 @@ impl Controller {
                         }
                         ui::set_right_tab(&self.ui, 1);
                     }
-                    Err(e) => self.status(&format!("could not open {rel}: {e}")),
+                    Err(e) => self.error(&format!("could not open {rel}: {e}")),
                 }
             }
             UiCommand::Undo => {
                 if let Some(session_id) = self.current_session_id() {
                     self.client.undo(&session_id).await?;
                     self.refresh_diff().await?;
-                    self.status("undid last checkpoint");
                 }
             }
             UiCommand::Redo => {
                 if let Some(session_id) = self.current_session_id() {
                     self.client.redo(&session_id).await?;
                     self.refresh_diff().await?;
-                    self.status("redid checkpoint");
                 }
             }
             UiCommand::CreatePr => {
@@ -1860,7 +1851,6 @@ impl Controller {
             }
             UiCommand::QuitWhenIdle => {
                 self.quit_when_idle = true;
-                self.status("quitting once all agents finish…");
                 self.push_agents_running();
             }
         }

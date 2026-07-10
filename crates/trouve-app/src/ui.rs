@@ -24,11 +24,6 @@ pub struct NavRowData {
     pub expanded: bool,
 }
 
-pub fn set_status(ui: &Ui, text: &str) {
-    let text = text.to_string();
-    let _ = ui.upgrade_in_event_loop(move |ui| ui.set_status_text(SharedString::from(text)));
-}
-
 pub fn set_error(ui: &Ui, text: &str) {
     let text = text.to_string();
     let _ = ui.upgrade_in_event_loop(move |ui| ui.set_error_text(SharedString::from(text)));
