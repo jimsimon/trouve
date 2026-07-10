@@ -1485,8 +1485,21 @@ export component AppWindow inherits Window {
             total: chat-list.viewport-height;
             VerticalLayout {
                 visible: root.center-screen == 0 || root.center-screen == 2;
-                padding: 10px;
-                spacing: 8px;
+                spacing: 0;
+
+                // Header bar: error banner + thread tabs on their own
+                // elevated strip (hairline + shadow), so scrolling chat
+                // content reads as a layer underneath instead of blending
+                // into the tabs.
+                Rectangle {
+                    background: Theme.c.panel-bg;
+                    height: chat-header.preferred-height;
+                    drop-shadow-color: #00000059;
+                    drop-shadow-blur: 5px;
+                    drop-shadow-offset-y: 1px;
+                    chat-header := VerticalLayout {
+                    padding: 10px;
+                    spacing: 8px;
 
                 // Error banner.
                 if root.error-text != "": Rectangle {
@@ -1552,6 +1565,22 @@ export component AppWindow inherits Window {
                     }
                     Rectangle { horizontal-stretch: 1; }
                 }
+                    }
+                    // Hairline under the header keeps the boundary visible
+                    // even where the shadow is too subtle to notice.
+                    Rectangle {
+                        y: parent.height - 1px;
+                        width: 100%;
+                        height: 1px;
+                        background: Theme.c.border;
+                    }
+                }
+
+                // Body: chat stream + composer, padded as before.
+                VerticalLayout {
+                    padding: 10px;
+                    spacing: 8px;
+                    vertical-stretch: 1;
 
                 // Chat stream. The std ListView's own scrollbar can't jump
                 // on track clicks and drifts while dragging, so a custom
@@ -2691,6 +2720,7 @@ export component AppWindow inherits Window {
                         overflow: elide;
                     }
                     }
+                }
                 }
             }
             }
