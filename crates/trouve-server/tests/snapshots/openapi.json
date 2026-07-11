@@ -7,7 +7,7 @@
       "name": "MIT",
       "identifier": "MIT"
     },
-    "version": "0.8"
+    "version": "0.9"
   },
   "paths": {
     "/v1/approvals": {
@@ -52,6 +52,48 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/CliList"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/clis/{id}": {
+      "delete": {
+        "tags": [],
+        "summary": "Remove the managed install of a CLI (a system install found on PATH is\nuntouched and will be used again if present).",
+        "operationId": "uninstall_cli",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": ""
+          },
+          "404": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
                 }
               }
             }
@@ -114,6 +156,36 @@
             }
           },
           "409": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      },
+      "delete": {
+        "tags": [],
+        "summary": "Cancel an in-flight install; the CLI returns to its previous state.",
+        "operationId": "cancel_cli_install",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": ""
+          },
+          "404": {
             "description": "",
             "content": {
               "application/json": {
@@ -247,6 +319,28 @@
         }
       }
     },
+    "/v1/local/enabled": {
+      "put": {
+        "tags": [],
+        "summary": "Enable or disable local models. Disabling stops the llama-server\nsidecar and unregisters the \"local\" provider.",
+        "operationId": "set_local_enabled",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SetLocalEnabledRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "204": {
+            "description": ""
+          }
+        }
+      }
+    },
     "/v1/local/models": {
       "post": {
         "tags": [],
@@ -333,6 +427,68 @@
             }
           }
         ],
+        "responses": {
+          "202": {
+            "description": ""
+          },
+          "404": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      },
+      "delete": {
+        "tags": [],
+        "summary": "Cancel an in-flight model download; the partial file is deleted.",
+        "operationId": "cancel_local_model_download",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": ""
+          },
+          "404": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/local/server/restart": {
+      "post": {
+        "tags": [],
+        "summary": "Restart llama-server with the model it is serving (reload happens in\nthe background; poll `GET /v1/local` for server_status).",
+        "operationId": "restart_local_server",
         "responses": {
           "202": {
             "description": ""
@@ -2509,9 +2665,21 @@
               "null"
             ]
           },
+          "received_bytes": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Bytes downloaded so far (pending only).",
+            "minimum": 0
+          },
           "status": {
             "type": "string",
             "description": "\"none\" (nothing running), \"pending\", \"success\", or \"failed\"."
+          },
+          "total_bytes": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Expected total from Content-Length; 0 when unknown.",
+            "minimum": 0
           },
           "version": {
             "type": [
@@ -3638,6 +3806,10 @@
           "models"
         ],
         "properties": {
+          "enabled": {
+            "type": "boolean",
+            "description": "Whether local models are enabled (the \"local\" provider is\nregistered). Toggled with `PUT /v1/local/enabled`."
+          },
           "gpus": {
             "type": "array",
             "items": {
@@ -3660,17 +3832,36 @@
               "string",
               "null"
             ],
-            "description": "Model id currently loaded in the running llama-server, if any."
+            "description": "Model id currently loaded in (or loading into) llama-server."
           },
           "runtime_installed": {
             "type": "boolean",
             "description": "Whether the llama.cpp runtime (llama-server) is installed."
+          },
+          "runtime_latest_version": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Newest llama.cpp build the vendor serves (None when the check\nfailed, e.g. offline)."
+          },
+          "runtime_managed": {
+            "type": "boolean",
+            "description": "True when the runtime is a trouve-managed install (updatable and\nuninstallable through the API), false for PATH/system builds."
+          },
+          "runtime_update_available": {
+            "type": "boolean",
+            "description": "True when a managed install is older than `runtime_latest_version`."
           },
           "runtime_version": {
             "type": [
               "string",
               "null"
             ]
+          },
+          "server_status": {
+            "type": "string",
+            "description": "Sidecar state: \"stopped\", \"starting\" (model loading), or \"running\"."
           }
         }
       },
@@ -4324,6 +4515,18 @@
         "properties": {
           "token": {
             "type": "string"
+          }
+        }
+      },
+      "SetLocalEnabledRequest": {
+        "type": "object",
+        "description": "Turn local models on or off (`PUT /v1/local/enabled`). Disabling stops\nthe llama-server sidecar and unregisters the \"local\" provider.",
+        "required": [
+          "enabled"
+        ],
+        "properties": {
+          "enabled": {
+            "type": "boolean"
           }
         }
       },

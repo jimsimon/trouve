@@ -77,6 +77,9 @@ pub struct Engine {
     cli_installs: Mutex<HashMap<String, CliInstallState>>,
     /// The llama-server sidecar behind the built-in "local" provider.
     local_manager: Arc<crate::local::LlamaManager>,
+    /// The built-in "local" provider, kept around so enabling re-injects
+    /// the same instance after a disable removed it from the registry.
+    local_provider: Arc<dyn Provider>,
     /// In-flight local model (GGUF) downloads, keyed by model id.
     local_downloads: Mutex<HashMap<String, LocalDownloadState>>,
     /// RAM/VRAM probe, run once on first use.
@@ -109,15 +112,24 @@ enum LoginState {
 
 #[derive(Debug, Clone)]
 enum CliInstallState {
-    Pending(Option<String>),
+    Pending {
+        /// Version being installed, once discovered.
+        version: Option<String>,
+        /// Byte progress + cancel flag, shared with the install task.
+        progress: Arc<trouve_agents::install::Progress>,
+    },
     Success(String),
     Failed(String),
 }
 
 #[derive(Debug, Clone)]
 enum LocalDownloadState {
-    /// Bytes downloaded so far; the task updates the counter.
-    Pending(Arc<std::sync::atomic::AtomicU64>),
+    Pending {
+        /// Bytes downloaded so far; the task updates the counter.
+        bytes: Arc<std::sync::atomic::AtomicU64>,
+        /// Set to make the download task stop and clean up its .part file.
+        cancel: Arc<std::sync::atomic::AtomicBool>,
+    },
     Failed(String),
 }
 
@@ -283,17 +295,21 @@ impl Engine {
         let backends = build_all_backends(config, &secrets, &data_dir);
         let mcp_logs = crate::mcp::McpLogStore::default();
         let config_dir = dirs::config_dir().map(|d| d.join("trouve"));
-        // The built-in "local" provider (managed llama-server). Always
-        // registered — it lists no models until a GGUF is downloaded — and
-        // seeded as injected so config-driven reloads keep it.
+        // The built-in "local" provider (managed llama-server). Registered
+        // unless the user disabled local models — it lists no models until
+        // a GGUF is downloaded — and seeded as injected so config-driven
+        // reloads keep it.
         let local_manager = Arc::new(crate::local::LlamaManager::default());
         let local_provider: Arc<dyn Provider> = Arc::new(crate::local::LocalProvider::new(
             data_dir.clone(),
             config_dir.clone(),
             local_manager.clone(),
         ));
-        providers.insert("local".into(), local_provider.clone());
-        let injected_providers = HashMap::from([("local".to_string(), local_provider)]);
+        let mut injected_providers = HashMap::new();
+        if config.local_enabled.unwrap_or(true) {
+            providers.insert("local".into(), local_provider.clone());
+            injected_providers.insert("local".to_string(), local_provider.clone());
+        }
         Self {
             store,
             data_dir,
@@ -324,6 +340,7 @@ impl Engine {
             logins: Mutex::new(HashMap::new()),
             cli_installs: Mutex::new(HashMap::new()),
             local_manager,
+            local_provider,
             local_downloads: Mutex::new(HashMap::new()),
             hardware: std::sync::OnceLock::new(),
             cli_latest: Mutex::new(HashMap::new()),
@@ -885,14 +902,21 @@ impl Engine {
     pub fn start_cli_install(self: &Arc<Self>, id: &str) -> Result<(), EngineError> {
         let cli = trouve_agents::install::CliId::parse(id)
             .ok_or_else(|| EngineError::NotFound(format!("cli {id}")))?;
+        let progress = Arc::new(trouve_agents::install::Progress::default());
         {
             let mut installs = self.cli_installs.lock().unwrap();
-            if matches!(installs.get(id), Some(CliInstallState::Pending(_))) {
+            if matches!(installs.get(id), Some(CliInstallState::Pending { .. })) {
                 return Err(EngineError::Conflict(format!(
                     "an install for {id} is already in progress"
                 )));
             }
-            installs.insert(id.to_string(), CliInstallState::Pending(None));
+            installs.insert(
+                id.to_string(),
+                CliInstallState::Pending {
+                    version: None,
+                    progress: progress.clone(),
+                },
+            );
         }
         let engine = self.clone();
         let id_owned = id.to_string();
@@ -903,26 +927,79 @@ impl Engine {
                     .map_err(|e| e.to_string())?;
                 engine.cli_installs.lock().unwrap().insert(
                     id_owned.clone(),
-                    CliInstallState::Pending(Some(version.clone())),
+                    CliInstallState::Pending {
+                        version: Some(version.clone()),
+                        progress: progress.clone(),
+                    },
                 );
-                trouve_agents::install::install(&engine.data_dir, cli, &version)
+                match trouve_agents::install::install(&engine.data_dir, cli, &version, &progress)
                     .await
-                    .map_err(|e| e.to_string())?;
-                Ok::<String, String>(version)
+                {
+                    Ok(_) => Ok(Some(version)),
+                    Err(trouve_agents::install::InstallError::Cancelled) => Ok(None),
+                    Err(e) => Err(e.to_string()),
+                }
             }
             .await;
-            let state = match result {
-                Ok(version) => {
+            let mut installs = engine.cli_installs.lock().unwrap();
+            match result {
+                Ok(Some(version)) => {
                     // The managed binary now exists; rebuild backends so it
                     // takes over from any PATH resolution.
                     engine.reload_providers();
                     engine.cli_latest.lock().unwrap().remove(id_owned.as_str());
-                    CliInstallState::Success(version)
+                    installs.insert(id_owned, CliInstallState::Success(version));
                 }
-                Err(e) => CliInstallState::Failed(e),
-            };
-            engine.cli_installs.lock().unwrap().insert(id_owned, state);
+                // Cancelled: back to "none", like it never started.
+                Ok(None) => {
+                    installs.remove(&id_owned);
+                }
+                Err(e) => {
+                    installs.insert(id_owned, CliInstallState::Failed(e));
+                }
+            }
         });
+        Ok(())
+    }
+
+    /// Ask an in-flight install started with `start_cli_install` to stop.
+    /// The task notices at its next chunk and clears the install state.
+    pub fn cancel_cli_install(&self, id: &str) -> Result<(), EngineError> {
+        match self.cli_installs.lock().unwrap().get(id) {
+            Some(CliInstallState::Pending { progress, .. }) => {
+                progress
+                    .cancel
+                    .store(true, std::sync::atomic::Ordering::Relaxed);
+                Ok(())
+            }
+            _ => Err(EngineError::NotFound(format!(
+                "no install for {id} is in progress"
+            ))),
+        }
+    }
+
+    /// Remove the managed install of a CLI (PATH installs are untouched).
+    /// For llama-server the sidecar is stopped first.
+    pub async fn uninstall_cli(&self, id: &str) -> Result<(), EngineError> {
+        let cli = trouve_agents::install::CliId::parse(id)
+            .ok_or_else(|| EngineError::NotFound(format!("cli {id}")))?;
+        {
+            let installs = self.cli_installs.lock().unwrap();
+            if matches!(installs.get(id), Some(CliInstallState::Pending { .. })) {
+                return Err(EngineError::Conflict(format!(
+                    "an install for {id} is in progress — cancel it first"
+                )));
+            }
+        }
+        if cli == trouve_agents::install::CliId::LlamaServer {
+            self.local_manager.stop().await;
+        }
+        trouve_agents::install::uninstall(&self.data_dir, cli)
+            .map_err(|e| EngineError::Internal(e.into()))?;
+        // Drop any stale success/failed state so status reads "none", and
+        // rebuild backends so they fall back to PATH resolution (or none).
+        self.cli_installs.lock().unwrap().remove(id);
+        self.reload_providers();
         Ok(())
     }
 
@@ -933,21 +1010,32 @@ impl Engine {
                 status: "none".into(),
                 version: None,
                 error: None,
+                received_bytes: 0,
+                total_bytes: 0,
             },
-            Some(CliInstallState::Pending(version)) => trouve_protocol::CliInstallStatus {
-                status: "pending".into(),
-                version: version.clone(),
-                error: None,
-            },
+            Some(CliInstallState::Pending { version, progress }) => {
+                use std::sync::atomic::Ordering::Relaxed;
+                trouve_protocol::CliInstallStatus {
+                    status: "pending".into(),
+                    version: version.clone(),
+                    error: None,
+                    received_bytes: progress.received.load(Relaxed),
+                    total_bytes: progress.total.load(Relaxed),
+                }
+            }
             Some(CliInstallState::Success(version)) => trouve_protocol::CliInstallStatus {
                 status: "success".into(),
                 version: Some(version.clone()),
                 error: None,
+                received_bytes: 0,
+                total_bytes: 0,
             },
             Some(CliInstallState::Failed(e)) => trouve_protocol::CliInstallStatus {
                 status: "failed".into(),
                 version: None,
                 error: Some(e.clone()),
+                received_bytes: 0,
+                total_bytes: 0,
             },
         }
     }
@@ -972,15 +1060,27 @@ impl Engine {
     pub async fn local_status(&self) -> trouve_protocol::LocalStatus {
         use trouve_agents::install as cli;
         let hw = self.hardware().await;
-        let (runtime_installed, runtime_version) =
-            match cli::installed(&self.data_dir, cli::CliId::LlamaServer) {
-                Some(info) => (true, Some(info.version)),
-                None => match cli::find_on_path("llama-server") {
-                    Some(_) => (true, Some("system".into())),
-                    None => (false, None),
-                },
-            };
-        let running_model = self.local_manager.running_model().await;
+        let managed = cli::installed(&self.data_dir, cli::CliId::LlamaServer);
+        let (runtime_installed, runtime_version, runtime_managed) = match &managed {
+            Some(info) => (true, Some(info.version.clone()), true),
+            None => match cli::find_on_path("llama-server") {
+                Some(_) => (true, Some("system".into()), false),
+                None => (false, None, false),
+            },
+        };
+        let runtime_latest_version = self.cli_latest_version(cli::CliId::LlamaServer).await;
+        // Only a managed install is ours to update; system builds belong
+        // to the user's package manager.
+        let runtime_update_available = match (&managed, &runtime_latest_version) {
+            (Some(info), Some(latest)) => !cli_version_matches(&info.version, latest),
+            _ => false,
+        };
+        let (running_model, server_status) = match self.local_manager.state() {
+            crate::local::ServerState::Stopped => (None, "stopped".to_string()),
+            crate::local::ServerState::Starting(m) => (Some(m), "starting".to_string()),
+            crate::local::ServerState::Running(m) => (Some(m), "running".to_string()),
+        };
+        let enabled = self.config.lock().unwrap().local_enabled.unwrap_or(true);
         let downloads = self.local_downloads.lock().unwrap().clone();
         let models = crate::local::all_entries(self.config_dir.as_deref())
             .into_iter()
@@ -988,7 +1088,7 @@ impl Engine {
                 let downloaded = crate::local::gguf_path(&self.data_dir, &entry).exists();
                 let (download_status, download_bytes, download_error) =
                     match downloads.get(&entry.id) {
-                        Some(LocalDownloadState::Pending(bytes)) => (
+                        Some(LocalDownloadState::Pending { bytes, .. }) => (
                             "pending".to_string(),
                             bytes.load(std::sync::atomic::Ordering::Relaxed),
                             String::new(),
@@ -1015,13 +1115,47 @@ impl Engine {
             })
             .collect();
         trouve_protocol::LocalStatus {
+            enabled,
             ram_bytes: hw.ram_bytes,
             gpus: hw.gpus,
             runtime_installed,
             runtime_version,
+            runtime_managed,
+            runtime_latest_version,
+            runtime_update_available,
             running_model,
+            server_status,
             models,
         }
+    }
+
+    /// Turn the built-in "local" provider on or off. Disabling stops the
+    /// llama-server sidecar and removes the provider (its models disappear
+    /// from pickers); enabling re-registers it. Persisted in config.toml.
+    pub async fn set_local_enabled(&self, enabled: bool) -> Result<(), EngineError> {
+        {
+            let mut config = self.config.lock().unwrap();
+            if config.local_enabled.unwrap_or(true) == enabled {
+                return Ok(());
+            }
+            config.local_enabled = Some(enabled);
+            self.persist_config(&config);
+        }
+        if enabled {
+            self.injected_providers
+                .lock()
+                .unwrap()
+                .insert("local".into(), self.local_provider.clone());
+            self.providers
+                .write()
+                .unwrap()
+                .insert("local".into(), self.local_provider.clone());
+        } else {
+            self.injected_providers.lock().unwrap().remove("local");
+            self.providers.write().unwrap().remove("local");
+            self.local_manager.stop().await;
+        }
+        Ok(())
     }
 
     /// Start downloading one model's GGUF from HuggingFace into the data
@@ -1032,23 +1166,31 @@ impl Engine {
             .find(|e| e.id == id)
             .ok_or_else(|| EngineError::NotFound(format!("local model {id}")))?;
         let counter = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
         {
             let mut downloads = self.local_downloads.lock().unwrap();
-            if matches!(downloads.get(id), Some(LocalDownloadState::Pending(..))) {
+            if matches!(downloads.get(id), Some(LocalDownloadState::Pending { .. })) {
                 return Err(EngineError::Conflict(format!(
                     "a download for {id} is already in progress"
                 )));
             }
-            downloads.insert(id.to_string(), LocalDownloadState::Pending(counter.clone()));
+            downloads.insert(
+                id.to_string(),
+                LocalDownloadState::Pending {
+                    bytes: counter.clone(),
+                    cancel: cancel.clone(),
+                },
+            );
         }
         let engine = self.clone();
         let id_owned = id.to_string();
         tokio::spawn(async move {
-            let result = download_gguf(&engine.data_dir, &entry, &counter).await;
+            let result = download_gguf(&engine.data_dir, &entry, &counter, &cancel).await;
             let mut downloads = engine.local_downloads.lock().unwrap();
             match result {
-                // Downloaded state comes from the file's existence.
-                Ok(()) => {
+                // Downloaded state comes from the file's existence;
+                // cancelled downloads also just clear (status "none").
+                Ok(_) => {
                     downloads.remove(&id_owned);
                 }
                 Err(e) => {
@@ -1057,6 +1199,20 @@ impl Engine {
             }
         });
         Ok(())
+    }
+
+    /// Ask an in-flight model download to stop; its partial file is
+    /// deleted and the model returns to the not-downloaded state.
+    pub fn cancel_local_model_download(&self, id: &str) -> Result<(), EngineError> {
+        match self.local_downloads.lock().unwrap().get(id) {
+            Some(LocalDownloadState::Pending { cancel, .. }) => {
+                cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+                Ok(())
+            }
+            _ => Err(EngineError::NotFound(format!(
+                "no download for {id} is in progress"
+            ))),
+        }
     }
 
     /// Register a custom GGUF (HuggingFace repo + filename), validating
@@ -1139,7 +1295,7 @@ impl Engine {
             .into_iter()
             .find(|e| e.id == id)
             .ok_or_else(|| EngineError::NotFound(format!("local model {id}")))?;
-        if self.local_manager.running_model().await.as_deref() == Some(id) {
+        if self.local_manager.running_model().as_deref() == Some(id) {
             self.local_manager.stop().await;
         }
         self.local_downloads.lock().unwrap().remove(id);
@@ -1164,6 +1320,33 @@ impl Engine {
     /// local turn restarts it).
     pub async fn stop_local_server(&self) {
         self.local_manager.stop().await;
+    }
+
+    /// Restart the llama-server sidecar with the model it is serving. The
+    /// reload happens in the background (large GGUFs take a while);
+    /// progress shows in `local_status` as server_status "starting".
+    pub async fn restart_local_server(&self) -> Result<(), EngineError> {
+        let model = self
+            .local_manager
+            .running_model()
+            .ok_or_else(|| EngineError::Conflict("no local server is running".into()))?;
+        let entry = crate::local::all_entries(self.config_dir.as_deref())
+            .into_iter()
+            .find(|e| e.id == model)
+            .ok_or_else(|| EngineError::NotFound(format!("local model {model}")))?;
+        let bin = crate::local::runtime_bin(&self.data_dir).ok_or_else(|| {
+            EngineError::Conflict("the llama.cpp runtime is not installed".into())
+        })?;
+        let gguf = crate::local::gguf_path(&self.data_dir, &entry);
+        let log_path = self.data_dir.join("llama-server.log");
+        self.local_manager.stop().await;
+        let manager = self.local_manager.clone();
+        tokio::spawn(async move {
+            if let Err(e) = manager.ensure(&bin, &entry.id, &gguf, &log_path).await {
+                tracing::warn!("llama-server restart failed: {e:#}");
+            }
+        });
+        Ok(())
     }
 
     /// Report the state of an OAuth login started with `start_login`.
@@ -3781,12 +3964,14 @@ pub fn question_result_json(
 /// (when `[providers.<id>.oauth]` is configured).
 /// Stream one GGUF from HuggingFace to `<data_dir>/models/`, updating
 /// `counter` as bytes land. Writes to a `.part` sibling and renames on
-/// success so a partial download never looks complete.
+/// success so a partial download never looks complete. Returns false when
+/// `cancel` was set (the partial file is deleted).
 async fn download_gguf(
     data_dir: &Path,
     entry: &crate::local::ModelEntry,
     counter: &std::sync::atomic::AtomicU64,
-) -> Result<()> {
+    cancel: &std::sync::atomic::AtomicBool,
+) -> Result<bool> {
     use futures::TryStreamExt as _;
     use tokio::io::AsyncWriteExt as _;
 
@@ -3803,13 +3988,18 @@ async fn download_gguf(
     let mut stream = resp.bytes_stream();
     let mut file = tokio::fs::File::create(&part).await?;
     while let Some(chunk) = stream.try_next().await? {
+        if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+            drop(file);
+            let _ = std::fs::remove_file(&part);
+            return Ok(false);
+        }
         file.write_all(&chunk).await?;
         counter.fetch_add(chunk.len() as u64, std::sync::atomic::Ordering::Relaxed);
     }
     file.flush().await?;
     drop(file);
     std::fs::rename(&part, &target)?;
-    Ok(())
+    Ok(true)
 }
 
 fn build_provider(

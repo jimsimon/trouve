@@ -625,16 +625,45 @@ pub struct LocalModelInfo {
 /// running server, and every known model.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct LocalStatus {
+    /// Whether local models are enabled (the "local" provider is
+    /// registered). Toggled with `PUT /v1/local/enabled`.
+    #[serde(default = "default_true")]
+    pub enabled: bool,
     pub ram_bytes: u64,
     pub gpus: Vec<LocalGpu>,
     /// Whether the llama.cpp runtime (llama-server) is installed.
     pub runtime_installed: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub runtime_version: Option<String>,
-    /// Model id currently loaded in the running llama-server, if any.
+    /// True when the runtime is a trouve-managed install (updatable and
+    /// uninstallable through the API), false for PATH/system builds.
+    #[serde(default)]
+    pub runtime_managed: bool,
+    /// Newest llama.cpp build the vendor serves (None when the check
+    /// failed, e.g. offline).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime_latest_version: Option<String>,
+    /// True when a managed install is older than `runtime_latest_version`.
+    #[serde(default)]
+    pub runtime_update_available: bool,
+    /// Model id currently loaded in (or loading into) llama-server.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub running_model: Option<String>,
+    /// Sidecar state: "stopped", "starting" (model loading), or "running".
+    #[serde(default)]
+    pub server_status: String,
     pub models: Vec<LocalModelInfo>,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+/// Turn local models on or off (`PUT /v1/local/enabled`). Disabling stops
+/// the llama-server sidecar and unregisters the "local" provider.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct SetLocalEnabledRequest {
+    pub enabled: bool,
 }
 
 /// Add a custom GGUF from a HuggingFace repo to the local model list.
@@ -658,6 +687,12 @@ pub struct CliInstallStatus {
     pub version: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    /// Bytes downloaded so far (pending only).
+    #[serde(default)]
+    pub received_bytes: u64,
+    /// Expected total from Content-Length; 0 when unknown.
+    #[serde(default)]
+    pub total_bytes: u64,
 }
 
 // --- models --------------------------------------------------------------

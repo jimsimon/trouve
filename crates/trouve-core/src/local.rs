@@ -226,6 +226,17 @@ pub fn download_url(repo: &str, file: &str) -> String {
     format!("https://huggingface.co/{repo}/resolve/main/{file}?download=true")
 }
 
+/// The llama-server binary to run: trouve-managed install first, PATH as
+/// a fallback.
+pub fn runtime_bin(data_dir: &Path) -> Option<PathBuf> {
+    let managed =
+        trouve_agents::install::managed_bin(data_dir, trouve_agents::install::CliId::LlamaServer);
+    if managed.exists() {
+        return Some(managed);
+    }
+    trouve_agents::install::find_on_path("llama-server")
+}
+
 // --- hardware probe ----------------------------------------------------------
 
 /// Detected memory resources. Conservative and best-effort: a machine
@@ -373,23 +384,55 @@ struct Running {
     child: tokio::process::Child,
 }
 
+/// Sidecar lifecycle as seen by status polling; a mirror kept outside the
+/// spawn lock so reads never wait behind a multi-minute model load.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ServerState {
+    Stopped,
+    /// Process spawned, model loading (waiting for /health).
+    Starting(String),
+    Running(String),
+}
+
 /// Owns the single llama-server sidecar. One model is loaded at a time;
 /// asking for a different model stops the old server and starts a new one.
-#[derive(Default)]
 pub struct LlamaManager {
     inner: tokio::sync::Mutex<Option<Running>>,
+    state: std::sync::Mutex<ServerState>,
+}
+
+impl Default for LlamaManager {
+    fn default() -> Self {
+        Self {
+            inner: tokio::sync::Mutex::new(None),
+            state: std::sync::Mutex::new(ServerState::Stopped),
+        }
+    }
 }
 
 impl LlamaManager {
-    /// Model id currently being served, if the sidecar is up.
-    pub async fn running_model(&self) -> Option<String> {
-        self.inner.lock().await.as_ref().map(|r| r.model_id.clone())
+    /// Sidecar state (non-blocking; safe to poll during a model load).
+    pub fn state(&self) -> ServerState {
+        self.state.lock().unwrap().clone()
+    }
+
+    /// Model id currently being served or loaded, if any.
+    pub fn running_model(&self) -> Option<String> {
+        match self.state() {
+            ServerState::Stopped => None,
+            ServerState::Starting(m) | ServerState::Running(m) => Some(m),
+        }
+    }
+
+    fn set_state(&self, state: ServerState) {
+        *self.state.lock().unwrap() = state;
     }
 
     pub async fn stop(&self) {
         if let Some(mut running) = self.inner.lock().await.take() {
             let _ = running.child.kill().await;
         }
+        self.set_state(ServerState::Stopped);
     }
 
     /// Make sure llama-server is up and serving `model_id`; returns the
@@ -411,7 +454,32 @@ impl LlamaManager {
             let _ = running.child.kill().await;
             *inner = None;
         }
+        self.set_state(ServerState::Starting(model_id.to_string()));
+        match self.spawn_and_wait(bin, gguf, log_path).await {
+            Ok((port, child)) => {
+                self.set_state(ServerState::Running(model_id.to_string()));
+                *inner = Some(Running {
+                    model_id: model_id.to_string(),
+                    port,
+                    child,
+                });
+                Ok(format!("http://127.0.0.1:{port}/v1"))
+            }
+            Err(e) => {
+                self.set_state(ServerState::Stopped);
+                Err(e)
+            }
+        }
+    }
 
+    /// Spawn llama-server and wait for /health; returns the bound port and
+    /// child on success.
+    async fn spawn_and_wait(
+        &self,
+        bin: &Path,
+        gguf: &Path,
+        log_path: &Path,
+    ) -> Result<(u16, tokio::process::Child)> {
         let port = free_port()?;
         let log = std::fs::File::create(log_path)
             .with_context(|| format!("creating {}", log_path.display()))?;
@@ -476,12 +544,7 @@ impl LlamaManager {
             tokio::time::sleep(std::time::Duration::from_millis(500)).await;
         }
 
-        *inner = Some(Running {
-            model_id: model_id.to_string(),
-            port,
-            child,
-        });
-        Ok(format!("http://127.0.0.1:{port}/v1"))
+        Ok((port, child))
     }
 }
 
@@ -518,17 +581,8 @@ impl LocalProvider {
         }
     }
 
-    /// The llama-server binary to run: trouve-managed install first, PATH
-    /// as a fallback.
     fn runtime_bin(&self) -> Option<PathBuf> {
-        let managed = trouve_agents::install::managed_bin(
-            &self.data_dir,
-            trouve_agents::install::CliId::LlamaServer,
-        );
-        if managed.exists() {
-            return Some(managed);
-        }
-        trouve_agents::install::find_on_path("llama-server")
+        runtime_bin(&self.data_dir)
     }
 
     fn downloaded_entries(&self) -> Vec<ModelEntry> {

@@ -8,7 +8,7 @@
 // Like the main window, this is dumb: models in, callbacks out.
 
 import {
-    AboutSlint, Button, CheckBox, ComboBox, LineEdit, ListView, ScrollView, TextEdit
+    AboutSlint, Button, CheckBox, ComboBox, LineEdit, ListView, ScrollView, Switch, TextEdit
 } from "std-widgets.slint";
 import { ScrollKeys } from "scroll-keys.slint";
 import { Theme } from "theme.slint";
@@ -33,6 +33,10 @@ export struct CliItem {
     // In-flight install feedback ("downloading…", "failed: …").
     status: string,
     busy: bool,
+    // Download percent while busy (-1 when the size is unknown).
+    progress: int,
+    // trouve-managed install exists (can be uninstalled).
+    managed: bool,
 }
 
 // Subscription usage for one agent-backend provider (flat: up to two
@@ -127,6 +131,22 @@ export struct KnownProviderItem {
     auth: string,
     // Undocumented vendor endpoint; may break or be restricted at any time.
     experimental: bool,
+}
+
+// A thin determinate download bar (accent fill over the control track).
+component DownloadBar inherits Rectangle {
+    in property <int> pct; // 0-100
+    height: 5px;
+    border-radius: 2.5px;
+    background: Theme.c.control-bg;
+    clip: true;
+    Rectangle {
+        x: 0;
+        width: max(parent.width * min(root.pct, 100) / 100, root.pct > 0 ? 5px : 0px);
+        height: parent.height;
+        border-radius: 2.5px;
+        background: Theme.c.accent;
+    }
 }
 
 // One metered subscription window: label, usage bar, reset note. The bar
@@ -225,6 +245,8 @@ export component SettingsScreen inherits Rectangle {
     callback mode-model-picked(/* id */ string, /* model-index */ int);
     callback refresh-settings();
     callback cli-install(/* id */ string);
+    callback cli-cancel(/* id */ string);
+    callback cli-uninstall(/* id */ string);
     callback theme-picked(int);
     callback font-size-picked(int);
     callback font-picked(int);
@@ -245,22 +267,37 @@ export component SettingsScreen inherits Rectangle {
     // Local Models section: hardware line, llama.cpp runtime state, the
     // running sidecar, and the model list.
     in property <[LocalModelItem]> local-models;
+    in property <bool> local-enabled: true;
     in property <string> local-hw-line;
     in property <string> local-runtime-label;
-    // "Install" / "Update"
+    // "Install" when not installed, "" otherwise (updates are a separate
+    // button shown only when one is actually available).
     in property <string> local-runtime-action;
     in property <bool> local-runtime-busy;
+    // Download percent while busy (-1 when the size is unknown).
+    in property <int> local-runtime-progress: -1;
+    // trouve-managed runtime install (updatable / uninstallable here).
+    in property <bool> local-runtime-managed;
+    // A newer llama.cpp build is available for a managed install.
+    in property <bool> local-runtime-update;
     in property <string> local-runtime-status;
     // "llama-server is running <model>" or "" when stopped.
     in property <string> local-server-line;
+    // Sidecar is loading a model (no stop/restart until it settles).
+    in property <bool> local-server-busy;
     in property <string> local-status;
     in-out property <string> local-form-repo;
     in-out property <string> local-form-file;
     callback local-refresh();
+    callback local-enabled-toggled(bool);
     callback local-runtime-install();
+    callback local-runtime-cancel();
+    callback local-runtime-uninstall();
     callback local-download(/* id */ string);
+    callback local-cancel(/* id */ string);
     callback local-delete(/* id */ string);
     callback local-stop-server();
+    callback local-restart-server();
     callback local-added(/* repo */ string, /* file */ string);
 
     // MCP servers (app-wide config + every registered workspace).
@@ -592,10 +629,10 @@ export component SettingsScreen inherits Rectangle {
                             Rectangle {
                                 background: Theme.c.surface;
                                 border-radius: 6px;
-                                height: 118px;
+                                height: 130px;
                                 ListView {
                                     for cli in root.clis: Rectangle {
-                                        height: Theme.fs(38px);
+                                        height: Theme.fs(42px);
                                         HorizontalLayout {
                                             padding-left: 10px;
                                             padding-right: 6px;
@@ -609,18 +646,31 @@ export component SettingsScreen inherits Rectangle {
                                                 width: 110px;
                                                 overflow: elide;
                                             }
-                                            Text {
-                                                text: cli.status != "" ? cli.status : cli.version-label;
-                                                color: cli.status != "" ? Theme.c.accent-tint : Theme.c.text-dim;
-                                                font-size: Theme.fs(12px);
-                                                vertical-alignment: center;
-                                                overflow: elide;
+                                            VerticalLayout {
+                                                alignment: center;
+                                                spacing: 4px;
                                                 horizontal-stretch: 1;
+                                                Text {
+                                                    text: cli.status != "" ? cli.status : cli.version-label;
+                                                    color: cli.status != "" ? Theme.c.accent-tint : Theme.c.text-dim;
+                                                    font-size: Theme.fs(12px);
+                                                    overflow: elide;
+                                                }
+                                                if cli.busy && cli.progress >= 0: DownloadBar {
+                                                    pct: cli.progress;
+                                                }
                                             }
-                                            if cli.action-label != "": Button {
+                                            if cli.busy: Button {
+                                                text: "Cancel";
+                                                clicked => { root.cli-cancel(cli.id); }
+                                            }
+                                            if !cli.busy && cli.action-label != "": Button {
                                                 text: cli.action-label;
-                                                enabled: !cli.busy;
                                                 clicked => { root.cli-install(cli.id); }
+                                            }
+                                            if !cli.busy && cli.managed: Button {
+                                                text: "Uninstall";
+                                                clicked => { root.cli-uninstall(cli.id); }
                                             }
                                         }
                                     }
@@ -994,6 +1044,7 @@ export component SettingsScreen inherits Rectangle {
                             spacing: 12px;
 
                             HorizontalLayout {
+                                spacing: 12px;
                                 Text {
                                     text: "Local Models";
                                     color: Theme.c.text-hi;
@@ -1001,7 +1052,12 @@ export component SettingsScreen inherits Rectangle {
                                     font-weight: 700;
                                     horizontal-stretch: 1;
                                 }
-                                Button {
+                                Switch {
+                                    text: root.local-enabled ? "Enabled" : "Disabled";
+                                    checked: root.local-enabled;
+                                    toggled => { root.local-enabled-toggled(self.checked); }
+                                }
+                                if root.local-enabled: Button {
                                     text: "⟳ Refresh";
                                     clicked => { root.local-refresh(); }
                                 }
@@ -1012,7 +1068,13 @@ export component SettingsScreen inherits Rectangle {
                                 font-size: Theme.fs(11px);
                                 wrap: word-wrap;
                             }
-                            Text {
+                            if !root.local-enabled: Text {
+                                text: "Local models are disabled: the llama-server sidecar is stopped and local models are hidden from the model pickers. Downloaded files stay on disk.";
+                                color: Theme.c.text-mid;
+                                font-size: Theme.fs(12px);
+                                wrap: word-wrap;
+                            }
+                            if root.local-enabled: Text {
                                 text: "Your machine: " + root.local-hw-line;
                                 color: Theme.c.text-mid;
                                 font-size: Theme.fs(12px);
@@ -1020,7 +1082,7 @@ export component SettingsScreen inherits Rectangle {
                             }
 
                             // Runtime install state.
-                            Rectangle {
+                            if root.local-enabled: Rectangle {
                                 background: Theme.c.surface;
                                 border-radius: 6px;
                                 height: local-runtime-row.preferred-height + 20px;
@@ -1029,6 +1091,7 @@ export component SettingsScreen inherits Rectangle {
                                     spacing: 8px;
                                     VerticalLayout {
                                         alignment: center;
+                                        spacing: 4px;
                                         horizontal-stretch: 1;
                                         Text {
                                             text: "llama.cpp runtime — " + root.local-runtime-label;
@@ -1041,21 +1104,37 @@ export component SettingsScreen inherits Rectangle {
                                             font-size: Theme.fs(11px);
                                             wrap: word-wrap;
                                         }
+                                        if root.local-runtime-busy && root.local-runtime-progress >= 0: DownloadBar {
+                                            pct: root.local-runtime-progress;
+                                        }
                                     }
                                     VerticalLayout {
                                         alignment: center;
-                                        Button {
-                                            text: root.local-runtime-busy
-                                                ? "installing…" : root.local-runtime-action;
-                                            enabled: !root.local-runtime-busy;
-                                            clicked => { root.local-runtime-install(); }
+                                        HorizontalLayout {
+                                            spacing: 6px;
+                                            if root.local-runtime-busy: Button {
+                                                text: "Cancel";
+                                                clicked => { root.local-runtime-cancel(); }
+                                            }
+                                            if !root.local-runtime-busy && root.local-runtime-action != "": Button {
+                                                text: root.local-runtime-action;
+                                                clicked => { root.local-runtime-install(); }
+                                            }
+                                            if !root.local-runtime-busy && root.local-runtime-update: Button {
+                                                text: "Update";
+                                                clicked => { root.local-runtime-install(); }
+                                            }
+                                            if !root.local-runtime-busy && root.local-runtime-managed: Button {
+                                                text: "Uninstall";
+                                                clicked => { root.local-runtime-uninstall(); }
+                                            }
                                         }
                                     }
                                 }
                             }
 
                             // Running sidecar (memory can be freed).
-                            if root.local-server-line != "": Rectangle {
+                            if root.local-enabled && root.local-server-line != "": Rectangle {
                                 background: Theme.c.accent-bg;
                                 border-radius: 6px;
                                 height: local-server-row.preferred-height + 16px;
@@ -1070,14 +1149,18 @@ export component SettingsScreen inherits Rectangle {
                                         horizontal-stretch: 1;
                                         overflow: elide;
                                     }
-                                    Button {
+                                    if !root.local-server-busy: Button {
+                                        text: "⟳ Restart";
+                                        clicked => { root.local-restart-server(); }
+                                    }
+                                    if !root.local-server-busy: Button {
                                         text: "Stop (free memory)";
                                         clicked => { root.local-stop-server(); }
                                     }
                                 }
                             }
 
-                            if root.local-status != "": Text {
+                            if root.local-enabled && root.local-status != "": Text {
                                 text: root.local-status;
                                 color: Theme.c.err;
                                 font-size: Theme.fs(12px);
@@ -1085,7 +1168,7 @@ export component SettingsScreen inherits Rectangle {
                             }
 
                             // Model list.
-                            Rectangle {
+                            if root.local-enabled: Rectangle {
                                 background: Theme.c.surface;
                                 border-radius: 6px;
                                 vertical-stretch: 1;
@@ -1099,6 +1182,7 @@ export component SettingsScreen inherits Rectangle {
                                             spacing: 8px;
                                             VerticalLayout {
                                                 alignment: center;
+                                                spacing: 3px;
                                                 horizontal-stretch: 1;
                                                 HorizontalLayout {
                                                     spacing: 6px;
@@ -1140,6 +1224,9 @@ export component SettingsScreen inherits Rectangle {
                                                     font-size: Theme.fs(11px);
                                                     overflow: elide;
                                                 }
+                                                if model.downloading: DownloadBar {
+                                                    pct: model.progress;
+                                                }
                                             }
                                             if model.downloaded: VerticalLayout {
                                                 alignment: center;
@@ -1149,12 +1236,19 @@ export component SettingsScreen inherits Rectangle {
                                                     font-size: Theme.fs(11px);
                                                 }
                                             }
+                                            if model.downloading: Button {
+                                                text: "Cancel";
+                                                min-width: Theme.fs(96px);
+                                                clicked => { root.local-cancel(model.id); }
+                                            }
                                             if !model.downloaded && !model.downloading: Button {
                                                 text: model.error != "" ? "Retry" : "Download";
+                                                min-width: Theme.fs(96px);
                                                 clicked => { root.local-download(model.id); }
                                             }
-                                            if model.downloaded || model.custom: Button {
+                                            if !model.downloading && (model.downloaded || model.custom): Button {
                                                 text: "Remove";
+                                                min-width: Theme.fs(96px);
                                                 clicked => { root.local-delete(model.id); }
                                             }
                                         }
@@ -1163,7 +1257,7 @@ export component SettingsScreen inherits Rectangle {
                             }
 
                             // Custom GGUF escape hatch for power users.
-                            VerticalLayout {
+                            if root.local-enabled: VerticalLayout {
                                 spacing: 6px;
                                 Text {
                                     text: "Add any single-file GGUF from HuggingFace (advanced):";

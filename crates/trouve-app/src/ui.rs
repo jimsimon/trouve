@@ -771,21 +771,35 @@ pub fn set_mode_model_indices(ui: &Ui, indices: Vec<i32>) {
     });
 }
 
-/// (id, display_name, version_label, action_label, status, busy) per CLI.
-pub fn set_clis(ui: &Ui, clis: Vec<(String, String, String, String, String, bool)>) {
+/// One vendor-CLI row for the settings Providers section (plain-data
+/// mirror of Slint's `CliItem`).
+pub struct CliView {
+    pub id: String,
+    pub display_name: String,
+    pub version_label: String,
+    pub action_label: String,
+    pub status: String,
+    pub busy: bool,
+    /// Download percent while busy (-1 when the size is unknown).
+    pub progress: i32,
+    /// A trouve-managed install exists (can be uninstalled).
+    pub managed: bool,
+}
+
+pub fn set_clis(ui: &Ui, clis: Vec<CliView>) {
     let _ = ui.upgrade_in_event_loop(move |ui| {
         let items: Vec<CliItem> = clis
             .into_iter()
-            .map(
-                |(id, display_name, version_label, action_label, status, busy)| CliItem {
-                    id: id.into(),
-                    display_name: display_name.into(),
-                    version_label: version_label.into(),
-                    action_label: action_label.into(),
-                    status: status.into(),
-                    busy,
-                },
-            )
+            .map(|c| CliItem {
+                id: c.id.into(),
+                display_name: c.display_name.into(),
+                version_label: c.version_label.into(),
+                action_label: c.action_label.into(),
+                status: c.status.into(),
+                busy: c.busy,
+                progress: c.progress,
+                managed: c.managed,
+            })
             .collect();
         ui.set_settings_clis(ModelRc::new(VecModel::from(items)));
     });
@@ -812,13 +826,23 @@ pub struct LocalModelView {
 
 /// Everything the Local Models settings section shows.
 pub struct LocalView {
+    pub enabled: bool,
     pub hw_line: String,
     pub runtime_label: String,
+    /// "Install" when not installed, "" otherwise.
     pub runtime_action: String,
     pub runtime_busy: bool,
+    /// Download percent while busy (-1 when the size is unknown).
+    pub runtime_progress: i32,
+    /// Managed install (updatable/uninstallable here).
+    pub runtime_managed: bool,
+    /// A newer llama.cpp build is available for a managed install.
+    pub runtime_update: bool,
     pub runtime_status: String,
     /// "llama-server is running <model>" or "" when stopped.
     pub server_line: String,
+    /// Sidecar is loading a model (stop/restart hidden until it settles).
+    pub server_busy: bool,
     pub models: Vec<LocalModelView>,
 }
 
@@ -841,12 +865,17 @@ pub fn set_local(ui: &Ui, view: LocalView) {
                 custom: m.custom,
             })
             .collect();
+        ui.set_local_enabled(view.enabled);
         ui.set_local_hw_line(SharedString::from(view.hw_line.as_str()));
         ui.set_local_runtime_label(SharedString::from(view.runtime_label.as_str()));
         ui.set_local_runtime_action(SharedString::from(view.runtime_action.as_str()));
         ui.set_local_runtime_busy(view.runtime_busy);
+        ui.set_local_runtime_progress(view.runtime_progress);
+        ui.set_local_runtime_managed(view.runtime_managed);
+        ui.set_local_runtime_update(view.runtime_update);
         ui.set_local_runtime_status(SharedString::from(view.runtime_status.as_str()));
         ui.set_local_server_line(SharedString::from(view.server_line.as_str()));
+        ui.set_local_server_busy(view.server_busy);
         ui.set_local_models(ModelRc::new(VecModel::from(items)));
     });
 }

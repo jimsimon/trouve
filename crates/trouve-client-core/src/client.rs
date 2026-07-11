@@ -373,6 +373,16 @@ impl ProtocolClient {
         self.get_json(&format!("/clis/{id}/install")).await
     }
 
+    /// Cancel an in-flight CLI install.
+    pub async fn cancel_cli_install(&self, id: &str) -> Result<()> {
+        self.delete(&format!("/clis/{id}/install")).await
+    }
+
+    /// Remove the managed install of a CLI (PATH installs are untouched).
+    pub async fn uninstall_cli(&self, id: &str) -> Result<()> {
+        self.delete(&format!("/clis/{id}")).await
+    }
+
     /// Local ("offline / integrated") inference status: hardware, runtime,
     /// running server, and model download/fit state.
     pub async fn local_status(&self) -> Result<LocalStatus> {
@@ -405,12 +415,33 @@ impl ProtocolClient {
             .await
     }
 
+    /// Cancel an in-flight model download (the partial file is deleted).
+    pub async fn cancel_local_model_download(&self, id: &str) -> Result<()> {
+        self.delete(&format!("/local/models/{id}/download")).await
+    }
+
     pub async fn delete_local_model(&self, id: &str) -> Result<()> {
         self.delete(&format!("/local/models/{id}")).await
     }
 
     pub async fn stop_local_server(&self) -> Result<()> {
         self.post_empty("/local/server/stop").await
+    }
+
+    /// Restart llama-server with the model it is serving (background;
+    /// poll `local_status` for server_status).
+    pub async fn restart_local_server(&self) -> Result<()> {
+        self.post_empty("/local/server/restart").await
+    }
+
+    /// Enable or disable local models (disable stops the sidecar and
+    /// removes the "local" provider).
+    pub async fn set_local_enabled(&self, enabled: bool) -> Result<()> {
+        self.put_empty(
+            "/local/enabled",
+            &trouve_protocol::SetLocalEnabledRequest { enabled },
+        )
+        .await
     }
 
     pub async fn set_default_model(&self, model: &str) -> Result<()> {

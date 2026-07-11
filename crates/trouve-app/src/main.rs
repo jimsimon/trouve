@@ -703,13 +703,31 @@ fn main() -> anyhow::Result<()> {
     }
     {
         let tx = tx.clone();
+        window.on_cli_cancel(move |id| {
+            let _ = tx.send(UiCommand::CliCancel(id.to_string()));
+        });
+    }
+    {
+        let tx = tx.clone();
+        window.on_cli_uninstall(move |id| {
+            let _ = tx.send(UiCommand::CliUninstall(id.to_string()));
+        });
+    }
+    {
+        let tx = tx.clone();
         window.on_local_refresh(move || {
             let _ = tx.send(UiCommand::RefreshLocal);
         });
     }
     {
-        // The llama.cpp runtime installs through the same managed-CLI
-        // machinery as the vendor CLIs.
+        let tx = tx.clone();
+        window.on_local_enabled_toggled(move |enabled| {
+            let _ = tx.send(UiCommand::LocalEnabledToggled(enabled));
+        });
+    }
+    {
+        // The llama.cpp runtime installs/cancels/uninstalls through the
+        // same managed-CLI machinery as the vendor CLIs.
         let tx = tx.clone();
         window.on_local_runtime_install(move || {
             let _ = tx.send(UiCommand::CliInstall("llama-server".into()));
@@ -717,8 +735,26 @@ fn main() -> anyhow::Result<()> {
     }
     {
         let tx = tx.clone();
+        window.on_local_runtime_cancel(move || {
+            let _ = tx.send(UiCommand::CliCancel("llama-server".into()));
+        });
+    }
+    {
+        let tx = tx.clone();
+        window.on_local_runtime_uninstall(move || {
+            let _ = tx.send(UiCommand::CliUninstall("llama-server".into()));
+        });
+    }
+    {
+        let tx = tx.clone();
         window.on_local_download(move |id| {
             let _ = tx.send(UiCommand::LocalDownload(id.to_string()));
+        });
+    }
+    {
+        let tx = tx.clone();
+        window.on_local_cancel(move |id| {
+            let _ = tx.send(UiCommand::LocalCancelDownload(id.to_string()));
         });
     }
     {
@@ -731,6 +767,12 @@ fn main() -> anyhow::Result<()> {
         let tx = tx.clone();
         window.on_local_stop_server(move || {
             let _ = tx.send(UiCommand::LocalStopServer);
+        });
+    }
+    {
+        let tx = tx.clone();
+        window.on_local_restart_server(move || {
+            let _ = tx.send(UiCommand::LocalRestartServer);
         });
     }
     {

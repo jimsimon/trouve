@@ -1927,3 +1927,133 @@ async fn terminal_shell_in_session_worktree() {
         .unwrap();
     assert_ne!(fresh["id"], *term_id);
 }
+
+/// The local-models enable toggle and the install-lifecycle endpoints:
+/// disabling unregisters the "local" provider (persisted), cancels 404
+/// when nothing is in flight, uninstall is a no-op for absent managed
+/// installs, and restart 409s with no server running.
+#[tokio::test]
+async fn local_enable_toggle_and_install_lifecycle_endpoints() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Store::open(&tmp.path().join("db/trouve.db")).unwrap();
+    let engine = Arc::new(
+        Engine::new(store, tmp.path().join("data"), &Config::default()).with_config_dir(None),
+    );
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let router = trouve_server::build_router(engine);
+    tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+    let base = format!("http://{addr}/v1");
+    let client = reqwest::Client::new();
+
+    // Enabled by default; the sidecar is stopped and the provider listed.
+    let local: serde_json::Value = client
+        .get(format!("{base}/local"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(local["enabled"], true);
+    assert_eq!(local["server_status"], "stopped");
+    let providers: serde_json::Value = client
+        .get(format!("{base}/providers"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let has_local = |p: &serde_json::Value| {
+        p["providers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|p| p["id"] == "local")
+    };
+    assert!(has_local(&providers));
+
+    // Disable: reflected in status, and the provider disappears.
+    let resp = client
+        .put(format!("{base}/local/enabled"))
+        .json(&serde_json::json!({"enabled": false}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 204);
+    let local: serde_json::Value = client
+        .get(format!("{base}/local"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(local["enabled"], false);
+    let providers: serde_json::Value = client
+        .get(format!("{base}/providers"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(!has_local(&providers));
+
+    // Re-enable restores the provider.
+    let resp = client
+        .put(format!("{base}/local/enabled"))
+        .json(&serde_json::json!({"enabled": true}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 204);
+    let providers: serde_json::Value = client
+        .get(format!("{base}/providers"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(has_local(&providers));
+
+    // Nothing is downloading/installing: cancels 404.
+    let resp = client
+        .delete(format!("{base}/clis/codex/install"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 404);
+    let resp = client
+        .delete(format!("{base}/local/models/qwen2.5-coder-3b/download"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 404);
+
+    // Uninstall: unknown CLI 404s; a known CLI with no managed install is
+    // a clean no-op.
+    let resp = client
+        .delete(format!("{base}/clis/not-a-cli"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 404);
+    let resp = client
+        .delete(format!("{base}/clis/codex"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 204);
+
+    // No llama-server running: restart conflicts.
+    let resp = client
+        .post(format!("{base}/local/server/restart"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 409);
+}

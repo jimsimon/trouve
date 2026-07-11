@@ -174,6 +174,12 @@ pub enum UiCommand {
     SetModeModel(String, i32),
     /// Download/update a managed vendor CLI ("cursor-agent", "claude", "codex").
     CliInstall(String),
+    /// Cancel an in-flight CLI install (also used for "llama-server").
+    CliCancel(String),
+    /// Remove the managed install of a CLI (also used for "llama-server").
+    CliUninstall(String),
+    /// Re-render just the vendor-CLI rows (install progress polling).
+    RefreshClis,
     /// Re-fetch local (offline) model state for the settings screen.
     RefreshLocal,
     /// Internal: the local status + runtime-install fetch finished.
@@ -188,10 +194,17 @@ pub enum UiCommand {
     ),
     /// Start downloading one local model's GGUF.
     LocalDownload(String),
+    /// Cancel an in-flight GGUF download (partial file is deleted).
+    LocalCancelDownload(String),
     /// Delete a local model's GGUF (custom entries disappear entirely).
     LocalDeleteModel(String),
     /// Stop the llama-server sidecar to free memory.
     LocalStopServer,
+    /// Restart the llama-server sidecar with its current model.
+    LocalRestartServer,
+    /// Turn local models on/off (off stops the sidecar and hides the
+    /// "local" provider's models).
+    LocalEnabledToggled(bool),
     /// Register a custom GGUF (HuggingFace repo + file).
     LocalAddModel {
         repo: String,
@@ -1694,14 +1707,16 @@ impl Controller {
             } else {
                 String::new()
             };
-            let (status, busy) = match install.as_ref().map(|s| s.status.as_str()) {
-                Some("pending") => (
-                    match install.as_ref().and_then(|s| s.version.clone()) {
-                        Some(v) => format!("downloading {v}…"),
-                        None => "downloading…".to_string(),
-                    },
-                    true,
-                ),
+            let (status, busy, progress) = match install.as_ref().map(|s| s.status.as_str()) {
+                Some("pending") => {
+                    let s = install.as_ref().unwrap();
+                    let label = match &s.version {
+                        Some(v) => format!("downloading {v}"),
+                        None => "downloading".to_string(),
+                    };
+                    let (text, pct) = download_progress(&label, s.received_bytes, s.total_bytes);
+                    (text, true, pct)
+                }
                 Some("failed") => (
                     format!(
                         "install failed: {}",
@@ -1711,17 +1726,20 @@ impl Controller {
                             .unwrap_or_default()
                     ),
                     false,
+                    -1,
                 ),
-                _ => (String::new(), false),
+                _ => (String::new(), false, -1),
             };
-            rows.push((
-                cli.id,
-                cli.display_name,
+            rows.push(ui::CliView {
+                id: cli.id,
+                display_name: cli.display_name,
                 version_label,
                 action_label,
                 status,
                 busy,
-            ));
+                progress,
+                managed: cli.source == "managed",
+            });
         }
         ui::set_clis(&self.ui, rows);
     }
@@ -1762,31 +1780,46 @@ impl Controller {
                 human_gb(gpu.vram_bytes)
             ));
         }
-        let runtime_label = match (&status.runtime_installed, &status.runtime_version) {
+        let mut runtime_label = match (&status.runtime_installed, &status.runtime_version) {
             (true, Some(v)) => format!("installed ({v})"),
             (true, None) => "installed".to_string(),
             (false, _) => "not installed".to_string(),
         };
-        let (runtime_busy, runtime_status) = match install.status.as_str() {
-            "pending" => (true, "downloading llama.cpp…".to_string()),
+        if status.runtime_update_available {
+            if let Some(latest) = &status.runtime_latest_version {
+                runtime_label.push_str(&format!(" — {latest} available"));
+            }
+        }
+        let (runtime_busy, runtime_status, runtime_progress) = match install.status.as_str() {
+            "pending" => {
+                let (text, pct) = download_progress(
+                    "downloading llama.cpp",
+                    install.received_bytes,
+                    install.total_bytes,
+                );
+                (true, text, pct)
+            }
             "failed" => (
                 false,
                 format!(
                     "install failed: {}",
                     install.error.clone().unwrap_or_default()
                 ),
+                -1,
             ),
-            _ => (false, String::new()),
+            _ => (false, String::new(), -1),
         };
         let runtime_action = if status.runtime_installed {
-            "Update".to_string()
+            String::new()
         } else {
             "Install".to_string()
         };
-        let server_line = match &status.running_model {
-            Some(model) => format!("llama-server is running {model}"),
-            None => String::new(),
-        };
+        let (server_line, server_busy) =
+            match (&status.running_model, status.server_status.as_str()) {
+                (Some(model), "starting") => (format!("llama-server is loading {model}…"), true),
+                (Some(model), _) => (format!("llama-server is running {model}"), false),
+                (None, _) => (String::new(), false),
+            };
         let models = status
             .models
             .iter()
@@ -1823,12 +1856,17 @@ impl Controller {
         ui::set_local(
             &self.ui,
             ui::LocalView {
+                enabled: status.enabled,
                 hw_line,
                 runtime_label,
                 runtime_action,
                 runtime_busy,
+                runtime_progress,
+                runtime_managed: status.runtime_managed,
+                runtime_update: status.runtime_update_available,
                 runtime_status,
                 server_line,
+                server_busy,
                 models,
             },
         );
@@ -2889,8 +2927,10 @@ impl Controller {
                         }
                         self.local_downloaded = Some(downloaded);
                     }
-                    // Keep polling while something is in flight.
+                    // Keep polling while something is in flight (downloads,
+                    // runtime install, or a model loading after restart).
                     let busy = install.status == "pending"
+                        || status.server_status == "starting"
                         || status.models.iter().any(|m| m.download_status == "pending");
                     if busy && !self.local_polling {
                         self.local_polling = true;
@@ -2910,6 +2950,13 @@ impl Controller {
                 }
                 self.refresh_local();
             }
+            UiCommand::LocalCancelDownload(id) => {
+                match self.client.cancel_local_model_download(&id).await {
+                    Ok(()) => ui::set_local_status(&self.ui, String::new()),
+                    Err(e) => ui::set_local_status(&self.ui, format!("{e:#}")),
+                }
+                self.refresh_local();
+            }
             UiCommand::LocalDeleteModel(id) => {
                 match self.client.delete_local_model(&id).await {
                     Ok(()) => ui::set_local_status(&self.ui, String::new()),
@@ -2920,6 +2967,22 @@ impl Controller {
             UiCommand::LocalStopServer => {
                 let _ = self.client.stop_local_server().await;
                 self.refresh_local();
+            }
+            UiCommand::LocalRestartServer => {
+                match self.client.restart_local_server().await {
+                    Ok(()) => ui::set_local_status(&self.ui, String::new()),
+                    Err(e) => ui::set_local_status(&self.ui, format!("{e:#}")),
+                }
+                self.refresh_local();
+            }
+            UiCommand::LocalEnabledToggled(enabled) => {
+                match self.client.set_local_enabled(enabled).await {
+                    Ok(()) => ui::set_local_status(&self.ui, String::new()),
+                    Err(e) => ui::set_local_status(&self.ui, format!("{e:#}")),
+                }
+                self.refresh_local();
+                // local/* models appear or disappear from the pickers.
+                self.reload_catalogs().await;
             }
             UiCommand::LocalAddModel { repo, file } => {
                 match self
@@ -2943,19 +3006,25 @@ impl Controller {
                 Ok(()) => {
                     ui::set_settings_status(&self.ui, format!("installing {id}…"));
                     self.refresh_clis().await;
-                    // Poll until the install settles; every refresh re-renders
-                    // the row from the server's install status.
+                    if id == "llama-server" {
+                        self.refresh_local();
+                    }
+                    // Poll until the install settles, re-rendering the rows
+                    // each tick so the progress bar moves.
                     let client = self.client.clone();
                     let settings_ui = self.ui.clone();
                     let tx = self.tx.clone();
                     tokio::spawn(async move {
-                        for _ in 0..600 {
-                            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                        for _ in 0..1200 {
+                            tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
                             let Ok(status) = client.cli_install_status(&id).await else {
                                 return;
                             };
                             match status.status.as_str() {
-                                "pending" => continue,
+                                "pending" => {
+                                    let _ = tx.send(UiCommand::RefreshClis);
+                                    continue;
+                                }
                                 "success" => {
                                     ui::set_settings_status(
                                         &settings_ui,
@@ -2964,6 +3033,10 @@ impl Controller {
                                             status.version.unwrap_or_default()
                                         ),
                                     );
+                                }
+                                // Cancelled installs clear back to "none".
+                                "none" => {
+                                    ui::set_settings_status(&settings_ui, String::new());
                                 }
                                 _ => {
                                     ui::set_settings_status(
@@ -2976,6 +3049,9 @@ impl Controller {
                                 }
                             }
                             let _ = tx.send(UiCommand::RefreshSettings);
+                            if id == "llama-server" {
+                                let _ = tx.send(UiCommand::RefreshLocal);
+                            }
                             return;
                         }
                     });
@@ -2984,6 +3060,29 @@ impl Controller {
                     ui::set_settings_status(&self.ui, format!("{e:#}"));
                 }
             },
+            UiCommand::CliCancel(id) => {
+                if let Err(e) = self.client.cancel_cli_install(&id).await {
+                    ui::set_settings_status(&self.ui, format!("{e:#}"));
+                }
+                // The install task notices at its next chunk; the poll loop
+                // (or the local section's poller) picks up the cleared state.
+            }
+            UiCommand::CliUninstall(id) => {
+                match self.client.uninstall_cli(&id).await {
+                    Ok(()) => ui::set_settings_status(&self.ui, format!("uninstalled {id}")),
+                    Err(e) => ui::set_settings_status(&self.ui, format!("{e:#}")),
+                }
+                self.refresh_clis().await;
+                if id == "llama-server" {
+                    self.refresh_local();
+                }
+                // Backends may have fallen back to a PATH binary (or gone
+                // away): refresh the model pickers.
+                self.reload_catalogs().await;
+            }
+            UiCommand::RefreshClis => {
+                self.refresh_clis().await;
+            }
             UiCommand::Event(thread_id, envelope) => {
                 let vm = self.vms.entry(thread_id.clone()).or_default();
                 let changed = vm.apply(&envelope);
@@ -3223,6 +3322,27 @@ fn format_reviews(reviews: &[trouve_protocol::PrReview]) -> String {
 /// Human-readable size in decimal gigabytes ("4.7 GB").
 fn human_gb(bytes: u64) -> String {
     format!("{:.1} GB", bytes as f64 / 1e9)
+}
+
+fn human_mb(bytes: u64) -> String {
+    format!("{:.0} MB", bytes as f64 / 1e6)
+}
+
+/// Download status line + bar percent: "label… 45 MB / 120 MB (37%)", or
+/// just the received count with -1 (no bar) when the total is unknown.
+fn download_progress(label: &str, received: u64, total: u64) -> (String, i32) {
+    if total == 0 {
+        return (format!("{label}… {}", human_mb(received)), -1);
+    }
+    let pct = ((received * 100) / total).min(100) as i32;
+    (
+        format!(
+            "{label}… {} / {} ({pct}%)",
+            human_mb(received),
+            human_mb(total)
+        ),
+        pct,
+    )
 }
 
 fn render_command_line(command: &str, args: &[String]) -> String {

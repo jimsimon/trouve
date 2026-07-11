@@ -26,7 +26,11 @@ pub use requests::*;
 // endpoints, and the `queued` flag on TurnAccepted (all additive).
 // 0.8: integrated terminal — POST /v1/sessions/{id}/terminal plus
 // /v1/terminals/{id} input/resize/kill/output endpoints (all additive).
-pub const PROTOCOL_VERSION: &str = "0.8";
+// 0.9: install lifecycle — byte progress on CliInstallStatus, cancel
+// (DELETE …/install, DELETE …/download) and uninstall (DELETE /v1/clis/{id})
+// endpoints, local enable toggle (PUT /v1/local/enabled + LocalStatus
+// fields), and POST /v1/local/server/restart (all additive).
+pub const PROTOCOL_VERSION: &str = "0.9";
 
 pub type WorkspaceId = String;
 pub type SessionId = String;

@@ -27,10 +27,11 @@ use trouve_protocol::{
     McpServerInfo, MergePrRequest, ModeInfo, ModelInfo, OpenTerminalRequest, PrInfo, ProviderInfo,
     ProvidersResponse, QueuedPrompt, RegisterWorkspaceRequest, ReorderQueueRequest,
     ResolveApprovalRequest, ResolveQuestionRequest, Scope, SendMessageRequest, ServerInfo, Session,
-    SessionDiff, SetDefaultModelRequest, SetGithubTokenRequest, SubscriptionHealth, TerminalInfo,
-    TerminalInputRequest, TerminalResizeRequest, Thread, TurnAccepted, UpdateQueuedPromptRequest,
-    UpdateSessionRequest, UpdateThreadRequest, UpsertMcpServerRequest, UpsertModeRequest,
-    UpsertProviderRequest, UsageSummary, Workspace, PROTOCOL_VERSION,
+    SessionDiff, SetDefaultModelRequest, SetGithubTokenRequest, SetLocalEnabledRequest,
+    SubscriptionHealth, TerminalInfo, TerminalInputRequest, TerminalResizeRequest, Thread,
+    TurnAccepted, UpdateQueuedPromptRequest, UpdateSessionRequest, UpdateThreadRequest,
+    UpsertMcpServerRequest, UpsertModeRequest, UpsertProviderRequest, UsageSummary, Workspace,
+    PROTOCOL_VERSION,
 };
 use utoipa::OpenApi;
 
@@ -102,11 +103,16 @@ impl IntoResponse for ApiError {
         list_clis,
         start_cli_install,
         cli_install_status,
+        cancel_cli_install,
+        uninstall_cli,
         local_status,
+        set_local_enabled,
         add_local_model,
         delete_local_model,
         start_local_model_download,
+        cancel_local_model_download,
         stop_local_server,
+        restart_local_server,
         set_default_model,
         thread_usage,
         session_usage,
@@ -166,6 +172,7 @@ impl IntoResponse for ApiError {
         trouve_protocol::LocalGpu,
         trouve_protocol::LocalModelInfo,
         AddLocalModelRequest,
+        SetLocalEnabledRequest,
         UpsertProviderRequest,
         SetDefaultModelRequest,
         UsageSummary,
@@ -276,9 +283,13 @@ pub fn build_router(engine: Arc<Engine>) -> Router {
         .route("/v1/clis", get(list_clis))
         .route(
             "/v1/clis/{id}/install",
-            post(start_cli_install).get(cli_install_status),
+            post(start_cli_install)
+                .get(cli_install_status)
+                .delete(cancel_cli_install),
         )
+        .route("/v1/clis/{id}", axum::routing::delete(uninstall_cli))
         .route("/v1/local", get(local_status))
+        .route("/v1/local/enabled", axum::routing::put(set_local_enabled))
         .route("/v1/local/models", post(add_local_model))
         .route(
             "/v1/local/models/{id}",
@@ -286,9 +297,10 @@ pub fn build_router(engine: Arc<Engine>) -> Router {
         )
         .route(
             "/v1/local/models/{id}/download",
-            post(start_local_model_download),
+            post(start_local_model_download).delete(cancel_local_model_download),
         )
         .route("/v1/local/server/stop", post(stop_local_server))
+        .route("/v1/local/server/restart", post(restart_local_server))
         .route(
             "/v1/config/default-model",
             axum::routing::put(set_default_model),
@@ -661,9 +673,45 @@ async fn cli_install_status(
     Json(engine.cli_install_status(&id))
 }
 
+/// Cancel an in-flight install; the CLI returns to its previous state.
+#[utoipa::path(delete, path = "/v1/clis/{id}/install", params(("id" = String, Path,)),
+    responses((status = 204), (status = 404, body = ErrorBody)))]
+async fn cancel_cli_install(
+    State(engine): State<Arc<Engine>>,
+    Path(id): Path<String>,
+) -> Result<axum::http::StatusCode, ApiError> {
+    engine.cancel_cli_install(&id)?;
+    Ok(axum::http::StatusCode::NO_CONTENT)
+}
+
+/// Remove the managed install of a CLI (a system install found on PATH is
+/// untouched and will be used again if present).
+#[utoipa::path(delete, path = "/v1/clis/{id}", params(("id" = String, Path,)),
+    responses((status = 204), (status = 404, body = ErrorBody),
+              (status = 409, body = ErrorBody)))]
+async fn uninstall_cli(
+    State(engine): State<Arc<Engine>>,
+    Path(id): Path<String>,
+) -> Result<axum::http::StatusCode, ApiError> {
+    engine.uninstall_cli(&id).await?;
+    Ok(axum::http::StatusCode::NO_CONTENT)
+}
+
 #[utoipa::path(get, path = "/v1/local", responses((status = 200, body = LocalStatus)))]
 async fn local_status(State(engine): State<Arc<Engine>>) -> Json<LocalStatus> {
     Json(engine.local_status().await)
+}
+
+/// Enable or disable local models. Disabling stops the llama-server
+/// sidecar and unregisters the "local" provider.
+#[utoipa::path(put, path = "/v1/local/enabled", request_body = SetLocalEnabledRequest,
+    responses((status = 204)))]
+async fn set_local_enabled(
+    State(engine): State<Arc<Engine>>,
+    Json(req): Json<SetLocalEnabledRequest>,
+) -> Result<axum::http::StatusCode, ApiError> {
+    engine.set_local_enabled(req.enabled).await?;
+    Ok(axum::http::StatusCode::NO_CONTENT)
 }
 
 #[utoipa::path(post, path = "/v1/local/models", request_body = AddLocalModelRequest,
@@ -700,6 +748,29 @@ async fn start_local_model_download(
 async fn stop_local_server(State(engine): State<Arc<Engine>>) -> axum::http::StatusCode {
     engine.stop_local_server().await;
     axum::http::StatusCode::NO_CONTENT
+}
+
+/// Cancel an in-flight model download; the partial file is deleted.
+#[utoipa::path(delete, path = "/v1/local/models/{id}/download", params(("id" = String, Path,)),
+    responses((status = 204), (status = 404, body = ErrorBody)))]
+async fn cancel_local_model_download(
+    State(engine): State<Arc<Engine>>,
+    Path(id): Path<String>,
+) -> Result<axum::http::StatusCode, ApiError> {
+    engine.cancel_local_model_download(&id)?;
+    Ok(axum::http::StatusCode::NO_CONTENT)
+}
+
+/// Restart llama-server with the model it is serving (reload happens in
+/// the background; poll `GET /v1/local` for server_status).
+#[utoipa::path(post, path = "/v1/local/server/restart",
+    responses((status = 202), (status = 404, body = ErrorBody),
+              (status = 409, body = ErrorBody)))]
+async fn restart_local_server(
+    State(engine): State<Arc<Engine>>,
+) -> Result<axum::http::StatusCode, ApiError> {
+    engine.restart_local_server().await?;
+    Ok(axum::http::StatusCode::ACCEPTED)
 }
 
 #[utoipa::path(delete, path = "/v1/providers/{id}", params(("id" = String, Path,)),

@@ -1049,24 +1049,36 @@ export component AppWindow inherits Window {
     callback mode-model-picked(string, int);
     callback refresh-settings();
     callback cli-install(/* id */ string);
+    callback cli-cancel(/* id */ string);
+    callback cli-uninstall(/* id */ string);
     callback close-settings();
 
     // Local (offline) models — state pushed by the controller, actions out.
     in property <[LocalModelItem]> local-models;
+    in property <bool> local-enabled: true;
     in property <string> local-hw-line: "";
     in property <string> local-runtime-label: "";
     in property <string> local-runtime-action: "Install";
     in property <bool> local-runtime-busy: false;
+    in property <int> local-runtime-progress: -1;
+    in property <bool> local-runtime-managed: false;
+    in property <bool> local-runtime-update: false;
     in property <string> local-runtime-status: "";
     in property <string> local-server-line: "";
+    in property <bool> local-server-busy: false;
     in property <string> local-status: "";
     in-out property <string> local-form-repo: "";
     in-out property <string> local-form-file: "";
     callback local-refresh();
+    callback local-enabled-toggled(bool);
     callback local-runtime-install();
+    callback local-runtime-cancel();
+    callback local-runtime-uninstall();
     callback local-download(string);
+    callback local-cancel(string);
     callback local-delete(string);
     callback local-stop-server();
+    callback local-restart-server();
     callback local-added(/* repo */ string, /* file */ string);
 
     // Appearance (handled on the Rust UI thread; see src/theme.rs).
@@ -3729,21 +3741,33 @@ export component AppWindow inherits Window {
         mode-model-picked(id, model) => { root.mode-model-picked(id, model); }
         refresh-settings => { root.refresh-settings(); }
         cli-install(id) => { root.cli-install(id); }
+        cli-cancel(id) => { root.cli-cancel(id); }
+        cli-uninstall(id) => { root.cli-uninstall(id); }
         local-models: root.local-models;
+        local-enabled: root.local-enabled;
         local-hw-line: root.local-hw-line;
         local-runtime-label: root.local-runtime-label;
         local-runtime-action: root.local-runtime-action;
         local-runtime-busy: root.local-runtime-busy;
+        local-runtime-progress: root.local-runtime-progress;
+        local-runtime-managed: root.local-runtime-managed;
+        local-runtime-update: root.local-runtime-update;
         local-runtime-status: root.local-runtime-status;
         local-server-line: root.local-server-line;
+        local-server-busy: root.local-server-busy;
         local-status: root.local-status;
         local-form-repo <=> root.local-form-repo;
         local-form-file <=> root.local-form-file;
         local-refresh => { root.local-refresh(); }
+        local-enabled-toggled(on) => { root.local-enabled-toggled(on); }
         local-runtime-install => { root.local-runtime-install(); }
+        local-runtime-cancel => { root.local-runtime-cancel(); }
+        local-runtime-uninstall => { root.local-runtime-uninstall(); }
         local-download(id) => { root.local-download(id); }
+        local-cancel(id) => { root.local-cancel(id); }
         local-delete(id) => { root.local-delete(id); }
         local-stop-server => { root.local-stop-server(); }
+        local-restart-server => { root.local-restart-server(); }
         local-added(repo, file) => { root.local-added(repo, file); }
         theme-picked(i) => { root.appearance-theme-picked(i); }
         font-size-picked(i) => { root.appearance-font-size-picked(i); }

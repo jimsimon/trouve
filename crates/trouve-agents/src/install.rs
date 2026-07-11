@@ -87,8 +87,27 @@ pub enum InstallError {
     Download(String),
     #[error("checksum mismatch for {0}")]
     Checksum(String),
+    #[error("cancelled")]
+    Cancelled,
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
+}
+
+/// Shared byte-level progress for one download, readable while the
+/// transfer runs. `total` is 0 until (unless) the server reports a
+/// Content-Length. Setting `cancel` makes the transfer stop at the next
+/// chunk with [`InstallError::Cancelled`].
+#[derive(Debug, Default)]
+pub struct Progress {
+    pub received: std::sync::atomic::AtomicU64,
+    pub total: std::sync::atomic::AtomicU64,
+    pub cancel: std::sync::atomic::AtomicBool,
+}
+
+impl Progress {
+    pub fn cancelled(&self) -> bool {
+        self.cancel.load(std::sync::atomic::Ordering::Relaxed)
+    }
 }
 
 /// The active managed install of one CLI, persisted as `installed.json`.
@@ -138,7 +157,13 @@ async fn get_text(url: &str) -> Result<String, InstallError> {
         .map_err(|e| InstallError::Download(format!("{url}: {e}")))
 }
 
-async fn get_bytes(url: &str) -> Result<Vec<u8>, InstallError> {
+/// Download `url` fully into memory (CLI artifacts are tens of MB),
+/// streaming chunks so `progress` stays live and cancellation can land
+/// mid-transfer.
+async fn get_bytes(url: &str, progress: &Progress) -> Result<Vec<u8>, InstallError> {
+    use futures::TryStreamExt as _;
+    use std::sync::atomic::Ordering::Relaxed;
+
     let resp = http()?
         .get(url)
         .send()
@@ -147,11 +172,23 @@ async fn get_bytes(url: &str) -> Result<Vec<u8>, InstallError> {
     if !resp.status().is_success() {
         return Err(InstallError::Download(format!("{url}: {}", resp.status())));
     }
-    Ok(resp
-        .bytes()
+    if let Some(len) = resp.content_length() {
+        progress.total.store(len, Relaxed);
+    }
+    let mut out = Vec::new();
+    let mut stream = resp.bytes_stream();
+    while let Some(chunk) = stream
+        .try_next()
         .await
         .map_err(|e| InstallError::Download(format!("{url}: {e}")))?
-        .to_vec())
+    {
+        if progress.cancelled() {
+            return Err(InstallError::Cancelled);
+        }
+        out.extend_from_slice(&chunk);
+        progress.received.fetch_add(chunk.len() as u64, Relaxed);
+    }
+    Ok(out)
 }
 
 // --- version discovery -------------------------------------------------------
@@ -282,11 +319,13 @@ fn codex_triple() -> Result<String, InstallError> {
 
 /// Download and activate `version` of `id` under `data_dir`. Returns the
 /// activated install. Idempotent: re-installing the active version just
-/// re-downloads and re-points the symlink.
+/// re-downloads and re-points the symlink. Byte progress lands in
+/// `progress`, which also carries the cancel flag.
 pub async fn install(
     data_dir: &Path,
     id: CliId,
     version: &str,
+    progress: &Progress,
 ) -> Result<InstalledCli, InstallError> {
     let root = cli_root(data_dir, id);
     let version_dir = root.join(version);
@@ -296,7 +335,7 @@ pub async fn install(
     let _ = std::fs::remove_dir_all(&stage);
     std::fs::create_dir_all(&stage)?;
 
-    let result = install_into(&stage, id, version).await;
+    let result = install_into(&stage, id, version, progress).await;
     let bin_rel = match result {
         Ok(rel) => rel,
         Err(e) => {
@@ -334,16 +373,36 @@ pub async fn install(
     Ok(info)
 }
 
+/// Remove the managed install of `id` entirely: every version directory,
+/// the pointer, and the stable symlink. Binaries found on PATH are
+/// untouched — trouve only manages its own copies.
+pub fn uninstall(data_dir: &Path, id: CliId) -> std::io::Result<()> {
+    let link = managed_bin(data_dir, id);
+    if link.symlink_metadata().is_ok() {
+        std::fs::remove_file(&link)?;
+    }
+    let root = cli_root(data_dir, id);
+    if root.exists() {
+        std::fs::remove_dir_all(&root)?;
+    }
+    Ok(())
+}
+
 /// Fetch and unpack one CLI into `dir`; returns the executable's path
 /// relative to `dir`.
-async fn install_into(dir: &Path, id: CliId, version: &str) -> Result<PathBuf, InstallError> {
+async fn install_into(
+    dir: &Path,
+    id: CliId,
+    version: &str,
+    progress: &Progress,
+) -> Result<PathBuf, InstallError> {
     match id {
         CliId::CursorAgent => {
             let (os, arch) = cursor_platform()?;
             let url = format!(
                 "https://downloads.cursor.com/lab/{version}/{os}/{arch}/agent-cli-package.tar.gz"
             );
-            let bytes = get_bytes(&url).await?;
+            let bytes = get_bytes(&url, progress).await?;
             untar_gz(bytes, dir).await?;
             let rel = PathBuf::from("dist-package").join("cursor-agent");
             make_executable(&dir.join(&rel))?;
@@ -359,7 +418,7 @@ async fn install_into(dir: &Path, id: CliId, version: &str) -> Result<PathBuf, I
                 .as_str()
                 .ok_or_else(|| InstallError::Unsupported(platform.clone()))?
                 .to_string();
-            let bytes = get_bytes(&format!("{base}/{version}/{platform}/claude")).await?;
+            let bytes = get_bytes(&format!("{base}/{version}/{platform}/claude"), progress).await?;
             let actual = format!("{:x}", sha2::Sha256::digest(&bytes));
             if actual != expected {
                 return Err(InstallError::Checksum("claude".into()));
@@ -374,7 +433,7 @@ async fn install_into(dir: &Path, id: CliId, version: &str) -> Result<PathBuf, I
             let url = format!(
                 "https://github.com/openai/codex/releases/download/rust-v{version}/codex-{triple}.tar.gz"
             );
-            let bytes = get_bytes(&url).await?;
+            let bytes = get_bytes(&url, progress).await?;
             untar_gz(bytes, dir).await?;
             let rel = PathBuf::from("codex");
             std::fs::rename(dir.join(format!("codex-{triple}")), dir.join(&rel))?;
@@ -386,7 +445,7 @@ async fn install_into(dir: &Path, id: CliId, version: &str) -> Result<PathBuf, I
             let url = format!(
                 "https://github.com/ggml-org/llama.cpp/releases/download/{version}/llama-{version}-bin-{platform}.tar.gz"
             );
-            let bytes = get_bytes(&url).await?;
+            let bytes = get_bytes(&url, progress).await?;
             untar_gz(bytes, dir).await?;
             // The tarball unpacks to `llama-<version>/` with llama-server and
             // its shared libraries side by side (rpath $ORIGIN).
@@ -533,6 +592,36 @@ DOWNLOAD_URL="https://downloads.cursor.com/lab/2026.07.01-41b2de7/${OS}/${ARCH}/
         // Pointer with a missing binary reports not installed.
         std::fs::remove_file(&bin).unwrap();
         assert!(installed(tmp.path(), CliId::Codex).is_none());
+    }
+
+    #[test]
+    fn uninstall_removes_managed_install() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = cli_root(tmp.path(), CliId::Codex);
+        std::fs::create_dir_all(root.join("1.0.0")).unwrap();
+        let bin = root.join("1.0.0").join("codex");
+        std::fs::write(&bin, "#!/bin/sh\n").unwrap();
+        std::fs::write(
+            root.join("installed.json"),
+            serde_json::to_string(&InstalledCli {
+                version: "1.0.0".into(),
+                bin: bin.to_string_lossy().into_owned(),
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        let link = managed_bin(tmp.path(), CliId::Codex);
+        std::fs::create_dir_all(link.parent().unwrap()).unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&bin, &link).unwrap();
+
+        uninstall(tmp.path(), CliId::Codex).unwrap();
+        assert!(installed(tmp.path(), CliId::Codex).is_none());
+        assert!(!root.exists());
+        assert!(link.symlink_metadata().is_err());
+
+        // Uninstalling again is a no-op, not an error.
+        uninstall(tmp.path(), CliId::Codex).unwrap();
     }
 
     #[test]
