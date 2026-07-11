@@ -226,6 +226,119 @@ pub fn download_url(repo: &str, file: &str) -> String {
     format!("https://huggingface.co/{repo}/resolve/main/{file}?download=true")
 }
 
+// --- HuggingFace search ------------------------------------------------------
+
+/// One repo from the HF model-search API.
+#[derive(Debug, Clone, Deserialize)]
+pub struct HfRepo {
+    pub id: String,
+    #[serde(default)]
+    pub downloads: u64,
+    #[serde(default)]
+    pub likes: u64,
+}
+
+/// Search HuggingFace for GGUF repos matching `query`, most-downloaded
+/// first.
+pub async fn search_hf_repos(
+    client: &reqwest::Client,
+    query: &str,
+    limit: usize,
+) -> Result<Vec<HfRepo>> {
+    let url = format!(
+        "https://huggingface.co/api/models?search={}&filter=gguf&sort=downloads&limit={limit}",
+        urlencoding_encode(query)
+    );
+    let resp = client.get(&url).send().await.context("HF search failed")?;
+    if !resp.status().is_success() {
+        bail!("HF search returned {}", resp.status());
+    }
+    resp.json().await.context("HF search response")
+}
+
+/// List a repo's GGUF files (path, size), excluding split multi-part
+/// GGUFs (llama.cpp needs the single-file variants we download).
+pub async fn list_gguf_files(client: &reqwest::Client, repo: &str) -> Result<Vec<(String, u64)>> {
+    #[derive(Deserialize)]
+    struct TreeEntry {
+        #[serde(rename = "type")]
+        kind: String,
+        path: String,
+        #[serde(default)]
+        size: u64,
+    }
+    let url = format!("https://huggingface.co/api/models/{repo}/tree/main?recursive=true");
+    let resp = client.get(&url).send().await.context("HF tree failed")?;
+    if !resp.status().is_success() {
+        bail!("HF tree returned {}", resp.status());
+    }
+    let entries: Vec<TreeEntry> = resp.json().await.context("HF tree response")?;
+    Ok(entries
+        .into_iter()
+        .filter(|e| {
+            e.kind == "file"
+                && e.path.to_ascii_lowercase().ends_with(".gguf")
+                && !is_split_gguf(&e.path)
+                && e.size > 0
+        })
+        .map(|e| (e.path, e.size))
+        .collect())
+}
+
+/// Multi-part GGUFs follow the `…-00001-of-00004.gguf` convention.
+fn is_split_gguf(path: &str) -> bool {
+    let lower = path.to_ascii_lowercase();
+    let Some(stem) = lower.strip_suffix(".gguf") else {
+        return false;
+    };
+    let mut parts = stem.rsplitn(3, '-');
+    match (parts.next(), parts.next()) {
+        (Some(last), Some(mid)) => {
+            mid == "of" && !last.is_empty() && last.chars().all(|c| c.is_ascii_digit())
+        }
+        _ => false,
+    }
+}
+
+/// The quantization tag from a GGUF filename ("Q4_K_M", "IQ2_XS", "F16");
+/// empty when none is recognizable.
+pub fn quant_of(file: &str) -> String {
+    let name = file.rsplit('/').next().unwrap_or(file);
+    let stem = name
+        .strip_suffix(".gguf")
+        .or_else(|| name.strip_suffix(".GGUF"))
+        .unwrap_or(name);
+    for token in stem.rsplit(['-', '.']) {
+        let upper = token.to_ascii_uppercase();
+        let bytes = upper.as_bytes();
+        let quantish = (bytes.first() == Some(&b'Q') || upper.starts_with("IQ"))
+            && bytes.iter().any(|b| b.is_ascii_digit())
+            && upper.len() <= 8;
+        if quantish || matches!(upper.as_str(), "F16" | "F32" | "BF16" | "FP16") {
+            return upper;
+        }
+    }
+    String::new()
+}
+
+/// Minimal query-string escaping for the HF search parameter.
+fn urlencoding_encode(s: &str) -> String {
+    let mut out = String::new();
+    for c in s.chars() {
+        if c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '~') {
+            out.push(c);
+        } else if c == ' ' {
+            out.push('+');
+        } else {
+            let mut buf = [0u8; 4];
+            for b in c.encode_utf8(&mut buf).as_bytes() {
+                out.push_str(&format!("%{b:02X}"));
+            }
+        }
+    }
+    out
+}
+
 /// The llama-server binary to run: trouve-managed install first, PATH as
 /// a fallback.
 pub fn runtime_bin(data_dir: &Path) -> Option<PathBuf> {
@@ -722,6 +835,27 @@ mod tests {
         let custom = entries.iter().find(|e| e.id == "my-model").unwrap();
         assert!(custom.custom);
         assert_eq!(entries.len(), CATALOG.len() + 1);
+    }
+
+    #[test]
+    fn split_ggufs_are_detected() {
+        assert!(is_split_gguf("model-q4_0-00001-of-00002.gguf"));
+        assert!(is_split_gguf(
+            "sub/dir/M-00003-of-00004.GGUF".to_lowercase().as_str()
+        ));
+        assert!(!is_split_gguf("model-q4_k_m.gguf"));
+        assert!(!is_split_gguf("model-of-legends.gguf"));
+        assert!(!is_split_gguf("readme.md"));
+    }
+
+    #[test]
+    fn quants_parse_from_filenames() {
+        assert_eq!(quant_of("qwen2.5-coder-7b-instruct-q4_k_m.gguf"), "Q4_K_M");
+        assert_eq!(quant_of("Devstral-Small-2507-Q4_K_M.gguf"), "Q4_K_M");
+        assert_eq!(quant_of("model.IQ2_XS.gguf"), "IQ2_XS");
+        assert_eq!(quant_of("model-fp16.gguf"), "FP16");
+        assert_eq!(quant_of("gpt-oss-20b-F16.gguf"), "F16");
+        assert_eq!(quant_of("some-model.gguf"), "");
     }
 
     #[test]

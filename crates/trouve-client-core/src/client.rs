@@ -422,6 +422,16 @@ impl ProtocolClient {
         Ok(())
     }
 
+    /// Search HuggingFace for GGUF repos, with per-file hardware-fit
+    /// guidance computed on the server's hardware.
+    pub async fn search_local_models(
+        &self,
+        query: &str,
+    ) -> Result<Vec<trouve_protocol::LocalSearchResult>> {
+        self.get_json(&format!("/local/search?q={}", urlencode(query)))
+            .await
+    }
+
     pub async fn start_local_model_download(&self, id: &str) -> Result<()> {
         self.post_empty(&format!("/local/models/{id}/download"))
             .await

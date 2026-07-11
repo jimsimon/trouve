@@ -861,6 +861,12 @@ fn main() -> anyhow::Result<()> {
     }
     {
         let tx = tx.clone();
+        window.on_local_search(move |query| {
+            let _ = tx.send(UiCommand::LocalSearch(query.to_string()));
+        });
+    }
+    {
+        let tx = tx.clone();
         window.on_close_settings(move || {
             let _ = tx.send(UiCommand::CloseSettings);
         });

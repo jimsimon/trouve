@@ -14,7 +14,7 @@ import { CodeView, TextSegment } from "code-view.slint";
 import { TerminalGrid, TermSpan } from "terminal-grid.slint";
 import {
     SettingsScreen, ProviderItem, CliItem, KnownProviderItem, McpServerItem,
-    SubscriptionItem, ModeItem, LocalModelItem
+    SubscriptionItem, ModeItem, LocalModelItem, LocalSearchItem
 } from "settings-window.slint";
 import { ScrollKeys } from "scroll-keys.slint";
 import { Theme, ThemePalette } from "theme.slint";
@@ -23,7 +23,7 @@ import { Palette } from "std-widgets.slint";
 // Theme re-exported so Rust can push the selected palette.
 export {
     DiffRow, TextSegment, TermSpan, ProviderItem, CliItem, KnownProviderItem, McpServerItem,
-    SubscriptionItem, ModeItem, LocalModelItem
+    SubscriptionItem, ModeItem, LocalModelItem, LocalSearchItem
 }
 export { Theme, ThemePalette }
 
@@ -1083,8 +1083,10 @@ export component AppWindow inherits Window {
     in property <string> local-server-line: "";
     in property <bool> local-server-busy: false;
     in property <string> local-status: "";
-    in-out property <string> local-form-repo: "";
-    in-out property <string> local-form-file: "";
+    in-out property <string> local-search-query: "";
+    in property <[LocalSearchItem]> local-search-results;
+    in property <string> local-search-status: "";
+    callback local-search(/* query */ string);
     callback local-refresh();
     callback local-enabled-toggled(bool);
     callback local-runtime-install();
@@ -3865,8 +3867,10 @@ export component AppWindow inherits Window {
         local-server-line: root.local-server-line;
         local-server-busy: root.local-server-busy;
         local-status: root.local-status;
-        local-form-repo <=> root.local-form-repo;
-        local-form-file <=> root.local-form-file;
+        local-search-query <=> root.local-search-query;
+        local-search-results: root.local-search-results;
+        local-search-status: root.local-search-status;
+        local-search(q) => { root.local-search(q); }
         local-refresh => { root.local-refresh(); }
         local-enabled-toggled(on) => { root.local-enabled-toggled(on); }
         local-runtime-install => { root.local-runtime-install(); }

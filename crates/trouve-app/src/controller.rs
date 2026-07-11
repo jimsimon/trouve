@@ -232,6 +232,10 @@ pub enum UiCommand {
         repo: String,
         file: String,
     },
+    /// Search HuggingFace for GGUF repos to add as local models.
+    LocalSearch(String),
+    /// Internal: a local-model search finished.
+    LocalSearchLoaded(Result<Vec<trouve_protocol::LocalSearchResult>, String>),
     /// Open settings straight to the Integrations section.
     OpenIntegrationsSettings,
     /// Store/remove the GitHub token (empty = remove).
@@ -346,6 +350,9 @@ struct Controller {
     /// change means the model catalog changed → reload pickers).
     local_polling: bool,
     local_downloaded: Option<usize>,
+    /// Last HuggingFace model-search results (kept so "✓ added" flags can
+    /// be updated in place after an add).
+    local_search: Vec<trouve_protocol::LocalSearchResult>,
     /// PRs detected for the current session's branch, and the one shown.
     prs: Vec<trouve_protocol::PrInfo>,
     pr_selected: usize,
@@ -473,6 +480,7 @@ pub async fn run(
         github_source: String::new(),
         local_polling: false,
         local_downloaded: None,
+        local_search: Vec::new(),
         prs: Vec::new(),
         pr_selected: 0,
         pr_error: String::new(),
@@ -1972,39 +1980,72 @@ impl Controller {
                 (Some(model), _) => (format!("llama-server is running {model}"), false),
                 (None, _) => (String::new(), false),
             };
-        let models = status
-            .models
-            .iter()
-            .map(|m| {
-                let mut meta = String::new();
-                if !m.params.is_empty() {
-                    meta.push_str(&m.params);
-                    meta.push_str(" · ");
-                }
-                meta.push_str(&human_gb(m.size_bytes));
-                let fit_label = match m.fit.as_str() {
-                    "gpu" => "fits your GPU",
-                    "cpu" => "runs on CPU (slower)",
-                    _ => "needs more memory",
-                };
-                let progress = (m.download_bytes * 100)
-                    .checked_div(m.size_bytes)
-                    .map_or(0, |p| p.min(99) as i32);
-                ui::LocalModelView {
-                    id: m.id.clone(),
-                    name: m.display_name.clone(),
-                    meta,
-                    fit: m.fit.clone(),
-                    fit_label: fit_label.into(),
-                    notes: m.notes.clone(),
-                    downloaded: m.downloaded,
-                    downloading: m.download_status == "pending",
-                    progress,
-                    error: m.download_error.clone(),
-                    custom: m.custom,
-                }
-            })
-            .collect();
+        // Two sections: models the user has (downloaded, downloading, or
+        // added themselves) and the untouched curated recommendations.
+        let mut yours: Vec<ui::LocalModelView> = Vec::new();
+        let mut recommended: Vec<ui::LocalModelView> = Vec::new();
+        for m in &status.models {
+            let mut meta = String::new();
+            if !m.params.is_empty() {
+                meta.push_str(&m.params);
+                meta.push_str(" · ");
+            }
+            meta.push_str(&human_gb(m.size_bytes));
+            let fit_label = match m.fit.as_str() {
+                "gpu" => "fits your GPU",
+                "cpu" => "runs on CPU (slower)",
+                _ => "needs more memory",
+            };
+            let progress = (m.download_bytes * 100)
+                .checked_div(m.size_bytes)
+                .map_or(0, |p| p.min(99) as i32);
+            let view = ui::LocalModelView {
+                id: m.id.clone(),
+                name: m.display_name.clone(),
+                header: String::new(),
+                meta,
+                fit: m.fit.clone(),
+                fit_label: fit_label.into(),
+                notes: m.notes.clone(),
+                downloaded: m.downloaded,
+                downloading: m.download_status == "pending",
+                progress,
+                error: m.download_error.clone(),
+                custom: m.custom,
+            };
+            let mine = m.downloaded
+                || m.custom
+                || m.download_status == "pending"
+                || !view.error.is_empty();
+            if mine {
+                yours.push(view);
+            } else {
+                recommended.push(view);
+            }
+        }
+        let header = |text: &str| ui::LocalModelView {
+            id: String::new(),
+            name: String::new(),
+            header: text.to_string(),
+            meta: String::new(),
+            fit: String::new(),
+            fit_label: String::new(),
+            notes: String::new(),
+            downloaded: false,
+            downloading: false,
+            progress: 0,
+            error: String::new(),
+            custom: false,
+        };
+        let mut models = Vec::new();
+        if !yours.is_empty() {
+            models.push(header("YOUR MODELS"));
+            models.extend(yours);
+        }
+        if !recommended.is_empty() {
+            models.push(header("RECOMMENDED"));
+            models.extend(recommended);
+        }
         ui::set_local(
             &self.ui,
             ui::LocalView {
@@ -2022,6 +2063,51 @@ impl Controller {
                 models,
             },
         );
+    }
+
+    /// Render the cached HuggingFace search results into the settings UI.
+    fn push_local_search(&self, status: String) {
+        let results = self
+            .local_search
+            .iter()
+            .map(|r| ui::LocalSearchView {
+                repo: r.repo.clone(),
+                meta: format!(
+                    "{} downloads · {} likes",
+                    human_count(r.downloads),
+                    human_count(r.likes)
+                ),
+                file_labels: r
+                    .files
+                    .iter()
+                    .map(|f| {
+                        let label = if f.quant.is_empty() {
+                            f.file.rsplit('/').next().unwrap_or(&f.file).to_string()
+                        } else {
+                            f.quant.clone()
+                        };
+                        format!("{label} · {}", human_gb(f.size_bytes))
+                    })
+                    .collect(),
+                file_names: r.files.iter().map(|f| f.file.clone()).collect(),
+                file_fits: r.files.iter().map(|f| f.fit.clone()).collect(),
+                file_fit_labels: r
+                    .files
+                    .iter()
+                    .map(|f| {
+                        match f.fit.as_str() {
+                            "gpu" => "fits your GPU",
+                            "cpu" => "runs on CPU (slower)",
+                            _ => "needs more memory",
+                        }
+                        .to_string()
+                    })
+                    .collect(),
+                file_added: r.files.iter().map(|f| f.added).collect(),
+                recommended: r.recommended as i32,
+            })
+            .collect();
+        ui::set_local_search(&self.ui, results, status);
     }
 
     // --- command dispatch --------------------------------------------------------
@@ -3197,20 +3283,60 @@ impl Controller {
                 match self
                     .client
                     .add_local_model(&AddLocalModelRequest {
-                        repo,
-                        file,
+                        repo: repo.clone(),
+                        file: file.clone(),
                         display_name: None,
                     })
                     .await
                 {
                     Ok(()) => {
                         ui::set_local_status(&self.ui, String::new());
-                        ui::clear_local_form(&self.ui);
+                        // Flip the just-added file to "✓ added" in the
+                        // search results without re-running the search
+                        // (and keep that file selected when rows rebuild).
+                        for result in &mut self.local_search {
+                            if result.repo.eq_ignore_ascii_case(&repo) {
+                                for (i, f) in result.files.iter_mut().enumerate() {
+                                    if f.file.eq_ignore_ascii_case(&file) {
+                                        f.added = true;
+                                        result.recommended = i as u32;
+                                    }
+                                }
+                            }
+                        }
+                        self.push_local_search(String::new());
                     }
                     Err(e) => ui::set_local_status(&self.ui, format!("{e:#}")),
                 }
                 self.refresh_local();
             }
+            UiCommand::LocalSearch(query) => {
+                ui::set_local_search(&self.ui, Vec::new(), "searching HuggingFace…".into());
+                let client = self.client.clone();
+                let tx = self.tx.clone();
+                tokio::spawn(async move {
+                    let result = client
+                        .search_local_models(&query)
+                        .await
+                        .map_err(|e| format!("{e:#}"));
+                    let _ = tx.send(UiCommand::LocalSearchLoaded(result));
+                });
+            }
+            UiCommand::LocalSearchLoaded(result) => match result {
+                Ok(results) => {
+                    let status = if results.is_empty() {
+                        "no repos with single-file GGUFs matched".to_string()
+                    } else {
+                        String::new()
+                    };
+                    self.local_search = results;
+                    self.push_local_search(status);
+                }
+                Err(e) => {
+                    self.local_search = Vec::new();
+                    self.push_local_search(format!("search failed: {e}"));
+                }
+            },
             UiCommand::CliInstall(id) => match self.client.start_cli_install(&id).await {
                 Ok(()) => {
                     ui::set_settings_status(&self.ui, format!("installing {id}…"));
@@ -3578,6 +3704,17 @@ fn human_gb(bytes: u64) -> String {
 
 fn human_mb(bytes: u64) -> String {
     format!("{:.0} MB", bytes as f64 / 1e6)
+}
+
+/// "1.2M" / "180k" / "42" for download/like counts.
+fn human_count(n: u64) -> String {
+    if n >= 1_000_000 {
+        format!("{:.1}M", n as f64 / 1e6)
+    } else if n >= 1_000 {
+        format!("{:.0}k", n as f64 / 1e3)
+    } else {
+        n.to_string()
+    }
 }
 
 /// Download status line + bar percent: "label… 45 MB / 120 MB (37%)", or

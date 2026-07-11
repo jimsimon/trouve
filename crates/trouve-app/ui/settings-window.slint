@@ -81,6 +81,9 @@ export struct ModeItem {
 export struct LocalModelItem {
     id: string,
     name: string,
+    // Non-empty renders this row as a section header ("On this machine",
+    // "Recommended") instead of a model row; other fields are ignored.
+    header: string,
     // "7B · 4.7 GB"
     meta: string,
     // "gpu" / "cpu" / "too-large"
@@ -95,6 +98,24 @@ export struct LocalModelItem {
     error: string,
     // User-added entries can be removed from the list entirely.
     custom: bool,
+}
+
+// One HuggingFace repo matching a local-model search. Parallel arrays
+// describe its single-file GGUFs; `recommended` picks the default.
+export struct LocalSearchItem {
+    repo: string,
+    // "180k downloads · 313 likes"
+    meta: string,
+    // Quant picker options ("Q4_K_M · 4.4 GB"; filename when no quant).
+    file-labels: [string],
+    // Repo-relative filenames, ready for local-added(repo, file).
+    file-names: [string],
+    // Per file: "gpu" / "cpu" / "too-large" and its human label.
+    file-fits: [string],
+    file-fit-labels: [string],
+    // Per file: already in the local model list.
+    file-added: [bool],
+    recommended: int,
 }
 
 // A user-managed MCP server (first-party servers trouve injects itself are
@@ -335,8 +356,12 @@ export component SettingsScreen inherits Rectangle {
     // Sidecar is loading a model (no stop/restart until it settles).
     in property <bool> local-server-busy;
     in property <string> local-status;
-    in-out property <string> local-form-repo;
-    in-out property <string> local-form-file;
+    // HuggingFace model search (replaces the old manual repo/file form).
+    in-out property <string> local-search-query;
+    in property <[LocalSearchItem]> local-search-results;
+    // "Searching…", an error, or "" when idle.
+    in property <string> local-search-status;
+    callback local-search(/* query */ string);
     callback local-refresh();
     callback local-enabled-toggled(bool);
     callback local-runtime-install();
@@ -1224,8 +1249,21 @@ export component SettingsScreen inherits Rectangle {
                                 min-height: 220px;
                                 ListView {
                                     for model in root.local-models: Rectangle {
-                                        height: Theme.fs(58px);
-                                        HorizontalLayout {
+                                        height: model.header != "" ? Theme.fs(30px) : Theme.fs(58px);
+                                        // Section header ("On this machine" / "Recommended").
+                                        if model.header != "": HorizontalLayout {
+                                            padding-left: 10px;
+                                            padding-top: 8px;
+                                            Text {
+                                                text: model.header;
+                                                color: Theme.c.text-faint;
+                                                font-size: Theme.fs(10px);
+                                                font-weight: 700;
+                                                letter-spacing: 0.8px;
+                                                vertical-alignment: center;
+                                            }
+                                        }
+                                        if model.header == "": HorizontalLayout {
                                             padding-left: 10px;
                                             padding-right: 6px;
                                             spacing: 8px;
@@ -1305,31 +1343,101 @@ export component SettingsScreen inherits Rectangle {
                                 }
                             }
 
-                            // Custom GGUF escape hatch for power users.
+                            // Add more models: search HuggingFace's GGUF repos,
+                            // pick a file (defaulting to the best fit for this
+                            // machine), add it to the list above.
                             if root.local-enabled: VerticalLayout {
                                 spacing: 6px;
                                 Text {
-                                    text: "Add any single-file GGUF from HuggingFace (advanced):";
+                                    text: "Add more models — search HuggingFace:";
                                     color: Theme.c.text-soft;
                                     font-size: Theme.fs(11px);
                                 }
                                 HorizontalLayout {
                                     spacing: 8px;
                                     LineEdit {
-                                        placeholder-text: "repo (owner/name-GGUF)";
-                                        text <=> root.local-form-repo;
+                                        placeholder-text: "search models (e.g. qwen coder, llama 3.2)";
+                                        text <=> root.local-search-query;
                                         horizontal-stretch: 1;
-                                    }
-                                    LineEdit {
-                                        placeholder-text: "file (model-Q4_K_M.gguf)";
-                                        text <=> root.local-form-file;
-                                        horizontal-stretch: 1;
+                                        accepted(text) => {
+                                            if (text != "") { root.local-search(text); }
+                                        }
                                     }
                                     Button {
-                                        text: "Add";
-                                        enabled: root.local-form-repo != "" && root.local-form-file != "";
-                                        clicked => {
-                                            root.local-added(root.local-form-repo, root.local-form-file);
+                                        text: "Search";
+                                        enabled: root.local-search-query != "";
+                                        clicked => { root.local-search(root.local-search-query); }
+                                    }
+                                }
+                                if root.local-search-status != "": Text {
+                                    text: root.local-search-status;
+                                    color: Theme.c.text-mid;
+                                    font-size: Theme.fs(11px);
+                                    wrap: word-wrap;
+                                }
+                                for item in root.local-search-results: Rectangle {
+                                    background: Theme.c.surface;
+                                    border-radius: 6px;
+                                    height: search-row.preferred-height + 16px;
+                                    search-row := HorizontalLayout {
+                                        padding: 8px;
+                                        spacing: 8px;
+                                        property <int> pick: item.recommended;
+                                        VerticalLayout {
+                                            spacing: 4px;
+                                            horizontal-stretch: 1;
+                                            HorizontalLayout {
+                                                spacing: 6px;
+                                                alignment: start;
+                                                Text {
+                                                    text: item.repo;
+                                                    color: Theme.c.text-hi;
+                                                    font-size: Theme.fs(12px);
+                                                    font-weight: 700;
+                                                    overflow: elide;
+                                                }
+                                                Text {
+                                                    text: item.meta;
+                                                    color: Theme.c.text-faint;
+                                                    font-size: Theme.fs(10px);
+                                                    vertical-alignment: center;
+                                                }
+                                            }
+                                            HorizontalLayout {
+                                                spacing: 8px;
+                                                alignment: start;
+                                                ComboBox {
+                                                    min-width: Theme.fs(190px);
+                                                    model: item.file-labels;
+                                                    current-index <=> search-row.pick;
+                                                }
+                                                // Same hardware-fit guidance as the
+                                                // model list, for the picked file.
+                                                Text {
+                                                    text: item.file-fit-labels[search-row.pick];
+                                                    color: item.file-fits[search-row.pick] == "gpu" ? Theme.c.ok
+                                                        : item.file-fits[search-row.pick] == "cpu" ? Theme.c.warn
+                                                        : Theme.c.err;
+                                                    font-size: Theme.fs(11px);
+                                                    vertical-alignment: center;
+                                                }
+                                            }
+                                        }
+                                        VerticalLayout {
+                                            alignment: center;
+                                            if item.file-added[search-row.pick]: Text {
+                                                text: "✓ added";
+                                                color: Theme.c.ok;
+                                                font-size: Theme.fs(11px);
+                                            }
+                                            if !item.file-added[search-row.pick]: Button {
+                                                text: "Add";
+                                                min-width: Theme.fs(72px);
+                                                clicked => {
+                                                    root.local-added(item.repo,
+                                                        item.file-names[search-row.pick]);
+                                                }
+                                            }
                                         }
                                     }
                                 }

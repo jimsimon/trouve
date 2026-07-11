@@ -1288,6 +1288,74 @@ impl Engine {
         Ok(())
     }
 
+    /// Search HuggingFace for GGUF repos matching `query`, listing each
+    /// repo's single-file GGUFs with hardware-fit guidance and a
+    /// recommended pick for this machine. Repos without usable files (or
+    /// whose file listing fails) are dropped.
+    pub async fn search_local_models(
+        &self,
+        query: &str,
+    ) -> Result<Vec<trouve_protocol::LocalSearchResult>, EngineError> {
+        let query = query.trim();
+        if query.is_empty() {
+            return Ok(Vec::new());
+        }
+        let hw = self.hardware().await;
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(12))
+            .build()
+            .map_err(|e| EngineError::Internal(e.into()))?;
+        let repos = crate::local::search_hf_repos(&client, query, 8)
+            .await
+            .map_err(|e| EngineError::BadRequest(format!("HuggingFace search failed: {e}")))?;
+        // (repo, file) pairs already in the model list, to mark "added".
+        let existing: std::collections::HashSet<(String, String)> =
+            crate::local::all_entries(self.config_dir.as_deref())
+                .into_iter()
+                .map(|e| (e.repo.to_ascii_lowercase(), e.file.to_ascii_lowercase()))
+                .collect();
+
+        let lookups = repos.into_iter().map(|repo| {
+            let client = client.clone();
+            async move {
+                let files = crate::local::list_gguf_files(&client, &repo.id)
+                    .await
+                    .ok()?;
+                Some((repo, files))
+            }
+        });
+        let mut results = Vec::new();
+        for looked_up in futures::future::join_all(lookups).await {
+            let Some((repo, mut files)) = looked_up else {
+                continue;
+            };
+            if files.is_empty() {
+                continue;
+            }
+            files.sort_by_key(|(_, size)| *size);
+            let files: Vec<trouve_protocol::LocalSearchFile> = files
+                .into_iter()
+                .map(|(file, size_bytes)| trouve_protocol::LocalSearchFile {
+                    quant: crate::local::quant_of(&file),
+                    fit: crate::local::fit(size_bytes, &hw).to_string(),
+                    added: existing
+                        .contains(&(repo.id.to_ascii_lowercase(), file.to_ascii_lowercase())),
+                    file,
+                    size_bytes,
+                })
+                .collect();
+            let recommended = recommend_gguf(&files) as u32;
+            results.push(trouve_protocol::LocalSearchResult {
+                repo: repo.id,
+                downloads: repo.downloads,
+                likes: repo.likes,
+                files,
+                recommended,
+            });
+        }
+        Ok(results)
+    }
+
     /// Delete a model's downloaded GGUF (stopping the server if it is the
     /// one loaded); custom entries are removed from the list entirely.
     pub async fn delete_local_model(&self, id: &str) -> Result<(), EngineError> {
@@ -3891,6 +3959,45 @@ impl Engine {
 /// The hint rides in the args as `"_line"` — display metadata for the
 /// client's diff gutter, never model input. Files that can't be read or
 /// snippets that don't match (or match ambiguously) just skip the hint.
+/// Index of the best file to suggest from a repo's GGUFs: prefer usable
+/// quants that fit the GPU over CPU-only over too-large, then the best
+/// quality/size trade-off quant (the catalog's Q4_K_M-class default),
+/// then the smaller file.
+fn recommend_gguf(files: &[trouve_protocol::LocalSearchFile]) -> usize {
+    // Sub-3-bit quants are a last resort no matter what they fit on —
+    // quality falls off a cliff below ~3 bits.
+    fn junk_quant(quant: &str) -> bool {
+        quant.starts_with("IQ1") || quant.starts_with("IQ2") || quant.starts_with("Q2")
+    }
+    fn quant_rank(quant: &str) -> usize {
+        const PREF: &[&str] = &[
+            "Q4_K_M", "Q4_K_S", "Q5_K_M", "IQ4_XS", "Q4_0", "Q5_K_S", "Q5_0", "Q6_K", "Q3_K_M",
+            "Q8_0", "Q3_K_S", "IQ3_XS", "IQ3_M", "Q2_K", "F16", "BF16", "F32",
+        ];
+        PREF.iter().position(|p| *p == quant).unwrap_or(PREF.len())
+    }
+    fn fit_rank(fit: &str) -> usize {
+        match fit {
+            "gpu" => 0,
+            "cpu" => 1,
+            _ => 2,
+        }
+    }
+    files
+        .iter()
+        .enumerate()
+        .min_by_key(|(_, f)| {
+            (
+                junk_quant(&f.quant),
+                fit_rank(&f.fit),
+                quant_rank(&f.quant),
+                f.size_bytes,
+            )
+        })
+        .map(|(i, _)| i)
+        .unwrap_or(0)
+}
+
 /// Append path references for attachments that can't ride natively in the
 /// model input, so the agent can open them with its file tools.
 fn annotate_attachments(

@@ -7,7 +7,7 @@
       "name": "MIT",
       "identifier": "MIT"
     },
-    "version": "0.10"
+    "version": "0.11"
   },
   "paths": {
     "/v1/approvals": {
@@ -511,6 +511,49 @@
             "description": ""
           },
           "404": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/local/search": {
+      "get": {
+        "tags": [],
+        "summary": "Search HuggingFace for GGUF repos, with per-file hardware-fit guidance\nfor this machine.",
+        "operationId": "search_local_models",
+        "parameters": [
+          {
+            "name": "q",
+            "in": "query",
+            "description": "Search text",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/LocalSearchResult"
+                  }
+                }
+              }
+            }
+          },
+          "400": {
             "description": "",
             "content": {
               "application/json": {
@@ -3888,6 +3931,79 @@
             "type": "integer",
             "format": "int64",
             "minimum": 0
+          }
+        }
+      },
+      "LocalSearchFile": {
+        "type": "object",
+        "description": "One single-file GGUF inside a search result's repo\n(`GET /v1/local/search`).",
+        "required": [
+          "file",
+          "size_bytes",
+          "quant",
+          "fit",
+          "added"
+        ],
+        "properties": {
+          "added": {
+            "type": "boolean",
+            "description": "Already in the local model list (catalog or previously added)."
+          },
+          "file": {
+            "type": "string",
+            "description": "Path inside the repo, ready for [`AddLocalModelRequest::file`]."
+          },
+          "fit": {
+            "type": "string",
+            "description": "Hardware fit on this machine: \"gpu\", \"cpu\", or \"too-large\"."
+          },
+          "quant": {
+            "type": "string",
+            "description": "Quantization tag parsed from the filename (\"Q4_K_M\"; may be empty)."
+          },
+          "size_bytes": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          }
+        }
+      },
+      "LocalSearchResult": {
+        "type": "object",
+        "description": "One HuggingFace repo matching a local-model search, with its\nsingle-file GGUFs (smallest first) and a recommended pick for this\nmachine's hardware.",
+        "required": [
+          "repo",
+          "downloads",
+          "likes",
+          "files",
+          "recommended"
+        ],
+        "properties": {
+          "downloads": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "files": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/LocalSearchFile"
+            }
+          },
+          "likes": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "recommended": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Index into `files` of the best pick for this hardware.",
+            "minimum": 0
+          },
+          "repo": {
+            "type": "string",
+            "description": "Repo id (\"Qwen/Qwen2.5-Coder-7B-Instruct-GGUF\")."
           }
         }
       },

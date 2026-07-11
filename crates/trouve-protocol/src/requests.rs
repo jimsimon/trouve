@@ -708,6 +708,35 @@ pub struct AddLocalModelRequest {
     pub display_name: Option<String>,
 }
 
+/// One single-file GGUF inside a search result's repo
+/// (`GET /v1/local/search`).
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct LocalSearchFile {
+    /// Path inside the repo, ready for [`AddLocalModelRequest::file`].
+    pub file: String,
+    pub size_bytes: u64,
+    /// Quantization tag parsed from the filename ("Q4_K_M"; may be empty).
+    pub quant: String,
+    /// Hardware fit on this machine: "gpu", "cpu", or "too-large".
+    pub fit: String,
+    /// Already in the local model list (catalog or previously added).
+    pub added: bool,
+}
+
+/// One HuggingFace repo matching a local-model search, with its
+/// single-file GGUFs (smallest first) and a recommended pick for this
+/// machine's hardware.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct LocalSearchResult {
+    /// Repo id ("Qwen/Qwen2.5-Coder-7B-Instruct-GGUF").
+    pub repo: String,
+    pub downloads: u64,
+    pub likes: u64,
+    pub files: Vec<LocalSearchFile>,
+    /// Index into `files` of the best pick for this hardware.
+    pub recommended: u32,
+}
+
 /// State of a CLI install started with `POST /v1/clis/{id}/install`.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct CliInstallStatus {

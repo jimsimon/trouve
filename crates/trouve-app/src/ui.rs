@@ -845,6 +845,9 @@ pub fn set_clis(ui: &Ui, clis: Vec<CliView>) {
 pub struct LocalModelView {
     pub id: String,
     pub name: String,
+    /// Non-empty renders a section header row ("On this machine",
+    /// "Recommended") instead of a model.
+    pub header: String,
     /// "7B · 4.7 GB"
     pub meta: String,
     /// "gpu" / "cpu" / "too-large"
@@ -889,6 +892,7 @@ pub fn set_local(ui: &Ui, view: LocalView) {
             .map(|m| crate::LocalModelItem {
                 id: SharedString::from(m.id.as_str()),
                 name: SharedString::from(m.name.as_str()),
+                header: SharedString::from(m.header.as_str()),
                 meta: SharedString::from(m.meta.as_str()),
                 fit: SharedString::from(m.fit.as_str()),
                 fit_label: SharedString::from(m.fit_label.as_str()),
@@ -922,11 +926,42 @@ pub fn set_local_status(ui: &Ui, status: String) {
     });
 }
 
-/// Clear the custom-GGUF form after a successful add.
-pub fn clear_local_form(ui: &Ui) {
-    let _ = ui.upgrade_in_event_loop(|ui| {
-        ui.set_local_form_repo(SharedString::new());
-        ui.set_local_form_file(SharedString::new());
+/// One HuggingFace search result row (plain-data mirror of Slint's
+/// `LocalSearchItem`; the per-file vectors are parallel).
+pub struct LocalSearchView {
+    pub repo: String,
+    pub meta: String,
+    pub file_labels: Vec<String>,
+    pub file_names: Vec<String>,
+    pub file_fits: Vec<String>,
+    pub file_fit_labels: Vec<String>,
+    pub file_added: Vec<bool>,
+    pub recommended: i32,
+}
+
+/// Search results + status line for the Local Models "add more" search.
+pub fn set_local_search(ui: &Ui, results: Vec<LocalSearchView>, status: String) {
+    fn strings(v: Vec<String>) -> ModelRc<SharedString> {
+        ModelRc::new(VecModel::from(
+            v.into_iter().map(SharedString::from).collect::<Vec<_>>(),
+        ))
+    }
+    let _ = ui.upgrade_in_event_loop(move |ui| {
+        let items: Vec<crate::LocalSearchItem> = results
+            .into_iter()
+            .map(|r| crate::LocalSearchItem {
+                repo: SharedString::from(r.repo.as_str()),
+                meta: SharedString::from(r.meta.as_str()),
+                file_labels: strings(r.file_labels),
+                file_names: strings(r.file_names),
+                file_fits: strings(r.file_fits),
+                file_fit_labels: strings(r.file_fit_labels),
+                file_added: ModelRc::new(VecModel::from(r.file_added)),
+                recommended: r.recommended,
+            })
+            .collect();
+        ui.set_local_search_results(ModelRc::new(VecModel::from(items)));
+        ui.set_local_search_status(SharedString::from(status.as_str()));
     });
 }
 

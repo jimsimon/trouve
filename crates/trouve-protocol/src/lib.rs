@@ -33,7 +33,9 @@ pub use requests::*;
 // 0.10: prompt attachments — SendMessageRequest.attachments (base64
 // uploads), Attachment metadata on user.message events and QueuedPrompt,
 // and GET /v1/attachments/{id} serving the stored bytes (all additive).
-pub const PROTOCOL_VERSION: &str = "0.10";
+// 0.11: local model search — GET /v1/local/search?q= returns HuggingFace
+// GGUF repos with per-file hardware-fit guidance (additive).
+pub const PROTOCOL_VERSION: &str = "0.11";
 
 pub type WorkspaceId = String;
 pub type SessionId = String;

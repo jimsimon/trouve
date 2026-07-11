@@ -23,9 +23,9 @@ use trouve_core::Engine;
 use trouve_protocol::{
     AddLocalModelRequest, AgentMode, BranchList, CliInfo, CliInstallStatus, CliList,
     CreatePrRequest, CreateSessionRequest, CreateThreadRequest, DirEntry, ErrorBody, FileContent,
-    GithubIntegration, KnownProvider, LocalStatus, LoginStarted, LoginStatus, McpLogs,
-    McpServerInfo, MergePrRequest, ModeInfo, ModelInfo, OpenTerminalRequest, PrInfo, ProviderInfo,
-    ProvidersResponse, QueuedPrompt, RegisterWorkspaceRequest, ReorderQueueRequest,
+    GithubIntegration, KnownProvider, LocalSearchResult, LocalStatus, LoginStarted, LoginStatus,
+    McpLogs, McpServerInfo, MergePrRequest, ModeInfo, ModelInfo, OpenTerminalRequest, PrInfo,
+    ProviderInfo, ProvidersResponse, QueuedPrompt, RegisterWorkspaceRequest, ReorderQueueRequest,
     ResolveApprovalRequest, ResolveQuestionRequest, Scope, SendMessageRequest, ServerInfo, Session,
     SessionDiff, SetDefaultModelRequest, SetGithubTokenRequest, SetLocalEnabledRequest,
     SubscriptionHealth, TerminalInfo, TerminalInputRequest, TerminalResizeRequest, Thread,
@@ -109,6 +109,7 @@ impl IntoResponse for ApiError {
         local_status,
         set_local_enabled,
         add_local_model,
+        search_local_models,
         delete_local_model,
         start_local_model_download,
         cancel_local_model_download,
@@ -291,6 +292,7 @@ pub fn build_router(engine: Arc<Engine>) -> Router {
         .route("/v1/clis/{id}", axum::routing::delete(uninstall_cli))
         .route("/v1/local", get(local_status))
         .route("/v1/local/enabled", axum::routing::put(set_local_enabled))
+        .route("/v1/local/search", get(search_local_models))
         .route("/v1/local/models", post(add_local_model))
         .route(
             "/v1/local/models/{id}",
@@ -789,6 +791,23 @@ async fn cancel_local_model_download(
 ) -> Result<axum::http::StatusCode, ApiError> {
     engine.cancel_local_model_download(&id)?;
     Ok(axum::http::StatusCode::NO_CONTENT)
+}
+
+#[derive(Deserialize)]
+struct LocalSearchQuery {
+    q: String,
+}
+
+/// Search HuggingFace for GGUF repos, with per-file hardware-fit guidance
+/// for this machine.
+#[utoipa::path(get, path = "/v1/local/search",
+    params(("q" = String, Query, description = "Search text")),
+    responses((status = 200, body = [LocalSearchResult]), (status = 400, body = ErrorBody)))]
+async fn search_local_models(
+    State(engine): State<Arc<Engine>>,
+    axum::extract::Query(query): axum::extract::Query<LocalSearchQuery>,
+) -> Result<Json<Vec<LocalSearchResult>>, ApiError> {
+    Ok(Json(engine.search_local_models(&query.q).await?))
 }
 
 /// Restart llama-server with the model it is serving (reload happens in
