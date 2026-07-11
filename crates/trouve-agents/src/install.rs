@@ -30,6 +30,11 @@ pub enum CliId {
     CursorAgent,
     Claude,
     Codex,
+    /// llama.cpp's `llama-server` — the local-inference runtime behind the
+    /// built-in "local" provider, not an agent CLI. Kept out of `ALL_CLIS`
+    /// so the CLI settings list doesn't show it; the Local Models settings
+    /// section drives its install through the same `/v1/clis` machinery.
+    LlamaServer,
 }
 
 pub const ALL_CLIS: [CliId; 3] = [CliId::CursorAgent, CliId::Claude, CliId::Codex];
@@ -40,6 +45,7 @@ impl CliId {
             "cursor-agent" => Some(Self::CursorAgent),
             "claude" => Some(Self::Claude),
             "codex" => Some(Self::Codex),
+            "llama-server" => Some(Self::LlamaServer),
             _ => None,
         }
     }
@@ -49,6 +55,7 @@ impl CliId {
             Self::CursorAgent => "cursor-agent",
             Self::Claude => "claude",
             Self::Codex => "codex",
+            Self::LlamaServer => "llama-server",
         }
     }
 
@@ -57,6 +64,7 @@ impl CliId {
             Self::CursorAgent => "Cursor CLI",
             Self::Claude => "Claude Code",
             Self::Codex => "Codex CLI",
+            Self::LlamaServer => "llama.cpp",
         }
     }
 
@@ -66,6 +74,7 @@ impl CliId {
             Self::CursorAgent => &["cursor-cli"],
             Self::Claude => &["claude-cli"],
             Self::Codex => &["codex-app-server", "codex-responses"],
+            Self::LlamaServer => &["local"],
         }
     }
 }
@@ -167,16 +176,25 @@ pub async fn latest_version(id: CliId) -> Result<String, InstallError> {
             Ok(v)
         }
         CliId::Codex => {
-            let body =
-                get_text("https://api.github.com/repos/openai/codex/releases/latest").await?;
-            let json: serde_json::Value = serde_json::from_str(&body)
-                .map_err(|e| InstallError::Download(format!("github release json: {e}")))?;
-            let tag = json["tag_name"]
-                .as_str()
-                .ok_or_else(|| InstallError::Download("github release had no tag_name".into()))?;
+            let tag = github_latest_tag("openai/codex").await?;
             Ok(tag.trim_start_matches("rust-v").to_string())
         }
+        // llama.cpp versions are bare build tags ("b9957").
+        CliId::LlamaServer => github_latest_tag("ggml-org/llama.cpp").await,
     }
+}
+
+async fn github_latest_tag(repo: &str) -> Result<String, InstallError> {
+    let body = get_text(&format!(
+        "https://api.github.com/repos/{repo}/releases/latest"
+    ))
+    .await?;
+    let json: serde_json::Value = serde_json::from_str(&body)
+        .map_err(|e| InstallError::Download(format!("github release json: {e}")))?;
+    json["tag_name"]
+        .as_str()
+        .map(str::to_string)
+        .ok_or_else(|| InstallError::Download("github release had no tag_name".into()))
 }
 
 /// Pull the pinned version out of the official cursor install script
@@ -207,6 +225,42 @@ fn cursor_platform() -> Result<(&'static str, &'static str), InstallError> {
 fn claude_platform() -> Result<String, InstallError> {
     let (os, arch) = cursor_platform()?; // same os/arch token scheme
     Ok(format!("{os}-{arch}"))
+}
+
+/// Release-asset platform token for llama.cpp builds. On Linux, prefer the
+/// Vulkan build when the Vulkan loader is present (works across NVIDIA/AMD/
+/// Intel through the installed GPU driver); plain CPU builds otherwise.
+/// macOS builds ship with Metal support built in.
+fn llama_platform() -> Result<String, InstallError> {
+    let arch = match std::env::consts::ARCH {
+        "x86_64" => "x64",
+        "aarch64" => "arm64",
+        other => return Err(InstallError::Unsupported(other.into())),
+    };
+    match std::env::consts::OS {
+        "macos" => Ok(format!("macos-{arch}")),
+        "linux" if linux_has_vulkan_loader() => Ok(format!("ubuntu-vulkan-{arch}")),
+        "linux" => Ok(format!("ubuntu-{arch}")),
+        other => Err(InstallError::Unsupported(other.into())),
+    }
+}
+
+/// Whether libvulkan is available on this Linux system (via ldconfig's
+/// cache or the usual lib directories).
+fn linux_has_vulkan_loader() -> bool {
+    if let Ok(out) = std::process::Command::new("ldconfig").arg("-p").output() {
+        if String::from_utf8_lossy(&out.stdout).contains("libvulkan.so.1") {
+            return true;
+        }
+    }
+    [
+        "/usr/lib/libvulkan.so.1",
+        "/usr/lib64/libvulkan.so.1",
+        "/usr/lib/x86_64-linux-gnu/libvulkan.so.1",
+        "/usr/lib/aarch64-linux-gnu/libvulkan.so.1",
+    ]
+    .iter()
+    .any(|p| Path::new(p).exists())
 }
 
 fn codex_triple() -> Result<String, InstallError> {
@@ -327,6 +381,24 @@ async fn install_into(dir: &Path, id: CliId, version: &str) -> Result<PathBuf, I
             make_executable(&dir.join(&rel))?;
             Ok(rel)
         }
+        CliId::LlamaServer => {
+            let platform = llama_platform()?;
+            let url = format!(
+                "https://github.com/ggml-org/llama.cpp/releases/download/{version}/llama-{version}-bin-{platform}.tar.gz"
+            );
+            let bytes = get_bytes(&url).await?;
+            untar_gz(bytes, dir).await?;
+            // The tarball unpacks to `llama-<version>/` with llama-server and
+            // its shared libraries side by side (rpath $ORIGIN).
+            let rel = PathBuf::from(format!("llama-{version}")).join("llama-server");
+            if !dir.join(&rel).exists() {
+                return Err(InstallError::Download(
+                    "llama.cpp archive had no llama-server binary".into(),
+                ));
+            }
+            make_executable(&dir.join(&rel))?;
+            Ok(rel)
+        }
     }
 }
 
@@ -431,6 +503,10 @@ DOWNLOAD_URL="https://downloads.cursor.com/lab/2026.07.01-41b2de7/${OS}/${ARCH}/
         for id in ALL_CLIS {
             assert_eq!(CliId::parse(id.as_str()), Some(id));
         }
+        assert_eq!(
+            CliId::parse(CliId::LlamaServer.as_str()),
+            Some(CliId::LlamaServer)
+        );
         assert_eq!(CliId::parse("unknown"), None);
     }
 

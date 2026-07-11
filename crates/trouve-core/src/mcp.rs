@@ -33,12 +33,19 @@ pub const TOOL_PREFIX: &str = "mcp__";
 /// One entry under `mcpServers` in `.mcp.json`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct McpServerConfig {
+    /// May be empty on a pure tombstone entry (`{"disabled": true}`).
+    #[serde(default)]
     pub command: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub args: Vec<String>,
     /// Values may be `${VAR}` references resolved from the environment.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub env: BTreeMap<String, String>,
+    /// Tombstone: a higher-priority scope can disable a server inherited
+    /// from a lower one (e.g. a branch's `.agents/.mcp.json` shadowing a
+    /// user- or workspace-level server) without redefining it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub disabled: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -82,7 +89,7 @@ impl McpLogStore {
 
 /// Expand `${VAR}` references from the process environment. Missing vars
 /// expand to the empty string (the server will fail loudly if it matters).
-fn expand_env(value: &str) -> String {
+pub fn expand_env(value: &str) -> String {
     let mut out = String::new();
     let mut rest = value;
     while let Some(start) = rest.find("${") {
@@ -177,6 +184,8 @@ fn edit_file(
 /// Discover MCP server configs: user config, overlaid by the workspace
 /// repo's `.agents/.mcp.json`, overlaid by the session worktree's (so
 /// settings edits apply immediately and committed files still win).
+/// Entries left `disabled` after the merge are dropped — that's how a
+/// branch removes a server it would otherwise inherit.
 pub fn discover_configs(
     config_dir: Option<&Path>,
     workspace_root: Option<&Path>,
@@ -192,7 +201,39 @@ pub fn discover_configs(
         }
     }
     servers.extend(read_servers(&workspace_config_path(worktree)));
+    servers.retain(|_, config| !config.disabled);
     servers
+}
+
+/// Like [`discover_configs`], but keeps disabled entries and tags each
+/// server with the layer whose definition won: "app-wide" (the user-level
+/// config applies to every workspace), "workspace" (the repo's committed
+/// file), or "branch" (the session worktree's checkout). Feeds the
+/// per-session effective-config view.
+pub fn discover_with_provenance(
+    config_dir: Option<&Path>,
+    workspace_root: Option<&Path>,
+    worktree: &Path,
+) -> Vec<(String, McpServerConfig, String)> {
+    let mut servers: BTreeMap<String, (McpServerConfig, String)> = BTreeMap::new();
+    let mut overlay = |path: &Path, source: &str| {
+        for (name, config) in read_servers(path) {
+            servers.insert(name, (config, source.to_string()));
+        }
+    };
+    if let Some(dir) = config_dir {
+        overlay(&user_config_path(dir), "app-wide");
+    }
+    if let Some(root) = workspace_root {
+        if root != worktree {
+            overlay(&workspace_config_path(root), "workspace");
+        }
+    }
+    overlay(&workspace_config_path(worktree), "branch");
+    servers
+        .into_iter()
+        .map(|(name, (config, source))| (name, config, source))
+        .collect()
 }
 
 /// Split `mcp__<server>__<tool>` into (server, tool).
@@ -506,6 +547,83 @@ mod tests {
     }
 
     #[test]
+    fn disabled_tombstone_removes_inherited_server() {
+        let user_dir = tempfile::tempdir().unwrap();
+        let worktree = tempfile::tempdir().unwrap();
+        std::fs::write(
+            user_config_path(user_dir.path()),
+            r#"{"mcpServers": {
+                "jira": {"command": "jira-mcp"},
+                "linear": {"command": "linear-mcp"}}}"#,
+        )
+        .unwrap();
+        let agents = worktree.path().join(".agents");
+        std::fs::create_dir_all(&agents).unwrap();
+        std::fs::write(
+            agents.join(".mcp.json"),
+            r#"{"mcpServers": {
+                "jira": {"disabled": true},
+                "docs": {"command": "docs-mcp"}}}"#,
+        )
+        .unwrap();
+
+        let configs = discover_configs(Some(user_dir.path()), None, worktree.path());
+        // jira is tombstoned by the worktree; linear inherited; docs added.
+        assert!(!configs.contains_key("jira"));
+        assert!(configs.contains_key("linear"));
+        assert!(configs.contains_key("docs"));
+    }
+
+    #[test]
+    fn provenance_tags_the_winning_layer_and_keeps_tombstones() {
+        let user_dir = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let worktree = tempfile::tempdir().unwrap();
+        std::fs::write(
+            user_config_path(user_dir.path()),
+            r#"{"mcpServers": {
+                "jira": {"command": "jira-mcp"},
+                "linear": {"command": "linear-mcp"}}}"#,
+        )
+        .unwrap();
+        for (dir, body) in [
+            (
+                workspace.path(),
+                r#"{"mcpServers": {"docs": {"command": "docs-mcp"}}}"#,
+            ),
+            (
+                worktree.path(),
+                r#"{"mcpServers": {
+                    "jira": {"disabled": true},
+                    "docs": {"command": "docs-mcp-branch"}}}"#,
+            ),
+        ] {
+            let agents = dir.join(".agents");
+            std::fs::create_dir_all(&agents).unwrap();
+            std::fs::write(agents.join(".mcp.json"), body).unwrap();
+        }
+
+        let servers = discover_with_provenance(
+            Some(user_dir.path()),
+            Some(workspace.path()),
+            worktree.path(),
+        );
+        let find = |name: &str| servers.iter().find(|(n, _, _)| n == name).unwrap();
+
+        let (_, config, source) = find("linear");
+        assert_eq!(source, "app-wide");
+        assert!(!config.disabled);
+        // The branch redefines docs, so it wins over the workspace entry.
+        let (_, config, source) = find("docs");
+        assert_eq!(source, "branch");
+        assert_eq!(config.command, "docs-mcp-branch");
+        // Tombstones stay visible, tagged with the layer that disabled them.
+        let (_, config, source) = find("jira");
+        assert_eq!(source, "branch");
+        assert!(config.disabled);
+    }
+
+    #[test]
     fn upsert_and_remove_edit_files_preserving_other_keys() {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("mcp.json");
@@ -519,6 +637,7 @@ mod tests {
             command: "linear-mcp".into(),
             args: vec!["--stdio".into()],
             env: BTreeMap::from([("TOKEN".into(), "${LINEAR_TOKEN}".into())]),
+            disabled: false,
         };
         upsert_server(&path, "linear", &config).unwrap();
 

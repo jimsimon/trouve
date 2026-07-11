@@ -8076,6 +8076,7 @@ dependencies = [
  "ignore",
  "octocrab",
  "regex",
+ "reqwest",
  "rusqlite",
  "serde",
  "serde_json",

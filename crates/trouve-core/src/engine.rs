@@ -72,6 +72,12 @@ pub struct Engine {
     logins: Mutex<HashMap<String, LoginState>>,
     /// In-flight managed vendor-CLI installs, keyed by CLI id.
     cli_installs: Mutex<HashMap<String, CliInstallState>>,
+    /// The llama-server sidecar behind the built-in "local" provider.
+    local_manager: Arc<crate::local::LlamaManager>,
+    /// In-flight local model (GGUF) downloads, keyed by model id.
+    local_downloads: Mutex<HashMap<String, LocalDownloadState>>,
+    /// RAM/VRAM probe, run once on first use.
+    hardware: std::sync::OnceLock<crate::local::Hardware>,
     /// Latest-version lookups, cached per CLI (network is best-effort).
     cli_latest: Mutex<HashMap<String, (std::time::Instant, Option<String>)>>,
     /// This server's reachable base URL (e.g. "http://127.0.0.1:7433"), set
@@ -100,6 +106,13 @@ enum LoginState {
 enum CliInstallState {
     Pending(Option<String>),
     Success(String),
+    Failed(String),
+}
+
+#[derive(Debug, Clone)]
+enum LocalDownloadState {
+    /// Bytes downloaded so far; the task updates the counter.
+    Pending(Arc<std::sync::atomic::AtomicU64>),
     Failed(String),
 }
 
@@ -264,15 +277,28 @@ impl Engine {
     pub fn new(store: Store, data_dir: PathBuf, config: &Config) -> Self {
         let secrets: Arc<dyn trouve_providers::secrets::SecretStore> =
             Arc::from(trouve_providers::secrets::default_store(&data_dir));
-        let providers = build_all_providers(config, &secrets);
+        let mut providers = build_all_providers(config, &secrets);
         let backends = build_all_backends(config, &secrets, &data_dir);
         let mcp_logs = crate::mcp::McpLogStore::default();
+        let config_dir = dirs::config_dir().map(|d| d.join("trouve"));
+        // The built-in "local" provider (managed llama-server). Always
+        // registered — it lists no models until a GGUF is downloaded — and
+        // seeded as injected so config-driven reloads keep it.
+        let local_manager = Arc::new(crate::local::LlamaManager::default());
+        let local_provider: Arc<dyn Provider> = Arc::new(crate::local::LocalProvider::new(
+            data_dir.clone(),
+            config_dir.clone(),
+            local_manager.clone(),
+        ));
+        providers.insert("local".into(), local_provider.clone());
+        let injected_providers =
+            HashMap::from([("local".to_string(), local_provider)]);
         Self {
             store,
             data_dir,
-            config_dir: dirs::config_dir().map(|d| d.join("trouve")),
+            config_dir,
             providers: RwLock::new(providers),
-            injected_providers: Mutex::new(HashMap::new()),
+            injected_providers: Mutex::new(injected_providers),
             backends: RwLock::new(backends),
             injected_backends: Mutex::new(HashMap::new()),
             executor: Arc::new(LocalToolExecutor::with_mcp_logs(mcp_logs.clone())),
@@ -295,6 +321,9 @@ impl Engine {
             secrets,
             logins: Mutex::new(HashMap::new()),
             cli_installs: Mutex::new(HashMap::new()),
+            local_manager,
+            local_downloads: Mutex::new(HashMap::new()),
+            hardware: std::sync::OnceLock::new(),
             cli_latest: Mutex::new(HashMap::new()),
             base_url: RwLock::new(None),
             index_hooks: false,
@@ -920,6 +949,225 @@ impl Engine {
         }
     }
 
+    // --- local models ---------------------------------------------------------
+
+    /// The hardware probe result, run once (off the async runtime) and
+    /// cached for the engine's lifetime.
+    async fn hardware(&self) -> crate::local::Hardware {
+        if self.hardware.get().is_none() {
+            let hw = tokio::task::spawn_blocking(crate::local::probe_hardware)
+                .await
+                .unwrap_or_default();
+            let _ = self.hardware.set(hw);
+        }
+        self.hardware.get().cloned().unwrap_or_default()
+    }
+
+    /// Local inference status for the settings screen: hardware, runtime
+    /// install state, the running sidecar, and every model with its
+    /// download/fit state.
+    pub async fn local_status(&self) -> trouve_protocol::LocalStatus {
+        use trouve_agents::install as cli;
+        let hw = self.hardware().await;
+        let (runtime_installed, runtime_version) =
+            match cli::installed(&self.data_dir, cli::CliId::LlamaServer) {
+                Some(info) => (true, Some(info.version)),
+                None => match cli::find_on_path("llama-server") {
+                    Some(_) => (true, Some("system".into())),
+                    None => (false, None),
+                },
+            };
+        let running_model = self.local_manager.running_model().await;
+        let downloads = self.local_downloads.lock().unwrap().clone();
+        let models = crate::local::all_entries(self.config_dir.as_deref())
+            .into_iter()
+            .map(|entry| {
+                let downloaded = crate::local::gguf_path(&self.data_dir, &entry).exists();
+                let (download_status, download_bytes, download_error) =
+                    match downloads.get(&entry.id) {
+                        Some(LocalDownloadState::Pending(bytes)) => (
+                            "pending".to_string(),
+                            bytes.load(std::sync::atomic::Ordering::Relaxed),
+                            String::new(),
+                        ),
+                        Some(LocalDownloadState::Failed(e)) => {
+                            ("failed".to_string(), 0, e.clone())
+                        }
+                        None => ("none".to_string(), 0, String::new()),
+                    };
+                trouve_protocol::LocalModelInfo {
+                    id: entry.id.clone(),
+                    display_name: entry.display_name.clone(),
+                    repo: entry.repo.clone(),
+                    file: entry.file.clone(),
+                    size_bytes: entry.size_bytes,
+                    params: entry.params.clone(),
+                    context_window: crate::local::SERVE_CONTEXT,
+                    fit: crate::local::fit(entry.size_bytes, &hw).to_string(),
+                    notes: entry.notes.clone(),
+                    downloaded,
+                    download_status,
+                    download_bytes,
+                    download_error,
+                    custom: entry.custom,
+                }
+            })
+            .collect();
+        trouve_protocol::LocalStatus {
+            ram_bytes: hw.ram_bytes,
+            gpus: hw.gpus,
+            runtime_installed,
+            runtime_version,
+            running_model,
+            models,
+        }
+    }
+
+    /// Start downloading one model's GGUF from HuggingFace into the data
+    /// dir. Progress is visible through `local_status`.
+    pub fn start_local_model_download(self: &Arc<Self>, id: &str) -> Result<(), EngineError> {
+        let entry = crate::local::all_entries(self.config_dir.as_deref())
+            .into_iter()
+            .find(|e| e.id == id)
+            .ok_or_else(|| EngineError::NotFound(format!("local model {id}")))?;
+        let counter = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        {
+            let mut downloads = self.local_downloads.lock().unwrap();
+            if matches!(downloads.get(id), Some(LocalDownloadState::Pending(..))) {
+                return Err(EngineError::Conflict(format!(
+                    "a download for {id} is already in progress"
+                )));
+            }
+            downloads.insert(
+                id.to_string(),
+                LocalDownloadState::Pending(counter.clone()),
+            );
+        }
+        let engine = self.clone();
+        let id_owned = id.to_string();
+        tokio::spawn(async move {
+            let result = download_gguf(&engine.data_dir, &entry, &counter).await;
+            let mut downloads = engine.local_downloads.lock().unwrap();
+            match result {
+                // Downloaded state comes from the file's existence.
+                Ok(()) => {
+                    downloads.remove(&id_owned);
+                }
+                Err(e) => {
+                    downloads.insert(id_owned, LocalDownloadState::Failed(format!("{e:#}")));
+                }
+            }
+        });
+        Ok(())
+    }
+
+    /// Register a custom GGUF (HuggingFace repo + filename), validating
+    /// that the file exists and reading its size.
+    pub async fn add_local_model(
+        &self,
+        req: trouve_protocol::AddLocalModelRequest,
+    ) -> Result<(), EngineError> {
+        let config_dir = self
+            .config_dir
+            .clone()
+            .ok_or_else(|| EngineError::Internal(anyhow::anyhow!("no config dir")))?;
+        let repo = req.repo.trim().trim_matches('/').to_string();
+        let file = req.file.trim().trim_start_matches('/').to_string();
+        if repo.is_empty() || !repo.contains('/') || file.is_empty() {
+            return Err(EngineError::BadRequest(
+                "expected a HuggingFace repo like owner/name and a .gguf filename".into(),
+            ));
+        }
+        if !file.ends_with(".gguf") {
+            return Err(EngineError::BadRequest("the file must be a .gguf".into()));
+        }
+        let id = crate::local::slug_from_file(&file);
+        if crate::local::all_entries(Some(&config_dir))
+            .iter()
+            .any(|e| e.id == id)
+        {
+            return Err(EngineError::Conflict(format!(
+                "a local model with id {id} already exists"
+            )));
+        }
+        // Validate against HF and learn the size for the fit label. Don't
+        // follow the CDN redirect: the size lives in `x-linked-size` on the
+        // resolve response itself, and a redirect already proves existence.
+        let url = crate::local::download_url(&repo, &file);
+        let resp = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .map_err(|e| EngineError::Internal(e.into()))?
+            .head(&url)
+            .send()
+            .await
+            .map_err(|e| EngineError::BadRequest(format!("checking {repo}/{file}: {e}")))?;
+        if !resp.status().is_success() && !resp.status().is_redirection() {
+            return Err(EngineError::BadRequest(format!(
+                "HuggingFace returned {} for {repo}/{file} — check the repo and filename \
+                 (gated repos are not supported)",
+                resp.status()
+            )));
+        }
+        let size_bytes = resp
+            .headers()
+            .get("x-linked-size")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.parse().ok())
+            .or_else(|| resp.content_length().filter(|n| *n > 0))
+            .unwrap_or(0);
+        let display_name = req
+            .display_name
+            .filter(|n| !n.trim().is_empty())
+            .unwrap_or_else(|| id.clone());
+        let path = crate::local::custom_models_path(&config_dir);
+        let mut models = crate::local::read_custom_models(&path);
+        models.push(crate::local::CustomModel {
+            id,
+            display_name,
+            repo,
+            file,
+            size_bytes,
+        });
+        crate::local::write_custom_models(&path, &models)
+            .map_err(|e| EngineError::Internal(e.into()))?;
+        Ok(())
+    }
+
+    /// Delete a model's downloaded GGUF (stopping the server if it is the
+    /// one loaded); custom entries are removed from the list entirely.
+    pub async fn delete_local_model(&self, id: &str) -> Result<(), EngineError> {
+        let entry = crate::local::all_entries(self.config_dir.as_deref())
+            .into_iter()
+            .find(|e| e.id == id)
+            .ok_or_else(|| EngineError::NotFound(format!("local model {id}")))?;
+        if self.local_manager.running_model().await.as_deref() == Some(id) {
+            self.local_manager.stop().await;
+        }
+        self.local_downloads.lock().unwrap().remove(id);
+        let gguf = crate::local::gguf_path(&self.data_dir, &entry);
+        let _ = std::fs::remove_file(gguf.with_extension("gguf.part"));
+        if gguf.exists() {
+            std::fs::remove_file(&gguf).map_err(|e| EngineError::Internal(e.into()))?;
+        }
+        if entry.custom {
+            if let Some(config_dir) = &self.config_dir {
+                let path = crate::local::custom_models_path(config_dir);
+                let mut models = crate::local::read_custom_models(&path);
+                models.retain(|m| m.id != id);
+                crate::local::write_custom_models(&path, &models)
+                    .map_err(|e| EngineError::Internal(e.into()))?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Stop the llama-server sidecar (frees the model's RAM/VRAM; the next
+    /// local turn restarts it).
+    pub async fn stop_local_server(&self) {
+        self.local_manager.stop().await;
+    }
+
     /// Report the state of an OAuth login started with `start_login`.
     pub fn login_status(&self, id: &str) -> trouve_protocol::LoginStatus {
         match self.logins.lock().unwrap().get(id) {
@@ -1190,50 +1438,69 @@ impl Engine {
         }
     }
 
-    /// User-managed MCP servers from the config dir plus (when a workspace
-    /// is given) the workspace's `.agents/.mcp.json`. With `probe`, every
+    /// User-managed MCP servers: the config dir's `mcp.json` plus each
+    /// workspace's `.agents/.mcp.json` (one workspace when an id is given,
+    /// every registered workspace otherwise). With `probe`, every enabled
     /// server is spawned and handshaken concurrently to report health.
     pub async fn list_mcp_servers(
         &self,
         workspace_id: Option<&str>,
         probe: bool,
     ) -> Result<Vec<trouve_protocol::McpServerInfo>, EngineError> {
-        let mut entries: Vec<(String, String, crate::mcp::McpServerConfig)> = Vec::new();
+        // (name, scope, workspace id, workspace name, config)
+        type Entry = (String, String, String, String, crate::mcp::McpServerConfig);
+        let mut entries: Vec<Entry> = Vec::new();
         if let Some(dir) = self.config_dir.as_deref() {
             for (name, config) in crate::mcp::read_servers(&crate::mcp::user_config_path(dir)) {
-                entries.push((name, "user".into(), config));
+                entries.push((name, "user".into(), String::new(), String::new(), config));
             }
         }
-        if let Some(id) = workspace_id {
-            let ws = self
+        let workspaces = match workspace_id {
+            Some(id) => vec![self
                 .store
                 .workspace(id)?
-                .ok_or_else(|| EngineError::NotFound(format!("workspace {id}")))?;
+                .ok_or_else(|| EngineError::NotFound(format!("workspace {id}")))?],
+            None => self.store.list_workspaces()?,
+        };
+        for ws in workspaces {
             let path = crate::mcp::workspace_config_path(Path::new(&ws.path));
             for (name, config) in crate::mcp::read_servers(&path) {
-                entries.push((name, "workspace".into(), config));
+                entries.push((
+                    name,
+                    "workspace".into(),
+                    ws.id.clone(),
+                    ws.name.clone(),
+                    config,
+                ));
             }
         }
-        let probes = futures::future::join_all(entries.iter().map(|(name, _, config)| async {
-            if probe {
-                Some(crate::mcp::probe(name, config, &self.mcp_logs).await)
-            } else {
-                None
-            }
-        }))
-        .await;
+        let probes =
+            futures::future::join_all(entries.iter().map(|(name, _, _, _, config)| async {
+                if probe && !config.disabled {
+                    Some(crate::mcp::probe(name, config, &self.mcp_logs).await)
+                } else {
+                    None
+                }
+            }))
+            .await;
         Ok(entries
             .into_iter()
             .zip(probes)
-            .map(|((name, scope, config), probed)| {
-                let (health, detail) = match probed {
-                    Some(Ok(tools)) => ("ok".to_string(), format!("{tools} tools")),
-                    Some(Err(e)) => ("error".to_string(), format!("{e:#}")),
-                    None => ("unknown".to_string(), String::new()),
+            .map(|((name, scope, workspace_id, workspace_name, config), probed)| {
+                let (health, detail) = if config.disabled {
+                    ("disabled".to_string(), "disabled in this scope".to_string())
+                } else {
+                    match probed {
+                        Some(Ok(tools)) => ("ok".to_string(), format!("{tools} tools")),
+                        Some(Err(e)) => ("error".to_string(), format!("{e:#}")),
+                        None => ("unknown".to_string(), String::new()),
+                    }
                 };
                 trouve_protocol::McpServerInfo {
                     name,
                     scope,
+                    workspace_id,
+                    workspace_name,
                     command: config.command,
                     args: config.args,
                     env: config.env,
@@ -1242,6 +1509,47 @@ impl Engine {
                 }
             })
             .collect())
+    }
+
+    /// The effective MCP config for one session: all scopes merged the way
+    /// a turn in this session would see them (app-wide < workspace <
+    /// branch), each entry tagged with the winning layer. Disabled entries
+    /// are kept and flagged so tombstones are visible.
+    pub fn session_mcp_servers(
+        &self,
+        session_id: &str,
+    ) -> Result<Vec<trouve_protocol::McpServerInfo>, EngineError> {
+        let session = self.get_session(session_id)?;
+        let workspace_root = self
+            .store
+            .workspace(&session.workspace_id)?
+            .map(|ws| PathBuf::from(ws.path));
+        Ok(crate::mcp::discover_with_provenance(
+            self.config_dir.as_deref(),
+            workspace_root.as_deref(),
+            Path::new(&session.worktree_path),
+        )
+        .into_iter()
+        .map(|(name, config, source)| trouve_protocol::McpServerInfo {
+            name,
+            scope: source.clone(),
+            workspace_id: session.workspace_id.clone(),
+            workspace_name: String::new(),
+            command: config.command,
+            args: config.args,
+            env: config.env,
+            health: if config.disabled {
+                "disabled".into()
+            } else {
+                "unknown".into()
+            },
+            detail: if config.disabled {
+                format!("disabled by the {source} config")
+            } else {
+                String::new()
+            },
+        })
+        .collect())
     }
 
     /// Add or replace an MCP server in the scope's config file.
@@ -1264,6 +1572,7 @@ impl Engine {
             command: req.command.trim().to_string(),
             args: req.args.clone(),
             env: req.env.clone(),
+            disabled: false,
         };
         crate::mcp::upsert_server(&path, name, &config).map_err(EngineError::Internal)
     }
@@ -2439,6 +2748,39 @@ impl Engine {
         Ok((session, thread, mode, ctx))
     }
 
+    /// User-configured MCP servers for a session's worktree, flattened for
+    /// a vendor agent CLI: scopes merged (user < workspace < worktree),
+    /// disabled entries dropped, env `${VAR}` references expanded. The name
+    /// "trouve" is reserved for the bridge and skipped.
+    fn mcp_servers_for(
+        &self,
+        session: &Session,
+    ) -> Result<Vec<trouve_agents::McpServerLaunch>, EngineError> {
+        let workspace_root = self
+            .store
+            .workspace(&session.workspace_id)?
+            .map(|ws| PathBuf::from(ws.path));
+        let configs = crate::mcp::discover_configs(
+            self.config_dir.as_deref(),
+            workspace_root.as_deref(),
+            Path::new(&session.worktree_path),
+        );
+        Ok(configs
+            .into_iter()
+            .filter(|(name, _)| name != "trouve")
+            .map(|(name, config)| trouve_agents::McpServerLaunch {
+                name,
+                command: config.command,
+                args: config.args,
+                env: config
+                    .env
+                    .iter()
+                    .map(|(k, v)| (k.clone(), crate::mcp::expand_env(v)))
+                    .collect(),
+            })
+            .collect())
+    }
+
     /// Run one turn through an external agent backend. The vendor harness
     /// plans, calls tools, and edits the worktree; we persist its events,
     /// gate its approval requests through our permission layer, and keep the
@@ -2508,6 +2850,7 @@ impl Engine {
             instructions: (!instructions.is_empty()).then_some(instructions),
             permission,
             mcp_bridge,
+            mcp_servers: self.mcp_servers_for(session)?,
         };
 
         let mut stream = backend
@@ -3246,6 +3589,39 @@ pub fn question_result_json(
 /// Build a provider from config. Credential resolution order: inline
 /// `api_key` > `api_key_env` > secret store API key > stored OAuth tokens
 /// (when `[providers.<id>.oauth]` is configured).
+/// Stream one GGUF from HuggingFace to `<data_dir>/models/`, updating
+/// `counter` as bytes land. Writes to a `.part` sibling and renames on
+/// success so a partial download never looks complete.
+async fn download_gguf(
+    data_dir: &Path,
+    entry: &crate::local::ModelEntry,
+    counter: &std::sync::atomic::AtomicU64,
+) -> Result<()> {
+    use futures::TryStreamExt as _;
+    use tokio::io::AsyncWriteExt as _;
+
+    let target = crate::local::gguf_path(data_dir, entry);
+    std::fs::create_dir_all(target.parent().unwrap())?;
+    let part = target.with_extension("gguf.part");
+
+    let url = crate::local::download_url(&entry.repo, &entry.file);
+    let client = reqwest::Client::builder()
+        .user_agent(concat!("trouve/", env!("CARGO_PKG_VERSION")))
+        .connect_timeout(std::time::Duration::from_secs(15))
+        .build()?;
+    let resp = client.get(&url).send().await?.error_for_status()?;
+    let mut stream = resp.bytes_stream();
+    let mut file = tokio::fs::File::create(&part).await?;
+    while let Some(chunk) = stream.try_next().await? {
+        file.write_all(&chunk).await?;
+        counter.fetch_add(chunk.len() as u64, std::sync::atomic::Ordering::Relaxed);
+    }
+    file.flush().await?;
+    drop(file);
+    std::fs::rename(&part, &target)?;
+    Ok(())
+}
+
 fn build_provider(
     id: &str,
     pc: &ProviderConfig,

@@ -13,8 +13,8 @@ use tokio::sync::mpsc;
 use trouve_client_core::client::ProtocolClient;
 use trouve_client_core::viewmodel::ThreadViewModel;
 use trouve_protocol::{
-    AgentMode, ApprovalDecision, CreateSessionRequest, CreateThreadRequest, DirEntry,
-    EventEnvelope, ModelInfo, PermissionMode, Session, Thread, UpdateSessionRequest,
+    AddLocalModelRequest, AgentMode, ApprovalDecision, CreateSessionRequest, CreateThreadRequest,
+    DirEntry, EventEnvelope, ModelInfo, PermissionMode, Session, Thread, UpdateSessionRequest,
     UpdateThreadRequest, UpsertModeRequest, UpsertProviderRequest, Workspace,
 };
 
@@ -144,6 +144,26 @@ pub enum UiCommand {
     SetModeModel(String, i32),
     /// Download/update a managed vendor CLI ("cursor-agent", "claude", "codex").
     CliInstall(String),
+    /// Re-fetch local (offline) model state for the settings screen.
+    RefreshLocal,
+    /// Internal: the local status + runtime-install fetch finished.
+    LocalLoaded(
+        Result<
+            (
+                trouve_protocol::LocalStatus,
+                trouve_protocol::CliInstallStatus,
+            ),
+            String,
+        >,
+    ),
+    /// Start downloading one local model's GGUF.
+    LocalDownload(String),
+    /// Delete a local model's GGUF (custom entries disappear entirely).
+    LocalDeleteModel(String),
+    /// Stop the llama-server sidecar to free memory.
+    LocalStopServer,
+    /// Register a custom GGUF (HuggingFace repo + file).
+    LocalAddModel { repo: String, file: String },
     /// Open settings straight to the Integrations section.
     OpenIntegrationsSettings,
     /// Store/remove the GitHub token (empty = remove).
@@ -157,15 +177,22 @@ pub enum UiCommand {
         command_line: String,
         /// One KEY=VALUE per line.
         env_lines: String,
+        /// Which workspace's file to edit (workspace scope only).
+        workspace_id: String,
     },
     DeleteMcpServer {
         name: String,
         scope: String,
+        workspace_id: String,
     },
     /// Fetch recent log lines for one MCP server.
     McpLogs(String),
     /// Internal: an MCP list fetch finished (true = with health probes).
     McpLoaded(Vec<trouve_protocol::McpServerInfo>, bool),
+    /// Re-fetch the current session's effective MCP config (right panel).
+    RefreshSessionMcp,
+    /// Internal: the session MCP fetch finished.
+    SessionMcpLoaded(String, Result<Vec<trouve_protocol::McpServerInfo>, String>),
     /// Internal: the subscription health fetch finished.
     SubscriptionsLoaded(Vec<trouve_protocol::SubscriptionHealth>),
 
@@ -215,6 +242,11 @@ struct Controller {
     /// GitHub integration state (None until the first fetch answers).
     github_configured: bool,
     github_source: String,
+    /// Local models: true while a poller is scheduled for an in-flight
+    /// download/install, plus the last seen downloaded-model count (a
+    /// change means the model catalog changed → reload pickers).
+    local_polling: bool,
+    local_downloaded: Option<usize>,
     /// PRs detected for the current session's branch, and the one shown.
     prs: Vec<trouve_protocol::PrInfo>,
     pr_selected: usize,
@@ -308,6 +340,8 @@ pub async fn run(
         current_thread: None,
         github_configured: false,
         github_source: String::new(),
+        local_polling: false,
+        local_downloaded: None,
         prs: Vec::new(),
         pr_selected: 0,
         pr_error: String::new(),
@@ -664,6 +698,7 @@ impl Controller {
         self.prs.clear();
         self.pr_selected = 0;
         self.refresh_prs();
+        self.refresh_session_mcp();
         Ok(())
     }
 
@@ -1011,6 +1046,24 @@ impl Controller {
         });
     }
 
+    /// Kick off a background fetch of the session's effective MCP config
+    /// (the merged view a turn would see); lands as `SessionMcpLoaded`.
+    fn refresh_session_mcp(&self) {
+        let Some(session_id) = self.current_session_id() else {
+            ui::set_session_mcp(&self.ui, Vec::new(), String::new());
+            return;
+        };
+        let client = self.client.clone();
+        let tx = self.tx.clone();
+        tokio::spawn(async move {
+            let result = client
+                .session_mcp_servers(&session_id)
+                .await
+                .map_err(|e| format!("{e:#}"));
+            let _ = tx.send(UiCommand::SessionMcpLoaded(session_id, result));
+        });
+    }
+
     fn push_prs(&self) {
         let labels = self
             .prs
@@ -1072,15 +1125,19 @@ impl Controller {
 
     /// Reload the MCP server list in the background: a quick unprobed list
     /// paints immediately, then health probes fill in (they spawn every
-    /// server, which can take seconds).
+    /// server, which can take seconds). Lists all registered workspaces,
+    /// grouped by scope, so nothing is hidden behind the current session.
     fn refresh_mcp(&self) {
+        ui::set_mcp_workspaces(
+            &self.ui,
+            self.workspaces.iter().map(|w| w.name.clone()).collect(),
+            self.workspaces.iter().map(|w| w.id.clone()).collect(),
+        );
         let client = self.client.clone();
         let tx = self.tx.clone();
         let ui = self.ui.clone();
-        let workspace_id = self.home_workspace_id.clone();
         tokio::spawn(async move {
-            let ws = (!workspace_id.is_empty()).then_some(workspace_id);
-            match client.list_mcp_servers(ws.as_deref(), false).await {
+            match client.list_mcp_servers(None, false).await {
                 Ok(list) => {
                     let _ = tx.send(UiCommand::McpLoaded(list, false));
                 }
@@ -1089,7 +1146,7 @@ impl Controller {
                     return;
                 }
             }
-            match client.list_mcp_servers(ws.as_deref(), true).await {
+            match client.list_mcp_servers(None, true).await {
                 Ok(list) => {
                     let _ = tx.send(UiCommand::McpLoaded(list, true));
                 }
@@ -1356,6 +1413,7 @@ impl Controller {
             ui::set_known_providers(&self.ui, known);
         }
         self.refresh_clis().await;
+        self.refresh_local();
     }
 
     /// Fetch managed vendor-CLI state and render the settings rows. Install
@@ -1424,6 +1482,109 @@ impl Controller {
             ));
         }
         ui::set_clis(&self.ui, rows);
+    }
+
+    /// Kick off a background fetch of local-model state (hardware, runtime,
+    /// downloads); lands as `LocalLoaded`.
+    fn refresh_local(&self) {
+        let client = self.client.clone();
+        let tx = self.tx.clone();
+        tokio::spawn(async move {
+            let result = async {
+                let status = client.local_status().await.map_err(|e| format!("{e:#}"))?;
+                let install = client
+                    .cli_install_status("llama-server")
+                    .await
+                    .map_err(|e| format!("{e:#}"))?;
+                Ok::<_, String>((status, install))
+            }
+            .await;
+            let _ = tx.send(UiCommand::LocalLoaded(result));
+        });
+    }
+
+    /// Render local-model state into the settings section.
+    fn push_local(
+        &self,
+        status: &trouve_protocol::LocalStatus,
+        install: &trouve_protocol::CliInstallStatus,
+    ) {
+        let mut hw_line = format!("{} RAM", human_gb(status.ram_bytes));
+        if status.gpus.is_empty() {
+            hw_line.push_str(" · no GPU detected (models run on the CPU)");
+        }
+        for gpu in &status.gpus {
+            hw_line.push_str(&format!(" · {} {} VRAM", gpu.name, human_gb(gpu.vram_bytes)));
+        }
+        let runtime_label = match (&status.runtime_installed, &status.runtime_version) {
+            (true, Some(v)) => format!("installed ({v})"),
+            (true, None) => "installed".to_string(),
+            (false, _) => "not installed".to_string(),
+        };
+        let (runtime_busy, runtime_status) = match install.status.as_str() {
+            "pending" => (true, "downloading llama.cpp…".to_string()),
+            "failed" => (
+                false,
+                format!("install failed: {}", install.error.clone().unwrap_or_default()),
+            ),
+            _ => (false, String::new()),
+        };
+        let runtime_action = if status.runtime_installed {
+            "Update".to_string()
+        } else {
+            "Install".to_string()
+        };
+        let server_line = match &status.running_model {
+            Some(model) => format!("llama-server is running {model}"),
+            None => String::new(),
+        };
+        let models = status
+            .models
+            .iter()
+            .map(|m| {
+                let mut meta = String::new();
+                if !m.params.is_empty() {
+                    meta.push_str(&m.params);
+                    meta.push_str(" · ");
+                }
+                meta.push_str(&human_gb(m.size_bytes));
+                let fit_label = match m.fit.as_str() {
+                    "gpu" => "fits your GPU",
+                    "cpu" => "runs on CPU (slower)",
+                    _ => "needs more memory",
+                };
+                let progress = if m.size_bytes > 0 {
+                    (m.download_bytes * 100 / m.size_bytes).min(99) as i32
+                } else {
+                    0
+                };
+                ui::LocalModelView {
+                    id: m.id.clone(),
+                    name: m.display_name.clone(),
+                    meta,
+                    fit: m.fit.clone(),
+                    fit_label: fit_label.into(),
+                    notes: m.notes.clone(),
+                    downloaded: m.downloaded,
+                    downloading: m.download_status == "pending",
+                    progress,
+                    error: m.download_error.clone(),
+                    custom: m.custom,
+                }
+            })
+            .collect();
+        ui::set_local(
+            &self.ui,
+            ui::LocalView {
+                hw_line,
+                runtime_label,
+                runtime_action,
+                runtime_busy,
+                runtime_status,
+                server_line,
+                models,
+            },
+        );
     }
 
     // --- command dispatch --------------------------------------------------------
@@ -1954,7 +2115,7 @@ impl Controller {
                 }
             }
             UiCommand::OpenIntegrationsSettings => {
-                ui::set_settings_section(&self.ui, 3);
+                ui::set_settings_section(&self.ui, 4);
                 self.refresh_settings().await;
                 self.refresh_mcp();
                 self.refresh_subscriptions();
@@ -1967,6 +2128,8 @@ impl Controller {
                     .map(|s| ui::McpView {
                         name: s.name,
                         scope: s.scope,
+                        workspace_id: s.workspace_id,
+                        workspace_name: s.workspace_name,
                         command_line: render_command_line(&s.command, &s.args),
                         env_lines: s
                             .env
@@ -1974,7 +2137,11 @@ impl Controller {
                             .map(|(k, v)| format!("{k}={v}"))
                             .collect::<Vec<_>>()
                             .join("\n"),
-                        health: if probed { s.health } else { "checking".into() },
+                        health: if probed || s.health == "disabled" {
+                            s.health
+                        } else {
+                            "checking".into()
+                        },
                         detail: s.detail,
                     })
                     .collect();
@@ -1988,37 +2155,82 @@ impl Controller {
                     },
                 );
             }
+            UiCommand::RefreshSessionMcp => self.refresh_session_mcp(),
+            UiCommand::SessionMcpLoaded(session_id, result) => {
+                // Stale fetch (session switched underneath): drop it.
+                if self.current_session_id().as_deref() == Some(session_id.as_str()) {
+                    match result {
+                        Ok(servers) => {
+                            let items = servers
+                                .into_iter()
+                                .map(|s| ui::McpView {
+                                    name: s.name,
+                                    scope: s.scope,
+                                    workspace_id: s.workspace_id,
+                                    workspace_name: s.workspace_name,
+                                    command_line: render_command_line(&s.command, &s.args),
+                                    env_lines: s
+                                        .env
+                                        .iter()
+                                        .map(|(k, v)| format!("{k}={v}"))
+                                        .collect::<Vec<_>>()
+                                        .join("\n"),
+                                    health: s.health,
+                                    detail: s.detail,
+                                })
+                                .collect();
+                            ui::set_session_mcp(&self.ui, items, String::new());
+                        }
+                        Err(e) => ui::set_session_mcp(
+                            &self.ui,
+                            Vec::new(),
+                            format!("failed to load MCP config: {e}"),
+                        ),
+                    }
+                }
+            }
             UiCommand::SaveMcpServer {
                 name,
                 scope,
                 command_line,
                 env_lines,
+                workspace_id,
             } => match parse_mcp_form(&command_line, &env_lines) {
                 Ok((command, args, env)) => {
                     let req = trouve_protocol::UpsertMcpServerRequest {
-                        workspace_id: (scope == "workspace")
-                            .then(|| self.home_workspace_id.clone()),
+                        workspace_id: (scope == "workspace" && !workspace_id.is_empty())
+                            .then_some(workspace_id),
                         scope,
                         command,
                         args,
                         env,
                     };
                     match self.client.upsert_mcp_server(&name, &req).await {
-                        Ok(()) => self.refresh_mcp(),
+                        Ok(()) => {
+                            self.refresh_mcp();
+                            self.refresh_session_mcp();
+                        }
                         Err(e) => ui::set_mcp_status(&self.ui, format!("{e:#}")),
                     }
                 }
                 Err(e) => ui::set_mcp_status(&self.ui, e),
             },
-            UiCommand::DeleteMcpServer { name, scope } => {
+            UiCommand::DeleteMcpServer {
+                name,
+                scope,
+                workspace_id,
+            } => {
                 let workspace_id =
-                    (scope == "workspace").then(|| self.home_workspace_id.clone());
+                    (scope == "workspace" && !workspace_id.is_empty()).then_some(workspace_id);
                 match self
                     .client
                     .delete_mcp_server(&name, &scope, workspace_id.as_deref())
                     .await
                 {
-                    Ok(()) => self.refresh_mcp(),
+                    Ok(()) => {
+                        self.refresh_mcp();
+                        self.refresh_session_mcp();
+                    }
                     Err(e) => ui::set_mcp_status(&self.ui, format!("{e:#}")),
                 }
             }
@@ -2253,6 +2465,73 @@ impl Controller {
                         Err(e) => ui::set_settings_status(&self.ui, format!("{e:#}")),
                     }
                 }
+            }
+            UiCommand::RefreshLocal => {
+                self.local_polling = false;
+                self.refresh_local();
+            }
+            UiCommand::LocalLoaded(result) => match result {
+                Ok((status, install)) => {
+                    self.push_local(&status, &install);
+                    // A finished download/delete changes the model catalog:
+                    // reload the composer pickers when the count moves.
+                    let downloaded = status.models.iter().filter(|m| m.downloaded).count();
+                    if self.local_downloaded != Some(downloaded) {
+                        if self.local_downloaded.is_some() {
+                            self.reload_catalogs().await;
+                        }
+                        self.local_downloaded = Some(downloaded);
+                    }
+                    // Keep polling while something is in flight.
+                    let busy = install.status == "pending"
+                        || status
+                            .models
+                            .iter()
+                            .any(|m| m.download_status == "pending");
+                    if busy && !self.local_polling {
+                        self.local_polling = true;
+                        let tx = self.tx.clone();
+                        tokio::spawn(async move {
+                            tokio::time::sleep(std::time::Duration::from_millis(1200)).await;
+                            let _ = tx.send(UiCommand::RefreshLocal);
+                        });
+                    }
+                }
+                Err(e) => ui::set_local_status(&self.ui, format!("failed to load: {e}")),
+            },
+            UiCommand::LocalDownload(id) => {
+                match self.client.start_local_model_download(&id).await {
+                    Ok(()) => ui::set_local_status(&self.ui, String::new()),
+                    Err(e) => ui::set_local_status(&self.ui, format!("{e:#}")),
+                }
+                self.refresh_local();
+            }
+            UiCommand::LocalDeleteModel(id) => {
+                match self.client.delete_local_model(&id).await {
+                    Ok(()) => ui::set_local_status(&self.ui, String::new()),
+                    Err(e) => ui::set_local_status(&self.ui, format!("{e:#}")),
+                }
+                self.refresh_local();
+            }
+            UiCommand::LocalStopServer => {
+                let _ = self.client.stop_local_server().await;
+                self.refresh_local();
+            }
+            UiCommand::LocalAddModel { repo, file } => {
+                match self.client.add_local_model(&AddLocalModelRequest {
+                    repo,
+                    file,
+                    display_name: None,
+                })
+                .await
+                {
+                    Ok(()) => {
+                        ui::set_local_status(&self.ui, String::new());
+                        ui::clear_local_form(&self.ui);
+                    }
+                    Err(e) => ui::set_local_status(&self.ui, format!("{e:#}")),
+                }
+                self.refresh_local();
             }
             UiCommand::CliInstall(id) => match self.client.start_cli_install(&id).await {
                 Ok(()) => {
@@ -2531,6 +2810,11 @@ fn format_reviews(reviews: &[trouve_protocol::PrReview]) -> String {
 
 /// Command + args as one shell-quoted line (round-trips through the MCP
 /// edit form and `parse_mcp_form`).
+/// Human-readable size in decimal gigabytes ("4.7 GB").
+fn human_gb(bytes: u64) -> String {
+    format!("{:.1} GB", bytes as f64 / 1e9)
+}
+
 fn render_command_line(command: &str, args: &[String]) -> String {
     std::iter::once(command)
         .chain(args.iter().map(String::as_str))

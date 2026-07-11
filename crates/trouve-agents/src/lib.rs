@@ -56,6 +56,19 @@ pub struct BackendTurn {
     /// When set, the vendor agent runs with its built-in tools disabled and
     /// trouve's ToolExecutor bridged in over MCP (Claude Code only, v1).
     pub mcp_bridge: Option<McpBridgeConfig>,
+    /// User-configured MCP servers (user/workspace/worktree scopes, already
+    /// merged and env-expanded by the engine) to mount alongside the bridge.
+    pub mcp_servers: Vec<McpServerLaunch>,
+}
+
+/// One user-configured stdio MCP server, ready to launch (env `${VAR}`
+/// references already expanded).
+#[derive(Debug, Clone)]
+pub struct McpServerLaunch {
+    pub name: String,
+    pub command: String,
+    pub args: Vec<String>,
+    pub env: Vec<(String, String)>,
 }
 
 /// Stdio MCP server the vendor agent should launch to reach trouve (the

@@ -19,8 +19,8 @@ use tokio_stream::wrappers::ReceiverStream;
 use trouve_core::engine::EngineError;
 use trouve_core::Engine;
 use trouve_protocol::{
-    AgentMode, BranchList, CliInfo, CliInstallStatus, CliList, CreatePrRequest, ModeInfo,
-    UpsertModeRequest,
+    AddLocalModelRequest, AgentMode, BranchList, CliInfo, CliInstallStatus, CliList,
+    CreatePrRequest, LocalStatus, ModeInfo, UpsertModeRequest,
     CreateSessionRequest, CreateThreadRequest, DirEntry, ErrorBody, FileContent, GithubIntegration,
     KnownProvider, LoginStarted, LoginStatus, McpLogs, McpServerInfo, MergePrRequest, ModelInfo,
     PrInfo, ProviderInfo, ProvidersResponse, RegisterWorkspaceRequest, ResolveApprovalRequest,
@@ -94,9 +94,15 @@ impl IntoResponse for ApiError {
         list_clis,
         start_cli_install,
         cli_install_status,
+        local_status,
+        add_local_model,
+        delete_local_model,
+        start_local_model_download,
+        stop_local_server,
         set_default_model,
         thread_usage,
         session_usage,
+        session_mcp_servers,
         session_diff,
         session_files,
         session_file,
@@ -140,6 +146,10 @@ impl IntoResponse for ApiError {
         CliInfo,
         CliList,
         CliInstallStatus,
+        LocalStatus,
+        trouve_protocol::LocalGpu,
+        trouve_protocol::LocalModelInfo,
+        AddLocalModelRequest,
         UpsertProviderRequest,
         SetDefaultModelRequest,
         UsageSummary,
@@ -200,6 +210,7 @@ pub fn build_router(engine: Arc<Engine>) -> Router {
         .route("/v1/sessions/{id}/redo", post(redo_session))
         .route("/v1/sessions/{id}/events", get(session_events))
         .route("/v1/sessions/{id}/usage", get(session_usage))
+        .route("/v1/sessions/{id}/mcp-servers", get(session_mcp_servers))
         .route("/v1/sessions/{id}/diff", get(session_diff))
         .route("/v1/sessions/{id}/files", get(session_files))
         .route("/v1/sessions/{id}/file", get(session_file))
@@ -242,6 +253,17 @@ pub fn build_router(engine: Arc<Engine>) -> Router {
             "/v1/clis/{id}/install",
             post(start_cli_install).get(cli_install_status),
         )
+        .route("/v1/local", get(local_status))
+        .route("/v1/local/models", post(add_local_model))
+        .route(
+            "/v1/local/models/{id}",
+            axum::routing::delete(delete_local_model),
+        )
+        .route(
+            "/v1/local/models/{id}/download",
+            post(start_local_model_download),
+        )
+        .route("/v1/local/server/stop", post(stop_local_server))
         .route(
             "/v1/config/default-model",
             axum::routing::put(set_default_model),
@@ -548,6 +570,49 @@ async fn cli_install_status(
     Json(engine.cli_install_status(&id))
 }
 
+#[utoipa::path(get, path = "/v1/local", responses((status = 200, body = LocalStatus)))]
+async fn local_status(State(engine): State<Arc<Engine>>) -> Json<LocalStatus> {
+    Json(engine.local_status().await)
+}
+
+#[utoipa::path(post, path = "/v1/local/models", request_body = AddLocalModelRequest,
+    responses((status = 204), (status = 400, body = ErrorBody), (status = 409, body = ErrorBody)))]
+async fn add_local_model(
+    State(engine): State<Arc<Engine>>,
+    Json(req): Json<AddLocalModelRequest>,
+) -> Result<axum::http::StatusCode, ApiError> {
+    engine.add_local_model(req).await?;
+    Ok(axum::http::StatusCode::NO_CONTENT)
+}
+
+#[utoipa::path(delete, path = "/v1/local/models/{id}", params(("id" = String, Path,)),
+    responses((status = 204), (status = 404, body = ErrorBody)))]
+async fn delete_local_model(
+    State(engine): State<Arc<Engine>>,
+    Path(id): Path<String>,
+) -> Result<axum::http::StatusCode, ApiError> {
+    engine.delete_local_model(&id).await?;
+    Ok(axum::http::StatusCode::NO_CONTENT)
+}
+
+#[utoipa::path(post, path = "/v1/local/models/{id}/download", params(("id" = String, Path,)),
+    responses((status = 202), (status = 404, body = ErrorBody), (status = 409, body = ErrorBody)))]
+async fn start_local_model_download(
+    State(engine): State<Arc<Engine>>,
+    Path(id): Path<String>,
+) -> Result<axum::http::StatusCode, ApiError> {
+    engine.start_local_model_download(&id)?;
+    Ok(axum::http::StatusCode::ACCEPTED)
+}
+
+#[utoipa::path(post, path = "/v1/local/server/stop", responses((status = 204)))]
+async fn stop_local_server(
+    State(engine): State<Arc<Engine>>,
+) -> axum::http::StatusCode {
+    engine.stop_local_server().await;
+    axum::http::StatusCode::NO_CONTENT
+}
+
 // --- internal tool bridge (undocumented; not part of the public protocol) ---
 
 /// Tool specs for a thread, consumed by the `trouve mcp-bridge` process that
@@ -626,6 +691,15 @@ async fn thread_usage(
     Path(id): Path<String>,
 ) -> Result<Json<UsageSummary>, ApiError> {
     Ok(Json(engine.thread_usage(&id)?))
+}
+
+#[utoipa::path(get, path = "/v1/sessions/{id}/mcp-servers", params(("id" = String, Path,)),
+    responses((status = 200, body = [McpServerInfo]), (status = 404, body = ErrorBody)))]
+async fn session_mcp_servers(
+    State(engine): State<Arc<Engine>>,
+    Path(id): Path<String>,
+) -> Result<Json<Vec<McpServerInfo>>, ApiError> {
+    Ok(Json(engine.session_mcp_servers(&id)?))
 }
 
 #[utoipa::path(get, path = "/v1/sessions/{id}/usage", params(("id" = String, Path,)),

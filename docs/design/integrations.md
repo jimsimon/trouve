@@ -9,11 +9,14 @@ servers, spoken over stdio JSON-RPC by `trouve-core/src/mcp.rs`.
 
 ### Configuration
 
-Standard `mcpServers` shape, discovered from two places (workspace wins on
+Standard `mcpServers` shape, discovered from three layers (later wins on
 name collision):
 
-- `<config>/mcp.json` — user-global servers
+- `<config>/mcp.json` — app-wide servers, applied to every workspace
+  (labeled "app-wide" in the UI; scope string `user` on the wire)
 - `<workspace>/.agents/.mcp.json` — per-repo servers (committed, dogfooded)
+- `<session worktree>/.agents/.mcp.json` — the branch's own file, so a
+  session sees whatever its checked-out branch declares
 
 ```json
 {
@@ -30,6 +33,15 @@ name collision):
 `${VAR}` references in `env` values expand from the process environment at
 spawn time, so secrets never live in the committed file.
 
+A higher layer can *remove* an inherited server with a tombstone entry —
+`"jira": { "disabled": true }` — since the merge is additive by name and
+omitting a server does not unconfigure it.
+
+The app's right panel has an "MCP" tab showing the effective merged config
+for the open session (`GET /v1/sessions/{id}/mcp-servers`): each entry is
+tagged with the layer whose definition won (app-wide / workspace / branch),
+and tombstoned entries stay listed, dimmed, with the disabling layer named.
+
 ### Execution model
 
 - Discovered tools surface as `mcp__<server>__<tool>` through the normal
@@ -41,6 +53,11 @@ spawn time, so secrets never live in the committed file.
 - The transport implements exactly `initialize`, `tools/list`, and
   `tools/call`. The `rmcp` SDK can replace it behind the same `McpManager`
   surface if resources/prompts/sampling are needed later.
+- Vendor agent backends get the same servers: each backend turn carries the
+  merged, env-expanded list (`BackendTurn.mcp_servers`), handed to Claude
+  via `--mcp-config`, to Codex via per-thread `config.mcp_servers`
+  overrides, and to Cursor via ACP `mcpServers` on `session/new` /
+  `session/load`. The name `trouve` is reserved for the tool bridge.
 
 ### First-use approval
 

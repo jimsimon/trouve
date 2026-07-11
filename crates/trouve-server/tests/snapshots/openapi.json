@@ -229,6 +229,148 @@
         }
       }
     },
+    "/v1/local": {
+      "get": {
+        "tags": [],
+        "operationId": "local_status",
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/LocalStatus"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/local/models": {
+      "post": {
+        "tags": [],
+        "operationId": "add_local_model",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AddLocalModelRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "204": {
+            "description": ""
+          },
+          "400": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/local/models/{id}": {
+      "delete": {
+        "tags": [],
+        "operationId": "delete_local_model",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": ""
+          },
+          "404": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/local/models/{id}/download": {
+      "post": {
+        "tags": [],
+        "operationId": "start_local_model_download",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "202": {
+            "description": ""
+          },
+          "404": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/local/server/stop": {
+      "post": {
+        "tags": [],
+        "operationId": "stop_local_server",
+        "responses": {
+          "204": {
+            "description": ""
+          }
+        }
+      }
+    },
     "/v1/mcp-servers": {
       "get": {
         "tags": [],
@@ -1087,6 +1229,47 @@
         }
       }
     },
+    "/v1/sessions/{id}/mcp-servers": {
+      "get": {
+        "tags": [],
+        "operationId": "session_mcp_servers",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/McpServerInfo"
+                  }
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/v1/sessions/{id}/pr": {
       "get": {
         "tags": [],
@@ -1726,6 +1909,30 @@
   },
   "components": {
     "schemas": {
+      "AddLocalModelRequest": {
+        "type": "object",
+        "description": "Add a custom GGUF from a HuggingFace repo to the local model list.",
+        "required": [
+          "repo",
+          "file"
+        ],
+        "properties": {
+          "display_name": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "file": {
+            "type": "string",
+            "description": "GGUF filename inside the repo."
+          },
+          "repo": {
+            "type": "string",
+            "description": "HuggingFace repo id, e.g. \"unsloth/Qwen3.6-27B-GGUF\"."
+          }
+        }
+      },
       "AgentMode": {
         "type": "object",
         "description": "A data-driven agent mode: prompt + tool policy + default permissions.\nAdding a mode is configuration, not code (AGENTS.md invariant 6).",
@@ -2889,6 +3096,149 @@
           }
         }
       },
+      "LocalGpu": {
+        "type": "object",
+        "description": "A GPU the local-models hardware probe found.",
+        "required": [
+          "name",
+          "vram_bytes"
+        ],
+        "properties": {
+          "name": {
+            "type": "string"
+          },
+          "vram_bytes": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Dedicated VRAM in bytes (system RAM for unified-memory machines).",
+            "minimum": 0
+          }
+        }
+      },
+      "LocalModelInfo": {
+        "type": "object",
+        "description": "One local model (curated catalog entry or user-added GGUF) with its\ndownload and hardware-fit state.",
+        "required": [
+          "id",
+          "display_name",
+          "repo",
+          "file",
+          "size_bytes",
+          "params",
+          "context_window",
+          "fit",
+          "downloaded",
+          "download_status",
+          "custom"
+        ],
+        "properties": {
+          "context_window": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Context window trouve serves the model with.",
+            "minimum": 0
+          },
+          "custom": {
+            "type": "boolean",
+            "description": "User-added entry (can be removed entirely)."
+          },
+          "display_name": {
+            "type": "string"
+          },
+          "download_bytes": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Downloaded bytes so far (pending only).",
+            "minimum": 0
+          },
+          "download_error": {
+            "type": "string"
+          },
+          "download_status": {
+            "type": "string",
+            "description": "\"none\" / \"pending\" / \"failed\" (success shows as downloaded)."
+          },
+          "downloaded": {
+            "type": "boolean",
+            "description": "True when the GGUF is on disk and ready to run."
+          },
+          "file": {
+            "type": "string",
+            "description": "GGUF filename inside the repo."
+          },
+          "fit": {
+            "type": "string",
+            "description": "Hardware fit: \"gpu\" (fits in VRAM), \"cpu\" (fits in RAM, slower),\nor \"too-large\"."
+          },
+          "id": {
+            "type": "string",
+            "description": "Stable id; runs as model \"local/<id>\"."
+          },
+          "notes": {
+            "type": "string",
+            "description": "One-line description shown in settings."
+          },
+          "params": {
+            "type": "string",
+            "description": "Human parameter count (\"7B\", \"30B MoE\")."
+          },
+          "repo": {
+            "type": "string",
+            "description": "HuggingFace repo the GGUF comes from (e.g. \"Qwen/…-GGUF\")."
+          },
+          "size_bytes": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          }
+        }
+      },
+      "LocalStatus": {
+        "type": "object",
+        "description": "Local inference status: hardware, the llama.cpp runtime install, the\nrunning server, and every known model.",
+        "required": [
+          "ram_bytes",
+          "gpus",
+          "runtime_installed",
+          "models"
+        ],
+        "properties": {
+          "gpus": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/LocalGpu"
+            }
+          },
+          "models": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/LocalModelInfo"
+            }
+          },
+          "ram_bytes": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "running_model": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Model id currently loaded in the running llama-server, if any."
+          },
+          "runtime_installed": {
+            "type": "boolean",
+            "description": "Whether the llama.cpp runtime (llama-server) is installed."
+          },
+          "runtime_version": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        }
+      },
       "LoginStarted": {
         "type": "object",
         "description": "Response to starting an OAuth login for a provider.",
@@ -2987,6 +3337,13 @@
           "scope": {
             "type": "string",
             "description": "\"user\" (config dir) or \"workspace\" (.agents/.mcp.json)."
+          },
+          "workspace_id": {
+            "type": "string",
+            "description": "For workspace scope: which workspace's config this entry lives in.\nEmpty for user scope."
+          },
+          "workspace_name": {
+            "type": "string"
           }
         }
       },

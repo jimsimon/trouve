@@ -72,18 +72,43 @@ export struct ModeItem {
     model-index: int,
 }
 
+// One local (offline) model: a curated or user-added GGUF with its
+// download state and how well it fits the machine's memory.
+export struct LocalModelItem {
+    id: string,
+    name: string,
+    // "7B · 4.7 GB"
+    meta: string,
+    // "gpu" / "cpu" / "too-large"
+    fit: string,
+    // "fits your GPU" / "runs on CPU (slower)" / "needs more memory"
+    fit-label: string,
+    notes: string,
+    downloaded: bool,
+    downloading: bool,
+    // 0-99 while downloading.
+    progress: int,
+    error: string,
+    // User-added entries can be removed from the list entirely.
+    custom: bool,
+}
+
 // A user-managed MCP server (first-party servers trouve injects itself are
 // never listed). command-line and env-lines are pre-rendered for display
 // and round-trip through the edit form.
 export struct McpServerItem {
     name: string,
-    // "user" (config dir) or "workspace" (.agents/.mcp.json).
+    // "user" (app-wide config dir, every workspace) or "workspace"
+    // (.agents/.mcp.json).
     scope: string,
+    // Which workspace's config the entry lives in (workspace scope only).
+    workspace-id: string,
+    workspace-name: string,
     // Command plus args, shell-quoted.
     command-line: string,
     // One KEY=VALUE per line ("" when none).
     env-lines: string,
-    // "ok" / "error" / "checking"
+    // "ok" / "error" / "disabled" / "checking"
     health: string,
     // "5 tools" or the failure reason.
     detail: string,
@@ -217,24 +242,53 @@ export component SettingsScreen inherits Rectangle {
     in property <[SubscriptionItem]> subscriptions;
     in property <string> subscriptions-status: "";
 
-    // MCP servers (user config + current workspace).
+    // Local Models section: hardware line, llama.cpp runtime state, the
+    // running sidecar, and the model list.
+    in property <[LocalModelItem]> local-models;
+    in property <string> local-hw-line;
+    in property <string> local-runtime-label;
+    // "Install" / "Update"
+    in property <string> local-runtime-action;
+    in property <bool> local-runtime-busy;
+    in property <string> local-runtime-status;
+    // "llama-server is running <model>" or "" when stopped.
+    in property <string> local-server-line;
+    in property <string> local-status;
+    in-out property <string> local-form-repo;
+    in-out property <string> local-form-file;
+    callback local-refresh();
+    callback local-runtime-install();
+    callback local-download(/* id */ string);
+    callback local-delete(/* id */ string);
+    callback local-stop-server();
+    callback local-added(/* repo */ string, /* file */ string);
+
+    // MCP servers (app-wide config + every registered workspace).
     in property <[McpServerItem]> mcp-servers;
     in property <string> mcp-status: "";
     // Logs viewer: non-empty name shows the panel.
     in property <string> mcp-logs-name: "";
     in property <string> mcp-logs-text: "";
+    // Registered workspaces for the workspace-scope picker (parallel
+    // arrays: names for display, ids for the callbacks).
+    in property <[string]> mcp-workspace-names;
+    in property <[string]> mcp-workspace-ids;
     // Add/edit form state. scope is fixed by the button that opened the
-    // form; editing locks the name (it is the file key).
+    // form; editing locks the name (it is the file key) and the workspace.
     in-out property <bool> mcp-form-open: false;
     in-out property <bool> mcp-form-editing: false;
     in-out property <string> mcp-form-scope: "user";
     in-out property <string> mcp-form-name: "";
     in-out property <string> mcp-form-command: "";
     in-out property <string> mcp-form-env: "";
+    in-out property <string> mcp-form-workspace-id: "";
+    in-out property <string> mcp-form-workspace-name: "";
     callback mcp-refresh();
     callback mcp-saved(/* name */ string, /* scope */ string,
-                       /* command-line */ string, /* env-lines */ string);
-    callback mcp-deleted(/* name */ string, /* scope */ string);
+                       /* command-line */ string, /* env-lines */ string,
+                       /* workspace-id */ string);
+    callback mcp-deleted(/* name */ string, /* scope */ string,
+                         /* workspace-id */ string);
     callback mcp-logs-requested(string);
     callback mcp-logs-closed();
 
@@ -250,11 +304,12 @@ export component SettingsScreen inherits Rectangle {
     in-out property <int> mode-form-permission: 0;
     in-out property <int> mode-form-model: -1;
 
-    // Side-nav selection: 0 providers, 1 modes & models, 2 mcp servers,
-    // 3 integrations, 4 appearance, 5 about. in-out so the app can open
-    // straight to a section (e.g. the PR tab's "set up GitHub" button).
+    // Side-nav selection: 0 providers, 1 modes & models, 2 local models,
+    // 3 mcp servers, 4 integrations, 5 appearance, 6 about. in-out so the
+    // app can open straight to a section (e.g. the PR tab's "set up
+    // GitHub" button).
     in-out property <int> section: 0;
-    property <[string]> section-names: ["Providers", "Modes & Models", "MCP Servers", "Integrations", "Appearance", "About"];
+    property <[string]> section-names: ["Providers", "Modes & Models", "Local Models", "MCP Servers", "Integrations", "Appearance", "About"];
 
     VerticalLayout {
         // Header: title + a way back to wherever the user came from.
@@ -934,8 +989,212 @@ export component SettingsScreen inherits Rectangle {
                             }
                         }
 
-                        // ---------------- mcp servers ----------------
+                        // ---------------- local models ----------------
                         if root.section == 2: VerticalLayout {
+                            spacing: 12px;
+
+                            HorizontalLayout {
+                                Text {
+                                    text: "Local Models";
+                                    color: Theme.c.text-hi;
+                                    font-size: Theme.fs(18px);
+                                    font-weight: 700;
+                                    horizontal-stretch: 1;
+                                }
+                                Button {
+                                    text: "⟳ Refresh";
+                                    clicked => { root.local-refresh(); }
+                                }
+                            }
+                            Text {
+                                text: "Run models fully offline. trouve manages the llama.cpp runtime and downloads models from HuggingFace; downloaded models appear in the model picker as local/<model>. Expect far less capability than the cloud providers — this is an offline fallback tier, not a peer.";
+                                color: Theme.c.text-soft;
+                                font-size: Theme.fs(11px);
+                                wrap: word-wrap;
+                            }
+                            Text {
+                                text: "Your machine: " + root.local-hw-line;
+                                color: Theme.c.text-mid;
+                                font-size: Theme.fs(12px);
+                                wrap: word-wrap;
+                            }
+
+                            // Runtime install state.
+                            Rectangle {
+                                background: Theme.c.surface;
+                                border-radius: 6px;
+                                height: local-runtime-row.preferred-height + 20px;
+                                local-runtime-row := HorizontalLayout {
+                                    padding: 10px;
+                                    spacing: 8px;
+                                    VerticalLayout {
+                                        alignment: center;
+                                        horizontal-stretch: 1;
+                                        Text {
+                                            text: "llama.cpp runtime — " + root.local-runtime-label;
+                                            color: Theme.c.text;
+                                            font-size: Theme.fs(13px);
+                                        }
+                                        if root.local-runtime-status != "": Text {
+                                            text: root.local-runtime-status;
+                                            color: Theme.c.text-soft;
+                                            font-size: Theme.fs(11px);
+                                            wrap: word-wrap;
+                                        }
+                                    }
+                                    VerticalLayout {
+                                        alignment: center;
+                                        Button {
+                                            text: root.local-runtime-busy
+                                                ? "installing…" : root.local-runtime-action;
+                                            enabled: !root.local-runtime-busy;
+                                            clicked => { root.local-runtime-install(); }
+                                        }
+                                    }
+                                }
+                            }
+
+                            // Running sidecar (memory can be freed).
+                            if root.local-server-line != "": Rectangle {
+                                background: Theme.c.accent-bg;
+                                border-radius: 6px;
+                                height: local-server-row.preferred-height + 16px;
+                                local-server-row := HorizontalLayout {
+                                    padding: 8px;
+                                    spacing: 8px;
+                                    Text {
+                                        text: root.local-server-line;
+                                        color: Theme.c.accent-tint;
+                                        font-size: Theme.fs(12px);
+                                        vertical-alignment: center;
+                                        horizontal-stretch: 1;
+                                        overflow: elide;
+                                    }
+                                    Button {
+                                        text: "Stop (free memory)";
+                                        clicked => { root.local-stop-server(); }
+                                    }
+                                }
+                            }
+
+                            if root.local-status != "": Text {
+                                text: root.local-status;
+                                color: Theme.c.err;
+                                font-size: Theme.fs(12px);
+                                wrap: word-wrap;
+                            }
+
+                            // Model list.
+                            Rectangle {
+                                background: Theme.c.surface;
+                                border-radius: 6px;
+                                vertical-stretch: 1;
+                                min-height: 220px;
+                                ListView {
+                                    for model in root.local-models: Rectangle {
+                                        height: Theme.fs(58px);
+                                        HorizontalLayout {
+                                            padding-left: 10px;
+                                            padding-right: 6px;
+                                            spacing: 8px;
+                                            VerticalLayout {
+                                                alignment: center;
+                                                horizontal-stretch: 1;
+                                                HorizontalLayout {
+                                                    spacing: 6px;
+                                                    alignment: start;
+                                                    Text {
+                                                        text: model.name;
+                                                        color: Theme.c.text-hi;
+                                                        font-size: Theme.fs(13px);
+                                                        font-weight: 700;
+                                                        overflow: elide;
+                                                    }
+                                                    Text {
+                                                        text: model.meta;
+                                                        color: Theme.c.text-mid;
+                                                        font-size: Theme.fs(11px);
+                                                        vertical-alignment: center;
+                                                    }
+                                                    // Hardware-fit badge.
+                                                    Text {
+                                                        text: model.fit-label;
+                                                        color: model.fit == "gpu" ? Theme.c.ok
+                                                            : model.fit == "cpu" ? Theme.c.warn
+                                                            : Theme.c.err;
+                                                        font-size: Theme.fs(10px);
+                                                        vertical-alignment: center;
+                                                    }
+                                                    if model.custom: Text {
+                                                        text: "custom";
+                                                        color: Theme.c.accent-tint;
+                                                        font-size: Theme.fs(10px);
+                                                        vertical-alignment: center;
+                                                    }
+                                                }
+                                                Text {
+                                                    text: model.error != "" ? "download failed: " + model.error
+                                                        : model.downloading ? "downloading… " + model.progress + "%"
+                                                        : model.notes;
+                                                    color: model.error != "" ? Theme.c.err-soft : Theme.c.text-dim;
+                                                    font-size: Theme.fs(11px);
+                                                    overflow: elide;
+                                                }
+                                            }
+                                            if model.downloaded: VerticalLayout {
+                                                alignment: center;
+                                                Text {
+                                                    text: "✓ downloaded";
+                                                    color: Theme.c.ok;
+                                                    font-size: Theme.fs(11px);
+                                                }
+                                            }
+                                            if !model.downloaded && !model.downloading: Button {
+                                                text: model.error != "" ? "Retry" : "Download";
+                                                clicked => { root.local-download(model.id); }
+                                            }
+                                            if model.downloaded || model.custom: Button {
+                                                text: "Remove";
+                                                clicked => { root.local-delete(model.id); }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+
+                            // Custom GGUF escape hatch for power users.
+                            VerticalLayout {
+                                spacing: 6px;
+                                Text {
+                                    text: "Add any single-file GGUF from HuggingFace (advanced):";
+                                    color: Theme.c.text-soft;
+                                    font-size: Theme.fs(11px);
+                                }
+                                HorizontalLayout {
+                                    spacing: 8px;
+                                    LineEdit {
+                                        placeholder-text: "repo (owner/name-GGUF)";
+                                        text <=> root.local-form-repo;
+                                        horizontal-stretch: 1;
+                                    }
+                                    LineEdit {
+                                        placeholder-text: "file (model-Q4_K_M.gguf)";
+                                        text <=> root.local-form-file;
+                                        horizontal-stretch: 1;
+                                    }
+                                    Button {
+                                        text: "Add";
+                                        enabled: root.local-form-repo != "" && root.local-form-file != "";
+                                        clicked => {
+                                            root.local-added(root.local-form-repo, root.local-form-file);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
+                        // ---------------- mcp servers ----------------
+                        if root.section == 3: VerticalLayout {
                             spacing: 12px;
 
                             HorizontalLayout {
@@ -954,6 +1213,12 @@ export component SettingsScreen inherits Rectangle {
                             }
                             Text {
                                 text: "External tool servers offered to the agent as mcp__<server>__<tool>. Each one needs first-use approval per session. trouve's own built-in servers are not listed.";
+                                color: Theme.c.text-soft;
+                                font-size: Theme.fs(11px);
+                                wrap: word-wrap;
+                            }
+                            Text {
+                                text: "Sessions merge these by name: the app-wide list (applies to every workspace), then the session workspace's list. A session branch can override or disable entries via its own committed .agents/.mcp.json — those per-branch files are managed in git, not here.";
                                 color: Theme.c.text-soft;
                                 font-size: Theme.fs(11px);
                                 wrap: word-wrap;
@@ -1006,7 +1271,10 @@ export component SettingsScreen inherits Rectangle {
                                                         overflow: elide;
                                                     }
                                                     Text {
-                                                        text: server.scope;
+                                                        text: server.scope == "workspace"
+                                                            ? "workspace · " + server.workspace-name
+                                                            : server.scope == "user"
+                                                                ? "app-wide" : server.scope;
                                                         color: Theme.c.accent-tint;
                                                         font-size: Theme.fs(10px);
                                                         vertical-alignment: center;
@@ -1034,11 +1302,16 @@ export component SettingsScreen inherits Rectangle {
                                                     root.mcp-form-name = server.name;
                                                     root.mcp-form-command = server.command-line;
                                                     root.mcp-form-env = server.env-lines;
+                                                    root.mcp-form-workspace-id = server.workspace-id;
+                                                    root.mcp-form-workspace-name = server.workspace-name;
                                                 }
                                             }
                                             Button {
                                                 text: "Remove";
-                                                clicked => { root.mcp-deleted(server.name, server.scope); }
+                                                clicked => {
+                                                    root.mcp-deleted(server.name, server.scope,
+                                                        server.workspace-id);
+                                                }
                                             }
                                         }
                                     }
@@ -1048,7 +1321,7 @@ export component SettingsScreen inherits Rectangle {
                             HorizontalLayout {
                                 spacing: 8px;
                                 Button {
-                                    text: "+ Add to user config";
+                                    text: "+ Add app-wide";
                                     clicked => {
                                         root.mcp-form-open = true;
                                         root.mcp-form-editing = false;
@@ -1056,10 +1329,13 @@ export component SettingsScreen inherits Rectangle {
                                         root.mcp-form-name = "";
                                         root.mcp-form-command = "";
                                         root.mcp-form-env = "";
+                                        root.mcp-form-workspace-id = "";
+                                        root.mcp-form-workspace-name = "";
                                     }
                                 }
                                 Button {
                                     text: "+ Add to workspace";
+                                    enabled: root.mcp-workspace-ids.length > 0;
                                     clicked => {
                                         root.mcp-form-open = true;
                                         root.mcp-form-editing = false;
@@ -1067,6 +1343,8 @@ export component SettingsScreen inherits Rectangle {
                                         root.mcp-form-name = "";
                                         root.mcp-form-command = "";
                                         root.mcp-form-env = "";
+                                        root.mcp-form-workspace-id = root.mcp-workspace-ids[0];
+                                        root.mcp-form-workspace-name = root.mcp-workspace-names[0];
                                     }
                                 }
                                 Rectangle { horizontal-stretch: 1; }
@@ -1082,11 +1360,43 @@ export component SettingsScreen inherits Rectangle {
                                     Text {
                                         text: (root.mcp-form-editing ? "Edit " : "New ")
                                             + (root.mcp-form-scope == "user"
-                                                ? "user server (~/.config/trouve/mcp.json)"
+                                                ? "app-wide server (~/.config/trouve/mcp.json — every workspace)"
                                                 : "workspace server (.agents/.mcp.json)");
                                         color: Theme.c.text-mid;
                                         font-size: Theme.fs(12px);
                                         font-weight: 700;
+                                    }
+                                    // Workspace scope: pick which workspace's
+                                    // file to edit (locked when editing).
+                                    if root.mcp-form-scope == "workspace": HorizontalLayout {
+                                        spacing: 8px;
+                                        Text {
+                                            text: "Workspace:";
+                                            color: Theme.c.text-soft;
+                                            font-size: Theme.fs(11px);
+                                            vertical-alignment: center;
+                                        }
+                                        if root.mcp-form-editing: Text {
+                                            text: root.mcp-form-workspace-name;
+                                            color: Theme.c.text-mid;
+                                            font-size: Theme.fs(12px);
+                                            vertical-alignment: center;
+                                            horizontal-stretch: 1;
+                                        }
+                                        if !root.mcp-form-editing: ComboBox {
+                                            horizontal-stretch: 1;
+                                            model: root.mcp-workspace-names;
+                                            current-index: 0;
+                                            selected => {
+                                                if (self.current-index >= 0
+                                                    && self.current-index < root.mcp-workspace-ids.length) {
+                                                    root.mcp-form-workspace-id =
+                                                        root.mcp-workspace-ids[self.current-index];
+                                                    root.mcp-form-workspace-name =
+                                                        root.mcp-workspace-names[self.current-index];
+                                                }
+                                            }
+                                        }
                                     }
                                     HorizontalLayout {
                                         spacing: 8px;
@@ -1116,7 +1426,8 @@ export component SettingsScreen inherits Rectangle {
                                             enabled: root.mcp-form-name != "" && root.mcp-form-command != "";
                                             clicked => {
                                                 root.mcp-saved(root.mcp-form-name, root.mcp-form-scope,
-                                                    root.mcp-form-command, root.mcp-form-env);
+                                                    root.mcp-form-command, root.mcp-form-env,
+                                                    root.mcp-form-workspace-id);
                                                 root.mcp-form-open = false;
                                             }
                                         }
@@ -1180,7 +1491,7 @@ export component SettingsScreen inherits Rectangle {
                         }
 
                         // ---------------- integrations ----------------
-                        if root.section == 3: VerticalLayout {
+                        if root.section == 4: VerticalLayout {
                             spacing: 12px;
 
                             Text {
@@ -1258,7 +1569,7 @@ export component SettingsScreen inherits Rectangle {
                         }
 
                         // ---------------- appearance ----------------
-                        if root.section == 4: VerticalLayout {
+                        if root.section == 5: VerticalLayout {
                             spacing: 12px;
 
                             Text {
@@ -1365,7 +1676,7 @@ export component SettingsScreen inherits Rectangle {
                         }
 
                         // ---------------- about ----------------
-                        if root.section == 5: VerticalLayout {
+                        if root.section == 6: VerticalLayout {
                             spacing: 12px;
 
                             Text {

@@ -144,14 +144,20 @@ fn config_fingerprint(turn: &BackendTurn) -> String {
             b.command, b.args, b.env, b.bridge_tools, b.disallowed_tools
         )
     });
+    let servers: Vec<String> = turn
+        .mcp_servers
+        .iter()
+        .map(|s| format!("{}|{}|{:?}|{:?}", s.name, s.command, s.args, s.env))
+        .collect();
     format!(
-        "{:?}|{}|{:?}|{:?}|{:?}|{:?}",
+        "{:?}|{}|{:?}|{:?}|{:?}|{:?}|{:?}",
         turn.worktree,
         turn.model,
         Value::Object(turn.model_options.clone()),
         turn.instructions,
         turn.permission,
         bridge,
+        servers,
     )
 }
 
@@ -375,32 +381,55 @@ impl ClaudeBackend {
         if let Some(instr) = &turn.instructions {
             cmd.args(["--append-system-prompt", instr]);
         }
-        // MCP bridge back into trouve. Two roles, both optional:
+        // MCP config: the trouve bridge plus any user-configured servers.
+        // The bridge has two roles, both optional:
         //  - approval gate: in Ask mode, Claude's permission requests go to
         //    the bridge's approval_prompt tool (trouve's approval flow)
         //    instead of failing in headless print mode;
         //  - tool bridge: Claude's built-ins stand down and trouve's
         //    ToolExecutor serves tools (approvals then gate inside trouve,
         //    so the bridged server is pre-allowed).
+        // User servers ride along un-allowlisted, so their tools flow
+        // through the normal permission path (approval_prompt in Ask mode).
+        let mut mcp_servers = serde_json::Map::new();
+        for server in &turn.mcp_servers {
+            let env: serde_json::Map<String, serde_json::Value> = server
+                .env
+                .iter()
+                .map(|(k, v)| (k.clone(), serde_json::Value::String(v.clone())))
+                .collect();
+            mcp_servers.insert(
+                server.name.clone(),
+                serde_json::json!({
+                    "command": server.command,
+                    "args": server.args,
+                    "env": env,
+                }),
+            );
+        }
         if let Some(bridge) = &turn.mcp_bridge {
             let env: serde_json::Map<String, serde_json::Value> = bridge
                 .env
                 .iter()
                 .map(|(k, v)| (k.clone(), serde_json::Value::String(v.clone())))
                 .collect();
-            let mcp_config = serde_json::json!({
-                "mcpServers": {
-                    "trouve": {
-                        "command": bridge.command,
-                        "args": bridge.args,
-                        "env": env,
-                    }
-                }
-            });
+            mcp_servers.insert(
+                "trouve".into(),
+                serde_json::json!({
+                    "command": bridge.command,
+                    "args": bridge.args,
+                    "env": env,
+                }),
+            );
+        }
+        if !mcp_servers.is_empty() {
+            let mcp_config = serde_json::json!({ "mcpServers": mcp_servers });
             let path = std::env::temp_dir().join(format!("trouve-mcp-{}.json", turn.thread_id));
             std::fs::write(&path, mcp_config.to_string())?;
             cmd.arg("--mcp-config").arg(&path);
             cmd.arg("--strict-mcp-config");
+        }
+        if let Some(bridge) = &turn.mcp_bridge {
             if bridge.bridge_tools {
                 if !bridge.disallowed_tools.is_empty() {
                     cmd.args(["--disallowedTools", &bridge.disallowed_tools.join(",")]);

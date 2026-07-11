@@ -13,7 +13,7 @@ import { DiffView, DiffRow } from "diff-view.slint";
 import { CodeView, TextSegment } from "code-view.slint";
 import {
     SettingsScreen, ProviderItem, CliItem, KnownProviderItem, McpServerItem,
-    SubscriptionItem, ModeItem
+    SubscriptionItem, ModeItem, LocalModelItem
 } from "settings-window.slint";
 import { ScrollKeys } from "scroll-keys.slint";
 import { Theme, ThemePalette } from "theme.slint";
@@ -22,7 +22,7 @@ import { Palette } from "std-widgets.slint";
 // Theme re-exported so Rust can push the selected palette.
 export {
     DiffRow, TextSegment, ProviderItem, CliItem, KnownProviderItem, McpServerItem,
-    SubscriptionItem, ModeItem
+    SubscriptionItem, ModeItem, LocalModelItem
 }
 export { Theme, ThemePalette }
 
@@ -1020,10 +1020,19 @@ export component AppWindow inherits Window {
     in property <string> settings-mcp-status: "";
     in property <string> settings-mcp-logs-name: "";
     in property <string> settings-mcp-logs-text: "";
+    in property <[string]> settings-mcp-workspace-names;
+    in property <[string]> settings-mcp-workspace-ids;
+    // Effective MCP config for the open session (right-panel tab): merged
+    // scopes with the winning layer in `scope` (app-wide/workspace/branch).
+    in property <[McpServerItem]> session-mcp-servers;
+    in property <string> session-mcp-status: "";
+    callback refresh-session-mcp();
     callback mcp-refresh();
     callback mcp-saved(/* name */ string, /* scope */ string,
-                       /* command-line */ string, /* env-lines */ string);
-    callback mcp-deleted(/* name */ string, /* scope */ string);
+                       /* command-line */ string, /* env-lines */ string,
+                       /* workspace-id */ string);
+    callback mcp-deleted(/* name */ string, /* scope */ string,
+                         /* workspace-id */ string);
     callback mcp-logs-requested(string);
     callback mcp-logs-closed();
     callback provider-saved(/* id */ string, /* kind */ string,
@@ -1037,6 +1046,24 @@ export component AppWindow inherits Window {
     callback refresh-settings();
     callback cli-install(/* id */ string);
     callback close-settings();
+
+    // Local (offline) models — state pushed by the controller, actions out.
+    in property <[LocalModelItem]> local-models;
+    in property <string> local-hw-line: "";
+    in property <string> local-runtime-label: "";
+    in property <string> local-runtime-action: "Install";
+    in property <bool> local-runtime-busy: false;
+    in property <string> local-runtime-status: "";
+    in property <string> local-server-line: "";
+    in property <string> local-status: "";
+    in-out property <string> local-form-repo: "";
+    in-out property <string> local-form-file: "";
+    callback local-refresh();
+    callback local-runtime-install();
+    callback local-download(string);
+    callback local-delete(string);
+    callback local-stop-server();
+    callback local-added(/* repo */ string, /* file */ string);
 
     // Appearance (handled on the Rust UI thread; see src/theme.rs).
     in property <[string]> appearance-theme-names;
@@ -3236,6 +3263,145 @@ export component AppWindow inherits Window {
                         }
                     }
                 }
+                Tab {
+                    title: "MCP";
+                    VerticalLayout {
+                        padding: 6px;
+                        spacing: 6px;
+
+                        HorizontalLayout {
+                            spacing: 6px;
+                            Text {
+                                text: "Effective MCP servers for this session";
+                                color: Theme.c.text-mid;
+                                font-size: Theme.fs(12px);
+                                font-weight: 700;
+                                vertical-alignment: center;
+                                horizontal-stretch: 1;
+                                overflow: elide;
+                            }
+                            Button {
+                                text: "⟳ Refresh";
+                                clicked => { root.refresh-session-mcp(); }
+                            }
+                        }
+                        Text {
+                            text: "App-wide, workspace, and branch configs merged the way a turn in this session sees them. Each entry shows the layer whose definition won.";
+                            color: Theme.c.text-soft;
+                            font-size: Theme.fs(11px);
+                            wrap: word-wrap;
+                        }
+
+                        if root.session-mcp-status != "": Text {
+                            text: root.session-mcp-status;
+                            color: Theme.c.err;
+                            font-size: Theme.fs(12px);
+                            wrap: word-wrap;
+                        }
+
+                        if root.session-mcp-servers.length == 0
+                            && root.session-mcp-status == "": VerticalLayout {
+                            alignment: center;
+                            vertical-stretch: 1;
+                            Text {
+                                text: "No MCP servers apply to this session.";
+                                color: Theme.c.text-soft;
+                                font-size: Theme.fs(12px);
+                                horizontal-alignment: center;
+                                wrap: word-wrap;
+                            }
+                        }
+
+                        if root.session-mcp-servers.length > 0: Rectangle {
+                            vertical-stretch: 1;
+                            background: Theme.c.surface;
+                            border-radius: 6px;
+                            ScrollKeys {
+                                target-y <=> session-mcp-scroll.viewport-y;
+                                page: session-mcp-scroll.visible-height;
+                                total: session-mcp-scroll.viewport-height;
+                            session-mcp-scroll := ScrollView {
+                                width: 100%;
+                                height: 100%;
+                                VerticalLayout {
+                                    padding: 8px;
+                                    spacing: 6px;
+                                    alignment: start;
+
+                                    for server in root.session-mcp-servers: Rectangle {
+                                        background: Theme.c.raised-bg;
+                                        border-radius: 6px;
+                                        border-width: 1px;
+                                        border-color: Theme.c.border;
+                                        height: session-mcp-row.preferred-height + 16px;
+                                        // Tombstoned entries stay listed but dimmed
+                                        // so it's clear which layer removed them.
+                                        opacity: server.health == "disabled" ? 0.55 : 1;
+
+                                        session-mcp-row := VerticalLayout {
+                                            padding: 8px;
+                                            spacing: 4px;
+
+                                            HorizontalLayout {
+                                                spacing: 6px;
+                                                Text {
+                                                    text: server.name;
+                                                    color: Theme.c.text-hi;
+                                                    font-size: Theme.fs(13px);
+                                                    font-weight: 700;
+                                                    vertical-alignment: center;
+                                                    overflow: elide;
+                                                }
+                                                // Winning layer badge.
+                                                Rectangle {
+                                                    width: session-mcp-scope.preferred-width + 12px;
+                                                    height: Theme.fs(18px);
+                                                    border-radius: 9px;
+                                                    background: server.scope == "app-wide"
+                                                        ? Theme.c.accent-bg
+                                                        : Theme.c.hover-bg;
+                                                    session-mcp-scope := Text {
+                                                        width: 100%;
+                                                        height: 100%;
+                                                        text: server.scope;
+                                                        color: server.scope == "app-wide"
+                                                            ? Theme.c.accent-tint
+                                                            : Theme.c.text-mid;
+                                                        font-size: Theme.fs(10px);
+                                                        horizontal-alignment: center;
+                                                        vertical-alignment: center;
+                                                    }
+                                                }
+                                                Rectangle { horizontal-stretch: 1; }
+                                            }
+                                            if server.command-line != "": Text {
+                                                text: server.command-line;
+                                                color: Theme.c.text;
+                                                font-family: "monospace";
+                                                font-size: Theme.fs(11px);
+                                                wrap: word-wrap;
+                                            }
+                                            if server.env-lines != "": Text {
+                                                text: "env: " + server.env-lines;
+                                                color: Theme.c.text-soft;
+                                                font-family: "monospace";
+                                                font-size: Theme.fs(11px);
+                                                wrap: word-wrap;
+                                            }
+                                            if server.detail != "": Text {
+                                                text: server.detail;
+                                                color: Theme.c.text-soft;
+                                                font-size: Theme.fs(11px);
+                                                wrap: word-wrap;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            }
+                        }
+                    }
+                }
             }
         }
     }
@@ -3264,11 +3430,13 @@ export component AppWindow inherits Window {
         mcp-status: root.settings-mcp-status;
         mcp-logs-name: root.settings-mcp-logs-name;
         mcp-logs-text: root.settings-mcp-logs-text;
+        mcp-workspace-names: root.settings-mcp-workspace-names;
+        mcp-workspace-ids: root.settings-mcp-workspace-ids;
         mcp-refresh => { root.mcp-refresh(); }
-        mcp-saved(name, scope, command, env) => {
-            root.mcp-saved(name, scope, command, env);
+        mcp-saved(name, scope, command, env, ws) => {
+            root.mcp-saved(name, scope, command, env, ws);
         }
-        mcp-deleted(name, scope) => { root.mcp-deleted(name, scope); }
+        mcp-deleted(name, scope, ws) => { root.mcp-deleted(name, scope, ws); }
         mcp-logs-requested(name) => { root.mcp-logs-requested(name); }
         mcp-logs-closed => { root.mcp-logs-closed(); }
         theme-names: root.appearance-theme-names;
@@ -3291,6 +3459,22 @@ export component AppWindow inherits Window {
         mode-model-picked(id, model) => { root.mode-model-picked(id, model); }
         refresh-settings => { root.refresh-settings(); }
         cli-install(id) => { root.cli-install(id); }
+        local-models: root.local-models;
+        local-hw-line: root.local-hw-line;
+        local-runtime-label: root.local-runtime-label;
+        local-runtime-action: root.local-runtime-action;
+        local-runtime-busy: root.local-runtime-busy;
+        local-runtime-status: root.local-runtime-status;
+        local-server-line: root.local-server-line;
+        local-status: root.local-status;
+        local-form-repo <=> root.local-form-repo;
+        local-form-file <=> root.local-form-file;
+        local-refresh => { root.local-refresh(); }
+        local-runtime-install => { root.local-runtime-install(); }
+        local-download(id) => { root.local-download(id); }
+        local-delete(id) => { root.local-delete(id); }
+        local-stop-server => { root.local-stop-server(); }
+        local-added(repo, file) => { root.local-added(repo, file); }
         theme-picked(i) => { root.appearance-theme-picked(i); }
         font-size-picked(i) => { root.appearance-font-size-picked(i); }
         font-picked(i) => { root.appearance-font-picked(i); }

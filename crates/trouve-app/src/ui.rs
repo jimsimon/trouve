@@ -473,6 +473,8 @@ pub fn set_subscriptions(ui: &Ui, items: Vec<SubscriptionView>, status: String) 
 pub struct McpView {
     pub name: String,
     pub scope: String,
+    pub workspace_id: String,
+    pub workspace_name: String,
     pub command_line: String,
     pub env_lines: String,
     pub health: String,
@@ -486,6 +488,8 @@ pub fn set_mcp_servers(ui: &Ui, items: Vec<McpView>) {
             .map(|s| crate::McpServerItem {
                 name: SharedString::from(s.name.as_str()),
                 scope: SharedString::from(s.scope.as_str()),
+                workspace_id: SharedString::from(s.workspace_id.as_str()),
+                workspace_name: SharedString::from(s.workspace_name.as_str()),
                 command_line: SharedString::from(s.command_line.as_str()),
                 env_lines: SharedString::from(s.env_lines.as_str()),
                 health: SharedString::from(s.health.as_str()),
@@ -493,6 +497,35 @@ pub fn set_mcp_servers(ui: &Ui, items: Vec<McpView>) {
             })
             .collect();
         ui.set_settings_mcp_servers(ModelRc::new(VecModel::from(items)));
+    });
+}
+
+/// The current session's effective MCP config for the right-panel tab.
+pub fn set_session_mcp(ui: &Ui, items: Vec<McpView>, status: String) {
+    let _ = ui.upgrade_in_event_loop(move |ui| {
+        let items: Vec<crate::McpServerItem> = items
+            .into_iter()
+            .map(|s| crate::McpServerItem {
+                name: SharedString::from(s.name.as_str()),
+                scope: SharedString::from(s.scope.as_str()),
+                workspace_id: SharedString::from(s.workspace_id.as_str()),
+                workspace_name: SharedString::from(s.workspace_name.as_str()),
+                command_line: SharedString::from(s.command_line.as_str()),
+                env_lines: SharedString::from(s.env_lines.as_str()),
+                health: SharedString::from(s.health.as_str()),
+                detail: SharedString::from(s.detail.as_str()),
+            })
+            .collect();
+        ui.set_session_mcp_servers(ModelRc::new(VecModel::from(items)));
+        ui.set_session_mcp_status(SharedString::from(status.as_str()));
+    });
+}
+
+/// Workspace picker options for the MCP add-to-workspace form.
+pub fn set_mcp_workspaces(ui: &Ui, names: Vec<String>, ids: Vec<String>) {
+    let _ = ui.upgrade_in_event_loop(move |ui| {
+        ui.set_settings_mcp_workspace_names(string_model(names));
+        ui.set_settings_mcp_workspace_ids(string_model(ids));
     });
 }
 
@@ -703,6 +736,81 @@ pub fn set_clis(ui: &Ui, clis: Vec<(String, String, String, String, String, bool
             )
             .collect();
         ui.set_settings_clis(ModelRc::new(VecModel::from(items)));
+    });
+}
+
+/// One local model row for the settings Local Models section (plain-data
+/// mirror of Slint's `LocalModelItem`).
+pub struct LocalModelView {
+    pub id: String,
+    pub name: String,
+    /// "7B · 4.7 GB"
+    pub meta: String,
+    /// "gpu" / "cpu" / "too-large"
+    pub fit: String,
+    pub fit_label: String,
+    pub notes: String,
+    pub downloaded: bool,
+    pub downloading: bool,
+    /// Download progress percent (0-99 while pending).
+    pub progress: i32,
+    pub error: String,
+    pub custom: bool,
+}
+
+/// Everything the Local Models settings section shows.
+pub struct LocalView {
+    pub hw_line: String,
+    pub runtime_label: String,
+    pub runtime_action: String,
+    pub runtime_busy: bool,
+    pub runtime_status: String,
+    /// "llama-server is running <model>" or "" when stopped.
+    pub server_line: String,
+    pub models: Vec<LocalModelView>,
+}
+
+pub fn set_local(ui: &Ui, view: LocalView) {
+    let _ = ui.upgrade_in_event_loop(move |ui| {
+        let items: Vec<crate::LocalModelItem> = view
+            .models
+            .into_iter()
+            .map(|m| crate::LocalModelItem {
+                id: SharedString::from(m.id.as_str()),
+                name: SharedString::from(m.name.as_str()),
+                meta: SharedString::from(m.meta.as_str()),
+                fit: SharedString::from(m.fit.as_str()),
+                fit_label: SharedString::from(m.fit_label.as_str()),
+                notes: SharedString::from(m.notes.as_str()),
+                downloaded: m.downloaded,
+                downloading: m.downloading,
+                progress: m.progress,
+                error: SharedString::from(m.error.as_str()),
+                custom: m.custom,
+            })
+            .collect();
+        ui.set_local_hw_line(SharedString::from(view.hw_line.as_str()));
+        ui.set_local_runtime_label(SharedString::from(view.runtime_label.as_str()));
+        ui.set_local_runtime_action(SharedString::from(view.runtime_action.as_str()));
+        ui.set_local_runtime_busy(view.runtime_busy);
+        ui.set_local_runtime_status(SharedString::from(view.runtime_status.as_str()));
+        ui.set_local_server_line(SharedString::from(view.server_line.as_str()));
+        ui.set_local_models(ModelRc::new(VecModel::from(items)));
+    });
+}
+
+/// Error/status line for the Local Models section.
+pub fn set_local_status(ui: &Ui, status: String) {
+    let _ = ui.upgrade_in_event_loop(move |ui| {
+        ui.set_local_status(SharedString::from(status.as_str()));
+    });
+}
+
+/// Clear the custom-GGUF form after a successful add.
+pub fn clear_local_form(ui: &Ui) {
+    let _ = ui.upgrade_in_event_loop(|ui| {
+        ui.set_local_form_repo(SharedString::new());
+        ui.set_local_form_file(SharedString::new());
     });
 }
 

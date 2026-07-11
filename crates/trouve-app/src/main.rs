@@ -468,6 +468,12 @@ fn main() -> anyhow::Result<()> {
     }
     {
         let tx = tx.clone();
+        window.on_refresh_session_mcp(move || {
+            let _ = tx.send(UiCommand::RefreshSessionMcp);
+        });
+    }
+    {
+        let tx = tx.clone();
         window.on_pr_picked(move |i| {
             let _ = tx.send(UiCommand::SelectPr(i as usize));
         });
@@ -498,21 +504,23 @@ fn main() -> anyhow::Result<()> {
     }
     {
         let tx = tx.clone();
-        window.on_mcp_saved(move |name, scope, command, env| {
+        window.on_mcp_saved(move |name, scope, command, env, workspace_id| {
             let _ = tx.send(UiCommand::SaveMcpServer {
                 name: name.to_string(),
                 scope: scope.to_string(),
                 command_line: command.to_string(),
                 env_lines: env.to_string(),
+                workspace_id: workspace_id.to_string(),
             });
         });
     }
     {
         let tx = tx.clone();
-        window.on_mcp_deleted(move |name, scope| {
+        window.on_mcp_deleted(move |name, scope, workspace_id| {
             let _ = tx.send(UiCommand::DeleteMcpServer {
                 name: name.to_string(),
                 scope: scope.to_string(),
+                workspace_id: workspace_id.to_string(),
             });
         });
     }
@@ -598,6 +606,47 @@ fn main() -> anyhow::Result<()> {
         let tx = tx.clone();
         window.on_cli_install(move |id| {
             let _ = tx.send(UiCommand::CliInstall(id.to_string()));
+        });
+    }
+    {
+        let tx = tx.clone();
+        window.on_local_refresh(move || {
+            let _ = tx.send(UiCommand::RefreshLocal);
+        });
+    }
+    {
+        // The llama.cpp runtime installs through the same managed-CLI
+        // machinery as the vendor CLIs.
+        let tx = tx.clone();
+        window.on_local_runtime_install(move || {
+            let _ = tx.send(UiCommand::CliInstall("llama-server".into()));
+        });
+    }
+    {
+        let tx = tx.clone();
+        window.on_local_download(move |id| {
+            let _ = tx.send(UiCommand::LocalDownload(id.to_string()));
+        });
+    }
+    {
+        let tx = tx.clone();
+        window.on_local_delete(move |id| {
+            let _ = tx.send(UiCommand::LocalDeleteModel(id.to_string()));
+        });
+    }
+    {
+        let tx = tx.clone();
+        window.on_local_stop_server(move || {
+            let _ = tx.send(UiCommand::LocalStopServer);
+        });
+    }
+    {
+        let tx = tx.clone();
+        window.on_local_added(move |repo, file| {
+            let _ = tx.send(UiCommand::LocalAddModel {
+                repo: repo.to_string(),
+                file: file.to_string(),
+            });
         });
     }
     {

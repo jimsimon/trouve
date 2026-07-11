@@ -193,10 +193,11 @@ impl AgentBackend for CodexBackend {
         };
 
         // Per-thread config overrides: the trouve MCP bridge rides along so
-        // codex gets trouve's semantic search / question tools (both
-        // thread/start and thread/resume accept `config`, and resumed
-        // threads re-spawn their MCP servers from it).
-        let config_override = turn.mcp_bridge.as_ref().map(bridge_config_override);
+        // codex gets trouve's semantic search / question tools, plus any
+        // user-configured MCP servers (both thread/start and thread/resume
+        // accept `config`, and resumed threads re-spawn their MCP servers
+        // from it).
+        let config_override = mcp_config_override(&turn);
         let with_config = |mut params: Value| {
             if let Some(config) = &config_override {
                 params["config"] = config.clone();
@@ -272,23 +273,41 @@ impl AgentBackend for CodexBackend {
     }
 }
 
-/// Codex config overrides that mount the trouve MCP bridge as a per-thread
-/// MCP server (same shape as `mcp_servers` in codex's config.toml).
-fn bridge_config_override(bridge: &crate::McpBridgeConfig) -> Value {
-    let env: serde_json::Map<String, Value> = bridge
-        .env
-        .iter()
-        .map(|(k, v)| (k.clone(), Value::String(v.clone())))
-        .collect();
-    json!({
-        "mcp_servers": {
-            "trouve": {
+/// Codex config overrides mounting the trouve MCP bridge and the user's
+/// configured MCP servers as per-thread MCP servers (same shape as
+/// `mcp_servers` in codex's config.toml). `None` when there is nothing to
+/// mount.
+fn mcp_config_override(turn: &crate::BackendTurn) -> Option<Value> {
+    let env_map = |env: &[(String, String)]| -> serde_json::Map<String, Value> {
+        env.iter()
+            .map(|(k, v)| (k.clone(), Value::String(v.clone())))
+            .collect()
+    };
+    let mut servers = serde_json::Map::new();
+    for server in &turn.mcp_servers {
+        servers.insert(
+            server.name.clone(),
+            json!({
+                "command": server.command,
+                "args": server.args,
+                "env": env_map(&server.env),
+            }),
+        );
+    }
+    if let Some(bridge) = &turn.mcp_bridge {
+        servers.insert(
+            "trouve".into(),
+            json!({
                 "command": bridge.command,
                 "args": bridge.args,
-                "env": env,
-            }
-        }
-    })
+                "env": env_map(&bridge.env),
+            }),
+        );
+    }
+    if servers.is_empty() {
+        return None;
+    }
+    Some(json!({ "mcp_servers": servers }))
 }
 
 fn model_or_default(model: &str) -> &str {
@@ -822,6 +841,52 @@ impl AppServer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn bare_turn() -> crate::BackendTurn {
+        crate::BackendTurn {
+            thread_id: "th_1".into(),
+            worktree: "/tmp".into(),
+            session: None,
+            model: "gpt-5.6".into(),
+            model_options: serde_json::Map::new(),
+            prompt: "hi".into(),
+            instructions: None,
+            permission: crate::BackendPermission::Ask,
+            mcp_bridge: None,
+            mcp_servers: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn mcp_config_override_merges_bridge_and_user_servers() {
+        let mut turn = bare_turn();
+        assert!(mcp_config_override(&turn).is_none());
+
+        turn.mcp_servers.push(crate::McpServerLaunch {
+            name: "jira".into(),
+            command: "jira-mcp".into(),
+            args: vec!["--stdio".into()],
+            env: vec![("TOKEN".into(), "sekrit".into())],
+        });
+        turn.mcp_bridge = Some(crate::McpBridgeConfig {
+            command: "trouve".into(),
+            args: vec!["mcp-bridge".into()],
+            env: vec![("TROUVE_THREAD_ID".into(), "th_1".into())],
+            bridge_tools: false,
+            disallowed_tools: Vec::new(),
+        });
+        let config = mcp_config_override(&turn).unwrap();
+        let servers = &config["mcp_servers"];
+        assert_eq!(servers["jira"]["command"], "jira-mcp");
+        assert_eq!(servers["jira"]["env"]["TOKEN"], "sekrit");
+        assert_eq!(servers["trouve"]["args"][0], "mcp-bridge");
+
+        // User servers alone (no bridge) still produce an override.
+        turn.mcp_bridge = None;
+        let config = mcp_config_override(&turn).unwrap();
+        assert!(config["mcp_servers"]["jira"].is_object());
+        assert!(config["mcp_servers"]["trouve"].is_null());
+    }
 
     #[test]
     fn parses_nested_token_usage() {

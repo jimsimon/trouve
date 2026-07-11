@@ -322,6 +322,46 @@ impl ProtocolClient {
         self.get_json(&format!("/clis/{id}/install")).await
     }
 
+    /// Local ("offline / integrated") inference status: hardware, runtime,
+    /// running server, and model download/fit state.
+    pub async fn local_status(&self) -> Result<LocalStatus> {
+        self.get_json("/local").await
+    }
+
+    /// Register a custom GGUF (HuggingFace repo + file). Surfaces the
+    /// server's validation message on failure.
+    pub async fn add_local_model(&self, req: &AddLocalModelRequest) -> Result<()> {
+        let path = "/local/models";
+        let resp = self
+            .http
+            .post(format!("{}{path}", self.base))
+            .json(req)
+            .send()
+            .await
+            .with_context(|| format!("POST {path}"))?;
+        if !resp.status().is_success() {
+            let status = resp.status();
+            if let Ok(body) = resp.json::<ErrorBody>().await {
+                bail!("{}", body.message);
+            }
+            bail!("{path}: {status}");
+        }
+        Ok(())
+    }
+
+    pub async fn start_local_model_download(&self, id: &str) -> Result<()> {
+        self.post_empty(&format!("/local/models/{id}/download"))
+            .await
+    }
+
+    pub async fn delete_local_model(&self, id: &str) -> Result<()> {
+        self.delete(&format!("/local/models/{id}")).await
+    }
+
+    pub async fn stop_local_server(&self) -> Result<()> {
+        self.post_empty("/local/server/stop").await
+    }
+
     pub async fn set_default_model(&self, model: &str) -> Result<()> {
         self.put_empty(
             "/config/default-model",
@@ -418,6 +458,14 @@ impl ProtocolClient {
 
     pub async fn mcp_server_logs(&self, name: &str) -> Result<McpLogs> {
         self.get_json(&format!("/mcp-servers/{name}/logs")).await
+    }
+
+    /// The effective MCP config a turn in this session would see: all
+    /// scopes merged, each entry tagged with the winning layer ("app-wide",
+    /// "workspace", or "branch"); disabled tombstones included.
+    pub async fn session_mcp_servers(&self, session_id: &str) -> Result<Vec<McpServerInfo>> {
+        self.get_json(&format!("/sessions/{session_id}/mcp-servers"))
+            .await
     }
 
     /// Subscription usage per configured agent backend. Codex answers via

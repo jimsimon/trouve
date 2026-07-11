@@ -10,6 +10,7 @@ pub mod context;
 pub mod engine;
 pub mod git;
 pub mod github;
+pub mod local;
 pub mod mcp;
 pub mod modes;
 pub mod permissions;

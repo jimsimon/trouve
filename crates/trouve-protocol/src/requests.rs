@@ -323,6 +323,12 @@ pub struct McpServerInfo {
     pub name: String,
     /// "user" (config dir) or "workspace" (.agents/.mcp.json).
     pub scope: String,
+    /// For workspace scope: which workspace's config this entry lives in.
+    /// Empty for user scope.
+    #[serde(default)]
+    pub workspace_id: String,
+    #[serde(default)]
+    pub workspace_name: String,
     pub command: String,
     #[serde(default)]
     pub args: Vec<String>,
@@ -504,6 +510,76 @@ pub struct CliInfo {
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct CliList {
     pub clis: Vec<CliInfo>,
+}
+
+/// A GPU the local-models hardware probe found.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct LocalGpu {
+    pub name: String,
+    /// Dedicated VRAM in bytes (system RAM for unified-memory machines).
+    pub vram_bytes: u64,
+}
+
+/// One local model (curated catalog entry or user-added GGUF) with its
+/// download and hardware-fit state.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct LocalModelInfo {
+    /// Stable id; runs as model "local/<id>".
+    pub id: String,
+    pub display_name: String,
+    /// HuggingFace repo the GGUF comes from (e.g. "Qwen/…-GGUF").
+    pub repo: String,
+    /// GGUF filename inside the repo.
+    pub file: String,
+    pub size_bytes: u64,
+    /// Human parameter count ("7B", "30B MoE").
+    pub params: String,
+    /// Context window trouve serves the model with.
+    pub context_window: u64,
+    /// Hardware fit: "gpu" (fits in VRAM), "cpu" (fits in RAM, slower),
+    /// or "too-large".
+    pub fit: String,
+    /// One-line description shown in settings.
+    #[serde(default)]
+    pub notes: String,
+    /// True when the GGUF is on disk and ready to run.
+    pub downloaded: bool,
+    /// "none" / "pending" / "failed" (success shows as downloaded).
+    pub download_status: String,
+    /// Downloaded bytes so far (pending only).
+    #[serde(default)]
+    pub download_bytes: u64,
+    #[serde(default)]
+    pub download_error: String,
+    /// User-added entry (can be removed entirely).
+    pub custom: bool,
+}
+
+/// Local inference status: hardware, the llama.cpp runtime install, the
+/// running server, and every known model.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct LocalStatus {
+    pub ram_bytes: u64,
+    pub gpus: Vec<LocalGpu>,
+    /// Whether the llama.cpp runtime (llama-server) is installed.
+    pub runtime_installed: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub runtime_version: Option<String>,
+    /// Model id currently loaded in the running llama-server, if any.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub running_model: Option<String>,
+    pub models: Vec<LocalModelInfo>,
+}
+
+/// Add a custom GGUF from a HuggingFace repo to the local model list.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct AddLocalModelRequest {
+    /// HuggingFace repo id, e.g. "unsloth/Qwen3.6-27B-GGUF".
+    pub repo: String,
+    /// GGUF filename inside the repo.
+    pub file: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
 }
 
 /// State of a CLI install started with `POST /v1/clis/{id}/install`.

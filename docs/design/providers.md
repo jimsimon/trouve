@@ -62,3 +62,34 @@ with a `context_window`, pricing (drives dollar-cost accounting on
 JSON Schema describing the model's knobs (reasoning effort, thinking budget,
 temperature). Clients render model option controls from that schema; no
 client hardcodes per-model UI.
+
+## Local ("offline / integrated") models
+
+The built-in `local` provider runs models fully offline with zero manual
+configuration (`trouve-core/src/local.rs`):
+
+- **Runtime**: llama.cpp's `llama-server`, installed through the same
+  managed-CLI machinery as the vendor CLIs (`POST /v1/clis/llama-server/
+  install`). Linux gets the Vulkan build when the Vulkan loader is present
+  (covers NVIDIA/AMD/Intel), CPU otherwise; macOS builds include Metal.
+- **Models**: single-file GGUFs from HuggingFace. A curated catalog of
+  known-good, tool-calling-capable coding models at Q4_K_M-class quants
+  (no quant jargon in the UI), plus user-added repo/file pairs persisted in
+  `<config>/local-models.json`. GGUFs download to `<data>/models/`.
+- **Hardware fit**: a RAM/VRAM probe (procfs + nvidia-smi + DRM sysfs;
+  unified memory on Apple Silicon) labels each model "fits your GPU",
+  "runs on CPU (slower)", or "needs more memory" using the Ollama-style
+  heuristic (weights × 1.15 + KV/overhead allowance).
+- **Sidecar**: the first turn on a `local/<model>` id spawns
+  `llama-server -m <gguf> --jinja -ngl 999 -c 32768` on a free localhost
+  port, waits for `/health`, and reuses the process across turns; switching
+  models restarts it. `--jinja` enables OpenAI-style tool calling. The
+  provider itself is a thin wrapper that delegates to the OpenAI-compat
+  client once the sidecar is up.
+- **API**: `GET /v1/local` (hardware + runtime + models + download state),
+  `POST /v1/local/models/{id}/download`, `DELETE /v1/local/models/{id}`,
+  `POST /v1/local/models` (custom GGUF), `POST /v1/local/server/stop`.
+
+Settings → Local Models drives all of it. Downloaded models appear in the
+model picker as `local/<id>` and report a 32k context window (what the
+server is actually launched with), so compaction budgets correctly.

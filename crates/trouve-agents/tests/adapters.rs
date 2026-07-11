@@ -31,6 +31,7 @@ fn turn(worktree: PathBuf, session: Option<&str>, permission: BackendPermission)
         instructions: Some("mode prompt".into()),
         permission,
         mcp_bridge: None,
+        mcp_servers: Vec::new(),
     }
 }
 
@@ -471,6 +472,12 @@ EOF
             bridge_tools: true,
             disallowed_tools: vec!["Bash".into(), "Edit".into(), "Write".into()],
         });
+        t.mcp_servers = vec![trouve_agents::McpServerLaunch {
+            name: "jira".into(),
+            command: "jira-mcp".into(),
+            args: vec!["--stdio".into()],
+            env: vec![("TOKEN".into(), "sekrit".into())],
+        }];
         t
     })
     .await;
@@ -498,6 +505,11 @@ EOF
         config["mcpServers"]["trouve"]["env"]["TROUVE_THREAD_ID"],
         "th_1"
     );
+    // User MCP servers ride along in the same config, but are not
+    // pre-allowed: their tools go through the normal permission path.
+    assert_eq!(config["mcpServers"]["jira"]["command"], "jira-mcp");
+    assert_eq!(config["mcpServers"]["jira"]["env"]["TOKEN"], "sekrit");
+    assert!(!args.contains("mcp__jira"), "{args}");
     let _ = std::fs::remove_file(config_path);
 }
 

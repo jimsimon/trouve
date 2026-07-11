@@ -16,6 +16,8 @@ futures.workspace = true
 ignore = "0.4.27"
 octocrab.workspace = true
 regex = "1.12.4"
+# Local-model downloads (HuggingFace GGUFs) and llama-server health checks.
+reqwest.workspace = true
 rusqlite.workspace = true
 serde.workspace = true
 serde_json.workspace = true

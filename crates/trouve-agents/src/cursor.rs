@@ -148,17 +148,20 @@ impl AgentBackend for CursorBackend {
         let mut fresh_session = false;
         let session_id = match &turn.session {
             Some(sid) if server.knows_session(sid).await => sid.clone(),
-            Some(sid) => match server.load_session(sid, &turn.worktree).await {
+            Some(sid) => match server
+                .load_session(sid, &turn.worktree, &turn.mcp_servers)
+                .await
+            {
                 Ok(()) => sid.clone(),
                 Err(e) => {
                     tracing::warn!("cursor session/load failed ({e}); starting fresh");
                     fresh_session = true;
-                    server.new_session(&turn.worktree).await?
+                    server.new_session(&turn.worktree, &turn.mcp_servers).await?
                 }
             },
             None => {
                 fresh_session = true;
-                server.new_session(&turn.worktree).await?
+                server.new_session(&turn.worktree, &turn.mcp_servers).await?
             }
         };
 
@@ -946,9 +949,16 @@ impl AcpServer {
         Ok(())
     }
 
-    async fn new_session(&self, worktree: &std::path::Path) -> Result<String, BackendError> {
+    async fn new_session(
+        &self,
+        worktree: &std::path::Path,
+        mcp_servers: &[crate::McpServerLaunch],
+    ) -> Result<String, BackendError> {
         let result = self
-            .request("session/new", json!({ "cwd": worktree, "mcpServers": [] }))
+            .request(
+                "session/new",
+                json!({ "cwd": worktree, "mcpServers": acp_mcp_servers(mcp_servers) }),
+            )
             .await
             .map_err(auth_hint)?;
         let id = result["sessionId"]
@@ -963,10 +973,15 @@ impl AcpServer {
         &self,
         session_id: &str,
         worktree: &std::path::Path,
+        mcp_servers: &[crate::McpServerLaunch],
     ) -> Result<(), BackendError> {
         self.request(
             "session/load",
-            json!({ "sessionId": session_id, "cwd": worktree, "mcpServers": [] }),
+            json!({
+                "sessionId": session_id,
+                "cwd": worktree,
+                "mcpServers": acp_mcp_servers(mcp_servers),
+            }),
         )
         .await
         .map_err(auth_hint)?;
@@ -1069,9 +1084,51 @@ fn auth_hint(e: BackendError) -> BackendError {
     }
 }
 
+/// User MCP servers in ACP `mcpServers` shape: stdio transport with env as
+/// an array of name/value pairs.
+fn acp_mcp_servers(servers: &[crate::McpServerLaunch]) -> Value {
+    Value::Array(
+        servers
+            .iter()
+            .map(|s| {
+                json!({
+                    "name": s.name,
+                    "command": s.command,
+                    "args": s.args,
+                    "env": s.env
+                        .iter()
+                        .map(|(name, value)| json!({ "name": name, "value": value }))
+                        .collect::<Vec<_>>(),
+                })
+            })
+            .collect(),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn acp_mcp_servers_shape() {
+        let servers = vec![crate::McpServerLaunch {
+            name: "jira".into(),
+            command: "jira-mcp".into(),
+            args: vec!["--stdio".into()],
+            env: vec![("TOKEN".into(), "sekrit".into())],
+        }];
+        let value = acp_mcp_servers(&servers);
+        assert_eq!(
+            value,
+            json!([{
+                "name": "jira",
+                "command": "jira-mcp",
+                "args": ["--stdio"],
+                "env": [{ "name": "TOKEN", "value": "sekrit" }],
+            }])
+        );
+        assert_eq!(acp_mcp_servers(&[]), json!([]));
+    }
 
     #[test]
     fn parses_acp_model_catalog() {
