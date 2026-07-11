@@ -196,6 +196,12 @@ pub enum Event {
     #[serde(rename = "thread.commands_updated")]
     CommandsUpdated { commands: Vec<CommandInfo> },
 
+    /// The thread's queue of pending prompts changed (enqueue, edit,
+    /// reorder, delete, or dispatch). Carries the full remaining queue in
+    /// run order; clients replace any previous list.
+    #[serde(rename = "thread.queue_updated")]
+    QueueUpdated { prompts: Vec<crate::QueuedPrompt> },
+
     /// The thread's transcript neared the model's context window; the engine
     /// is summarizing older messages. Clients show a busy indicator.
     #[serde(rename = "thread.compaction_started")]

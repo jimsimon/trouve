@@ -186,6 +186,60 @@ impl ProtocolClient {
         .await
     }
 
+    // --- queued prompts ---------------------------------------------------
+
+    pub async fn list_queue(
+        &self,
+        thread_id: &str,
+    ) -> Result<Vec<trouve_protocol::QueuedPrompt>> {
+        self.get_json(&format!("/threads/{thread_id}/queue")).await
+    }
+
+    pub async fn update_queued_prompt(&self, prompt_id: &str, content: &str) -> Result<()> {
+        let path = format!("/queue/{prompt_id}");
+        let resp = self
+            .http
+            .patch(format!("{}{path}", self.base))
+            .json(&trouve_protocol::UpdateQueuedPromptRequest {
+                content: content.into(),
+            })
+            .send()
+            .await
+            .with_context(|| format!("PATCH {path}"))?;
+        if !resp.status().is_success() {
+            bail!("{path}: {}", resp.status());
+        }
+        Ok(())
+    }
+
+    pub async fn delete_queued_prompt(&self, prompt_id: &str) -> Result<()> {
+        self.delete(&format!("/queue/{prompt_id}")).await
+    }
+
+    /// Full desired order (every queued prompt id, first to run first).
+    pub async fn reorder_queue(
+        &self,
+        thread_id: &str,
+        ids: &[String],
+    ) -> Result<Vec<trouve_protocol::QueuedPrompt>> {
+        self.put_json(
+            &format!("/threads/{thread_id}/queue"),
+            &trouve_protocol::ReorderQueueRequest { ids: ids.to_vec() },
+        )
+        .await
+    }
+
+    /// Kick an idle thread into draining its queue. Prompts left queued by
+    /// a restart/crash or paused by a failed turn wait for this explicit
+    /// resume ("Send now").
+    pub async fn dispatch_queue(&self, thread_id: &str) -> Result<TurnAccepted> {
+        self.post_json(
+            &format!("/threads/{thread_id}/queue/dispatch"),
+            &serde_json::json!({}),
+        )
+        .await
+    }
+
     pub async fn resolve_approval(&self, call_id: &str, decision: ApprovalDecision) -> Result<()> {
         let resp = self
             .http

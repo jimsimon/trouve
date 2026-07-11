@@ -24,10 +24,11 @@ use trouve_protocol::{
     CreateSessionRequest, CreateThreadRequest, DirEntry, ErrorBody, FileContent, GithubIntegration,
     KnownProvider, LoginStarted, LoginStatus, McpLogs, McpServerInfo, MergePrRequest, ModelInfo,
     PrInfo, ProviderInfo, ProvidersResponse, RegisterWorkspaceRequest, ResolveApprovalRequest,
-    ResolveQuestionRequest, Scope, SendMessageRequest, ServerInfo, Session, SessionDiff,
-    SetDefaultModelRequest, SetGithubTokenRequest, SubscriptionHealth, Thread, TurnAccepted,
-    UpdateSessionRequest, UpdateThreadRequest, UpsertMcpServerRequest, UpsertProviderRequest,
-    UsageSummary, Workspace, PROTOCOL_VERSION,
+    QueuedPrompt, ReorderQueueRequest, ResolveQuestionRequest, Scope, SendMessageRequest,
+    ServerInfo, Session, SessionDiff, SetDefaultModelRequest, SetGithubTokenRequest,
+    SubscriptionHealth, Thread, TurnAccepted, UpdateQueuedPromptRequest, UpdateSessionRequest,
+    UpdateThreadRequest, UpsertMcpServerRequest, UpsertProviderRequest, UsageSummary, Workspace,
+    PROTOCOL_VERSION,
 };
 use utoipa::OpenApi;
 
@@ -78,6 +79,11 @@ impl IntoResponse for ApiError {
         get_thread,
         update_thread,
         send_message,
+        list_queue,
+        reorder_queue,
+        dispatch_queue,
+        update_queued_prompt,
+        delete_queued_prompt,
         resolve_approval,
         resolve_question,
         list_models,
@@ -131,6 +137,9 @@ impl IntoResponse for ApiError {
         UpdateThreadRequest,
         SendMessageRequest,
         TurnAccepted,
+        QueuedPrompt,
+        UpdateQueuedPromptRequest,
+        ReorderQueueRequest,
         ResolveApprovalRequest,
         ResolveQuestionRequest,
         trouve_protocol::Question,
@@ -271,6 +280,15 @@ pub fn build_router(engine: Arc<Engine>) -> Router {
         .route("/v1/threads", post(create_thread).get(list_threads))
         .route("/v1/threads/{id}", get(get_thread).patch(update_thread))
         .route("/v1/threads/{id}/messages", post(send_message))
+        .route(
+            "/v1/threads/{id}/queue",
+            get(list_queue).put(reorder_queue),
+        )
+        .route("/v1/threads/{id}/queue/dispatch", post(dispatch_queue))
+        .route(
+            "/v1/queue/{id}",
+            axum::routing::patch(update_queued_prompt).delete(delete_queued_prompt),
+        )
         .route("/v1/threads/{id}/events", get(thread_events))
         .route("/v1/threads/{id}/usage", get(thread_usage))
         .route("/v1/approvals", post(resolve_approval))
@@ -478,6 +496,70 @@ async fn send_message(
 ) -> Result<(StatusCode, Json<TurnAccepted>), ApiError> {
     let accepted = engine.send_message(&id, req.content)?;
     Ok((StatusCode::ACCEPTED, Json(accepted)))
+}
+
+#[utoipa::path(get, path = "/v1/threads/{id}/queue", params(("id" = String, Path,)),
+    responses((status = 200, body = [QueuedPrompt]), (status = 404, body = ErrorBody)))]
+async fn list_queue(
+    State(engine): State<Arc<Engine>>,
+    Path(id): Path<String>,
+) -> Result<Json<Vec<QueuedPrompt>>, ApiError> {
+    Ok(Json(engine.list_queued_prompts(&id)?))
+}
+
+#[utoipa::path(put, path = "/v1/threads/{id}/queue", params(("id" = String, Path,)),
+    request_body = ReorderQueueRequest,
+    responses((status = 200, body = [QueuedPrompt]), (status = 404, body = ErrorBody),
+              (status = 409, body = ErrorBody)))]
+async fn reorder_queue(
+    State(engine): State<Arc<Engine>>,
+    Path(id): Path<String>,
+    Json(req): Json<ReorderQueueRequest>,
+) -> Result<Json<Vec<QueuedPrompt>>, ApiError> {
+    engine.reorder_queue(&id, &req.ids)?;
+    Ok(Json(engine.list_queued_prompts(&id)?))
+}
+
+/// Kick an idle thread into draining its queue. Queued prompts never
+/// auto-run at startup (a crash may have cut the previous turn short) and a
+/// failed turn pauses its queue — both wait for this explicit resume.
+#[utoipa::path(post, path = "/v1/threads/{id}/queue/dispatch", params(("id" = String, Path,)),
+    responses((status = 202, body = TurnAccepted), (status = 404, body = ErrorBody)))]
+async fn dispatch_queue(
+    State(engine): State<Arc<Engine>>,
+    Path(id): Path<String>,
+) -> Result<(StatusCode, Json<TurnAccepted>), ApiError> {
+    let turn = engine.dispatch_queue(&id)?;
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(TurnAccepted {
+            thread_id: id,
+            turn: turn.unwrap_or(0),
+            queued: turn.is_none(),
+        }),
+    ))
+}
+
+#[utoipa::path(patch, path = "/v1/queue/{id}", params(("id" = String, Path,)),
+    request_body = UpdateQueuedPromptRequest,
+    responses((status = 204), (status = 404, body = ErrorBody)))]
+async fn update_queued_prompt(
+    State(engine): State<Arc<Engine>>,
+    Path(id): Path<String>,
+    Json(req): Json<UpdateQueuedPromptRequest>,
+) -> Result<StatusCode, ApiError> {
+    engine.update_queued_prompt(&id, &req.content)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+#[utoipa::path(delete, path = "/v1/queue/{id}", params(("id" = String, Path,)),
+    responses((status = 204), (status = 404, body = ErrorBody)))]
+async fn delete_queued_prompt(
+    State(engine): State<Arc<Engine>>,
+    Path(id): Path<String>,
+) -> Result<StatusCode, ApiError> {
+    engine.delete_queued_prompt(&id)?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 #[utoipa::path(post, path = "/v1/approvals", request_body = ResolveApprovalRequest,

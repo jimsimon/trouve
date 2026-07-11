@@ -91,6 +91,8 @@ pub struct ThreadViewModel {
     /// Slash commands / skills the vendor harness accepts in prompts
     /// (latest announcement wins) — prompt-box completions.
     pub commands: Vec<trouve_protocol::CommandInfo>,
+    /// Prompts waiting their turn, in run order (latest announcement wins).
+    pub queue: Vec<trouve_protocol::QueuedPrompt>,
 }
 
 impl ThreadViewModel {
@@ -139,6 +141,10 @@ impl ThreadViewModel {
             }
             Event::CommandsUpdated { commands } => {
                 self.commands = commands.clone();
+                None
+            }
+            Event::QueueUpdated { prompts } => {
+                self.queue = prompts.clone();
                 None
             }
             Event::CompactionCompleted { .. } => {

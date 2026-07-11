@@ -188,10 +188,40 @@ pub struct SendMessageRequest {
 }
 
 /// Accepted-for-processing response; progress arrives on the event stream.
+/// When the thread already has a turn running the prompt is queued instead:
+/// `queued` is true and `turn` is 0 (the turn number is assigned when the
+/// prompt is dispatched).
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct TurnAccepted {
     pub thread_id: ThreadId,
     pub turn: u64,
+    #[serde(default)]
+    pub queued: bool,
+}
+
+// --- queued prompts --------------------------------------------------------
+
+/// A prompt waiting its turn. Queued prompts persist on disk and run in
+/// `position` order once the thread is idle.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
+pub struct QueuedPrompt {
+    pub id: String,
+    pub thread_id: ThreadId,
+    pub position: u64,
+    pub content: String,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct UpdateQueuedPromptRequest {
+    pub content: String,
+}
+
+/// Full desired order for a thread's queue (every queued prompt id, first
+/// to run first).
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct ReorderQueueRequest {
+    pub ids: Vec<String>,
 }
 
 // --- approvals -----------------------------------------------------------

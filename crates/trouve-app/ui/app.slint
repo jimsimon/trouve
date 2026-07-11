@@ -7,7 +7,7 @@
 // folding happens in Rust (client-core view models + the app controller).
 
 import {
-    Button, ComboBox, LineEdit, ListView, ScrollView, Spinner, TabWidget
+    Button, ComboBox, LineEdit, ListView, ScrollView, Spinner, TabWidget, TextEdit
 } from "std-widgets.slint";
 import { DiffView, DiffRow } from "diff-view.slint";
 import { CodeView, TextSegment } from "code-view.slint";
@@ -1127,6 +1127,40 @@ export component AppWindow inherits Window {
         root.slash-suppressed = false;
         root.slash-filter-changed(root.composer-draft);
     }
+
+    // --- queued prompts ---------------------------------------------------
+    // Prompts waiting their turn on the current thread, in run order. Rows
+    // support inline editing, reordering (drag the ⠿ handle, or the ↑/↓
+    // buttons for single steps), and deletion. The "Send now" pill shows
+    // when the thread is idle: prompts left queued by a restart/crash or
+    // paused by a failed turn never auto-run — a crash may have cut the
+    // previous turn short, so resuming is the user's call.
+    in property <[string]> queue-prompts;
+    in property <bool> queue-idle: false;
+    callback queue-edited(/* index */ int, /* content */ string);
+    callback queue-deleted(/* index */ int);
+    callback queue-moved(/* index */ int, /* delta, -1 up / +1 down */ int);
+    callback queue-reordered(/* from */ int, /* to */ int);
+    callback queue-send-now();
+    // Row currently showing its inline editor (-1 = none). Any queue change
+    // replaces the list model, which resets this — indices may have shifted.
+    property <int> queue-editing: -1;
+    // Drag-to-reorder state: the row being dragged and its pointer
+    // displacement. Rows are uniform height while dragging (the drag closes
+    // any open editor), so the drop slot falls out of the row pitch.
+    property <int> queue-drag-from: -1;
+    property <length> queue-drag-dy: 0px;
+    property <length> queue-row-pitch: Theme.fs(24px) + 4px;
+    pure function queue-drop-target() -> int {
+        Math.max(0, Math.min(root.queue-prompts.length - 1,
+            root.queue-drag-from + Math.round(root.queue-drag-dy / root.queue-row-pitch)))
+    }
+    changed queue-prompts => {
+        root.queue-editing = -1;
+        root.queue-drag-from = -1;
+        root.queue-drag-dy = 0px;
+    }
+
     in-out property <string> error-text: "";
 
     in property <[string]> modes;
@@ -2574,6 +2608,156 @@ export component AppWindow inherits Window {
                 if root.center-screen == 0: VerticalLayout {
                     spacing: 6px;
                     vertical-stretch: 0;
+
+                    // Queued prompts: waiting their turn behind the running
+                    // one. Edit in place, reorder with the arrows, delete,
+                    // or — when the thread is idle — kick the queue off.
+                    if root.queue-prompts.length > 0: Rectangle {
+                        vertical-stretch: 0;
+                        background: Theme.c.surface;
+                        border-radius: 8px;
+                        border-width: 1px;
+                        border-color: Theme.c.border;
+                        VerticalLayout {
+                            padding: 8px;
+                            spacing: 4px;
+                            HorizontalLayout {
+                                spacing: 8px;
+                                Text {
+                                    text: root.queue-prompts.length == 1
+                                        ? "1 queued prompt"
+                                        : root.queue-prompts.length + " queued prompts";
+                                    color: Theme.c.text-soft;
+                                    font-size: Theme.fs(11px);
+                                    vertical-alignment: center;
+                                    horizontal-stretch: 1;
+                                }
+                                if root.queue-idle: PillButton {
+                                    label: "Send now";
+                                    primary: true;
+                                    clicked => { root.queue-send-now(); }
+                                }
+                            }
+                            for qtext[qi] in root.queue-prompts: VerticalLayout {
+                                spacing: 4px;
+                                Rectangle {
+                                    height: Theme.fs(24px);
+                                    border-radius: 4px;
+                                    // Dragged row reads as "lifted"; the slot
+                                    // it would land in gets a soft highlight.
+                                    background: root.queue-drag-from == qi
+                                        ? Theme.c.accent-bg
+                                        : root.queue-drag-from != -1
+                                            && root.queue-drop-target() == qi
+                                        ? Theme.c.hover-strong : transparent;
+                                    HorizontalLayout {
+                                    spacing: 4px;
+                                    padding-left: 2px;
+                                    padding-right: 2px;
+                                    Rectangle {
+                                        width: Theme.fs(14px);
+                                        qdrag-ta := TouchArea {
+                                            mouse-cursor: root.queue-drag-from == qi
+                                                ? MouseCursor.grabbing : MouseCursor.grab;
+                                            moved => {
+                                                root.queue-editing = -1;
+                                                root.queue-drag-from = qi;
+                                                root.queue-drag-dy =
+                                                    self.mouse-y - self.pressed-y;
+                                            }
+                                            pointer-event(ev) => {
+                                                if (ev.kind == PointerEventKind.up
+                                                        && root.queue-drag-from == qi) {
+                                                    if (root.queue-drop-target() != qi) {
+                                                        root.queue-reordered(
+                                                            qi, root.queue-drop-target());
+                                                    }
+                                                    root.queue-drag-from = -1;
+                                                    root.queue-drag-dy = 0px;
+                                                }
+                                            }
+                                        }
+                                        Text {
+                                            width: 100%;
+                                            height: 100%;
+                                            text: "⠿";
+                                            color: qdrag-ta.has-hover
+                                                    || root.queue-drag-from == qi
+                                                ? Theme.c.text-hi : Theme.c.text-faint;
+                                            font-size: Theme.fs(12px);
+                                            horizontal-alignment: center;
+                                            vertical-alignment: center;
+                                        }
+                                    }
+                                    Text {
+                                        text: (qi + 1) + ".";
+                                        color: Theme.c.text-faint;
+                                        font-size: Theme.fs(11px);
+                                        vertical-alignment: center;
+                                    }
+                                    Text {
+                                        text: qtext;
+                                        color: Theme.c.text-mid;
+                                        font-size: Theme.fs(12px);
+                                        overflow: elide;
+                                        vertical-alignment: center;
+                                        horizontal-stretch: 1;
+                                    }
+                                    IconButton {
+                                        icon: "↑";
+                                        tip: "Run earlier";
+                                        enabled: qi > 0;
+                                        clicked => { root.queue-moved(qi, -1); }
+                                    }
+                                    IconButton {
+                                        icon: "↓";
+                                        tip: "Run later";
+                                        enabled: qi < root.queue-prompts.length - 1;
+                                        clicked => { root.queue-moved(qi, 1); }
+                                    }
+                                    IconButton {
+                                        icon: "✎";
+                                        tip: "Edit";
+                                        clicked => {
+                                            root.queue-editing =
+                                                root.queue-editing == qi ? -1 : qi;
+                                        }
+                                    }
+                                    IconButton {
+                                        icon: "✕";
+                                        tip: "Remove from queue";
+                                        clicked => { root.queue-deleted(qi); }
+                                    }
+                                    }
+                                }
+                                if root.queue-editing == qi: VerticalLayout {
+                                    spacing: 4px;
+                                    qedit := TextEdit {
+                                        text: qtext;
+                                        height: Theme.fs(80px);
+                                        wrap: word-wrap;
+                                        font-size: Theme.fs(12px);
+                                    }
+                                    HorizontalLayout {
+                                        spacing: 6px;
+                                        alignment: end;
+                                        PillButton {
+                                            label: "Cancel";
+                                            clicked => { root.queue-editing = -1; }
+                                        }
+                                        PillButton {
+                                            label: "Save";
+                                            primary: true;
+                                            clicked => {
+                                                root.queue-edited(qi, qedit.text);
+                                                root.queue-editing = -1;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
 
                     // "/" completion popup, floated above the composer via a
                     // zero-height anchor (rows can then reach `composer`

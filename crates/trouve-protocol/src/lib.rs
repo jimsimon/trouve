@@ -22,7 +22,9 @@ pub use requests::*;
 // events (all additive).
 // 0.5: added the interactive question flow — question.requested /
 // question.resolved events and POST /v1/questions (additive).
-pub const PROTOCOL_VERSION: &str = "0.6";
+// 0.7: queued prompts — thread.queue_updated event, /v1/threads/{id}/queue
+// endpoints, and the `queued` flag on TurnAccepted (all additive).
+pub const PROTOCOL_VERSION: &str = "0.7";
 
 pub type WorkspaceId = String;
 pub type SessionId = String;

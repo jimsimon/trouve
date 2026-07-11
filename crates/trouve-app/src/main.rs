@@ -297,6 +297,45 @@ fn main() -> anyhow::Result<()> {
     }
     {
         let tx = tx.clone();
+        window.on_queue_edited(move |index, content| {
+            let _ = tx.send(UiCommand::QueueEdit {
+                index: index.max(0) as usize,
+                content: content.to_string(),
+            });
+        });
+    }
+    {
+        let tx = tx.clone();
+        window.on_queue_deleted(move |index| {
+            let _ = tx.send(UiCommand::QueueDelete(index.max(0) as usize));
+        });
+    }
+    {
+        let tx = tx.clone();
+        window.on_queue_moved(move |index, delta| {
+            let _ = tx.send(UiCommand::QueueMove {
+                index: index.max(0) as usize,
+                delta,
+            });
+        });
+    }
+    {
+        let tx = tx.clone();
+        window.on_queue_reordered(move |from, to| {
+            let _ = tx.send(UiCommand::QueueReorder {
+                from: from.max(0) as usize,
+                to: to.max(0) as usize,
+            });
+        });
+    }
+    {
+        let tx = tx.clone();
+        window.on_queue_send_now(move || {
+            let _ = tx.send(UiCommand::QueueSendNow);
+        });
+    }
+    {
+        let tx = tx.clone();
         window.on_approval_resolved(move |row, approved| {
             let _ = tx.send(UiCommand::Approval {
                 row: row as usize,

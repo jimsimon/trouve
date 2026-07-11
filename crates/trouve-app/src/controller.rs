@@ -70,6 +70,27 @@ pub enum UiCommand {
     /// Chat viewport-y sampled by the shell's poll, bookmarked per thread.
     ChatScrolled(f32),
     SendMessage(String),
+    /// Queued-prompt panel: replace the text of the row at `index`.
+    QueueEdit {
+        index: usize,
+        content: String,
+    },
+    /// Queued-prompt panel: remove the row at `index`.
+    QueueDelete(usize),
+    /// Queued-prompt panel: swap the row at `index` with its neighbor
+    /// (`delta` is -1 to run earlier, +1 later).
+    QueueMove {
+        index: usize,
+        delta: i32,
+    },
+    /// Queued-prompt panel: drag-and-drop — move the row at `from` to land
+    /// at position `to` (remove-and-insert, not a swap).
+    QueueReorder {
+        from: usize,
+        to: usize,
+    },
+    /// Queued-prompt panel: start draining an idle thread's queue.
+    QueueSendNow,
     Approval {
         row: usize,
         approved: bool,
@@ -690,6 +711,7 @@ impl Controller {
         self.follow_current();
         self.render_chat(true);
         self.push_context();
+        self.push_queue();
         self.remember_position();
         self.restore_scroll();
         self.refresh_usage_text().await;
@@ -920,6 +942,29 @@ impl Controller {
         );
         ui::set_chat(&self.ui, rows, scroll);
         ui::set_composer_enabled(&self.ui, true);
+    }
+
+    /// Push the current thread's prompt queue to the composer's queue panel.
+    /// "Send now" shows when the thread is idle: queues never auto-run
+    /// after a restart or a failed turn — resuming is the user's call.
+    fn push_queue(&mut self) {
+        let Some(thread_id) = self.current_thread_id() else {
+            ui::set_queue(&self.ui, Vec::new(), false);
+            return;
+        };
+        let vm = self.vms.entry(thread_id).or_default();
+        let prompts = vm.queue.iter().map(|p| p.content.clone()).collect();
+        ui::set_queue(&self.ui, prompts, !vm.turn_running);
+    }
+
+    /// Server id of the current thread's queued prompt shown at `index`.
+    fn queued_prompt_id(&self, index: usize) -> Option<String> {
+        let thread_id = self.current_thread_id()?;
+        self.vms
+            .get(&thread_id)?
+            .queue
+            .get(index)
+            .map(|p| p.id.clone())
     }
 
     /// Push the context dial: last turn's input tokens vs the model window.
@@ -1553,11 +1598,9 @@ impl Controller {
                     "cpu" => "runs on CPU (slower)",
                     _ => "needs more memory",
                 };
-                let progress = if m.size_bytes > 0 {
-                    (m.download_bytes * 100 / m.size_bytes).min(99) as i32
-                } else {
-                    0
-                };
+                let progress = (m.download_bytes * 100)
+                    .checked_div(m.size_bytes)
+                    .map_or(0, |p| p.min(99) as i32);
                 ui::LocalModelView {
                     id: m.id.clone(),
                     name: m.display_name.clone(),
@@ -1778,6 +1821,7 @@ impl Controller {
                     self.follow_current();
                     self.render_chat(true);
                     self.push_context();
+                    self.push_queue();
                     self.remember_position();
                     self.restore_scroll();
                 }
@@ -1794,6 +1838,61 @@ impl Controller {
             UiCommand::SendMessage(text) => {
                 if let Some(thread_id) = self.current_thread_id() {
                     self.client.send_message(&thread_id, &text).await?;
+                }
+            }
+            UiCommand::QueueEdit { index, content } => {
+                if let Some(id) = self.queued_prompt_id(index) {
+                    if let Err(e) = self.client.update_queued_prompt(&id, &content).await {
+                        self.error(&format!("{e:#}"));
+                    }
+                }
+            }
+            UiCommand::QueueDelete(index) => {
+                if let Some(id) = self.queued_prompt_id(index) {
+                    if let Err(e) = self.client.delete_queued_prompt(&id).await {
+                        self.error(&format!("{e:#}"));
+                    }
+                }
+            }
+            UiCommand::QueueMove { index, delta } => {
+                if let Some(thread_id) = self.current_thread_id() {
+                    let ids: Vec<String> = self
+                        .vms
+                        .get(&thread_id)
+                        .map(|vm| vm.queue.iter().map(|p| p.id.clone()).collect())
+                        .unwrap_or_default();
+                    let to = index as i64 + delta as i64;
+                    if index < ids.len() && to >= 0 && (to as usize) < ids.len() {
+                        let mut ids = ids;
+                        ids.swap(index, to as usize);
+                        if let Err(e) = self.client.reorder_queue(&thread_id, &ids).await {
+                            self.error(&format!("{e:#}"));
+                        }
+                    }
+                }
+            }
+            UiCommand::QueueReorder { from, to } => {
+                if let Some(thread_id) = self.current_thread_id() {
+                    let ids: Vec<String> = self
+                        .vms
+                        .get(&thread_id)
+                        .map(|vm| vm.queue.iter().map(|p| p.id.clone()).collect())
+                        .unwrap_or_default();
+                    if from < ids.len() && to < ids.len() && from != to {
+                        let mut ids = ids;
+                        let id = ids.remove(from);
+                        ids.insert(to, id);
+                        if let Err(e) = self.client.reorder_queue(&thread_id, &ids).await {
+                            self.error(&format!("{e:#}"));
+                        }
+                    }
+                }
+            }
+            UiCommand::QueueSendNow => {
+                if let Some(thread_id) = self.current_thread_id() {
+                    if let Err(e) = self.client.dispatch_queue(&thread_id).await {
+                        self.error(&format!("{e:#}"));
+                    }
                 }
             }
             UiCommand::Approval { row, approved } => {
@@ -2585,6 +2684,9 @@ impl Controller {
                     // Compaction/usage state can change without a chat row
                     // changing, so the dial refreshes on every event.
                     self.push_context();
+                    // Queue contents and the idle flag both ride the event
+                    // stream (queue_updated / turn.started / turn ends).
+                    self.push_queue();
                     if changed.is_some() {
                         self.render_chat(true);
                     }
@@ -2653,6 +2755,7 @@ impl Controller {
         self.follow_current();
         self.render_chat(true);
         self.push_context();
+        self.push_queue();
         self.remember_position();
         Ok(())
     }

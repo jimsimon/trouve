@@ -7,7 +7,7 @@
       "name": "MIT",
       "identifier": "MIT"
     },
-    "version": "0.6"
+    "version": "0.7"
   },
   "paths": {
     "/v1/approvals": {
@@ -913,6 +913,76 @@
         }
       }
     },
+    "/v1/queue/{id}": {
+      "delete": {
+        "tags": [],
+        "operationId": "delete_queued_prompt",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": ""
+          },
+          "404": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      },
+      "patch": {
+        "tags": [],
+        "operationId": "update_queued_prompt",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UpdateQueuedPromptRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "204": {
+            "description": ""
+          },
+          "404": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/v1/sessions": {
       "get": {
         "tags": [],
@@ -1749,6 +1819,145 @@
           },
           "required": true
         },
+        "responses": {
+          "202": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TurnAccepted"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/threads/{id}/queue": {
+      "get": {
+        "tags": [],
+        "operationId": "list_queue",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/QueuedPrompt"
+                  }
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      },
+      "put": {
+        "tags": [],
+        "operationId": "reorder_queue",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ReorderQueueRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/QueuedPrompt"
+                  }
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/threads/{id}/queue/dispatch": {
+      "post": {
+        "tags": [],
+        "summary": "Kick an idle thread into draining its queue (a failed turn pauses the\nqueue until the user explicitly resumes it).",
+        "operationId": "dispatch_queue",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
         "responses": {
           "202": {
             "description": "",
@@ -2677,6 +2886,28 @@
                 "type": "string",
                 "enum": [
                   "thread.commands_updated"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "description": "The thread's queue of pending prompts changed (enqueue, edit,\nreorder, delete, or dispatch). Carries the full remaining queue in\nrun order; clients replace any previous list.",
+            "required": [
+              "prompts",
+              "type"
+            ],
+            "properties": {
+              "prompts": {
+                "type": "array",
+                "items": {
+                  "$ref": "#/components/schemas/QueuedPrompt"
+                }
+              },
+              "type": {
+                "type": "string",
+                "enum": [
+                  "thread.queue_updated"
                 ]
               }
             }
@@ -3624,6 +3855,36 @@
           }
         }
       },
+      "QueuedPrompt": {
+        "type": "object",
+        "description": "A prompt waiting its turn. Queued prompts persist on disk and run in\n`position` order once the thread is idle.",
+        "required": [
+          "id",
+          "thread_id",
+          "position",
+          "content",
+          "created_at"
+        ],
+        "properties": {
+          "content": {
+            "type": "string"
+          },
+          "created_at": {
+            "type": "string"
+          },
+          "id": {
+            "type": "string"
+          },
+          "position": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "thread_id": {
+            "$ref": "#/components/schemas/String"
+          }
+        }
+      },
       "RegisterWorkspaceRequest": {
         "type": "object",
         "required": [
@@ -3639,6 +3900,21 @@
           "path": {
             "type": "string",
             "description": "Absolute path to a git repository root."
+          }
+        }
+      },
+      "ReorderQueueRequest": {
+        "type": "object",
+        "description": "Full desired order for a thread's queue (every queued prompt id, first\nto run first).",
+        "required": [
+          "ids"
+        ],
+        "properties": {
+          "ids": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
           }
         }
       },
@@ -3943,12 +4219,15 @@
       },
       "TurnAccepted": {
         "type": "object",
-        "description": "Accepted-for-processing response; progress arrives on the event stream.",
+        "description": "Accepted-for-processing response; progress arrives on the event stream.\nWhen the thread already has a turn running the prompt is queued instead:\n`queued` is true and `turn` is 0 (the turn number is assigned when the\nprompt is dispatched).",
         "required": [
           "thread_id",
           "turn"
         ],
         "properties": {
+          "queued": {
+            "type": "boolean"
+          },
           "thread_id": {
             "$ref": "#/components/schemas/String"
           },
@@ -3956,6 +4235,17 @@
             "type": "integer",
             "format": "int64",
             "minimum": 0
+          }
+        }
+      },
+      "UpdateQueuedPromptRequest": {
+        "type": "object",
+        "required": [
+          "content"
+        ],
+        "properties": {
+          "content": {
+            "type": "string"
           }
         }
       },

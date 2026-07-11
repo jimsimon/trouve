@@ -1328,3 +1328,438 @@ async fn backend_turns_bridge_approvals_resume_sessions_and_checkpoint() {
     // Claude Code's login is an interactive TUI; we surface instructions.
     assert_eq!(resp.status(), 400);
 }
+
+/// Echoes the last user message, but holds each reply until the test grants
+/// a semaphore permit — keeps a turn "running" while the queue endpoints
+/// are exercised.
+struct GatedProvider {
+    gate: Arc<tokio::sync::Semaphore>,
+}
+
+#[async_trait::async_trait]
+impl Provider for GatedProvider {
+    fn id(&self) -> &str {
+        "gated"
+    }
+
+    async fn stream_chat(
+        &self,
+        _model: &str,
+        messages: &[Message],
+        _tools: &[ToolSpec],
+        _options: &serde_json::Map<String, serde_json::Value>,
+    ) -> Result<EventStream, ProviderError> {
+        let gate = self.gate.clone();
+        let last = messages
+            .iter()
+            .rev()
+            .find_map(|m| match m {
+                Message::User(t) => Some(t.clone()),
+                _ => None,
+            })
+            .unwrap_or_default();
+        let events = futures::stream::once(async move {
+            gate.acquire_owned().await.unwrap().forget();
+            Ok(ProviderEvent::TextDelta(format!("echo: {last}")))
+        })
+        .chain(futures::stream::iter(vec![Ok(ProviderEvent::Completed {
+            usage: Usage {
+                input_tokens: 1,
+                output_tokens: 1,
+                ..Default::default()
+            },
+        })]));
+        Ok(Box::pin(events))
+    }
+}
+
+#[tokio::test]
+async fn queued_prompts_crud_and_in_order_dispatch() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path().join("repo");
+    std::fs::create_dir(&repo).unwrap();
+    init_repo(&repo);
+
+    let gate = Arc::new(tokio::sync::Semaphore::new(0));
+    let store = Store::open(&tmp.path().join("db/trouve.db")).unwrap();
+    let engine = Arc::new(
+        Engine::new(store, tmp.path().join("data"), &Config::default())
+            .with_config_dir(None)
+            .with_provider("gated", Arc::new(GatedProvider { gate: gate.clone() }))
+            .with_default_model("gated/test-model"),
+    );
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let router = trouve_server::build_router(engine);
+    tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+    let base = format!("http://{addr}/v1");
+    let client = reqwest::Client::new();
+
+    let ws: serde_json::Value = client
+        .post(format!("{base}/workspaces"))
+        .json(&serde_json::json!({"path": repo.to_str().unwrap()}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let session: serde_json::Value = client
+        .post(format!("{base}/sessions"))
+        .json(&serde_json::json!({"workspace_id": ws["id"], "title": "Queue"}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let thread: serde_json::Value = client
+        .post(format!("{base}/threads"))
+        .json(&serde_json::json!({"session_id": session["id"]}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let thread_id = thread["id"].as_str().unwrap();
+    let events_url = format!("{base}/threads/{thread_id}/events");
+    let send = |content: &str| {
+        let client = client.clone();
+        let url = format!("{base}/threads/{thread_id}/messages");
+        let content = content.to_string();
+        async move {
+            client
+                .post(url)
+                .json(&serde_json::json!({"content": content}))
+                .send()
+                .await
+                .unwrap()
+                .json::<serde_json::Value>()
+                .await
+                .unwrap()
+        }
+    };
+
+    // First message dispatches immediately (turn 1, held open by the gate);
+    // everything sent while it runs queues up.
+    let first = send("one").await;
+    assert_eq!(first["turn"], 1);
+    assert_eq!(first["queued"], false);
+    let second = send("two").await;
+    assert_eq!(second["queued"], true);
+    assert_eq!(second["turn"], 0);
+    send("three").await;
+
+    let queue: Vec<serde_json::Value> = client
+        .get(format!("{base}/threads/{thread_id}/queue"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(queue.len(), 2);
+    assert_eq!(queue[0]["content"], "two");
+    assert_eq!(queue[1]["content"], "three");
+    let id_two = queue[0]["id"].as_str().unwrap().to_string();
+    let id_three = queue[1]["id"].as_str().unwrap().to_string();
+
+    // Edit a queued prompt.
+    let resp = client
+        .patch(format!("{base}/queue/{id_two}"))
+        .json(&serde_json::json!({"content": "two v2"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 204);
+
+    // Reorder: "three" now runs before "two v2". A stale id set conflicts.
+    let resp = client
+        .put(format!("{base}/threads/{thread_id}/queue"))
+        .json(&serde_json::json!({"ids": [id_three, "bogus"]}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 409);
+    let reordered: Vec<serde_json::Value> = client
+        .put(format!("{base}/threads/{thread_id}/queue"))
+        .json(&serde_json::json!({"ids": [id_three, id_two]}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(reordered[0]["content"], "three");
+    assert_eq!(reordered[1]["content"], "two v2");
+
+    // Delete: queue a fourth prompt and remove it again.
+    send("four").await;
+    let queue: Vec<serde_json::Value> = client
+        .get(format!("{base}/threads/{thread_id}/queue"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let id_four = queue[2]["id"].as_str().unwrap().to_string();
+    let resp = client
+        .delete(format!("{base}/queue/{id_four}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 204);
+
+    // Release the gate: turn 1 finishes, then the queue drains in order.
+    gate.add_permits(3);
+    let events = wait_for_event(&client, &events_url, |e| {
+        e["type"] == "turn.completed" && e["turn"] == 3
+    })
+    .await;
+    let user_messages: Vec<&str> = events
+        .iter()
+        .filter(|e| e["type"] == "user.message")
+        .map(|e| e["content"].as_str().unwrap())
+        .collect();
+    assert_eq!(user_messages, ["one", "three", "two v2"]);
+
+    // The queue announced every change on the event stream and ended empty.
+    let last_queue = events
+        .iter()
+        .filter(|e| e["type"] == "thread.queue_updated")
+        .next_back()
+        .expect("queue events published");
+    assert_eq!(last_queue["prompts"].as_array().unwrap().len(), 0);
+
+    let queue: Vec<serde_json::Value> = client
+        .get(format!("{base}/threads/{thread_id}/queue"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(queue.is_empty());
+}
+
+/// A queue on one session keeps draining while the user works in another:
+/// session A's turn is gated (its queue holds two prompts) while session B
+/// runs a full turn — then A drains in order without anyone looking at it.
+#[tokio::test]
+async fn queued_prompts_drain_on_background_sessions() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path().join("repo");
+    std::fs::create_dir(&repo).unwrap();
+    init_repo(&repo);
+
+    let gate = Arc::new(tokio::sync::Semaphore::new(0));
+    let store = Store::open(&tmp.path().join("db/trouve.db")).unwrap();
+    let engine = Arc::new(
+        Engine::new(store, tmp.path().join("data"), &Config::default())
+            .with_config_dir(None)
+            .with_provider("gated", Arc::new(GatedProvider { gate: gate.clone() }))
+            .with_provider(
+                "scripted",
+                Arc::new(ScriptedProvider {
+                    calls: AtomicUsize::new(1), // skip the tool-call turn
+                }),
+            )
+            .with_default_model("gated/test-model"),
+    );
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let router = trouve_server::build_router(engine);
+    tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+    let base = format!("http://{addr}/v1");
+    let client = reqwest::Client::new();
+
+    let ws: serde_json::Value = client
+        .post(format!("{base}/workspaces"))
+        .json(&serde_json::json!({"path": repo.to_str().unwrap()}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let mut threads = Vec::new();
+    for (title, model) in [("A", "gated/test-model"), ("B", "scripted/test-model")] {
+        let session: serde_json::Value = client
+            .post(format!("{base}/sessions"))
+            .json(&serde_json::json!({"workspace_id": ws["id"], "title": title}))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let thread: serde_json::Value = client
+            .post(format!("{base}/threads"))
+            .json(&serde_json::json!({"session_id": session["id"], "model": model}))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        threads.push(thread["id"].as_str().unwrap().to_string());
+    }
+    let (thread_a, thread_b) = (&threads[0], &threads[1]);
+
+    // Session A: one running (gated) turn plus two queued prompts.
+    for content in ["a-one", "a-two", "a-three"] {
+        client
+            .post(format!("{base}/threads/{thread_a}/messages"))
+            .json(&serde_json::json!({"content": content}))
+            .send()
+            .await
+            .unwrap();
+    }
+
+    // Session B is fully interactive while A's queue waits.
+    client
+        .post(format!("{base}/threads/{thread_b}/messages"))
+        .json(&serde_json::json!({"content": "b-one"}))
+        .send()
+        .await
+        .unwrap();
+    let events_b = format!("{base}/threads/{thread_b}/events");
+    wait_for_event(&client, &events_b, |e| e["type"] == "turn.completed").await;
+
+    // A's turn is still gated; its queue is untouched.
+    let queue_a: Vec<serde_json::Value> = client
+        .get(format!("{base}/threads/{thread_a}/queue"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(queue_a.len(), 2, "B's activity must not consume A's queue");
+
+    // Release A; its queue drains in order with nobody watching the thread.
+    gate.add_permits(3);
+    let events_a = format!("{base}/threads/{thread_a}/events");
+    let events = wait_for_event(&client, &events_a, |e| {
+        e["type"] == "turn.completed" && e["turn"] == 3
+    })
+    .await;
+    let user_messages: Vec<&str> = events
+        .iter()
+        .filter(|e| e["type"] == "user.message")
+        .map(|e| e["content"].as_str().unwrap())
+        .collect();
+    assert_eq!(user_messages, ["a-one", "a-two", "a-three"]);
+}
+
+/// Prompts left in the queue by a crash wait for an explicit kick: a crash
+/// may have cut the in-flight turn short, so the queue must NOT auto-run at
+/// startup — it drains only once the user hits "Send now" (queue/dispatch).
+#[tokio::test]
+async fn leftover_queue_waits_for_explicit_dispatch_after_restart() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path().join("repo");
+    std::fs::create_dir(&repo).unwrap();
+    init_repo(&repo);
+
+    let store = Store::open(&tmp.path().join("db/trouve.db")).unwrap();
+    let engine = Arc::new(
+        Engine::new(store.clone(), tmp.path().join("data"), &Config::default())
+            .with_config_dir(None)
+            .with_provider(
+                "scripted",
+                Arc::new(ScriptedProvider {
+                    calls: AtomicUsize::new(1), // text-only turns
+                }),
+            )
+            .with_default_model("scripted/test-model"),
+    );
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let router = trouve_server::build_router(engine);
+    tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+    let base = format!("http://{addr}/v1");
+    let client = reqwest::Client::new();
+
+    let ws: serde_json::Value = client
+        .post(format!("{base}/workspaces"))
+        .json(&serde_json::json!({"path": repo.to_str().unwrap()}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let session: serde_json::Value = client
+        .post(format!("{base}/sessions"))
+        .json(&serde_json::json!({"workspace_id": ws["id"], "title": "Resume"}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let thread: serde_json::Value = client
+        .post(format!("{base}/threads"))
+        .json(&serde_json::json!({"session_id": session["id"]}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let thread_id = thread["id"].as_str().unwrap();
+
+    // What a crash mid-drain leaves behind: rows in queued_prompts, no
+    // active dispatcher.
+    store.enqueue_prompt(thread_id, "left-behind-1").unwrap();
+    store.enqueue_prompt(thread_id, "left-behind-2").unwrap();
+
+    // Nothing runs on its own — the server never auto-resumes a queue.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let queue: Vec<serde_json::Value> = client
+        .get(format!("{base}/threads/{thread_id}/queue"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(queue.len(), 2, "leftover prompts must wait for the user");
+
+    // "Send now" drains the leftovers in order.
+    let resp = client
+        .post(format!("{base}/threads/{thread_id}/queue/dispatch"))
+        .json(&serde_json::json!({}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 202);
+
+    let events_url = format!("{base}/threads/{thread_id}/events");
+    let events = wait_for_event(&client, &events_url, |e| {
+        e["type"] == "turn.completed" && e["turn"] == 2
+    })
+    .await;
+    let user_messages: Vec<&str> = events
+        .iter()
+        .filter(|e| e["type"] == "user.message")
+        .map(|e| e["content"].as_str().unwrap())
+        .collect();
+    assert_eq!(user_messages, ["left-behind-1", "left-behind-2"]);
+
+    let queue: Vec<serde_json::Value> = client
+        .get(format!("{base}/threads/{thread_id}/queue"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(queue.is_empty());
+}

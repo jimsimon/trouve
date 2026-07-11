@@ -75,6 +75,14 @@ signal and the sort key of every session list.
 - Tool cards collapsed by default: icon, one-line summary, exit status.
   Expand for full command/output. Approval prompts are keyboard-first
   (y / a / n).
+- Sending while a turn runs queues the prompt (persisted server-side, so a
+  crash/restart keeps it). A panel above the composer lists queued prompts
+  in run order with edit / reorder (drag or ↑/↓) / delete; the queue drains
+  automatically between turns, including on sessions that aren't currently
+  open. Queues never auto-run at startup — a crash may have cut the
+  in-flight turn short, so continuing on top of half-finished work is the
+  user's call — and a failed turn pauses its queue (a persistent error
+  can't burn every prompt). The "Send now" pill resumes either case.
 - Status bar always shows the permission mode; YOLO renders in warning
   color everywhere it appears.
 

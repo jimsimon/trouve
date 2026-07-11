@@ -62,6 +62,9 @@ pub struct Engine {
     approvals: Arc<ApprovalHub>,
     questions: Arc<QuestionHub>,
     session_locks: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+    /// Threads with a dispatcher currently running turns. A thread in this
+    /// set drains its own prompt queue; sends while present just enqueue.
+    active_threads: Mutex<std::collections::HashSet<String>>,
     config: Mutex<Config>,
     /// Where provider configuration changes are persisted. `None` disables
     /// persistence (tests).
@@ -305,6 +308,7 @@ impl Engine {
             approvals: Arc::new(ApprovalHub::default()),
             questions: Arc::new(QuestionHub::default()),
             session_locks: Mutex::new(HashMap::new()),
+            active_threads: Mutex::new(std::collections::HashSet::new()),
             config: Mutex::new(config.clone()),
             // No write-back by default: only a caller that loaded `config`
             // from disk should enable persisting to that file (see
@@ -2276,33 +2280,162 @@ impl Engine {
 
     // --- turns ---------------------------------------------------------------
 
-    /// Accept a user message and run the turn in the background. Progress is
-    /// visible on the thread's event stream.
+    /// Accept a user message. If the thread is idle it runs immediately;
+    /// otherwise it joins the thread's persistent prompt queue and runs when
+    /// its turn comes. Progress is visible on the thread's event stream.
     pub fn send_message(
         self: &Arc<Self>,
         thread_id: &str,
         content: String,
     ) -> Result<TurnAccepted, EngineError> {
+        self.get_thread(thread_id)?; // 404 for unknown threads
+        self.store.enqueue_prompt(thread_id, &content)?;
+        self.emit_queue(thread_id)?;
+        let turn = self.dispatch_queue(thread_id)?;
+        Ok(TurnAccepted {
+            thread_id: thread_id.to_string(),
+            turn: turn.unwrap_or(0),
+            queued: turn.is_none(),
+        })
+    }
+
+    /// Publish the thread's current queue on its event stream.
+    fn emit_queue(&self, thread_id: &str) -> Result<(), EngineError> {
+        let prompts = self.store.queued_prompts(thread_id)?;
+        self.store.append_event(
+            Scope::Thread(thread_id.to_string()),
+            Event::QueueUpdated { prompts },
+        )?;
+        Ok(())
+    }
+
+    // --- prompt queue ----------------------------------------------------
+
+    pub fn list_queued_prompts(
+        &self,
+        thread_id: &str,
+    ) -> Result<Vec<trouve_protocol::QueuedPrompt>, EngineError> {
+        self.get_thread(thread_id)?;
+        Ok(self.store.queued_prompts(thread_id)?)
+    }
+
+    pub fn update_queued_prompt(
+        &self,
+        prompt_id: &str,
+        content: &str,
+    ) -> Result<(), EngineError> {
+        let thread_id = self
+            .store
+            .queued_prompt_thread(prompt_id)?
+            .ok_or_else(|| EngineError::NotFound(format!("queued prompt {prompt_id}")))?;
+        if !self.store.update_queued_prompt(prompt_id, content)? {
+            return Err(EngineError::NotFound(format!("queued prompt {prompt_id}")));
+        }
+        self.emit_queue(&thread_id)
+    }
+
+    pub fn delete_queued_prompt(&self, prompt_id: &str) -> Result<(), EngineError> {
+        let thread_id = self
+            .store
+            .queued_prompt_thread(prompt_id)?
+            .ok_or_else(|| EngineError::NotFound(format!("queued prompt {prompt_id}")))?;
+        if !self.store.delete_queued_prompt(prompt_id)? {
+            return Err(EngineError::NotFound(format!("queued prompt {prompt_id}")));
+        }
+        self.emit_queue(&thread_id)
+    }
+
+    /// Apply a full new order for the thread's queue. `ids` must name every
+    /// currently queued prompt exactly once.
+    pub fn reorder_queue(&self, thread_id: &str, ids: &[String]) -> Result<(), EngineError> {
+        self.get_thread(thread_id)?;
+        if !self.store.reorder_queued_prompts(thread_id, ids)? {
+            return Err(EngineError::Conflict(
+                "queue changed while reordering; refresh and retry".into(),
+            ));
+        }
+        self.emit_queue(thread_id)
+    }
+
+    /// Start draining the thread's queue if it's idle — the "Send now"
+    /// affordance. Deliberately never called automatically at startup: a
+    /// crash may have cut a turn short, and running the queue on top of
+    /// half-finished work needs a human's judgment. (A failed turn likewise
+    /// pauses its queue until the user kicks it.)
+    /// Returns the turn number of the dispatched prompt, or `None` when a
+    /// turn is already running or the queue is empty.
+    pub fn dispatch_queue(self: &Arc<Self>, thread_id: &str) -> Result<Option<u64>, EngineError> {
         let thread = self.get_thread(thread_id)?;
+        // Claim the thread and take the queue front atomically so two
+        // concurrent sends can't both start a dispatcher.
+        let prompt = {
+            let mut active = self.active_threads.lock().unwrap();
+            if active.contains(thread_id) {
+                return Ok(None);
+            }
+            let Some(p) = self.store.pop_queued_prompt(thread_id)? else {
+                return Ok(None);
+            };
+            active.insert(thread_id.to_string());
+            p
+        };
+        self.emit_queue(thread_id)?;
         let turn = self.store.next_turn(thread_id)?;
         let engine = self.clone();
-        let thread_id_owned = thread_id.to_string();
         tokio::spawn(async move {
-            if let Err(e) = engine.run_turn(&thread, turn, content).await {
-                tracing::error!("turn {turn} of {thread_id_owned} failed: {e}");
-                let _ = engine.store.append_event(
-                    Scope::Thread(thread_id_owned.clone()),
+            engine.drain_queue(thread, turn, prompt.content).await;
+        });
+        Ok(Some(turn))
+    }
+
+    /// Run `content` as `turn`, then keep pulling queued prompts until the
+    /// queue is empty or a turn fails (a failure pauses the queue so a
+    /// persistent error can't burn every queued prompt).
+    async fn drain_queue(self: &Arc<Self>, thread: Thread, turn: u64, content: String) {
+        let mut thread = thread;
+        let mut turn = turn;
+        let mut content = content;
+        loop {
+            if let Err(e) = self.run_turn(&thread, turn, content).await {
+                tracing::error!("turn {turn} of {} failed: {e}", thread.id);
+                let _ = self.store.append_event(
+                    Scope::Thread(thread.id.clone()),
                     Event::TurnFailed {
                         turn,
                         error: e.to_string(),
                     },
                 );
+                self.active_threads.lock().unwrap().remove(&thread.id);
+                return;
             }
-        });
-        Ok(TurnAccepted {
-            thread_id: thread_id.to_string(),
-            turn,
-        })
+            // Pop the next prompt; releasing the claim and inspecting the
+            // queue must be atomic against concurrent send_message calls.
+            let next = {
+                let mut active = self.active_threads.lock().unwrap();
+                match self.store.pop_queued_prompt(&thread.id) {
+                    Ok(Some(p)) => Some(p),
+                    _ => {
+                        active.remove(&thread.id);
+                        None
+                    }
+                }
+            };
+            let Some(next) = next else { return };
+            let _ = self.emit_queue(&thread.id);
+            // Thread settings may have changed between turns.
+            if let Ok(t) = self.get_thread(&thread.id) {
+                thread = t;
+            }
+            turn = match self.store.next_turn(&thread.id) {
+                Ok(t) => t,
+                Err(e) => {
+                    tracing::error!("queue for {} stopped: {e}", thread.id);
+                    self.active_threads.lock().unwrap().remove(&thread.id);
+                    return;
+                }
+            };
+            content = next.content;
+        }
     }
 
     async fn run_turn(&self, thread: &Thread, turn: u64, content: String) -> Result<()> {

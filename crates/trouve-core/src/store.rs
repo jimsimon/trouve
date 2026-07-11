@@ -72,6 +72,14 @@ CREATE TABLE IF NOT EXISTS backend_sessions (
   thread_id TEXT PRIMARY KEY REFERENCES threads(id),
   backend_session_id TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS queued_prompts (
+  id TEXT PRIMARY KEY,
+  thread_id TEXT NOT NULL REFERENCES threads(id),
+  position INTEGER NOT NULL,
+  content TEXT NOT NULL,
+  created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS queued_prompts_thread ON queued_prompts (thread_id, position);
 CREATE TABLE IF NOT EXISTS events (
   cursor INTEGER PRIMARY KEY AUTOINCREMENT,
   scope_kind TEXT NOT NULL,
@@ -380,6 +388,10 @@ impl Store {
             "DELETE FROM backend_sessions WHERE thread_id IN (SELECT id FROM threads WHERE session_id = ?1)",
             params![id],
         )?;
+        tx.execute(
+            "DELETE FROM queued_prompts WHERE thread_id IN (SELECT id FROM threads WHERE session_id = ?1)",
+            params![id],
+        )?;
         tx.execute("DELETE FROM usage WHERE session_id = ?1", params![id])?;
         tx.execute("DELETE FROM checkpoints WHERE session_id = ?1", params![id])?;
         tx.execute("DELETE FROM threads WHERE session_id = ?1", params![id])?;
@@ -506,6 +518,144 @@ impl Store {
             |r| r.get(0),
         )?;
         Ok(turn as u64)
+    }
+
+    // --- queued prompts -------------------------------------------------------
+    // Prompts submitted while a turn was running. Persisted so a restart or
+    // crash doesn't lose them; drained in `position` order between turns.
+
+    pub fn enqueue_prompt(
+        &self,
+        thread_id: &str,
+        content: &str,
+    ) -> Result<trouve_protocol::QueuedPrompt> {
+        let conn = self.conn.lock().unwrap();
+        let id = format!("qp_{}", uuid::Uuid::new_v4().simple());
+        let created_at = chrono::Utc::now().to_rfc3339();
+        conn.execute(
+            "INSERT INTO queued_prompts (id, thread_id, position, content, created_at)
+             VALUES (?1, ?2,
+               (SELECT COALESCE(MAX(position), 0) + 1 FROM queued_prompts WHERE thread_id = ?2),
+               ?3, ?4)",
+            params![id, thread_id, content, created_at],
+        )?;
+        let position: i64 = conn.query_row(
+            "SELECT position FROM queued_prompts WHERE id = ?1",
+            params![id],
+            |r| r.get(0),
+        )?;
+        Ok(trouve_protocol::QueuedPrompt {
+            id,
+            thread_id: thread_id.to_string(),
+            position: position as u64,
+            content: content.to_string(),
+            created_at,
+        })
+    }
+
+    pub fn queued_prompts(&self, thread_id: &str) -> Result<Vec<trouve_protocol::QueuedPrompt>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, position, content, created_at FROM queued_prompts
+             WHERE thread_id = ?1 ORDER BY position",
+        )?;
+        let rows = stmt.query_map(params![thread_id], |r| {
+            Ok(trouve_protocol::QueuedPrompt {
+                id: r.get(0)?,
+                thread_id: thread_id.to_string(),
+                position: r.get::<_, i64>(1)? as u64,
+                content: r.get(2)?,
+                created_at: r.get(3)?,
+            })
+        })?;
+        Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+    }
+
+    /// Thread the queued prompt belongs to, if it still exists.
+    pub fn queued_prompt_thread(&self, id: &str) -> Result<Option<String>> {
+        let conn = self.conn.lock().unwrap();
+        Ok(conn
+            .query_row(
+                "SELECT thread_id FROM queued_prompts WHERE id = ?1",
+                params![id],
+                |r| r.get(0),
+            )
+            .optional()?)
+    }
+
+    /// Returns false when the prompt no longer exists (already dispatched).
+    pub fn update_queued_prompt(&self, id: &str, content: &str) -> Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        let n = conn.execute(
+            "UPDATE queued_prompts SET content = ?2 WHERE id = ?1",
+            params![id, content],
+        )?;
+        Ok(n > 0)
+    }
+
+    pub fn delete_queued_prompt(&self, id: &str) -> Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        let n = conn.execute("DELETE FROM queued_prompts WHERE id = ?1", params![id])?;
+        Ok(n > 0)
+    }
+
+    /// Apply a full new order. `ids` must be exactly the thread's current
+    /// queue; returns false (changing nothing) when it isn't, so a reorder
+    /// racing a dispatch fails cleanly instead of corrupting positions.
+    pub fn reorder_queued_prompts(&self, thread_id: &str, ids: &[String]) -> Result<bool> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        let mut current: Vec<String> = {
+            let mut stmt = tx.prepare(
+                "SELECT id FROM queued_prompts WHERE thread_id = ?1 ORDER BY position",
+            )?;
+            let rows = stmt.query_map(params![thread_id], |r| r.get::<_, String>(0))?;
+            rows.collect::<std::result::Result<Vec<_>, _>>()?
+        };
+        current.sort();
+        let mut requested = ids.to_vec();
+        requested.sort();
+        if current != requested {
+            return Ok(false);
+        }
+        for (i, id) in ids.iter().enumerate() {
+            tx.execute(
+                "UPDATE queued_prompts SET position = ?2 WHERE id = ?1",
+                params![id, (i + 1) as i64],
+            )?;
+        }
+        tx.commit()?;
+        Ok(true)
+    }
+
+    /// Remove and return the front of the thread's queue.
+    pub fn pop_queued_prompt(
+        &self,
+        thread_id: &str,
+    ) -> Result<Option<trouve_protocol::QueuedPrompt>> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        let front = tx
+            .query_row(
+                "SELECT id, position, content, created_at FROM queued_prompts
+                 WHERE thread_id = ?1 ORDER BY position LIMIT 1",
+                params![thread_id],
+                |r| {
+                    Ok(trouve_protocol::QueuedPrompt {
+                        id: r.get(0)?,
+                        thread_id: thread_id.to_string(),
+                        position: r.get::<_, i64>(1)? as u64,
+                        content: r.get(2)?,
+                        created_at: r.get(3)?,
+                    })
+                },
+            )
+            .optional()?;
+        if let Some(p) = &front {
+            tx.execute("DELETE FROM queued_prompts WHERE id = ?1", params![p.id])?;
+        }
+        tx.commit()?;
+        Ok(front)
     }
 
     // --- provider transcript --------------------------------------------------
@@ -901,10 +1051,108 @@ mod tests {
             .unwrap();
         // The vendor-resume link is what used to trip the FK constraint.
         store.set_backend_session("th_1", "vendor-abc").unwrap();
+        store.enqueue_prompt("th_1", "pending").unwrap();
 
         store.delete_session("se_1").unwrap();
         assert!(store.session("se_1").unwrap().is_none());
         assert!(store.backend_session("th_1").unwrap().is_none());
+        assert!(store.queued_prompts("th_1").unwrap().is_empty());
+    }
+
+    /// Workspace + session + thread rows so FK-checked inserts succeed.
+    fn seed_thread(store: &Store, thread_id: &str) {
+        if store.workspace("ws_q").unwrap().is_none() {
+            store
+                .insert_workspace(&Workspace {
+                    id: "ws_q".into(),
+                    name: "x".into(),
+                    path: format!("/tmp/repo-{thread_id}"),
+                })
+                .unwrap();
+            store
+                .insert_session(&Session {
+                    id: "se_q".into(),
+                    workspace_id: "ws_q".into(),
+                    title: "t".into(),
+                    branch: "b".into(),
+                    worktree_path: "/tmp/wt".into(),
+                    base_ref: "main".into(),
+                    archived: false,
+                    created_at: chrono::Utc::now(),
+                })
+                .unwrap();
+        }
+        store
+            .insert_thread(
+                &Thread {
+                    id: thread_id.into(),
+                    session_id: "se_q".into(),
+                    mode: "code".into(),
+                    model: "p/m".into(),
+                    model_options: serde_json::Map::new(),
+                    permission_mode: PermissionMode::Ask,
+                    created_at: chrono::Utc::now(),
+                },
+                &serde_json::Map::new(),
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn queued_prompts_crud_pop_and_reorder() {
+        let store = Store::open_in_memory().unwrap();
+        seed_thread(&store, "th_1");
+        seed_thread(&store, "th_2");
+        let a = store.enqueue_prompt("th_1", "first").unwrap();
+        let b = store.enqueue_prompt("th_1", "second").unwrap();
+        let c = store.enqueue_prompt("th_1", "third").unwrap();
+        store.enqueue_prompt("th_2", "other thread").unwrap();
+
+        let q = store.queued_prompts("th_1").unwrap();
+        assert_eq!(
+            q.iter().map(|p| p.content.as_str()).collect::<Vec<_>>(),
+            ["first", "second", "third"]
+        );
+        assert_eq!(store.queued_prompt_thread(&a.id).unwrap().unwrap(), "th_1");
+
+        // Edit and delete.
+        assert!(store.update_queued_prompt(&b.id, "second v2").unwrap());
+        assert!(store.delete_queued_prompt(&a.id).unwrap());
+        assert!(!store.delete_queued_prompt(&a.id).unwrap());
+
+        // Reorder requires the exact current id set...
+        assert!(!store
+            .reorder_queued_prompts("th_1", &[c.id.clone()])
+            .unwrap());
+        // ...and applies the given order when it matches.
+        assert!(store
+            .reorder_queued_prompts("th_1", &[c.id.clone(), b.id.clone()])
+            .unwrap());
+
+        // Pop drains front-first in the new order.
+        let p1 = store.pop_queued_prompt("th_1").unwrap().unwrap();
+        assert_eq!(p1.content, "third");
+        let p2 = store.pop_queued_prompt("th_1").unwrap().unwrap();
+        assert_eq!(p2.content, "second v2");
+        assert!(store.pop_queued_prompt("th_1").unwrap().is_none());
+
+        // The other thread's queue is untouched.
+        assert_eq!(store.queued_prompts("th_2").unwrap().len(), 1);
+    }
+
+    #[test]
+    fn queued_prompts_survive_reopen() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("q.db");
+        {
+            let store = Store::open(&path).unwrap();
+            seed_thread(&store, "th_1");
+            store.enqueue_prompt("th_1", "keep me").unwrap();
+        }
+        let store = Store::open(&path).unwrap();
+        let q = store.queued_prompts("th_1").unwrap();
+        assert_eq!(q.len(), 1);
+        assert_eq!(q[0].content, "keep me");
     }
 
     #[test]

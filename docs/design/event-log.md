@@ -74,6 +74,9 @@ Thread scope:
   decision, by}`
 - `tool.started` `{call_id}` / `tool.output` `{call_id, chunk}` /
   `tool.completed` `{call_id, status, result}`
+- `thread.queue_updated` `{prompts}` — the thread's queue of pending prompts
+  changed (enqueue/edit/reorder/delete/dispatch); carries the full remaining
+  queue in run order, so replaying to the tail reproduces the current queue
 
 Session scope:
 
