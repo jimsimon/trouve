@@ -24,6 +24,21 @@ pub struct NavRowData {
     pub expanded: bool,
 }
 
+/// Bring the window to the front (notification clicks). Wayland
+/// compositors may deny focus stealing, in which case the
+/// user-attention request at least flashes the taskbar entry.
+pub fn raise_window(ui: &Ui) {
+    let _ = ui.upgrade_in_event_loop(|ui| {
+        use slint::winit_030::{winit, WinitWindowAccessor};
+        use slint::ComponentHandle;
+        ui.window().with_winit_window(|w| {
+            w.set_minimized(false);
+            w.focus_window();
+            w.request_user_attention(Some(winit::window::UserAttentionType::Informational));
+        });
+    });
+}
+
 pub fn set_error(ui: &Ui, text: &str) {
     let text = text.to_string();
     let _ = ui.upgrade_in_event_loop(move |ui| ui.set_error_text(SharedString::from(text)));

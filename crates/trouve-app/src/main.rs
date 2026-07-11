@@ -2,6 +2,7 @@
 //! still goes over the protocol on localhost) and runs the Slint UI.
 
 mod controller;
+mod notify;
 mod render;
 mod theme;
 mod ui;
@@ -48,6 +49,13 @@ fn main() -> anyhow::Result<()> {
 
     let window = AppWindow::new()?;
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<UiCommand>();
+
+    // Window focus for the controller's notification gate (events on the
+    // focused, on-screen thread never pop a desktop notification). Sampled
+    // off winit by the 1s geometry poll below; starts false so a launch
+    // that never gains focus (or a locked screen) doesn't suppress
+    // notifications.
+    let window_focused = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
 
     // --- appearance: restore, populate the pickers, wire the callbacks ------
     // All handled here on the UI thread (palette swaps are direct property
@@ -149,6 +157,38 @@ fn main() -> anyhow::Result<()> {
         let on_appearance = on_appearance.clone();
         window.on_appearance_reduce_motion_toggled(move |on| {
             on_appearance(&|a| a.reduce_motion = on);
+        });
+    }
+
+    // --- notifications: restore, wire the toggles ----------------------------
+    // Persisted on this thread like appearance; the controller keeps a copy
+    // to gate what event notifications fire.
+    {
+        let prefs = winstate::load_notifications();
+        window.set_notify_enabled(prefs.enabled);
+        window.set_notify_finish(prefs.on_finish);
+        window.set_notify_fail(prefs.on_fail);
+        window.set_notify_attention(prefs.on_attention);
+        window.set_notify_sound(prefs.sound);
+        let prefs = std::rc::Rc::new(std::cell::RefCell::new(prefs));
+        let tx_prefs = tx.clone();
+        window.on_notify_pref_toggled(move |which, on| {
+            let mut p = prefs.borrow_mut();
+            match which {
+                0 => p.enabled = on,
+                1 => p.on_finish = on,
+                2 => p.on_fail = on,
+                3 => p.on_attention = on,
+                _ => p.sound = on,
+            }
+            winstate::save_notifications(&p);
+            let _ = tx_prefs.send(UiCommand::NotifyPrefsChanged(p.clone()));
+        });
+    }
+    {
+        let tx = tx.clone();
+        window.on_notify_test(move || {
+            let _ = tx.send(UiCommand::NotifyTest);
         });
     }
 
@@ -794,12 +834,13 @@ fn main() -> anyhow::Result<()> {
     // Controller (and spawned server) live on a background tokio runtime.
     let scroll_tx = tx.clone();
     let weak = window.as_weak();
+    let focused = window_focused.clone();
     std::thread::spawn(move || {
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()
             .expect("tokio runtime");
-        runtime.block_on(controller::run(weak, tx, rx));
+        runtime.block_on(controller::run(weak, tx, rx, focused));
     });
 
     // Restore the last window geometry (position picks the monitor too);
@@ -832,12 +873,19 @@ fn main() -> anyhow::Result<()> {
         let weak = window.as_weak();
         let last = std::cell::RefCell::new(restored);
         let last_scroll = std::cell::RefCell::new(f32::NAN);
+        let focused = window_focused.clone();
         geometry_timer.start(
             slint::TimerMode::Repeated,
             std::time::Duration::from_secs(1),
             move || {
                 let Some(window) = weak.upgrade() else { return };
                 let w = window.window();
+                {
+                    use slint::winit_030::WinitWindowAccessor;
+                    if let Some(f) = w.with_winit_window(|w| w.has_focus()) {
+                        focused.store(f, std::sync::atomic::Ordering::Relaxed);
+                    }
+                }
                 let mut next = last.borrow().unwrap_or_default();
                 next.maximized = w.is_maximized();
                 if !next.maximized {

@@ -1094,6 +1094,16 @@ export component AppWindow inherits Window {
     callback appearance-font-picked(int);
     callback appearance-reduce-motion-toggled(bool);
 
+    // Desktop notification preferences (handled on the Rust UI thread;
+    // see src/notify.rs and winstate::Notifications).
+    in-out property <bool> notify-enabled: true;
+    in-out property <bool> notify-finish: true;
+    in-out property <bool> notify-fail: true;
+    in-out property <bool> notify-attention: true;
+    in-out property <bool> notify-sound: false;
+    callback notify-pref-toggled(/* which */ int, /* on */ bool);
+    callback notify-test();
+
     in property <[ThreadTabItem]> threads;
     in property <int> current-thread: -1;
     callback thread-selected(int);
@@ -3728,6 +3738,13 @@ export component AppWindow inherits Window {
         font-names: root.appearance-font-names;
         font-index <=> root.appearance-font-index;
         reduce-motion <=> root.appearance-reduce-motion;
+        notify-enabled <=> root.notify-enabled;
+        notify-finish <=> root.notify-finish;
+        notify-fail <=> root.notify-fail;
+        notify-attention <=> root.notify-attention;
+        notify-sound <=> root.notify-sound;
+        notify-pref-toggled(which, on) => { root.notify-pref-toggled(which, on); }
+        notify-test => { root.notify-test(); }
         provider-saved(id, kind, url, key) => {
             root.provider-saved(id, kind, url, key);
         }

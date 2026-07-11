@@ -57,6 +57,17 @@ pub enum UiCommand {
     /// (syntax-highlight segments, inline-code tints). The palette itself
     /// was already swapped on the UI thread.
     AppearanceChanged,
+    /// Notification preferences toggled (already persisted on the UI
+    /// thread); the controller keeps a copy to gate event notifications.
+    NotifyPrefsChanged(crate::winstate::Notifications),
+    /// "Send test notification" in settings.
+    NotifyTest,
+    /// A desktop notification was clicked: raise the window and reveal the
+    /// thread it was about.
+    NotificationActivated {
+        session_id: String,
+        thread_id: String,
+    },
 
     // New-chat screens.
     NewSession,
@@ -331,6 +342,15 @@ struct Controller {
 
     vms: HashMap<String, ThreadViewModel>,
     followed: HashSet<String>,
+    /// thread id → session id, for notifications about backgrounded
+    /// threads (`threads` only holds the open session's).
+    thread_sessions: HashMap<String, String>,
+    /// Desktop notification preferences; persisted on the UI thread, this
+    /// copy gates what event notifications fire.
+    notify: crate::winstate::Notifications,
+    /// Whether the app window has focus (winit Focused events, written on
+    /// the UI thread). Focused + on-screen threads never notify.
+    window_focused: std::sync::Arc<std::sync::atomic::AtomicBool>,
     expanded_tools: HashSet<String>,
     /// (thread id, turn) pairs showing raw text instead of styled markdown.
     raw_turns: HashSet<(String, u64)>,
@@ -410,6 +430,7 @@ pub async fn run(
     ui: slint::Weak<crate::AppWindow>,
     tx: mpsc::UnboundedSender<UiCommand>,
     mut rx: mpsc::UnboundedReceiver<UiCommand>,
+    window_focused: std::sync::Arc<std::sync::atomic::AtomicBool>,
 ) {
     let (client, _server) = match start_local_server().await {
         Ok(pair) => pair,
@@ -443,6 +464,9 @@ pub async fn run(
         pr_error: String::new(),
         vms: HashMap::new(),
         followed: HashSet::new(),
+        thread_sessions: HashMap::new(),
+        notify: crate::winstate::load_notifications(),
+        window_focused,
         expanded_tools: HashSet::new(),
         raw_turns: HashSet::new(),
         collapsed_cards: HashSet::new(),
@@ -731,6 +755,81 @@ impl Controller {
         }
     }
 
+    /// Pop a desktop notification for events the user would miss: the
+    /// window is unfocused or the thread isn't the one on screen. Followers
+    /// replay each thread's history from cursor 0, so anything but a fresh
+    /// event (by append timestamp) is skipped.
+    fn maybe_notify(&self, thread_id: &str, envelope: &EventEnvelope) {
+        if !self.notify.enabled {
+            return;
+        }
+        let focused = self
+            .window_focused
+            .load(std::sync::atomic::Ordering::Relaxed);
+        let visible = self.current_thread_id().as_deref() == Some(thread_id);
+        if focused && visible {
+            return;
+        }
+        // A future ts (clock skew) errors in elapsed(); treat it as fresh.
+        let fresh = std::time::SystemTime::from(envelope.ts)
+            .elapsed()
+            .map(|age| age < std::time::Duration::from_secs(10))
+            .unwrap_or(true);
+        if !fresh {
+            return;
+        }
+
+        use trouve_protocol::Event;
+        let (summary, detail) = match &envelope.event {
+            Event::TurnCompleted { .. } if self.notify.on_finish => {
+                ("Agent finished".to_string(), None)
+            }
+            Event::TurnFailed { error, .. } if self.notify.on_fail => {
+                let mut error = error.trim().to_string();
+                if error.len() > 120 {
+                    error.truncate(120);
+                    error.push('…');
+                }
+                ("Turn failed".to_string(), Some(error))
+            }
+            Event::ApprovalRequested { .. } if self.notify.on_attention => {
+                ("Approval needed".to_string(), None)
+            }
+            Event::QuestionRequested { title, .. } if self.notify.on_attention => (
+                "The agent has a question".to_string(),
+                title.clone().filter(|t| !t.is_empty()),
+            ),
+            _ => return,
+        };
+
+        let session_id = self
+            .thread_sessions
+            .get(thread_id)
+            .cloned()
+            .unwrap_or_default();
+        let session_title = self
+            .sessions
+            .iter()
+            .find(|s| s.id == session_id)
+            .map(|s| s.title.clone())
+            .unwrap_or_default();
+        let body = match detail {
+            Some(detail) if session_title.is_empty() => detail,
+            Some(detail) => format!("{session_title}\n{detail}"),
+            None => session_title,
+        };
+        crate::notify::show(
+            crate::notify::Toast {
+                summary,
+                body,
+                sound: self.notify.sound,
+                session_id,
+                thread_id: thread_id.to_string(),
+            },
+            self.tx.clone(),
+        );
+    }
+
     fn nav_session(&self, row: usize) -> Option<usize> {
         match self.nav.get(row) {
             Some(NavEntry::Session(i)) => Some(*i),
@@ -772,6 +871,10 @@ impl Controller {
         self.push_nav();
         let session_id = self.sessions[index].id.clone();
         self.threads = self.client.list_threads(&session_id).await?;
+        for t in &self.threads {
+            self.thread_sessions
+                .insert(t.id.clone(), session_id.clone());
+        }
         // Reopen the thread the user last had open in this session; first
         // thread when there's no bookmark (or it was deleted).
         self.current_thread = self
@@ -3101,7 +3204,37 @@ impl Controller {
                         self.refresh_usage_text().await;
                     }
                 }
+                self.maybe_notify(&thread_id, &envelope);
                 self.push_agents_running();
+            }
+            UiCommand::NotifyPrefsChanged(prefs) => self.notify = prefs,
+            UiCommand::NotifyTest => {
+                crate::notify::show(
+                    crate::notify::Toast {
+                        summary: "Test notification".into(),
+                        body: "Notifications are working.".into(),
+                        sound: self.notify.sound,
+                        session_id: self.current_session_id().unwrap_or_default(),
+                        thread_id: self.current_thread_id().unwrap_or_default(),
+                    },
+                    self.tx.clone(),
+                );
+            }
+            UiCommand::NotificationActivated {
+                session_id,
+                thread_id,
+            } => {
+                ui::raise_window(&self.ui);
+                if !session_id.is_empty() && self.current_session_id() != Some(session_id.clone()) {
+                    if let Some(i) = self.sessions.iter().position(|s| s.id == session_id) {
+                        self.select_session(i).await?;
+                    }
+                }
+                if let Some(i) = self.threads.iter().position(|t| t.id == thread_id) {
+                    if self.current_thread != Some(i) {
+                        let _ = self.tx.send(UiCommand::SelectThread(i));
+                    }
+                }
             }
             UiCommand::QuitWhenIdle => {
                 self.quit_when_idle = true;
@@ -3154,6 +3287,8 @@ impl Controller {
                 permission_mode: None,
             })
             .await?;
+        self.thread_sessions
+            .insert(thread.id.clone(), thread.session_id.clone());
         self.threads.push(thread);
         self.current_thread = Some(self.threads.len() - 1);
         self.push_threads();

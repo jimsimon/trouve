@@ -84,6 +84,43 @@ pub struct Appearance {
     pub reduce_motion: bool,
 }
 
+/// Desktop notification preferences. Client-side: whether *this* frontend
+/// pops system notifications is not protocol state.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Notifications {
+    /// Master switch; off suppresses everything below.
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// A turn finished (agent is done / next queued prompt starts).
+    #[serde(default = "default_true")]
+    pub on_finish: bool,
+    /// A turn failed.
+    #[serde(default = "default_true")]
+    pub on_fail: bool,
+    /// The agent is blocked on the user: approval request or question.
+    #[serde(default = "default_true")]
+    pub on_attention: bool,
+    /// Ask the notification server to play a sound too.
+    #[serde(default)]
+    pub sound: bool,
+}
+
+impl Default for Notifications {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            on_finish: true,
+            on_fail: true,
+            on_attention: true,
+            sound: false,
+        }
+    }
+}
+
+fn default_true() -> bool {
+    true
+}
+
 fn default_theme() -> String {
     "dark".into()
 }
@@ -145,6 +182,18 @@ pub fn load_appearance() -> Appearance {
 
 pub fn save_appearance(appearance: &Appearance) {
     write_json(config_path("appearance.json"), appearance);
+}
+
+pub fn load_notifications() -> Notifications {
+    let read = || {
+        let text = std::fs::read_to_string(config_path("notifications.json")?).ok()?;
+        serde_json::from_str::<Notifications>(&text).ok()
+    };
+    read().unwrap_or_default()
+}
+
+pub fn save_notifications(notifications: &Notifications) {
+    write_json(config_path("notifications.json"), notifications);
 }
 
 pub fn load_resume() -> Resume {

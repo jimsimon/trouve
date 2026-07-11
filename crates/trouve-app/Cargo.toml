@@ -17,7 +17,9 @@ anyhow.workspace = true
 dirs.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-slint.workspace = true
+# unstable-winit-030 exposes the winit window (focus tracking + raise for
+# notification clicks); the winit backend itself is already the default.
+slint = { workspace = true, features = ["unstable-winit-030"] }
 tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
@@ -36,6 +38,8 @@ open = "5.3.6"
 # Fuzzy filtering for the model search picker.
 fuzzy-matcher = "0.3"
 shlex = "2.0.1"
+# Desktop notifications (turn finished / needs attention).
+notify-rust = "4.18.0"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 # PR_SET_PDEATHSIG so the spawned server dies with the app.

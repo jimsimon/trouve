@@ -149,6 +149,44 @@ component DownloadBar inherits Rectangle {
     }
 }
 
+// An On/Off pill with a wrapping description beside it (the style the
+// Appearance section's "Reduce motion" established).
+component ToggleRow inherits HorizontalLayout {
+    in-out property <bool> on;
+    in property <string> label;
+    callback toggled(bool);
+    spacing: 10px;
+    Rectangle {
+        width: 44px;
+        height: Theme.fs(26px);
+        background: root.on ? Theme.c.accent-bg : Theme.c.control-bg;
+        border-radius: 6px;
+        border-width: 1px;
+        border-color: root.on ? Theme.c.primary-border : Theme.c.border;
+        TouchArea {
+            clicked => {
+                root.on = !root.on;
+                root.toggled(root.on);
+            }
+        }
+        Text {
+            text: root.on ? "On" : "Off";
+            color: root.on ? Theme.c.text-hi : Theme.c.text-soft;
+            font-size: Theme.fs(12px);
+            horizontal-alignment: center;
+            vertical-alignment: center;
+        }
+    }
+    Text {
+        text: root.label;
+        color: Theme.c.text-mid;
+        font-size: Theme.fs(12px);
+        vertical-alignment: center;
+        wrap: word-wrap;
+        horizontal-stretch: 1;
+    }
+}
+
 // One metered subscription window: label, usage bar, reset note. The bar
 // shifts to warn/err colors as the window fills up.
 component SubscriptionMeter inherits VerticalLayout {
@@ -229,6 +267,17 @@ export component SettingsScreen inherits Rectangle {
     in property <[string]> font-names;
     in-out property <int> font-index: 0;
     in-out property <bool> reduce-motion: false;
+
+    // Desktop notifications: master switch, per-event toggles, sound.
+    // Toggles report through notify-pref-toggled(which, on) — which is
+    // 0 enabled, 1 finish, 2 fail, 3 attention, 4 sound.
+    in-out property <bool> notify-enabled: true;
+    in-out property <bool> notify-finish: true;
+    in-out property <bool> notify-fail: true;
+    in-out property <bool> notify-attention: true;
+    in-out property <bool> notify-sound: false;
+    callback notify-pref-toggled(/* which */ int, /* on */ bool);
+    callback notify-test();
 
     callback provider-saved(/* id */ string, /* kind */ string,
                             /* base-url */ string, /* api-key */ string);
@@ -342,11 +391,11 @@ export component SettingsScreen inherits Rectangle {
     in-out property <int> mode-form-model: -1;
 
     // Side-nav selection: 0 providers, 1 modes & models, 2 local models,
-    // 3 mcp servers, 4 integrations, 5 appearance, 6 about. in-out so the
-    // app can open straight to a section (e.g. the PR tab's "set up
-    // GitHub" button).
+    // 3 mcp servers, 4 integrations, 5 appearance, 6 notifications,
+    // 7 about. in-out so the app can open straight to a section (e.g. the
+    // PR tab's "set up GitHub" button).
     in-out property <int> section: 0;
-    property <[string]> section-names: ["Providers", "Modes & Models", "Local Models", "MCP Servers", "Integrations", "Appearance", "About"];
+    property <[string]> section-names: ["Providers", "Modes & Models", "Local Models", "MCP Servers", "Integrations", "Appearance", "Notifications", "About"];
 
     VerticalLayout {
         // Header: title + a way back to wherever the user came from.
@@ -1735,42 +1784,73 @@ export component SettingsScreen inherits Rectangle {
                                 wrap: word-wrap;
                             }
 
-                            HorizontalLayout {
-                                spacing: 10px;
-                                Rectangle {
-                                    width: 44px;
-                                    height: Theme.fs(26px);
-                                    background: root.reduce-motion ? Theme.c.accent-bg : Theme.c.control-bg;
-                                    border-radius: 6px;
-                                    border-width: 1px;
-                                    border-color: root.reduce-motion ? Theme.c.primary-border : Theme.c.border;
-                                    TouchArea {
-                                        clicked => {
-                                            root.reduce-motion = !root.reduce-motion;
-                                            root.reduce-motion-toggled(root.reduce-motion);
-                                        }
-                                    }
-                                    Text {
-                                        text: root.reduce-motion ? "On" : "Off";
-                                        color: root.reduce-motion ? Theme.c.text-hi : Theme.c.text-soft;
-                                        font-size: Theme.fs(12px);
-                                        horizontal-alignment: center;
-                                        vertical-alignment: center;
-                                    }
+                            ToggleRow {
+                                on <=> root.reduce-motion;
+                                label: "Reduce motion — replace spinners and other animation with static indicators.";
+                                toggled(on) => { root.reduce-motion-toggled(on); }
+                            }
+                        }
+
+                        // ---------------- notifications ----------------
+                        if root.section == 6: VerticalLayout {
+                            spacing: 12px;
+
+                            Text {
+                                text: "Notifications";
+                                color: Theme.c.text-hi;
+                                font-size: Theme.fs(16px);
+                                font-weight: 700;
+                            }
+                            Text {
+                                text: "System notifications for agent activity you'd otherwise miss: they fire when the window is in the background or the event belongs to a session that isn't on screen.";
+                                color: Theme.c.text-soft;
+                                font-size: Theme.fs(11px);
+                                wrap: word-wrap;
+                            }
+
+                            ToggleRow {
+                                on <=> root.notify-enabled;
+                                label: "Enable desktop notifications.";
+                                toggled(on) => { root.notify-pref-toggled(0, on); }
+                            }
+
+                            if root.notify-enabled: VerticalLayout {
+                                spacing: 12px;
+                                padding-left: 12px;
+                                ToggleRow {
+                                    on <=> root.notify-finish;
+                                    label: "Agent finished — a turn completed.";
+                                    toggled(on) => { root.notify-pref-toggled(1, on); }
                                 }
-                                Text {
-                                    text: "Reduce motion — replace spinners and other animation with static indicators.";
-                                    color: Theme.c.text-mid;
-                                    font-size: Theme.fs(12px);
-                                    vertical-alignment: center;
-                                    wrap: word-wrap;
-                                    horizontal-stretch: 1;
+                                ToggleRow {
+                                    on <=> root.notify-fail;
+                                    label: "Turn failed — a turn ended with an error.";
+                                    toggled(on) => { root.notify-pref-toggled(2, on); }
+                                }
+                                ToggleRow {
+                                    on <=> root.notify-attention;
+                                    label: "Needs attention — the agent is waiting on an approval or a question.";
+                                    toggled(on) => { root.notify-pref-toggled(3, on); }
+                                }
+                                ToggleRow {
+                                    on <=> root.notify-sound;
+                                    label: "Play a sound with each notification.";
+                                    toggled(on) => { root.notify-pref-toggled(4, on); }
+                                }
+                            }
+
+                            HorizontalLayout {
+                                alignment: start;
+                                Button {
+                                    text: "Send test notification";
+                                    enabled: root.notify-enabled;
+                                    clicked => { root.notify-test(); }
                                 }
                             }
                         }
 
                         // ---------------- about ----------------
-                        if root.section == 6: VerticalLayout {
+                        if root.section == 7: VerticalLayout {
                             spacing: 12px;
 
                             Text {
