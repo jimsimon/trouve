@@ -155,10 +155,7 @@ pub fn remove_server(path: &Path, name: &str) -> Result<()> {
     })
 }
 
-fn edit_file(
-    path: &Path,
-    mutate: impl FnOnce(&mut serde_json::Map<String, Value>),
-) -> Result<()> {
+fn edit_file(path: &Path, mutate: impl FnOnce(&mut serde_json::Map<String, Value>)) -> Result<()> {
     let mut doc: Value = match std::fs::read_to_string(path) {
         Ok(text) => serde_json::from_str(&text)
             .with_context(|| format!("{} is not valid JSON", path.display()))?,
@@ -421,7 +418,10 @@ pub async fn probe(server: &str, config: &McpServerConfig, logs: &McpLogStore) -
     .await
     .map_err(|_| anyhow::anyhow!("timed out after 10s during the MCP handshake"))?;
     match &connection {
-        Ok(c) => logs.push(server, format!("health check: ok ({} tools)", c.tools().len())),
+        Ok(c) => logs.push(
+            server,
+            format!("health check: ok ({} tools)", c.tools().len()),
+        ),
         Err(e) => logs.push(server, format!("health check: failed: {e:#}")),
     }
     Ok(connection?.tools().len())
@@ -465,11 +465,12 @@ impl McpManager {
         let config = configs
             .get(server)
             .with_context(|| format!("no MCP server '{server}' configured"))?;
-        let connection = std::sync::Arc::new(
-            McpConnection::connect(server, config, Some(&self.logs)).await?,
+        let connection =
+            std::sync::Arc::new(McpConnection::connect(server, config, Some(&self.logs)).await?);
+        self.logs.push(
+            server,
+            format!("connected ({} tools)", connection.tools().len()),
         );
-        self.logs
-            .push(server, format!("connected ({} tools)", connection.tools().len()));
         connections.insert(key, connection.clone());
         Ok(connection)
     }
@@ -732,7 +733,13 @@ for line in sys.stdin:
         assert_eq!(specs[0].name, "mcp__fake__echo");
 
         let (is_error, value) = manager
-            .call(None, None, tmp.path(), "mcp__fake__echo", &json!({"text": "hi"}))
+            .call(
+                None,
+                None,
+                tmp.path(),
+                "mcp__fake__echo",
+                &json!({"text": "hi"}),
+            )
             .await
             .unwrap();
         assert!(!is_error);

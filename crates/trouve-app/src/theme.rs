@@ -433,6 +433,8 @@ pub fn apply(ui: &crate::AppWindow, appearance: &crate::winstate::Appearance) {
     // re-renders existing rows.
     crate::render::set_syntax_dark(def.dark);
     crate::render::set_inline_code_tint(p.warn);
+    // The terminal grid bakes its default colors the same way.
+    crate::render::set_term_colors(p.code_fg, p.code_bg);
 }
 
 /// UI font families offered in the Appearance picker: the system default

@@ -279,7 +279,10 @@ default_permission_mode = "ask"
         assert_eq!(infos[0].mode.id, "code");
 
         // Customize a built-in and add a custom mode.
-        let mut plan = builtin_modes().into_iter().find(|m| m.id == "plan").unwrap();
+        let mut plan = builtin_modes()
+            .into_iter()
+            .find(|m| m.id == "plan")
+            .unwrap();
         plan.display_name = "My Plan".into();
         plan.default_model = Some("openai/gpt-4.1-mini".into());
         upsert_user_mode(config, &plan).unwrap();

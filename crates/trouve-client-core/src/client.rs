@@ -188,10 +188,7 @@ impl ProtocolClient {
 
     // --- queued prompts ---------------------------------------------------
 
-    pub async fn list_queue(
-        &self,
-        thread_id: &str,
-    ) -> Result<Vec<trouve_protocol::QueuedPrompt>> {
+    pub async fn list_queue(&self, thread_id: &str) -> Result<Vec<trouve_protocol::QueuedPrompt>> {
         self.get_json(&format!("/threads/{thread_id}/queue")).await
     }
 
@@ -451,6 +448,116 @@ impl ProtocolClient {
             .await
     }
 
+    // --- integrated terminal -------------------------------------------
+
+    /// Open (or re-attach to) the session's shell terminal.
+    pub async fn open_terminal(
+        &self,
+        session_id: &str,
+        cols: u16,
+        rows: u16,
+    ) -> Result<TerminalInfo> {
+        self.post_json(
+            &format!("/sessions/{session_id}/terminal"),
+            &OpenTerminalRequest { cols, rows },
+        )
+        .await
+    }
+
+    /// Write raw bytes (already key-encoded) to the terminal's PTY.
+    pub async fn terminal_input(&self, terminal_id: &str, bytes: &[u8]) -> Result<()> {
+        use base64::Engine as _;
+        let body = TerminalInputRequest {
+            data: base64::engine::general_purpose::STANDARD.encode(bytes),
+        };
+        let path = format!("/terminals/{terminal_id}/input");
+        let resp = self
+            .http
+            .post(format!("{}{path}", self.base))
+            .json(&body)
+            .send()
+            .await
+            .with_context(|| format!("POST {path}"))?;
+        if !resp.status().is_success() {
+            bail!("{path}: {}", resp.status());
+        }
+        Ok(())
+    }
+
+    pub async fn terminal_resize(&self, terminal_id: &str, cols: u16, rows: u16) -> Result<()> {
+        let path = format!("/terminals/{terminal_id}/resize");
+        let resp = self
+            .http
+            .post(format!("{}{path}", self.base))
+            .json(&TerminalResizeRequest { cols, rows })
+            .send()
+            .await
+            .with_context(|| format!("POST {path}"))?;
+        if !resp.status().is_success() {
+            bail!("{path}: {}", resp.status());
+        }
+        Ok(())
+    }
+
+    /// Kill the terminal's shell (the next open starts a fresh one).
+    pub async fn kill_terminal(&self, terminal_id: &str) -> Result<()> {
+        self.delete(&format!("/terminals/{terminal_id}")).await
+    }
+
+    /// Follow a terminal's output from byte offset `after`, invoking
+    /// `on_chunk` with (end offset, raw bytes). Returns `(offset, exited)`:
+    /// `exited: true` means the shell is gone; `false` means the stream
+    /// dropped or lagged and the caller may reconnect from `offset`.
+    pub async fn follow_terminal(
+        &self,
+        terminal_id: &str,
+        after: u64,
+        mut on_chunk: impl FnMut(u64, Vec<u8>) -> std::ops::ControlFlow<()>,
+    ) -> Result<(u64, bool)> {
+        use base64::Engine as _;
+        let resp = self
+            .http
+            .get(format!(
+                "{}/terminals/{terminal_id}/output?after={after}",
+                self.base
+            ))
+            .send()
+            .await?;
+        if !resp.status().is_success() {
+            bail!("terminal output: {}", resp.status());
+        }
+        let mut stream = resp.bytes_stream();
+        let mut buf = String::new();
+        let mut last = after;
+        let mut id: Option<u64> = None;
+        while let Some(chunk) = stream.next().await {
+            buf.push_str(&String::from_utf8_lossy(&chunk?));
+            while let Some(pos) = buf.find('\n') {
+                let line = buf[..pos].trim().to_string();
+                buf.drain(..=pos);
+                if let Some(v) = line.strip_prefix("id:") {
+                    id = v.trim().parse().ok();
+                } else if line == "event: exit" {
+                    return Ok((last, true));
+                } else if line == "event: lagged" {
+                    return Ok((last, false));
+                } else if let Some(data) = line.strip_prefix("data:") {
+                    let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(data.trim())
+                    else {
+                        continue;
+                    };
+                    if let Some(end) = id.take() {
+                        last = end;
+                    }
+                    if !bytes.is_empty() && on_chunk(last, bytes).is_break() {
+                        return Ok((last, true));
+                    }
+                }
+            }
+        }
+        Ok((last, false))
+    }
+
     pub async fn session_pr(&self, session_id: &str) -> Result<Option<PrInfo>> {
         self.get_json(&format!("/sessions/{session_id}/pr")).await
     }
@@ -474,11 +581,7 @@ impl ProtocolClient {
         self.get_json(&path).await
     }
 
-    pub async fn upsert_mcp_server(
-        &self,
-        name: &str,
-        req: &UpsertMcpServerRequest,
-    ) -> Result<()> {
+    pub async fn upsert_mcp_server(&self, name: &str, req: &UpsertMcpServerRequest) -> Result<()> {
         let resp = self
             .http
             .put(format!("{}/mcp-servers/{name}", self.base))

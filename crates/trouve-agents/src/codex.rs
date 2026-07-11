@@ -470,7 +470,10 @@ fn turn_stream(
                         usage.output_tokens += u.output_tokens;
                         if let Some(n) = u.context_window {
                             usage.context_window = Some(n);
-                            observed_windows.lock().unwrap().insert(model_name.clone(), n);
+                            observed_windows
+                                .lock()
+                                .unwrap()
+                                .insert(model_name.clone(), n);
                         }
                     }
                     "turn/completed" => {
@@ -592,9 +595,16 @@ fn parse_rate_limits(provider_id: &str, value: &Value) -> trouve_protocol::Subsc
         .get("credits")
         .filter(|c| !c.is_null())
         .map(|c| {
-            if c.get("unlimited").and_then(|u| u.as_bool()).unwrap_or(false) {
+            if c.get("unlimited")
+                .and_then(|u| u.as_bool())
+                .unwrap_or(false)
+            {
                 "unlimited credits".to_string()
-            } else if c.get("hasCredits").and_then(|h| h.as_bool()).unwrap_or(false) {
+            } else if c
+                .get("hasCredits")
+                .and_then(|h| h.as_bool())
+                .unwrap_or(false)
+            {
                 match c.get("balance").and_then(|b| b.as_str()) {
                     Some(balance) => format!("credits: {balance}"),
                     None => String::new(),

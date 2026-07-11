@@ -21,6 +21,13 @@ use trouve_protocol::{
 use crate::render;
 use crate::ui::{self, NavRowData};
 
+/// Right-panel tab index of the integrated terminal (see app.slint's
+/// TabWidget order: Diff, Files, Pull Requests, MCP, Terminal).
+const TERMINAL_TAB: i32 = 4;
+
+/// Terminal scrollback the client-side screen model keeps, in lines.
+const TERM_SCROLLBACK: usize = 5000;
+
 #[derive(Debug)]
 pub enum UiCommand {
     // Left nav.
@@ -124,6 +131,8 @@ pub enum UiCommand {
     ComposerFastToggled(bool),
 
     // Right column.
+    /// The right panel switched tabs (terminal attaches lazily on visit).
+    RightTabChanged(i32),
     RefreshDiff,
     ToggleDiffFile(usize),
     Undo,
@@ -184,7 +193,10 @@ pub enum UiCommand {
     /// Stop the llama-server sidecar to free memory.
     LocalStopServer,
     /// Register a custom GGUF (HuggingFace repo + file).
-    LocalAddModel { repo: String, file: String },
+    LocalAddModel {
+        repo: String,
+        file: String,
+    },
     /// Open settings straight to the Integrations section.
     OpenIntegrationsSettings,
     /// Store/remove the GitHub token (empty = remove).
@@ -216,6 +228,37 @@ pub enum UiCommand {
     SessionMcpLoaded(String, Result<Vec<trouve_protocol::McpServerInfo>, String>),
     /// Internal: the subscription health fetch finished.
     SubscriptionsLoaded(Vec<trouve_protocol::SubscriptionHealth>),
+
+    // Terminal tab.
+    /// A key press in the terminal grid (text + modifiers, Slint encoding).
+    TermKey {
+        text: String,
+        ctrl: bool,
+        alt: bool,
+    },
+    /// Clipboard text pasted into the terminal.
+    TermPaste(String),
+    /// Mouse wheel over the terminal (+ = towards history), in lines.
+    TermWheel(i32),
+    /// The grid re-measured to a new cell size.
+    TermResized {
+        cols: u16,
+        rows: u16,
+    },
+    /// Kill the shell and start a fresh one.
+    TermRestart,
+    /// Internal: output bytes arrived for a terminal (end offset included).
+    TermOutput {
+        session_id: String,
+        terminal_id: String,
+        offset: u64,
+        bytes: Vec<u8>,
+    },
+    /// Internal: a terminal's output stream ended (shell exit / kill).
+    TermEnded {
+        session_id: String,
+        terminal_id: String,
+    },
 
     /// Internal: an event arrived on some thread's stream.
     Event(String, Box<EventEnvelope>),
@@ -318,6 +361,25 @@ struct Controller {
     /// Worktree-relative path of the file open in the Files tab, for
     /// re-highlighting after a theme change.
     open_file: Option<String>,
+
+    /// Which right-panel tab is showing (terminal attaches lazily on 4).
+    right_tab: i32,
+    /// Attached terminals by session id. Screen state lives client-side;
+    /// followers keep feeding backgrounded sessions so switching back is
+    /// instant.
+    terms: HashMap<String, TermState>,
+    /// Last grid size reported by the UI (used for opens before the first
+    /// resize event lands).
+    term_view: (u16, u16),
+}
+
+/// Client-side state of one session's terminal.
+struct TermState {
+    terminal_id: String,
+    grid: slint_terminal::GridState,
+    /// Bytes consumed from the output stream (resume offset).
+    offset: u64,
+    exited: bool,
 }
 
 /// One visible row of the Files tree.
@@ -389,6 +451,9 @@ pub async fn run(
         file_expanded: HashSet::new(),
         file_rows: Vec::new(),
         open_file: None,
+        right_tab: 0,
+        terms: HashMap::new(),
+        term_view: (80, 24),
     };
 
     if let Err(e) = ctl.bootstrap().await {
@@ -721,6 +786,13 @@ impl Controller {
         self.pr_selected = 0;
         self.refresh_prs();
         self.refresh_session_mcp();
+        // The terminal tab always reflects the open session: attach (or
+        // reuse the running attachment) when it's showing.
+        if self.right_tab == TERMINAL_TAB {
+            self.ensure_terminal().await;
+        } else {
+            self.push_term();
+        }
         Ok(())
     }
 
@@ -965,6 +1037,131 @@ impl Controller {
             .queue
             .get(index)
             .map(|p| p.id.clone())
+    }
+
+    // --- terminal tab -----------------------------------------------------
+
+    /// The current session's attached, still-running terminal.
+    fn term_attached(&self) -> Option<(String, &TermState)> {
+        let state = self.terms.get(&self.current_session_id()?)?;
+        if state.exited {
+            return None;
+        }
+        Some((state.terminal_id.clone(), state))
+    }
+
+    fn current_term_mut(&mut self) -> Option<&mut TermState> {
+        let session_id = self.current_session_id()?;
+        self.terms.get_mut(&session_id)
+    }
+
+    /// Attach the current session's terminal: reuse the running attachment,
+    /// otherwise open (or re-open after exit) server-side and start a
+    /// follower task streaming output back as [`UiCommand::TermOutput`].
+    async fn ensure_terminal(&mut self) {
+        let Some(session_id) = self.current_session_id() else {
+            self.push_term();
+            return;
+        };
+        if self.terms.get(&session_id).is_some_and(|s| !s.exited) {
+            self.push_term();
+            return;
+        }
+        let (cols, rows) = self.term_view;
+        let info = match self.client.open_terminal(&session_id, cols, rows).await {
+            Ok(info) => info,
+            Err(e) => {
+                self.error(&format!("terminal: {e:#}"));
+                return;
+            }
+        };
+        // Size the screen model like the view; the server PTY follows on
+        // the next resize event if it disagrees.
+        let mut state = TermState {
+            terminal_id: info.id.clone(),
+            grid: slint_terminal::GridState::new(rows, cols, TERM_SCROLLBACK),
+            offset: 0,
+            exited: info.exited,
+        };
+        if (info.cols, info.rows) != (cols, rows) {
+            let _ = self.client.terminal_resize(&info.id, cols, rows).await;
+        }
+        state.grid.resize(rows, cols);
+        self.terms.insert(session_id.clone(), state);
+        self.push_term();
+
+        // Follower: replays the backlog, then streams live output until the
+        // shell exits or the terminal is killed. A dropped/lagged stream
+        // reconnects from the last offset (the server replays its backlog).
+        // Output goes through the command channel so all screen state stays
+        // on the controller.
+        let client = self.client.clone();
+        let tx = self.tx.clone();
+        let terminal_id = info.id.clone();
+        tokio::spawn(async move {
+            let mut after = 0u64;
+            loop {
+                let result = client
+                    .follow_terminal(&terminal_id, after, |offset, bytes| {
+                        if tx
+                            .send(UiCommand::TermOutput {
+                                session_id: session_id.clone(),
+                                terminal_id: terminal_id.clone(),
+                                offset,
+                                bytes,
+                            })
+                            .is_err()
+                        {
+                            return std::ops::ControlFlow::Break(());
+                        }
+                        std::ops::ControlFlow::Continue(())
+                    })
+                    .await;
+                match result {
+                    Ok((_, true)) => break,
+                    Ok((offset, false)) => {
+                        after = offset;
+                        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+                    }
+                    // Gone (killed / server restart): stop following.
+                    Err(e) => {
+                        tracing::debug!("terminal follower ended: {e:#}");
+                        break;
+                    }
+                }
+            }
+            let _ = tx.send(UiCommand::TermEnded {
+                session_id,
+                terminal_id,
+            });
+        });
+    }
+
+    /// Render the current session's terminal screen into the UI (or the
+    /// detached placeholder when there is none).
+    fn push_term(&mut self) {
+        let Some(state) = self
+            .current_session_id()
+            .and_then(|sid| self.terms.get(&sid))
+        else {
+            ui::set_term(&self.ui, Vec::new(), None, 0, String::new(), false);
+            return;
+        };
+        let (fg, bg) = render::term_colors();
+        let rows = state.grid.rows(fg, bg);
+        let status = if state.exited {
+            "shell exited".to_string()
+        } else {
+            String::new()
+        };
+        ui::set_term(
+            &self.ui,
+            rows,
+            state.grid.cursor(),
+            state.grid.scrollback_offset(),
+            status,
+            true,
+        );
     }
 
     /// Push the context dial: last turn's input tokens vs the model window.
@@ -1559,7 +1756,11 @@ impl Controller {
             hw_line.push_str(" · no GPU detected (models run on the CPU)");
         }
         for gpu in &status.gpus {
-            hw_line.push_str(&format!(" · {} {} VRAM", gpu.name, human_gb(gpu.vram_bytes)));
+            hw_line.push_str(&format!(
+                " · {} {} VRAM",
+                gpu.name,
+                human_gb(gpu.vram_bytes)
+            ));
         }
         let runtime_label = match (&status.runtime_installed, &status.runtime_version) {
             (true, Some(v)) => format!("installed ({v})"),
@@ -1570,7 +1771,10 @@ impl Controller {
             "pending" => (true, "downloading llama.cpp…".to_string()),
             "failed" => (
                 false,
-                format!("install failed: {}", install.error.clone().unwrap_or_default()),
+                format!(
+                    "install failed: {}",
+                    install.error.clone().unwrap_or_default()
+                ),
             ),
             _ => (false, String::new()),
         };
@@ -2064,6 +2268,110 @@ impl Controller {
                     ..Default::default()
                 })
                 .await;
+            }
+            UiCommand::RightTabChanged(tab) => {
+                self.right_tab = tab;
+                if tab == TERMINAL_TAB {
+                    self.ensure_terminal().await;
+                }
+            }
+            UiCommand::TermKey { text, ctrl, alt } => {
+                let Some((id, bytes)) = self.term_attached().and_then(|(id, state)| {
+                    slint_terminal::encode_key(&text, ctrl, alt, state.grid.application_cursor())
+                        .map(|b| (id, b))
+                }) else {
+                    return Ok(());
+                };
+                // Typing always snaps back to the live tail.
+                if let Some(state) = self.current_term_mut() {
+                    if state.grid.scrollback_offset() > 0 {
+                        state.grid.scroll_to_live();
+                        self.push_term();
+                    }
+                }
+                if let Err(e) = self.client.terminal_input(&id, &bytes).await {
+                    self.error(&format!("terminal input: {e:#}"));
+                }
+            }
+            UiCommand::TermPaste(text) => {
+                let Some((id, bracketed)) = self
+                    .term_attached()
+                    .map(|(id, state)| (id, state.grid.bracketed_paste()))
+                else {
+                    return Ok(());
+                };
+                let bytes = slint_terminal::encode_paste(&text, bracketed);
+                if let Err(e) = self.client.terminal_input(&id, &bytes).await {
+                    self.error(&format!("terminal paste: {e:#}"));
+                }
+            }
+            UiCommand::TermWheel(lines) => {
+                if let Some(state) = self.current_term_mut() {
+                    state.grid.scroll_lines(lines);
+                    self.push_term();
+                }
+            }
+            UiCommand::TermResized { cols, rows } => {
+                self.term_view = (cols, rows);
+                let Some((id, state)) = self
+                    .current_session_id()
+                    .and_then(|sid| self.terms.get_mut(&sid).map(|s| (s.terminal_id.clone(), s)))
+                else {
+                    return Ok(());
+                };
+                if state.grid.size() != (rows, cols) {
+                    state.grid.resize(rows, cols);
+                    self.push_term();
+                    if let Err(e) = self.client.terminal_resize(&id, cols, rows).await {
+                        tracing::warn!("terminal resize: {e:#}");
+                    }
+                }
+            }
+            UiCommand::TermRestart => {
+                let Some(session_id) = self.current_session_id() else {
+                    return Ok(());
+                };
+                if let Some(state) = self.terms.remove(&session_id) {
+                    // Kill server-side; the follower ends with the stream.
+                    let _ = self.client.kill_terminal(&state.terminal_id).await;
+                }
+                self.ensure_terminal().await;
+            }
+            UiCommand::TermOutput {
+                session_id,
+                terminal_id,
+                offset,
+                bytes,
+            } => {
+                let visible = self.current_session_id().as_deref() == Some(session_id.as_str());
+                // Guard against a stale follower racing a restart.
+                let mut applied = false;
+                if let Some(state) = self.terms.get_mut(&session_id) {
+                    if state.terminal_id == terminal_id {
+                        state.grid.process(&bytes);
+                        state.offset = offset;
+                        applied = true;
+                    }
+                }
+                if applied && visible {
+                    self.push_term();
+                }
+            }
+            UiCommand::TermEnded {
+                session_id,
+                terminal_id,
+            } => {
+                let visible = self.current_session_id().as_deref() == Some(session_id.as_str());
+                let mut applied = false;
+                if let Some(state) = self.terms.get_mut(&session_id) {
+                    if state.terminal_id == terminal_id {
+                        state.exited = true;
+                        applied = true;
+                    }
+                }
+                if applied && visible {
+                    self.push_term();
+                }
             }
             // Background poll: swallow transient errors rather than flashing
             // the error banner every tick.
@@ -2583,10 +2891,7 @@ impl Controller {
                     }
                     // Keep polling while something is in flight.
                     let busy = install.status == "pending"
-                        || status
-                            .models
-                            .iter()
-                            .any(|m| m.download_status == "pending");
+                        || status.models.iter().any(|m| m.download_status == "pending");
                     if busy && !self.local_polling {
                         self.local_polling = true;
                         let tx = self.tx.clone();
@@ -2617,12 +2922,14 @@ impl Controller {
                 self.refresh_local();
             }
             UiCommand::LocalAddModel { repo, file } => {
-                match self.client.add_local_model(&AddLocalModelRequest {
-                    repo,
-                    file,
-                    display_name: None,
-                })
-                .await
+                match self
+                    .client
+                    .add_local_model(&AddLocalModelRequest {
+                        repo,
+                        file,
+                        display_name: None,
+                    })
+                    .await
                 {
                     Ok(()) => {
                         ui::set_local_status(&self.ui, String::new());
@@ -2935,7 +3242,14 @@ fn render_command_line(command: &str, args: &[String]) -> String {
 fn parse_mcp_form(
     command_line: &str,
     env_lines: &str,
-) -> Result<(String, Vec<String>, std::collections::BTreeMap<String, String>), String> {
+) -> Result<
+    (
+        String,
+        Vec<String>,
+        std::collections::BTreeMap<String, String>,
+    ),
+    String,
+> {
     let mut parts = shlex::split(command_line)
         .ok_or_else(|| "command line has unbalanced quotes".to_string())?;
     if parts.is_empty() {

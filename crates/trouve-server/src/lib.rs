@@ -22,15 +22,15 @@ use trouve_core::engine::EngineError;
 use trouve_core::Engine;
 use trouve_protocol::{
     AddLocalModelRequest, AgentMode, BranchList, CliInfo, CliInstallStatus, CliList,
-    CreatePrRequest, LocalStatus, ModeInfo, UpsertModeRequest,
-    CreateSessionRequest, CreateThreadRequest, DirEntry, ErrorBody, FileContent, GithubIntegration,
-    KnownProvider, LoginStarted, LoginStatus, McpLogs, McpServerInfo, MergePrRequest, ModelInfo,
-    PrInfo, ProviderInfo, ProvidersResponse, RegisterWorkspaceRequest, ResolveApprovalRequest,
-    QueuedPrompt, ReorderQueueRequest, ResolveQuestionRequest, Scope, SendMessageRequest,
-    ServerInfo, Session, SessionDiff, SetDefaultModelRequest, SetGithubTokenRequest,
-    SubscriptionHealth, Thread, TurnAccepted, UpdateQueuedPromptRequest, UpdateSessionRequest,
-    UpdateThreadRequest, UpsertMcpServerRequest, UpsertProviderRequest, UsageSummary, Workspace,
-    PROTOCOL_VERSION,
+    CreatePrRequest, CreateSessionRequest, CreateThreadRequest, DirEntry, ErrorBody, FileContent,
+    GithubIntegration, KnownProvider, LocalStatus, LoginStarted, LoginStatus, McpLogs,
+    McpServerInfo, MergePrRequest, ModeInfo, ModelInfo, OpenTerminalRequest, PrInfo, ProviderInfo,
+    ProvidersResponse, QueuedPrompt, RegisterWorkspaceRequest, ReorderQueueRequest,
+    ResolveApprovalRequest, ResolveQuestionRequest, Scope, SendMessageRequest, ServerInfo, Session,
+    SessionDiff, SetDefaultModelRequest, SetGithubTokenRequest, SubscriptionHealth, TerminalInfo,
+    TerminalInputRequest, TerminalResizeRequest, Thread, TurnAccepted, UpdateQueuedPromptRequest,
+    UpdateSessionRequest, UpdateThreadRequest, UpsertMcpServerRequest, UpsertModeRequest,
+    UpsertProviderRequest, UsageSummary, Workspace, PROTOCOL_VERSION,
 };
 use utoipa::OpenApi;
 
@@ -114,6 +114,11 @@ impl IntoResponse for ApiError {
         session_diff,
         session_files,
         session_file,
+        open_terminal,
+        kill_terminal,
+        terminal_input,
+        terminal_resize,
+        terminal_output,
         get_session_pr,
         create_session_pr,
         merge_session_pr,
@@ -167,6 +172,10 @@ impl IntoResponse for ApiError {
         SessionDiff,
         DirEntry,
         FileContent,
+        OpenTerminalRequest,
+        TerminalInfo,
+        TerminalInputRequest,
+        TerminalResizeRequest,
         PrInfo,
         CreatePrRequest,
         MergePrRequest,
@@ -225,6 +234,11 @@ pub fn build_router(engine: Arc<Engine>) -> Router {
         .route("/v1/sessions/{id}/diff", get(session_diff))
         .route("/v1/sessions/{id}/files", get(session_files))
         .route("/v1/sessions/{id}/file", get(session_file))
+        .route("/v1/sessions/{id}/terminal", post(open_terminal))
+        .route("/v1/terminals/{id}", axum::routing::delete(kill_terminal))
+        .route("/v1/terminals/{id}/input", post(terminal_input))
+        .route("/v1/terminals/{id}/resize", post(terminal_resize))
+        .route("/v1/terminals/{id}/output", get(terminal_output))
         .route(
             "/v1/sessions/{id}/pr",
             get(get_session_pr).post(create_session_pr),
@@ -282,10 +296,7 @@ pub fn build_router(engine: Arc<Engine>) -> Router {
         .route("/v1/threads", post(create_thread).get(list_threads))
         .route("/v1/threads/{id}", get(get_thread).patch(update_thread))
         .route("/v1/threads/{id}/messages", post(send_message))
-        .route(
-            "/v1/threads/{id}/queue",
-            get(list_queue).put(reorder_queue),
-        )
+        .route("/v1/threads/{id}/queue", get(list_queue).put(reorder_queue))
         .route("/v1/threads/{id}/queue/dispatch", post(dispatch_queue))
         .route(
             "/v1/queue/{id}",
@@ -686,9 +697,7 @@ async fn start_local_model_download(
 }
 
 #[utoipa::path(post, path = "/v1/local/server/stop", responses((status = 204)))]
-async fn stop_local_server(
-    State(engine): State<Arc<Engine>>,
-) -> axum::http::StatusCode {
+async fn stop_local_server(State(engine): State<Arc<Engine>>) -> axum::http::StatusCode {
     engine.stop_local_server().await;
     axum::http::StatusCode::NO_CONTENT
 }
@@ -835,6 +844,120 @@ async fn session_file(
     }))
 }
 
+#[utoipa::path(post, path = "/v1/sessions/{id}/terminal", params(("id" = String, Path,)),
+    request_body = OpenTerminalRequest,
+    responses((status = 200, body = TerminalInfo), (status = 404, body = ErrorBody)))]
+async fn open_terminal(
+    State(engine): State<Arc<Engine>>,
+    Path(id): Path<String>,
+    Json(req): Json<OpenTerminalRequest>,
+) -> Result<Json<TerminalInfo>, ApiError> {
+    Ok(Json(engine.open_terminal(&id, req.cols, req.rows)?))
+}
+
+#[utoipa::path(delete, path = "/v1/terminals/{id}", params(("id" = String, Path,)),
+    responses((status = 204), (status = 404, body = ErrorBody)))]
+async fn kill_terminal(
+    State(engine): State<Arc<Engine>>,
+    Path(id): Path<String>,
+) -> Result<StatusCode, ApiError> {
+    engine.terminal_kill(&id)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+#[utoipa::path(post, path = "/v1/terminals/{id}/input", params(("id" = String, Path,)),
+    request_body = TerminalInputRequest,
+    responses((status = 204), (status = 404, body = ErrorBody)))]
+async fn terminal_input(
+    State(engine): State<Arc<Engine>>,
+    Path(id): Path<String>,
+    Json(req): Json<TerminalInputRequest>,
+) -> Result<StatusCode, ApiError> {
+    use base64::Engine as _;
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(&req.data)
+        .map_err(|e| EngineError::BadRequest(format!("bad base64 input: {e}")))?;
+    engine.terminal_input(&id, &bytes)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+#[utoipa::path(post, path = "/v1/terminals/{id}/resize", params(("id" = String, Path,)),
+    request_body = TerminalResizeRequest,
+    responses((status = 204), (status = 404, body = ErrorBody)))]
+async fn terminal_resize(
+    State(engine): State<Arc<Engine>>,
+    Path(id): Path<String>,
+    Json(req): Json<TerminalResizeRequest>,
+) -> Result<StatusCode, ApiError> {
+    engine.terminal_resize(&id, req.cols, req.rows)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// PTY output as SSE: each event's `id` is the byte offset *after* the
+/// chunk, data is base64. `?after=` resumes from an offset (bytes older
+/// than the retained backlog are silently skipped). A final `exit` event
+/// marks shell exit. Ephemeral — not part of the persisted event log.
+#[utoipa::path(get, path = "/v1/terminals/{id}/output",
+    params(("id" = String, Path,), ("after" = Option<u64>, Query, description = "Resume byte offset")),
+    responses((status = 200, description = "SSE stream of base64 output chunks"),
+              (status = 404, body = ErrorBody)))]
+async fn terminal_output(
+    State(engine): State<Arc<Engine>>,
+    Path(id): Path<String>,
+    Query(q): Query<EventsQuery>,
+) -> Result<Sse<impl Stream<Item = Result<SseEvent, Infallible>>>, ApiError> {
+    use base64::Engine as _;
+    let b64 = base64::engine::general_purpose::STANDARD;
+    let (start, replay, mut live, exited) = engine.terminal_subscribe(&id, q.after.unwrap_or(0))?;
+
+    let (tx, rx) = tokio::sync::mpsc::channel::<SseEvent>(64);
+    tokio::spawn(async move {
+        let mut offset = start;
+        if !replay.is_empty() {
+            offset += replay.len() as u64;
+            let ev = SseEvent::default()
+                .id(offset.to_string())
+                .data(b64.encode(&replay));
+            if tx.send(ev).await.is_err() {
+                return;
+            }
+        }
+        if exited {
+            let _ = tx.send(SseEvent::default().event("exit").data("")).await;
+            return;
+        }
+        loop {
+            match live.recv().await {
+                // Empty chunk = the reader thread's end-of-stream sentinel.
+                Ok(chunk) if chunk.is_empty() => {
+                    let _ = tx.send(SseEvent::default().event("exit").data("")).await;
+                    return;
+                }
+                Ok(chunk) => {
+                    offset += chunk.len() as u64;
+                    let ev = SseEvent::default()
+                        .id(offset.to_string())
+                        .data(b64.encode(&chunk));
+                    if tx.send(ev).await.is_err() {
+                        return;
+                    }
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                    // Dropped chunks would corrupt the escape-code stream;
+                    // tell the client to reconnect (it replays the backlog).
+                    let _ = tx.send(SseEvent::default().event("lagged").data("")).await;
+                    return;
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
+            }
+        }
+    });
+    Ok(
+        Sse::new(futures::StreamExt::map(ReceiverStream::new(rx), Ok))
+            .keep_alive(KeepAlive::default()),
+    )
+}
+
 #[utoipa::path(get, path = "/v1/sessions/{id}/pr", params(("id" = String, Path,)),
     responses((status = 200, body = Option<PrInfo>), (status = 404, body = ErrorBody)))]
 async fn get_session_pr(
@@ -946,17 +1069,13 @@ async fn mcp_server_logs(
 
 #[utoipa::path(get, path = "/v1/subscriptions",
     responses((status = 200, body = [SubscriptionHealth])))]
-async fn subscription_health(
-    State(engine): State<Arc<Engine>>,
-) -> Json<Vec<SubscriptionHealth>> {
+async fn subscription_health(State(engine): State<Arc<Engine>>) -> Json<Vec<SubscriptionHealth>> {
     Json(engine.subscription_health().await)
 }
 
 #[utoipa::path(get, path = "/v1/integrations/github",
     responses((status = 200, body = GithubIntegration)))]
-async fn get_github_integration(
-    State(engine): State<Arc<Engine>>,
-) -> Json<GithubIntegration> {
+async fn get_github_integration(State(engine): State<Arc<Engine>>) -> Json<GithubIntegration> {
     Json(engine.github_integration())
 }
 

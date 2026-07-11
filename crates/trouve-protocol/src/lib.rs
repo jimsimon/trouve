@@ -24,7 +24,9 @@ pub use requests::*;
 // question.resolved events and POST /v1/questions (additive).
 // 0.7: queued prompts — thread.queue_updated event, /v1/threads/{id}/queue
 // endpoints, and the `queued` flag on TurnAccepted (all additive).
-pub const PROTOCOL_VERSION: &str = "0.7";
+// 0.8: integrated terminal — POST /v1/sessions/{id}/terminal plus
+// /v1/terminals/{id} input/resize/kill/output endpoints (all additive).
+pub const PROTOCOL_VERSION: &str = "0.8";
 
 pub type WorkspaceId = String;
 pub type SessionId = String;

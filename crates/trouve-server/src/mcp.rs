@@ -141,7 +141,11 @@ async fn tools_list(
 /// Relay one Claude permission request to the engine's approval flow and
 /// answer in the shape `--permission-prompt-tool` expects: a JSON-encoded
 /// `{"behavior": "allow"|"deny", ...}` payload in the text content.
-async fn approval_prompt(engine: &Engine, thread_id: &str, params: &Value) -> Result<Value, String> {
+async fn approval_prompt(
+    engine: &Engine,
+    thread_id: &str,
+    params: &Value,
+) -> Result<Value, String> {
     let args = &params["arguments"];
     let tool = args["tool_name"].as_str().unwrap_or("tool");
     let input = args.get("input").cloned().unwrap_or(json!({}));

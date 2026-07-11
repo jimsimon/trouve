@@ -156,12 +156,16 @@ impl AgentBackend for CursorBackend {
                 Err(e) => {
                     tracing::warn!("cursor session/load failed ({e}); starting fresh");
                     fresh_session = true;
-                    server.new_session(&turn.worktree, &turn.mcp_servers).await?
+                    server
+                        .new_session(&turn.worktree, &turn.mcp_servers)
+                        .await?
                 }
             },
             None => {
                 fresh_session = true;
-                server.new_session(&turn.worktree, &turn.mcp_servers).await?
+                server
+                    .new_session(&turn.worktree, &turn.mcp_servers)
+                    .await?
             }
         };
 

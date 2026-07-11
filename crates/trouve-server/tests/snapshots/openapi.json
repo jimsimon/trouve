@@ -7,7 +7,7 @@
       "name": "MIT",
       "identifier": "MIT"
     },
-    "version": "0.7"
+    "version": "0.8"
   },
   "paths": {
     "/v1/approvals": {
@@ -1544,6 +1544,54 @@
         }
       }
     },
+    "/v1/sessions/{id}/terminal": {
+      "post": {
+        "tags": [],
+        "operationId": "open_terminal",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/OpenTerminalRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TerminalInfo"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/v1/sessions/{id}/undo": {
       "post": {
         "tags": [],
@@ -1627,6 +1675,162 @@
                   "items": {
                     "$ref": "#/components/schemas/SubscriptionHealth"
                   }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/terminals/{id}": {
+      "delete": {
+        "tags": [],
+        "operationId": "kill_terminal",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": ""
+          },
+          "404": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/terminals/{id}/input": {
+      "post": {
+        "tags": [],
+        "operationId": "terminal_input",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/TerminalInputRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "204": {
+            "description": ""
+          },
+          "404": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/terminals/{id}/output": {
+      "get": {
+        "tags": [],
+        "summary": "PTY output as SSE: each event's `id` is the byte offset *after* the\nchunk, data is base64. `?after=` resumes from an offset (bytes older\nthan the retained backlog are silently skipped). A final `exit` event\nmarks shell exit. Ephemeral — not part of the persisted event log.",
+        "operationId": "terminal_output",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "after",
+            "in": "query",
+            "description": "Resume byte offset",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int64",
+              "minimum": 0
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "SSE stream of base64 output chunks"
+          },
+          "404": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/terminals/{id}/resize": {
+      "post": {
+        "tags": [],
+        "operationId": "terminal_resize",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/TerminalResizeRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "204": {
+            "description": ""
+          },
+          "404": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
                 }
               }
             }
@@ -3653,6 +3857,27 @@
           }
         }
       },
+      "OpenTerminalRequest": {
+        "type": "object",
+        "description": "Open (or re-attach to) the session's terminal.",
+        "required": [
+          "cols",
+          "rows"
+        ],
+        "properties": {
+          "cols": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Initial grid size; ignored when re-attaching to a live terminal.",
+            "minimum": 0
+          },
+          "rows": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 0
+          }
+        }
+      },
       "PermissionMode": {
         "type": "string",
         "description": "How tool calls are gated in a thread. See ADR 0004.",
@@ -4164,6 +4389,69 @@
           "used_percent": {
             "type": "integer",
             "format": "int64"
+          }
+        }
+      },
+      "TerminalInfo": {
+        "type": "object",
+        "required": [
+          "id",
+          "session_id",
+          "cols",
+          "rows",
+          "exited"
+        ],
+        "properties": {
+          "cols": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 0
+          },
+          "exited": {
+            "type": "boolean",
+            "description": "True once the shell process has exited (the stream is complete)."
+          },
+          "id": {
+            "type": "string"
+          },
+          "rows": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 0
+          },
+          "session_id": {
+            "type": "string"
+          }
+        }
+      },
+      "TerminalInputRequest": {
+        "type": "object",
+        "description": "Keyboard/paste bytes for the PTY, base64-encoded.",
+        "required": [
+          "data"
+        ],
+        "properties": {
+          "data": {
+            "type": "string"
+          }
+        }
+      },
+      "TerminalResizeRequest": {
+        "type": "object",
+        "required": [
+          "cols",
+          "rows"
+        ],
+        "properties": {
+          "cols": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 0
+          },
+          "rows": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 0
           }
         }
       },

@@ -10,11 +10,14 @@ rust-version.workspace = true
 [dependencies]
 anyhow.workspace = true
 async-trait.workspace = true
+base64 = "0.22.1"
+bytes.workspace = true
 chrono.workspace = true
 dirs.workspace = true
 futures.workspace = true
 ignore = "0.4.27"
 octocrab.workspace = true
+portable-pty = "0.9.0"
 regex = "1.12.4"
 # Local-model downloads (HuggingFace GGUFs) and llama-server health checks.
 reqwest.workspace = true

@@ -11,6 +11,7 @@ categories = ["gui"]
 
 [dependencies]
 slint.workspace = true
+vt100 = "0.16.2"
 
 [build-dependencies]
 slint-build = "1.17"

@@ -456,6 +456,51 @@ fn main() -> anyhow::Result<()> {
     }
     {
         let tx = tx.clone();
+        window.on_right_tab_changed(move |tab| {
+            let _ = tx.send(UiCommand::RightTabChanged(tab));
+        });
+    }
+    {
+        // shift is folded into the key text by Slint already; Ctrl+Shift+V
+        // (paste) never reaches this callback.
+        let tx = tx.clone();
+        window.on_term_key(move |text, ctrl, alt, _shift| {
+            let _ = tx.send(UiCommand::TermKey {
+                text: text.to_string(),
+                ctrl,
+                alt,
+            });
+        });
+    }
+    {
+        let tx = tx.clone();
+        window.on_term_paste(move |text| {
+            let _ = tx.send(UiCommand::TermPaste(text.to_string()));
+        });
+    }
+    {
+        let tx = tx.clone();
+        window.on_term_wheel(move |lines| {
+            let _ = tx.send(UiCommand::TermWheel(lines));
+        });
+    }
+    {
+        let tx = tx.clone();
+        window.on_term_resized(move |cols, rows| {
+            let _ = tx.send(UiCommand::TermResized {
+                cols: cols.clamp(2, 500) as u16,
+                rows: rows.clamp(2, 500) as u16,
+            });
+        });
+    }
+    {
+        let tx = tx.clone();
+        window.on_term_restart(move || {
+            let _ = tx.send(UiCommand::TermRestart);
+        });
+    }
+    {
+        let tx = tx.clone();
         window.on_chat_file_opened(move |path, from, to| {
             let _ = tx.send(UiCommand::OpenChatFile(path.to_string(), from, to));
         });

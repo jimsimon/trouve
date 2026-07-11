@@ -590,6 +590,45 @@ pub fn set_diff(ui: &Ui, rows: Vec<slint_diff_view::RowData>, raw: String) {
     });
 }
 
+/// Push the terminal screen: styled rows (resolved RGB spans from the
+/// vt100 grid), cursor cell (None = hidden), scrollback offset in lines,
+/// a status note ("shell exited"), and whether a terminal is attached.
+pub fn set_term(
+    ui: &Ui,
+    rows: Vec<Vec<slint_terminal::GridSpan>>,
+    cursor: Option<(u16, u16)>,
+    scrollback: usize,
+    status: String,
+    attached: bool,
+) {
+    let _ = ui.upgrade_in_event_loop(move |ui| {
+        let lines: Vec<ModelRc<crate::TermSpan>> = rows
+            .into_iter()
+            .map(|spans| {
+                let spans: Vec<crate::TermSpan> = spans
+                    .into_iter()
+                    .map(|s| crate::TermSpan {
+                        text: SharedString::from(s.text.as_str()),
+                        fg: slint::Color::from_argb_encoded(0xff00_0000 | s.fg),
+                        bg: slint::Color::from_argb_encoded(0xff00_0000 | s.bg),
+                        has_bg: s.has_bg,
+                    })
+                    .collect();
+                ModelRc::new(VecModel::from(spans))
+            })
+            .collect();
+        ui.set_term_lines(ModelRc::new(VecModel::from(lines)));
+        let (row, col) = cursor
+            .map(|(r, c)| (r as i32, c as i32))
+            .unwrap_or((-1, -1));
+        ui.set_term_cursor_row(row);
+        ui.set_term_cursor_col(col);
+        ui.set_term_scrollback(scrollback as i32);
+        ui.set_term_status(SharedString::from(status.as_str()));
+        ui.set_term_attached(attached);
+    });
+}
+
 /// Rows of the Files tree, already flattened in display order:
 /// (name, is_dir, depth, expanded).
 pub fn set_file_list(ui: &Ui, entries: Vec<(String, bool, i32, bool)>) {

@@ -254,7 +254,10 @@ pub fn probe_hardware() -> Hardware {
 
     // NVIDIA via nvidia-smi (present wherever the proprietary driver is).
     if let Ok(out) = std::process::Command::new("nvidia-smi")
-        .args(["--query-gpu=name,memory.total", "--format=csv,noheader,nounits"])
+        .args([
+            "--query-gpu=name,memory.total",
+            "--format=csv,noheader,nounits",
+        ])
         .output()
     {
         if out.status.success() {
@@ -274,7 +277,10 @@ pub fn probe_hardware() -> Hardware {
     // AMD/Intel discrete GPUs via DRM sysfs (Linux). NVIDIA cards covered
     // above are skipped by vendor id.
     if std::env::consts::OS == "linux" {
-        gpus.extend(probe_drm_gpus(Path::new("/sys/class/drm"), !gpus.is_empty()));
+        gpus.extend(probe_drm_gpus(
+            Path::new("/sys/class/drm"),
+            !gpus.is_empty(),
+        ));
     }
 
     Hardware { ram_bytes, gpus }

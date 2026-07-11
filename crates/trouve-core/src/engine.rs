@@ -93,6 +93,8 @@ pub struct Engine {
     /// Per-server MCP logs, shared with the executor's `McpManager` so both
     /// runtime connections and settings health probes land in one place.
     mcp_logs: crate::mcp::McpLogStore,
+    /// Interactive shells (one per session) for the client terminal panel.
+    terminals: crate::terminal::TerminalManager,
 }
 
 #[derive(Debug, Clone)]
@@ -120,6 +122,17 @@ enum LocalDownloadState {
 }
 
 /// Whether a `--version` report refers to the given vendor version. The
+fn terminal_info(terminal: &crate::terminal::Terminal) -> trouve_protocol::TerminalInfo {
+    let (cols, rows) = terminal.size();
+    trouve_protocol::TerminalInfo {
+        id: terminal.id.clone(),
+        session_id: terminal.session_id.clone(),
+        cols,
+        rows,
+        exited: terminal.exited(),
+    }
+}
+
 /// CLIs decorate their output differently ("2.1.34 (Claude Code)",
 /// "codex-cli 0.143.0", "2026.07.01-41b2de7"), so containment beats
 /// equality.
@@ -280,8 +293,7 @@ impl Engine {
             local_manager.clone(),
         ));
         providers.insert("local".into(), local_provider.clone());
-        let injected_providers =
-            HashMap::from([("local".to_string(), local_provider)]);
+        let injected_providers = HashMap::from([("local".to_string(), local_provider)]);
         Self {
             store,
             data_dir,
@@ -318,6 +330,7 @@ impl Engine {
             base_url: RwLock::new(None),
             index_hooks: false,
             mcp_logs,
+            terminals: crate::terminal::TerminalManager::default(),
         }
     }
 
@@ -980,9 +993,7 @@ impl Engine {
                             bytes.load(std::sync::atomic::Ordering::Relaxed),
                             String::new(),
                         ),
-                        Some(LocalDownloadState::Failed(e)) => {
-                            ("failed".to_string(), 0, e.clone())
-                        }
+                        Some(LocalDownloadState::Failed(e)) => ("failed".to_string(), 0, e.clone()),
                         None => ("none".to_string(), 0, String::new()),
                     };
                 trouve_protocol::LocalModelInfo {
@@ -1028,10 +1039,7 @@ impl Engine {
                     "a download for {id} is already in progress"
                 )));
             }
-            downloads.insert(
-                id.to_string(),
-                LocalDownloadState::Pending(counter.clone()),
-            );
+            downloads.insert(id.to_string(), LocalDownloadState::Pending(counter.clone()));
         }
         let engine = self.clone();
         let id_owned = id.to_string();
@@ -1476,28 +1484,30 @@ impl Engine {
         Ok(entries
             .into_iter()
             .zip(probes)
-            .map(|((name, scope, workspace_id, workspace_name, config), probed)| {
-                let (health, detail) = if config.disabled {
-                    ("disabled".to_string(), "disabled in this scope".to_string())
-                } else {
-                    match probed {
-                        Some(Ok(tools)) => ("ok".to_string(), format!("{tools} tools")),
-                        Some(Err(e)) => ("error".to_string(), format!("{e:#}")),
-                        None => ("unknown".to_string(), String::new()),
+            .map(
+                |((name, scope, workspace_id, workspace_name, config), probed)| {
+                    let (health, detail) = if config.disabled {
+                        ("disabled".to_string(), "disabled in this scope".to_string())
+                    } else {
+                        match probed {
+                            Some(Ok(tools)) => ("ok".to_string(), format!("{tools} tools")),
+                            Some(Err(e)) => ("error".to_string(), format!("{e:#}")),
+                            None => ("unknown".to_string(), String::new()),
+                        }
+                    };
+                    trouve_protocol::McpServerInfo {
+                        name,
+                        scope,
+                        workspace_id,
+                        workspace_name,
+                        command: config.command,
+                        args: config.args,
+                        env: config.env,
+                        health,
+                        detail,
                     }
-                };
-                trouve_protocol::McpServerInfo {
-                    name,
-                    scope,
-                    workspace_id,
-                    workspace_name,
-                    command: config.command,
-                    args: config.args,
-                    env: config.env,
-                    health,
-                    detail,
-                }
-            })
+                },
+            )
             .collect())
     }
 
@@ -1776,6 +1786,78 @@ impl Engine {
             .map_err(|e| EngineError::BadRequest(format!("cannot read {rel_path}: {e}")))
     }
 
+    // --- integrated terminal --------------------------------------------
+
+    /// The session's interactive terminal, spawning a shell in its worktree
+    /// if none is live. Ephemeral (not persisted, not in the event log).
+    pub fn open_terminal(
+        &self,
+        session_id: &str,
+        cols: u16,
+        rows: u16,
+    ) -> Result<trouve_protocol::TerminalInfo, EngineError> {
+        let session = self.get_session(session_id)?;
+        let terminal = self
+            .terminals
+            .open(session_id, Path::new(&session.worktree_path), cols, rows)
+            .map_err(EngineError::Internal)?;
+        Ok(terminal_info(&terminal))
+    }
+
+    pub fn terminal_input(&self, terminal_id: &str, bytes: &[u8]) -> Result<(), EngineError> {
+        let terminal = self
+            .terminals
+            .get(terminal_id)
+            .map_err(|e| EngineError::NotFound(e.to_string()))?;
+        terminal.write(bytes).map_err(EngineError::Internal)
+    }
+
+    pub fn terminal_resize(
+        &self,
+        terminal_id: &str,
+        cols: u16,
+        rows: u16,
+    ) -> Result<(), EngineError> {
+        let terminal = self
+            .terminals
+            .get(terminal_id)
+            .map_err(|e| EngineError::NotFound(e.to_string()))?;
+        terminal.resize(cols, rows).map_err(EngineError::Internal)
+    }
+
+    /// Kill a terminal (the next open spawns a fresh shell).
+    pub fn terminal_kill(&self, terminal_id: &str) -> Result<(), EngineError> {
+        // get() first so unknown ids surface as 404 rather than a no-op.
+        self.terminals
+            .get(terminal_id)
+            .map_err(|e| EngineError::NotFound(e.to_string()))?;
+        self.terminals.remove(terminal_id);
+        Ok(())
+    }
+
+    /// Attach to a terminal's output from byte offset `after`: the retained
+    /// backlog from there plus a live receiver (empty chunk = shell exited).
+    pub fn terminal_subscribe(
+        &self,
+        terminal_id: &str,
+        after: u64,
+    ) -> Result<
+        (
+            u64,
+            Vec<u8>,
+            tokio::sync::broadcast::Receiver<bytes::Bytes>,
+            bool,
+        ),
+        EngineError,
+    > {
+        let terminal = self
+            .terminals
+            .get(terminal_id)
+            .map_err(|e| EngineError::NotFound(e.to_string()))?;
+        let (from, replay, rx) = terminal.subscribe(after);
+        Ok((from, replay, rx, terminal.exited()))
+    }
+
     fn session_lock(&self, session_id: &str) -> Arc<tokio::sync::Mutex<()>> {
         self.session_locks
             .lock()
@@ -1986,6 +2068,7 @@ impl Engine {
 
     pub async fn delete_session(&self, id: &str) -> Result<(), EngineError> {
         let session = self.get_session(id)?;
+        self.terminals.remove_session(id);
         let ws = self
             .store
             .workspace(&session.workspace_id)?
@@ -2305,11 +2388,7 @@ impl Engine {
         Ok(self.store.queued_prompts(thread_id)?)
     }
 
-    pub fn update_queued_prompt(
-        &self,
-        prompt_id: &str,
-        content: &str,
-    ) -> Result<(), EngineError> {
+    pub fn update_queued_prompt(&self, prompt_id: &str, content: &str) -> Result<(), EngineError> {
         let thread_id = self
             .store
             .queued_prompt_thread(prompt_id)?

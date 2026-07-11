@@ -11,6 +11,7 @@ import {
 } from "std-widgets.slint";
 import { DiffView, DiffRow } from "diff-view.slint";
 import { CodeView, TextSegment } from "code-view.slint";
+import { TerminalGrid, TermSpan } from "terminal-grid.slint";
 import {
     SettingsScreen, ProviderItem, CliItem, KnownProviderItem, McpServerItem,
     SubscriptionItem, ModeItem, LocalModelItem
@@ -21,7 +22,7 @@ import { Palette } from "std-widgets.slint";
 
 // Theme re-exported so Rust can push the selected palette.
 export {
-    DiffRow, TextSegment, ProviderItem, CliItem, KnownProviderItem, McpServerItem,
+    DiffRow, TextSegment, TermSpan, ProviderItem, CliItem, KnownProviderItem, McpServerItem,
     SubscriptionItem, ModeItem, LocalModelItem
 }
 export { Theme, ThemePalette }
@@ -1106,9 +1107,12 @@ export component AppWindow inherits Window {
     in property <int> file-sel-from: -1;
     in property <int> file-sel-to: -1;
     in property <int> file-sel-seq: 0;
-    // Right-panel tab (0 diff, 1 files, 2 pull requests); the controller
-    // flips it when a chat click opens a file.
+    // Right-panel tab (0 diff, 1 files, 2 pull requests, 3 mcp,
+    // 4 terminal); the controller flips it when a chat click opens a file,
+    // and watches it to lazily attach the terminal.
     in-out property <int> right-tab: 0;
+    callback right-tab-changed(int);
+    changed right-tab => { root.right-tab-changed(root.right-tab); }
     callback send-message(string);
     in property <bool> composer-enabled: false;
     // Draft survives the composer being swapped out for the new-thread form.
@@ -1237,6 +1241,23 @@ export component AppWindow inherits Window {
     callback pr-picked(int);
     callback open-pr-url(string);
     callback open-integrations-settings();
+
+    // --- terminal tab --------------------------------------------------
+    // Interactive shell in the current session's worktree. Rust owns the
+    // screen model (vt100) and pushes styled rows; the grid reports keys,
+    // pastes, wheel scrolls, and cell-size changes back.
+    in property <[[TermSpan]]> term-lines;
+    in property <int> term-cursor-row: -1;
+    in property <int> term-cursor-col: -1;
+    in property <int> term-scrollback: 0;
+    // Non-empty while there's something to say ("shell exited", errors).
+    in property <string> term-status: "";
+    in property <bool> term-attached: false;
+    callback term-key(/* text */ string, /* ctrl */ bool, /* alt */ bool, /* shift */ bool);
+    callback term-paste(string);
+    callback term-wheel(/* lines, + = history */ int);
+    callback term-resized(/* cols */ int, /* rows */ int);
+    callback term-restart();
 
     in property <[FileItem]> file-entries;
     callback file-activated(int);
@@ -3586,6 +3607,68 @@ export component AppWindow inherits Window {
                                 }
                             }
                             }
+                        }
+                    }
+                }
+                Tab {
+                    title: "Terminal";
+                    VerticalLayout {
+                        padding: 6px;
+                        spacing: 6px;
+
+                        HorizontalLayout {
+                            spacing: 6px;
+                            Text {
+                                text: "Shell in the session worktree";
+                                color: Theme.c.text-mid;
+                                font-size: Theme.fs(12px);
+                                font-weight: 700;
+                                vertical-alignment: center;
+                                horizontal-stretch: 1;
+                                overflow: elide;
+                            }
+                            if root.term-status != "": Text {
+                                text: root.term-status;
+                                color: Theme.c.warn;
+                                font-size: Theme.fs(12px);
+                                vertical-alignment: center;
+                            }
+                            Button {
+                                text: "⟳ Restart";
+                                enabled: root.term-attached;
+                                clicked => { root.term-restart(); }
+                            }
+                        }
+
+                        if !root.term-attached: VerticalLayout {
+                            alignment: center;
+                            vertical-stretch: 1;
+                            Text {
+                                text: "Open a session to get a shell in its worktree.";
+                                color: Theme.c.text-soft;
+                                font-size: Theme.fs(12px);
+                                horizontal-alignment: center;
+                                wrap: word-wrap;
+                            }
+                        }
+
+                        if root.term-attached: TerminalGrid {
+                            vertical-stretch: 1;
+                            border-radius: 6px;
+                            clip: true;
+                            grid-lines: root.term-lines;
+                            cursor-row: root.term-cursor-row;
+                            cursor-col: root.term-cursor-col;
+                            scrollback-lines: root.term-scrollback;
+                            grid-font-size: Theme.fs(13px);
+                            background: Theme.c.code-bg;
+                            grid-foreground: Theme.c.code-fg;
+                            key-pressed(text, ctrl, alt, shift) => {
+                                root.term-key(text, ctrl, alt, shift);
+                            }
+                            paste-text(text) => { root.term-paste(text); }
+                            wheel(lines) => { root.term-wheel(lines); }
+                            grid-resized(cols, rows) => { root.term-resized(cols, rows); }
                         }
                     }
                 }

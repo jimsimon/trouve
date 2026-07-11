@@ -1776,3 +1776,154 @@ async fn leftover_queue_waits_for_explicit_dispatch_after_restart() {
         .unwrap();
     assert!(queue.is_empty());
 }
+
+/// Integrated terminal: open a shell in the session worktree, type a
+/// command, watch the output stream, resize, and kill.
+#[cfg(unix)]
+#[tokio::test]
+async fn terminal_shell_in_session_worktree() {
+    use base64::Engine as _;
+    let b64 = base64::engine::general_purpose::STANDARD;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path().join("repo");
+    std::fs::create_dir(&repo).unwrap();
+    init_repo(&repo);
+
+    let store = Store::open(&tmp.path().join("db/trouve.db")).unwrap();
+    let engine = Arc::new(
+        Engine::new(store, tmp.path().join("data"), &Config::default())
+            .with_config_dir(None)
+            .with_provider(
+                "scripted",
+                Arc::new(ScriptedProvider {
+                    calls: AtomicUsize::new(0),
+                }),
+            )
+            .with_default_model("scripted/test-model"),
+    );
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let router = trouve_server::build_router(engine);
+    tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+    let base = format!("http://{addr}/v1");
+    let client = reqwest::Client::new();
+
+    let ws: serde_json::Value = client
+        .post(format!("{base}/workspaces"))
+        .json(&serde_json::json!({"path": repo.to_str().unwrap()}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let session: serde_json::Value = client
+        .post(format!("{base}/sessions"))
+        .json(&serde_json::json!({"workspace_id": ws["id"], "title": "Terminal"}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let session_id = session["id"].as_str().unwrap();
+
+    let term: serde_json::Value = client
+        .post(format!("{base}/sessions/{session_id}/terminal"))
+        .json(&serde_json::json!({"cols": 100, "rows": 30}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let term_id = term["id"].as_str().unwrap().to_string();
+    assert_eq!(term["session_id"], *session_id);
+    assert_eq!(term["cols"], 100);
+    assert_eq!(term["exited"], false);
+
+    // Re-open returns the same live terminal.
+    let again: serde_json::Value = client
+        .post(format!("{base}/sessions/{session_id}/terminal"))
+        .json(&serde_json::json!({"cols": 80, "rows": 24}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(again["id"], *term_id);
+
+    // The shell starts in the worktree: `ls` shows the checked-out README.
+    let resp = client
+        .post(format!("{base}/terminals/{term_id}/input"))
+        .json(&serde_json::json!({"data": b64.encode("ls\r")}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 204);
+
+    // Follow the output SSE until the README shows up.
+    let out_url = format!("{base}/terminals/{term_id}/output?after=0");
+    let collected = tokio::time::timeout(Duration::from_secs(20), async {
+        let resp = client.get(&out_url).send().await.unwrap();
+        let mut stream = resp.bytes_stream();
+        let mut buf = String::new();
+        let mut out: Vec<u8> = Vec::new();
+        while let Some(chunk) = stream.next().await {
+            buf.push_str(&String::from_utf8_lossy(&chunk.unwrap()));
+            while let Some(pos) = buf.find('\n') {
+                let line = buf[..pos].trim().to_string();
+                buf.drain(..=pos);
+                if let Some(data) = line.strip_prefix("data:") {
+                    if let Ok(bytes) = b64.decode(data.trim()) {
+                        out.extend_from_slice(&bytes);
+                    }
+                }
+            }
+            if String::from_utf8_lossy(&out).contains("README.md") {
+                return out;
+            }
+        }
+        panic!("terminal stream ended without README.md; got: {out:?}");
+    })
+    .await
+    .expect("timed out waiting for terminal output");
+    assert!(String::from_utf8_lossy(&collected).contains("README.md"));
+
+    // Resize.
+    let resp = client
+        .post(format!("{base}/terminals/{term_id}/resize"))
+        .json(&serde_json::json!({"cols": 120, "rows": 40}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 204);
+
+    // Kill; input to a dead terminal 404s, and reopening spawns a new one.
+    let resp = client
+        .delete(format!("{base}/terminals/{term_id}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 204);
+    let resp = client
+        .post(format!("{base}/terminals/{term_id}/input"))
+        .json(&serde_json::json!({"data": b64.encode("x")}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 404);
+    let fresh: serde_json::Value = client
+        .post(format!("{base}/sessions/{session_id}/terminal"))
+        .json(&serde_json::json!({"cols": 80, "rows": 24}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_ne!(fresh["id"], *term_id);
+}

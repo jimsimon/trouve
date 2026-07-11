@@ -138,9 +138,10 @@ impl ClaudeProc {
 
 /// Spawn-time configuration that must match for a process to be reused.
 fn config_fingerprint(turn: &BackendTurn) -> String {
-    let bridge = turn.mcp_bridge.as_ref().map(|b| {
-        format!("{}|{}|{:?}", b.url, b.bridge_tools, b.disallowed_tools)
-    });
+    let bridge = turn
+        .mcp_bridge
+        .as_ref()
+        .map(|b| format!("{}|{}|{:?}", b.url, b.bridge_tools, b.disallowed_tools));
     let servers: Vec<String> = turn
         .mcp_servers
         .iter()

@@ -1617,6 +1617,24 @@ pub fn set_inline_code_tint(argb: u32) {
     INLINE_CODE_TINT.store(argb, std::sync::atomic::Ordering::Relaxed);
 }
 
+/// Terminal default foreground/background (the theme's code colors, RGB),
+/// baked into grid spans when the controller renders the terminal screen.
+static TERM_FG: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0x00d8_d8c8);
+static TERM_BG: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0x001f_2226);
+
+pub fn set_term_colors(fg_argb: u32, bg_argb: u32) {
+    TERM_FG.store(fg_argb & 0xff_ffff, std::sync::atomic::Ordering::Relaxed);
+    TERM_BG.store(bg_argb & 0xff_ffff, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// (default fg, default bg) as 0xRRGGBB.
+pub fn term_colors() -> (u32, u32) {
+    (
+        TERM_FG.load(std::sync::atomic::Ordering::Relaxed),
+        TERM_BG.load(std::sync::atomic::Ordering::Relaxed),
+    )
+}
+
 /// Syntax-highlight file content into per-line `(text, rgb)` segments.
 pub fn highlight_file(path: &str, content: &str) -> Vec<Vec<(String, u32)>> {
     let (syntaxes, _) = syntect_assets();

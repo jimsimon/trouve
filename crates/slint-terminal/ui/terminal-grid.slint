@@ -1,0 +1,164 @@
+// TerminalGrid: an interactive terminal screen. The host feeds it styled
+// spans per row (from a vt100-style screen model), a cursor position, and
+// listens for key/paste/wheel/resize callbacks to drive the PTY. The
+// component owns focus handling and cell metrics (it probes the monospace
+// advance width and reports how many cells fit).
+
+export struct TermSpan {
+    text: string,
+    fg: color,
+    bg: color,
+    // True when bg differs from the grid background (skips overdraw).
+    has-bg: bool,
+}
+
+export component TerminalGrid inherits Rectangle {
+    // One entry per visible screen row; spans carry resolved colors.
+    in property <[[TermSpan]]> grid-lines;
+    in property <int> cursor-row: -1;
+    in property <int> cursor-col: -1;
+    // Lines scrolled into history (0 = live); shows the "history" badge.
+    in property <int> scrollback-lines: 0;
+    in property <string> grid-font-family: "monospace";
+    in property <length> grid-font-size: 13px;
+    in property <color> grid-foreground: #d4d4d4;
+    in property <bool> grid-enabled: true;
+
+    // Cell metrics probed from the actual font, exported so hosts can size
+    // the PTY: number of whole cells that fit the current widget size.
+    out property <length> cell-width: probe.preferred-width / 100;
+    out property <length> cell-height: probe.preferred-height * 1.15;
+    out property <int> grid-cols: max(2, floor(root.width / root.cell-width));
+    out property <int> grid-rows-count: max(2, floor(root.height / root.cell-height));
+
+    // A key press with modifiers (special keys arrive as Slint's
+    // private-use-area code points). The host encodes and writes to the PTY.
+    callback key-pressed(text: string, ctrl: bool, alt: bool, shift: bool);
+    // Clipboard text pasted via Ctrl+Shift+V.
+    callback paste-text(text: string);
+    // Mouse wheel: positive = towards history, in lines.
+    callback wheel(lines: int);
+    // The widget was resized to a new cell grid (debounce host-side).
+    callback grid-resized(cols: int, rows: int);
+
+    public function grab-focus() {
+        keys.focus();
+    }
+
+    // The init emit reports the size a freshly created grid settled on
+    // (changed handlers only fire on later changes).
+    init => { root.grid-resized(root.grid-cols, root.grid-rows-count); }
+    changed grid-cols => { root.grid-resized(root.grid-cols, root.grid-rows-count); }
+    changed grid-rows-count => { root.grid-resized(root.grid-cols, root.grid-rows-count); }
+
+    background: #101010;
+    forward-focus: keys;
+
+    // Invisible metrics probe: 100 zeros wide so integer rounding of the
+    // advance width averages out.
+    probe := Text {
+        opacity: 0;
+        width: 0;
+        height: 0;
+        text: "0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000";
+        font-family: root.grid-font-family;
+        font-size: root.grid-font-size;
+    }
+
+    keys := FocusScope {
+        enabled: root.grid-enabled;
+
+        key-pressed(event) => {
+            // Ctrl+Shift+V pastes; everything else goes to the PTY.
+            if (event.modifiers.control && event.modifiers.shift && (event.text == "v" || event.text == "V")) {
+                clip.text = "";
+                clip.paste();
+                return accept;
+            }
+            root.key-pressed(
+                event.text,
+                event.modifiers.control,
+                event.modifiers.alt,
+                event.modifiers.shift);
+            return accept;
+        }
+
+        // Hidden clipboard shuttle: paste() lands here, then the edited
+        // callback hands the text to the host and clears.
+        clip := TextInput {
+            width: 0;
+            height: 0;
+            opacity: 0;
+            edited => {
+                if (self.text != "") {
+                    root.paste-text(self.text);
+                    self.text = "";
+                }
+            }
+        }
+    }
+
+    ta := TouchArea {
+        mouse-cursor: text;
+        clicked => { keys.focus(); }
+        scroll-event(event) => {
+            if (event.delta-y != 0) {
+                root.wheel(event.delta-y > 0 ? 3 : -3);
+                return accept;
+            }
+            return reject;
+        }
+    }
+
+    // The cell grid. Rows are absolutely positioned so partial rows at the
+    // bottom simply clip.
+    grid := Rectangle {
+        clip: true;
+        for line[r] in root.grid-lines: Rectangle {
+            x: 0;
+            y: r * root.cell-height;
+            height: root.cell-height;
+            width: root.width;
+            HorizontalLayout {
+                alignment: start;
+                for span in line: Rectangle {
+                    background: span.has-bg ? span.bg : transparent;
+                    Text {
+                        text: span.text;
+                        color: span.fg;
+                        font-family: root.grid-font-family;
+                        font-size: root.grid-font-size;
+                        vertical-alignment: center;
+                        height: root.cell-height;
+                    }
+                }
+            }
+        }
+
+        // Block cursor: filled when focused, outline otherwise.
+        if root.cursor-row >= 0 && root.cursor-col >= 0: Rectangle {
+            x: root.cursor-col * root.cell-width;
+            y: root.cursor-row * root.cell-height;
+            width: root.cell-width;
+            height: root.cell-height;
+            background: keys.has-focus ? root.grid-foreground.with-alpha(0.55) : transparent;
+            border-width: keys.has-focus ? 0 : 1px;
+            border-color: root.grid-foreground.with-alpha(0.7);
+        }
+    }
+
+    // Scrolled-into-history badge.
+    if root.scrollback-lines > 0: Rectangle {
+        x: root.width - self.width - 8px;
+        y: 6px;
+        width: badge.preferred-width + 12px;
+        height: badge.preferred-height + 6px;
+        background: #000000aa;
+        border-radius: 4px;
+        badge := Text {
+            text: "history · " + root.scrollback-lines;
+            color: #d4d4d4;
+            font-size: root.grid-font-size * 0.85;
+        }
+    }
+}

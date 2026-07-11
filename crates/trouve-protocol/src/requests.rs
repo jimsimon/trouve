@@ -263,6 +263,42 @@ pub struct FileContent {
     pub content: String,
 }
 
+// --- integrated terminal -----------------------------------------------------
+//
+// A session has at most one interactive shell, spawned in its worktree.
+// Output is an ephemeral byte stream (SSE of base64 chunks addressed by
+// byte offset), like the diff/files endpoints — not part of the event log.
+
+/// Open (or re-attach to) the session's terminal.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct OpenTerminalRequest {
+    /// Initial grid size; ignored when re-attaching to a live terminal.
+    pub cols: u16,
+    pub rows: u16,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct TerminalInfo {
+    pub id: String,
+    pub session_id: String,
+    pub cols: u16,
+    pub rows: u16,
+    /// True once the shell process has exited (the stream is complete).
+    pub exited: bool,
+}
+
+/// Keyboard/paste bytes for the PTY, base64-encoded.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct TerminalInputRequest {
+    pub data: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct TerminalResizeRequest {
+    pub cols: u16,
+    pub rows: u16,
+}
+
 // --- GitHub PRs ------------------------------------------------------------
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]

@@ -606,9 +606,8 @@ impl Store {
         let mut conn = self.conn.lock().unwrap();
         let tx = conn.transaction()?;
         let mut current: Vec<String> = {
-            let mut stmt = tx.prepare(
-                "SELECT id FROM queued_prompts WHERE thread_id = ?1 ORDER BY position",
-            )?;
+            let mut stmt =
+                tx.prepare("SELECT id FROM queued_prompts WHERE thread_id = ?1 ORDER BY position")?;
             let rows = stmt.query_map(params![thread_id], |r| r.get::<_, String>(0))?;
             rows.collect::<std::result::Result<Vec<_>, _>>()?
         };
