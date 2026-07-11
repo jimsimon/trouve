@@ -15,7 +15,6 @@ on. Decisions live in `docs/adr/` — check there before re-litigating one.
 - `crates/trouve-providers` — LLM provider abstraction and implementations.
 - `crates/trouve-server` — axum HTTP/SSE server exposing core over the
   protocol.
-- `crates/trouve-cli` — minimal protocol client for terminals and scripting.
 - `crates/trouve-client-core` — shared client logic (protocol client, session
   state, view models) for native clients.
 - `crates/slint-*` — standalone, reusable Slint widgets (code view, diff

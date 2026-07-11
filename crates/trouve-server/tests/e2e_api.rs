@@ -1257,55 +1257,69 @@ async fn backend_turns_bridge_approvals_resume_sessions_and_checkpoint() {
     assert_eq!(usage["turns"], 2);
     assert_eq!(usage["input_tokens"], 80);
 
-    // Internal tool-bridge endpoints: a bridged vendor agent can list and
+    // Embedded MCP bridge endpoint: a bridged vendor agent can list and
     // call trouve tools for this thread through the engine's gate.
-    let specs: serde_json::Value = client
-        .get(format!("http://{addr}/internal/threads/{thread_id}/tools"))
-        .send()
-        .await
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
-    let names: Vec<&str> = specs
+    let mcp_url = format!("http://{addr}/internal/threads/{thread_id}/mcp?tools=1&approval=1");
+    let mcp = |body: serde_json::Value| {
+        let client = client.clone();
+        let url = mcp_url.clone();
+        async move {
+            client
+                .post(url)
+                .json(&body)
+                .send()
+                .await
+                .unwrap()
+                .json::<serde_json::Value>()
+                .await
+                .unwrap()
+        }
+    };
+
+    let init = mcp(serde_json::json!({
+        "jsonrpc": "2.0", "id": 1, "method": "initialize",
+        "params": {"protocolVersion": "2025-03-26"}
+    }))
+    .await;
+    assert_eq!(init["result"]["serverInfo"]["name"], "trouve-bridge");
+
+    let listed = mcp(serde_json::json!({
+        "jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}
+    }))
+    .await;
+    let names: Vec<&str> = listed["result"]["tools"]
         .as_array()
         .unwrap()
         .iter()
         .map(|s| s["name"].as_str().unwrap())
         .collect();
     assert!(names.contains(&"read_file") && names.contains(&"write_file"));
+    assert!(names.contains(&"approval_prompt"));
 
     // Non-mutating call runs without approval (thread is yolo by now anyway).
-    let called: serde_json::Value = client
-        .post(format!(
-            "http://{addr}/internal/threads/{thread_id}/tools/call"
-        ))
-        .json(&serde_json::json!({"name": "list_dir", "arguments": {"path": "."}}))
-        .send()
-        .await
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
+    let called = mcp(serde_json::json!({
+        "jsonrpc": "2.0", "id": 3, "method": "tools/call",
+        "params": {"name": "list_dir", "arguments": {"path": "."}}
+    }))
+    .await;
     assert!(
-        called["content"].as_str().unwrap().contains("agent.txt"),
+        called["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("agent.txt"),
         "{called}"
     );
 
     // Vendor-executed tool gating (Claude's permission-prompt hook): the
     // thread is yolo by now, so the gate auto-approves.
-    let verdict: serde_json::Value = client
-        .post(format!(
-            "http://{addr}/internal/threads/{thread_id}/approval"
-        ))
-        .json(&serde_json::json!({"tool": "Bash", "args": {"command": "ls"}}))
-        .send()
-        .await
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
-    assert_eq!(verdict["approved"], true);
+    let verdict = mcp(serde_json::json!({
+        "jsonrpc": "2.0", "id": 4, "method": "tools/call",
+        "params": {"name": "approval_prompt",
+                   "arguments": {"tool_name": "Bash", "input": {"command": "ls"}}}
+    }))
+    .await;
+    let text = verdict["result"]["content"][0]["text"].as_str().unwrap();
+    assert!(text.contains("\"behavior\":\"allow\""), "{verdict}");
 
     // CLI-kind provider CRUD: upsert reports auth "cli"; login relays the
     // vendor flow (here: a bogus binary, so it fails with 400).
@@ -1529,8 +1543,7 @@ async fn queued_prompts_crud_and_in_order_dispatch() {
     // The queue announced every change on the event stream and ended empty.
     let last_queue = events
         .iter()
-        .filter(|e| e["type"] == "thread.queue_updated")
-        .next_back()
+        .rfind(|e| e["type"] == "thread.queue_updated")
         .expect("queue events published");
     assert_eq!(last_queue["prompts"].as_array().unwrap().len(), 0);
 

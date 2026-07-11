@@ -152,20 +152,6 @@ fn is_cli_auth_kind(kind: &str) -> bool {
     is_backend_kind(kind) || kind == "codex-responses"
 }
 
-/// Default `trouve` binary for the MCP bridge: next to the running server
-/// (installed layout and cargo target dir), else resolved via `$PATH`.
-fn default_bridge_command() -> String {
-    let name = format!("trouve{}", std::env::consts::EXE_SUFFIX);
-    if let Ok(me) = std::env::current_exe() {
-        if let Some(sibling) = me.parent().map(|d| d.join(&name)) {
-            if sibling.exists() {
-                return sibling.to_string_lossy().into_owned();
-            }
-        }
-    }
-    name
-}
-
 /// Credential style for a configured provider: "cli" for vendor-CLI-backed
 /// kinds, "oauth" when subscription endpoints are configured (and no inline
 /// key wins), "none" for keyless local endpoints, "api-key" otherwise.
@@ -2637,14 +2623,10 @@ impl Engine {
         thread_id: &str,
     ) -> Option<trouve_agents::McpBridgeConfig> {
         let backend_id = model.split_once('/')?.0;
-        let (kind, bridge_tools, bridge_command) = {
+        let (kind, bridge_tools) = {
             let config = self.config.lock().unwrap();
             let pc = config.providers.get(backend_id)?;
-            (
-                pc.kind.clone(),
-                pc.tool_bridge.unwrap_or(false),
-                pc.bridge_command.clone(),
-            )
+            (pc.kind.clone(), pc.tool_bridge.unwrap_or(false))
         };
         if kind != "claude-cli" && kind != "codex-app-server" {
             return None;
@@ -2658,22 +2640,18 @@ impl Engine {
             );
             return None;
         };
-        let mut env = vec![
-            ("TROUVE_SERVER".into(), base_url),
-            ("TROUVE_THREAD_ID".into(), thread_id.to_string()),
-        ];
-        if bridge_tools {
-            env.push(("TROUVE_BRIDGE_TOOLS".into(), "1".into()));
-        }
-        if kind == "codex-app-server" {
-            // Codex approvals are native RPCs; serving Claude's
-            // permission-gate tool would only tempt the model to call it.
-            env.push(("TROUVE_BRIDGE_APPROVAL".into(), "0".into()));
-        }
+        // Codex approvals are native RPCs; serving Claude's permission-gate
+        // tool would only tempt the model to call it.
+        let approval = if kind == "codex-app-server" { 0 } else { 1 };
+        let url = format!(
+            "{}/internal/threads/{}/mcp?tools={}&approval={}",
+            base_url.trim_end_matches('/'),
+            thread_id,
+            bridge_tools as u8,
+            approval,
+        );
         Some(trouve_agents::McpBridgeConfig {
-            command: bridge_command.unwrap_or_else(default_bridge_command),
-            args: vec!["mcp-bridge".into()],
-            env,
+            url,
             bridge_tools,
             // Claude built-ins stand down; trouve's executor is the tool
             // source (reads included, for full permission fidelity).

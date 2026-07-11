@@ -67,12 +67,9 @@ pub struct ProviderConfig {
     pub command: Option<String>,
     /// Claude Code only: disable the vendor's built-in tools and bridge
     /// trouve's ToolExecutor in over MCP (full trouve tool/permission
-    /// fidelity). Requires the `trouve` CLI (or `bridge_command`) on PATH.
+    /// fidelity), served from the engine's embedded HTTP MCP endpoint.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_bridge: Option<bool>,
-    /// Binary that provides the `mcp-bridge` subcommand (default: "trouve").
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub bridge_command: Option<String>,
 }
 
 impl Default for ProviderConfig {
@@ -85,7 +82,6 @@ impl Default for ProviderConfig {
             oauth: None,
             command: None,
             tool_bridge: None,
-            bridge_command: None,
         }
     }
 }

@@ -1122,7 +1122,7 @@ mod tests {
 
         // Reorder requires the exact current id set...
         assert!(!store
-            .reorder_queued_prompts("th_1", &[c.id.clone()])
+            .reorder_queued_prompts("th_1", std::slice::from_ref(&c.id))
             .unwrap());
         // ...and applies the given order when it matches.
         assert!(store

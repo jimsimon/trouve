@@ -71,15 +71,15 @@ pub struct McpServerLaunch {
     pub env: Vec<(String, String)>,
 }
 
-/// Stdio MCP server the vendor agent should launch to reach trouve (the
-/// `trouve mcp-bridge` subcommand, pointed at this engine's internal
-/// endpoints via env vars). Always used for approval prompting in Ask mode;
-/// optionally also replaces the vendor's built-in tools with trouve's.
+/// Streamable-HTTP MCP server the vendor agent connects to in order to
+/// reach trouve (the engine's internal per-thread MCP endpoint). Always
+/// used for approval prompting in Ask mode; optionally also replaces the
+/// vendor's built-in tools with trouve's.
 #[derive(Debug, Clone)]
 pub struct McpBridgeConfig {
-    pub command: String,
-    pub args: Vec<String>,
-    pub env: Vec<(String, String)>,
+    /// Full endpoint URL, thread-scoped, with the tool/approval surface
+    /// selected via query parameters.
+    pub url: String,
     /// When true the bridge serves trouve's ToolExecutor tools and the
     /// vendor's built-ins are disabled; when false it only serves the
     /// approval-prompt gate.

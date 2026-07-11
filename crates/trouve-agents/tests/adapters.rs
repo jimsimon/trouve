@@ -463,12 +463,7 @@ EOF
     let mut stream = start_turn(&backend, || {
         let mut t = turn(tmp.path().to_path_buf(), None, BackendPermission::Ask);
         t.mcp_bridge = Some(trouve_agents::McpBridgeConfig {
-            command: "trouve".into(),
-            args: vec!["mcp-bridge".into()],
-            env: vec![
-                ("TROUVE_SERVER".into(), "http://127.0.0.1:1".into()),
-                ("TROUVE_THREAD_ID".into(), "th_1".into()),
-            ],
+            url: "http://127.0.0.1:1/internal/threads/th_1/mcp?tools=1&approval=1".into(),
             bridge_tools: true,
             disallowed_tools: vec!["Bash".into(), "Edit".into(), "Write".into()],
         });
@@ -496,15 +491,17 @@ EOF
     assert!(args.contains("--permission-prompt-tool"), "{args}");
     assert!(args.contains("mcp__trouve__approval_prompt"), "{args}");
 
-    // The generated MCP config launches the bridge with the dial-back env.
+    // The generated MCP config points at the engine's embedded HTTP MCP
+    // endpoint for this thread.
     let config_path = std::env::temp_dir().join("trouve-mcp-th_1.json");
     let config: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(&config_path).unwrap()).unwrap();
-    assert_eq!(config["mcpServers"]["trouve"]["command"], "trouve");
+    assert_eq!(config["mcpServers"]["trouve"]["type"], "http");
     assert_eq!(
-        config["mcpServers"]["trouve"]["env"]["TROUVE_THREAD_ID"],
-        "th_1"
+        config["mcpServers"]["trouve"]["url"],
+        "http://127.0.0.1:1/internal/threads/th_1/mcp?tools=1&approval=1"
     );
+    assert!(config["mcpServers"]["trouve"]["command"].is_null());
     // User MCP servers ride along in the same config, but are not
     // pre-allowed: their tools go through the normal permission path.
     assert_eq!(config["mcpServers"]["jira"]["command"], "jira-mcp");
@@ -531,12 +528,7 @@ EOF
         let mut t = turn(tmp.path().to_path_buf(), None, BackendPermission::Ask);
         t.thread_id = "th_2".into();
         t.mcp_bridge = Some(trouve_agents::McpBridgeConfig {
-            command: "trouve".into(),
-            args: vec!["mcp-bridge".into()],
-            env: vec![
-                ("TROUVE_SERVER".into(), "http://127.0.0.1:1".into()),
-                ("TROUVE_THREAD_ID".into(), "th_2".into()),
-            ],
+            url: "http://127.0.0.1:1/internal/threads/th_2/mcp?tools=0&approval=1".into(),
             bridge_tools: false,
             disallowed_tools: Vec::new(),
         });

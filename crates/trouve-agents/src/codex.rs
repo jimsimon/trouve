@@ -295,14 +295,9 @@ fn mcp_config_override(turn: &crate::BackendTurn) -> Option<Value> {
         );
     }
     if let Some(bridge) = &turn.mcp_bridge {
-        servers.insert(
-            "trouve".into(),
-            json!({
-                "command": bridge.command,
-                "args": bridge.args,
-                "env": env_map(&bridge.env),
-            }),
-        );
+        // Streamable-HTTP server (`url` instead of `command` selects the
+        // transport in codex's mcp_servers config shape).
+        servers.insert("trouve".into(), json!({ "url": bridge.url }));
     }
     if servers.is_empty() {
         return None;
@@ -498,11 +493,46 @@ fn turn_stream(
                     _ => {}
                 },
                 ServerMsg::Request { id, method, params } => {
+                    // MCP tool-call permission elicitation (codex's rmcp
+                    // client asks before every MCP tool call). The trouve
+                    // bridge's tools are gated inside trouve's own
+                    // permission layer, so auto-accept those; other MCP
+                    // servers go through the normal approval flow.
+                    if method == "mcpServer/elicitation/request" {
+                        if params["serverName"] == "trouve" {
+                            server
+                                .respond(id, json!({ "action": "accept", "content": {} }))
+                                .await;
+                            continue;
+                        }
+                        let (ok_tx, ok_rx) = oneshot::channel();
+                        let _ = tx
+                            .send(Ok(BackendEvent::ApprovalNeeded {
+                                call_id: String::new(),
+                                tool: "mcpToolCall".into(),
+                                args: params.clone(),
+                                responder: ok_tx,
+                            }))
+                            .await;
+                        let action = if ok_rx.await.unwrap_or(false) {
+                            "accept"
+                        } else {
+                            "decline"
+                        };
+                        server
+                            .respond(id, json!({ "action": action, "content": {} }))
+                            .await;
+                        continue;
+                    }
                     let tool = match method.as_str() {
                         "item/commandExecution/requestApproval" => "commandExecution",
                         "item/fileChange/requestApproval" => "fileChange",
                         _ => {
                             // Unknown server request: deny rather than hang.
+                            tracing::warn!(
+                                "codex: denying unknown server request {method}: {}",
+                                serde_json::to_string(&params).unwrap_or_default()
+                            );
                             server.respond(id, json!({ "decision": "denied" })).await;
                             continue;
                         }
@@ -869,9 +899,7 @@ mod tests {
             env: vec![("TOKEN".into(), "sekrit".into())],
         });
         turn.mcp_bridge = Some(crate::McpBridgeConfig {
-            command: "trouve".into(),
-            args: vec!["mcp-bridge".into()],
-            env: vec![("TROUVE_THREAD_ID".into(), "th_1".into())],
+            url: "http://127.0.0.1:1/internal/threads/th_1/mcp?tools=0&approval=0".into(),
             bridge_tools: false,
             disallowed_tools: Vec::new(),
         });
@@ -879,7 +907,11 @@ mod tests {
         let servers = &config["mcp_servers"];
         assert_eq!(servers["jira"]["command"], "jira-mcp");
         assert_eq!(servers["jira"]["env"]["TOKEN"], "sekrit");
-        assert_eq!(servers["trouve"]["args"][0], "mcp-bridge");
+        assert_eq!(
+            servers["trouve"]["url"],
+            "http://127.0.0.1:1/internal/threads/th_1/mcp?tools=0&approval=0"
+        );
+        assert!(servers["trouve"]["command"].is_null());
 
         // User servers alone (no bridge) still produce an override.
         turn.mcp_bridge = None;

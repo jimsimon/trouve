@@ -1946,7 +1946,7 @@
     "/v1/threads/{id}/queue/dispatch": {
       "post": {
         "tags": [],
-        "summary": "Kick an idle thread into draining its queue (a failed turn pauses the\nqueue until the user explicitly resumes it).",
+        "summary": "Kick an idle thread into draining its queue. Queued prompts never\nauto-run at startup (a crash may have cut the previous turn short) and a\nfailed turn pauses its queue — both wait for this explicit resume.",
         "operationId": "dispatch_queue",
         "parameters": [
           {

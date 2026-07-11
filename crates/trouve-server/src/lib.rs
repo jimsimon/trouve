@@ -4,6 +4,8 @@
 //! event stream per scope, delivered as SSE with cursor resumption via
 //! `Last-Event-ID` or `?after=`.
 
+mod mcp;
+
 use std::convert::Infallible;
 use std::sync::Arc;
 
@@ -294,14 +296,10 @@ pub fn build_router(engine: Arc<Engine>) -> Router {
         .route("/v1/approvals", post(resolve_approval))
         .route("/v1/questions", post(resolve_question))
         .route("/v1/events", get(server_events))
-        // Internal (undocumented, same-host trust domain): tool bridge for
-        // external agent backends running with trouve's ToolExecutor.
-        .route("/internal/threads/{id}/tools", get(bridged_tools))
-        .route("/internal/threads/{id}/tools/call", post(bridged_tool_call))
-        .route(
-            "/internal/threads/{id}/approval",
-            post(bridged_approval_prompt),
-        )
+        // Internal (undocumented, same-host trust domain): streamable-HTTP
+        // MCP endpoint bridging external agent backends into trouve's
+        // tools and approval gate.
+        .route("/internal/threads/{id}/mcp", post(mcp::mcp_endpoint))
         .with_state(engine)
 }
 
@@ -693,56 +691,6 @@ async fn stop_local_server(
 ) -> axum::http::StatusCode {
     engine.stop_local_server().await;
     axum::http::StatusCode::NO_CONTENT
-}
-
-// --- internal tool bridge (undocumented; not part of the public protocol) ---
-
-/// Tool specs for a thread, consumed by the `trouve mcp-bridge` process that
-/// external agent backends (Claude Code) launch to reach trouve's tools.
-async fn bridged_tools(
-    State(engine): State<Arc<Engine>>,
-    Path(id): Path<String>,
-) -> Result<Json<serde_json::Value>, ApiError> {
-    let specs = engine.bridged_tool_specs(&id).await?;
-    Ok(Json(serde_json::to_value(specs).unwrap_or_default()))
-}
-
-#[derive(serde::Deserialize)]
-struct BridgedCallRequest {
-    name: String,
-    #[serde(default)]
-    arguments: serde_json::Value,
-}
-
-#[derive(serde::Deserialize)]
-struct BridgedApprovalRequest {
-    tool: String,
-    #[serde(default)]
-    args: serde_json::Value,
-}
-
-/// Permission-prompt gate for vendor-executed tools (Claude Code's
-/// `--permission-prompt-tool` hook, relayed by `trouve mcp-bridge`).
-async fn bridged_approval_prompt(
-    State(engine): State<Arc<Engine>>,
-    Path(id): Path<String>,
-    Json(req): Json<BridgedApprovalRequest>,
-) -> Result<Json<serde_json::Value>, ApiError> {
-    let approved = engine.bridged_approval(&id, &req.tool, &req.args).await?;
-    Ok(Json(serde_json::json!({ "approved": approved })))
-}
-
-/// Execute one bridged tool call through the engine's gate/approval/event
-/// chokepoint; returns the content string fed back to the vendor agent.
-async fn bridged_tool_call(
-    State(engine): State<Arc<Engine>>,
-    Path(id): Path<String>,
-    Json(req): Json<BridgedCallRequest>,
-) -> Result<Json<serde_json::Value>, ApiError> {
-    let content = engine
-        .bridged_tool_call(&id, &req.name, &req.arguments)
-        .await?;
-    Ok(Json(serde_json::json!({ "content": content })))
 }
 
 #[utoipa::path(delete, path = "/v1/providers/{id}", params(("id" = String, Path,)),

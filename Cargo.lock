@@ -8033,24 +8033,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "trouve-cli"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "clap",
- "futures",
- "getrandom 0.3.4",
- "reqwest",
- "serde_json",
- "tokio",
- "tracing-subscriber",
- "trouve-core",
- "trouve-protocol",
- "trouve-providers",
- "trouve-server",
-]
-
-[[package]]
 name = "trouve-client-core"
 version = "0.1.0"
 dependencies = [
