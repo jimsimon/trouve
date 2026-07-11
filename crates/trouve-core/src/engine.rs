@@ -1040,6 +1040,216 @@ impl Engine {
         }
     }
 
+    // --- automations ------------------------------------------------------------
+
+    /// All automations, in creation order.
+    pub fn list_automations(&self) -> Result<Vec<trouve_protocol::Automation>, EngineError> {
+        Ok(self.store.list_automations()?)
+    }
+
+    pub fn create_automation(
+        &self,
+        req: trouve_protocol::UpsertAutomationRequest,
+    ) -> Result<trouve_protocol::Automation, EngineError> {
+        self.validate_automation(&req)?;
+        let next_run_at = if req.enabled {
+            crate::automations::next_run(&req.schedule, chrono::Local::now())
+                .map(|t| t.to_rfc3339())
+        } else {
+            None
+        };
+        let automation = trouve_protocol::Automation {
+            id: new_id("auto"),
+            name: req.name,
+            prompt: req.prompt,
+            workspace_id: req.workspace_id,
+            mode: req.mode,
+            model: req.model,
+            schedule: req.schedule,
+            enabled: req.enabled,
+            next_run_at,
+            last_run_at: None,
+            last_session_id: None,
+            last_error: String::new(),
+            created_at: chrono::Utc::now().to_rfc3339(),
+        };
+        self.store.insert_automation(&automation)?;
+        Ok(automation)
+    }
+
+    pub fn update_automation(
+        &self,
+        id: &str,
+        req: trouve_protocol::UpsertAutomationRequest,
+    ) -> Result<trouve_protocol::Automation, EngineError> {
+        self.validate_automation(&req)?;
+        let mut automation = self
+            .store
+            .automation(id)?
+            .ok_or_else(|| EngineError::NotFound(format!("automation {id}")))?;
+        automation.name = req.name;
+        automation.prompt = req.prompt;
+        automation.workspace_id = req.workspace_id;
+        automation.mode = req.mode;
+        automation.model = req.model;
+        automation.schedule = req.schedule;
+        automation.enabled = req.enabled;
+        automation.next_run_at = if req.enabled {
+            crate::automations::next_run(&automation.schedule, chrono::Local::now())
+                .map(|t| t.to_rfc3339())
+        } else {
+            None
+        };
+        self.store.update_automation(&automation)?;
+        Ok(automation)
+    }
+
+    pub fn delete_automation(&self, id: &str) -> Result<(), EngineError> {
+        if !self.store.delete_automation(id)? {
+            return Err(EngineError::NotFound(format!("automation {id}")));
+        }
+        Ok(())
+    }
+
+    fn validate_automation(
+        &self,
+        req: &trouve_protocol::UpsertAutomationRequest,
+    ) -> Result<(), EngineError> {
+        if req.name.trim().is_empty() {
+            return Err(EngineError::BadRequest("automations need a name".into()));
+        }
+        if req.prompt.trim().is_empty() {
+            return Err(EngineError::BadRequest("automations need a prompt".into()));
+        }
+        if self.store.workspace(&req.workspace_id)?.is_none() {
+            return Err(EngineError::NotFound(format!(
+                "workspace {}",
+                req.workspace_id
+            )));
+        }
+        if let Some(complaint) = crate::automations::validate(&req.schedule) {
+            return Err(EngineError::BadRequest(complaint));
+        }
+        Ok(())
+    }
+
+    /// Fire an automation immediately, in the background (creating the
+    /// worktree takes a moment). The outcome lands in `last_*` and an
+    /// `automation.fired` event, same as a scheduled run.
+    pub fn run_automation_now(self: &Arc<Self>, id: &str) -> Result<(), EngineError> {
+        let automation = self
+            .store
+            .automation(id)?
+            .ok_or_else(|| EngineError::NotFound(format!("automation {id}")))?;
+        let engine = self.clone();
+        tokio::spawn(async move {
+            engine.fire_and_record(&automation).await;
+        });
+        Ok(())
+    }
+
+    /// Start the background scheduler (called once when serving). Runs
+    /// missed while the server was down are skipped — every enabled
+    /// automation's next fire is recomputed from "now" at startup.
+    pub fn start_automation_scheduler(self: &Arc<Self>) {
+        let engine = self.clone();
+        tokio::spawn(async move {
+            let now = chrono::Local::now();
+            if let Ok(automations) = engine.store.list_automations() {
+                for a in automations {
+                    let next = a
+                        .enabled
+                        .then(|| crate::automations::next_run(&a.schedule, now))
+                        .flatten()
+                        .map(|t| t.to_rfc3339());
+                    let _ = engine.store.set_automation_next_run(&a.id, next.as_deref());
+                }
+            }
+            let mut tick = tokio::time::interval(std::time::Duration::from_secs(15));
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                tick.tick().await;
+                engine.fire_due_automations().await;
+            }
+        });
+    }
+
+    async fn fire_due_automations(self: &Arc<Self>) {
+        let Ok(automations) = self.store.list_automations() else {
+            return;
+        };
+        let now = chrono::Utc::now();
+        for automation in automations {
+            if !automation.enabled {
+                continue;
+            }
+            let due = automation
+                .next_run_at
+                .as_deref()
+                .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+                .is_some_and(|next| next <= now);
+            if due {
+                self.fire_and_record(&automation).await;
+            }
+        }
+    }
+
+    /// One run: session + thread + prompt, then bookkeeping and the
+    /// server-scope event clients refresh on.
+    async fn fire_and_record(self: &Arc<Self>, automation: &trouve_protocol::Automation) {
+        let (session_id, error) = match self.fire_automation(automation).await {
+            Ok(session_id) => (Some(session_id), String::new()),
+            Err(e) => (None, e.to_string()),
+        };
+        let next = crate::automations::next_run(&automation.schedule, chrono::Local::now())
+            .filter(|_| automation.enabled)
+            .map(|t| t.to_rfc3339());
+        let _ = self.store.mark_automation_run(
+            &automation.id,
+            &chrono::Utc::now().to_rfc3339(),
+            session_id.as_deref(),
+            &error,
+            next.as_deref(),
+        );
+        if !error.is_empty() {
+            tracing::warn!("automation {} failed: {error}", automation.name);
+        }
+        let _ = self.store.append_event(
+            Scope::Server,
+            Event::AutomationFired {
+                automation_id: automation.id.clone(),
+                session_id,
+                error,
+            },
+        );
+    }
+
+    async fn fire_automation(
+        self: &Arc<Self>,
+        automation: &trouve_protocol::Automation,
+    ) -> Result<String, EngineError> {
+        let session = self
+            .create_session(trouve_protocol::CreateSessionRequest {
+                workspace_id: automation.workspace_id.clone(),
+                title: Some(format!(
+                    "{} — {}",
+                    automation.name,
+                    chrono::Local::now().format("%b %d %H:%M")
+                )),
+                base_ref: None,
+            })
+            .await?;
+        let thread = self.create_thread(trouve_protocol::CreateThreadRequest {
+            session_id: session.id.clone(),
+            mode: automation.mode.clone(),
+            model: automation.model.clone(),
+            model_options: Default::default(),
+            permission_mode: None,
+        })?;
+        self.send_message(&thread.id, automation.prompt.clone(), Vec::new())?;
+        Ok(session.id)
+    }
+
     // --- local models ---------------------------------------------------------
 
     /// The hardware probe result, run once (off the async runtime) and

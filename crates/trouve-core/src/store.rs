@@ -98,6 +98,21 @@ CREATE TABLE IF NOT EXISTS events (
   payload TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS events_scope ON events (scope_kind, scope_id, cursor);
+CREATE TABLE IF NOT EXISTS automations (
+  id TEXT PRIMARY KEY,
+  name TEXT NOT NULL,
+  prompt TEXT NOT NULL,
+  workspace_id TEXT NOT NULL REFERENCES workspaces(id),
+  mode TEXT,
+  model TEXT,
+  schedule TEXT NOT NULL,       -- JSON trouve_protocol::AutomationSchedule
+  enabled INTEGER NOT NULL DEFAULT 1,
+  next_run_at TEXT,             -- RFC3339; NULL while disabled
+  last_run_at TEXT,
+  last_session_id TEXT,
+  last_error TEXT NOT NULL DEFAULT '',
+  created_at TEXT NOT NULL
+);
 "#;
 
 /// Additive migrations for databases created before a column existed.
@@ -124,6 +139,33 @@ fn apply_migrations(conn: &Connection) -> Result<()> {
 /// "no attachments" rather than failing the whole queue read.
 fn parse_attachments(json: &str) -> Vec<trouve_protocol::Attachment> {
     serde_json::from_str(json).unwrap_or_default()
+}
+
+/// One `automations` row (column order matches the SELECTs below).
+fn row_to_automation(r: &rusqlite::Row<'_>) -> rusqlite::Result<trouve_protocol::Automation> {
+    let schedule_json: String = r.get(6)?;
+    Ok(trouve_protocol::Automation {
+        id: r.get(0)?,
+        name: r.get(1)?,
+        prompt: r.get(2)?,
+        workspace_id: r.get(3)?,
+        mode: r.get(4)?,
+        model: r.get(5)?,
+        schedule: serde_json::from_str(&schedule_json).unwrap_or(
+            trouve_protocol::AutomationSchedule {
+                kind: "daily".into(),
+                minute: 0,
+                time: "09:00".into(),
+                days: vec![],
+            },
+        ),
+        enabled: r.get(7)?,
+        next_run_at: r.get(8)?,
+        last_run_at: r.get(9)?,
+        last_session_id: r.get(10)?,
+        last_error: r.get(11)?,
+        created_at: r.get(12)?,
+    })
 }
 
 pub enum UsageScope<'a> {
@@ -730,6 +772,121 @@ impl Store {
             .optional()?)
     }
 
+    // --- automations ------------------------------------------------------------
+
+    pub fn insert_automation(&self, a: &trouve_protocol::Automation) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO automations (id, name, prompt, workspace_id, mode, model, schedule,
+                                      enabled, next_run_at, last_run_at, last_session_id,
+                                      last_error, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+            params![
+                a.id,
+                a.name,
+                a.prompt,
+                a.workspace_id,
+                a.mode,
+                a.model,
+                serde_json::to_string(&a.schedule)?,
+                a.enabled,
+                a.next_run_at,
+                a.last_run_at,
+                a.last_session_id,
+                a.last_error,
+                a.created_at,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Replace the user-editable fields plus the recomputed next fire time
+    /// (run bookkeeping is `mark_automation_run`'s job).
+    pub fn update_automation(&self, a: &trouve_protocol::Automation) -> Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        let n = conn.execute(
+            "UPDATE automations SET name = ?2, prompt = ?3, workspace_id = ?4, mode = ?5,
+                    model = ?6, schedule = ?7, enabled = ?8, next_run_at = ?9
+             WHERE id = ?1",
+            params![
+                a.id,
+                a.name,
+                a.prompt,
+                a.workspace_id,
+                a.mode,
+                a.model,
+                serde_json::to_string(&a.schedule)?,
+                a.enabled,
+                a.next_run_at,
+            ],
+        )?;
+        Ok(n > 0)
+    }
+
+    /// Record one fire: when, what it created (or why it failed), and when
+    /// it fires next.
+    pub fn mark_automation_run(
+        &self,
+        id: &str,
+        ran_at: &str,
+        session_id: Option<&str>,
+        error: &str,
+        next_run_at: Option<&str>,
+    ) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE automations SET last_run_at = ?2, last_session_id = ?3, last_error = ?4,
+                    next_run_at = ?5
+             WHERE id = ?1",
+            params![id, ran_at, session_id, error, next_run_at],
+        )?;
+        Ok(())
+    }
+
+    /// Reset the next fire time alone (startup recompute after downtime).
+    pub fn set_automation_next_run(&self, id: &str, next_run_at: Option<&str>) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE automations SET next_run_at = ?2 WHERE id = ?1",
+            params![id, next_run_at],
+        )?;
+        Ok(())
+    }
+
+    pub fn list_automations(&self) -> Result<Vec<trouve_protocol::Automation>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, name, prompt, workspace_id, mode, model, schedule, enabled,
+                    next_run_at, last_run_at, last_session_id, last_error, created_at
+             FROM automations ORDER BY created_at, id",
+        )?;
+        let rows = stmt.query_map([], row_to_automation)?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r?);
+        }
+        Ok(out)
+    }
+
+    pub fn automation(&self, id: &str) -> Result<Option<trouve_protocol::Automation>> {
+        let conn = self.conn.lock().unwrap();
+        Ok(conn
+            .query_row(
+                "SELECT id, name, prompt, workspace_id, mode, model, schedule, enabled,
+                        next_run_at, last_run_at, last_session_id, last_error, created_at
+                 FROM automations WHERE id = ?1",
+                params![id],
+                row_to_automation,
+            )
+            .optional()?)
+    }
+
+    pub fn delete_automation(&self, id: &str) -> Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        let n = conn.execute("DELETE FROM automations WHERE id = ?1", params![id])?;
+        Ok(n > 0)
+    }
+
     // --- provider transcript --------------------------------------------------
 
     pub fn append_message(&self, thread_id: &str, payload: &serde_json::Value) -> Result<()> {
@@ -1225,6 +1382,74 @@ mod tests {
         let q = store.queued_prompts("th_1").unwrap();
         assert_eq!(q.len(), 1);
         assert_eq!(q[0].content, "keep me");
+    }
+
+    #[test]
+    fn automations_round_trip_and_record_runs() {
+        let store = Store::open_in_memory().unwrap();
+        store
+            .insert_workspace(&trouve_protocol::Workspace {
+                id: "ws_1".into(),
+                name: "proj".into(),
+                path: "/tmp/proj".into(),
+            })
+            .unwrap();
+        let auto = trouve_protocol::Automation {
+            id: "auto_1".into(),
+            name: "Nightly triage".into(),
+            prompt: "Review open issues".into(),
+            workspace_id: "ws_1".into(),
+            mode: Some("code".into()),
+            model: None,
+            schedule: trouve_protocol::AutomationSchedule {
+                kind: "weekly".into(),
+                minute: 0,
+                time: "09:00".into(),
+                days: vec![0, 4],
+            },
+            enabled: true,
+            next_run_at: Some("2026-07-13T09:00:00-04:00".into()),
+            last_run_at: None,
+            last_session_id: None,
+            last_error: String::new(),
+            created_at: chrono::Utc::now().to_rfc3339(),
+        };
+        store.insert_automation(&auto).unwrap();
+
+        let listed = store.list_automations().unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].schedule, auto.schedule);
+        assert_eq!(listed[0].mode.as_deref(), Some("code"));
+
+        // Edit: rename + disable clears the next fire time.
+        let mut edited = auto.clone();
+        edited.name = "Morning triage".into();
+        edited.enabled = false;
+        edited.next_run_at = None;
+        assert!(store.update_automation(&edited).unwrap());
+        let got = store.automation("auto_1").unwrap().unwrap();
+        assert_eq!(got.name, "Morning triage");
+        assert!(!got.enabled);
+        assert!(got.next_run_at.is_none());
+
+        // A run records its outcome without touching the definition.
+        store
+            .mark_automation_run(
+                "auto_1",
+                "2026-07-13T09:00:01-04:00",
+                Some("sess_9"),
+                "",
+                Some("2026-07-17T09:00:00-04:00"),
+            )
+            .unwrap();
+        let got = store.automation("auto_1").unwrap().unwrap();
+        assert_eq!(got.last_session_id.as_deref(), Some("sess_9"));
+        assert_eq!(got.last_error, "");
+        assert_eq!(got.name, "Morning triage");
+
+        assert!(store.delete_automation("auto_1").unwrap());
+        assert!(!store.delete_automation("auto_1").unwrap());
+        assert!(store.list_automations().unwrap().is_empty());
     }
 
     #[test]

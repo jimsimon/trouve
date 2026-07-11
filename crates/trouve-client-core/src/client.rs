@@ -723,22 +723,85 @@ impl ProtocolClient {
         Ok(())
     }
 
+    // --- automations -----------------------------------------------------------
+
+    pub async fn list_automations(&self) -> Result<Vec<trouve_protocol::Automation>> {
+        self.get_json("/automations").await
+    }
+
+    pub async fn create_automation(
+        &self,
+        req: &trouve_protocol::UpsertAutomationRequest,
+    ) -> Result<trouve_protocol::Automation> {
+        self.post_json("/automations", req).await
+    }
+
+    pub async fn update_automation(
+        &self,
+        id: &str,
+        req: &trouve_protocol::UpsertAutomationRequest,
+    ) -> Result<trouve_protocol::Automation> {
+        let path = format!("/automations/{id}");
+        let resp = self
+            .http
+            .put(format!("{}{path}", self.base))
+            .json(req)
+            .send()
+            .await
+            .with_context(|| format!("PUT {path}"))?;
+        decode(resp, &path).await
+    }
+
+    pub async fn delete_automation(&self, id: &str) -> Result<()> {
+        self.delete(&format!("/automations/{id}")).await
+    }
+
+    /// Fire an automation immediately (runs in the background server-side).
+    pub async fn run_automation(&self, id: &str) -> Result<()> {
+        self.post_empty(&format!("/automations/{id}/run")).await
+    }
+
+    /// Follow the server-scope event stream (session/workspace lifecycle,
+    /// automation runs) from `after`. Same contract as
+    /// [`Self::follow_thread_events`].
+    pub async fn follow_server_events(
+        &self,
+        after: u64,
+        on_event: impl FnMut(EventEnvelope) -> std::ops::ControlFlow<()>,
+    ) -> Result<u64> {
+        self.follow_sse(
+            format!("{}/events?after={after}", self.base),
+            after,
+            on_event,
+        )
+        .await
+    }
+
     /// Follow a thread's event stream from `after`, invoking `on_event` for
     /// each envelope. Returns when the stream ends or the callback errors.
     pub async fn follow_thread_events(
         &self,
         thread_id: &str,
         after: u64,
+        on_event: impl FnMut(EventEnvelope) -> std::ops::ControlFlow<()>,
+    ) -> Result<u64> {
+        self.follow_sse(
+            format!("{}/threads/{thread_id}/events?after={after}", self.base),
+            after,
+            on_event,
+        )
+        .await
+    }
+
+    /// Consume one SSE stream of [`EventEnvelope`]s, returning the last
+    /// cursor seen.
+    async fn follow_sse(
+        &self,
+        url: String,
+        after: u64,
         mut on_event: impl FnMut(EventEnvelope) -> std::ops::ControlFlow<()>,
     ) -> Result<u64> {
-        let resp = self
-            .http
-            .get(format!(
-                "{}/threads/{thread_id}/events?after={after}",
-                self.base
-            ))
-            .send()
-            .await?;
+        let resp = self.http.get(url).send().await?;
         let mut stream = resp.bytes_stream();
         let mut buf = String::new();
         let mut last = after;

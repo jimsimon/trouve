@@ -16,6 +16,7 @@ import {
     SettingsScreen, ProviderItem, CliItem, KnownProviderItem, McpServerItem,
     SubscriptionItem, ModeItem, LocalModelItem, LocalSearchItem
 } from "settings-window.slint";
+import { AutomationsScreen, AutomationItem } from "automations-screen.slint";
 import { ScrollKeys } from "scroll-keys.slint";
 import { Theme, ThemePalette } from "theme.slint";
 import { Palette } from "std-widgets.slint";
@@ -23,7 +24,7 @@ import { Palette } from "std-widgets.slint";
 // Theme re-exported so Rust can push the selected palette.
 export {
     DiffRow, TextSegment, TermSpan, ProviderItem, CliItem, KnownProviderItem, McpServerItem,
-    SubscriptionItem, ModeItem, LocalModelItem, LocalSearchItem
+    SubscriptionItem, ModeItem, LocalModelItem, LocalSearchItem, AutomationItem
 }
 export { Theme, ThemePalette }
 
@@ -1014,8 +1015,30 @@ export component AppWindow inherits Window {
     in-out property <string> modal-title: "";
 
     // --- center column ---------------------------------------------------------
-    // 0 chat, 1 new-session screen, 2 new-thread screen, 3 settings
+    // 0 chat, 1 new-session screen, 2 new-thread screen, 3 settings,
+    // 4 automations
     in property <int> center-screen: 0;
+
+    // --- automations screen ----------------------------------------------------
+    in property <[AutomationItem]> automations;
+    in property <string> automations-status: "";
+    in property <[string]> automation-workspace-names;
+    in property <[string]> automation-workspace-ids;
+    callback open-automations();
+    callback close-automations();
+    callback automations-refresh();
+    callback automation-saved(/* id */ string, /* name */ string, /* prompt */ string,
+                              /* workspace-id */ string, /* kind */ string,
+                              /* minute */ string, /* time */ string, /* days */ string,
+                              /* enabled */ bool);
+    callback automation-toggled(/* id */ string, /* enabled */ bool);
+    callback automation-run(/* id */ string);
+    callback automation-deleted(/* id */ string);
+    // Lets the controller dismiss the form after a successful save.
+    public function close-automation-form() {
+        automations-screen-form-open = false;
+    }
+    in-out property <bool> automations-screen-form-open: false;
 
     // --- settings screen -------------------------------------------------------
     in property <[ProviderItem]> settings-providers;
@@ -1367,8 +1390,8 @@ export component AppWindow inherits Window {
 
     HorizontalLayout {
         // Hidden (not removed — the chat list keeps its scroll state) while
-        // the full-window settings screen is up.
-        visible: root.center-screen != 3;
+        // a full-window screen (settings, automations) is up.
+        visible: root.center-screen != 3 && root.center-screen != 4;
 
         // ---------------- left: sessions ----------------
         Rectangle {
@@ -1378,6 +1401,35 @@ export component AppWindow inherits Window {
             VerticalLayout {
                 padding: 10px;
                 spacing: 8px;
+
+                // App-level nav (above the workspace/session tree).
+                Rectangle {
+                    height: Theme.fs(34px);
+                    border-radius: 6px;
+                    background: automations-ta.has-hover ? Theme.c.hover-bg : Theme.c.raised-bg;
+                    automations-ta := TouchArea {
+                        clicked => { root.open-automations(); }
+                    }
+                    HorizontalLayout {
+                        padding-left: 10px;
+                        padding-right: 10px;
+                        spacing: 8px;
+                        Text {
+                            text: "⏱";
+                            color: Theme.c.text-mid;
+                            font-size: Theme.fs(14px);
+                            vertical-alignment: center;
+                        }
+                        Text {
+                            text: "Automations";
+                            color: Theme.c.text-hi;
+                            font-size: Theme.fs(13px);
+                            font-weight: 700;
+                            vertical-alignment: center;
+                            horizontal-stretch: 1;
+                        }
+                    }
+                }
 
                 HorizontalLayout {
                     Text {
@@ -3790,6 +3842,25 @@ export component AppWindow inherits Window {
                 }
             }
         }
+    }
+
+    // ---------------- automations screen (full-window) ----------------
+    if root.center-screen == 4: AutomationsScreen {
+        width: 100%;
+        height: 100%;
+        automations: root.automations;
+        status: root.automations-status;
+        workspace-names: root.automation-workspace-names;
+        workspace-ids: root.automation-workspace-ids;
+        form-open <=> root.automations-screen-form-open;
+        close => { root.close-automations(); }
+        refresh => { root.automations-refresh(); }
+        saved(id, name, prompt, ws, kind, minute, time, days, enabled) => {
+            root.automation-saved(id, name, prompt, ws, kind, minute, time, days, enabled);
+        }
+        toggled(id, on) => { root.automation-toggled(id, on); }
+        run-now(id) => { root.automation-run(id); }
+        deleted(id) => { root.automation-deleted(id); }
     }
 
     // ---------------- settings screen (full-window) ----------------

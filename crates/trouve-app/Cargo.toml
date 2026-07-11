@@ -40,6 +40,9 @@ fuzzy-matcher = "0.3"
 shlex = "2.0.1"
 # Desktop notifications (turn finished / needs attention).
 notify-rust = "4.18.0"
+# Automations: local-time rendering of schedule timestamps.
+chrono.workspace = true
+
 # Prompt attachments: clipboard image paste (arboard), PNG encoding of the
 # pasted RGBA pixels, and MIME sniffing for picked files.
 arboard = "3.6.1"

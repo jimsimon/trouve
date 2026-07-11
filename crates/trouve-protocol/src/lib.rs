@@ -35,7 +35,10 @@ pub use requests::*;
 // and GET /v1/attachments/{id} serving the stored bytes (all additive).
 // 0.11: local model search — GET /v1/local/search?q= returns HuggingFace
 // GGUF repos with per-file hardware-fit guidance (additive).
-pub const PROTOCOL_VERSION: &str = "0.11";
+// 0.12: automations — scheduled prompts (CRUD under /v1/automations, run-now
+// endpoint, automation.fired server event); each run creates a session and
+// sends the prompt (all additive).
+pub const PROTOCOL_VERSION: &str = "0.12";
 
 pub type WorkspaceId = String;
 pub type SessionId = String;

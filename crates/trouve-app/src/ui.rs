@@ -926,6 +926,80 @@ pub fn set_local_status(ui: &Ui, status: String) {
     });
 }
 
+/// One automation row (plain-data mirror of Slint's `AutomationItem`).
+pub struct AutomationView {
+    pub id: String,
+    pub name: String,
+    pub schedule_line: String,
+    pub next_line: String,
+    pub last_line: String,
+    pub last_failed: bool,
+    pub enabled: bool,
+    pub prompt: String,
+    pub workspace_index: i32,
+    pub kind: String,
+    pub minute_text: String,
+    pub time: String,
+    /// 7 flags, Monday first.
+    pub days: Vec<bool>,
+}
+
+/// The automations screen: rows plus the workspace picker arrays.
+pub fn set_automations(
+    ui: &Ui,
+    rows: Vec<AutomationView>,
+    workspace_names: Vec<String>,
+    workspace_ids: Vec<String>,
+) {
+    let _ = ui.upgrade_in_event_loop(move |ui| {
+        let items: Vec<crate::AutomationItem> = rows
+            .into_iter()
+            .map(|a| crate::AutomationItem {
+                id: SharedString::from(a.id.as_str()),
+                name: SharedString::from(a.name.as_str()),
+                schedule_line: SharedString::from(a.schedule_line.as_str()),
+                next_line: SharedString::from(a.next_line.as_str()),
+                last_line: SharedString::from(a.last_line.as_str()),
+                last_failed: a.last_failed,
+                enabled: a.enabled,
+                prompt: SharedString::from(a.prompt.as_str()),
+                workspace_index: a.workspace_index,
+                kind: SharedString::from(a.kind.as_str()),
+                minute_text: SharedString::from(a.minute_text.as_str()),
+                time: SharedString::from(a.time.as_str()),
+                days: ModelRc::new(VecModel::from(a.days)),
+            })
+            .collect();
+        ui.set_automations(ModelRc::new(VecModel::from(items)));
+        ui.set_automation_workspace_names(ModelRc::new(VecModel::from(
+            workspace_names
+                .into_iter()
+                .map(SharedString::from)
+                .collect::<Vec<_>>(),
+        )));
+        ui.set_automation_workspace_ids(ModelRc::new(VecModel::from(
+            workspace_ids
+                .into_iter()
+                .map(SharedString::from)
+                .collect::<Vec<_>>(),
+        )));
+    });
+}
+
+/// Error/status line for the automations screen.
+pub fn set_automations_status(ui: &Ui, status: String) {
+    let _ = ui.upgrade_in_event_loop(move |ui| {
+        ui.set_automations_status(SharedString::from(status.as_str()));
+    });
+}
+
+/// Dismiss the automation add/edit form (after a successful save).
+pub fn close_automation_form(ui: &Ui) {
+    let _ = ui.upgrade_in_event_loop(|ui| {
+        ui.invoke_close_automation_form();
+    });
+}
+
 /// One HuggingFace search result row (plain-data mirror of Slint's
 /// `LocalSearchItem`; the per-file vectors are parallel).
 pub struct LocalSearchView {

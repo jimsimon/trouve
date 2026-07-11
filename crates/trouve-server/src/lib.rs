@@ -21,7 +21,7 @@ use tokio_stream::wrappers::ReceiverStream;
 use trouve_core::engine::EngineError;
 use trouve_core::Engine;
 use trouve_protocol::{
-    AddLocalModelRequest, AgentMode, BranchList, CliInfo, CliInstallStatus, CliList,
+    AddLocalModelRequest, AgentMode, Automation, BranchList, CliInfo, CliInstallStatus, CliList,
     CreatePrRequest, CreateSessionRequest, CreateThreadRequest, DirEntry, ErrorBody, FileContent,
     GithubIntegration, KnownProvider, LocalSearchResult, LocalStatus, LoginStarted, LoginStatus,
     McpLogs, McpServerInfo, MergePrRequest, ModeInfo, ModelInfo, OpenTerminalRequest, PrInfo,
@@ -30,8 +30,8 @@ use trouve_protocol::{
     SessionDiff, SetDefaultModelRequest, SetGithubTokenRequest, SetLocalEnabledRequest,
     SubscriptionHealth, TerminalInfo, TerminalInputRequest, TerminalResizeRequest, Thread,
     TurnAccepted, UpdateQueuedPromptRequest, UpdateSessionRequest, UpdateThreadRequest,
-    UpsertMcpServerRequest, UpsertModeRequest, UpsertProviderRequest, UsageSummary, Workspace,
-    PROTOCOL_VERSION,
+    UpsertAutomationRequest, UpsertMcpServerRequest, UpsertModeRequest, UpsertProviderRequest,
+    UsageSummary, Workspace, PROTOCOL_VERSION,
 };
 use utoipa::OpenApi;
 
@@ -138,6 +138,11 @@ impl IntoResponse for ApiError {
         delete_mcp_server,
         mcp_server_logs,
         subscription_health,
+        list_automations,
+        create_automation,
+        update_automation,
+        delete_automation,
+        run_automation,
     ),
     components(schemas(
         ServerInfo,
@@ -195,6 +200,9 @@ impl IntoResponse for ApiError {
         McpLogs,
         SubscriptionHealth,
         trouve_protocol::SubscriptionWindow,
+        Automation,
+        trouve_protocol::AutomationSchedule,
+        UpsertAutomationRequest,
         ErrorBody,
         trouve_protocol::EventEnvelope,
         trouve_protocol::Event,
@@ -290,6 +298,15 @@ pub fn build_router(engine: Arc<Engine>) -> Router {
                 .delete(cancel_cli_install),
         )
         .route("/v1/clis/{id}", axum::routing::delete(uninstall_cli))
+        .route(
+            "/v1/automations",
+            get(list_automations).post(create_automation),
+        )
+        .route(
+            "/v1/automations/{id}",
+            axum::routing::put(update_automation).delete(delete_automation),
+        )
+        .route("/v1/automations/{id}/run", post(run_automation))
         .route("/v1/local", get(local_status))
         .route("/v1/local/enabled", axum::routing::put(set_local_enabled))
         .route("/v1/local/search", get(search_local_models))
@@ -346,6 +363,7 @@ pub async fn serve_listener(
 ) -> anyhow::Result<()> {
     // Backends dialing back in (MCP tool bridge) need our reachable URL.
     engine.set_base_url(&format!("http://{}", listener.local_addr()?));
+    engine.start_automation_scheduler();
     let router = build_router(engine);
     tracing::info!(
         "trouve-server listening on http://{}",
@@ -791,6 +809,57 @@ async fn cancel_local_model_download(
 ) -> Result<axum::http::StatusCode, ApiError> {
     engine.cancel_local_model_download(&id)?;
     Ok(axum::http::StatusCode::NO_CONTENT)
+}
+
+#[utoipa::path(get, path = "/v1/automations", responses((status = 200, body = [Automation])))]
+async fn list_automations(
+    State(engine): State<Arc<Engine>>,
+) -> Result<Json<Vec<Automation>>, ApiError> {
+    Ok(Json(engine.list_automations()?))
+}
+
+#[utoipa::path(post, path = "/v1/automations", request_body = UpsertAutomationRequest,
+    responses((status = 200, body = Automation), (status = 400, body = ErrorBody),
+              (status = 404, body = ErrorBody)))]
+async fn create_automation(
+    State(engine): State<Arc<Engine>>,
+    Json(req): Json<UpsertAutomationRequest>,
+) -> Result<Json<Automation>, ApiError> {
+    Ok(Json(engine.create_automation(req)?))
+}
+
+#[utoipa::path(put, path = "/v1/automations/{id}", params(("id" = String, Path,)),
+    request_body = UpsertAutomationRequest,
+    responses((status = 200, body = Automation), (status = 400, body = ErrorBody),
+              (status = 404, body = ErrorBody)))]
+async fn update_automation(
+    State(engine): State<Arc<Engine>>,
+    Path(id): Path<String>,
+    Json(req): Json<UpsertAutomationRequest>,
+) -> Result<Json<Automation>, ApiError> {
+    Ok(Json(engine.update_automation(&id, req)?))
+}
+
+#[utoipa::path(delete, path = "/v1/automations/{id}", params(("id" = String, Path,)),
+    responses((status = 204), (status = 404, body = ErrorBody)))]
+async fn delete_automation(
+    State(engine): State<Arc<Engine>>,
+    Path(id): Path<String>,
+) -> Result<StatusCode, ApiError> {
+    engine.delete_automation(&id)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// Fire the automation immediately (in the background); the outcome shows
+/// up on the automation's last_* fields and an `automation.fired` event.
+#[utoipa::path(post, path = "/v1/automations/{id}/run", params(("id" = String, Path,)),
+    responses((status = 202), (status = 404, body = ErrorBody)))]
+async fn run_automation(
+    State(engine): State<Arc<Engine>>,
+    Path(id): Path<String>,
+) -> Result<StatusCode, ApiError> {
+    engine.run_automation_now(&id)?;
+    Ok(StatusCode::ACCEPTED)
 }
 
 #[derive(Deserialize)]

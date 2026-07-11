@@ -7,7 +7,7 @@
       "name": "MIT",
       "identifier": "MIT"
     },
-    "version": "0.11"
+    "version": "0.12"
   },
   "paths": {
     "/v1/approvals": {
@@ -66,6 +66,192 @@
                 }
               }
             }
+          },
+          "404": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/automations": {
+      "get": {
+        "tags": [],
+        "operationId": "list_automations",
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/Automation"
+                  }
+                }
+              }
+            }
+          }
+        }
+      },
+      "post": {
+        "tags": [],
+        "operationId": "create_automation",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UpsertAutomationRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Automation"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/automations/{id}": {
+      "put": {
+        "tags": [],
+        "operationId": "update_automation",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UpsertAutomationRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Automation"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      },
+      "delete": {
+        "tags": [],
+        "operationId": "delete_automation",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": ""
+          },
+          "404": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/automations/{id}/run": {
+      "post": {
+        "tags": [],
+        "summary": "Fire the automation immediately (in the background); the outcome shows\nup on the automation's last_* fields and an `automation.fired` event.",
+        "operationId": "run_automation",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "202": {
+            "description": ""
           },
           "404": {
             "description": "",
@@ -2685,6 +2871,113 @@
           }
         }
       },
+      "Automation": {
+        "type": "object",
+        "description": "A scheduled prompt. Each run creates a fresh session (worktree) in the\nworkspace, a thread with the configured mode/model, and sends the\nprompt — exactly as if the user had typed it.",
+        "required": [
+          "id",
+          "name",
+          "prompt",
+          "workspace_id",
+          "schedule",
+          "enabled",
+          "created_at"
+        ],
+        "properties": {
+          "created_at": {
+            "type": "string"
+          },
+          "enabled": {
+            "type": "boolean"
+          },
+          "id": {
+            "type": "string"
+          },
+          "last_error": {
+            "type": "string",
+            "description": "Why the last run failed (\"\" = it didn't)."
+          },
+          "last_run_at": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Last fire time (RFC3339)."
+          },
+          "last_session_id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Session created by the last run."
+          },
+          "mode": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Agent mode for the runs (None = the default mode)."
+          },
+          "model": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Model for the runs (None = the mode's default)."
+          },
+          "name": {
+            "type": "string"
+          },
+          "next_run_at": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Next fire time (RFC3339), when enabled."
+          },
+          "prompt": {
+            "type": "string"
+          },
+          "schedule": {
+            "$ref": "#/components/schemas/AutomationSchedule"
+          },
+          "workspace_id": {
+            "$ref": "#/components/schemas/String"
+          }
+        }
+      },
+      "AutomationSchedule": {
+        "type": "object",
+        "description": "When an automation fires. Times are the server's local time zone.",
+        "required": [
+          "kind"
+        ],
+        "properties": {
+          "days": {
+            "type": "array",
+            "items": {
+              "type": "integer",
+              "format": "int32",
+              "minimum": 0
+            },
+            "description": "Weekly: days it fires (0 = Monday … 6 = Sunday); at least one."
+          },
+          "kind": {
+            "type": "string",
+            "description": "\"hourly\", \"daily\", or \"weekly\"."
+          },
+          "minute": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Hourly: minute of the hour (0-59).",
+            "minimum": 0
+          },
+          "time": {
+            "type": "string",
+            "description": "Daily/weekly: time of day as \"HH:MM\" (24h)."
+          }
+        }
+      },
       "BranchList": {
         "type": "object",
         "description": "Local branches of a workspace repository, for base-ref selection.",
@@ -3723,6 +4016,40 @@
                 "type": "string",
                 "enum": [
                   "thread.updated"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "description": "A scheduled automation ran (or failed to). Clients refetch the\nautomations list — and the sessions list when it succeeded, since a\nrun creates a session.",
+            "required": [
+              "automation_id",
+              "type"
+            ],
+            "properties": {
+              "automation_id": {
+                "type": "string"
+              },
+              "error": {
+                "type": "string",
+                "description": "Failure reason (\"\" = success)."
+              },
+              "session_id": {
+                "oneOf": [
+                  {
+                    "type": "null"
+                  },
+                  {
+                    "$ref": "#/components/schemas/String",
+                    "description": "Session the run created (absent when the run failed)."
+                  }
+                ]
+              },
+              "type": {
+                "type": "string",
+                "enum": [
+                  "automation.fired"
                 ]
               }
             }
@@ -5019,6 +5346,46 @@
                 "$ref": "#/components/schemas/PermissionMode"
               }
             ]
+          }
+        }
+      },
+      "UpsertAutomationRequest": {
+        "type": "object",
+        "description": "Create or update an automation (`POST /v1/automations`,\n`PUT /v1/automations/{id}`).",
+        "required": [
+          "name",
+          "prompt",
+          "workspace_id",
+          "schedule",
+          "enabled"
+        ],
+        "properties": {
+          "enabled": {
+            "type": "boolean"
+          },
+          "mode": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "model": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "name": {
+            "type": "string"
+          },
+          "prompt": {
+            "type": "string"
+          },
+          "schedule": {
+            "$ref": "#/components/schemas/AutomationSchedule"
+          },
+          "workspace_id": {
+            "$ref": "#/components/schemas/String"
           }
         }
       },

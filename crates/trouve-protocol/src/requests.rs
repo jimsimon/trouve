@@ -737,6 +737,71 @@ pub struct LocalSearchResult {
     pub recommended: u32,
 }
 
+// --- automations -----------------------------------------------------------
+
+/// When an automation fires. Times are the server's local time zone.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct AutomationSchedule {
+    /// "hourly", "daily", or "weekly".
+    pub kind: String,
+    /// Hourly: minute of the hour (0-59).
+    #[serde(default)]
+    pub minute: u8,
+    /// Daily/weekly: time of day as "HH:MM" (24h).
+    #[serde(default)]
+    pub time: String,
+    /// Weekly: days it fires (0 = Monday … 6 = Sunday); at least one.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub days: Vec<u8>,
+}
+
+/// A scheduled prompt. Each run creates a fresh session (worktree) in the
+/// workspace, a thread with the configured mode/model, and sends the
+/// prompt — exactly as if the user had typed it.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct Automation {
+    pub id: String,
+    pub name: String,
+    pub prompt: String,
+    pub workspace_id: WorkspaceId,
+    /// Agent mode for the runs (None = the default mode).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode: Option<String>,
+    /// Model for the runs (None = the mode's default).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    pub schedule: AutomationSchedule,
+    pub enabled: bool,
+    /// Next fire time (RFC3339), when enabled.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_run_at: Option<String>,
+    /// Last fire time (RFC3339).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_run_at: Option<String>,
+    /// Session created by the last run.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_session_id: Option<String>,
+    /// Why the last run failed ("" = it didn't).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub last_error: String,
+    pub created_at: String,
+}
+
+/// Create or update an automation (`POST /v1/automations`,
+/// `PUT /v1/automations/{id}`).
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct UpsertAutomationRequest {
+    pub name: String,
+    pub prompt: String,
+    pub workspace_id: WorkspaceId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    pub schedule: AutomationSchedule,
+    pub enabled: bool,
+}
+
 /// State of a CLI install started with `POST /v1/clis/{id}/install`.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct CliInstallStatus {

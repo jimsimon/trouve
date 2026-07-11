@@ -236,6 +236,38 @@ pub enum UiCommand {
     LocalSearch(String),
     /// Internal: a local-model search finished.
     LocalSearchLoaded(Result<Vec<trouve_protocol::LocalSearchResult>, String>),
+    /// Open the full-window automations screen.
+    OpenAutomations,
+    /// Leave the automations screen (back to chat / new-chat).
+    CloseAutomations,
+    /// Re-fetch the automations list.
+    RefreshAutomations,
+    /// Internal: the automations fetch finished.
+    AutomationsLoaded(Result<Vec<trouve_protocol::Automation>, String>),
+    /// Create (id "") or update an automation from the form fields.
+    SaveAutomation {
+        id: String,
+        name: String,
+        prompt: String,
+        workspace_id: String,
+        /// "hourly" / "daily" / "weekly".
+        kind: String,
+        /// Minute of the hour, as typed (hourly).
+        minute: String,
+        /// "HH:MM" (daily/weekly).
+        time: String,
+        /// Comma-separated Monday-first day indices (weekly).
+        days: String,
+        enabled: bool,
+    },
+    /// Pause/resume an automation.
+    AutomationToggled(String, bool),
+    /// Fire an automation immediately.
+    RunAutomation(String),
+    DeleteAutomation(String),
+    /// Internal: a server-scope event (session lifecycle, automation runs)
+    /// arrived on the global stream.
+    ServerEvent(Box<trouve_protocol::EventEnvelope>),
     /// Open settings straight to the Integrations section.
     OpenIntegrationsSettings,
     /// Store/remove the GitHub token (empty = remove).
@@ -353,6 +385,9 @@ struct Controller {
     /// Last HuggingFace model-search results (kept so "✓ added" flags can
     /// be updated in place after an add).
     local_search: Vec<trouve_protocol::LocalSearchResult>,
+    /// Automations, as last fetched (kept so pause/resume can resend the
+    /// full definition).
+    automations: Vec<trouve_protocol::Automation>,
     /// PRs detected for the current session's branch, and the one shown.
     prs: Vec<trouve_protocol::PrInfo>,
     pr_selected: usize,
@@ -481,6 +516,7 @@ pub async fn run(
         local_polling: false,
         local_downloaded: None,
         local_search: Vec::new(),
+        automations: Vec::new(),
         prs: Vec::new(),
         pr_selected: 0,
         pr_error: String::new(),
@@ -629,6 +665,30 @@ impl Controller {
         }
         self.push_github_integration();
         self.push_prs();
+
+        // Follow the server-scope event stream for the lifetime of the app:
+        // sessions created in the background (scheduled automations) and
+        // automation run outcomes arrive here. The handler ignores stale
+        // envelopes, so the history replay on (re)connect is harmless.
+        {
+            let client = self.client.clone();
+            let tx = self.tx.clone();
+            tokio::spawn(async move {
+                let mut after = 0u64;
+                loop {
+                    if let Ok(last) = client
+                        .follow_server_events(after, |envelope| {
+                            let _ = tx.send(UiCommand::ServerEvent(Box::new(envelope)));
+                            std::ops::ControlFlow::Continue(())
+                        })
+                        .await
+                    {
+                        after = after.max(last);
+                    }
+                    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                }
+            });
+        }
 
         // Reopen the last open session (select_session then restores its
         // last thread and scroll); fall back to the most recent active
@@ -2065,6 +2125,108 @@ impl Controller {
         );
     }
 
+    /// Re-fetch the automations list in the background.
+    fn refresh_automations(&self) {
+        let client = self.client.clone();
+        let tx = self.tx.clone();
+        tokio::spawn(async move {
+            let result = client
+                .list_automations()
+                .await
+                .map_err(|e| format!("{e:#}"));
+            let _ = tx.send(UiCommand::AutomationsLoaded(result));
+        });
+    }
+
+    /// Render the cached automations into the screen, with the workspace
+    /// picker arrays it needs.
+    fn push_automations(&self) {
+        let names: Vec<String> = self.workspaces.iter().map(|w| w.name.clone()).collect();
+        let ids: Vec<String> = self.workspaces.iter().map(|w| w.id.clone()).collect();
+        let rows = self
+            .automations
+            .iter()
+            .map(|a| {
+                let ws_name = self
+                    .workspaces
+                    .iter()
+                    .find(|w| w.id == a.workspace_id)
+                    .map(|w| w.name.clone())
+                    .unwrap_or_else(|| a.workspace_id.clone());
+                let next_line = a
+                    .next_run_at
+                    .as_deref()
+                    .and_then(fmt_local_ts)
+                    .map(|t| format!("next run {t}"))
+                    .unwrap_or_default();
+                let last_line = if !a.last_error.is_empty() {
+                    format!("last run failed: {}", a.last_error)
+                } else {
+                    a.last_run_at
+                        .as_deref()
+                        .and_then(fmt_local_ts)
+                        .map(|t| format!("last run {t}"))
+                        .unwrap_or_default()
+                };
+                let mut days = vec![false; 7];
+                for d in &a.schedule.days {
+                    if let Some(flag) = days.get_mut(*d as usize) {
+                        *flag = true;
+                    }
+                }
+                ui::AutomationView {
+                    id: a.id.clone(),
+                    name: a.name.clone(),
+                    schedule_line: format!("{} · {ws_name}", schedule_summary(&a.schedule)),
+                    next_line,
+                    last_line,
+                    last_failed: !a.last_error.is_empty(),
+                    enabled: a.enabled,
+                    prompt: a.prompt.clone(),
+                    workspace_index: ids.iter().position(|id| *id == a.workspace_id).unwrap_or(0)
+                        as i32,
+                    kind: a.schedule.kind.clone(),
+                    minute_text: a.schedule.minute.to_string(),
+                    time: if a.schedule.time.is_empty() {
+                        "09:00".into()
+                    } else {
+                        a.schedule.time.clone()
+                    },
+                    days,
+                }
+            })
+            .collect();
+        ui::set_automations(&self.ui, rows, names, ids);
+    }
+
+    /// React to a server-scope event. Only fresh envelopes count — on
+    /// (re)connect the stream replays history, which must not trigger a
+    /// reload storm.
+    async fn handle_server_event(&mut self, envelope: trouve_protocol::EventEnvelope) {
+        let fresh = std::time::SystemTime::from(envelope.ts)
+            .elapsed()
+            .map(|age| age.as_secs() < 20)
+            .unwrap_or(true);
+        if !fresh {
+            return;
+        }
+        use trouve_protocol::Event;
+        match &envelope.event {
+            // An automation ran: its last/next fields changed, and a
+            // successful run created a session this UI hasn't seen.
+            Event::AutomationFired { .. } => {
+                self.refresh_automations();
+                let _ = self.reload_sessions().await;
+            }
+            // Background session changes (this UI's own actions already
+            // reload explicitly; a second reload is cheap and idempotent).
+            Event::SessionCreated { .. } | Event::SessionDeleted { .. } => {
+                let _ = self.reload_sessions().await;
+            }
+            _ => {}
+        }
+    }
+
     /// Render the cached HuggingFace search results into the settings UI.
     fn push_local_search(&self, status: String) {
         let results = self
@@ -3337,6 +3499,112 @@ impl Controller {
                     self.push_local_search(format!("search failed: {e}"));
                 }
             },
+            UiCommand::OpenAutomations => {
+                ui::set_automations_status(&self.ui, String::new());
+                self.push_automations(); // last known list while the fetch runs
+                self.refresh_automations();
+                ui::set_center_screen(&self.ui, 4);
+            }
+            UiCommand::CloseAutomations => {
+                ui::set_center_screen(
+                    &self.ui,
+                    match self.new_chat {
+                        None => 0,
+                        Some(NewChat::Session) => 1,
+                        Some(NewChat::Thread) => 2,
+                    },
+                );
+            }
+            UiCommand::RefreshAutomations => self.refresh_automations(),
+            UiCommand::AutomationsLoaded(result) => match result {
+                Ok(automations) => {
+                    self.automations = automations;
+                    self.push_automations();
+                }
+                Err(e) => ui::set_automations_status(&self.ui, format!("loading failed: {e}")),
+            },
+            UiCommand::SaveAutomation {
+                id,
+                name,
+                prompt,
+                workspace_id,
+                kind,
+                minute,
+                time,
+                days,
+                enabled,
+            } => {
+                let minute: u8 = match minute.trim().parse() {
+                    Ok(m) if m <= 59 => m,
+                    _ if kind == "hourly" => {
+                        ui::set_automations_status(&self.ui, "minute must be 0-59".into());
+                        return Ok(());
+                    }
+                    _ => 0,
+                };
+                let req = trouve_protocol::UpsertAutomationRequest {
+                    name,
+                    prompt,
+                    workspace_id,
+                    mode: None,
+                    model: None,
+                    schedule: trouve_protocol::AutomationSchedule {
+                        kind,
+                        minute,
+                        time: time.trim().to_string(),
+                        days: days
+                            .split(',')
+                            .filter_map(|d| d.trim().parse().ok())
+                            .collect(),
+                    },
+                    enabled,
+                };
+                let result = if id.is_empty() {
+                    self.client.create_automation(&req).await.map(|_| ())
+                } else {
+                    self.client.update_automation(&id, &req).await.map(|_| ())
+                };
+                match result {
+                    Ok(()) => {
+                        ui::set_automations_status(&self.ui, String::new());
+                        ui::close_automation_form(&self.ui);
+                        self.refresh_automations();
+                    }
+                    Err(e) => ui::set_automations_status(&self.ui, format!("{e:#}")),
+                }
+            }
+            UiCommand::AutomationToggled(id, enabled) => {
+                let Some(automation) = self.automations.iter().find(|a| a.id == id) else {
+                    return Ok(());
+                };
+                let req = trouve_protocol::UpsertAutomationRequest {
+                    name: automation.name.clone(),
+                    prompt: automation.prompt.clone(),
+                    workspace_id: automation.workspace_id.clone(),
+                    mode: automation.mode.clone(),
+                    model: automation.model.clone(),
+                    schedule: automation.schedule.clone(),
+                    enabled,
+                };
+                match self.client.update_automation(&id, &req).await {
+                    Ok(_) => self.refresh_automations(),
+                    Err(e) => ui::set_automations_status(&self.ui, format!("{e:#}")),
+                }
+            }
+            UiCommand::RunAutomation(id) => match self.client.run_automation(&id).await {
+                Ok(()) => ui::set_automations_status(
+                    &self.ui,
+                    "run started — a new session will appear in a moment".into(),
+                ),
+                Err(e) => ui::set_automations_status(&self.ui, format!("{e:#}")),
+            },
+            UiCommand::DeleteAutomation(id) => match self.client.delete_automation(&id).await {
+                Ok(()) => self.refresh_automations(),
+                Err(e) => ui::set_automations_status(&self.ui, format!("{e:#}")),
+            },
+            UiCommand::ServerEvent(envelope) => {
+                self.handle_server_event(*envelope).await;
+            }
             UiCommand::CliInstall(id) => match self.client.start_cli_install(&id).await {
                 Ok(()) => {
                     ui::set_settings_status(&self.ui, format!("installing {id}…"));
@@ -3704,6 +3972,39 @@ fn human_gb(bytes: u64) -> String {
 
 fn human_mb(bytes: u64) -> String {
     format!("{:.0} MB", bytes as f64 / 1e6)
+}
+
+/// Human summary of an automation schedule ("Hourly at :15",
+/// "Daily at 09:00", "Mon, Wed at 09:00"). Mirrors the server's model.
+fn schedule_summary(s: &trouve_protocol::AutomationSchedule) -> String {
+    const DAYS: [&str; 7] = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
+    match s.kind.as_str() {
+        "hourly" => format!("Hourly at :{:02}", s.minute),
+        "daily" => format!("Daily at {}", s.time),
+        "weekly" => {
+            let mut days: Vec<u8> = s.days.clone();
+            days.sort_unstable();
+            days.dedup();
+            if days.len() == 7 {
+                return format!("Daily at {}", s.time);
+            }
+            let names: Vec<&str> = days
+                .iter()
+                .filter_map(|d| DAYS.get(*d as usize).copied())
+                .collect();
+            format!("{} at {}", names.join(", "), s.time)
+        }
+        other => other.to_string(),
+    }
+}
+
+/// RFC3339 → "Jul 13 09:00" in this machine's time zone.
+fn fmt_local_ts(rfc: &str) -> Option<String> {
+    chrono::DateTime::parse_from_rfc3339(rfc).ok().map(|t| {
+        t.with_timezone(&chrono::Local)
+            .format("%b %d %H:%M")
+            .to_string()
+    })
 }
 
 /// "1.2M" / "180k" / "42" for download/like counts.

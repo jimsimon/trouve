@@ -274,6 +274,19 @@ pub enum Event {
         thread_id: ThreadId,
         session_id: SessionId,
     },
+    /// A scheduled automation ran (or failed to). Clients refetch the
+    /// automations list — and the sessions list when it succeeded, since a
+    /// run creates a session.
+    #[serde(rename = "automation.fired")]
+    AutomationFired {
+        automation_id: String,
+        /// Session the run created (absent when the run failed).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        session_id: Option<SessionId>,
+        /// Failure reason ("" = success).
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        error: String,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]

@@ -5,6 +5,7 @@
 //! all agent file operations happen inside a session's git worktree
 //! ([`git`]). See `AGENTS.md` for the invariants.
 
+pub mod automations;
 pub mod config;
 pub mod context;
 pub mod engine;

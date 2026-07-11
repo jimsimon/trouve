@@ -871,6 +871,60 @@ fn main() -> anyhow::Result<()> {
             let _ = tx.send(UiCommand::CloseSettings);
         });
     }
+    {
+        let tx = tx.clone();
+        window.on_open_automations(move || {
+            let _ = tx.send(UiCommand::OpenAutomations);
+        });
+    }
+    {
+        let tx = tx.clone();
+        window.on_close_automations(move || {
+            let _ = tx.send(UiCommand::CloseAutomations);
+        });
+    }
+    {
+        let tx = tx.clone();
+        window.on_automations_refresh(move || {
+            let _ = tx.send(UiCommand::RefreshAutomations);
+        });
+    }
+    {
+        let tx = tx.clone();
+        window.on_automation_saved(
+            move |id, name, prompt, workspace_id, kind, minute, time, days, enabled| {
+                let _ = tx.send(UiCommand::SaveAutomation {
+                    id: id.to_string(),
+                    name: name.to_string(),
+                    prompt: prompt.to_string(),
+                    workspace_id: workspace_id.to_string(),
+                    kind: kind.to_string(),
+                    minute: minute.to_string(),
+                    time: time.to_string(),
+                    days: days.to_string(),
+                    enabled,
+                });
+            },
+        );
+    }
+    {
+        let tx = tx.clone();
+        window.on_automation_toggled(move |id, enabled| {
+            let _ = tx.send(UiCommand::AutomationToggled(id.to_string(), enabled));
+        });
+    }
+    {
+        let tx = tx.clone();
+        window.on_automation_run(move |id| {
+            let _ = tx.send(UiCommand::RunAutomation(id.to_string()));
+        });
+    }
+    {
+        let tx = tx.clone();
+        window.on_automation_deleted(move |id| {
+            let _ = tx.send(UiCommand::DeleteAutomation(id.to_string()));
+        });
+    }
 
     // Controller (and spawned server) live on a background tokio runtime.
     let scroll_tx = tx.clone();
