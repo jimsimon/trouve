@@ -185,6 +185,34 @@ pub struct UpdateThreadRequest {
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct SendMessageRequest {
     pub content: String,
+    /// Files riding along with the prompt (screenshots, logs, …); bytes are
+    /// base64 in the request, stored server-side, and referenced by id from
+    /// then on.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub attachments: Vec<AttachmentUpload>,
+}
+
+/// One file uploaded with a prompt.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct AttachmentUpload {
+    /// Display name ("screenshot.png"); the server keeps it for rendering
+    /// and derives the stored file's extension from it.
+    pub name: String,
+    /// MIME type ("image/png"). `image/*` attachments are passed to agents
+    /// as native image inputs; anything else is referenced by path.
+    pub mime: String,
+    /// Base64-encoded contents (standard alphabet, padded).
+    pub data: String,
+}
+
+/// A stored prompt attachment. Bytes are served at
+/// `GET /v1/attachments/{id}`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct Attachment {
+    pub id: String,
+    pub name: String,
+    pub mime: String,
+    pub size_bytes: u64,
 }
 
 /// Accepted-for-processing response; progress arrives on the event stream.
@@ -209,6 +237,9 @@ pub struct QueuedPrompt {
     pub thread_id: ThreadId,
     pub position: u64,
     pub content: String,
+    /// Attachments uploaded with the prompt (already stored server-side).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub attachments: Vec<Attachment>,
     pub created_at: String,
 }
 

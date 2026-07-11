@@ -177,10 +177,22 @@ impl ProtocolClient {
     }
 
     pub async fn send_message(&self, thread_id: &str, content: &str) -> Result<TurnAccepted> {
+        self.send_message_with(thread_id, content, Vec::new()).await
+    }
+
+    /// Send a prompt with attachment uploads (base64 bytes; stored
+    /// server-side and passed to the agent).
+    pub async fn send_message_with(
+        &self,
+        thread_id: &str,
+        content: &str,
+        attachments: Vec<trouve_protocol::AttachmentUpload>,
+    ) -> Result<TurnAccepted> {
         self.post_json(
             &format!("/threads/{thread_id}/messages"),
             &SendMessageRequest {
                 content: content.into(),
+                attachments,
             },
         )
         .await

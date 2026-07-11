@@ -82,6 +82,7 @@ impl IntoResponse for ApiError {
         get_thread,
         update_thread,
         send_message,
+        get_attachment,
         list_queue,
         reorder_queue,
         dispatch_queue,
@@ -308,6 +309,7 @@ pub fn build_router(engine: Arc<Engine>) -> Router {
         .route("/v1/threads", post(create_thread).get(list_threads))
         .route("/v1/threads/{id}", get(get_thread).patch(update_thread))
         .route("/v1/threads/{id}/messages", post(send_message))
+        .route("/v1/attachments/{id}", get(get_attachment))
         .route("/v1/threads/{id}/queue", get(list_queue).put(reorder_queue))
         .route("/v1/threads/{id}/queue/dispatch", post(dispatch_queue))
         .route(
@@ -323,6 +325,9 @@ pub fn build_router(engine: Arc<Engine>) -> Router {
         // MCP endpoint bridging external agent backends into trouve's
         // tools and approval gate.
         .route("/internal/threads/{id}/mcp", post(mcp::mcp_endpoint))
+        // Attachment uploads ride base64 inside the JSON body; axum's 2 MB
+        // default would cap a prompt at roughly one screenshot.
+        .layer(axum::extract::DefaultBodyLimit::max(64 * 1024 * 1024))
         .with_state(engine)
 }
 
@@ -515,8 +520,33 @@ async fn send_message(
     Path(id): Path<String>,
     Json(req): Json<SendMessageRequest>,
 ) -> Result<(StatusCode, Json<TurnAccepted>), ApiError> {
-    let accepted = engine.send_message(&id, req.content)?;
+    let accepted = engine.send_message(&id, req.content, req.attachments)?;
     Ok((StatusCode::ACCEPTED, Json(accepted)))
+}
+
+/// Raw bytes of a stored prompt attachment, with its uploaded MIME type.
+#[utoipa::path(get, path = "/v1/attachments/{id}", params(("id" = String, Path,)),
+    responses((status = 200, body = String), (status = 404, body = ErrorBody)))]
+async fn get_attachment(
+    State(engine): State<Arc<Engine>>,
+    Path(id): Path<String>,
+) -> Result<axum::response::Response, ApiError> {
+    use axum::response::IntoResponse;
+    let (attachment, path) = engine.attachment(&id)?;
+    let bytes = tokio::fs::read(&path)
+        .await
+        .map_err(|e| ApiError::from(EngineError::NotFound(format!("attachment {id}: {e}"))))?;
+    Ok((
+        [
+            (axum::http::header::CONTENT_TYPE, attachment.mime),
+            (
+                axum::http::header::CONTENT_DISPOSITION,
+                format!("inline; filename=\"{}\"", attachment.name.replace('"', "")),
+            ),
+        ],
+        bytes,
+    )
+        .into_response())
 }
 
 #[utoipa::path(get, path = "/v1/threads/{id}/queue", params(("id" = String, Path,)),

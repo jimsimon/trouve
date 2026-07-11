@@ -216,6 +216,21 @@ impl AgentBackend for ClaudeBackend {
         let pool = self.pool.clone();
         let thread_id = turn.thread_id.clone();
         let prompt = turn.prompt.clone();
+        // Anthropic-style base64 image blocks, alongside the text block.
+        let mut content = vec![json!({ "type": "text", "text": prompt })];
+        for att in &turn.attachments {
+            match att.read_base64() {
+                Ok(data) => content.push(json!({
+                    "type": "image",
+                    "source": {
+                        "type": "base64",
+                        "media_type": att.mime,
+                        "data": data,
+                    }
+                })),
+                Err(e) => tracing::warn!("skipping attachment {}: {e}", att.name),
+            }
+        }
 
         let stream = async_stream(move |tx| async move {
             // Exclusive claim on the process for this turn.
@@ -226,7 +241,7 @@ impl AgentBackend for ClaudeBackend {
                 "type": "user",
                 "message": {
                     "role": "user",
-                    "content": [ { "type": "text", "text": prompt } ],
+                    "content": content,
                 }
             });
             let sent = {

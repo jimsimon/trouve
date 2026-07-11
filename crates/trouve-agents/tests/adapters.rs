@@ -28,6 +28,7 @@ fn turn(worktree: PathBuf, session: Option<&str>, permission: BackendPermission)
         model: "test-model".into(),
         model_options: serde_json::Map::new(),
         prompt: "do the thing".into(),
+        attachments: vec![],
         instructions: Some("mode prompt".into()),
         permission,
         mcp_bridge: None,

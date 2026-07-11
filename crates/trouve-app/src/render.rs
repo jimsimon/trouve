@@ -354,7 +354,11 @@ pub fn chat_rows(
     // place), so they key the collapse state.
     for (i, item) in vm.items.iter().enumerate() {
         match item {
-            ChatItem::User { content, .. } => {
+            ChatItem::User {
+                content,
+                attachments,
+                ..
+            } => {
                 // A user prompt starts a new turn: separate it from the
                 // previous one with a horizontal rule.
                 if !rows.is_empty() {
@@ -373,10 +377,25 @@ pub fn chat_rows(
                     for (b, _) in &mut body {
                         b.tone = 1;
                     }
+                    if !attachments.is_empty() {
+                        body.push((
+                            ChatRowData {
+                                kind: 1,
+                                tone: 1,
+                                text: attachment_line(attachments),
+                                ..Default::default()
+                            },
+                            None,
+                        ));
+                    }
                 }
                 let header = ChatRowData {
                     tool_name: "You".into(),
-                    text: preview(content),
+                    text: if content.trim().is_empty() {
+                        attachment_line(attachments)
+                    } else {
+                        preview(content)
+                    },
                     detail: content.clone(),
                     expanded: open,
                     card_key: key,
@@ -1495,6 +1514,26 @@ fn text_blocks(v: &serde_json::Value) -> Option<String> {
     (!texts.is_empty()).then(|| texts.join("\n"))
 }
 
+/// "📎 screenshot.png (34 KB) · log.txt (2 KB)" — shown under the prompt
+/// text (and as the header teaser for attachment-only prompts).
+fn attachment_line(attachments: &[trouve_protocol::Attachment]) -> String {
+    let list = attachments
+        .iter()
+        .map(|a| {
+            let size = if a.size_bytes < 1024 {
+                format!("{} B", a.size_bytes)
+            } else if a.size_bytes < 1024 * 1024 {
+                format!("{} KB", a.size_bytes / 1024)
+            } else {
+                format!("{:.1} MB", a.size_bytes as f64 / (1024.0 * 1024.0))
+            };
+            format!("{} ({size})", a.name)
+        })
+        .collect::<Vec<_>>()
+        .join(" · ");
+    format!("📎 {list}")
+}
+
 /// One-line teaser for a collapsed card header: the first non-empty line,
 /// capped; the header row elides it further to fit.
 fn preview(content: &str) -> String {
@@ -2078,6 +2117,7 @@ mod tests {
                 ChatItem::User {
                     turn: 1,
                     content: "q".into(),
+                    attachments: vec![],
                 },
                 // The agent searched before writing any text.
                 tool("t1"),
@@ -2166,6 +2206,7 @@ mod tests {
                 ChatItem::User {
                     turn: 1,
                     content: "q".into(),
+                    attachments: vec![],
                 },
                 // Thinking before any text (owned by the following
                 // assistant item)…
@@ -2242,6 +2283,7 @@ mod tests {
         vm.items.push(ChatItem::User {
             turn: 2,
             content: "next question".into(),
+            attachments: vec![],
         });
         let (rows, _) = chat_rows(
             &vm,
@@ -2285,6 +2327,7 @@ mod tests {
                 ChatItem::User {
                     turn: 2,
                     content: "weather?".into(),
+                    attachments: vec![],
                 },
                 tool("t1"),
                 tool("t2"),
@@ -2336,6 +2379,7 @@ mod tests {
                 ChatItem::User {
                     turn: 1,
                     content: "q".into(),
+                    attachments: vec![],
                 },
                 ChatItem::Thinking {
                     turn: 1,
@@ -2420,6 +2464,7 @@ mod tests {
                 ChatItem::User {
                     turn: 1,
                     content: "one".into(),
+                    attachments: vec![],
                 },
                 ChatItem::Assistant {
                     turn: 1,
@@ -2429,6 +2474,7 @@ mod tests {
                 ChatItem::User {
                     turn: 2,
                     content: "two".into(),
+                    attachments: vec![],
                 },
             ],
             ..Default::default()

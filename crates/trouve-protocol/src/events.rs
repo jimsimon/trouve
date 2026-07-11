@@ -134,7 +134,14 @@ pub enum Event {
     TurnFailed { turn: u64, error: String },
 
     #[serde(rename = "user.message")]
-    UserMessage { turn: u64, content: String },
+    UserMessage {
+        turn: u64,
+        content: String,
+        /// Files the user attached to the prompt (bytes at
+        /// `GET /v1/attachments/{id}`).
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        attachments: Vec<crate::Attachment>,
+    },
     /// Streamed model output. Replaying all deltas of a turn reproduces the
     /// final message exactly.
     #[serde(rename = "assistant.delta")]

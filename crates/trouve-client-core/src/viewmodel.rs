@@ -13,6 +13,9 @@ pub enum ChatItem {
     User {
         turn: u64,
         content: String,
+        /// Files uploaded with the prompt (metadata only; bytes are served
+        /// at `GET /v1/attachments/{id}`).
+        attachments: Vec<trouve_protocol::Attachment>,
     },
     /// Streaming or final assistant text (grows in place from deltas).
     Assistant {
@@ -151,10 +154,15 @@ impl ThreadViewModel {
                 self.compacting = false;
                 None
             }
-            Event::UserMessage { turn, content } => {
+            Event::UserMessage {
+                turn,
+                content,
+                attachments,
+            } => {
                 self.items.push(ChatItem::User {
                     turn: *turn,
                     content: content.clone(),
+                    attachments: attachments.clone(),
                 });
                 Some(self.items.len() - 1)
             }
@@ -412,6 +420,7 @@ mod tests {
             Event::UserMessage {
                 turn: 1,
                 content: "do it".into(),
+                attachments: vec![],
             },
             Event::AssistantDelta {
                 turn: 1,
@@ -702,6 +711,7 @@ mod tests {
             Event::UserMessage {
                 turn: 1,
                 content: "hi".into(),
+                attachments: vec![],
             },
             Event::AssistantDelta {
                 turn: 1,

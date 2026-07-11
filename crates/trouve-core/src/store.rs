@@ -77,9 +77,19 @@ CREATE TABLE IF NOT EXISTS queued_prompts (
   thread_id TEXT NOT NULL REFERENCES threads(id),
   position INTEGER NOT NULL,
   content TEXT NOT NULL,
+  attachments TEXT NOT NULL DEFAULT '[]',  -- JSON [trouve_protocol::Attachment]
   created_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS queued_prompts_thread ON queued_prompts (thread_id, position);
+CREATE TABLE IF NOT EXISTS attachments (
+  id TEXT PRIMARY KEY,
+  thread_id TEXT NOT NULL REFERENCES threads(id),
+  name TEXT NOT NULL,
+  mime TEXT NOT NULL,
+  size_bytes INTEGER NOT NULL,
+  path TEXT NOT NULL,         -- stored file, absolute
+  created_at TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS events (
   cursor INTEGER PRIMARY KEY AUTOINCREMENT,
   scope_kind TEXT NOT NULL,
@@ -93,8 +103,10 @@ CREATE INDEX IF NOT EXISTS events_scope ON events (scope_kind, scope_id, cursor)
 /// Additive migrations for databases created before a column existed.
 /// `CREATE TABLE IF NOT EXISTS` won't touch existing tables, so each entry
 /// is applied and "duplicate column" errors are ignored.
-const MIGRATIONS: &[&str] =
-    &["ALTER TABLE sessions ADD COLUMN archived INTEGER NOT NULL DEFAULT 0"];
+const MIGRATIONS: &[&str] = &[
+    "ALTER TABLE sessions ADD COLUMN archived INTEGER NOT NULL DEFAULT 0",
+    "ALTER TABLE queued_prompts ADD COLUMN attachments TEXT NOT NULL DEFAULT '[]'",
+];
 
 fn apply_migrations(conn: &Connection) -> Result<()> {
     for sql in MIGRATIONS {
@@ -106,6 +118,12 @@ fn apply_migrations(conn: &Connection) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Attachment metadata JSON from a queue row; a corrupt value degrades to
+/// "no attachments" rather than failing the whole queue read.
+fn parse_attachments(json: &str) -> Vec<trouve_protocol::Attachment> {
+    serde_json::from_str(json).unwrap_or_default()
 }
 
 pub enum UsageScope<'a> {
@@ -528,16 +546,18 @@ impl Store {
         &self,
         thread_id: &str,
         content: &str,
+        attachments: &[trouve_protocol::Attachment],
     ) -> Result<trouve_protocol::QueuedPrompt> {
         let conn = self.conn.lock().unwrap();
         let id = format!("qp_{}", uuid::Uuid::new_v4().simple());
         let created_at = chrono::Utc::now().to_rfc3339();
+        let attachments_json = serde_json::to_string(attachments)?;
         conn.execute(
-            "INSERT INTO queued_prompts (id, thread_id, position, content, created_at)
+            "INSERT INTO queued_prompts (id, thread_id, position, content, attachments, created_at)
              VALUES (?1, ?2,
                (SELECT COALESCE(MAX(position), 0) + 1 FROM queued_prompts WHERE thread_id = ?2),
-               ?3, ?4)",
-            params![id, thread_id, content, created_at],
+               ?3, ?4, ?5)",
+            params![id, thread_id, content, attachments_json, created_at],
         )?;
         let position: i64 = conn.query_row(
             "SELECT position FROM queued_prompts WHERE id = ?1",
@@ -549,6 +569,7 @@ impl Store {
             thread_id: thread_id.to_string(),
             position: position as u64,
             content: content.to_string(),
+            attachments: attachments.to_vec(),
             created_at,
         })
     }
@@ -556,7 +577,7 @@ impl Store {
     pub fn queued_prompts(&self, thread_id: &str) -> Result<Vec<trouve_protocol::QueuedPrompt>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT id, position, content, created_at FROM queued_prompts
+            "SELECT id, position, content, attachments, created_at FROM queued_prompts
              WHERE thread_id = ?1 ORDER BY position",
         )?;
         let rows = stmt.query_map(params![thread_id], |r| {
@@ -565,7 +586,8 @@ impl Store {
                 thread_id: thread_id.to_string(),
                 position: r.get::<_, i64>(1)? as u64,
                 content: r.get(2)?,
-                created_at: r.get(3)?,
+                attachments: parse_attachments(&r.get::<_, String>(3)?),
+                created_at: r.get(4)?,
             })
         })?;
         Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
@@ -636,7 +658,7 @@ impl Store {
         let tx = conn.transaction()?;
         let front = tx
             .query_row(
-                "SELECT id, position, content, created_at FROM queued_prompts
+                "SELECT id, position, content, attachments, created_at FROM queued_prompts
                  WHERE thread_id = ?1 ORDER BY position LIMIT 1",
                 params![thread_id],
                 |r| {
@@ -645,7 +667,8 @@ impl Store {
                         thread_id: thread_id.to_string(),
                         position: r.get::<_, i64>(1)? as u64,
                         content: r.get(2)?,
-                        created_at: r.get(3)?,
+                        attachments: parse_attachments(&r.get::<_, String>(3)?),
+                        created_at: r.get(4)?,
                     })
                 },
             )
@@ -655,6 +678,56 @@ impl Store {
         }
         tx.commit()?;
         Ok(front)
+    }
+
+    // --- attachments ------------------------------------------------------
+    // Prompt uploads. Bytes live on disk (the engine writes them under
+    // data_dir/attachments); this table is the id → file index plus the
+    // metadata shown in transcripts.
+
+    pub fn add_attachment(
+        &self,
+        thread_id: &str,
+        attachment: &trouve_protocol::Attachment,
+        path: &str,
+    ) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO attachments (id, thread_id, name, mime, size_bytes, path, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                attachment.id,
+                thread_id,
+                attachment.name,
+                attachment.mime,
+                attachment.size_bytes as i64,
+                path,
+                chrono::Utc::now().to_rfc3339(),
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Metadata plus the stored file path.
+    pub fn attachment(&self, id: &str) -> Result<Option<(trouve_protocol::Attachment, String)>> {
+        let conn = self.conn.lock().unwrap();
+        Ok(conn
+            .query_row(
+                "SELECT name, mime, size_bytes, path FROM attachments WHERE id = ?1",
+                params![id],
+                |r| {
+                    Ok((
+                        trouve_protocol::Attachment {
+                            id: id.to_string(),
+                            name: r.get(0)?,
+                            mime: r.get(1)?,
+                            size_bytes: r.get::<_, i64>(2)? as u64,
+                        },
+                        r.get::<_, String>(3)?,
+                    ))
+                },
+            )
+            .optional()?)
     }
 
     // --- provider transcript --------------------------------------------------
@@ -1050,7 +1123,7 @@ mod tests {
             .unwrap();
         // The vendor-resume link is what used to trip the FK constraint.
         store.set_backend_session("th_1", "vendor-abc").unwrap();
-        store.enqueue_prompt("th_1", "pending").unwrap();
+        store.enqueue_prompt("th_1", "pending", &[]).unwrap();
 
         store.delete_session("se_1").unwrap();
         assert!(store.session("se_1").unwrap().is_none());
@@ -1102,10 +1175,10 @@ mod tests {
         let store = Store::open_in_memory().unwrap();
         seed_thread(&store, "th_1");
         seed_thread(&store, "th_2");
-        let a = store.enqueue_prompt("th_1", "first").unwrap();
-        let b = store.enqueue_prompt("th_1", "second").unwrap();
-        let c = store.enqueue_prompt("th_1", "third").unwrap();
-        store.enqueue_prompt("th_2", "other thread").unwrap();
+        let a = store.enqueue_prompt("th_1", "first", &[]).unwrap();
+        let b = store.enqueue_prompt("th_1", "second", &[]).unwrap();
+        let c = store.enqueue_prompt("th_1", "third", &[]).unwrap();
+        store.enqueue_prompt("th_2", "other thread", &[]).unwrap();
 
         let q = store.queued_prompts("th_1").unwrap();
         assert_eq!(
@@ -1146,12 +1219,39 @@ mod tests {
         {
             let store = Store::open(&path).unwrap();
             seed_thread(&store, "th_1");
-            store.enqueue_prompt("th_1", "keep me").unwrap();
+            store.enqueue_prompt("th_1", "keep me", &[]).unwrap();
         }
         let store = Store::open(&path).unwrap();
         let q = store.queued_prompts("th_1").unwrap();
         assert_eq!(q.len(), 1);
         assert_eq!(q[0].content, "keep me");
+    }
+
+    #[test]
+    fn attachments_round_trip_and_ride_the_queue() {
+        let store = Store::open_in_memory().unwrap();
+        seed_thread(&store, "th_1");
+        let att = trouve_protocol::Attachment {
+            id: "at_1".into(),
+            name: "shot.png".into(),
+            mime: "image/png".into(),
+            size_bytes: 42,
+        };
+        store
+            .add_attachment("th_1", &att, "/data/attachments/at_1.png")
+            .unwrap();
+        let (meta, path) = store.attachment("at_1").unwrap().unwrap();
+        assert_eq!(meta, att);
+        assert_eq!(path, "/data/attachments/at_1.png");
+        assert!(store.attachment("at_missing").unwrap().is_none());
+
+        store
+            .enqueue_prompt("th_1", "with file", std::slice::from_ref(&att))
+            .unwrap();
+        let q = store.queued_prompts("th_1").unwrap();
+        assert_eq!(q[0].attachments, vec![att.clone()]);
+        let popped = store.pop_queued_prompt("th_1").unwrap().unwrap();
+        assert_eq!(popped.attachments, vec![att]);
     }
 
     #[test]

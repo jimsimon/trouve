@@ -1730,8 +1730,12 @@ async fn leftover_queue_waits_for_explicit_dispatch_after_restart() {
 
     // What a crash mid-drain leaves behind: rows in queued_prompts, no
     // active dispatcher.
-    store.enqueue_prompt(thread_id, "left-behind-1").unwrap();
-    store.enqueue_prompt(thread_id, "left-behind-2").unwrap();
+    store
+        .enqueue_prompt(thread_id, "left-behind-1", &[])
+        .unwrap();
+    store
+        .enqueue_prompt(thread_id, "left-behind-2", &[])
+        .unwrap();
 
     // Nothing runs on its own — the server never auto-resumes a queue.
     tokio::time::sleep(Duration::from_millis(300)).await;

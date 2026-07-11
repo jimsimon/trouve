@@ -88,6 +88,17 @@ pub enum UiCommand {
     /// Chat viewport-y sampled by the shell's poll, bookmarked per thread.
     ChatScrolled(f32),
     SendMessage(String),
+    /// Composer 📎 button: pick files to ride with the next prompt.
+    AttachFileDialog,
+    /// A file's bytes staged as a prompt attachment (from the picker or a
+    /// clipboard image paste).
+    AddAttachment {
+        name: String,
+        mime: String,
+        bytes: Vec<u8>,
+    },
+    /// Composer attachment chip ✕ at `index`.
+    AttachmentRemoved(usize),
     /// Queued-prompt panel: replace the text of the row at `index`.
     QueueEdit {
         index: usize,
@@ -351,6 +362,9 @@ struct Controller {
     /// Whether the app window has focus (winit Focused events, written on
     /// the UI thread). Focused + on-screen threads never notify.
     window_focused: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// Files staged for the next prompt (already base64-encoded uploads);
+    /// consumed by the next send from either composer.
+    pending_attachments: Vec<trouve_protocol::AttachmentUpload>,
     expanded_tools: HashSet<String>,
     /// (thread id, turn) pairs showing raw text instead of styled markdown.
     raw_turns: HashSet<(String, u64)>,
@@ -467,6 +481,7 @@ pub async fn run(
         thread_sessions: HashMap::new(),
         notify: crate::winstate::load_notifications(),
         window_focused,
+        pending_attachments: Vec::new(),
         expanded_tools: HashSet::new(),
         raw_turns: HashSet::new(),
         collapsed_cards: HashSet::new(),
@@ -1137,12 +1152,38 @@ impl Controller {
     /// after a restart or a failed turn — resuming is the user's call.
     fn push_queue(&mut self) {
         let Some(thread_id) = self.current_thread_id() else {
-            ui::set_queue(&self.ui, Vec::new(), false);
+            ui::set_queue(&self.ui, Vec::new(), Vec::new(), false);
             return;
         };
         let vm = self.vms.entry(thread_id).or_default();
         let prompts = vm.queue.iter().map(|p| p.content.clone()).collect();
-        ui::set_queue(&self.ui, prompts, !vm.turn_running);
+        // Shown beside the row text (not part of it — rows are editable).
+        let badges = vm
+            .queue
+            .iter()
+            .map(|p| match p.attachments.len() {
+                0 => String::new(),
+                n => format!("📎{n}"),
+            })
+            .collect();
+        ui::set_queue(&self.ui, prompts, badges, !vm.turn_running);
+    }
+
+    /// Mirror the staged attachments as composer chips.
+    fn push_attachments(&self) {
+        let chips = self
+            .pending_attachments
+            .iter()
+            .map(|a| {
+                // Base64 is 4 chars per 3 bytes; close enough for a label.
+                let bytes = a.data.len() * 3 / 4;
+                (
+                    a.name.clone(),
+                    format!("{} · {}", a.mime, human_size(bytes)),
+                )
+            })
+            .collect();
+        ui::set_composer_attachments(&self.ui, chips);
     }
 
     /// Server id of the current thread's queued prompt shown at `index`.
@@ -1672,7 +1713,11 @@ impl Controller {
                 self.close_new_chat();
                 self.create_thread(mode_idx, model_idx).await?;
                 if let Some(thread_id) = self.current_thread_id() {
-                    self.client.send_message(&thread_id, &prompt).await?;
+                    let uploads = std::mem::take(&mut self.pending_attachments);
+                    self.push_attachments();
+                    self.client
+                        .send_message_with(&thread_id, &prompt, uploads)
+                        .await?;
                 }
             }
             _ => {
@@ -1699,7 +1744,11 @@ impl Controller {
                 self.select_session(index).await?;
                 self.create_thread(mode_idx, model_idx).await?;
                 if let Some(thread_id) = self.current_thread_id() {
-                    self.client.send_message(&thread_id, &prompt).await?;
+                    let uploads = std::mem::take(&mut self.pending_attachments);
+                    self.push_attachments();
+                    self.client
+                        .send_message_with(&thread_id, &prompt, uploads)
+                        .await?;
                 }
             }
         }
@@ -2182,7 +2231,64 @@ impl Controller {
             }
             UiCommand::SendMessage(text) => {
                 if let Some(thread_id) = self.current_thread_id() {
-                    self.client.send_message(&thread_id, &text).await?;
+                    let uploads = std::mem::take(&mut self.pending_attachments);
+                    self.push_attachments();
+                    if let Err(e) = self
+                        .client
+                        .send_message_with(&thread_id, &text, uploads.clone())
+                        .await
+                    {
+                        // Restage so a transient failure doesn't eat the files.
+                        self.pending_attachments = uploads;
+                        self.push_attachments();
+                        return Err(e);
+                    }
+                }
+            }
+            UiCommand::AttachFileDialog => {
+                // The portal dialog can stay open indefinitely; run it off
+                // the command loop so events keep flowing meanwhile.
+                let tx = self.tx.clone();
+                tokio::spawn(async move {
+                    let picked = rfd::AsyncFileDialog::new()
+                        .set_title("Attach files to the prompt")
+                        .pick_files()
+                        .await;
+                    for file in picked.unwrap_or_default() {
+                        let path = file.path().to_path_buf();
+                        let name = file.file_name();
+                        match tokio::fs::read(&path).await {
+                            Ok(bytes) => {
+                                let mime = mime_guess::from_path(&path)
+                                    .first_or_octet_stream()
+                                    .essence_str()
+                                    .to_string();
+                                let _ = tx.send(UiCommand::AddAttachment { name, mime, bytes });
+                            }
+                            Err(e) => tracing::warn!("attach {name}: {e}"),
+                        }
+                    }
+                });
+            }
+            UiCommand::AddAttachment { name, mime, bytes } => {
+                const MAX_ATTACHMENT_BYTES: usize = 10 * 1024 * 1024;
+                if bytes.len() > MAX_ATTACHMENT_BYTES {
+                    self.error(&format!("{name} is larger than the 10 MB attachment limit"));
+                } else {
+                    use base64::Engine as _;
+                    self.pending_attachments
+                        .push(trouve_protocol::AttachmentUpload {
+                            name,
+                            mime,
+                            data: base64::engine::general_purpose::STANDARD.encode(&bytes),
+                        });
+                    self.push_attachments();
+                }
+            }
+            UiCommand::AttachmentRemoved(index) => {
+                if index < self.pending_attachments.len() {
+                    self.pending_attachments.remove(index);
+                    self.push_attachments();
                 }
             }
             UiCommand::QueueEdit { index, content } => {
@@ -3389,6 +3495,17 @@ fn default_mode_index(modes: &[AgentMode]) -> i32 {
         .position(|m| m.id == "code")
         .map(|i| i as i32)
         .unwrap_or(0)
+}
+
+/// "512 B" / "34 KB" / "2.4 MB", for attachment chip labels.
+fn human_size(bytes: usize) -> String {
+    if bytes < 1024 {
+        format!("{bytes} B")
+    } else if bytes < 1024 * 1024 {
+        format!("{} KB", bytes / 1024)
+    } else {
+        format!("{:.1} MB", bytes as f64 / (1024.0 * 1024.0))
+    }
 }
 
 /// Derive a session title from the first prompt: first line, word-truncated.

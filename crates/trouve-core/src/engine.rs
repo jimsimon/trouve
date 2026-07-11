@@ -2535,13 +2535,18 @@ impl Engine {
     /// Accept a user message. If the thread is idle it runs immediately;
     /// otherwise it joins the thread's persistent prompt queue and runs when
     /// its turn comes. Progress is visible on the thread's event stream.
+    /// Attachment uploads are decoded and stored immediately, so queued
+    /// prompts reference durable files rather than request payloads.
     pub fn send_message(
         self: &Arc<Self>,
         thread_id: &str,
         content: String,
+        uploads: Vec<trouve_protocol::AttachmentUpload>,
     ) -> Result<TurnAccepted, EngineError> {
         self.get_thread(thread_id)?; // 404 for unknown threads
-        self.store.enqueue_prompt(thread_id, &content)?;
+        let attachments = self.save_attachments(thread_id, uploads)?;
+        self.store
+            .enqueue_prompt(thread_id, &content, &attachments)?;
         self.emit_queue(thread_id)?;
         let turn = self.dispatch_queue(thread_id)?;
         Ok(TurnAccepted {
@@ -2549,6 +2554,97 @@ impl Engine {
             turn: turn.unwrap_or(0),
             queued: turn.is_none(),
         })
+    }
+
+    /// Decode and persist prompt uploads under `data_dir/attachments`,
+    /// recording each in the store. Rejects the whole message on a bad or
+    /// oversized attachment — better than silently dropping a file the
+    /// prompt refers to.
+    fn save_attachments(
+        &self,
+        thread_id: &str,
+        uploads: Vec<trouve_protocol::AttachmentUpload>,
+    ) -> Result<Vec<trouve_protocol::Attachment>, EngineError> {
+        use base64::Engine as _;
+        const MAX_ATTACHMENT_BYTES: usize = 10 * 1024 * 1024;
+        let mut out = Vec::new();
+        let dir = self.data_dir.join("attachments");
+        for up in uploads {
+            let bytes = base64::engine::general_purpose::STANDARD
+                .decode(up.data.as_bytes())
+                .map_err(|e| {
+                    EngineError::BadRequest(format!("attachment {}: invalid base64: {e}", up.name))
+                })?;
+            if bytes.is_empty() {
+                return Err(EngineError::BadRequest(format!(
+                    "attachment {} is empty",
+                    up.name
+                )));
+            }
+            if bytes.len() > MAX_ATTACHMENT_BYTES {
+                return Err(EngineError::BadRequest(format!(
+                    "attachment {} exceeds {} MB",
+                    up.name,
+                    MAX_ATTACHMENT_BYTES / (1024 * 1024)
+                )));
+            }
+            std::fs::create_dir_all(&dir).map_err(anyhow::Error::from)?;
+            let id = format!("at_{}", uuid::Uuid::new_v4().simple());
+            // Store under the opaque id; keep the (sanitized) extension so
+            // tools and vendor CLIs sniff the type naturally.
+            let ext = Path::new(&up.name)
+                .extension()
+                .and_then(|e| e.to_str())
+                .filter(|e| e.len() <= 8 && e.chars().all(|c| c.is_ascii_alphanumeric()))
+                .map(|e| format!(".{}", e.to_ascii_lowercase()))
+                .unwrap_or_default();
+            let path = dir.join(format!("{id}{ext}"));
+            std::fs::write(&path, &bytes).map_err(anyhow::Error::from)?;
+            let attachment = trouve_protocol::Attachment {
+                id,
+                name: up.name,
+                mime: up.mime,
+                size_bytes: bytes.len() as u64,
+            };
+            self.store
+                .add_attachment(thread_id, &attachment, &path.to_string_lossy())?;
+            out.push(attachment);
+        }
+        Ok(out)
+    }
+
+    /// Metadata and stored file for one attachment (serves
+    /// `GET /v1/attachments/{id}`).
+    pub fn attachment(
+        &self,
+        id: &str,
+    ) -> Result<(trouve_protocol::Attachment, PathBuf), EngineError> {
+        let (attachment, path) = self
+            .store
+            .attachment(id)?
+            .ok_or_else(|| EngineError::NotFound(format!("attachment {id}")))?;
+        Ok((attachment, PathBuf::from(path)))
+    }
+
+    /// Look up the stored file behind each attachment; rows that vanished
+    /// (e.g. a pruned data dir) are dropped with a warning rather than
+    /// failing the turn.
+    fn resolve_attachments(
+        &self,
+        attachments: &[trouve_protocol::Attachment],
+    ) -> Vec<(trouve_protocol::Attachment, PathBuf)> {
+        attachments
+            .iter()
+            .filter_map(|a| match self.store.attachment(&a.id) {
+                Ok(Some((meta, path))) if Path::new(&path).exists() => {
+                    Some((meta, PathBuf::from(path)))
+                }
+                _ => {
+                    tracing::warn!("attachment {} ({}) missing; skipped", a.id, a.name);
+                    None
+                }
+            })
+            .collect()
     }
 
     /// Publish the thread's current queue on its event stream.
@@ -2631,7 +2727,9 @@ impl Engine {
         let turn = self.store.next_turn(thread_id)?;
         let engine = self.clone();
         tokio::spawn(async move {
-            engine.drain_queue(thread, turn, prompt.content).await;
+            engine
+                .drain_queue(thread, turn, prompt.content, prompt.attachments)
+                .await;
         });
         Ok(Some(turn))
     }
@@ -2639,12 +2737,19 @@ impl Engine {
     /// Run `content` as `turn`, then keep pulling queued prompts until the
     /// queue is empty or a turn fails (a failure pauses the queue so a
     /// persistent error can't burn every queued prompt).
-    async fn drain_queue(self: &Arc<Self>, thread: Thread, turn: u64, content: String) {
+    async fn drain_queue(
+        self: &Arc<Self>,
+        thread: Thread,
+        turn: u64,
+        content: String,
+        attachments: Vec<trouve_protocol::Attachment>,
+    ) {
         let mut thread = thread;
         let mut turn = turn;
         let mut content = content;
+        let mut attachments = attachments;
         loop {
-            if let Err(e) = self.run_turn(&thread, turn, content).await {
+            if let Err(e) = self.run_turn(&thread, turn, content, attachments).await {
                 tracing::error!("turn {turn} of {} failed: {e}", thread.id);
                 let _ = self.store.append_event(
                     Scope::Thread(thread.id.clone()),
@@ -2683,10 +2788,17 @@ impl Engine {
                 }
             };
             content = next.content;
+            attachments = next.attachments;
         }
     }
 
-    async fn run_turn(&self, thread: &Thread, turn: u64, content: String) -> Result<()> {
+    async fn run_turn(
+        &self,
+        thread: &Thread,
+        turn: u64,
+        content: String,
+        attachments: Vec<trouve_protocol::Attachment>,
+    ) -> Result<()> {
         let session = self
             .store
             .session(&thread.session_id)?
@@ -2716,7 +2828,16 @@ impl Engine {
         // stream its events and bridge approvals. (Session lock stays held.)
         if let Some((backend, model_name)) = self.backend_for(&thread.model) {
             return self
-                .run_backend_turn(&session, thread, turn, &mode, backend, model_name, content)
+                .run_backend_turn(
+                    &session,
+                    thread,
+                    turn,
+                    &mode,
+                    backend,
+                    model_name,
+                    content,
+                    attachments,
+                )
                 .await;
         }
 
@@ -2749,8 +2870,13 @@ impl Engine {
             Event::UserMessage {
                 turn,
                 content: content.clone(),
+                attachments: attachments.clone(),
             },
         )?;
+        // Native providers speak text-only; every attachment (images
+        // included) becomes a path reference the model's file tools can
+        // follow.
+        let content = annotate_attachments(content, &self.resolve_attachments(&attachments));
         self.store
             .append_message(&thread.id, &serde_json::to_value(Message::User(content))?)?;
 
@@ -3171,6 +3297,7 @@ impl Engine {
         backend: Arc<dyn AgentBackend>,
         model_name: String,
         content: String,
+        attachments: Vec<trouve_protocol::Attachment>,
     ) -> Result<()> {
         let scope = Scope::Thread(thread.id.clone());
         self.store.append_event(
@@ -3186,8 +3313,25 @@ impl Engine {
             Event::UserMessage {
                 turn,
                 content: content.clone(),
+                attachments: attachments.clone(),
             },
         )?;
+        // Images go to the vendor protocol as native image inputs; other
+        // files become path references in the prompt text (vendor agents
+        // run on this filesystem and can read them with their tools).
+        let resolved = self.resolve_attachments(&attachments);
+        let (images, files): (Vec<_>, Vec<_>) = resolved
+            .into_iter()
+            .partition(|(a, _)| a.mime.starts_with("image/"));
+        let content = annotate_attachments(content, &files);
+        let turn_attachments: Vec<trouve_agents::TurnAttachment> = images
+            .into_iter()
+            .map(|(a, path)| trouve_agents::TurnAttachment {
+                name: a.name,
+                mime: a.mime,
+                path,
+            })
+            .collect();
         self.store.append_message(
             &thread.id,
             &serde_json::to_value(Message::User(content.clone()))?,
@@ -3220,6 +3364,7 @@ impl Engine {
             model: model_name,
             model_options: self.store.thread_model_options(&thread.id)?,
             prompt: content,
+            attachments: turn_attachments,
             instructions: (!instructions.is_empty()).then_some(instructions),
             permission,
             mcp_bridge,
@@ -3746,6 +3891,23 @@ impl Engine {
 /// The hint rides in the args as `"_line"` — display metadata for the
 /// client's diff gutter, never model input. Files that can't be read or
 /// snippets that don't match (or match ambiguously) just skip the hint.
+/// Append path references for attachments that can't ride natively in the
+/// model input, so the agent can open them with its file tools.
+fn annotate_attachments(
+    content: String,
+    files: &[(trouve_protocol::Attachment, PathBuf)],
+) -> String {
+    if files.is_empty() {
+        return content;
+    }
+    let mut out = content;
+    out.push_str("\n\nThe user attached these files (read them from disk as needed):");
+    for (a, path) in files {
+        out.push_str(&format!("\n- {} ({}): {}", a.name, a.mime, path.display()));
+    }
+    out
+}
+
 fn annotate_edit_lines(worktree: &Path, args: &mut serde_json::Value) {
     let str_of = |v: &serde_json::Value, keys: &[&str]| {
         keys.iter()

@@ -7,7 +7,7 @@
       "name": "MIT",
       "identifier": "MIT"
     },
-    "version": "0.9"
+    "version": "0.10"
   },
   "paths": {
     "/v1/approvals": {
@@ -27,6 +27,45 @@
         "responses": {
           "204": {
             "description": ""
+          },
+          "404": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/attachments/{id}": {
+      "get": {
+        "tags": [],
+        "summary": "Raw bytes of a stored prompt attachment, with its uploaded MIME type.",
+        "operationId": "get_attachment",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           },
           "404": {
             "description": "",
@@ -2554,6 +2593,55 @@
           "deny"
         ]
       },
+      "Attachment": {
+        "type": "object",
+        "description": "A stored prompt attachment. Bytes are served at\n`GET /v1/attachments/{id}`.",
+        "required": [
+          "id",
+          "name",
+          "mime",
+          "size_bytes"
+        ],
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "mime": {
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          },
+          "size_bytes": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          }
+        }
+      },
+      "AttachmentUpload": {
+        "type": "object",
+        "description": "One file uploaded with a prompt.",
+        "required": [
+          "name",
+          "mime",
+          "data"
+        ],
+        "properties": {
+          "data": {
+            "type": "string",
+            "description": "Base64-encoded contents (standard alphabet, padded)."
+          },
+          "mime": {
+            "type": "string",
+            "description": "MIME type (\"image/png\"). `image/*` attachments are passed to agents\nas native image inputs; anything else is referenced by path."
+          },
+          "name": {
+            "type": "string",
+            "description": "Display name (\"screenshot.png\"); the server keeps it for rendering\nand derives the stored file's extension from it."
+          }
+        }
+      },
       "BranchList": {
         "type": "object",
         "description": "Local branches of a workspace repository, for base-ref selection.",
@@ -2939,6 +3027,13 @@
               "type"
             ],
             "properties": {
+              "attachments": {
+                "type": "array",
+                "items": {
+                  "$ref": "#/components/schemas/Attachment"
+                },
+                "description": "Files the user attached to the prompt (bytes at\n`GET /v1/attachments/{id}`)."
+              },
               "content": {
                 "type": "string"
               },
@@ -4282,6 +4377,13 @@
           "created_at"
         ],
         "properties": {
+          "attachments": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/Attachment"
+            },
+            "description": "Attachments uploaded with the prompt (already stored server-side)."
+          },
           "content": {
             "type": "string"
           },
@@ -4416,6 +4518,13 @@
           "content"
         ],
         "properties": {
+          "attachments": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/AttachmentUpload"
+            },
+            "description": "Files riding along with the prompt (screenshots, logs, …); bytes are\nbase64 in the request, stored server-side, and referenced by id from\nthen on."
+          },
           "content": {
             "type": "string"
           }

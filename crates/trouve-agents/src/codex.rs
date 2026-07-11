@@ -249,12 +249,19 @@ impl AgentBackend for CodexBackend {
             _ => turn.prompt.clone(),
         };
 
+        // Images ride as localImage items (app-server reads the file
+        // itself); the engine already turned non-image uploads into path
+        // references inside the prompt text.
+        let mut input = vec![json!({ "type": "text", "text": text })];
+        for att in &turn.attachments {
+            input.push(json!({ "type": "localImage", "path": att.path }));
+        }
         let mut turn_params = json!({
             "threadId": codex_thread_id,
             "model": model_or_default(model_name),
             "approvalPolicy": approval_policy,
             "sandboxPolicy": { "type": sandbox_policy_type },
-            "input": [ { "type": "text", "text": text } ],
+            "input": input,
         });
         if let Some(effort) = effort {
             turn_params["effort"] = json!(effort);
@@ -890,6 +897,7 @@ mod tests {
             model: "gpt-5.6".into(),
             model_options: serde_json::Map::new(),
             prompt: "hi".into(),
+            attachments: vec![],
             instructions: None,
             permission: crate::BackendPermission::Ask,
             mcp_bridge: None,

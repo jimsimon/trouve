@@ -197,6 +197,19 @@ impl AgentBackend for CursorBackend {
                 apply_model_config(&server, &session_id, &turn).await?;
             }
 
+            // ACP image content blocks carry base64 data inline.
+            let mut prompt_blocks = vec![json!({ "type": "text", "text": text })];
+            for att in &turn.attachments {
+                match att.read_base64() {
+                    Ok(data) => prompt_blocks.push(json!({
+                        "type": "image",
+                        "mimeType": att.mime,
+                        "data": data,
+                    })),
+                    Err(e) => tracing::warn!("skipping attachment {}: {e}", att.name),
+                }
+            }
+
             // Subscribe after session setup so a session/load's history
             // replay doesn't re-emit old text into the thread.
             let route = server.subscribe(&session_id).await;
@@ -205,7 +218,7 @@ impl AgentBackend for CursorBackend {
                     "session/prompt",
                     json!({
                         "sessionId": session_id,
-                        "prompt": [ { "type": "text", "text": text } ],
+                        "prompt": prompt_blocks,
                     }),
                 )
                 .await?;

@@ -30,7 +30,10 @@ pub use requests::*;
 // (DELETE …/install, DELETE …/download) and uninstall (DELETE /v1/clis/{id})
 // endpoints, local enable toggle (PUT /v1/local/enabled + LocalStatus
 // fields), and POST /v1/local/server/restart (all additive).
-pub const PROTOCOL_VERSION: &str = "0.9";
+// 0.10: prompt attachments — SendMessageRequest.attachments (base64
+// uploads), Attachment metadata on user.message events and QueuedPrompt,
+// and GET /v1/attachments/{id} serving the stored bytes (all additive).
+pub const PROTOCOL_VERSION: &str = "0.10";
 
 pub type WorkspaceId = String;
 pub type SessionId = String;

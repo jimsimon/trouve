@@ -9,6 +9,7 @@ description = "External agent backends (Codex app-server, cursor-agent, Claude C
 
 [dependencies]
 async-trait.workspace = true
+base64 = "0.22"
 chrono.workspace = true
 dirs.workspace = true
 flate2 = "1"

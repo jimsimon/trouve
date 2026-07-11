@@ -320,16 +320,36 @@ pub fn set_slash_commands(ui: &Ui, commands: Vec<(String, String)>) {
     });
 }
 
-/// The current thread's queued prompts (run order) and whether the thread
-/// is idle (idle + non-empty queue surfaces the "Send now" pill).
-pub fn set_queue(ui: &Ui, prompts: Vec<String>, idle: bool) {
+/// The current thread's queued prompts (run order), a per-row badge
+/// ("📎2", empty for none — kept out of the editable text), and whether the
+/// thread is idle (idle + non-empty queue surfaces the "Send now" pill).
+pub fn set_queue(ui: &Ui, prompts: Vec<String>, badges: Vec<String>, idle: bool) {
     let _ = ui.upgrade_in_event_loop(move |ui| {
         let rows: Vec<SharedString> = prompts
             .iter()
             .map(|p| SharedString::from(p.as_str()))
             .collect();
+        let badges: Vec<SharedString> = badges
+            .iter()
+            .map(|b| SharedString::from(b.as_str()))
+            .collect();
         ui.set_queue_prompts(ModelRc::new(VecModel::from(rows)));
+        ui.set_queue_badges(ModelRc::new(VecModel::from(badges)));
         ui.set_queue_idle(idle);
+    });
+}
+
+/// Files staged for the next prompt, shown as removable composer chips.
+pub fn set_composer_attachments(ui: &Ui, chips: Vec<(String, String)>) {
+    let _ = ui.upgrade_in_event_loop(move |ui| {
+        let rows: Vec<crate::AttachmentChip> = chips
+            .into_iter()
+            .map(|(name, meta)| crate::AttachmentChip {
+                name: name.into(),
+                meta: meta.into(),
+            })
+            .collect();
+        ui.set_composer_attachments(ModelRc::new(VecModel::from(rows)));
     });
 }
 

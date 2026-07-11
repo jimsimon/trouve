@@ -346,6 +346,41 @@ fn main() -> anyhow::Result<()> {
     }
     {
         let tx = tx.clone();
+        window.on_attach_file(move || {
+            let _ = tx.send(UiCommand::AttachFileDialog);
+        });
+    }
+    {
+        let tx = tx.clone();
+        window.on_attachment_removed(move |index| {
+            let _ = tx.send(UiCommand::AttachmentRemoved(index.max(0) as usize));
+        });
+    }
+    {
+        // Ctrl/Cmd+V in the composer: if the clipboard holds an image
+        // (a screenshot, usually), stage it as an attachment and swallow
+        // the paste; otherwise let the TextInput paste text as normal.
+        // Checked synchronously on the UI thread — clipboard reads are
+        // local IPC and small relative to a keystroke.
+        let tx = tx.clone();
+        window.on_paste_image_attempted(move || match clipboard_image_png() {
+            Some(bytes) => {
+                let stamp = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0);
+                let _ = tx.send(UiCommand::AddAttachment {
+                    name: format!("pasted-{stamp}.png"),
+                    mime: "image/png".into(),
+                    bytes,
+                });
+                true
+            }
+            None => false,
+        });
+    }
+    {
+        let tx = tx.clone();
         window.on_queue_edited(move |index, content| {
             let _ = tx.send(UiCommand::QueueEdit {
                 index: index.max(0) as usize,
@@ -915,4 +950,20 @@ fn main() -> anyhow::Result<()> {
 
     window.run()?;
     Ok(())
+}
+
+/// The clipboard's image as PNG bytes, or `None` when it holds no image
+/// (or the clipboard isn't reachable). Used by the composer's Ctrl+V hook
+/// to turn pasted screenshots into attachments.
+fn clipboard_image_png() -> Option<Vec<u8>> {
+    let image = arboard::Clipboard::new().ok()?.get_image().ok()?;
+    let mut out = Vec::new();
+    {
+        let mut encoder = png::Encoder::new(&mut out, image.width as u32, image.height as u32);
+        encoder.set_color(png::ColorType::Rgba);
+        encoder.set_depth(png::BitDepth::Eight);
+        let mut writer = encoder.write_header().ok()?;
+        writer.write_image_data(&image.bytes).ok()?;
+    }
+    Some(out)
 }

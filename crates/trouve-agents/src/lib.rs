@@ -49,6 +49,11 @@ pub struct BackendTurn {
     /// Values for the model's options schema (thinking level, fast, ...).
     pub model_options: serde_json::Map<String, serde_json::Value>,
     pub prompt: String,
+    /// Image attachments riding with the prompt, already stored as files by
+    /// the engine. Sent as native image inputs where the vendor protocol
+    /// supports them (non-image uploads are referenced by path inside
+    /// `prompt` instead — the engine handles that).
+    pub attachments: Vec<TurnAttachment>,
     /// Trouve mode prompt, appended to the vendor's own system prompt where
     /// the vendor protocol allows.
     pub instructions: Option<String>,
@@ -59,6 +64,28 @@ pub struct BackendTurn {
     /// User-configured MCP servers (user/workspace/worktree scopes, already
     /// merged and env-expanded by the engine) to mount alongside the bridge.
     pub mcp_servers: Vec<McpServerLaunch>,
+}
+
+/// One prompt attachment, resolved to a stored file the backend process can
+/// read (the server and vendor CLIs share a filesystem).
+#[derive(Debug, Clone)]
+pub struct TurnAttachment {
+    /// Display name from the upload ("screenshot.png").
+    pub name: String,
+    /// MIME type ("image/png").
+    pub mime: String,
+    /// Absolute path of the stored bytes.
+    pub path: PathBuf,
+}
+
+impl TurnAttachment {
+    /// The file's bytes as standard base64, for protocols that embed image
+    /// data instead of referencing paths.
+    pub fn read_base64(&self) -> std::io::Result<String> {
+        use base64::Engine as _;
+        let bytes = std::fs::read(&self.path)?;
+        Ok(base64::engine::general_purpose::STANDARD.encode(bytes))
+    }
 }
 
 /// One user-configured stdio MCP server, ready to launch (env `${VAR}`

@@ -147,6 +147,13 @@ export struct ChatRow {
     q-last: bool,
 }
 
+// A file staged to ride with the next prompt (composer chips).
+export struct AttachmentChip {
+    name: string,
+    // "image/png · 34 KB".
+    meta: string,
+}
+
 // One visible row of the Files tree, pre-flattened by the controller:
 // folders carry an expanded flag, depth drives the indent.
 export struct FileItem {
@@ -575,6 +582,9 @@ component PromptBox inherits Rectangle {
     in property <bool> completion-active: false;
     in property <string> completion-text;
     callback completion-dismissed();
+    // Ctrl/Cmd+V: give the app a chance to capture a clipboard image as an
+    // attachment; returns true when it did (the text paste is skipped).
+    callback paste-image-attempted() -> bool;
     public function apply-completion(t: string) {
         input.text = t + " ";
         input.set-selection-offsets(
@@ -632,6 +642,12 @@ component PromptBox inherits Rectangle {
             selection-background-color: Theme.c.selection;
 
             key-pressed(event) => {
+                if ((event.text == "v" || event.text == "V")
+                    && (event.modifiers.control || event.modifiers.meta)
+                    && !event.modifiers.shift
+                    && root.paste-image-attempted()) {
+                    return accept;
+                }
                 if (root.completion-active && event.text == Key.Tab) {
                     root.apply-completion(root.completion-text);
                     return accept;
@@ -1139,6 +1155,14 @@ export component AppWindow inherits Window {
     in property <bool> composer-enabled: false;
     // Draft survives the composer being swapped out for the new-thread form.
     property <string> composer-draft;
+    // Files staged for the next prompt (screenshots, logs, …).
+    in property <[AttachmentChip]> composer-attachments: [];
+    callback attach-file();
+    callback attachment-removed(int);
+    // Ctrl/Cmd+V in the composer: returns true when the clipboard held an
+    // image that was captured as an attachment (so the paste shouldn't
+    // also insert text).
+    callback paste-image-attempted() -> bool;
 
     // "/" skill completion: the harness's slash commands (parallel name /
     // description lists), the fuzzy-ranked match indices (best first,
@@ -1165,6 +1189,9 @@ export component AppWindow inherits Window {
     // paused by a failed turn never auto-run — a crash may have cut the
     // previous turn short, so resuming is the user's call.
     in property <[string]> queue-prompts;
+    // Per-row attachment badge ("📎2"; empty hides it). Parallel to
+    // queue-prompts so the editable row text stays pristine.
+    in property <[string]> queue-badges;
     in property <bool> queue-idle: false;
     callback queue-edited(/* index */ int, /* content */ string);
     callback queue-deleted(/* index */ int);
@@ -2749,6 +2776,12 @@ export component AppWindow inherits Window {
                                         vertical-alignment: center;
                                         horizontal-stretch: 1;
                                     }
+                                    if qi < root.queue-badges.length && root.queue-badges[qi] != "": Text {
+                                        text: root.queue-badges[qi];
+                                        color: Theme.c.text-soft;
+                                        font-size: Theme.fs(11px);
+                                        vertical-alignment: center;
+                                    }
                                     IconButton {
                                         icon: "↑";
                                         tip: "Run earlier";
@@ -2857,6 +2890,50 @@ export component AppWindow inherits Window {
                         }
                     }
 
+                    // Files staged for the next prompt: one removable chip
+                    // each. Kept above the input so pasting a screenshot has
+                    // visible, undoable feedback before sending.
+                    if root.composer-attachments.length > 0: Flickable {
+                        height: Theme.fs(26px);
+                        viewport-height: self.height;
+                        HorizontalLayout {
+                            spacing: 6px;
+                            alignment: start;
+                            for chip[i] in root.composer-attachments: Rectangle {
+                                background: Theme.c.accent-bg;
+                                border-radius: 6px;
+                                border-width: 1px;
+                                border-color: Theme.c.primary-border;
+                                height: Theme.fs(24px);
+                                HorizontalLayout {
+                                    spacing: 6px;
+                                    padding-left: 8px;
+                                    padding-right: 4px;
+                                    Text {
+                                        text: chip.name;
+                                        color: Theme.c.text-hi;
+                                        font-size: Theme.fs(11px);
+                                        vertical-alignment: center;
+                                        overflow: elide;
+                                        max-width: 220px;
+                                    }
+                                    Text {
+                                        text: chip.meta;
+                                        color: Theme.c.text-soft;
+                                        font-size: Theme.fs(10px);
+                                        vertical-alignment: center;
+                                    }
+                                    IconButton {
+                                        icon: "✕";
+                                        tip: "Remove attachment";
+                                        y: (parent.height - self.height) / 2;
+                                        clicked => { root.attachment-removed(i); }
+                                    }
+                                }
+                            }
+                        }
+                    }
+
                     composer := PromptBox {
                         text <=> root.composer-draft;
                         placeholder: root.composer-enabled
@@ -2866,6 +2943,7 @@ export component AppWindow inherits Window {
                         completion-active: root.slash-active && !root.slash-suppressed;
                         completion-text: root.slash-completion;
                         completion-dismissed => { root.slash-suppressed = true; }
+                        paste-image-attempted => { root.paste-image-attempted() }
                         submitted(text) => {
                             root.send-message(text);
                             self.text = "";
@@ -2955,10 +3033,24 @@ export component AppWindow inherits Window {
                     VerticalLayout {
                         spacing: 2px;
                         Text { text: " "; font-size: Theme.fs(10px); }
+                        IconButton {
+                            icon: "📎";
+                            tip: "Attach files (or paste an image with Ctrl+V)";
+                            icon-size: Theme.fs(14px);
+                            width: Theme.fs(30px);
+                            height: Theme.fs(30px);
+                            enabled: root.composer-enabled;
+                            clicked => { root.attach-file(); }
+                        }
+                    }
+                    VerticalLayout {
+                        spacing: 2px;
+                        Text { text: " "; font-size: Theme.fs(10px); }
                         Button {
                             text: "Send";
                             primary: true;
-                            enabled: root.composer-enabled && composer.text != "";
+                            enabled: root.composer-enabled
+                                && (composer.text != "" || root.composer-attachments.length > 0);
                             clicked => {
                                 root.send-message(composer.text);
                                 composer.text = "";
