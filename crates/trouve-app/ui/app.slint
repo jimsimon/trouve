@@ -940,7 +940,10 @@ export component AppWindow inherits Window {
     preferred-height: 900px;
     min-width: 900px;
     min-height: 560px;
-    title: "trouve";
+    title: "Trouve";
+    // Branching-threads mark: one line of work splitting into parallel
+    // sessions, the glowing dot being the one that found it ("trouvé").
+    icon: @image-url("assets/trouve.png");
     background: Theme.c.win-bg;
     // Texts without an explicit font-size inherit these; explicit sizes
     // route through Theme.fs() so everything follows the user's base size.

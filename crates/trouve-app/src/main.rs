@@ -37,6 +37,15 @@ fn main() -> anyhow::Result<()> {
         )
         .init();
 
+    // Wayland/X11 app id. Compositors resolve taskbar/titlebar icons through a
+    // desktop file matching this id (see packaging/linux/trouve.desktop);
+    // must be set after the backend is initialized but before the window is
+    // created.
+    slint::BackendSelector::new()
+        .select()
+        .map_err(|e| anyhow::anyhow!("failed to initialize UI backend: {e}"))?;
+    slint::set_xdg_app_id("trouve")?;
+
     let window = AppWindow::new()?;
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<UiCommand>();
 
