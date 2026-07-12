@@ -2393,6 +2393,8 @@ async fn github_enterprise_host_crud() {
     assert_eq!(hosts.len(), 1);
     assert_eq!(hosts[0]["host"], "github.com");
     assert_eq!(hosts[0]["removable"], false);
+    // The built-in shared OAuth app: sign-in works with zero config.
+    assert_eq!(hosts[0]["oauth_available"], true);
 
     // Add an enterprise host (scheme and trailing slash are tolerated).
     let gh: serde_json::Value = client

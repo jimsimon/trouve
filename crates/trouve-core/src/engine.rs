@@ -1874,10 +1874,13 @@ impl Engine {
         let config = self.config.lock().unwrap();
         let mut hosts = vec![(
             crate::github::GITHUB_COM.to_string(),
+            // github.com always has an OAuth path: the built-in shared app,
+            // unless config overrides it with the user's own client id.
             config
                 .github_client_id
                 .clone()
-                .filter(|id| !id.trim().is_empty()),
+                .filter(|id| !id.trim().is_empty())
+                .or_else(|| Some(crate::github::DEFAULT_CLIENT_ID.to_string())),
         )];
         for e in &config.github_enterprise {
             hosts.push((

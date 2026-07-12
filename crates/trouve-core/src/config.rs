@@ -40,8 +40,9 @@ pub struct Config {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub local_enabled: Option<bool>,
     /// Client id of a GitHub OAuth app (with device flow enabled) for
-    /// "Sign in with GitHub". Unset disables the OAuth path; a pasted
-    /// token, GITHUB_TOKEN, or the gh CLI still work.
+    /// "Sign in with GitHub" on github.com. Unset uses the built-in shared
+    /// Trouve app (`github::DEFAULT_CLIENT_ID`); set it to route sign-in
+    /// through your own OAuth app instead.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub github_client_id: Option<String>,
     /// Self-hosted GitHub Enterprise instances the integration should also

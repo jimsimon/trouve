@@ -75,6 +75,12 @@ pub fn token_from_gh_cli(host: &str) -> Option<String> {
     (!token.is_empty()).then_some(token)
 }
 
+/// Client id of the shared "Trouve" OAuth app on github.com, baked in so
+/// sign-in works out of the box. OAuth client ids are public identifiers
+/// (the device flow needs no secret); `github_client_id` in config.toml
+/// overrides it. Enterprise hosts still need their own per-instance app.
+pub const DEFAULT_CLIENT_ID: &str = "Ov23liEvV9xEJCsfJQ15";
+
 /// Device-flow OAuth endpoints for a GitHub host (github.com or a GHES
 /// instance — both serve the flow under /login). The client id comes from
 /// config: an OAuth app on that host with device flow enabled.

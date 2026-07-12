@@ -1879,10 +1879,10 @@ export component SettingsScreen inherits Rectangle {
                                             clicked => { root.github-token-saved(gh.host, ""); }
                                         }
                                     }
+                                    // Only enterprise hosts can lack an OAuth path:
+                                    // github.com always has the built-in shared app.
                                     if !gh.oauth-available: Text {
-                                        text: gh.host == "github.com"
-                                            ? "To enable one-click sign-in, register a GitHub OAuth app (Settings → Developer settings → OAuth Apps, \"Enable Device Flow\") and set github_client_id in trouve's config.toml."
-                                            : "To enable one-click sign-in, register an OAuth app on this instance (device flow enabled) and re-add the host with its client id.";
+                                        text: "To enable one-click sign-in, register an OAuth app on this instance (device flow enabled) and re-add the host with its client id.";
                                         color: Theme.c.text-soft;
                                         font-size: Theme.fs(11px);
                                         wrap: word-wrap;
