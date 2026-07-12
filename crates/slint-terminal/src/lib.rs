@@ -96,6 +96,10 @@ fn to_widget(seg: &AnsiSegment) -> TermSegment {
     }
 }
 
+/// Longest partial (newline-free) line buffered before it is force-flushed
+/// as its own row, so pathological output can't grow it without bound.
+const MAX_PARTIAL_BYTES: usize = 64 * 1024;
+
 /// Growable scrollback buffer backing the widget's model, with a line cap.
 pub struct Scrollback {
     model: Rc<VecModel<ModelRc<TermSegment>>>,
@@ -127,6 +131,20 @@ impl Scrollback {
         while let Some(pos) = self.partial.find('\n') {
             let line: String = self.partial.drain(..=pos).collect();
             let segments: Vec<TermSegment> = parse_ansi_line(line.trim_end_matches(['\n', '\r']))
+                .iter()
+                .map(to_widget)
+                .collect();
+            self.model.push(ModelRc::new(VecModel::from(segments)));
+            while self.model.row_count() > self.max_lines {
+                self.model.remove(0);
+            }
+        }
+        // Cap the pending partial line: a process emitting megabytes with no
+        // newline (progress bars using \r, or binary output) would otherwise
+        // grow it without bound. Flush an over-long partial as its own row.
+        if self.partial.len() > MAX_PARTIAL_BYTES {
+            let flushed = std::mem::take(&mut self.partial);
+            let segments: Vec<TermSegment> = parse_ansi_line(flushed.trim_end_matches(['\n', '\r']))
                 .iter()
                 .map(to_widget)
                 .collect();
