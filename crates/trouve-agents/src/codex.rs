@@ -732,6 +732,11 @@ struct AppServer {
     next_id: AtomicI64,
     pending: Pending,
     routes: Arc<Mutex<HashMap<String, mpsc::Sender<ServerMsg>>>>,
+    /// Thread-scoped messages that arrived before anyone subscribed to that
+    /// thread — the id is only known after thread/start returns, so the
+    /// app-server can emit notifications in the gap before `subscribe`.
+    /// Delivered when the route is registered instead of being dropped.
+    buffered: Arc<Mutex<HashMap<String, Vec<ServerMsg>>>>,
     /// Held so the child (kill_on_drop) lives as long as the server handle.
     _child: Child,
     closed: Arc<std::sync::atomic::AtomicBool>,
@@ -758,6 +763,7 @@ impl AppServer {
             next_id: AtomicI64::new(1),
             pending: Arc::new(Mutex::new(HashMap::new())),
             routes: Arc::new(Mutex::new(HashMap::new())),
+            buffered: Arc::new(Mutex::new(HashMap::new())),
             _child: child,
             closed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         };
@@ -773,6 +779,7 @@ impl AppServer {
         let routes = self.routes.clone();
         let closed = self.closed.clone();
         let pending = self.pending.clone();
+        let buffered = self.buffered.clone();
         tokio::spawn(async move {
             let mut lines = BufReader::new(stdout).lines();
             while let Ok(Some(line)) = lines.next_line().await {
@@ -804,21 +811,30 @@ impl AppServer {
                         .or_else(|| params["thread"]["id"].as_str())
                         .unwrap_or("")
                         .to_string();
+                    let m = if has_id {
+                        ServerMsg::Request {
+                            id: msg["id"].clone(),
+                            method,
+                            params,
+                        }
+                    } else {
+                        ServerMsg::Notification { method, params }
+                    };
                     let routed = {
                         let routes = routes.lock().await;
                         routes.get(&thread_id).cloned()
                     };
-                    if let Some(tx) = routed {
-                        let m = if has_id {
-                            ServerMsg::Request {
-                                id: msg["id"].clone(),
-                                method,
-                                params,
-                            }
-                        } else {
-                            ServerMsg::Notification { method, params }
-                        };
-                        let _ = tx.send(m).await;
+                    match routed {
+                        Some(tx) => {
+                            let _ = tx.send(m).await;
+                        }
+                        // No subscriber yet: buffer for a thread id we've
+                        // seen named (skip the empty catch-all) so nothing
+                        // emitted between thread/start and subscribe is lost.
+                        None if !thread_id.is_empty() => {
+                            buffered.lock().await.entry(thread_id).or_default().push(m);
+                        }
+                        None => {}
                     }
                 }
             }
@@ -875,12 +891,20 @@ impl AppServer {
 
     async fn subscribe(&self, thread_id: &str) -> mpsc::Receiver<ServerMsg> {
         let (tx, rx) = mpsc::channel(256);
-        self.routes.lock().await.insert(thread_id.to_string(), tx);
+        self.routes.lock().await.insert(thread_id.to_string(), tx.clone());
+        // Flush anything the reader buffered for this thread before we
+        // subscribed (notifications emitted right after thread/start).
+        if let Some(msgs) = self.buffered.lock().await.remove(thread_id) {
+            for m in msgs {
+                let _ = tx.send(m).await;
+            }
+        }
         rx
     }
 
     async fn unsubscribe(&self, thread_id: &str) {
         self.routes.lock().await.remove(thread_id);
+        self.buffered.lock().await.remove(thread_id);
     }
 }
 
