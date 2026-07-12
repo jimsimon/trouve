@@ -825,6 +825,14 @@ impl Controller {
             .collect();
         self.current_session =
             current_id.and_then(|id| self.sessions.iter().position(|s| s.id == id));
+        // If the open session vanished (deleted in another window or by an
+        // automation), drop its threads and selection too — otherwise
+        // current_thread_id keeps returning a thread of a session that no
+        // longer exists and the chat renders stale.
+        if self.current_session.is_none() {
+            self.threads.clear();
+            self.current_thread = None;
+        }
         self.push_nav();
         Ok(())
     }
@@ -1002,7 +1010,9 @@ impl Controller {
     }
 
     fn current_thread_id(&self) -> Option<String> {
-        self.current_thread.map(|i| self.threads[i].id.clone())
+        self.current_thread
+            .and_then(|i| self.threads.get(i))
+            .map(|t| t.id.clone())
     }
 
     /// The question request behind a wizard row: its request id and the
@@ -4072,10 +4082,14 @@ impl Controller {
         let Some(index) = self.current_thread else {
             return;
         };
-        let thread_id = self.threads[index].id.clone();
+        let Some(thread_id) = self.threads.get(index).map(|t| t.id.clone()) else {
+            return;
+        };
         match self.client.update_thread(&thread_id, &req).await {
             Ok(thread) => {
-                self.threads[index] = thread;
+                if let Some(slot) = self.threads.get_mut(index) {
+                    *slot = thread;
+                }
                 self.push_threads();
                 self.push_picker_indices();
                 self.push_context();
