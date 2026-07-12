@@ -3540,8 +3540,12 @@ impl Engine {
         }
         // Native providers speak text-only; every attachment (images
         // included) becomes a path reference the model's file tools can
-        // follow.
-        let content = annotate_attachments(content, &self.resolve_attachments(&attachments));
+        // follow. Copy them into the worktree first: the file tools reject
+        // absolute paths (the sandbox), so a data-dir path the model can't
+        // open is useless — a worktree-relative copy is reachable.
+        let resolved = self.resolve_attachments(&attachments);
+        let materialized = materialize_attachments(&worktree, &resolved);
+        let content = annotate_attachments(content, &materialized);
         self.store
             .append_message(&thread.id, &serde_json::to_value(Message::User(content))?)?;
 
@@ -5321,6 +5325,40 @@ fn ceil_char_boundary(s: &str, mut at: usize) -> usize {
     at
 }
 
+/// Copy prompt attachments into the session worktree (under a gitignored
+/// `.trouve/attachments/` dir) so the native file tools — which only open
+/// worktree-relative paths — can read them. Returns each attachment paired
+/// with its worktree-relative path. Failures drop that attachment with a
+/// warning rather than failing the turn.
+fn materialize_attachments(
+    worktree: &Path,
+    files: &[(trouve_protocol::Attachment, PathBuf)],
+) -> Vec<(trouve_protocol::Attachment, PathBuf)> {
+    if files.is_empty() {
+        return Vec::new();
+    }
+    let rel_dir = Path::new(".trouve").join("attachments");
+    let abs_dir = worktree.join(&rel_dir);
+    if let Err(e) = std::fs::create_dir_all(&abs_dir) {
+        tracing::warn!("cannot stage attachments in {}: {e}", abs_dir.display());
+        return Vec::new();
+    }
+    // Keep the staged files out of the user's diffs/commits.
+    let _ = std::fs::write(worktree.join(".trouve").join(".gitignore"), "*\n");
+    let mut out = Vec::new();
+    for (meta, src) in files {
+        // Prefix with the id so distinct attachments with the same filename
+        // don't collide.
+        let file_name = format!("{}-{}", meta.id, meta.name);
+        let rel = rel_dir.join(&file_name);
+        match std::fs::copy(src, worktree.join(&rel)) {
+            Ok(_) => out.push((meta.clone(), rel)),
+            Err(e) => tracing::warn!("cannot stage attachment {}: {e}", meta.name),
+        }
+    }
+    out
+}
+
 fn annotate_attachments(
     content: String,
     files: &[(trouve_protocol::Attachment, PathBuf)],
@@ -5329,7 +5367,9 @@ fn annotate_attachments(
         return content;
     }
     let mut out = content;
-    out.push_str("\n\nThe user attached these files (read them from disk as needed):");
+    out.push_str(
+        "\n\nThe user attached these files (read them with the file tools at the paths shown):",
+    );
     for (a, path) in files {
         out.push_str(&format!("\n- {} ({}): {}", a.name, a.mime, path.display()));
     }
