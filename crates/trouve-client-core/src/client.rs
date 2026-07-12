@@ -616,14 +616,13 @@ impl ProtocolClient {
             bail!("terminal output: {}", resp.status());
         }
         let mut stream = resp.bytes_stream();
-        let mut buf = String::new();
+        let mut buf = LineBuffer::default();
         let mut last = after;
         let mut id: Option<u64> = None;
         while let Some(chunk) = stream.next().await {
-            buf.push_str(&String::from_utf8_lossy(&chunk?));
-            while let Some(pos) = buf.find('\n') {
-                let line = buf[..pos].trim().to_string();
-                buf.drain(..=pos);
+            buf.push(&chunk?);
+            while let Some(line) = buf.next_line() {
+                let line = line.trim();
                 if let Some(v) = line.strip_prefix("id:") {
                     id = v.trim().parse().ok();
                 } else if line == "event: exit" {
@@ -864,14 +863,12 @@ impl ProtocolClient {
     ) -> Result<u64> {
         let resp = self.http.get(url).send().await?;
         let mut stream = resp.bytes_stream();
-        let mut buf = String::new();
+        let mut buf = LineBuffer::default();
         let mut last = after;
         while let Some(chunk) = stream.next().await {
-            buf.push_str(&String::from_utf8_lossy(&chunk?));
-            while let Some(pos) = buf.find('\n') {
-                let line = buf[..pos].trim().to_string();
-                buf.drain(..=pos);
-                let Some(data) = line.strip_prefix("data:") else {
+            buf.push(&chunk?);
+            while let Some(line) = buf.next_line() {
+                let Some(data) = line.trim().strip_prefix("data:") else {
                     continue;
                 };
                 let Ok(envelope) = serde_json::from_str::<EventEnvelope>(data.trim()) else {
@@ -884,6 +881,28 @@ impl ProtocolClient {
             }
         }
         Ok(last)
+    }
+}
+
+/// Buffers raw SSE bytes and yields complete lines, decoding each only once
+/// whole — decoding per network chunk would corrupt multi-byte UTF-8 (and
+/// thus drop the whole JSON envelope) when a character straddles a chunk
+/// boundary. Lines split on `\n`, which is never part of a multi-byte
+/// sequence.
+#[derive(Default)]
+struct LineBuffer {
+    buf: Vec<u8>,
+}
+
+impl LineBuffer {
+    fn push(&mut self, chunk: &[u8]) {
+        self.buf.extend_from_slice(chunk);
+    }
+
+    fn next_line(&mut self) -> Option<String> {
+        let pos = self.buf.iter().position(|&b| b == b'\n')?;
+        let line: Vec<u8> = self.buf.drain(..=pos).collect();
+        Some(String::from_utf8_lossy(&line[..line.len() - 1]).into_owned())
     }
 }
 

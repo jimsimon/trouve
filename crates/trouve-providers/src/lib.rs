@@ -12,6 +12,7 @@ pub mod catalog;
 pub mod codex_responses;
 pub mod openai_compat;
 pub mod secrets;
+pub(crate) mod sse;
 
 use futures::stream::BoxStream;
 use serde::{Deserialize, Serialize};

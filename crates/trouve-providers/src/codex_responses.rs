@@ -261,7 +261,7 @@ fn sse_events(
     let (tx, mut rx) = mpsc::channel::<Result<ProviderEvent, ProviderError>>(64);
     tokio::spawn(async move {
         let mut bytes = resp.bytes_stream();
-        let mut buf = String::new();
+        let mut buf = crate::sse::LineBuffer::default();
         let mut usage = Usage::default();
         while let Some(chunk) = bytes.next().await {
             let chunk = match chunk {
@@ -271,10 +271,9 @@ fn sse_events(
                     return;
                 }
             };
-            buf.push_str(&String::from_utf8_lossy(&chunk));
-            while let Some(pos) = buf.find('\n') {
-                let line = buf[..pos].trim().to_string();
-                buf.drain(..=pos);
+            buf.push(&chunk);
+            while let Some(line) = buf.next_line() {
+                let line = line.trim();
                 let Some(data) = line.strip_prefix("data:") else {
                     continue;
                 };
