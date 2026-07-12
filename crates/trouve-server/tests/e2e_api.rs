@@ -2590,6 +2590,195 @@ async fn local_enable_toggle_and_install_lifecycle_endpoints() {
     assert_eq!(resp.status(), 409);
 }
 
+/// Drives search_transcript: turn 1 plants a fact; turn 2 searches for it
+/// (plus a bad-scope probe), then reads the matched turn in full.
+struct RecallProvider {
+    calls: AtomicUsize,
+}
+
+#[async_trait::async_trait]
+impl Provider for RecallProvider {
+    fn id(&self) -> &str {
+        "scripted"
+    }
+
+    async fn stream_chat(
+        &self,
+        _model: &str,
+        _messages: &[Message],
+        _tools: &[ToolSpec],
+        _options: &serde_json::Map<String, serde_json::Value>,
+    ) -> Result<EventStream, ProviderError> {
+        let call = self.calls.fetch_add(1, Ordering::SeqCst);
+        let done = Ok(ProviderEvent::Completed {
+            usage: Usage {
+                input_tokens: 10,
+                output_tokens: 4,
+                ..Default::default()
+            },
+        });
+        let events: Vec<Result<ProviderEvent, ProviderError>> = match call {
+            // Turn 1: acknowledge the fact (also searchable later).
+            0 => vec![
+                Ok(ProviderEvent::TextDelta(
+                    "Noted: 74656 is the magic number.".into(),
+                )),
+                done,
+            ],
+            // Turn 2, iteration 1: search for it, plus a bad scope.
+            1 => vec![
+                Ok(ProviderEvent::ToolCall(ToolCallRequest {
+                    id: "s1".into(),
+                    name: "search_transcript".into(),
+                    arguments: serde_json::json!({"query": "magic number"}),
+                })),
+                Ok(ProviderEvent::ToolCall(ToolCallRequest {
+                    id: "s2".into(),
+                    name: "search_transcript".into(),
+                    arguments: serde_json::json!({"query": "x", "scope": "galaxy"}),
+                })),
+                done,
+            ],
+            // Turn 2, iteration 2: read the matched turn in full.
+            2 => vec![
+                Ok(ProviderEvent::ToolCall(ToolCallRequest {
+                    id: "s3".into(),
+                    name: "search_transcript".into(),
+                    arguments: serde_json::json!({"turn": 1}),
+                })),
+                done,
+            ],
+            _ => vec![
+                Ok(ProviderEvent::TextDelta("Recovered: 74656.".into())),
+                done,
+            ],
+        };
+        Ok(Box::pin(futures::stream::iter(events)))
+    }
+}
+
+/// search_transcript: snippets are turn-stamped, scopes validate, and turn
+/// mode replays one turn's messages in full.
+#[tokio::test]
+async fn search_transcript_recovers_history() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path().join("repo");
+    std::fs::create_dir(&repo).unwrap();
+    init_repo(&repo);
+
+    let store = Store::open(&tmp.path().join("db/trouve.db")).unwrap();
+    let engine = Arc::new(
+        Engine::new(store, tmp.path().join("data"), &Config::default())
+            .with_config_dir(None)
+            .with_provider(
+                "scripted",
+                Arc::new(RecallProvider {
+                    calls: AtomicUsize::new(0),
+                }),
+            )
+            .with_default_model("scripted/test-model"),
+    );
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let router = trouve_server::build_router(engine);
+    tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+    let base = format!("http://{addr}/v1");
+    let client = reqwest::Client::new();
+
+    let ws: serde_json::Value = client
+        .post(format!("{base}/workspaces"))
+        .json(&serde_json::json!({"path": repo.to_str().unwrap()}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let session: serde_json::Value = client
+        .post(format!("{base}/sessions"))
+        .json(&serde_json::json!({"workspace_id": ws["id"], "title": "Recall"}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let thread: serde_json::Value = client
+        .post(format!("{base}/threads"))
+        .json(&serde_json::json!({"session_id": session["id"]}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let thread_id = thread["id"].as_str().unwrap().to_string();
+    let events_url = format!("{base}/threads/{thread_id}/events");
+
+    // Turn 1 plants the fact.
+    client
+        .post(format!("{base}/threads/{thread_id}/messages"))
+        .json(&serde_json::json!({"content": "remember the magic number is 74656"}))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+    wait_for_event(&client, &events_url, |e| {
+        e["type"] == "turn.completed" && e["turn"] == 1
+    })
+    .await;
+
+    // Turn 2 recovers it.
+    client
+        .post(format!("{base}/threads/{thread_id}/messages"))
+        .json(&serde_json::json!({"content": "what was the magic number?"}))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+    let events = wait_for_event(&client, &events_url, |e| {
+        e["type"] == "turn.completed" && e["turn"] == 2
+    })
+    .await;
+
+    let results = tool_results(&events);
+    // The search found turn 1's user message and assistant reply.
+    let search = results.iter().find(|(id, _)| *id == "s1").unwrap().1;
+    let matches = search["matches"].as_array().unwrap();
+    assert!(matches.len() >= 2, "{search}");
+    assert_eq!(matches[0]["turn"], 1);
+    assert_eq!(matches[0]["role"], "user");
+    assert!(
+        matches[0]["snippet"].as_str().unwrap().contains("74656"),
+        "{search}"
+    );
+    assert!(matches.iter().any(|m| m["role"] == "assistant"));
+    assert_eq!(search["truncated"], false);
+    // Scope names validate.
+    let bad = results.iter().find(|(id, _)| *id == "s2").unwrap().1;
+    assert!(
+        bad["error"].as_str().unwrap().contains("unknown scope"),
+        "{bad}"
+    );
+    // Turn mode replays the full messages of turn 1.
+    let full = results.iter().find(|(id, _)| *id == "s3").unwrap().1;
+    let messages = full["messages"].as_array().unwrap();
+    assert!(messages.iter().any(|m| m["role"] == "user"
+        && m["content"].as_str().unwrap().contains("remember the magic number")));
+    assert!(
+        messages
+            .iter()
+            .any(|m| m["role"] == "assistant" && m["content"].as_str().unwrap().contains("Noted")),
+        "{full}"
+    );
+    // ... and the model could answer from it.
+    assert!(events.iter().any(|e| e["type"] == "assistant.message"
+        && e["content"].as_str().unwrap().contains("Recovered: 74656")));
+}
+
 /// Drives the spawn tool family end-to-end. The parent turn spawns a child
 /// agent, pokes spawn_output with a bogus id (denied: not its child), waits
 /// on the real child, then summarizes. The child turn first tries to spawn

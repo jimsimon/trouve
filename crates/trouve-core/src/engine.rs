@@ -3448,6 +3448,7 @@ impl Engine {
             .filter(|s| mode.allowed_tools.is_empty() || mode.allowed_tools.contains(&s.name))
             .collect();
         specs.push(ask_question_spec());
+        specs.push(search_transcript_spec());
         // Spawn tools are for top-level agents only: children don't get to
         // spawn grandchildren (also enforced at execution).
         if self.store.spawn_parent(&thread.id)?.is_none() {
@@ -3652,6 +3653,7 @@ impl Engine {
             .collect();
         // Engine-served, always available (see handle_tool_call).
         specs.push(ask_question_spec());
+        specs.push(search_transcript_spec());
         // Spawn tools: top-level agents only, same as native turns.
         if self.store.spawn_parent(thread_id)?.is_none() {
             specs.push(spawn_thread_spec());
@@ -4307,7 +4309,9 @@ impl Engine {
         }
 
         let replacement = serde_json::to_value(Message::User(format!(
-            "[Context was compacted. Summary of the conversation so far:]\n\n{summary}"
+            "[Context was compacted. Older turns were summarized below; exact details \
+             (error text, file paths, command output) are recoverable with the \
+             search_transcript tool.]\n\n{summary}"
         )))?;
         self.store.replace_messages(&thread.id, &[replacement])?;
         self.store.append_event(
@@ -4355,13 +4359,14 @@ impl Engine {
             return Ok((result.to_string(), Vec::new()));
         }
 
-        // The spawn family is engine-served too (child agents need session/
-        // thread creation and turn dispatch, which tools can't reach). Unlike
-        // ask_question they do get tool cards — a spawned agent is a real,
-        // visible action. Errors become tool results, never turn failures.
+        // The spawn family and transcript search are engine-served too
+        // (child agents and cross-thread history need the store and turn
+        // dispatch, which tools can't reach). Unlike ask_question they do
+        // get tool cards — these are real, visible actions. Errors become
+        // tool results, never turn failures.
         if matches!(
             call.name.as_str(),
-            "spawn_thread" | "spawn_session" | "spawn_output"
+            "spawn_thread" | "spawn_session" | "spawn_output" | "search_transcript"
         ) {
             self.store.append_event(
                 scope.clone(),
@@ -4373,10 +4378,13 @@ impl Engine {
                     requires_approval: false,
                 },
             )?;
-            let result = match self
-                .handle_spawn_tool(session, thread, mode, &call.name, &call.arguments)
-                .await
-            {
+            let outcome = if call.name == "search_transcript" {
+                self.handle_search_transcript(session, thread, &call.arguments)
+            } else {
+                self.handle_spawn_tool(session, thread, mode, &call.name, &call.arguments)
+                    .await
+            };
+            let result = match outcome {
                 Ok(v) => v,
                 Err(e) => serde_json::json!({ "error": e.to_string() }),
             };
@@ -4722,6 +4730,175 @@ impl Engine {
         Ok(out)
     }
 
+    /// The engine-served `search_transcript` tool: recover details that
+    /// compaction summarized away or a handoff digest elided. Query mode
+    /// returns turn-stamped snippets from the stored event log (user and
+    /// assistant messages plus tool results — already image-stripped and
+    /// bounded); turn mode reads one turn's messages in full. Scoped to the
+    /// current thread by default, opt-in to the session or workspace —
+    /// never across workspaces.
+    fn handle_search_transcript(
+        &self,
+        session: &Session,
+        thread: &Thread,
+        args: &serde_json::Value,
+    ) -> Result<serde_json::Value> {
+        const MAX_MATCHES: usize = 20;
+        const SNIPPET_RADIUS: usize = 120;
+        const TURN_ITEM_CAP: usize = 2_000;
+
+        // Turn mode: read one turn in full (found via a prior search).
+        if let Some(turn) = args.get("turn").and_then(serde_json::Value::as_u64) {
+            let target = args
+                .get("thread_id")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or(&thread.id);
+            let t = self.get_thread(target).map_err(|e| anyhow!(e.to_string()))?;
+            let s = self
+                .get_session(&t.session_id)
+                .map_err(|e| anyhow!(e.to_string()))?;
+            if s.workspace_id != session.workspace_id {
+                bail!("thread {target} is outside this workspace");
+            }
+            let mut calls: std::collections::HashMap<String, u64> = Default::default();
+            let mut messages = Vec::new();
+            for env in self
+                .store
+                .events_after(&Scope::Thread(target.to_string()), 0)?
+            {
+                let item = match env.event {
+                    Event::UserMessage { turn: t, content, .. } if t == turn => {
+                        serde_json::json!({"role": "user", "content": cap_chars(&content, TURN_ITEM_CAP)})
+                    }
+                    Event::AssistantMessage { turn: t, content } if t == turn => {
+                        serde_json::json!({"role": "assistant", "content": cap_chars(&content, TURN_ITEM_CAP)})
+                    }
+                    Event::ToolRequested {
+                        turn: t,
+                        call_id,
+                        tool,
+                        args,
+                        ..
+                    } => {
+                        if t != turn {
+                            continue;
+                        }
+                        calls.insert(call_id, t);
+                        serde_json::json!({"role": "tool_call", "tool": tool,
+                            "args": cap_chars(&args.to_string(), TURN_ITEM_CAP)})
+                    }
+                    Event::ToolCompleted {
+                        call_id, result, ..
+                    } if calls.contains_key(&call_id) => {
+                        serde_json::json!({"role": "tool_result",
+                            "content": cap_chars(&result.to_string(), TURN_ITEM_CAP)})
+                    }
+                    Event::TurnFailed { turn: t, error } if t == turn => {
+                        serde_json::json!({"role": "error", "content": error})
+                    }
+                    _ => continue,
+                };
+                messages.push(item);
+            }
+            if messages.is_empty() {
+                bail!("no messages for turn {turn} of thread {target}");
+            }
+            return Ok(serde_json::json!({
+                "thread_id": target,
+                "turn": turn,
+                "messages": messages,
+            }));
+        }
+
+        let query = args
+            .get("query")
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|q| !q.is_empty())
+            .context("query is required (or pass turn to read one turn in full)")?;
+        let needle = query.to_lowercase();
+        let scope = args
+            .get("scope")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("thread");
+        let thread_ids: Vec<String> = match scope {
+            "thread" => vec![thread.id.clone()],
+            "session" => self
+                .store
+                .list_threads(&session.id)?
+                .into_iter()
+                .map(|t| t.id)
+                .collect(),
+            "workspace" => {
+                let mut ids = Vec::new();
+                for s in self.store.list_sessions(Some(&session.workspace_id))? {
+                    ids.extend(self.store.list_threads(&s.id)?.into_iter().map(|t| t.id));
+                }
+                ids
+            }
+            other => bail!("unknown scope: {other} (thread | session | workspace)"),
+        };
+
+        let mut matches = Vec::new();
+        let mut truncated = false;
+        'threads: for tid in &thread_ids {
+            let mut calls: std::collections::HashMap<String, u64> = Default::default();
+            for env in self.store.events_after(&Scope::Thread(tid.clone()), 0)? {
+                let (turn, role, text) = match &env.event {
+                    Event::UserMessage { turn, content, .. } => (*turn, "user", content.clone()),
+                    Event::AssistantMessage { turn, content } => {
+                        (*turn, "assistant", content.clone())
+                    }
+                    Event::ToolRequested { turn, call_id, .. } => {
+                        calls.insert(call_id.clone(), *turn);
+                        continue;
+                    }
+                    Event::ToolCompleted {
+                        call_id, result, ..
+                    } => {
+                        let Some(turn) = calls.get(call_id) else {
+                            continue;
+                        };
+                        (*turn, "tool", result.to_string())
+                    }
+                    _ => continue,
+                };
+                let Some(at) = text.to_lowercase().find(&needle) else {
+                    continue;
+                };
+                if matches.len() >= MAX_MATCHES {
+                    truncated = true;
+                    break 'threads;
+                }
+                let start = floor_char_boundary(&text, at.saturating_sub(SNIPPET_RADIUS));
+                let end =
+                    ceil_char_boundary(&text, (at + needle.len() + SNIPPET_RADIUS).min(text.len()));
+                let mut snippet = String::new();
+                if start > 0 {
+                    snippet.push('…');
+                }
+                snippet.push_str(&text[start..end]);
+                if end < text.len() {
+                    snippet.push('…');
+                }
+                matches.push(serde_json::json!({
+                    "thread_id": tid,
+                    "turn": turn,
+                    "role": role,
+                    "ts": env.ts.to_rfc3339(),
+                    "snippet": snippet,
+                }));
+            }
+        }
+        Ok(serde_json::json!({
+            "query": query,
+            "scope": scope,
+            "matches": matches,
+            "truncated": truncated,
+            "hint": "pass {thread_id, turn} to read a matched turn in full",
+        }))
+    }
+
     async fn maybe_checkpoint(
         &self,
         session: &Session,
@@ -4853,7 +5030,8 @@ fn render_history_digest(messages: &[Message], resumed: bool) -> Option<String> 
         let head = floor_char_boundary(&body, HISTORY_DIGEST_MAX / 4);
         let tail = ceil_char_boundary(&body, body.len() - (HISTORY_DIGEST_MAX - head));
         body = format!(
-            "{}\n\n[... earlier conversation truncated ...]\n\n{}",
+            "{}\n\n[... earlier conversation truncated — recover specifics with the \
+             search_transcript tool ...]\n\n{}",
             &body[..head],
             &body[tail..]
         );
@@ -4871,6 +5049,15 @@ fn render_history_digest(messages: &[Message], resumed: bool) -> Option<String> 
     Some(format!(
         "{header}\n\n{body}\n\n[End of digest. The user's current message follows.]"
     ))
+}
+
+/// Truncate to at most `max` bytes on a char boundary, marking the cut.
+fn cap_chars(s: &str, max: usize) -> String {
+    if s.len() <= max {
+        return s.to_string();
+    }
+    let end = floor_char_boundary(s, max);
+    format!("{}… [truncated]", &s[..end])
 }
 
 /// Largest index `<= at` that lands on a char boundary.
@@ -5138,6 +5325,46 @@ pub fn spawn_output_spec() -> ToolSpec {
                 }
             },
             "required": ["thread_id"]
+        }),
+    }
+}
+
+/// Spec for the engine-served `search_transcript` tool (recovering history
+/// lost to compaction or handoff digests, and cross-thread memory).
+pub fn search_transcript_spec() -> ToolSpec {
+    ToolSpec {
+        name: "search_transcript".into(),
+        description: "Search the stored conversation history, including turns that were \
+                      compacted out of your context or elided from a handoff digest. \
+                      Returns turn-stamped snippets around each match (user and \
+                      assistant messages plus tool results). scope defaults to this \
+                      thread; \"session\" covers all threads in this session, \
+                      \"workspace\" every session in this workspace. To read a matched \
+                      turn in full, call again with turn (and the match's thread_id) \
+                      instead of a query."
+            .into(),
+        parameters: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": "Case-insensitive text to find (exact substring match)."
+                },
+                "scope": {
+                    "type": "string",
+                    "enum": ["thread", "session", "workspace"],
+                    "description": "How far to search (default: thread)."
+                },
+                "turn": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "description": "Read this turn's messages in full instead of searching."
+                },
+                "thread_id": {
+                    "type": "string",
+                    "description": "Thread the turn belongs to (default: this thread); from a match."
+                }
+            }
         }),
     }
 }
@@ -5422,7 +5649,16 @@ mod tests {
         assert!(digest.len() < HISTORY_DIGEST_MAX + 1_000);
         assert!(digest.contains("start-marker"));
         assert!(digest.contains("end-marker"));
-        assert!(digest.contains("truncated"));
+        // The cut points at the recovery hatch for the elided middle.
+        assert!(digest.contains("truncated — recover specifics with the search_transcript tool"));
+    }
+
+    #[test]
+    fn cap_chars_truncates_on_char_boundaries() {
+        assert_eq!(cap_chars("short", 100), "short");
+        let capped = cap_chars(&"é".repeat(100), 21);
+        assert!(capped.starts_with("éééééééééé"));
+        assert!(capped.ends_with("[truncated]"));
     }
 
     #[test]
