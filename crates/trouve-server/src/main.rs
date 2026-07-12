@@ -23,6 +23,7 @@ async fn main() -> anyhow::Result<()> {
     let data = data_dir();
     let store = Store::open(&data.join("trouve.db"))?;
     let config = Config::load();
+    let security = trouve_server::ServerSecurity::resolve(&data);
     let engine = Arc::new(
         Engine::new(store, data, &config)
             // This engine loaded the real config file, so provider changes
@@ -30,5 +31,5 @@ async fn main() -> anyhow::Result<()> {
             .with_config_file(Some(trouve_core::config::config_path()))
             .with_index_hooks(),
     );
-    trouve_server::serve(engine, addr).await
+    trouve_server::serve(engine, addr, security).await
 }

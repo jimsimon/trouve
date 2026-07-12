@@ -228,18 +228,18 @@ mod tests {
 
     #[test]
     fn repo_resolution_defaults_and_rejects_escapes() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("sub/dir")).unwrap();
+        let wt = dir.path().display().to_string();
         let ctx = ToolCtx {
-            worktree: std::path::PathBuf::from("/tmp/wt"),
+            worktree: dir.path().to_path_buf(),
             ..Default::default()
         };
-        assert_eq!(resolve_repo(&ctx, &json!({})).unwrap(), "/tmp/wt");
-        assert_eq!(
-            resolve_repo(&ctx, &json!({"repo": "."})).unwrap(),
-            "/tmp/wt"
-        );
+        assert_eq!(resolve_repo(&ctx, &json!({})).unwrap(), wt);
+        assert_eq!(resolve_repo(&ctx, &json!({"repo": "."})).unwrap(), wt);
         assert_eq!(
             resolve_repo(&ctx, &json!({"repo": "sub/dir"})).unwrap(),
-            "/tmp/wt/sub/dir"
+            format!("{wt}/sub/dir")
         );
         assert!(
             resolve_repo(&ctx, &json!({"repo": "https://github.com/org/repo"}))

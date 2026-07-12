@@ -99,6 +99,11 @@ pub struct StoredOAuthToken {
     pub secret_key: String,
     pub oauth: OAuthConfig,
     pub http: reqwest::Client,
+    /// Serializes refreshes: concurrent turns sharing this token must not
+    /// each POST the same refresh_token. Providers that rotate refresh
+    /// tokens revoke the whole family when an old one is reused, logging the
+    /// user out; the racing `set`s would also clobber each other.
+    refresh_lock: tokio::sync::Mutex<()>,
 }
 
 impl StoredOAuthToken {
@@ -108,6 +113,7 @@ impl StoredOAuthToken {
             secret_key,
             oauth,
             http: reqwest::Client::new(),
+            refresh_lock: tokio::sync::Mutex::new(()),
         }
     }
 
@@ -167,10 +173,17 @@ impl StoredOAuthToken {
 impl TokenSource for StoredOAuthToken {
     async fn bearer(&self) -> Result<String, ProviderError> {
         let tokens = self.load()?;
-        if tokens.expired() {
-            return Ok(self.refresh(&tokens).await?.access_token);
+        if !tokens.expired() {
+            return Ok(tokens.access_token);
         }
-        Ok(tokens.access_token)
+        // Serialize the refresh; re-check under the lock in case another
+        // task already refreshed while we waited.
+        let _guard = self.refresh_lock.lock().await;
+        let tokens = self.load()?;
+        if !tokens.expired() {
+            return Ok(tokens.access_token);
+        }
+        Ok(self.refresh(&tokens).await?.access_token)
     }
 }
 
@@ -338,14 +351,16 @@ pub async fn pkce_wait_for_code(
         };
         let mut code = None;
         let mut state_ok = false;
+        let mut error = None;
         for (k, v) in url.query_pairs() {
             match &*k {
                 "code" => code = Some(v.to_string()),
                 "state" => state_ok = v == expected_state,
+                "error" => error = Some(v.to_string()),
                 _ => {}
             }
         }
-        let body = "<html><body>trouve: login complete, you can close this tab.</body></html>";
+        let body = "<html><body>trouve: you can close this tab.</body></html>";
         let _ = stream
             .write_all(
                 format!(
@@ -355,6 +370,13 @@ pub async fn pkce_wait_for_code(
                 .as_bytes(),
             )
             .await;
+        // The provider redirects with `error=...` (no code) when the user
+        // denies consent; fail now instead of waiting out the whole timeout.
+        if let Some(error) = error {
+            return Err(ProviderError::Auth(format!(
+                "authorization denied: {error}"
+            )));
+        }
         if let (Some(code), true) = (code, state_ok) {
             return Ok(code);
         }

@@ -2766,8 +2766,13 @@ async fn search_transcript_recovers_history() {
     // Turn mode replays the full messages of turn 1.
     let full = results.iter().find(|(id, _)| *id == "s3").unwrap().1;
     let messages = full["messages"].as_array().unwrap();
-    assert!(messages.iter().any(|m| m["role"] == "user"
-        && m["content"].as_str().unwrap().contains("remember the magic number")));
+    assert!(messages.iter().any(|m| {
+        m["role"] == "user"
+            && m["content"]
+                .as_str()
+                .unwrap()
+                .contains("remember the magic number")
+    }));
     assert!(
         messages
             .iter()
@@ -3032,16 +3037,12 @@ async fn spawn_thread_child_agent_end_to_end() {
     assert!(!parent["spawned"].as_bool().unwrap_or(false));
 
     // Depth guard: the child's own spawn attempt was refused.
-    let child_events = wait_for_event(
-        &client,
-        &format!("{base}/threads/{child_id}/events"),
-        |e| {
-            e["type"] == "tool.completed"
-                && e["result"]["error"]
-                    .as_str()
-                    .is_some_and(|s| s.contains("cannot spawn"))
-        },
-    )
+    let child_events = wait_for_event(&client, &format!("{base}/threads/{child_id}/events"), |e| {
+        e["type"] == "tool.completed"
+            && e["result"]["error"]
+                .as_str()
+                .is_some_and(|s| s.contains("cannot spawn"))
+    })
     .await;
     assert!(!child_events.is_empty());
 }
@@ -3073,7 +3074,18 @@ async fn spawn_session_child_agent_isolated() {
     let child_thread_id = spawn["thread_id"].as_str().unwrap();
     let child_session_id = spawn["session_id"].as_str().unwrap();
     assert_ne!(child_session_id, session["id"].as_str().unwrap());
-    assert_eq!(spawn["based_on"], session["branch"]);
+    // The child is based on the parent's latest checkpoint commit (its
+    // actual work), not the session branch — checkpoints never move the
+    // branch, so basing on the branch would show the child nothing. Expect
+    // a resolved commit hash rather than the branch name.
+    let based_on = spawn["based_on"].as_str().unwrap();
+    assert_ne!(based_on, session["branch"].as_str().unwrap());
+    assert_eq!(
+        based_on.len(),
+        40,
+        "based_on should be a commit hash: {based_on}"
+    );
+    assert!(based_on.chars().all(|c| c.is_ascii_hexdigit()));
     let output = results.iter().find(|(id, _)| *id == "p3").unwrap().1;
     assert_eq!(output["status"], "completed", "{output}");
     assert!(
@@ -3095,7 +3107,9 @@ async fn spawn_session_child_agent_isolated() {
         .await
         .unwrap();
     assert_eq!(child_session["title"], "Sub experiment");
-    assert_eq!(child_session["base_ref"], session["branch"]);
+    // base_ref is the parent's checkpoint commit (see based_on above), not
+    // the branch name.
+    assert_eq!(child_session["base_ref"], based_on);
     assert_ne!(child_session["branch"], session["branch"]);
     let child_worktree = child_session["worktree_path"].as_str().unwrap();
     assert_ne!(child_worktree, session["worktree_path"].as_str().unwrap());
@@ -3109,10 +3123,60 @@ async fn spawn_session_child_agent_isolated() {
         .json()
         .await
         .unwrap();
-    let child = threads
-        .iter()
-        .find(|t| t["id"] == child_thread_id)
-        .unwrap();
+    let child = threads.iter().find(|t| t["id"] == child_thread_id).unwrap();
     assert_eq!(child["spawned"], true, "{child}");
     assert_eq!(child["mode"], "code");
+}
+
+#[tokio::test]
+async fn secured_router_enforces_token_and_loopback_host() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Store::open(&tmp.path().join("db/trouve.db")).unwrap();
+    let engine = Arc::new(
+        Engine::new(store, tmp.path().join("data"), &Config::default()).with_config_dir(None),
+    );
+
+    let security = trouve_server::ServerSecurity {
+        token: Some("s3cret-token".to_string()),
+        require_loopback_host: true,
+    };
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let router = trouve_server::build_secured_router(engine, security);
+    tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+    let base = format!("http://{addr}/v1");
+    let client = reqwest::Client::new();
+
+    // No token -> 401.
+    let resp = client.get(format!("{base}/info")).send().await.unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::UNAUTHORIZED);
+
+    // Wrong token -> 401.
+    let resp = client
+        .get(format!("{base}/info"))
+        .bearer_auth("nope")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::UNAUTHORIZED);
+
+    // Correct token -> 200.
+    let resp = client
+        .get(format!("{base}/info"))
+        .bearer_auth("s3cret-token")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+
+    // Non-loopback Host header (DNS-rebinding attempt) -> 403, even with a
+    // valid token.
+    let resp = client
+        .get(format!("{base}/info"))
+        .bearer_auth("s3cret-token")
+        .header(reqwest::header::HOST, "attacker.example.com")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::FORBIDDEN);
 }

@@ -150,8 +150,28 @@ impl Provider for CodexResponsesProvider {
             body["reasoning"] = json!({ "effort": effort });
         }
 
-        let url = std::env::var("TROUVE_CODEX_RESPONSES_URL")
-            .unwrap_or_else(|_| CODEX_RESPONSES_URL.to_string());
+        let url = match std::env::var("TROUVE_CODEX_RESPONSES_URL") {
+            Ok(u) if !u.is_empty() => {
+                // This redirects the ChatGPT subscription bearer token to an
+                // arbitrary host — a test/debug hook only. Refuse a
+                // non-loopback override unless explicitly allowed, and log
+                // loudly so it can't be set silently.
+                let host_ok = reqwest::Url::parse(&u).ok().is_some_and(|parsed| {
+                    parsed
+                        .host_str()
+                        .is_some_and(|h| h == "localhost" || h.starts_with("127."))
+                });
+                if !host_ok && std::env::var_os("TROUVE_ALLOW_REMOTE").is_none() {
+                    return Err(ProviderError::Auth(format!(
+                        "refusing to send the ChatGPT token to {u}: set TROUVE_ALLOW_REMOTE \
+                         to override TROUVE_CODEX_RESPONSES_URL with a non-loopback host"
+                    )));
+                }
+                tracing::warn!("using TROUVE_CODEX_RESPONSES_URL override: {u}");
+                u
+            }
+            _ => CODEX_RESPONSES_URL.to_string(),
+        };
         let resp = self
             .http
             .post(&url)
@@ -201,6 +221,7 @@ fn input_items(messages: &[Message]) -> Vec<Value> {
             Message::Assistant {
                 content,
                 tool_calls,
+                reasoning: _,
             } => {
                 if !content.is_empty() {
                     items.push(json!({
@@ -261,7 +282,7 @@ fn sse_events(
     let (tx, mut rx) = mpsc::channel::<Result<ProviderEvent, ProviderError>>(64);
     tokio::spawn(async move {
         let mut bytes = resp.bytes_stream();
-        let mut buf = String::new();
+        let mut buf = crate::sse::LineBuffer::default();
         let mut usage = Usage::default();
         while let Some(chunk) = bytes.next().await {
             let chunk = match chunk {
@@ -271,10 +292,9 @@ fn sse_events(
                     return;
                 }
             };
-            buf.push_str(&String::from_utf8_lossy(&chunk));
-            while let Some(pos) = buf.find('\n') {
-                let line = buf[..pos].trim().to_string();
-                buf.drain(..=pos);
+            buf.push(&chunk);
+            while let Some(line) = buf.next_line() {
+                let line = line.trim();
                 let Some(data) = line.strip_prefix("data:") else {
                     continue;
                 };
@@ -374,6 +394,7 @@ mod tests {
                     name: "read_file".into(),
                     arguments: json!({"path": "x"}),
                 }],
+                reasoning: vec![],
             },
             Message::ToolResult {
                 call_id: "c1".into(),

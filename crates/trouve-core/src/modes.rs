@@ -49,6 +49,9 @@ pub fn builtin_modes() -> Vec<AgentMode> {
                             report problems — bugs, missed edge cases, style violations — with \
                             file and line references. Do not modify files."
                 .into(),
+            // No shell here: review is read_only, and the gate denies every
+            // mutating tool (shell included) in read-only modes, so listing
+            // them would only tempt the model into a guaranteed-deny loop.
             allowed_tools: vec![
                 "read_file".into(),
                 "list_dir".into(),
@@ -57,9 +60,6 @@ pub fn builtin_modes() -> Vec<AgentMode> {
                 "search".into(),
                 "find_related".into(),
                 "todo_write".into(),
-                "shell".into(),
-                "shell_output".into(),
-                "shell_kill".into(),
             ],
             read_only: true,
             default_permission_mode: PermissionMode::Ask,
@@ -97,6 +97,33 @@ pub fn builtin_modes() -> Vec<AgentMode> {
             default_model: None,
         },
     ]
+}
+
+/// The mode to run when a thread references one that no longer resolves
+/// (its TOML was deleted or became invalid). Locked down and read-only: a
+/// thread the user believed was restricted must not silently gain write
+/// access by falling back to the permissive `code` mode.
+pub fn fallback_mode() -> AgentMode {
+    AgentMode {
+        id: "restricted".into(),
+        display_name: "Restricted".into(),
+        system_prompt: "The configured mode is unavailable. Operating in a restricted, \
+                        read-only mode: inspect the workspace and report, but do not modify \
+                        anything."
+            .into(),
+        allowed_tools: vec![
+            "read_file".into(),
+            "list_dir".into(),
+            "glob".into(),
+            "grep".into(),
+            "search".into(),
+            "find_related".into(),
+            "todo_write".into(),
+        ],
+        read_only: true,
+        default_permission_mode: PermissionMode::Ask,
+        default_model: None,
+    }
 }
 
 fn load_dir(dir: &Path, modes: &mut Vec<AgentMode>) {

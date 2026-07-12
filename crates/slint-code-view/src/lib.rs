@@ -38,9 +38,19 @@ pub fn segment_parts(line: &str, spans: &[Span]) -> Vec<(String, u32)> {
             parts.push((text.to_string(), color));
         }
     };
+    // Highlighter byte offsets (e.g. tree-sitter ranges) can land in the
+    // middle of a multi-byte UTF-8 character; slicing there would panic.
+    // Snap every offset down to the nearest char boundary.
+    let clamp = |i: usize| {
+        let mut i = i.min(line.len());
+        while !line.is_char_boundary(i) {
+            i -= 1;
+        }
+        i
+    };
     for span in spans {
-        let start = span.start.min(line.len());
-        let end = span.end.min(line.len());
+        let start = clamp(span.start);
+        let end = clamp(span.end);
         if start < cursor || start >= end {
             continue;
         }
@@ -198,6 +208,43 @@ mod tests {
         );
         let joined: String = segs.iter().map(|s| s.text.as_str()).collect();
         assert_eq!(joined, "abcdef");
+    }
+
+    #[test]
+    fn spans_inside_multibyte_chars_do_not_panic() {
+        // "café" — the é is two bytes (3..5). A span boundary at byte 4
+        // (mid-é) must be clamped rather than panic the slice.
+        let line = "café x";
+        let segs = segment_parts(
+            line,
+            &[
+                Span {
+                    start: 0,
+                    end: 4,
+                    color: 1,
+                },
+                Span {
+                    start: 4,
+                    end: 6,
+                    color: 2,
+                },
+            ],
+        );
+        let joined: String = segs.iter().map(|(t, _)| t.as_str()).collect();
+        assert_eq!(joined, line);
+
+        // An emoji (4 bytes) with a boundary in its middle.
+        let line = "a🎉b";
+        let segs = segment_parts(
+            line,
+            &[Span {
+                start: 1,
+                end: 3,
+                color: 1,
+            }],
+        );
+        let joined: String = segs.iter().map(|(t, _)| t.as_str()).collect();
+        assert_eq!(joined, line);
     }
 
     #[test]

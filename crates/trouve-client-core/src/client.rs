@@ -12,9 +12,30 @@ pub struct ProtocolClient {
 
 impl ProtocolClient {
     pub fn new(server: &str) -> Self {
+        Self::with_token(server, None)
+    }
+
+    /// Build a client that sends `Authorization: Bearer <token>` on every
+    /// request (the local server requires it). `None` disables auth (tests
+    /// and unauthenticated servers).
+    pub fn with_token(server: &str, token: Option<String>) -> Self {
+        let http = match token.filter(|t| !t.is_empty()) {
+            Some(token) => {
+                let mut headers = reqwest::header::HeaderMap::new();
+                let mut value = reqwest::header::HeaderValue::from_str(&format!("Bearer {token}"))
+                    .expect("bearer token is valid header value");
+                value.set_sensitive(true);
+                headers.insert(reqwest::header::AUTHORIZATION, value);
+                reqwest::Client::builder()
+                    .default_headers(headers)
+                    .build()
+                    .expect("reqwest client builds")
+            }
+            None => reqwest::Client::new(),
+        };
         Self {
             base: format!("{}/v1", server.trim_end_matches('/')),
-            http: reqwest::Client::new(),
+            http,
         }
     }
 
@@ -259,6 +280,12 @@ impl ProtocolClient {
         .await
     }
 
+    /// Interrupt the turn currently running on a thread.
+    pub async fn cancel_turn(&self, thread_id: &str) -> Result<()> {
+        self.post_empty(&format!("/threads/{thread_id}/cancel"))
+            .await
+    }
+
     pub async fn resolve_approval(&self, call_id: &str, decision: ApprovalDecision) -> Result<()> {
         let resp = self
             .http
@@ -500,7 +527,8 @@ impl ProtocolClient {
 
     /// Every worktree path (files, dirs with trailing '/'), for "@" mentions.
     pub async fn session_paths(&self, session_id: &str) -> Result<Vec<String>> {
-        self.get_json(&format!("/sessions/{session_id}/paths")).await
+        self.get_json(&format!("/sessions/{session_id}/paths"))
+            .await
     }
 
     pub async fn session_file(&self, session_id: &str, path: &str) -> Result<FileContent> {
@@ -595,14 +623,13 @@ impl ProtocolClient {
             bail!("terminal output: {}", resp.status());
         }
         let mut stream = resp.bytes_stream();
-        let mut buf = String::new();
+        let mut buf = LineBuffer::default();
         let mut last = after;
         let mut id: Option<u64> = None;
         while let Some(chunk) = stream.next().await {
-            buf.push_str(&String::from_utf8_lossy(&chunk?));
-            while let Some(pos) = buf.find('\n') {
-                let line = buf[..pos].trim().to_string();
-                buf.drain(..=pos);
+            buf.push(&chunk?);
+            while let Some(line) = buf.next_line() {
+                let line = line.trim();
                 if let Some(v) = line.strip_prefix("id:") {
                     id = v.trim().parse().ok();
                 } else if line == "event: exit" {
@@ -843,14 +870,12 @@ impl ProtocolClient {
     ) -> Result<u64> {
         let resp = self.http.get(url).send().await?;
         let mut stream = resp.bytes_stream();
-        let mut buf = String::new();
+        let mut buf = LineBuffer::default();
         let mut last = after;
         while let Some(chunk) = stream.next().await {
-            buf.push_str(&String::from_utf8_lossy(&chunk?));
-            while let Some(pos) = buf.find('\n') {
-                let line = buf[..pos].trim().to_string();
-                buf.drain(..=pos);
-                let Some(data) = line.strip_prefix("data:") else {
+            buf.push(&chunk?);
+            while let Some(line) = buf.next_line() {
+                let Some(data) = line.trim().strip_prefix("data:") else {
                     continue;
                 };
                 let Ok(envelope) = serde_json::from_str::<EventEnvelope>(data.trim()) else {
@@ -863,6 +888,28 @@ impl ProtocolClient {
             }
         }
         Ok(last)
+    }
+}
+
+/// Buffers raw SSE bytes and yields complete lines, decoding each only once
+/// whole — decoding per network chunk would corrupt multi-byte UTF-8 (and
+/// thus drop the whole JSON envelope) when a character straddles a chunk
+/// boundary. Lines split on `\n`, which is never part of a multi-byte
+/// sequence.
+#[derive(Default)]
+struct LineBuffer {
+    buf: Vec<u8>,
+}
+
+impl LineBuffer {
+    fn push(&mut self, chunk: &[u8]) {
+        self.buf.extend_from_slice(chunk);
+    }
+
+    fn next_line(&mut self) -> Option<String> {
+        let pos = self.buf.iter().position(|&b| b == b'\n')?;
+        let line: Vec<u8> = self.buf.drain(..=pos).collect();
+        Some(String::from_utf8_lossy(&line[..line.len() - 1]).into_owned())
     }
 }
 

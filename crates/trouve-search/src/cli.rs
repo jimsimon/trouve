@@ -210,6 +210,13 @@ fn run_clear(clear_type: &str) -> ExitCode {
                 println!("Cleared index store at `{}`", path.display());
             }
         }
+        // Remove the now-defunct clone cache left by 1.1–2.0 (remote git URL
+        // support was dropped); otherwise those shallow clones are orphaned
+        // with no command to clean them up.
+        let clones = resolve_cache_folder().join("clones");
+        if clones.is_dir() && std::fs::remove_dir_all(&clones).is_ok() {
+            println!("Removed legacy clone cache at `{}`", clones.display());
+        }
     }
     if clear_type == "savings" || clear_type == "all" {
         match clear_savings() {

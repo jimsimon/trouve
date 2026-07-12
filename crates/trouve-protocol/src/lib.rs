@@ -48,7 +48,9 @@ pub use requests::*;
 // 0.16: GitHub Enterprise — GithubIntegration.hosts (per-host auth state),
 // SetGithubTokenRequest.host, POST/DELETE /v1/integrations/github/hosts for
 // self-hosted instances, and provider-login ids "github:<host>" (additive).
-pub const PROTOCOL_VERSION: &str = "0.16";
+// 0.17: turn cancellation — POST /v1/threads/{id}/cancel interrupts the
+// running turn, and the turn.cancelled event reports it (additive).
+pub const PROTOCOL_VERSION: &str = "0.17";
 
 pub type WorkspaceId = String;
 pub type SessionId = String;

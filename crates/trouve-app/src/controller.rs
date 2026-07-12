@@ -444,6 +444,11 @@ struct Controller {
     /// mention popup, and when they were fetched (throttles refreshes).
     at_files_fetched: Option<(String, std::time::Instant)>,
     expanded_tools: HashSet<String>,
+    /// Last time a streaming-delta render ran, to coalesce bursts of deltas
+    /// into at most one full chat re-fold per interval (a full turn's worth
+    /// of deltas would otherwise re-fold and re-clone the whole transcript
+    /// on every token). Non-delta events always render immediately.
+    last_delta_render: Option<std::time::Instant>,
     /// (thread id, turn) pairs showing raw text instead of styled markdown.
     raw_turns: HashSet<(String, u64)>,
     /// (thread id, card key) pairs whose card body is collapsed.
@@ -579,6 +584,7 @@ pub async fn run(
         pending_attachments: Vec::new(),
         at_files_fetched: None,
         expanded_tools: HashSet::new(),
+        last_delta_render: None,
         raw_turns: HashSet::new(),
         collapsed_cards: HashSet::new(),
         row_call_ids: Vec::new(),
@@ -637,7 +643,10 @@ pub async fn run(
 /// (possibly remote) server instead.
 async fn start_local_server() -> Result<(ProtocolClient, Option<tokio::process::Child>)> {
     if let Ok(url) = std::env::var("TROUVE_SERVER_URL") {
-        let client = ProtocolClient::new(&url);
+        // Connecting to an externally-managed server: the user supplies its
+        // token (if any) in the environment.
+        let token = std::env::var("TROUVE_AUTH_TOKEN").ok();
+        let client = ProtocolClient::with_token(&url, token);
         client
             .info()
             .await
@@ -652,8 +661,19 @@ async fn start_local_server() -> Result<(ProtocolClient, Option<tokio::process::
         .port();
     let addr = format!("127.0.0.1:{port}");
 
+    // A per-launch bearer token so no other local process can drive the
+    // server we just spawned (it can run shell and edit files).
+    let token = format!(
+        "{}{}",
+        uuid::Uuid::new_v4().simple(),
+        uuid::Uuid::new_v4().simple()
+    );
+
     let mut command = tokio::process::Command::new(&binary);
-    command.args(["--addr", &addr]).kill_on_drop(true);
+    command
+        .args(["--addr", &addr])
+        .env("TROUVE_AUTH_TOKEN", &token)
+        .kill_on_drop(true);
     #[cfg(target_os = "linux")]
     unsafe {
         // Tie the server's lifetime to ours even if we exit uncleanly.
@@ -666,7 +686,7 @@ async fn start_local_server() -> Result<(ProtocolClient, Option<tokio::process::
         .spawn()
         .with_context(|| format!("spawning {}", binary.display()))?;
 
-    let client = ProtocolClient::new(&format!("http://{addr}"));
+    let client = ProtocolClient::with_token(&format!("http://{addr}"), Some(token));
     for _ in 0..100 {
         if client.info().await.is_ok() {
             return Ok((client, Some(child)));
@@ -811,6 +831,14 @@ impl Controller {
             .collect();
         self.current_session =
             current_id.and_then(|id| self.sessions.iter().position(|s| s.id == id));
+        // If the open session vanished (deleted in another window or by an
+        // automation), drop its threads and selection too — otherwise
+        // current_thread_id keeps returning a thread of a session that no
+        // longer exists and the chat renders stale.
+        if self.current_session.is_none() {
+            self.threads.clear();
+            self.current_thread = None;
+        }
         self.push_nav();
         Ok(())
     }
@@ -988,7 +1016,9 @@ impl Controller {
     }
 
     fn current_thread_id(&self) -> Option<String> {
-        self.current_thread.map(|i| self.threads[i].id.clone())
+        self.current_thread
+            .and_then(|i| self.threads.get(i))
+            .map(|t| t.id.clone())
     }
 
     /// The question request behind a wizard row: its request id and the
@@ -1203,16 +1233,35 @@ impl Controller {
         self.vms.insert(thread_id.clone(), ThreadViewModel::new());
         let client = self.client.clone();
         let tx = self.tx.clone();
+        // Reconnect for the lifetime of the app. The server ends the stream
+        // on a store error or its own restart; without this the thread's
+        // chat would silently freeze (no deltas, tool cards, or approvals)
+        // until relaunch. Resume from the last cursor delivered — tracked in
+        // the closure so an error path (which loses the return value) still
+        // knows where to continue — so no event is replayed or dropped.
         tokio::spawn(async move {
-            let id = thread_id.clone();
-            let result = client
-                .follow_thread_events(&thread_id, 0, |envelope| {
-                    let _ = tx.send(UiCommand::Event(id.clone(), Box::new(envelope)));
-                    std::ops::ControlFlow::Continue(())
-                })
-                .await;
-            if let Err(e) = result {
-                tracing::warn!("event stream for {thread_id} ended: {e:#}");
+            use std::sync::atomic::{AtomicU64, Ordering};
+            let cursor = std::sync::Arc::new(AtomicU64::new(0));
+            loop {
+                let id = thread_id.clone();
+                let seen = cursor.clone();
+                let after = cursor.load(Ordering::Relaxed);
+                let result = client
+                    .follow_thread_events(&thread_id, after, |envelope| {
+                        seen.store(envelope.cursor, Ordering::Relaxed);
+                        let _ = tx.send(UiCommand::Event(id.clone(), Box::new(envelope)));
+                        std::ops::ControlFlow::Continue(())
+                    })
+                    .await;
+                match result {
+                    Ok(last) => {
+                        cursor.fetch_max(last, Ordering::Relaxed);
+                    }
+                    Err(e) => {
+                        tracing::warn!("event stream for {thread_id} reconnecting: {e:#}");
+                    }
+                }
+                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
             }
         });
     }
@@ -3977,7 +4026,26 @@ impl Controller {
                     // stream (queue_updated / turn.started / turn ends).
                     self.push_queue();
                     if changed.is_some() {
-                        self.render_chat(true);
+                        // Coalesce streaming deltas: re-folding the whole
+                        // transcript per token is O(n^2) over a turn. Render
+                        // at most every 50ms for deltas; every other event
+                        // (including the finalized assistant.message and
+                        // turn.completed) renders immediately, so the last
+                        // token is never left unshown.
+                        let is_delta = matches!(
+                            envelope.event,
+                            trouve_protocol::Event::AssistantDelta { .. }
+                                | trouve_protocol::Event::AssistantThinking { .. }
+                        );
+                        let now = std::time::Instant::now();
+                        let throttled = is_delta
+                            && self
+                                .last_delta_render
+                                .is_some_and(|t| now.duration_since(t).as_millis() < 50);
+                        if !throttled {
+                            self.render_chat(true);
+                            self.last_delta_render = if is_delta { Some(now) } else { None };
+                        }
                     }
                     if matches!(envelope.event, trouve_protocol::Event::TurnCompleted { .. }) {
                         let _ = self.refresh_diff().await;
@@ -4039,10 +4107,14 @@ impl Controller {
         let Some(index) = self.current_thread else {
             return;
         };
-        let thread_id = self.threads[index].id.clone();
+        let Some(thread_id) = self.threads.get(index).map(|t| t.id.clone()) else {
+            return;
+        };
         match self.client.update_thread(&thread_id, &req).await {
             Ok(thread) => {
-                self.threads[index] = thread;
+                if let Some(slot) = self.threads.get_mut(index) {
+                    *slot = thread;
+                }
                 self.push_threads();
                 self.push_picker_indices();
                 self.push_context();

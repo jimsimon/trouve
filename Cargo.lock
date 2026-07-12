@@ -8269,6 +8269,7 @@ dependencies = [
  "tracing-subscriber",
  "trouve-client-core",
  "trouve-protocol",
+ "uuid",
 ]
 
 [[package]]
@@ -8310,6 +8311,7 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
+ "tokio-util",
  "toml 0.8.23",
  "tracing",
  "trouve-agents",
@@ -8454,6 +8456,7 @@ dependencies = [
  "trouve-protocol",
  "trouve-providers",
  "utoipa",
+ "uuid",
 ]
 
 [[package]]

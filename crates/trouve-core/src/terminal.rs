@@ -27,6 +27,9 @@ pub struct TerminalManager {
     terminals: Mutex<HashMap<String, Arc<Terminal>>>,
     /// session id → terminal id (one live terminal per session).
     by_session: Mutex<HashMap<String, String>>,
+    /// Serializes `open` so two concurrent opens for one session can't both
+    /// spawn a shell (the loser's would leak, running, forever).
+    open_lock: Mutex<()>,
 }
 
 pub struct Terminal {
@@ -82,10 +85,14 @@ impl Terminal {
     /// live receiver opened before the snapshot, so nothing falls in the
     /// gap. Returns (start offset of the replay, replay bytes, receiver).
     pub fn subscribe(&self, after: u64) -> (u64, Vec<u8>, broadcast::Receiver<bytes::Bytes>) {
-        // Order matters: open the receiver first, then snapshot; duplicates
-        // at the boundary are dropped by offset bookkeeping client-side.
-        let rx = self.live.subscribe();
+        // Open the receiver and snapshot the backlog under one lock, and have
+        // the reader broadcast under that same lock (see the reader thread).
+        // That makes "append + broadcast" and "subscribe + snapshot" mutually
+        // exclusive, so a chunk can't land in both the replay and the live
+        // stream — which would otherwise double-render it and permanently
+        // skew every subsequent SSE offset.
         let backlog = self.backlog.lock().unwrap();
+        let rx = self.live.subscribe();
         let from = after.max(backlog.start);
         let skip = (from - backlog.start) as usize;
         let replay = backlog.data.get(skip..).unwrap_or_default().to_vec();
@@ -103,6 +110,10 @@ impl TerminalManager {
         cols: u16,
         rows: u16,
     ) -> Result<Arc<Terminal>> {
+        // Serialize the check-and-spawn: without this, two concurrent opens
+        // both miss the existing terminal, both spawn a shell, and the second
+        // overwrites by_session — leaking the first's running shell.
+        let _open = self.open_lock.lock().unwrap();
         if let Some(existing) = self.for_session(session_id) {
             if !existing.exited() {
                 return Ok(existing);
@@ -176,14 +187,16 @@ impl TerminalManager {
                         Ok(0) | Err(_) => break,
                         Ok(n) => {
                             let chunk = bytes::Bytes::copy_from_slice(&buf[..n]);
-                            {
-                                let mut backlog = terminal.backlog.lock().unwrap();
-                                backlog.data.extend_from_slice(&chunk);
-                                if backlog.data.len() > BACKLOG_CAP {
-                                    let drop_n = backlog.data.len() - BACKLOG_CAP;
-                                    backlog.data.drain(..drop_n);
-                                    backlog.start += drop_n as u64;
-                                }
+                            // Append and broadcast under the backlog lock so a
+                            // new subscriber (which snapshots + opens its
+                            // receiver under the same lock) sees the chunk in
+                            // exactly one of the two paths, never both.
+                            let mut backlog = terminal.backlog.lock().unwrap();
+                            backlog.data.extend_from_slice(&chunk);
+                            if backlog.data.len() > BACKLOG_CAP {
+                                let drop_n = backlog.data.len() - BACKLOG_CAP;
+                                backlog.data.drain(..drop_n);
+                                backlog.start += drop_n as u64;
                             }
                             let _ = terminal.live.send(chunk);
                         }

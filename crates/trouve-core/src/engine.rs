@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, RwLock};
 
 use anyhow::{Context, Result, anyhow, bail};
-use futures::StreamExt;
+use futures::{FutureExt, StreamExt};
 use trouve_agents::{AgentBackend, BackendEvent, BackendPermission, BackendTurn};
 use trouve_protocol::{
     AgentMode, ApprovalDecision, BranchList, CreateSessionRequest, CreateThreadRequest, Event,
@@ -67,6 +67,10 @@ pub struct Engine {
     /// while present just enqueue. The session ids feed `Session.active`
     /// and the `session.activity` server event.
     active_threads: Mutex<std::collections::HashMap<String, String>>,
+    /// Cancellation tokens for in-flight turns, keyed by thread id. Set while
+    /// a turn runs; `cancel_turn` trips one to interrupt the turn's provider
+    /// stream, tool calls, and approval waits at the next await point.
+    turn_cancels: Mutex<std::collections::HashMap<String, tokio_util::sync::CancellationToken>>,
     config: Mutex<Config>,
     /// Where provider configuration changes are persisted. `None` disables
     /// persistence (tests).
@@ -327,6 +331,7 @@ impl Engine {
             questions: Arc::new(QuestionHub::default()),
             session_locks: Mutex::new(HashMap::new()),
             active_threads: Mutex::new(std::collections::HashMap::new()),
+            turn_cancels: Mutex::new(std::collections::HashMap::new()),
             config: Mutex::new(config.clone()),
             // No write-back by default: only a caller that loaded `config`
             // from disk should enable persisting to that file (see
@@ -2024,15 +2029,19 @@ impl Engine {
                 ));
             }
         }
-        let probes =
-            futures::future::join_all(entries.iter().map(|(name, _, _, _, config)| async {
-                if probe && !config.disabled {
+        let probes = futures::future::join_all(entries.iter().map(
+            |(name, scope, _, _, config)| async move {
+                // Only probe (spawn) user-scope servers: workspace-scope
+                // servers live in a repo's .agents/.mcp.json and are never
+                // auto-run, so opening settings must not execute them.
+                if probe && !config.disabled && scope == "user" {
                     Some(crate::mcp::probe(name, config, &self.mcp_logs).await)
                 } else {
                     None
                 }
-            }))
-            .await;
+            },
+        ))
+        .await;
         Ok(entries
             .into_iter()
             .zip(probes)
@@ -2040,6 +2049,13 @@ impl Engine {
                 |((name, scope, workspace_id, workspace_name, config), probed)| {
                     let (health, detail) = if config.disabled {
                         ("disabled".to_string(), "disabled in this scope".to_string())
+                    } else if scope == "workspace" {
+                        (
+                            "untrusted".to_string(),
+                            "defined in this repo's .agents/.mcp.json; not auto-run. \
+                             Copy it into your own config to trust and enable it."
+                                .to_string(),
+                        )
                     } else {
                         match probed {
                             Some(Ok(tools)) => ("ok".to_string(), format!("{tools} tools")),
@@ -2402,10 +2418,7 @@ impl Engine {
     /// Every path in the session worktree (files, plus directories with a
     /// trailing '/'), worktree-relative, honouring .gitignore — feeds the
     /// composer's "@" file-mention completion. Capped; alphabetical.
-    pub async fn session_list_paths(
-        &self,
-        session_id: &str,
-    ) -> Result<Vec<String>, EngineError> {
+    pub async fn session_list_paths(&self, session_id: &str) -> Result<Vec<String>, EngineError> {
         const MAX_PATHS: usize = 5000;
         let session = self.get_session(session_id)?;
         let worktree = PathBuf::from(&session.worktree_path);
@@ -2781,6 +2794,16 @@ impl Engine {
                 workspace_id: session.workspace_id.clone(),
             },
         )?;
+        // Release any MCP server processes spawned for this worktree, so they
+        // don't leak for the lifetime of the server.
+        self.executor
+            .evict_worktree(Path::new(&session.worktree_path))
+            .await;
+        // Remove attachment files from disk before dropping their DB rows;
+        // afterwards their paths are unrecoverable.
+        for path in self.store.session_attachment_paths(id)? {
+            let _ = std::fs::remove_file(&path);
+        }
         // Deleting the session deletes its events (privacy: see event-log doc).
         self.store.delete_session(id)?;
         if self.index_hooks {
@@ -3231,13 +3254,46 @@ impl Engine {
         if session_woke {
             self.emit_session_activity(&thread.session_id, true);
         }
-        self.emit_queue(thread_id)?;
-        let turn = self.store.next_turn(thread_id)?;
+        // If setup fails after claiming, release the claim — otherwise the
+        // thread stays "active" forever and can never dispatch again.
+        if let Err(e) = self.emit_queue(thread_id) {
+            self.release_thread(thread_id);
+            return Err(e);
+        }
+        let turn = match self.store.next_turn(thread_id) {
+            Ok(t) => t,
+            Err(e) => {
+                self.release_thread(thread_id);
+                return Err(e.into());
+            }
+        };
         let engine = self.clone();
         tokio::spawn(async move {
-            engine
-                .drain_queue(thread, turn, prompt.content, prompt.attachments)
-                .await;
+            let thread_id = thread.id.clone();
+            // Catch a panic in the turn machinery so the claim (and cancel
+            // token) are always released and the UI unsticks — tokio would
+            // otherwise swallow the panic and leave the thread wedged as
+            // "active" with no TurnFailed event.
+            let drained = std::panic::AssertUnwindSafe(engine.drain_queue(
+                thread,
+                turn,
+                prompt.content,
+                prompt.attachments,
+            ))
+            .catch_unwind()
+            .await;
+            if drained.is_err() {
+                tracing::error!("turn dispatcher for {thread_id} panicked");
+                let _ = engine.store.append_event(
+                    Scope::Thread(thread_id.clone()),
+                    Event::TurnFailed {
+                        turn,
+                        error: "internal error".into(),
+                    },
+                );
+                engine.clear_cancel(&thread_id);
+                engine.release_thread(&thread_id);
+            }
         });
         Ok(Some(turn))
     }
@@ -3257,7 +3313,13 @@ impl Engine {
         let mut content = content;
         let mut attachments = attachments;
         loop {
-            if let Err(e) = self.run_turn(&thread, turn, content, attachments).await {
+            let cancel = self.register_cancel(&thread.id);
+            let result = self
+                .run_turn(&thread, turn, content, attachments, cancel.clone())
+                .await;
+            let cancelled = cancel.is_cancelled();
+            self.clear_cancel(&thread.id);
+            if let Err(e) = result {
                 tracing::error!("turn {turn} of {} failed: {e}", thread.id);
                 let _ = self.store.append_event(
                     Scope::Thread(thread.id.clone()),
@@ -3265,6 +3327,16 @@ impl Engine {
                         turn,
                         error: e.to_string(),
                     },
+                );
+                self.release_thread(&thread.id);
+                return;
+            }
+            if cancelled {
+                // A user-cancelled turn pauses the queue (like a failure, but
+                // not an error): leave queued prompts for the user to resume.
+                let _ = self.store.append_event(
+                    Scope::Thread(thread.id.clone()),
+                    Event::TurnCancelled { turn },
                 );
                 self.release_thread(&thread.id);
                 return;
@@ -3317,6 +3389,36 @@ impl Engine {
         }
     }
 
+    /// Register a fresh cancellation token for a turn about to run.
+    fn register_cancel(&self, thread_id: &str) -> tokio_util::sync::CancellationToken {
+        let token = tokio_util::sync::CancellationToken::new();
+        self.turn_cancels
+            .lock()
+            .unwrap()
+            .insert(thread_id.to_string(), token.clone());
+        token
+    }
+
+    fn clear_cancel(&self, thread_id: &str) {
+        self.turn_cancels.lock().unwrap().remove(thread_id);
+    }
+
+    /// Interrupt the turn currently running on a thread. Trips its
+    /// cancellation token, which stops the provider stream, in-flight tool
+    /// call, or approval wait at the next await point. No-op error when the
+    /// thread has no running turn.
+    pub fn cancel_turn(&self, thread_id: &str) -> Result<(), EngineError> {
+        match self.turn_cancels.lock().unwrap().get(thread_id) {
+            Some(token) => {
+                token.cancel();
+                Ok(())
+            }
+            None => Err(EngineError::BadRequest(format!(
+                "no running turn to cancel on thread {thread_id}"
+            ))),
+        }
+    }
+
     /// Server-scope `session.activity` event — session lists light up (or
     /// dim) their indicator without refetching.
     fn emit_session_activity(&self, session_id: &str, active: bool) {
@@ -3343,6 +3445,7 @@ impl Engine {
         turn: u64,
         content: String,
         attachments: Vec<trouve_protocol::Attachment>,
+        cancel: tokio_util::sync::CancellationToken,
     ) -> Result<()> {
         let session = self
             .store
@@ -3363,7 +3466,7 @@ impl Engine {
         let all_modes = modes::resolve_modes(self.config_dir.as_deref(), Some(Path::new(&ws.path)));
         let mode = modes::find_mode(&all_modes, &thread.mode)
             .cloned()
-            .unwrap_or_else(|| modes::builtin_modes().remove(0));
+            .unwrap_or_else(modes::fallback_mode);
 
         // Serialize worktree mutations across the session's threads — except
         // agent-spawned children in read-only modes: they can't write, and
@@ -3391,6 +3494,8 @@ impl Engine {
                     model_name,
                     content,
                     attachments,
+                    concurrent_child,
+                    cancel,
                 )
                 .await;
         }
@@ -3432,8 +3537,12 @@ impl Engine {
         }
         // Native providers speak text-only; every attachment (images
         // included) becomes a path reference the model's file tools can
-        // follow.
-        let content = annotate_attachments(content, &self.resolve_attachments(&attachments));
+        // follow. Copy them into the worktree first: the file tools reject
+        // absolute paths (the sandbox), so a data-dir path the model can't
+        // open is useless — a worktree-relative copy is reachable.
+        let resolved = self.resolve_attachments(&attachments);
+        let materialized = materialize_attachments(&worktree, &resolved);
+        let content = annotate_attachments(content, &materialized);
         self.store
             .append_message(&thread.id, &serde_json::to_value(Message::User(content))?)?;
 
@@ -3450,22 +3559,50 @@ impl Engine {
         specs.push(ask_question_spec());
         specs.push(search_transcript_spec());
         // Spawn tools are for top-level agents only: children don't get to
-        // spawn grandchildren (also enforced at execution).
+        // spawn grandchildren (also enforced at execution). They also respect
+        // the mode's tool policy, so restrictive/read-only modes that don't
+        // list them can't create branches or child agents.
+        let spawn_allowed = |name: &str| {
+            mode.allowed_tools.is_empty() || mode.allowed_tools.iter().any(|t| t == name)
+        };
         if self.store.spawn_parent(&thread.id)?.is_none() {
-            specs.push(spawn_thread_spec());
-            specs.push(spawn_session_spec());
-            specs.push(spawn_output_spec());
+            if spawn_allowed("spawn_thread") {
+                specs.push(spawn_thread_spec());
+            }
+            if spawn_allowed("spawn_session") {
+                specs.push(spawn_session_spec());
+            }
+            if spawn_allowed("spawn_thread") || spawn_allowed("spawn_session") {
+                specs.push(spawn_output_spec());
+            }
         }
 
         let system = context::system_prompt(&mode, self.config_dir.as_deref(), Path::new(&ws.path));
         let mut usage_total = Usage::default();
+        // The last request's input size — the context-size proxy for
+        // compaction. Summing per-iteration inputs (usage_total) would
+        // over-count a multi-tool turn many-fold; the final request carries
+        // the whole transcript, so its input is what "context size" means.
+        let mut context_input_tokens = 0u64;
+        // Becomes false when the loop ends because the model stopped calling
+        // tools (or was cancelled); stays true only if we exhaust the
+        // iteration budget mid-work, which we then surface to the user.
+        let mut hit_iteration_limit = true;
 
         for _iteration in 0..MAX_ITERATIONS {
+            if cancel.is_cancelled() {
+                hit_iteration_limit = false;
+                break;
+            }
             // Rebuild the transcript each iteration; the store is the truth.
             let mut messages = vec![Message::System(system.clone())];
             for payload in self.store.messages(&thread.id)? {
                 messages.push(serde_json::from_value(payload)?);
             }
+            // Repair any tool_calls left without results by a crash/restart
+            // mid-turn (and drop empty assistant turns); providers reject a
+            // dangling tool_use/tool_call, which would wedge the thread.
+            let messages = sanitize_transcript(messages);
 
             let mut stream = provider
                 .stream_chat(&model_name, &messages, &specs, &model_options)
@@ -3474,7 +3611,19 @@ impl Engine {
 
             let mut text = String::new();
             let mut tool_calls = Vec::new();
-            while let Some(ev) = stream.next().await {
+            // Provider-native reasoning blocks (Anthropic signed thinking) to
+            // persist and replay verbatim — Anthropic rejects a follow-up
+            // tool-use turn whose thinking blocks aren't preserved.
+            let mut reasoning: Vec<serde_json::Value> = Vec::new();
+            loop {
+                let ev = tokio::select! {
+                    biased;
+                    _ = cancel.cancelled() => break,
+                    ev = stream.next() => match ev {
+                        Some(ev) => ev,
+                        None => break,
+                    },
+                };
                 match ev.map_err(|e| anyhow!("provider stream error: {e}"))? {
                     ProviderEvent::TextDelta(delta) => {
                         text.push_str(&delta);
@@ -3490,13 +3639,42 @@ impl Engine {
                             Event::AssistantThinking { turn, text: delta },
                         )?;
                     }
+                    // Kept out of the UI (already streamed as ThinkingDelta);
+                    // carried in the transcript for replay only.
+                    ProviderEvent::Reasoning(block) => reasoning.push(block),
                     ProviderEvent::ToolCall(call) => tool_calls.push(call),
                     ProviderEvent::Completed { usage } => {
                         usage_total.input_tokens += usage.input_tokens;
                         usage_total.output_tokens += usage.output_tokens;
                         usage_total.cached_input_tokens += usage.cached_input_tokens;
+                        context_input_tokens = usage.input_tokens + usage.cached_input_tokens;
                     }
                 }
+            }
+
+            // Interrupted mid-stream: keep any streamed text for display, but
+            // drop the (unexecuted) tool calls so we don't strand tool_use
+            // without results, and stop the turn.
+            if cancel.is_cancelled() {
+                if !text.is_empty() {
+                    self.store.append_event(
+                        scope.clone(),
+                        Event::AssistantMessage {
+                            turn,
+                            content: text.clone(),
+                        },
+                    )?;
+                    self.store.append_message(
+                        &thread.id,
+                        &serde_json::to_value(Message::Assistant {
+                            content: text,
+                            tool_calls: Vec::new(),
+                            reasoning,
+                        })?,
+                    )?;
+                }
+                hit_iteration_limit = false;
+                break;
             }
 
             if !text.is_empty() {
@@ -3508,21 +3686,29 @@ impl Engine {
                     },
                 )?;
             }
-            self.store.append_message(
-                &thread.id,
-                &serde_json::to_value(Message::Assistant {
-                    content: text,
-                    tool_calls: tool_calls.clone(),
-                })?,
-            )?;
+            // Skip a fully-empty assistant message (no text, no tool calls —
+            // e.g. a thinking-only or empty provider response): it serializes
+            // to an empty content block that Anthropic rejects on the next
+            // request, wedging the thread.
+            if !text.is_empty() || !tool_calls.is_empty() {
+                self.store.append_message(
+                    &thread.id,
+                    &serde_json::to_value(Message::Assistant {
+                        content: text,
+                        tool_calls: tool_calls.clone(),
+                        reasoning,
+                    })?,
+                )?;
+            }
 
             if tool_calls.is_empty() {
+                hit_iteration_limit = false;
                 break;
             }
 
             for call in tool_calls {
                 let (result_content, images) = self
-                    .handle_tool_call(&session, thread, turn, &mode, &ctx, &call)
+                    .handle_tool_call(&session, thread, turn, &mode, &ctx, &call, &cancel)
                     .await?;
                 self.store.append_message(
                     &thread.id,
@@ -3535,6 +3721,31 @@ impl Engine {
             }
         }
 
+        // Truncated mid-work at the iteration budget: tell the user (and
+        // leave a transcript note the model sees next turn) instead of
+        // ending silently as if the work were finished.
+        if hit_iteration_limit {
+            let note = format!(
+                "Reached the {MAX_ITERATIONS}-step limit for one turn and stopped mid-task. \
+                 Send another message to continue."
+            );
+            self.store.append_event(
+                scope.clone(),
+                Event::AssistantMessage {
+                    turn,
+                    content: note.clone(),
+                },
+            )?;
+            self.store.append_message(
+                &thread.id,
+                &serde_json::to_value(Message::Assistant {
+                    content: note,
+                    tool_calls: Vec::new(),
+                    reasoning: Vec::new(),
+                })?,
+            )?;
+        }
+
         // Dollar cost from the model catalog, when pricing is known.
         if let Some(model) = provider.models().iter().find(|m| m.id == thread.model) {
             usage_total.cost_usd = trouve_providers::catalog::cost_usd(
@@ -3543,8 +3754,13 @@ impl Engine {
                 usage_total.output_tokens,
             );
         }
-        self.store
-            .record_usage(&session.id, &thread.id, turn, &usage_total)?;
+        self.store.record_usage(
+            &session.id,
+            &thread.id,
+            turn,
+            &usage_total,
+            context_input_tokens,
+        )?;
 
         // Snapshot the worktree when the turn changed it. Lock-free child
         // turns never snapshot: they can't write, so any dirt is the
@@ -3682,8 +3898,17 @@ impl Engine {
         // images, but no bridged vendor consumes them yet); the summary the
         // engine leaves in place of "_images" still tells the model the
         // image was read.
+        // Share the running turn's cancellation token when there is one, so a
+        // cancel also unblocks a bridged tool's approval wait.
+        let cancel = self
+            .turn_cancels
+            .lock()
+            .unwrap()
+            .get(thread_id)
+            .cloned()
+            .unwrap_or_default();
         let (content, _images) = self
-            .handle_tool_call(&session, &thread, turn, &mode, &ctx, &call)
+            .handle_tool_call(&session, &thread, turn, &mode, &ctx, &call, &cancel)
             .await
             .map_err(EngineError::Internal)?;
         Ok(content)
@@ -3823,7 +4048,7 @@ impl Engine {
         let all_modes = modes::resolve_modes(self.config_dir.as_deref(), Some(Path::new(&ws.path)));
         let mode = modes::find_mode(&all_modes, &thread.mode)
             .cloned()
-            .unwrap_or_else(|| modes::builtin_modes().remove(0));
+            .unwrap_or_else(modes::fallback_mode);
         let ctx = ToolCtx {
             worktree: PathBuf::from(&session.worktree_path),
             config_dir: self.config_dir.clone(),
@@ -3844,7 +4069,10 @@ impl Engine {
             .store
             .workspace(&session.workspace_id)?
             .map(|ws| PathBuf::from(ws.path));
-        let configs = crate::mcp::discover_configs(
+        // Only trusted (user-config) servers are handed to the vendor CLI:
+        // it would otherwise spawn a cloned repo's command with the expanded
+        // environment, same RCE/exfiltration risk as the native path.
+        let configs = crate::mcp::trusted_configs(
             self.config_dir.as_deref(),
             workspace_root.as_deref(),
             Path::new(&session.worktree_path),
@@ -3884,6 +4112,8 @@ impl Engine {
         model_name: String,
         content: String,
         attachments: Vec<trouve_protocol::Attachment>,
+        concurrent_child: bool,
+        cancel: tokio_util::sync::CancellationToken,
     ) -> Result<()> {
         let scope = Scope::Thread(thread.id.clone());
         // Vendor sessions are per (thread, backend): each vendor keeps its
@@ -4000,7 +4230,18 @@ impl Engine {
         let mut text = String::new();
         let mut segment = String::new();
         let mut usage_total = Usage::default();
-        while let Some(ev) = stream.next().await {
+        loop {
+            let ev = tokio::select! {
+                biased;
+                // Cancellation drops the backend stream, whose Drop kills the
+                // vendor process (kill_on_drop). We stop consuming and finish
+                // the turn with whatever streamed so far.
+                _ = cancel.cancelled() => break,
+                ev = stream.next() => match ev {
+                    Some(ev) => ev,
+                    None => break,
+                },
+            };
             match ev.map_err(|e| anyhow!("backend stream error: {e}"))? {
                 BackendEvent::SessionStarted { session_id } => {
                     self.store
@@ -4140,6 +4381,9 @@ impl Engine {
                 }
             }
         }
+        // Drop the backend stream promptly so a cancelled turn kills the
+        // vendor process now rather than at end of scope.
+        drop(stream);
 
         if !segment.is_empty() {
             self.store.append_event(
@@ -4155,14 +4399,31 @@ impl Engine {
             &serde_json::to_value(Message::Assistant {
                 content: text,
                 tool_calls: Vec::new(),
+                reasoning: Vec::new(),
             })?,
         )?;
         self.store
             .mark_backend_seen(&thread.id, backend_id, seen_after)?;
 
-        self.store
-            .record_usage(&session.id, &thread.id, turn, &usage_total)?;
-        let checkpoint_id = self.maybe_checkpoint(session, thread, turn).await?;
+        // Vendors report one usage per turn, so the totals already reflect
+        // the last (only) request — use them as the context-size proxy.
+        let context_input_tokens = usage_total.input_tokens + usage_total.cached_input_tokens;
+        self.store.record_usage(
+            &session.id,
+            &thread.id,
+            turn,
+            &usage_total,
+            context_input_tokens,
+        )?;
+        // Lock-free children (read-only spawned agents) never checkpoint:
+        // they hold no session lock, so `git add`/write-tree here would race
+        // the parent's concurrent turn and snapshot its half-finished work as
+        // the child's checkpoint. Matches the native path (invariant 4).
+        let checkpoint_id = if concurrent_child {
+            None
+        } else {
+            self.maybe_checkpoint(session, thread, turn).await?
+        };
         self.store.append_event(
             scope,
             Event::TurnCompleted {
@@ -4288,6 +4549,7 @@ impl Engine {
         for payload in &payloads {
             messages.push(serde_json::from_value(payload.clone())?);
         }
+        messages = sanitize_transcript(messages);
         messages.push(Message::User(
             "Summarize the conversation so far per your instructions.".into(),
         ));
@@ -4326,6 +4588,7 @@ impl Engine {
 
     /// Gate, (maybe) get approval for, and execute one tool call. Returns the
     /// content fed back to the model.
+    #[allow(clippy::too_many_arguments)]
     async fn handle_tool_call(
         self: &Arc<Self>,
         session: &Session,
@@ -4334,6 +4597,7 @@ impl Engine {
         mode: &AgentMode,
         ctx: &ToolCtx,
         call: &trouve_providers::ToolCallRequest,
+        cancel: &tokio_util::sync::CancellationToken,
     ) -> Result<(String, Vec<trouve_providers::ToolImage>)> {
         let scope = Scope::Thread(thread.id.clone());
         let call_id = if call.id.is_empty() {
@@ -4463,7 +4727,13 @@ impl Engine {
                         call_id: call_id.clone(),
                     },
                 )?;
-                let decision = rx.await.unwrap_or(ApprovalDecision::Deny);
+                // A cancelled turn must not hang on an unanswered approval:
+                // treat cancellation as a denial so the wait unblocks.
+                let decision = tokio::select! {
+                    biased;
+                    _ = cancel.cancelled() => ApprovalDecision::Deny,
+                    d = rx => d.unwrap_or(ApprovalDecision::Deny),
+                };
                 self.store.append_event(
                     scope.clone(),
                     Event::ApprovalResolved {
@@ -4564,18 +4834,25 @@ impl Engine {
         }
 
         // Depth guard: one level only. Fan-out stays useful; runaway
-        // recursive spawning does not.
+        // recursive spawning does not. Checked before the mode policy so a
+        // child always gets the depth message regardless of its mode.
         if self.store.spawn_parent(&thread.id)?.is_some() {
             bail!("spawned agents cannot spawn further agents");
+        }
+
+        // Respect the mode's tool policy: a restrictive/read-only mode that
+        // doesn't list the spawn tool can't create branches or child agents
+        // (the specs are already filtered, but a model may still emit the
+        // call — deny it here too).
+        if !(mode.allowed_tools.is_empty() || mode.allowed_tools.iter().any(|t| t == name)) {
+            bail!("{name} is not permitted in {} mode", mode.id);
         }
         let children = self.store.spawned_children(&thread.id)?;
         {
             let active = self.active_threads.lock().unwrap();
             let running = children.iter().filter(|c| active.contains_key(*c)).count();
             if running >= MAX_CONCURRENT_CHILDREN {
-                bail!(
-                    "already {running} children running; collect some with spawn_output first"
-                );
+                bail!("already {running} children running; collect some with spawn_output first");
             }
         }
 
@@ -4619,23 +4896,39 @@ impl Engine {
                 .filter(|t| !t.is_empty())
                 .map(String::from)
                 .unwrap_or_else(|| {
-                    let snippet: String =
-                        prompt.lines().next().unwrap_or("").chars().take(48).collect();
+                    let snippet: String = prompt
+                        .lines()
+                        .next()
+                        .unwrap_or("")
+                        .chars()
+                        .take(48)
+                        .collect();
                     format!("Agent: {snippet}")
                 });
+            // Base the child on the parent's latest checkpoint commit, not
+            // its branch: turn checkpoints are written to hidden refs and
+            // never move the session branch, so basing on the branch would
+            // show the child none of the parent's work. Fall back to the
+            // branch when there is no checkpoint yet.
+            let base_ref = match self.store.latest_checkpoint_seq(&session.id)? {
+                Some(seq) => self
+                    .store
+                    .checkpoint_at(&session.id, seq)?
+                    .map(|c| c.commit_hash)
+                    .unwrap_or_else(|| session.branch.clone()),
+                None => session.branch.clone(),
+            };
             let child_session = self
                 .create_session(CreateSessionRequest {
                     workspace_id: session.workspace_id.clone(),
                     title: Some(title),
-                    // The child sees the parent's committed work (its branch,
-                    // checkpoints included) — not uncommitted changes.
-                    base_ref: Some(session.branch.clone()),
+                    base_ref: Some(base_ref.clone()),
                 })
                 .await
                 .map_err(|e| anyhow!(e.to_string()))?;
             let extra = serde_json::json!({
                 "branch": child_session.branch,
-                "based_on": session.branch,
+                "based_on": base_ref,
                 "worktree": child_session.worktree_path,
             });
             (child_session.id, Some(extra))
@@ -4679,11 +4972,7 @@ impl Engine {
     /// idle), or pending (never ran). Includes the latest assistant message
     /// and aggregate token usage so the parent sees what its money bought.
     fn spawn_status(&self, thread_id: &str) -> Result<serde_json::Value> {
-        let running = self
-            .active_threads
-            .lock()
-            .unwrap()
-            .contains_key(thread_id);
+        let running = self.active_threads.lock().unwrap().contains_key(thread_id);
         let mut last_message = String::new();
         let mut completed_turns = 0u64;
         let mut failure: Option<String> = None;
@@ -4753,7 +5042,9 @@ impl Engine {
                 .get("thread_id")
                 .and_then(serde_json::Value::as_str)
                 .unwrap_or(&thread.id);
-            let t = self.get_thread(target).map_err(|e| anyhow!(e.to_string()))?;
+            let t = self
+                .get_thread(target)
+                .map_err(|e| anyhow!(e.to_string()))?;
             let s = self
                 .get_session(&t.session_id)
                 .map_err(|e| anyhow!(e.to_string()))?;
@@ -4767,7 +5058,9 @@ impl Engine {
                 .events_after(&Scope::Thread(target.to_string()), 0)?
             {
                 let item = match env.event {
-                    Event::UserMessage { turn: t, content, .. } if t == turn => {
+                    Event::UserMessage {
+                        turn: t, content, ..
+                    } if t == turn => {
                         serde_json::json!({"role": "user", "content": cap_chars(&content, TURN_ITEM_CAP)})
                     }
                     Event::AssistantMessage { turn: t, content } if t == turn => {
@@ -5076,6 +5369,40 @@ fn ceil_char_boundary(s: &str, mut at: usize) -> usize {
     at
 }
 
+/// Copy prompt attachments into the session worktree (under a gitignored
+/// `.trouve/attachments/` dir) so the native file tools — which only open
+/// worktree-relative paths — can read them. Returns each attachment paired
+/// with its worktree-relative path. Failures drop that attachment with a
+/// warning rather than failing the turn.
+fn materialize_attachments(
+    worktree: &Path,
+    files: &[(trouve_protocol::Attachment, PathBuf)],
+) -> Vec<(trouve_protocol::Attachment, PathBuf)> {
+    if files.is_empty() {
+        return Vec::new();
+    }
+    let rel_dir = Path::new(".trouve").join("attachments");
+    let abs_dir = worktree.join(&rel_dir);
+    if let Err(e) = std::fs::create_dir_all(&abs_dir) {
+        tracing::warn!("cannot stage attachments in {}: {e}", abs_dir.display());
+        return Vec::new();
+    }
+    // Keep the staged files out of the user's diffs/commits.
+    let _ = std::fs::write(worktree.join(".trouve").join(".gitignore"), "*\n");
+    let mut out = Vec::new();
+    for (meta, src) in files {
+        // Prefix with the id so distinct attachments with the same filename
+        // don't collide.
+        let file_name = format!("{}-{}", meta.id, meta.name);
+        let rel = rel_dir.join(&file_name);
+        match std::fs::copy(src, worktree.join(&rel)) {
+            Ok(_) => out.push((meta.clone(), rel)),
+            Err(e) => tracing::warn!("cannot stage attachment {}: {e}", meta.name),
+        }
+    }
+    out
+}
+
 fn annotate_attachments(
     content: String,
     files: &[(trouve_protocol::Attachment, PathBuf)],
@@ -5084,7 +5411,9 @@ fn annotate_attachments(
         return content;
     }
     let mut out = content;
-    out.push_str("\n\nThe user attached these files (read them from disk as needed):");
+    out.push_str(
+        "\n\nThe user attached these files (read them with the file tools at the paths shown):",
+    );
     for (a, path) in files {
         out.push_str(&format!("\n- {} ({}): {}", a.name, a.mime, path.display()));
     }
@@ -5115,6 +5444,69 @@ fn take_tool_images(result: &mut serde_json::Value) -> Vec<trouve_providers::Too
         );
     }
     images
+}
+
+/// Make a stored transcript safe to send to a provider. A crash or restart
+/// between persisting an assistant message with `tool_calls` and persisting
+/// its results (tool execution can take minutes; approval waits are
+/// unbounded) leaves a dangling `tool_call`, which both OpenAI and Anthropic
+/// reject — permanently wedging the thread. Synthesize an "interrupted"
+/// result for every tool call left unanswered, and drop empty assistant
+/// messages (they serialize to an empty content block Anthropic rejects).
+fn sanitize_transcript(messages: Vec<Message>) -> Vec<Message> {
+    let mut out: Vec<Message> = Vec::with_capacity(messages.len());
+    let mut iter = messages.into_iter().peekable();
+    while let Some(msg) = iter.next() {
+        match msg {
+            Message::Assistant {
+                content,
+                tool_calls,
+                reasoning,
+            } => {
+                if content.trim().is_empty() && tool_calls.is_empty() {
+                    continue;
+                }
+                let ids: Vec<String> = tool_calls.iter().map(|c| c.id.clone()).collect();
+                out.push(Message::Assistant {
+                    content,
+                    tool_calls,
+                    reasoning,
+                });
+                if ids.is_empty() {
+                    continue;
+                }
+                // Absorb the contiguous run of results that follow, tracking
+                // which call ids they answer.
+                let mut answered = std::collections::HashSet::new();
+                while matches!(iter.peek(), Some(Message::ToolResult { .. })) {
+                    if let Some(Message::ToolResult {
+                        call_id,
+                        content,
+                        images,
+                    }) = iter.next()
+                    {
+                        answered.insert(call_id.clone());
+                        out.push(Message::ToolResult {
+                            call_id,
+                            content,
+                            images,
+                        });
+                    }
+                }
+                for id in ids {
+                    if !answered.contains(&id) {
+                        out.push(Message::ToolResult {
+                            call_id: id,
+                            content: "Tool call interrupted; no result was recorded.".into(),
+                            images: Vec::new(),
+                        });
+                    }
+                }
+            }
+            other => out.push(other),
+        }
+    }
+    out
 }
 
 fn annotate_edit_lines(worktree: &Path, args: &mut serde_json::Value) {
@@ -5265,12 +5657,12 @@ pub fn spawn_session_spec() -> ToolSpec {
     ToolSpec {
         name: "spawn_session".into(),
         description: "Start a child agent in a NEW session with its own git worktree and \
-                      branch, based on this session's branch (committed work only — not \
-                      uncommitted changes). Fully isolated: it cannot touch your files; \
-                      its work lands on its own branch for later review or merge. \
-                      Returns thread_id, session_id and branch immediately; collect \
-                      results with spawn_output. Use for risky experiments, best-of-N \
-                      attempts, or parallel feature work."
+                      branch, based on your latest checkpoint (your work up to the last \
+                      completed turn — not the current turn's uncommitted changes). Fully \
+                      isolated: it cannot touch your files; its work lands on its own \
+                      branch for later review or merge. Returns thread_id, session_id and \
+                      branch immediately; collect results with spawn_output. Use for risky \
+                      experiments, best-of-N attempts, or parallel feature work."
             .into(),
         parameters: serde_json::json!({
             "type": "object",
@@ -5503,8 +5895,10 @@ async fn download_gguf(
         .connect_timeout(std::time::Duration::from_secs(15))
         .build()?;
     let resp = client.get(&url).send().await?.error_for_status()?;
+    let content_length = resp.content_length();
     let mut stream = resp.bytes_stream();
     let mut file = tokio::fs::File::create(&part).await?;
+    let mut downloaded: u64 = 0;
     while let Some(chunk) = stream.try_next().await? {
         if cancel.load(std::sync::atomic::Ordering::Relaxed) {
             drop(file);
@@ -5512,10 +5906,44 @@ async fn download_gguf(
             return Ok(false);
         }
         file.write_all(&chunk).await?;
+        downloaded += chunk.len() as u64;
         counter.fetch_add(chunk.len() as u64, std::sync::atomic::Ordering::Relaxed);
     }
     file.flush().await?;
     drop(file);
+
+    // Integrity checks before promoting the .part file: catch a truncated
+    // download (connection dropped mid-stream) or a wrong file served from
+    // the mutable `main` ref. Without these a partial/corrupt GGUF would be
+    // renamed to final and loaded.
+    let verify = |ok: bool, msg: String| -> Result<()> {
+        if ok {
+            Ok(())
+        } else {
+            let _ = std::fs::remove_file(&part);
+            bail!(msg)
+        }
+    };
+    if let Some(expected) = content_length {
+        verify(
+            downloaded == expected,
+            format!("download truncated: got {downloaded} of {expected} bytes"),
+        )?;
+    }
+    if entry.size_bytes > 0 {
+        // Allow a small drift (the curated size can lag a re-quantization),
+        // but reject anything clearly wrong.
+        let expected = entry.size_bytes;
+        let tolerance = expected / 100; // 1%
+        let diff = downloaded.abs_diff(expected);
+        verify(
+            diff <= tolerance,
+            format!(
+                "downloaded size {downloaded} differs from the expected {expected} by more than 1%"
+            ),
+        )?;
+    }
+
     std::fs::rename(&part, &target)?;
     Ok(true)
 }
@@ -5612,6 +6040,7 @@ mod tests {
                     name: "write_file".into(),
                     arguments: "{}".into(),
                 }],
+                reasoning: vec![],
             },
             Message::ToolResult {
                 call_id: "1".into(),
@@ -5621,6 +6050,7 @@ mod tests {
             Message::Assistant {
                 content: "Done — login page added.".into(),
                 tool_calls: vec![],
+                reasoning: vec![],
             },
         ];
         let digest = render_history_digest(&messages, false).unwrap();
@@ -5711,5 +6141,75 @@ mod tests {
         let before = args.clone();
         annotate_edit_lines(tmp.path(), &mut args);
         assert_eq!(args, before);
+    }
+
+    #[test]
+    fn sanitize_transcript_repairs_dangling_tool_calls() {
+        use trouve_providers::{Message, ToolCallRequest};
+        let call = |id: &str| ToolCallRequest {
+            id: id.to_string(),
+            name: "shell".into(),
+            arguments: serde_json::json!({}),
+        };
+
+        // A crash left two tool calls with only one result, then the next
+        // turn's user message.
+        let messages = vec![
+            Message::User("do it".into()),
+            Message::Assistant {
+                content: String::new(),
+                tool_calls: vec![call("a"), call("b")],
+                reasoning: vec![],
+            },
+            Message::ToolResult {
+                call_id: "a".into(),
+                content: "ok".into(),
+                images: vec![],
+            },
+            Message::User("next".into()),
+        ];
+        let out = sanitize_transcript(messages);
+        // The missing result for "b" is synthesized right after "a"'s.
+        match &out[2] {
+            Message::ToolResult { call_id, .. } => assert_eq!(call_id, "a"),
+            other => panic!("expected result a, got {other:?}"),
+        }
+        match &out[3] {
+            Message::ToolResult {
+                call_id, content, ..
+            } => {
+                assert_eq!(call_id, "b");
+                assert!(content.contains("interrupted"));
+            }
+            other => panic!("expected synthesized result b, got {other:?}"),
+        }
+        assert!(matches!(&out[4], Message::User(u) if u == "next"));
+
+        // An empty assistant message is dropped entirely.
+        let out = sanitize_transcript(vec![
+            Message::User("hi".into()),
+            Message::Assistant {
+                content: "   ".into(),
+                tool_calls: vec![],
+                reasoning: vec![],
+            },
+        ]);
+        assert_eq!(out.len(), 1);
+        assert!(matches!(&out[0], Message::User(_)));
+
+        // A well-formed transcript is unchanged in length and pairing.
+        let clean = vec![
+            Message::Assistant {
+                content: String::new(),
+                tool_calls: vec![call("x")],
+                reasoning: vec![],
+            },
+            Message::ToolResult {
+                call_id: "x".into(),
+                content: "done".into(),
+                images: vec![],
+            },
+        ];
+        assert_eq!(sanitize_transcript(clean).len(), 2);
     }
 }

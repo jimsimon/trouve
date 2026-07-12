@@ -90,6 +90,8 @@ impl OpenAiCompatProvider {
                 Message::Assistant {
                     content,
                     tool_calls,
+                    // Anthropic-native reasoning blocks; not applicable here.
+                    reasoning: _,
                 } => {
                     let mut obj = json!({"role": "assistant", "content": content});
                     if !tool_calls.is_empty() {
@@ -301,7 +303,7 @@ fn async_stream(
 ) -> EventStream {
     let (tx, rx) = tokio::sync::mpsc::channel::<Result<ProviderEvent, ProviderError>>(64);
     tokio::spawn(async move {
-        let mut buf = String::new();
+        let mut buf = crate::sse::LineBuffer::default();
         let mut partials: Vec<PartialToolCall> = Vec::new();
         let mut usage = Usage::default();
         while let Some(chunk) = bytes.next().await {
@@ -312,11 +314,10 @@ fn async_stream(
                     return;
                 }
             };
-            buf.push_str(&String::from_utf8_lossy(&chunk));
+            buf.push(&chunk);
             // Process complete SSE lines; keep the remainder buffered.
-            while let Some(pos) = buf.find('\n') {
-                let line = buf[..pos].trim().to_string();
-                buf.drain(..=pos);
+            while let Some(line) = buf.next_line() {
+                let line = line.trim();
                 let Some(data) = line.strip_prefix("data:") else {
                     continue;
                 };

@@ -19,7 +19,7 @@ pub use search::{VENDOR_SEARCH_GUIDANCE, gc_index_store_in_background, warm_inde
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use serde_json::Value;
 use trouve_protocol::ToolStatus;
 use trouve_providers::ToolSpec;
@@ -38,7 +38,7 @@ pub struct ToolCtx {
 
 impl ToolCtx {
     /// Resolve a model-supplied path inside the worktree, rejecting absolute
-    /// paths and traversal.
+    /// paths, traversal, and symlinks that point outside the worktree.
     pub fn resolve(&self, path: &str) -> Result<PathBuf> {
         let p = Path::new(path);
         if p.is_absolute() {
@@ -50,7 +50,32 @@ impl ToolCtx {
                 _ => bail!("path escapes the worktree: {path}"),
             }
         }
-        Ok(self.worktree.join(p))
+        let joined = self.worktree.join(p);
+        // The lexical checks above don't stop symlinks committed to the
+        // worktree (git stores arbitrary targets, including absolute paths)
+        // from pointing outside it. Canonicalize the deepest existing
+        // ancestor — which resolves every symlink on the way, including the
+        // target itself when it exists — and require it to stay under the
+        // canonicalized worktree. The not-yet-created remainder is safe: it
+        // contains only `Normal` components (checked above) and dangling
+        // symlinks fail canonicalization rather than being written through.
+        let root = self
+            .worktree
+            .canonicalize()
+            .with_context(|| format!("worktree unavailable: {}", self.worktree.display()))?;
+        let mut existing = joined.clone();
+        while existing.symlink_metadata().is_err() {
+            if !existing.pop() {
+                bail!("path escapes the worktree: {path}");
+            }
+        }
+        let canon = existing
+            .canonicalize()
+            .with_context(|| format!("cannot resolve {path}"))?;
+        if !canon.starts_with(&root) {
+            bail!("path escapes the worktree: {path}");
+        }
+        Ok(joined)
     }
 }
 
@@ -95,6 +120,9 @@ pub trait ToolExecutor: Send + Sync {
     /// `None` when the tool is unknown.
     fn tool_mutates(&self, name: &str) -> Option<bool>;
     async fn execute(&self, ctx: &ToolCtx, name: &str, args: &Value) -> ToolResult;
+    /// Release any per-worktree resources (e.g. spawned MCP server
+    /// processes) when a session/worktree is going away. Default no-op.
+    async fn evict_worktree(&self, _worktree: &Path) {}
 }
 
 /// Runs tools in-process against the local filesystem/shell, plus any MCP
@@ -131,7 +159,7 @@ impl LocalToolExecutor {
                 Arc::new(shell::ShellOutput { jobs: jobs.clone() }),
                 Arc::new(shell::ShellKill { jobs }),
                 Arc::new(grep::Grep),
-                Arc::new(web::WebFetch),
+                Arc::new(web::WebFetch::default()),
                 Arc::new(todo::TodoWrite::default()),
                 Arc::new(search::Search {
                     cache: search_cache.clone(),
@@ -208,6 +236,10 @@ impl ToolExecutor for LocalToolExecutor {
             None => ToolResult::error(format!("unknown tool: {name}")),
         }
     }
+
+    async fn evict_worktree(&self, worktree: &Path) {
+        self.mcp.evict_worktree(worktree).await;
+    }
 }
 
 #[cfg(test)]
@@ -216,8 +248,10 @@ mod tests {
 
     #[test]
     fn path_resolution_rejects_escapes() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("a")).unwrap();
         let ctx = ToolCtx {
-            worktree: PathBuf::from("/tmp/wt"),
+            worktree: dir.path().to_path_buf(),
             ..Default::default()
         };
         assert!(ctx.resolve("src/main.rs").is_ok());
@@ -225,6 +259,39 @@ mod tests {
         assert!(ctx.resolve("/etc/passwd").is_err());
         assert!(ctx.resolve("../outside").is_err());
         assert!(ctx.resolve("a/../../outside").is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn path_resolution_rejects_symlink_escapes() {
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(outside.path().join("secret"), "s").unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = ToolCtx {
+            worktree: dir.path().to_path_buf(),
+            ..Default::default()
+        };
+
+        // A symlink whose target file exists outside the worktree.
+        std::os::unix::fs::symlink(outside.path().join("secret"), dir.path().join("leak")).unwrap();
+        assert!(ctx.resolve("leak").is_err());
+
+        // A symlinked directory: every path component is `Normal`, but the
+        // resolved location is outside the worktree.
+        std::os::unix::fs::symlink(outside.path(), dir.path().join("dir")).unwrap();
+        assert!(ctx.resolve("dir/secret").is_err());
+        assert!(ctx.resolve("dir/new-file").is_err());
+
+        // A dangling symlink must not be written through either.
+        std::os::unix::fs::symlink(outside.path().join("missing"), dir.path().join("dangle"))
+            .unwrap();
+        assert!(ctx.resolve("dangle").is_err());
+
+        // Symlinks that stay inside the worktree are fine.
+        std::fs::create_dir(dir.path().join("real")).unwrap();
+        std::fs::write(dir.path().join("real/f"), "x").unwrap();
+        std::os::unix::fs::symlink(dir.path().join("real"), dir.path().join("alias")).unwrap();
+        assert!(ctx.resolve("alias/f").is_ok());
     }
 
     #[tokio::test]

@@ -62,9 +62,10 @@ CREATE TABLE IF NOT EXISTS usage (
   thread_id TEXT NOT NULL REFERENCES threads(id),
   session_id TEXT NOT NULL REFERENCES sessions(id),
   turn INTEGER NOT NULL,
-  input_tokens INTEGER NOT NULL,
+  input_tokens INTEGER NOT NULL,      -- summed across the turn's requests (cost)
   output_tokens INTEGER NOT NULL,
   cached_input_tokens INTEGER NOT NULL,
+  context_input_tokens INTEGER NOT NULL DEFAULT 0, -- last request's input (context size)
   cost_usd REAL,
   PRIMARY KEY (thread_id, turn)
 );
@@ -131,6 +132,9 @@ CREATE TABLE IF NOT EXISTS automations (
 const MIGRATIONS: &[&str] = &[
     "ALTER TABLE sessions ADD COLUMN archived INTEGER NOT NULL DEFAULT 0",
     "ALTER TABLE queued_prompts ADD COLUMN attachments TEXT NOT NULL DEFAULT '[]'",
+    // Context-size proxy for compaction/UI: the input tokens of the turn's
+    // *last* request, not the sum over its iterations (see record_usage).
+    "ALTER TABLE usage ADD COLUMN context_input_tokens INTEGER NOT NULL DEFAULT 0",
 ];
 
 fn apply_migrations(conn: &Connection) -> Result<()> {
@@ -296,14 +300,17 @@ impl Store {
         let ts = chrono::Utc::now();
         let payload = serde_json::to_string(&event)?;
         let (kind, id) = scope_cols(&scope);
-        let cursor: u64 = {
-            let conn = self.conn.lock().unwrap();
-            conn.execute(
-                "INSERT INTO events (scope_kind, scope_id, ts, payload) VALUES (?1, ?2, ?3, ?4)",
-                params![kind, id, ts.to_rfc3339(), payload],
-            )?;
-            conn.last_insert_rowid() as u64
-        };
+        // Assign the cursor and broadcast under the same lock, so two
+        // concurrent appends to one scope can never publish out of cursor
+        // order. Live SSE subscribers drop anything with cursor <= the last
+        // they saw, so an out-of-order broadcast (6 before 5) would lose
+        // event 5 permanently until reconnect.
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO events (scope_kind, scope_id, ts, payload) VALUES (?1, ?2, ?3, ?4)",
+            params![kind, id, ts.to_rfc3339(), payload],
+        )?;
+        let cursor = conn.last_insert_rowid() as u64;
         let envelope = EventEnvelope {
             cursor,
             scope,
@@ -335,11 +342,22 @@ impl Store {
         let mut out = Vec::new();
         for row in rows {
             let (cursor, kind, id, ts, payload) = row?;
+            // Skip a row we can't deserialize (e.g. an event type written by
+            // a newer build) rather than failing the whole scope's replay —
+            // otherwise one unknown event makes the session/thread
+            // permanently unloadable.
+            let event = match serde_json::from_str(&payload) {
+                Ok(e) => e,
+                Err(e) => {
+                    tracing::warn!("skipping undeserializable event {cursor}: {e}");
+                    continue;
+                }
+            };
             out.push(EventEnvelope {
                 cursor,
                 scope: scope_from_cols(&kind, id),
                 ts: ts.parse().unwrap_or_else(|_| chrono::Utc::now()),
-                event: serde_json::from_str(&payload)?,
+                event,
             });
         }
         Ok(out)
@@ -505,6 +523,20 @@ impl Store {
         )?;
         tx.execute("DELETE FROM usage WHERE session_id = ?1", params![id])?;
         tx.execute("DELETE FROM checkpoints WHERE session_id = ?1", params![id])?;
+        // attachments and spawned_threads both FK to threads(id); with
+        // foreign_keys=ON, deleting threads while these rows exist fails the
+        // whole transaction. Any session that ever took an attachment or used
+        // spawn_thread/spawn_session hit this, leaving a session the engine
+        // had already removed from disk still present in the DB.
+        tx.execute(
+            "DELETE FROM attachments WHERE thread_id IN (SELECT id FROM threads WHERE session_id = ?1)",
+            params![id],
+        )?;
+        tx.execute(
+            "DELETE FROM spawned_threads WHERE child_thread_id IN (SELECT id FROM threads WHERE session_id = ?1)
+             OR parent_thread_id IN (SELECT id FROM threads WHERE session_id = ?1)",
+            params![id],
+        )?;
         tx.execute("DELETE FROM threads WHERE session_id = ?1", params![id])?;
         tx.execute("DELETE FROM sessions WHERE id = ?1", params![id])?;
         tx.commit()?;
@@ -832,6 +864,18 @@ impl Store {
         Ok(())
     }
 
+    /// On-disk paths of every attachment belonging to a session's threads
+    /// (for cleaning up the files when the session is deleted).
+    pub fn session_attachment_paths(&self, session_id: &str) -> Result<Vec<String>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT path FROM attachments
+             WHERE thread_id IN (SELECT id FROM threads WHERE session_id = ?1)",
+        )?;
+        let rows = stmt.query_map(params![session_id], |r| r.get::<_, String>(0))?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
     /// Metadata plus the stored file path.
     pub fn attachment(&self, id: &str) -> Result<Option<(trouve_protocol::Attachment, String)>> {
         let conn = self.conn.lock().unwrap();
@@ -1072,17 +1116,24 @@ impl Store {
 
     // --- usage accounting -------------------------------------------------------
 
+    /// Record a turn's usage. `usage` totals are summed across the turn's
+    /// requests (correct for billing); `context_input_tokens` is the input
+    /// size of the turn's *last* request — the only meaningful proxy for the
+    /// current context size, since summing per-iteration inputs over a
+    /// multi-tool turn inflates the figure many-fold and spuriously trips
+    /// compaction.
     pub fn record_usage(
         &self,
         session_id: &str,
         thread_id: &str,
         turn: u64,
         usage: &trouve_protocol::Usage,
+        context_input_tokens: u64,
     ) -> Result<()> {
         self.conn.lock().unwrap().execute(
             "INSERT OR REPLACE INTO usage
-             (thread_id, session_id, turn, input_tokens, output_tokens, cached_input_tokens, cost_usd)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+             (thread_id, session_id, turn, input_tokens, output_tokens, cached_input_tokens, context_input_tokens, cost_usd)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
             params![
                 thread_id,
                 session_id,
@@ -1090,19 +1141,22 @@ impl Store {
                 usage.input_tokens as i64,
                 usage.output_tokens as i64,
                 usage.cached_input_tokens as i64,
+                context_input_tokens as i64,
                 usage.cost_usd
             ],
         )?;
         Ok(())
     }
 
-    /// Input tokens reported for the thread's most recent turn (context size
-    /// proxy for the compaction trigger and the UI usage indicator).
+    /// Context size (in tokens) of the thread's most recent turn: the last
+    /// request's input, used by the compaction trigger and the UI usage
+    /// indicator. Older rows recorded before this column existed report 0
+    /// (the caller falls back to a character estimate).
     pub fn last_input_tokens(&self, thread_id: &str) -> Result<Option<u64>> {
         let conn = self.conn.lock().unwrap();
         Ok(conn
             .query_row(
-                "SELECT input_tokens + cached_input_tokens FROM usage
+                "SELECT context_input_tokens FROM usage
                  WHERE thread_id = ?1 ORDER BY turn DESC LIMIT 1",
                 params![thread_id],
                 |r| r.get::<_, i64>(0),
@@ -1142,22 +1196,26 @@ impl Store {
     /// position (standard undo-stack semantics).
     pub fn append_checkpoint(&self, row: &CheckpointRow) -> Result<()> {
         let conn = self.conn.lock().unwrap();
-        let undo_pos: Option<i64> = conn.query_row(
+        // One transaction: truncating the redo tail, clearing undo_pos, and
+        // inserting the checkpoint must be all-or-nothing, or a crash between
+        // them loses the redo tail without recording the new checkpoint.
+        let tx = conn.unchecked_transaction()?;
+        let undo_pos: Option<i64> = tx.query_row(
             "SELECT undo_pos FROM sessions WHERE id = ?1",
             params![row.session_id],
             |r| r.get(0),
         )?;
         if let Some(pos) = undo_pos {
-            conn.execute(
+            tx.execute(
                 "DELETE FROM checkpoints WHERE session_id = ?1 AND seq > ?2",
                 params![row.session_id, pos],
             )?;
-            conn.execute(
+            tx.execute(
                 "UPDATE sessions SET undo_pos = NULL WHERE id = ?1",
                 params![row.session_id],
             )?;
         }
-        conn.execute(
+        tx.execute(
             "INSERT INTO checkpoints (id, session_id, thread_id, turn, seq, commit_hash, created_at)
              VALUES (?1, ?2, ?3, ?4,
                      (SELECT COALESCE(MAX(seq), -1) + 1 FROM checkpoints WHERE session_id = ?2),
@@ -1171,6 +1229,7 @@ impl Store {
                 chrono::Utc::now().to_rfc3339()
             ],
         )?;
+        tx.commit()?;
         Ok(())
     }
 
@@ -1409,11 +1468,40 @@ mod tests {
             .set_backend_session("th_1", "cursor", "vendor-abc")
             .unwrap();
         store.enqueue_prompt("th_1", "pending", &[]).unwrap();
+        // Attachments and spawned-thread rows also FK to threads and would
+        // otherwise fail the delete.
+        store
+            .add_attachment(
+                "th_1",
+                &trouve_protocol::Attachment {
+                    id: "at_1".into(),
+                    name: "shot.png".into(),
+                    mime: "image/png".into(),
+                    size_bytes: 3,
+                },
+                "/data/attachments/at_1.png",
+            )
+            .unwrap();
+        let child = Thread {
+            id: "th_child".into(),
+            session_id: "se_1".into(),
+            mode: "code".into(),
+            model: "p/m".into(),
+            model_options: serde_json::Map::new(),
+            permission_mode: PermissionMode::Ask,
+            created_at: chrono::Utc::now(),
+            spawned: true,
+        };
+        store
+            .insert_thread(&child, &serde_json::Map::new())
+            .unwrap();
+        store.insert_spawned("th_child", "th_1", "thread").unwrap();
 
         store.delete_session("se_1").unwrap();
         assert!(store.session("se_1").unwrap().is_none());
         assert!(store.backend_session("th_1", "cursor").unwrap().is_none());
         assert!(store.queued_prompts("th_1").unwrap().is_empty());
+        assert!(store.attachment("at_1").unwrap().is_none());
     }
 
     /// Vendor sessions are keyed per backend: swapping cursor → claude →

@@ -26,6 +26,20 @@ fn git(dir: &Path, args: &[&str]) -> Result<String> {
     Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
 }
 
+/// Reject a ref/commit-ish that could be misread by git as an option (the
+/// value reaches git as a positional argument, and one starting with `-`
+/// would be parsed as a flag — e.g. `git diff` accepts file-writing options
+/// like `--output=`). These come from the HTTP API, so validate before use.
+fn ensure_safe_ref(r: &str) -> Result<()> {
+    if r.is_empty() {
+        bail!("empty git ref");
+    }
+    if r.starts_with('-') {
+        bail!("invalid git ref (must not start with '-'): {r}");
+    }
+    Ok(())
+}
+
 pub fn is_git_repo(path: &Path) -> bool {
     git(path, &["rev-parse", "--is-inside-work-tree"])
         .map(|s| s == "true")
@@ -84,6 +98,7 @@ pub fn create_worktree(
     branch: &str,
     base_ref: &str,
 ) -> Result<()> {
+    ensure_safe_ref(base_ref)?;
     if let Some(parent) = worktree_path.parent() {
         std::fs::create_dir_all(parent)?;
     }
@@ -95,6 +110,7 @@ pub fn create_worktree(
             "-b",
             branch,
             worktree_path.to_str().context("non-utf8 worktree path")?,
+            "--end-of-options",
             base_ref,
         ],
     )?;
@@ -157,7 +173,8 @@ pub fn restore(worktree: &Path, commit: &str) -> Result<()> {
 /// Unified diff of the session's work: base ref vs the worktree's current
 /// state (includes uncommitted changes — checkpoints live on hidden refs).
 pub fn session_diff(worktree: &Path, base_ref: &str) -> Result<String> {
-    git(worktree, &["diff", base_ref])
+    ensure_safe_ref(base_ref)?;
+    git(worktree, &["diff", "--end-of-options", base_ref])
 }
 
 /// URL of the named remote (usually "origin"), if configured.

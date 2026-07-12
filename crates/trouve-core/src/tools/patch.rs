@@ -124,6 +124,14 @@ impl Tool for ApplyPatch {
                                 Ok(p) => p,
                                 Err(e) => return ToolResult::error(e),
                             };
+                            // Don't silently clobber an existing destination
+                            // (which would also delete the source) — matches
+                            // the Add guard.
+                            if dest != path && dest_full.exists() {
+                                return ToolResult::error(format!(
+                                    "cannot move {path} to {dest}: destination already exists"
+                                ));
+                            }
                             report.push(json!({
                                 "path": dest, "action": "move",
                                 "from": path, "adds": adds, "dels": dels,

@@ -440,7 +440,8 @@ pub struct McpServerInfo {
     /// Values may be `${VAR}` references resolved at spawn time.
     #[serde(default)]
     pub env: std::collections::BTreeMap<String, String>,
-    /// "ok" / "error" / "unknown" (unknown when listing skipped the probe).
+    /// "ok" / "error" / "unknown" (unknown when listing skipped the probe) /
+    /// "untrusted" (a repo-scoped server that is never auto-run).
     pub health: String,
     /// "5 tools" when healthy, the failure reason when not, "" for unknown.
     pub detail: String,

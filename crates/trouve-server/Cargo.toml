@@ -22,6 +22,7 @@ tracing-subscriber.workspace = true
 trouve-core.workspace = true
 trouve-protocol.workspace = true
 utoipa.workspace = true
+uuid.workspace = true
 
 [dev-dependencies]
 async-trait.workspace = true
