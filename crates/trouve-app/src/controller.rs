@@ -1093,9 +1093,12 @@ impl Controller {
                     .find(|m| m.id == t.mode)
                     .map(|m| mode_display_name(&m.display_name, &m.id))
                     .unwrap_or_else(|| mode_display_name("", &t.mode));
+                // Agent-spawned children carry a fork marker so users can
+                // tell delegated work from their own tabs at a glance.
+                let marker = if t.spawned { "⑂ " } else { "" };
                 (
                     t.id.clone(),
-                    format!("{} · {}", mode, short_model(&t.model)),
+                    format!("{marker}{} · {}", mode, short_model(&t.model)),
                 )
             })
             .collect();

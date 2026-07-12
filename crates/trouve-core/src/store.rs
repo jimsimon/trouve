@@ -103,6 +103,11 @@ CREATE TABLE IF NOT EXISTS events (
   payload TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS events_scope ON events (scope_kind, scope_id, cursor);
+CREATE TABLE IF NOT EXISTS spawned_threads (
+  child_thread_id TEXT PRIMARY KEY REFERENCES threads(id),
+  parent_thread_id TEXT NOT NULL REFERENCES threads(id),
+  kind TEXT NOT NULL             -- 'thread' (inline, same worktree) | 'session'
+);
 CREATE TABLE IF NOT EXISTS automations (
   id TEXT PRIMARY KEY,
   name TEXT NOT NULL,
@@ -532,8 +537,7 @@ impl Store {
     pub fn thread(&self, id: &str) -> Result<Option<Thread>> {
         let conn = self.conn.lock().unwrap();
         conn.query_row(
-            "SELECT id, session_id, mode, model, permission_mode, model_options, created_at
-             FROM threads WHERE id = ?1",
+            &format!("SELECT {THREAD_COLUMNS} FROM threads WHERE id = ?1"),
             params![id],
             row_to_thread,
         )
@@ -556,10 +560,9 @@ impl Store {
 
     pub fn list_threads(&self, session_id: &str) -> Result<Vec<Thread>> {
         let conn = self.conn.lock().unwrap();
-        let mut stmt = conn.prepare(
-            "SELECT id, session_id, mode, model, permission_mode, model_options, created_at
-             FROM threads WHERE session_id = ?1 ORDER BY created_at",
-        )?;
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {THREAD_COLUMNS} FROM threads WHERE session_id = ?1 ORDER BY created_at"
+        ))?;
         let rows = stmt.query_map(params![session_id], row_to_thread)?;
         Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
@@ -599,6 +602,39 @@ impl Store {
             )?;
         }
         Ok(())
+    }
+
+    // --- spawned threads --------------------------------------------------
+    // Parentage of agent-spawned children (spawn_thread / spawn_session
+    // tools): drives the depth guard (children don't spawn grandchildren)
+    // and the concurrency cap.
+
+    pub fn insert_spawned(&self, child: &str, parent: &str, kind: &str) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO spawned_threads (child_thread_id, parent_thread_id, kind)
+             VALUES (?1, ?2, ?3)",
+            params![child, parent, kind],
+        )?;
+        Ok(())
+    }
+
+    /// The parent thread id, when `child` was spawned by an agent.
+    pub fn spawn_parent(&self, child: &str) -> Result<Option<String>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn
+            .prepare("SELECT parent_thread_id FROM spawned_threads WHERE child_thread_id = ?1")?;
+        let mut rows = stmt.query_map(params![child], |r| r.get(0))?;
+        Ok(rows.next().transpose()?)
+    }
+
+    /// Every child the agent on `parent` has spawned (thread ids).
+    pub fn spawned_children(&self, parent: &str) -> Result<Vec<String>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn
+            .prepare("SELECT child_thread_id FROM spawned_threads WHERE parent_thread_id = ?1")?;
+        let rows = stmt.query_map(params![parent], |r| r.get(0))?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
 
     /// Atomically claim the next turn number for a thread.
@@ -1211,6 +1247,10 @@ fn row_to_session(r: &rusqlite::Row<'_>) -> rusqlite::Result<Session> {
     })
 }
 
+/// Columns matching `row_to_thread`, including the agent-spawned flag.
+const THREAD_COLUMNS: &str = "id, session_id, mode, model, permission_mode, model_options, \
+     created_at, EXISTS(SELECT 1 FROM spawned_threads st WHERE st.child_thread_id = threads.id)";
+
 fn row_to_thread(r: &rusqlite::Row<'_>) -> rusqlite::Result<Thread> {
     Ok(Thread {
         id: r.get(0)?,
@@ -1223,6 +1263,7 @@ fn row_to_thread(r: &rusqlite::Row<'_>) -> rusqlite::Result<Thread> {
             .get::<_, String>(6)?
             .parse()
             .unwrap_or_else(|_| chrono::Utc::now()),
+        spawned: r.get(7)?,
     })
 }
 
@@ -1358,6 +1399,7 @@ mod tests {
             model_options: serde_json::Map::new(),
             permission_mode: PermissionMode::Ask,
             created_at: chrono::Utc::now(),
+            spawned: false,
         };
         store
             .insert_thread(&thread, &serde_json::Map::new())
@@ -1490,6 +1532,7 @@ mod tests {
                     model_options: serde_json::Map::new(),
                     permission_mode: PermissionMode::Ask,
                     created_at: chrono::Utc::now(),
+                    spawned: false,
                 },
                 &serde_json::Map::new(),
             )
@@ -1681,6 +1724,7 @@ mod tests {
             model_options: serde_json::Map::new(),
             permission_mode: PermissionMode::Ask,
             created_at: chrono::Utc::now(),
+            spawned: false,
         };
         store
             .insert_thread(&thread, &serde_json::Map::new())

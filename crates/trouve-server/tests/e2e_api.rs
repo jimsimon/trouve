@@ -2589,3 +2589,341 @@ async fn local_enable_toggle_and_install_lifecycle_endpoints() {
         .unwrap();
     assert_eq!(resp.status(), 409);
 }
+
+/// Drives the spawn tool family end-to-end. The parent turn spawns a child
+/// agent, pokes spawn_output with a bogus id (denied: not its child), waits
+/// on the real child, then summarizes. The child turn first tries to spawn
+/// a grandchild (denied: depth guard) and then answers.
+struct SpawnProvider {
+    /// "spawn_thread" (same session) or "spawn_session" (fresh worktree).
+    spawn_tool: &'static str,
+}
+
+#[async_trait::async_trait]
+impl Provider for SpawnProvider {
+    fn id(&self) -> &str {
+        "scripted"
+    }
+
+    async fn stream_chat(
+        &self,
+        _model: &str,
+        messages: &[Message],
+        _tools: &[ToolSpec],
+        _options: &serde_json::Map<String, serde_json::Value>,
+    ) -> Result<EventStream, ProviderError> {
+        let users: String = messages
+            .iter()
+            .filter_map(|m| match m {
+                Message::User(c) => Some(c.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let results: String = messages
+            .iter()
+            .filter_map(|m| match m {
+                Message::ToolResult { content, .. } => Some(content.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let done = Ok(ProviderEvent::Completed {
+            usage: Usage {
+                input_tokens: 10,
+                output_tokens: 4,
+                ..Default::default()
+            },
+        });
+        let events: Vec<Result<ProviderEvent, ProviderError>> = if users.contains("child task") {
+            // The child agent's turn.
+            if results.contains("cannot spawn") {
+                vec![
+                    Ok(ProviderEvent::TextDelta(
+                        "Child done: the answer is 42.".into(),
+                    )),
+                    done,
+                ]
+            } else {
+                // Try (and fail) to spawn a grandchild: the depth guard.
+                vec![
+                    Ok(ProviderEvent::ToolCall(ToolCallRequest {
+                        id: "c1".into(),
+                        name: "spawn_thread".into(),
+                        arguments: serde_json::json!({"prompt": "grandchild task"}),
+                    })),
+                    done,
+                ]
+            }
+        } else if !results.contains("thread_id") {
+            // Parent iteration 1: spawn the child.
+            let mut args = serde_json::json!({"prompt": "child task: compute the answer"});
+            if self.spawn_tool == "spawn_thread" {
+                // Read-only children run concurrently with this very turn.
+                args["mode"] = "plan".into();
+            } else {
+                args["title"] = "Sub experiment".into();
+            }
+            vec![
+                Ok(ProviderEvent::ToolCall(ToolCallRequest {
+                    id: "p1".into(),
+                    name: self.spawn_tool.into(),
+                    arguments: args,
+                })),
+                done,
+            ]
+        } else if !results.contains("Child done") {
+            // Parent iteration 2: a bogus collect (denied), then the real
+            // one, blocking until the child finishes.
+            let child_id = results
+                .split("\"thread_id\":\"")
+                .nth(1)
+                .unwrap()
+                .split('"')
+                .next()
+                .unwrap()
+                .to_string();
+            vec![
+                Ok(ProviderEvent::ToolCall(ToolCallRequest {
+                    id: "p2".into(),
+                    name: "spawn_output".into(),
+                    arguments: serde_json::json!({"thread_id": "th_bogus"}),
+                })),
+                Ok(ProviderEvent::ToolCall(ToolCallRequest {
+                    id: "p3".into(),
+                    name: "spawn_output".into(),
+                    arguments: serde_json::json!({"thread_id": child_id, "wait_ms": 25_000}),
+                })),
+                done,
+            ]
+        } else {
+            vec![
+                Ok(ProviderEvent::TextDelta(
+                    "Parent: the child reported 42.".into(),
+                )),
+                done,
+            ]
+        };
+        Ok(Box::pin(futures::stream::iter(events)))
+    }
+}
+
+/// Shared setup for the spawn tests: server + workspace + session + thread.
+/// Returns (base url, client, session json, parent thread id).
+async fn spawn_test_setup(
+    tmp: &tempfile::TempDir,
+    spawn_tool: &'static str,
+) -> (String, reqwest::Client, serde_json::Value, String) {
+    let repo = tmp.path().join("repo");
+    std::fs::create_dir(&repo).unwrap();
+    init_repo(&repo);
+
+    let store = Store::open(&tmp.path().join("db/trouve.db")).unwrap();
+    let engine = Arc::new(
+        Engine::new(store, tmp.path().join("data"), &Config::default())
+            .with_config_dir(None)
+            .with_provider("scripted", Arc::new(SpawnProvider { spawn_tool }))
+            .with_default_model("scripted/test-model"),
+    );
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let router = trouve_server::build_router(engine);
+    tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+    let base = format!("http://{addr}/v1");
+    let client = reqwest::Client::new();
+
+    let ws: serde_json::Value = client
+        .post(format!("{base}/workspaces"))
+        .json(&serde_json::json!({"path": repo.to_str().unwrap()}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let session: serde_json::Value = client
+        .post(format!("{base}/sessions"))
+        .json(&serde_json::json!({"workspace_id": ws["id"], "title": "Parent work"}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let thread: serde_json::Value = client
+        .post(format!("{base}/threads"))
+        .json(&serde_json::json!({"session_id": session["id"]}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let thread_id = thread["id"].as_str().unwrap().to_string();
+    (base, client, session, thread_id)
+}
+
+/// The completed tool results of a turn's event list, by tool call id.
+fn tool_results(events: &[serde_json::Value]) -> Vec<(&str, &serde_json::Value)> {
+    events
+        .iter()
+        .filter(|e| e["type"] == "tool.completed")
+        .map(|e| (e["call_id"].as_str().unwrap(), &e["result"]))
+        .collect()
+}
+
+/// spawn_thread: a child agent on a new thread in the same session, running
+/// concurrently with the parent's turn (read-only child), collected with
+/// spawn_output — plus the authorization and depth guardrails.
+#[tokio::test]
+async fn spawn_thread_child_agent_end_to_end() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (base, client, session, thread_id) = spawn_test_setup(&tmp, "spawn_thread").await;
+    let session_id = session["id"].as_str().unwrap();
+
+    client
+        .post(format!("{base}/threads/{thread_id}/messages"))
+        .json(&serde_json::json!({"content": "spawn a child worker"}))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+    let events = wait_for_event(
+        &client,
+        &format!("{base}/threads/{thread_id}/events"),
+        |e| e["type"] == "turn.completed",
+    )
+    .await;
+
+    let results = tool_results(&events);
+    // The spawn returned the child's coordinates without blocking the turn.
+    let spawn = results.iter().find(|(id, _)| *id == "p1").unwrap().1;
+    let child_id = spawn["thread_id"].as_str().unwrap().to_string();
+    assert_eq!(spawn["session_id"], session["id"]);
+    // Collecting someone else's (or a made-up) thread is refused.
+    let bogus = results.iter().find(|(id, _)| *id == "p2").unwrap().1;
+    assert!(
+        bogus["error"].as_str().unwrap().contains("not a child"),
+        "{bogus}"
+    );
+    // The real collect waited for the child and folded its result.
+    let output = results.iter().find(|(id, _)| *id == "p3").unwrap().1;
+    assert_eq!(output["status"], "completed", "{output}");
+    assert!(
+        output["last_message"]
+            .as_str()
+            .unwrap()
+            .contains("Child done"),
+        "{output}"
+    );
+    assert!(output["usage"]["output_tokens"].as_u64().unwrap() > 0);
+    // ... and the parent's final answer used it.
+    assert!(events.iter().any(|e| e["type"] == "assistant.message"
+        && e["content"].as_str().unwrap().contains("child reported 42")));
+
+    // The child rides the same session, marked as agent-spawned, in the
+    // requested read-only mode.
+    let threads: Vec<serde_json::Value> = client
+        .get(format!("{base}/threads?session_id={session_id}"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let child = threads.iter().find(|t| t["id"] == child_id).unwrap();
+    assert_eq!(child["spawned"], true, "{child}");
+    assert_eq!(child["mode"], "plan");
+    let parent = threads
+        .iter()
+        .find(|t| t["id"] == thread_id.as_str())
+        .unwrap();
+    assert!(!parent["spawned"].as_bool().unwrap_or(false));
+
+    // Depth guard: the child's own spawn attempt was refused.
+    let child_events = wait_for_event(
+        &client,
+        &format!("{base}/threads/{child_id}/events"),
+        |e| {
+            e["type"] == "tool.completed"
+                && e["result"]["error"]
+                    .as_str()
+                    .is_some_and(|s| s.contains("cannot spawn"))
+        },
+    )
+    .await;
+    assert!(!child_events.is_empty());
+}
+
+/// spawn_session: a child agent in a fresh worktree session branched from
+/// the parent session's branch, fully isolated, collected with spawn_output.
+#[tokio::test]
+async fn spawn_session_child_agent_isolated() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (base, client, session, thread_id) = spawn_test_setup(&tmp, "spawn_session").await;
+
+    client
+        .post(format!("{base}/threads/{thread_id}/messages"))
+        .json(&serde_json::json!({"content": "spawn an isolated experiment"}))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+    let events = wait_for_event(
+        &client,
+        &format!("{base}/threads/{thread_id}/events"),
+        |e| e["type"] == "turn.completed",
+    )
+    .await;
+
+    let results = tool_results(&events);
+    let spawn = results.iter().find(|(id, _)| *id == "p1").unwrap().1;
+    let child_thread_id = spawn["thread_id"].as_str().unwrap();
+    let child_session_id = spawn["session_id"].as_str().unwrap();
+    assert_ne!(child_session_id, session["id"].as_str().unwrap());
+    assert_eq!(spawn["based_on"], session["branch"]);
+    let output = results.iter().find(|(id, _)| *id == "p3").unwrap().1;
+    assert_eq!(output["status"], "completed", "{output}");
+    assert!(
+        output["last_message"]
+            .as_str()
+            .unwrap()
+            .contains("Child done"),
+        "{output}"
+    );
+
+    // A real session: its own branch off the parent's, its own worktree,
+    // the requested title, and a spawned thread inheriting the parent mode.
+    let child_session: serde_json::Value = client
+        .get(format!("{base}/sessions/{child_session_id}"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(child_session["title"], "Sub experiment");
+    assert_eq!(child_session["base_ref"], session["branch"]);
+    assert_ne!(child_session["branch"], session["branch"]);
+    let child_worktree = child_session["worktree_path"].as_str().unwrap();
+    assert_ne!(child_worktree, session["worktree_path"].as_str().unwrap());
+    assert!(Path::new(child_worktree).join("README.md").exists());
+
+    let threads: Vec<serde_json::Value> = client
+        .get(format!("{base}/threads?session_id={child_session_id}"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let child = threads
+        .iter()
+        .find(|t| t["id"] == child_thread_id)
+        .unwrap();
+    assert_eq!(child["spawned"], true, "{child}");
+    assert_eq!(child["mode"], "code");
+}

@@ -167,6 +167,10 @@ pub struct Thread {
     pub model_options: serde_json::Map<String, serde_json::Value>,
     pub permission_mode: PermissionMode,
     pub created_at: chrono::DateTime<chrono::Utc>,
+    /// True when an agent spawned this thread (spawn_thread/spawn_session
+    /// tools) rather than the user; clients mark such threads visually.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub spawned: bool,
 }
 
 /// Partial thread update between turns (mode/model switching). Rejected with

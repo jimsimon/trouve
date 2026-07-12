@@ -8,7 +8,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, RwLock};
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Context, Result, anyhow, bail};
 use futures::StreamExt;
 use trouve_agents::{AgentBackend, BackendEvent, BackendPermission, BackendTurn};
 use trouve_protocol::{
@@ -2814,6 +2814,9 @@ impl Engine {
             model_options: req.model_options.clone(),
             permission_mode: req.permission_mode.unwrap_or(mode.default_permission_mode),
             created_at: chrono::Utc::now(),
+            // Spawn parentage is recorded by the spawn tools after insert;
+            // reads recompute this flag from the spawned_threads table.
+            spawned: false,
         };
         self.store.insert_thread(&thread, &req.model_options)?;
         self.store.append_event(
@@ -3335,7 +3338,7 @@ impl Engine {
     }
 
     async fn run_turn(
-        &self,
+        self: &Arc<Self>,
         thread: &Thread,
         turn: u64,
         content: String,
@@ -3357,14 +3360,22 @@ impl Engine {
             workspace_root: Some(PathBuf::from(&ws.path)),
         };
 
-        // Serialize worktree mutations across the session's threads.
-        let lock = self.session_lock(&session.id);
-        let _guard = lock.lock().await;
-
         let all_modes = modes::resolve_modes(self.config_dir.as_deref(), Some(Path::new(&ws.path)));
         let mode = modes::find_mode(&all_modes, &thread.mode)
             .cloned()
             .unwrap_or_else(|| modes::builtin_modes().remove(0));
+
+        // Serialize worktree mutations across the session's threads — except
+        // agent-spawned children in read-only modes: they can't write, and
+        // running them concurrently with the parent's turn (which holds this
+        // lock) is the whole point of spawn_thread exploration fan-out.
+        let concurrent_child = mode.read_only && self.store.spawn_parent(&thread.id)?.is_some();
+        let lock = self.session_lock(&session.id);
+        let _guard = if concurrent_child {
+            None
+        } else {
+            Some(lock.lock().await)
+        };
 
         // External agent backend? The vendor harness owns the loop; we
         // stream its events and bridge approvals. (Session lock stays held.)
@@ -3437,6 +3448,13 @@ impl Engine {
             .filter(|s| mode.allowed_tools.is_empty() || mode.allowed_tools.contains(&s.name))
             .collect();
         specs.push(ask_question_spec());
+        // Spawn tools are for top-level agents only: children don't get to
+        // spawn grandchildren (also enforced at execution).
+        if self.store.spawn_parent(&thread.id)?.is_none() {
+            specs.push(spawn_thread_spec());
+            specs.push(spawn_session_spec());
+            specs.push(spawn_output_spec());
+        }
 
         let system = context::system_prompt(&mode, self.config_dir.as_deref(), Path::new(&ws.path));
         let mut usage_total = Usage::default();
@@ -3527,8 +3545,14 @@ impl Engine {
         self.store
             .record_usage(&session.id, &thread.id, turn, &usage_total)?;
 
-        // Snapshot the worktree when the turn changed it.
-        let checkpoint_id = self.maybe_checkpoint(&session, thread, turn).await?;
+        // Snapshot the worktree when the turn changed it. Lock-free child
+        // turns never snapshot: they can't write, so any dirt is the
+        // parent's in-flight work — not theirs to checkpoint.
+        let checkpoint_id = if concurrent_child {
+            None
+        } else {
+            self.maybe_checkpoint(&session, thread, turn).await?
+        };
         self.store.append_event(
             scope,
             Event::TurnCompleted {
@@ -3628,13 +3652,19 @@ impl Engine {
             .collect();
         // Engine-served, always available (see handle_tool_call).
         specs.push(ask_question_spec());
+        // Spawn tools: top-level agents only, same as native turns.
+        if self.store.spawn_parent(thread_id)?.is_none() {
+            specs.push(spawn_thread_spec());
+            specs.push(spawn_session_spec());
+            specs.push(spawn_output_spec());
+        }
         Ok(specs)
     }
 
     /// Execute one tool call on behalf of a bridged vendor agent, through
     /// the same gate/approval/event chokepoint as native tool calls.
     pub async fn bridged_tool_call(
-        &self,
+        self: &Arc<Self>,
         thread_id: &str,
         name: &str,
         arguments: &serde_json::Value,
@@ -4293,7 +4323,7 @@ impl Engine {
     /// Gate, (maybe) get approval for, and execute one tool call. Returns the
     /// content fed back to the model.
     async fn handle_tool_call(
-        &self,
+        self: &Arc<Self>,
         session: &Session,
         thread: &Thread,
         turn: u64,
@@ -4322,6 +4352,47 @@ impl Engine {
                 }
                 Err(e) => serde_json::json!({ "error": e }),
             };
+            return Ok((result.to_string(), Vec::new()));
+        }
+
+        // The spawn family is engine-served too (child agents need session/
+        // thread creation and turn dispatch, which tools can't reach). Unlike
+        // ask_question they do get tool cards — a spawned agent is a real,
+        // visible action. Errors become tool results, never turn failures.
+        if matches!(
+            call.name.as_str(),
+            "spawn_thread" | "spawn_session" | "spawn_output"
+        ) {
+            self.store.append_event(
+                scope.clone(),
+                Event::ToolRequested {
+                    turn,
+                    call_id: call_id.clone(),
+                    tool: call.name.clone(),
+                    args: call.arguments.clone(),
+                    requires_approval: false,
+                },
+            )?;
+            let result = match self
+                .handle_spawn_tool(session, thread, mode, &call.name, &call.arguments)
+                .await
+            {
+                Ok(v) => v,
+                Err(e) => serde_json::json!({ "error": e.to_string() }),
+            };
+            let status = if result.get("error").is_some() {
+                ToolStatus::Error
+            } else {
+                ToolStatus::Ok
+            };
+            self.store.append_event(
+                scope,
+                Event::ToolCompleted {
+                    call_id,
+                    status,
+                    result: result.clone(),
+                },
+            )?;
             return Ok((result.to_string(), Vec::new()));
         }
 
@@ -4438,6 +4509,217 @@ impl Engine {
             },
         )?;
         Ok((outcome.result.to_string(), images))
+    }
+
+    /// The spawn tool family: `spawn_thread` starts a child agent on a new
+    /// thread in the caller's session, `spawn_session` starts one in a fresh
+    /// worktree session branched from the caller's branch, and
+    /// `spawn_output` reports (and optionally waits for) a child's result.
+    /// Guardrails: children never spawn grandchildren, at most
+    /// `MAX_CONCURRENT_CHILDREN` children run at once, children inherit the
+    /// parent's permission mode, and read-only parents can't escalate a
+    /// child into a writing mode.
+    async fn handle_spawn_tool(
+        self: &Arc<Self>,
+        session: &Session,
+        thread: &Thread,
+        mode: &AgentMode,
+        name: &str,
+        args: &serde_json::Value,
+    ) -> Result<serde_json::Value> {
+        const MAX_CONCURRENT_CHILDREN: usize = 4;
+
+        if name == "spawn_output" {
+            let child_id = args
+                .get("thread_id")
+                .and_then(serde_json::Value::as_str)
+                .context("thread_id is required")?;
+            // Only the spawner may collect: child output can hold anything
+            // the child read, so it stays within the parent's thread.
+            if self.store.spawn_parent(child_id)?.as_deref() != Some(thread.id.as_str()) {
+                bail!("thread {child_id} is not a child of this thread");
+            }
+            let wait_ms = args
+                .get("wait_ms")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0)
+                .min(180_000);
+            let deadline = std::time::Instant::now() + std::time::Duration::from_millis(wait_ms);
+            loop {
+                let status = self.spawn_status(child_id)?;
+                let running = status["status"] == "running";
+                if !running || std::time::Instant::now() >= deadline {
+                    return Ok(status);
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+            }
+        }
+
+        // Depth guard: one level only. Fan-out stays useful; runaway
+        // recursive spawning does not.
+        if self.store.spawn_parent(&thread.id)?.is_some() {
+            bail!("spawned agents cannot spawn further agents");
+        }
+        let children = self.store.spawned_children(&thread.id)?;
+        {
+            let active = self.active_threads.lock().unwrap();
+            let running = children.iter().filter(|c| active.contains_key(*c)).count();
+            if running >= MAX_CONCURRENT_CHILDREN {
+                bail!(
+                    "already {running} children running; collect some with spawn_output first"
+                );
+            }
+        }
+
+        let prompt = args
+            .get("prompt")
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|p| !p.is_empty())
+            .context("prompt is required")?;
+        let child_mode = args
+            .get("mode")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or(&thread.mode)
+            .to_string();
+        // A read-only parent must not launch an agent that can do what it
+        // itself cannot.
+        if mode.read_only && child_mode != thread.mode {
+            bail!("read-only modes can only spawn children in the same mode");
+        }
+        let child_model = args
+            .get("model")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or(&thread.model)
+            .to_string();
+        if !child_model.contains('/') {
+            bail!("model must be provider-qualified (e.g. openai/gpt-4.1-mini): {child_model}");
+        }
+        // Same model: the parent's option choices (thinking level, …) carry
+        // over. A different model validates its own options; start clean.
+        let model_options = if child_model == thread.model {
+            self.store.thread_model_options(&thread.id)?
+        } else {
+            serde_json::Map::new()
+        };
+
+        let (child_session_id, extra) = if name == "spawn_session" {
+            let title = args
+                .get("title")
+                .and_then(serde_json::Value::as_str)
+                .map(str::trim)
+                .filter(|t| !t.is_empty())
+                .map(String::from)
+                .unwrap_or_else(|| {
+                    let snippet: String =
+                        prompt.lines().next().unwrap_or("").chars().take(48).collect();
+                    format!("Agent: {snippet}")
+                });
+            let child_session = self
+                .create_session(CreateSessionRequest {
+                    workspace_id: session.workspace_id.clone(),
+                    title: Some(title),
+                    // The child sees the parent's committed work (its branch,
+                    // checkpoints included) — not uncommitted changes.
+                    base_ref: Some(session.branch.clone()),
+                })
+                .await
+                .map_err(|e| anyhow!(e.to_string()))?;
+            let extra = serde_json::json!({
+                "branch": child_session.branch,
+                "based_on": session.branch,
+                "worktree": child_session.worktree_path,
+            });
+            (child_session.id, Some(extra))
+        } else {
+            (session.id.clone(), None)
+        };
+
+        let child = self
+            .create_thread(CreateThreadRequest {
+                session_id: child_session_id.clone(),
+                mode: Some(child_mode),
+                model: Some(child_model),
+                model_options,
+                permission_mode: Some(thread.permission_mode),
+            })
+            .map_err(|e| anyhow!(e.to_string()))?;
+        let kind = if name == "spawn_session" {
+            "session"
+        } else {
+            "thread"
+        };
+        self.store.insert_spawned(&child.id, &thread.id, kind)?;
+        self.send_message(&child.id, prompt.to_string(), Vec::new())
+            .map_err(|e| anyhow!(e.to_string()))?;
+
+        let mut result = serde_json::json!({
+            "thread_id": child.id,
+            "session_id": child_session_id,
+            "note": "child agent started; check on it with spawn_output",
+        });
+        if let Some(extra) = extra {
+            for (k, v) in extra.as_object().unwrap() {
+                result[k] = v.clone();
+            }
+        }
+        Ok(result)
+    }
+
+    /// A child agent's status, folded from its event log: running (its
+    /// dispatcher is live), failed (last turn errored), completed (ran and
+    /// idle), or pending (never ran). Includes the latest assistant message
+    /// and aggregate token usage so the parent sees what its money bought.
+    fn spawn_status(&self, thread_id: &str) -> Result<serde_json::Value> {
+        let running = self
+            .active_threads
+            .lock()
+            .unwrap()
+            .contains_key(thread_id);
+        let mut last_message = String::new();
+        let mut completed_turns = 0u64;
+        let mut failure: Option<String> = None;
+        for envelope in self
+            .store
+            .events_after(&Scope::Thread(thread_id.to_string()), 0)?
+        {
+            match envelope.event {
+                Event::AssistantMessage { content, .. } => last_message = content,
+                Event::TurnCompleted { .. } => {
+                    completed_turns += 1;
+                    failure = None;
+                }
+                Event::TurnFailed { error, .. } => failure = Some(error),
+                _ => {}
+            }
+        }
+        let status = if running {
+            "running"
+        } else if failure.is_some() {
+            "failed"
+        } else if completed_turns > 0 {
+            "completed"
+        } else {
+            "pending"
+        };
+        let usage = self
+            .store
+            .usage_summary(crate::store::UsageScope::Thread(thread_id))?;
+        let mut out = serde_json::json!({
+            "thread_id": thread_id,
+            "status": status,
+            "turns": completed_turns,
+            "last_message": last_message,
+            "usage": {
+                "input_tokens": usage.input_tokens,
+                "output_tokens": usage.output_tokens,
+                "cost_usd": usage.cost_usd,
+            },
+        });
+        if let Some(error) = failure {
+            out["error"] = serde_json::json!(error);
+        }
+        Ok(out)
     }
 
     async fn maybe_checkpoint(
@@ -4749,6 +5031,113 @@ pub fn ask_question_spec() -> ToolSpec {
                 }
             },
             "required": ["questions"]
+        }),
+    }
+}
+
+/// Spec for the engine-served `spawn_thread` tool (child agent, same
+/// session/worktree). Offered only to threads that aren't themselves
+/// spawned children.
+pub fn spawn_thread_spec() -> ToolSpec {
+    ToolSpec {
+        name: "spawn_thread".into(),
+        description: "Start a child agent on a new thread in this session (same working \
+                      tree). Returns the child's thread_id immediately; collect results \
+                      with spawn_output. The child inherits your mode, model and \
+                      permission level unless overridden. Children in read-only modes \
+                      (e.g. plan) run concurrently with your turn — ideal for parallel \
+                      exploration and research. Children that can write must wait for \
+                      your current turn to finish before starting, so never block on \
+                      one with spawn_output's wait_ms; prefer spawn_session for \
+                      write-heavy delegation."
+            .into(),
+        parameters: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "prompt": {
+                    "type": "string",
+                    "description": "The task for the child agent. Self-contained: the child does not see your conversation."
+                },
+                "mode": {
+                    "type": "string",
+                    "description": "Agent mode id for the child (default: your mode). Use a read-only mode like \"plan\" for concurrent research."
+                },
+                "model": {
+                    "type": "string",
+                    "description": "Provider-qualified model for the child (default: your model)."
+                }
+            },
+            "required": ["prompt"]
+        }),
+    }
+}
+
+/// Spec for the engine-served `spawn_session` tool (child agent, isolated
+/// worktree).
+pub fn spawn_session_spec() -> ToolSpec {
+    ToolSpec {
+        name: "spawn_session".into(),
+        description: "Start a child agent in a NEW session with its own git worktree and \
+                      branch, based on this session's branch (committed work only — not \
+                      uncommitted changes). Fully isolated: it cannot touch your files; \
+                      its work lands on its own branch for later review or merge. \
+                      Returns thread_id, session_id and branch immediately; collect \
+                      results with spawn_output. Use for risky experiments, best-of-N \
+                      attempts, or parallel feature work."
+            .into(),
+        parameters: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "prompt": {
+                    "type": "string",
+                    "description": "The task for the child agent. Self-contained: the child does not see your conversation."
+                },
+                "title": {
+                    "type": "string",
+                    "description": "Session title (also names the branch); derived from the prompt when omitted."
+                },
+                "mode": {
+                    "type": "string",
+                    "description": "Agent mode id for the child (default: your mode)."
+                },
+                "model": {
+                    "type": "string",
+                    "description": "Provider-qualified model for the child (default: your model)."
+                }
+            },
+            "required": ["prompt"]
+        }),
+    }
+}
+
+/// Spec for the engine-served `spawn_output` tool (child status/result
+/// collection).
+pub fn spawn_output_spec() -> ToolSpec {
+    ToolSpec {
+        name: "spawn_output".into(),
+        description: "Status and latest output of a child agent you spawned with \
+                      spawn_thread or spawn_session. Returns status (pending | running \
+                      | completed | failed), the child's last assistant message, turns \
+                      completed, and token usage. Set wait_ms to block until the child \
+                      finishes (or the timeout passes) — but only wait on children that \
+                      run concurrently (read-only same-session children, or any \
+                      spawn_session child)."
+            .into(),
+        parameters: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "thread_id": {
+                    "type": "string",
+                    "description": "The child's thread id, as returned by spawn_thread/spawn_session."
+                },
+                "wait_ms": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "maximum": 180000,
+                    "description": "Milliseconds to wait for the child to finish (default 0: return current status immediately)."
+                }
+            },
+            "required": ["thread_id"]
         }),
     }
 }

@@ -164,7 +164,11 @@ async fn approval_prompt(
     }))
 }
 
-async fn tools_call(engine: &Engine, thread_id: &str, params: &Value) -> Result<Value, String> {
+async fn tools_call(
+    engine: &Arc<Engine>,
+    thread_id: &str,
+    params: &Value,
+) -> Result<Value, String> {
     let name = params["name"].as_str().unwrap_or_default();
     let arguments = params.get("arguments").cloned().unwrap_or(json!({}));
     match engine.bridged_tool_call(thread_id, name, &arguments).await {

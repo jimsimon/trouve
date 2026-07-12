@@ -5524,6 +5524,10 @@
           },
           "session_id": {
             "$ref": "#/components/schemas/String"
+          },
+          "spawned": {
+            "type": "boolean",
+            "description": "True when an agent spawned this thread (spawn_thread/spawn_session\ntools) rather than the user; clients mark such threads visually."
           }
         }
       },
