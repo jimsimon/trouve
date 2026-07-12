@@ -2792,6 +2792,11 @@ impl Engine {
                 workspace_id: session.workspace_id.clone(),
             },
         )?;
+        // Release any MCP server processes spawned for this worktree, so they
+        // don't leak for the lifetime of the server.
+        self.executor
+            .evict_worktree(Path::new(&session.worktree_path))
+            .await;
         // Remove attachment files from disk before dropping their DB rows;
         // afterwards their paths are unrecoverable.
         for path in self.store.session_attachment_paths(id)? {

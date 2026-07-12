@@ -39,6 +39,13 @@ use trouve_providers::ToolSpec;
 /// Prefix for MCP tool names: `mcp__<server>__<tool>`.
 pub const TOOL_PREFIX: &str = "mcp__";
 
+/// Upper bound on any single JSON-RPC request (handshake or tool call). Tool
+/// calls can be slow, but not unbounded — a hung server must not wedge the
+/// turn (and the session lock) forever.
+const REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+/// Upper bound on spawning + handshaking a server.
+const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// One entry under `mcpServers` in `.mcp.json`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct McpServerConfig {
@@ -382,26 +389,38 @@ impl McpConnection {
 
     /// Send a request and wait for its response, skipping any interleaved
     /// notifications. Requests are fully serialized behind the pipe mutex.
+    /// A hung server can't block the caller forever — the wait is bounded,
+    /// and a timeout returns an error so the manager can evict the (now
+    /// possibly desynced) connection.
     async fn request(&self, method: &str, params: Value) -> Result<Value> {
         let id = self.next_id.fetch_add(1, Ordering::SeqCst);
         let msg = json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params});
         let mut pipes = self.pipes.lock().await;
         pipes.stdin.write_all(format!("{msg}\n").as_bytes()).await?;
         pipes.stdin.flush().await?;
-        loop {
-            let Some(line) = pipes.stdout.next_line().await? else {
-                bail!("MCP server closed the stream during '{method}'");
-            };
-            let Ok(reply) = serde_json::from_str::<Value>(&line) else {
-                continue;
-            };
-            if reply.get("id").and_then(|v| v.as_i64()) != Some(id) {
-                continue; // notification or unrelated message
+        let read = async {
+            loop {
+                let Some(line) = pipes.stdout.next_line().await? else {
+                    bail!("MCP server closed the stream during '{method}'");
+                };
+                let Ok(reply) = serde_json::from_str::<Value>(&line) else {
+                    continue;
+                };
+                if reply.get("id").and_then(|v| v.as_i64()) != Some(id) {
+                    continue; // notification or unrelated message
+                }
+                if let Some(error) = reply.get("error") {
+                    bail!("MCP '{method}' failed: {error}");
+                }
+                return Ok(reply.get("result").cloned().unwrap_or(Value::Null));
             }
-            if let Some(error) = reply.get("error") {
-                bail!("MCP '{method}' failed: {error}");
-            }
-            return Ok(reply.get("result").cloned().unwrap_or(Value::Null));
+        };
+        match tokio::time::timeout(REQUEST_TIMEOUT, read).await {
+            Ok(result) => result,
+            Err(_) => bail!(
+                "MCP '{method}' timed out after {}s",
+                REQUEST_TIMEOUT.as_secs()
+            ),
         }
     }
 
@@ -502,8 +521,18 @@ impl McpManager {
                 return Ok(existing.clone());
             }
         }
-        let connection =
-            std::sync::Arc::new(McpConnection::connect(server, &config, Some(&self.logs)).await?);
+        let connection = match tokio::time::timeout(
+            CONNECT_TIMEOUT,
+            McpConnection::connect(server, &config, Some(&self.logs)),
+        )
+        .await
+        {
+            Ok(res) => std::sync::Arc::new(res?),
+            Err(_) => bail!(
+                "MCP server '{server}' timed out after {}s during connect",
+                CONNECT_TIMEOUT.as_secs()
+            ),
+        };
         self.logs.push(
             server,
             format!("connected ({} tools)", connection.tools().len()),
@@ -511,6 +540,25 @@ impl McpManager {
         let mut connections = self.connections.lock().await;
         // Another caller may have connected while we spawned; keep theirs.
         Ok(connections.entry(key).or_insert(connection).clone())
+    }
+
+    /// Drop a single cached connection (killing its child process). The next
+    /// use reconnects. Called after a request error so a crashed or wedged
+    /// server doesn't stay permanently broken in the cache.
+    async fn evict(&self, worktree: &Path, server: &str) {
+        let key = (worktree.to_string_lossy().to_string(), server.to_string());
+        self.connections.lock().await.remove(&key);
+    }
+
+    /// Drop every cached connection for a worktree (killing their child
+    /// processes). Called when a session is deleted so its MCP servers don't
+    /// leak for the lifetime of the process.
+    pub async fn evict_worktree(&self, worktree: &Path) {
+        let prefix = worktree.to_string_lossy().to_string();
+        self.connections
+            .lock()
+            .await
+            .retain(|(wt, _), _| wt != &prefix);
     }
 
     /// All MCP tool specs visible from this worktree. Connection failures
@@ -562,7 +610,14 @@ impl McpManager {
         let connection = self
             .connection(config_dir, workspace_root, worktree, server)
             .await?;
-        connection.call_tool(tool, args).await
+        let result = connection.call_tool(tool, args).await;
+        if result.is_err() {
+            // The connection may be dead or desynced (closed stream, timeout
+            // mid-response); drop it so the next call reconnects instead of
+            // failing forever against a cached-but-broken process.
+            self.evict(worktree, server).await;
+        }
+        result
     }
 }
 

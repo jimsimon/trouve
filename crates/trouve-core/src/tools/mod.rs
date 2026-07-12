@@ -120,6 +120,9 @@ pub trait ToolExecutor: Send + Sync {
     /// `None` when the tool is unknown.
     fn tool_mutates(&self, name: &str) -> Option<bool>;
     async fn execute(&self, ctx: &ToolCtx, name: &str, args: &Value) -> ToolResult;
+    /// Release any per-worktree resources (e.g. spawned MCP server
+    /// processes) when a session/worktree is going away. Default no-op.
+    async fn evict_worktree(&self, _worktree: &Path) {}
 }
 
 /// Runs tools in-process against the local filesystem/shell, plus any MCP
@@ -232,6 +235,10 @@ impl ToolExecutor for LocalToolExecutor {
             Some(tool) => tool.run(ctx, args).await,
             None => ToolResult::error(format!("unknown tool: {name}")),
         }
+    }
+
+    async fn evict_worktree(&self, worktree: &Path) {
+        self.mcp.evict_worktree(worktree).await;
     }
 }
 
