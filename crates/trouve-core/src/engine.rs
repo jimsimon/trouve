@@ -3477,6 +3477,10 @@ impl Engine {
             for payload in self.store.messages(&thread.id)? {
                 messages.push(serde_json::from_value(payload)?);
             }
+            // Repair any tool_calls left without results by a crash/restart
+            // mid-turn (and drop empty assistant turns); providers reject a
+            // dangling tool_use/tool_call, which would wedge the thread.
+            let messages = sanitize_transcript(messages);
 
             let mut stream = provider
                 .stream_chat(&model_name, &messages, &specs, &model_options)
@@ -3519,13 +3523,19 @@ impl Engine {
                     },
                 )?;
             }
-            self.store.append_message(
-                &thread.id,
-                &serde_json::to_value(Message::Assistant {
-                    content: text,
-                    tool_calls: tool_calls.clone(),
-                })?,
-            )?;
+            // Skip a fully-empty assistant message (no text, no tool calls —
+            // e.g. a thinking-only or empty provider response): it serializes
+            // to an empty content block that Anthropic rejects on the next
+            // request, wedging the thread.
+            if !text.is_empty() || !tool_calls.is_empty() {
+                self.store.append_message(
+                    &thread.id,
+                    &serde_json::to_value(Message::Assistant {
+                        content: text,
+                        tool_calls: tool_calls.clone(),
+                    })?,
+                )?;
+            }
 
             if tool_calls.is_empty() {
                 break;
@@ -4302,6 +4312,7 @@ impl Engine {
         for payload in &payloads {
             messages.push(serde_json::from_value(payload.clone())?);
         }
+        messages = sanitize_transcript(messages);
         messages.push(Message::User(
             "Summarize the conversation so far per your instructions.".into(),
         ));
@@ -5131,6 +5142,67 @@ fn take_tool_images(result: &mut serde_json::Value) -> Vec<trouve_providers::Too
     images
 }
 
+/// Make a stored transcript safe to send to a provider. A crash or restart
+/// between persisting an assistant message with `tool_calls` and persisting
+/// its results (tool execution can take minutes; approval waits are
+/// unbounded) leaves a dangling `tool_call`, which both OpenAI and Anthropic
+/// reject — permanently wedging the thread. Synthesize an "interrupted"
+/// result for every tool call left unanswered, and drop empty assistant
+/// messages (they serialize to an empty content block Anthropic rejects).
+fn sanitize_transcript(messages: Vec<Message>) -> Vec<Message> {
+    let mut out: Vec<Message> = Vec::with_capacity(messages.len());
+    let mut iter = messages.into_iter().peekable();
+    while let Some(msg) = iter.next() {
+        match msg {
+            Message::Assistant {
+                content,
+                tool_calls,
+            } => {
+                if content.trim().is_empty() && tool_calls.is_empty() {
+                    continue;
+                }
+                let ids: Vec<String> = tool_calls.iter().map(|c| c.id.clone()).collect();
+                out.push(Message::Assistant {
+                    content,
+                    tool_calls,
+                });
+                if ids.is_empty() {
+                    continue;
+                }
+                // Absorb the contiguous run of results that follow, tracking
+                // which call ids they answer.
+                let mut answered = std::collections::HashSet::new();
+                while matches!(iter.peek(), Some(Message::ToolResult { .. })) {
+                    if let Some(Message::ToolResult {
+                        call_id,
+                        content,
+                        images,
+                    }) = iter.next()
+                    {
+                        answered.insert(call_id.clone());
+                        out.push(Message::ToolResult {
+                            call_id,
+                            content,
+                            images,
+                        });
+                    }
+                }
+                for id in ids {
+                    if !answered.contains(&id) {
+                        out.push(Message::ToolResult {
+                            call_id: id,
+                            content: "Tool call interrupted; no result was recorded.".into(),
+                            images: Vec::new(),
+                        });
+                    }
+                }
+            }
+            other => out.push(other),
+        }
+    }
+    out
+}
+
 fn annotate_edit_lines(worktree: &Path, args: &mut serde_json::Value) {
     let str_of = |v: &serde_json::Value, keys: &[&str]| {
         keys.iter()
@@ -5725,5 +5797,70 @@ mod tests {
         let before = args.clone();
         annotate_edit_lines(tmp.path(), &mut args);
         assert_eq!(args, before);
+    }
+
+    #[test]
+    fn sanitize_transcript_repairs_dangling_tool_calls() {
+        use trouve_providers::{Message, ToolCallRequest};
+        let call = |id: &str| ToolCallRequest {
+            id: id.to_string(),
+            name: "shell".into(),
+            arguments: serde_json::json!({}),
+        };
+
+        // A crash left two tool calls with only one result, then the next
+        // turn's user message.
+        let messages = vec![
+            Message::User("do it".into()),
+            Message::Assistant {
+                content: String::new(),
+                tool_calls: vec![call("a"), call("b")],
+            },
+            Message::ToolResult {
+                call_id: "a".into(),
+                content: "ok".into(),
+                images: vec![],
+            },
+            Message::User("next".into()),
+        ];
+        let out = sanitize_transcript(messages);
+        // The missing result for "b" is synthesized right after "a"'s.
+        match &out[2] {
+            Message::ToolResult { call_id, .. } => assert_eq!(call_id, "a"),
+            other => panic!("expected result a, got {other:?}"),
+        }
+        match &out[3] {
+            Message::ToolResult { call_id, content, .. } => {
+                assert_eq!(call_id, "b");
+                assert!(content.contains("interrupted"));
+            }
+            other => panic!("expected synthesized result b, got {other:?}"),
+        }
+        assert!(matches!(&out[4], Message::User(u) if u == "next"));
+
+        // An empty assistant message is dropped entirely.
+        let out = sanitize_transcript(vec![
+            Message::User("hi".into()),
+            Message::Assistant {
+                content: "   ".into(),
+                tool_calls: vec![],
+            },
+        ]);
+        assert_eq!(out.len(), 1);
+        assert!(matches!(&out[0], Message::User(_)));
+
+        // A well-formed transcript is unchanged in length and pairing.
+        let clean = vec![
+            Message::Assistant {
+                content: String::new(),
+                tool_calls: vec![call("x")],
+            },
+            Message::ToolResult {
+                call_id: "x".into(),
+                content: "done".into(),
+                images: vec![],
+            },
+        ];
+        assert_eq!(sanitize_transcript(clean).len(), 2);
     }
 }
