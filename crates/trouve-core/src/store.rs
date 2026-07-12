@@ -69,8 +69,13 @@ CREATE TABLE IF NOT EXISTS usage (
   PRIMARY KEY (thread_id, turn)
 );
 CREATE TABLE IF NOT EXISTS backend_sessions (
-  thread_id TEXT PRIMARY KEY REFERENCES threads(id),
-  backend_session_id TEXT NOT NULL
+  thread_id TEXT NOT NULL REFERENCES threads(id),
+  backend TEXT NOT NULL,          -- provider id ("cursor", "claude", …)
+  backend_session_id TEXT NOT NULL,
+  -- Transcript length (messages) when this backend last ran a turn; lets
+  -- a resumed vendor session be told what other models did in between.
+  seen_messages INTEGER NOT NULL DEFAULT 0,
+  PRIMARY KEY (thread_id, backend)
 );
 CREATE TABLE IF NOT EXISTS queued_prompts (
   id TEXT PRIMARY KEY,
@@ -131,6 +136,47 @@ fn apply_migrations(conn: &Connection) -> Result<()> {
                 return Err(e).context(format!("migration failed: {sql}"));
             }
         }
+    }
+    migrate_backend_sessions(conn)?;
+    Ok(())
+}
+
+/// Rebuild `backend_sessions` for databases created before it was keyed by
+/// (thread, backend) — adding a column to the primary key needs a new
+/// table. Legacy rows (one vendor session per thread, vendor unrecorded)
+/// migrate under backend '' and act as a fallback until a real turn
+/// replaces them.
+fn migrate_backend_sessions(conn: &Connection) -> Result<()> {
+    let legacy = {
+        let mut stmt = conn.prepare("PRAGMA table_info(backend_sessions)")?;
+        let columns: Vec<String> = stmt
+            .query_map([], |r| r.get::<_, String>(1))?
+            .collect::<rusqlite::Result<_>>()?;
+        !columns.is_empty() && !columns.iter().any(|c| c == "backend")
+    };
+    if legacy {
+        conn.execute_batch(
+            "BEGIN;
+             CREATE TABLE backend_sessions_v2 (
+               thread_id TEXT NOT NULL REFERENCES threads(id),
+               backend TEXT NOT NULL,
+               backend_session_id TEXT NOT NULL,
+               seen_messages INTEGER NOT NULL DEFAULT 0,
+               PRIMARY KEY (thread_id, backend)
+             );
+             -- Legacy sessions have seen the whole transcript to date: their
+             -- vendor session was the only history carrier under the old
+             -- schema, so nothing needs handing off on the next resume.
+             INSERT INTO backend_sessions_v2
+                    (thread_id, backend, backend_session_id, seen_messages)
+               SELECT bs.thread_id, '', bs.backend_session_id,
+                      (SELECT COUNT(*) FROM messages m WHERE m.thread_id = bs.thread_id)
+                 FROM backend_sessions bs;
+             DROP TABLE backend_sessions;
+             ALTER TABLE backend_sessions_v2 RENAME TO backend_sessions;
+             COMMIT;",
+        )
+        .context("rekeying backend_sessions by (thread, backend)")?;
     }
     Ok(())
 }
@@ -933,23 +979,57 @@ impl Store {
     // Vendor-agent session ids (Codex/Cursor/Claude Code) so external
     // backends resume the same conversation across turns and restarts.
 
-    pub fn backend_session(&self, thread_id: &str) -> Result<Option<String>> {
+    /// The vendor session to resume for this thread and backend, plus how
+    /// many transcript messages that backend had seen when it last ran
+    /// (anything after that happened under other models and needs handing
+    /// off). Rows migrated from the pre-(thread, backend) schema live under
+    /// backend '' and match any backend until a real turn writes a proper
+    /// key.
+    pub fn backend_session(&self, thread_id: &str, backend: &str) -> Result<Option<(String, u64)>> {
         let conn = self.conn.lock().unwrap();
         Ok(conn
             .query_row(
-                "SELECT backend_session_id FROM backend_sessions WHERE thread_id = ?1",
-                params![thread_id],
-                |r| r.get(0),
+                "SELECT backend_session_id, seen_messages FROM backend_sessions
+                 WHERE thread_id = ?1 AND backend IN (?2, '')
+                 ORDER BY backend DESC LIMIT 1",
+                params![thread_id, backend],
+                |r| Ok((r.get(0)?, r.get(1)?)),
             )
             .optional()?)
     }
 
-    pub fn set_backend_session(&self, thread_id: &str, backend_session_id: &str) -> Result<()> {
+    pub fn set_backend_session(
+        &self,
+        thread_id: &str,
+        backend: &str,
+        backend_session_id: &str,
+    ) -> Result<()> {
         let conn = self.conn.lock().unwrap();
         conn.execute(
-            "INSERT INTO backend_sessions (thread_id, backend_session_id) VALUES (?1, ?2)
-             ON CONFLICT(thread_id) DO UPDATE SET backend_session_id = excluded.backend_session_id",
-            params![thread_id, backend_session_id],
+            "INSERT INTO backend_sessions (thread_id, backend, backend_session_id)
+             VALUES (?1, ?2, ?3)
+             ON CONFLICT(thread_id, backend)
+               DO UPDATE SET backend_session_id = excluded.backend_session_id",
+            params![thread_id, backend, backend_session_id],
+        )?;
+        // A properly keyed row supersedes any migrated legacy fallback.
+        conn.execute(
+            "DELETE FROM backend_sessions WHERE thread_id = ?1 AND backend = ''",
+            params![thread_id],
+        )?;
+        Ok(())
+    }
+
+    /// Record how far through the transcript a backend's vendor session is
+    /// (called at the end of its turns). No-op when the backend never
+    /// reported a session — with nothing to resume, the next turn hands
+    /// off the whole history again anyway.
+    pub fn mark_backend_seen(&self, thread_id: &str, backend: &str, seen: u64) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE backend_sessions SET seen_messages = ?3
+             WHERE thread_id = ?1 AND backend = ?2",
+            params![thread_id, backend, seen],
         )?;
         Ok(())
     }
@@ -1283,13 +1363,97 @@ mod tests {
             .insert_thread(&thread, &serde_json::Map::new())
             .unwrap();
         // The vendor-resume link is what used to trip the FK constraint.
-        store.set_backend_session("th_1", "vendor-abc").unwrap();
+        store
+            .set_backend_session("th_1", "cursor", "vendor-abc")
+            .unwrap();
         store.enqueue_prompt("th_1", "pending", &[]).unwrap();
 
         store.delete_session("se_1").unwrap();
         assert!(store.session("se_1").unwrap().is_none());
-        assert!(store.backend_session("th_1").unwrap().is_none());
+        assert!(store.backend_session("th_1", "cursor").unwrap().is_none());
         assert!(store.queued_prompts("th_1").unwrap().is_empty());
+    }
+
+    /// Vendor sessions are keyed per backend: swapping cursor → claude →
+    /// cursor must not lose cursor's resume id. Rows migrated from the old
+    /// one-per-thread schema (backend '') match any backend until a real
+    /// turn writes a proper key.
+    #[test]
+    fn backend_sessions_keyed_per_backend_with_legacy_fallback() {
+        let store = Store::open_in_memory().unwrap();
+        seed_thread(&store, "th_bs");
+
+        store
+            .set_backend_session("th_bs", "cursor", "cursor-sess")
+            .unwrap();
+        store
+            .set_backend_session("th_bs", "claude", "claude-sess")
+            .unwrap();
+        store.mark_backend_seen("th_bs", "cursor", 4).unwrap();
+        assert_eq!(
+            store.backend_session("th_bs", "cursor").unwrap(),
+            Some(("cursor-sess".into(), 4))
+        );
+        assert_eq!(
+            store.backend_session("th_bs", "claude").unwrap(),
+            Some(("claude-sess".into(), 0))
+        );
+        assert_eq!(store.backend_session("th_bs", "codex").unwrap(), None);
+        // Marking an unknown (thread, backend) is a no-op, not an insert.
+        store.mark_backend_seen("th_bs", "codex", 9).unwrap();
+        assert_eq!(store.backend_session("th_bs", "codex").unwrap(), None);
+
+        // Legacy fallback: a backend-less row (as migrated) matches any
+        // backend, and the first properly keyed write clears it.
+        seed_thread(&store, "th_legacy");
+        store
+            .conn
+            .lock()
+            .unwrap()
+            .execute(
+                "INSERT INTO backend_sessions (thread_id, backend, backend_session_id)
+                 VALUES ('th_legacy', '', 'old-sess')",
+                [],
+            )
+            .unwrap();
+        assert_eq!(
+            store.backend_session("th_legacy", "cursor").unwrap(),
+            Some(("old-sess".into(), 0))
+        );
+        store
+            .set_backend_session("th_legacy", "cursor", "new-sess")
+            .unwrap();
+        assert_eq!(
+            store.backend_session("th_legacy", "claude").unwrap(),
+            None,
+            "legacy fallback row should be gone after a keyed write"
+        );
+    }
+
+    /// Opening a database created before backend_sessions was keyed by
+    /// (thread, backend) rebuilds the table and keeps the rows.
+    #[test]
+    fn backend_sessions_migrates_legacy_schema() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("legacy.db");
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE threads (id TEXT PRIMARY KEY);
+                 CREATE TABLE backend_sessions (
+                   thread_id TEXT PRIMARY KEY REFERENCES threads(id),
+                   backend_session_id TEXT NOT NULL
+                 );
+                 INSERT INTO threads (id) VALUES ('th_old');
+                 INSERT INTO backend_sessions VALUES ('th_old', 'vendor-legacy');",
+            )
+            .unwrap();
+        }
+        let store = Store::open(&path).unwrap();
+        assert_eq!(
+            store.backend_session("th_old", "anything").unwrap(),
+            Some(("vendor-legacy".into(), 0))
+        );
     }
 
     /// Workspace + session + thread rows so FK-checked inserts succeed.

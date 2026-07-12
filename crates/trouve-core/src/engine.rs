@@ -3322,13 +3322,14 @@ impl Engine {
 
         // External agent backend? The vendor harness owns the loop; we
         // stream its events and bridge approvals. (Session lock stays held.)
-        if let Some((backend, model_name)) = self.backend_for(&thread.model) {
+        if let Some((backend_id, backend, model_name)) = self.backend_for(&thread.model) {
             return self
                 .run_backend_turn(
                     &session,
                     thread,
                     turn,
                     &mode,
+                    &backend_id,
                     backend,
                     model_name,
                     content,
@@ -3490,10 +3491,10 @@ impl Engine {
     }
 
     /// Resolve a provider-qualified model id to a registered agent backend.
-    fn backend_for(&self, model: &str) -> Option<(Arc<dyn AgentBackend>, String)> {
+    fn backend_for(&self, model: &str) -> Option<(String, Arc<dyn AgentBackend>, String)> {
         let (backend_id, model_name) = model.split_once('/')?;
         let backend = self.backends.read().unwrap().get(backend_id).cloned()?;
-        Some((backend, model_name.to_string()))
+        Some((backend_id.to_string(), backend, model_name.to_string()))
     }
 
     /// MCP tool-bridge config for a backend turn. Claude Code always gets
@@ -3790,12 +3791,38 @@ impl Engine {
         thread: &Thread,
         turn: u64,
         mode: &AgentMode,
+        backend_id: &str,
         backend: Arc<dyn AgentBackend>,
         model_name: String,
         content: String,
         attachments: Vec<trouve_protocol::Attachment>,
     ) -> Result<()> {
         let scope = Scope::Thread(thread.id.clone());
+        // Vendor sessions are per (thread, backend): each vendor keeps its
+        // own history, and switching models away and back resumes it.
+        // Vendors can't read our transcript, so whatever part of the
+        // thread's past this one hasn't seen — everything for a vendor
+        // joining mid-conversation, the interleaved turns other models ran
+        // for a resumed one — is handed off as a digest in the prompt.
+        let resume = self.store.backend_session(&thread.id, backend_id)?;
+        let payloads = self.store.messages(&thread.id)?;
+        let unseen = match &resume {
+            // A compaction can shrink the transcript below the watermark;
+            // handing off the fresh summary again covers that.
+            Some((_, seen)) => payloads.get(*seen as usize..).unwrap_or(&payloads),
+            None => &payloads[..],
+        };
+        let handoff = {
+            let messages: Vec<Message> = unseen
+                .iter()
+                .filter_map(|p| serde_json::from_value(p.clone()).ok())
+                .collect();
+            render_history_digest(&messages, resume.is_some())
+        };
+        let vendor_session = resume.map(|(id, _)| id);
+        // After this turn the vendor has seen everything up to and
+        // including its own reply (appended below on completion).
+        let seen_after = payloads.len() as u64 + 2;
         self.store.append_event(
             scope.clone(),
             Event::TurnStarted {
@@ -3853,13 +3880,19 @@ impl Engine {
             }
             instructions.push_str(crate::tools::VENDOR_SEARCH_GUIDANCE);
         }
+        // The digest decorates only the prompt sent to the vendor; the
+        // stored transcript keeps the user's words alone.
+        let prompt = match &handoff {
+            Some(digest) => format!("{digest}\n\n{content}"),
+            None => content,
+        };
         let backend_turn = BackendTurn {
             thread_id: thread.id.clone(),
             worktree: PathBuf::from(&session.worktree_path),
-            session: self.store.backend_session(&thread.id)?,
+            session: vendor_session,
             model: model_name,
             model_options: self.store.thread_model_options(&thread.id)?,
-            prompt: content,
+            prompt,
             attachments: turn_attachments,
             instructions: (!instructions.is_empty()).then_some(instructions),
             permission,
@@ -3882,7 +3915,8 @@ impl Engine {
         while let Some(ev) = stream.next().await {
             match ev.map_err(|e| anyhow!("backend stream error: {e}"))? {
                 BackendEvent::SessionStarted { session_id } => {
-                    self.store.set_backend_session(&thread.id, &session_id)?;
+                    self.store
+                        .set_backend_session(&thread.id, backend_id, &session_id)?;
                 }
                 BackendEvent::TextDelta(delta) => {
                     text.push_str(&delta);
@@ -4035,6 +4069,8 @@ impl Engine {
                 tool_calls: Vec::new(),
             })?,
         )?;
+        self.store
+            .mark_backend_seen(&thread.id, backend_id, seen_after)?;
 
         self.store
             .record_usage(&session.id, &thread.id, turn, &usage_total)?;
@@ -4428,6 +4464,81 @@ fn recommend_gguf(files: &[trouve_protocol::LocalSearchFile]) -> usize {
 
 /// Append path references for attachments that can't ride natively in the
 /// model input, so the agent can open them with its file tools.
+/// Ceiling on the handoff digest, in characters (~6k tokens). Compaction
+/// keeps most transcripts under this; anything longer loses its middle —
+/// the opening (goals, often a compaction summary) and the recent tail
+/// matter most.
+const HISTORY_DIGEST_MAX: usize = 24_000;
+
+/// Render stored transcript messages into a handoff preamble for a vendor
+/// backend that hasn't seen them: everything, for a vendor joining a
+/// thread mid-conversation (`resumed` false); just the interleaved turns
+/// other models ran, for one being resumed after a model swap (`resumed`
+/// true). Tool results are omitted — their effects live in the worktree,
+/// which the vendor can inspect. Returns None when there is nothing to
+/// hand off.
+fn render_history_digest(messages: &[Message], resumed: bool) -> Option<String> {
+    let mut body = String::new();
+    for message in messages {
+        let block = match message {
+            Message::User(text) => format!("User:\n{}", text.trim()),
+            Message::Assistant { content, .. } if !content.trim().is_empty() => {
+                format!("Assistant:\n{}", content.trim())
+            }
+            Message::Assistant { tool_calls, .. } if !tool_calls.is_empty() => {
+                let names: Vec<&str> = tool_calls.iter().map(|c| c.name.as_str()).collect();
+                format!("Assistant: [ran tools: {}]", names.join(", "))
+            }
+            _ => continue,
+        };
+        if !body.is_empty() {
+            body.push_str("\n\n");
+        }
+        body.push_str(&block);
+    }
+    if body.is_empty() {
+        return None;
+    }
+    if body.len() > HISTORY_DIGEST_MAX {
+        let head = floor_char_boundary(&body, HISTORY_DIGEST_MAX / 4);
+        let tail = ceil_char_boundary(&body, body.len() - (HISTORY_DIGEST_MAX - head));
+        body = format!(
+            "{}\n\n[... earlier conversation truncated ...]\n\n{}",
+            &body[..head],
+            &body[tail..]
+        );
+    }
+    let header = if resumed {
+        "[Handoff: since your last turn in this conversation, the turns below were \
+         handled by a different assistant or model. Catch up from this digest and \
+         continue seamlessly — do not greet the user or restate the history.]"
+    } else {
+        "[Handoff: you are continuing an existing conversation. Earlier turns may have \
+         been handled by a different assistant or model; a digest of the conversation so \
+         far follows. Continue seamlessly from it — do not greet the user or restate the \
+         history.]"
+    };
+    Some(format!(
+        "{header}\n\n{body}\n\n[End of digest. The user's current message follows.]"
+    ))
+}
+
+/// Largest index `<= at` that lands on a char boundary.
+fn floor_char_boundary(s: &str, mut at: usize) -> usize {
+    while !s.is_char_boundary(at) {
+        at -= 1;
+    }
+    at
+}
+
+/// Smallest index `>= at` that lands on a char boundary.
+fn ceil_char_boundary(s: &str, mut at: usize) -> usize {
+    while at < s.len() && !s.is_char_boundary(at) {
+        at += 1;
+    }
+    at
+}
+
 fn annotate_attachments(
     content: String,
     files: &[(trouve_protocol::Attachment, PathBuf)],
@@ -4771,6 +4882,64 @@ fn build_provider(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn history_digest_renders_text_skips_tools_and_caps_length() {
+        // Empty transcript: nothing to hand off.
+        assert_eq!(render_history_digest(&[], false), None);
+        assert_eq!(
+            render_history_digest(&[Message::System("prompt".into())], false),
+            None
+        );
+
+        let messages = [
+            Message::System("mode prompt".into()),
+            Message::User("add a login page".into()),
+            Message::Assistant {
+                content: String::new(),
+                tool_calls: vec![trouve_providers::ToolCallRequest {
+                    id: "1".into(),
+                    name: "write_file".into(),
+                    arguments: "{}".into(),
+                }],
+            },
+            Message::ToolResult {
+                call_id: "1".into(),
+                content: "long tool output that should not appear".into(),
+            },
+            Message::Assistant {
+                content: "Done — login page added.".into(),
+                tool_calls: vec![],
+            },
+        ];
+        let digest = render_history_digest(&messages, false).unwrap();
+        assert!(digest.contains("User:\nadd a login page"));
+        assert!(digest.contains("[ran tools: write_file]"));
+        assert!(digest.contains("Done — login page added."));
+        assert!(!digest.contains("should not appear"));
+        assert!(!digest.contains("mode prompt"));
+        assert!(digest.starts_with("[Handoff: you are continuing"));
+
+        // Resumed sessions get catch-up framing instead.
+        let digest = render_history_digest(&messages, true).unwrap();
+        assert!(digest.starts_with("[Handoff: since your last turn"));
+
+        // Oversized transcripts lose their middle, keep head and tail, and
+        // never split a multi-byte character.
+        let long = "é".repeat(HISTORY_DIGEST_MAX);
+        let digest = render_history_digest(
+            &[
+                Message::User(format!("start-marker {long}")),
+                Message::User("end-marker".into()),
+            ],
+            false,
+        )
+        .unwrap();
+        assert!(digest.len() < HISTORY_DIGEST_MAX + 1_000);
+        assert!(digest.contains("start-marker"));
+        assert!(digest.contains("end-marker"));
+        assert!(digest.contains("truncated"));
+    }
 
     #[test]
     fn annotate_edit_lines_resolves_snippet_positions() {

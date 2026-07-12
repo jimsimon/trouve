@@ -984,6 +984,247 @@ async fn ask_question_tool_round_trips_answers() {
 
 // --- external agent backends -------------------------------------------------
 
+/// Minimal `AgentBackend` for handoff tests: records the (resume session,
+/// prompt) each turn arrives with, replies with fixed text, and issues one
+/// stable vendor session id per instance.
+struct HandoffBackend {
+    name: &'static str,
+    turns: std::sync::Mutex<Vec<(Option<String>, String)>>,
+}
+
+impl HandoffBackend {
+    fn new(name: &'static str) -> Self {
+        Self {
+            name,
+            turns: std::sync::Mutex::new(Vec::new()),
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl trouve_agents::AgentBackend for HandoffBackend {
+    fn id(&self) -> &str {
+        self.name
+    }
+
+    fn models(&self) -> Vec<trouve_protocol::ModelInfo> {
+        vec![trouve_protocol::ModelInfo {
+            id: format!("{}/m", self.name),
+            display_name: self.name.into(),
+            context_window: 100_000,
+            supports_tools: true,
+            input_price_per_mtok: None,
+            output_price_per_mtok: None,
+            options_schema: serde_json::json!({"type": "object", "properties": {}}),
+        }]
+    }
+
+    fn status(&self) -> trouve_agents::BackendStatus {
+        trouve_agents::BackendStatus {
+            installed: true,
+            has_credentials: true,
+        }
+    }
+
+    async fn start_login(
+        &self,
+    ) -> Result<trouve_agents::BackendLogin, trouve_agents::BackendError> {
+        Err(trouve_agents::BackendError::Auth("not needed".into()))
+    }
+
+    async fn run_turn(
+        &self,
+        turn: trouve_agents::BackendTurn,
+    ) -> Result<trouve_agents::BackendEventStream, trouve_agents::BackendError> {
+        let fresh = turn.session.is_none();
+        self.turns
+            .lock()
+            .unwrap()
+            .push((turn.session.clone(), turn.prompt.clone()));
+        let name = self.name;
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        tokio::spawn(async move {
+            use trouve_agents::BackendEvent as E;
+            if fresh {
+                let _ = tx
+                    .send(Ok(E::SessionStarted {
+                        session_id: format!("{name}-sess"),
+                    }))
+                    .await;
+            }
+            let _ = tx
+                .send(Ok(E::TextDelta(format!("reply from {name}"))))
+                .await;
+            let _ = tx
+                .send(Ok(E::Completed {
+                    usage: Usage::default(),
+                }))
+                .await;
+        });
+        let stream = futures::stream::poll_fn(move |cx| rx.poll_recv(cx));
+        Ok(Box::pin(stream))
+    }
+}
+
+/// Swapping models mid-thread: each vendor keeps its own resumable
+/// session, a vendor joining a thread with history gets a handoff digest
+/// of the prior conversation prepended to its first prompt, and switching
+/// back to the first vendor resumes its session digest-free.
+#[tokio::test]
+async fn model_swap_hands_off_history_and_keeps_vendor_sessions() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path().join("repo");
+    std::fs::create_dir(&repo).unwrap();
+    init_repo(&repo);
+
+    let agent_a = Arc::new(HandoffBackend::new("agent-a"));
+    let agent_b = Arc::new(HandoffBackend::new("agent-b"));
+    let store = Store::open(&tmp.path().join("db/trouve.db")).unwrap();
+    let engine = Arc::new(
+        Engine::new(store, tmp.path().join("data"), &Config::default())
+            .with_config_dir(None)
+            .with_backend("agent-a", agent_a.clone())
+            .with_backend("agent-b", agent_b.clone())
+            .with_default_model("agent-a/m"),
+    );
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let router = trouve_server::build_router(engine);
+    tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+    let base = format!("http://{addr}/v1");
+    let client = reqwest::Client::new();
+
+    let ws: serde_json::Value = client
+        .post(format!("{base}/workspaces"))
+        .json(&serde_json::json!({"path": repo.to_str().unwrap()}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let session: serde_json::Value = client
+        .post(format!("{base}/sessions"))
+        .json(&serde_json::json!({"workspace_id": ws["id"], "title": "Swap"}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let thread: serde_json::Value = client
+        .post(format!("{base}/threads"))
+        .json(&serde_json::json!({"session_id": session["id"]}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let thread_id = thread["id"].as_str().unwrap();
+    let events_url = format!("{base}/threads/{thread_id}/events");
+
+    let send = |content: &str| {
+        let client = client.clone();
+        let url = format!("{base}/threads/{thread_id}/messages");
+        let body = serde_json::json!({"content": content});
+        async move {
+            client.post(url).json(&body).send().await.unwrap();
+        }
+    };
+    let set_model = |model: &str| {
+        let client = client.clone();
+        let url = format!("{base}/threads/{thread_id}");
+        let body = serde_json::json!({"model": model});
+        async move {
+            let resp = client.patch(url).json(&body).send().await.unwrap();
+            assert_eq!(resp.status(), 200);
+        }
+    };
+
+    // Turn 1 on agent-a: a fresh thread — no session, no digest.
+    send("first message").await;
+    wait_for_event(&client, &events_url, |e| {
+        e["type"] == "turn.completed" && e["turn"] == 1
+    })
+    .await;
+    {
+        let turns = agent_a.turns.lock().unwrap();
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0].0, None);
+        assert_eq!(turns[0].1, "first message");
+    }
+
+    // Turn 2 on agent-b: no vendor session here yet, so its first prompt
+    // carries a digest of the conversation agent-a had.
+    set_model("agent-b/m").await;
+    send("second message").await;
+    wait_for_event(&client, &events_url, |e| {
+        e["type"] == "turn.completed" && e["turn"] == 2
+    })
+    .await;
+    {
+        let turns = agent_b.turns.lock().unwrap();
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0].0, None);
+        let prompt = &turns[0].1;
+        assert!(prompt.starts_with("[Handoff:"), "digest missing: {prompt}");
+        assert!(prompt.contains("first message"));
+        assert!(prompt.contains("reply from agent-a"));
+        assert!(prompt.ends_with("second message"));
+    }
+
+    // Turn 3 back on agent-a: its vendor session survived agent-b's turn
+    // (per-backend keying), and it gets caught up on just the turn it
+    // missed — not the history its own session already carries.
+    set_model("agent-a/m").await;
+    send("third message").await;
+    wait_for_event(&client, &events_url, |e| {
+        e["type"] == "turn.completed" && e["turn"] == 3
+    })
+    .await;
+    {
+        let turns = agent_a.turns.lock().unwrap();
+        assert_eq!(turns.len(), 2);
+        assert_eq!(turns[1].0.as_deref(), Some("agent-a-sess"));
+        let prompt = &turns[1].1;
+        assert!(
+            prompt.starts_with("[Handoff: since your last turn"),
+            "catch-up digest missing: {prompt}"
+        );
+        assert!(prompt.contains("second message"));
+        assert!(prompt.contains("reply from agent-b"));
+        assert!(
+            !prompt.contains("first message"),
+            "already-seen history repeated"
+        );
+        assert!(prompt.ends_with("third message"));
+    }
+
+    // agent-b's session survived too, and its catch-up covers only
+    // agent-a's interleaved turn.
+    set_model("agent-b/m").await;
+    send("fourth message").await;
+    wait_for_event(&client, &events_url, |e| {
+        e["type"] == "turn.completed" && e["turn"] == 4
+    })
+    .await;
+    {
+        let turns = agent_b.turns.lock().unwrap();
+        assert_eq!(turns.len(), 2);
+        assert_eq!(turns[1].0.as_deref(), Some("agent-b-sess"));
+        let prompt = &turns[1].1;
+        assert!(prompt.starts_with("[Handoff: since your last turn"));
+        assert!(prompt.contains("third message"));
+        assert!(
+            !prompt.contains("first message"),
+            "already-seen history repeated"
+        );
+        assert!(prompt.ends_with("fourth message"));
+    }
+}
+
 /// Scripted `AgentBackend`: every turn asks for approval of one "command",
 /// writes a file to the worktree when approved, and completes with usage.
 /// Records the vendor session id it was resumed with, per turn.
