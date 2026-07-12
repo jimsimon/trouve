@@ -8,6 +8,10 @@ const MAX_READ_BYTES: usize = 64 * 1024;
 /// Images larger than this are rejected rather than truncated (a partial
 /// image is useless as vision input).
 const MAX_IMAGE_BYTES: usize = 8 * 1024 * 1024;
+/// Text files larger than this are refused up front: `read_to_string`
+/// buffers the whole file regardless of offset/limit, so an adversarial
+/// multi-GB file would otherwise exhaust memory before the line paging runs.
+const MAX_TEXT_FILE_BYTES: u64 = 32 * 1024 * 1024;
 
 /// MIME type for paths `read_file` should return as vision content.
 fn image_mime(path: &str) -> Option<&'static str> {
@@ -59,6 +63,16 @@ impl Tool for ReadFile {
         // onto the provider message as native image input).
         if let Some(mime) = image_mime(path) {
             use base64::Engine as _;
+            // Check the size before reading so an 8 GB "image" isn't buffered
+            // in full only to be rejected.
+            if let Ok(meta) = tokio::fs::metadata(&full).await
+                && meta.len() > MAX_IMAGE_BYTES as u64
+            {
+                return ToolResult::error(format!(
+                    "image {path} is {} bytes; the limit is {MAX_IMAGE_BYTES}",
+                    meta.len()
+                ));
+            }
             let bytes = match tokio::fs::read(&full).await {
                 Ok(b) => b,
                 Err(e) => return ToolResult::error(format!("cannot read {path}: {e}")),
@@ -74,6 +88,15 @@ impl Tool for ReadFile {
                 "note": format!("{mime} image, {} bytes, attached as vision content", bytes.len()),
                 "_images": [{"mime": mime, "data": data}],
             }));
+        }
+        if let Ok(meta) = tokio::fs::metadata(&full).await
+            && meta.len() > MAX_TEXT_FILE_BYTES
+        {
+            return ToolResult::error(format!(
+                "{path} is {} bytes; too large to read whole (limit {MAX_TEXT_FILE_BYTES}). \
+                 Use grep to find the relevant lines.",
+                meta.len()
+            ));
         }
         let text = match tokio::fs::read_to_string(&full).await {
             Ok(t) => t,

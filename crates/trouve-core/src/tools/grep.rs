@@ -9,6 +9,9 @@ use serde_json::{Value, json};
 use super::{Tool, ToolCtx, ToolResult};
 
 const MAX_RESULTS: usize = 200;
+/// Skip files larger than this: grep slurps each file into a String, so a
+/// single huge or newline-free file would spike memory and CPU.
+const MAX_GREP_FILE_BYTES: u64 = 8 * 1024 * 1024;
 
 pub struct Grep;
 
@@ -86,6 +89,14 @@ fn search(
     'outer: for entry in walker {
         let entry = entry.map_err(|e| e.to_string())?;
         if !entry.file_type().is_some_and(|t| t.is_file()) {
+            continue;
+        }
+        // Skip files too large to slurp: one huge or newline-free file
+        // (minified/generated) would otherwise blow up memory and CPU.
+        if entry
+            .metadata()
+            .is_ok_and(|m| m.len() > MAX_GREP_FILE_BYTES)
+        {
             continue;
         }
         let Ok(text) = std::fs::read_to_string(entry.path()) else {
