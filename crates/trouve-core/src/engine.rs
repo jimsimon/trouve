@@ -2394,6 +2394,44 @@ impl Engine {
         Ok(entries)
     }
 
+    /// Every path in the session worktree (files, plus directories with a
+    /// trailing '/'), worktree-relative, honouring .gitignore — feeds the
+    /// composer's "@" file-mention completion. Capped; alphabetical.
+    pub async fn session_list_paths(
+        &self,
+        session_id: &str,
+    ) -> Result<Vec<String>, EngineError> {
+        const MAX_PATHS: usize = 5000;
+        let session = self.get_session(session_id)?;
+        let worktree = PathBuf::from(&session.worktree_path);
+        let paths = tokio::task::spawn_blocking(move || {
+            let mut paths = Vec::new();
+            let walker = ignore::WalkBuilder::new(&worktree)
+                .hidden(true)
+                .require_git(false)
+                .build();
+            for entry in walker.flatten() {
+                let Ok(rel) = entry.path().strip_prefix(&worktree) else {
+                    continue;
+                };
+                if rel.as_os_str().is_empty() {
+                    continue;
+                }
+                let mut path = rel.to_string_lossy().replace('\\', "/");
+                if entry.file_type().is_some_and(|t| t.is_dir()) {
+                    path.push('/');
+                }
+                paths.push(path);
+            }
+            paths.sort();
+            paths.truncate(MAX_PATHS);
+            paths
+        })
+        .await
+        .map_err(|e| EngineError::Internal(anyhow!("path walk failed: {e}")))?;
+        Ok(paths)
+    }
+
     /// Read a file inside the session worktree.
     pub async fn session_read_file(
         &self,

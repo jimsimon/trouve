@@ -2075,6 +2075,89 @@ async fn leftover_queue_waits_for_explicit_dispatch_after_restart() {
     assert!(queue.is_empty());
 }
 
+/// The "@"-mention path list: every worktree file plus directories with a
+/// trailing '/', gitignored and hidden entries excluded.
+#[tokio::test]
+async fn worktree_paths_for_mentions() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path().join("repo");
+    std::fs::create_dir(&repo).unwrap();
+    init_repo(&repo);
+
+    let store = Store::open(&tmp.path().join("db/trouve.db")).unwrap();
+    let engine = Arc::new(
+        Engine::new(store, tmp.path().join("data"), &Config::default())
+            .with_config_dir(None)
+            .with_provider(
+                "scripted",
+                Arc::new(ScriptedProvider {
+                    calls: AtomicUsize::new(0),
+                }),
+            )
+            .with_default_model("scripted/test-model"),
+    );
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let router = trouve_server::build_router(engine);
+    tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+    let base = format!("http://{addr}/v1");
+    let client = reqwest::Client::new();
+
+    let ws: serde_json::Value = client
+        .post(format!("{base}/workspaces"))
+        .json(&serde_json::json!({"path": repo.to_str().unwrap()}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let session: serde_json::Value = client
+        .post(format!("{base}/sessions"))
+        .json(&serde_json::json!({"workspace_id": ws["id"], "title": "Mentions"}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let session_id = session["id"].as_str().unwrap();
+    let worktree = std::path::PathBuf::from(session["worktree_path"].as_str().unwrap());
+
+    std::fs::create_dir_all(worktree.join("src")).unwrap();
+    std::fs::write(worktree.join("src/main.rs"), "fn main() {}\n").unwrap();
+    std::fs::create_dir_all(worktree.join("target")).unwrap();
+    std::fs::write(worktree.join("target/junk.o"), "o").unwrap();
+    std::fs::write(worktree.join(".gitignore"), "target/\n").unwrap();
+
+    let paths: Vec<String> = client
+        .get(format!("{base}/sessions/{session_id}/paths"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(paths.contains(&"src/".to_string()), "{paths:?}");
+    assert!(paths.contains(&"src/main.rs".to_string()), "{paths:?}");
+    // Gitignored and hidden entries stay out.
+    assert!(!paths.iter().any(|p| p.starts_with("target")), "{paths:?}");
+    assert!(!paths.iter().any(|p| p.starts_with(".git")), "{paths:?}");
+    // Sorted, so the popup's unfiltered view is stable.
+    let mut sorted = paths.clone();
+    sorted.sort();
+    assert_eq!(paths, sorted);
+
+    // Unknown session: 404.
+    let missing = client
+        .get(format!("{base}/sessions/nope/paths"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(missing.status(), 404);
+}
+
 /// Integrated terminal: open a shell in the session worktree, type a
 /// command, watch the output stream, resize, and kill.
 #[cfg(unix)]

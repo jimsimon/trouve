@@ -597,6 +597,27 @@ component PromptBox inherits Rectangle {
         input.focus();
     }
 
+    // "@" file-mention completion: while its popup is up, ↑/↓ move the
+    // highlight, Tab/Enter insert the highlighted path, Escape dismisses.
+    // Rust owns the token parsing and list filtering — the box just streams
+    // cursor positions out (mentions can sit anywhere in the draft, so the
+    // byte offset locates the token under edit).
+    in property <bool> at-active: false;
+    in property <int> at-count: 0;
+    in-out property <int> at-selected: 0;
+    callback at-accepted();
+    callback at-dismissed();
+    callback cursor-moved(/* UTF-8 byte offset */ int);
+    // Rust-driven cursor placement after splicing a mention into the draft:
+    // bump `cursor-seq` with the wanted offset in `cursor-target` (a plain
+    // property write can't retrigger at the same offset; the seq can).
+    in property <int> cursor-seq: 0;
+    in property <int> cursor-target: 0;
+    changed cursor-seq => {
+        input.set-selection-offsets(root.cursor-target, root.cursor-target);
+        input.focus();
+    }
+
     property <length> pad: 8px;
     property <length> line-height: Theme.fs(18px);
     property <length> max-input-height: Theme.fs(162px); // ~8 lines
@@ -653,6 +674,26 @@ component PromptBox inherits Rectangle {
                     && root.paste-image-attempted()) {
                     return accept;
                 }
+                if (root.at-active) {
+                    if (event.text == Key.UpArrow) {
+                        root.at-selected = Math.max(0, root.at-selected - 1);
+                        return accept;
+                    }
+                    if (event.text == Key.DownArrow) {
+                        root.at-selected = Math.min(
+                            root.at-count - 1, root.at-selected + 1);
+                        return accept;
+                    }
+                    if (event.text == Key.Tab
+                        || (event.text == Key.Return && !event.modifiers.shift)) {
+                        root.at-accepted();
+                        return accept;
+                    }
+                    if (event.text == Key.Escape) {
+                        root.at-dismissed();
+                        return accept;
+                    }
+                }
                 if (root.completion-active && event.text == Key.Tab) {
                     root.apply-completion(root.completion-text);
                     return accept;
@@ -677,6 +718,9 @@ component PromptBox inherits Rectangle {
                 } else if (pos.y + root.scroll-y + root.line-height > clipper.height) {
                     root.scroll-y = clipper.height - pos.y - root.line-height;
                 }
+            }
+            changed cursor-position-byte-offset => {
+                root.cursor-moved(self.cursor-position-byte-offset);
             }
         }
     }
@@ -1186,7 +1230,8 @@ export component AppWindow inherits Window {
     callback send-message(string);
     in property <bool> composer-enabled: false;
     // Draft survives the composer being swapped out for the new-thread form.
-    property <string> composer-draft;
+    // in-out: Rust splices "@path " mentions into it when one is picked.
+    in-out property <string> composer-draft;
     // Files staged for the next prompt (screenshots, logs, …).
     in property <[AttachmentChip]> composer-attachments: [];
     callback attach-file();
@@ -1210,7 +1255,30 @@ export component AppWindow inherits Window {
     callback slash-filter-changed(string);
     changed composer-draft => {
         root.slash-suppressed = false;
+        root.at-suppressed = false;
         root.slash-filter-changed(root.composer-draft);
+        root.at-filter-changed(root.composer-draft, root.composer-cursor);
+    }
+
+    // "@" file mentions: the session worktree's paths (files, dirs with a
+    // trailing '/'), the fuzzy-ranked match indices for the token under the
+    // cursor, and the highlighted row. Rust parses the token and filters on
+    // every edit or caret move; picking splices "@path " into the draft.
+    in property <[string]> at-files;
+    in property <[int]> at-matches;
+    in-out property <bool> at-active: false;
+    in-out property <int> at-selected: 0;
+    property <bool> at-suppressed: false;
+    // Caret byte offset, mirrored out of the composer so filters and the
+    // splice both know which "@token" is under edit.
+    in-out property <int> composer-cursor: 0;
+    // Post-splice caret placement (see PromptBox.cursor-seq).
+    in-out property <int> composer-cursor-seq: 0;
+    in-out property <int> composer-cursor-target: 0;
+    callback at-filter-changed(/* draft */ string, /* cursor */ int);
+    callback at-picked(/* index into at-files */ int);
+    changed at-files => {
+        root.at-filter-changed(root.composer-draft, root.composer-cursor);
     }
 
     // --- queued prompts ---------------------------------------------------
@@ -2969,6 +3037,48 @@ export component AppWindow inherits Window {
                         }
                     }
 
+                    // "@" file-mention popup, floated above the composer the
+                    // same way as the "/" one. ↑/↓ (handled in the PromptBox)
+                    // move the highlight; click or Tab/Enter inserts.
+                    Rectangle {
+                        height: 0;
+                        visible: root.at-active && !root.at-suppressed;
+                        Rectangle {
+                            x: 0;
+                            y: -self.height - 6px;
+                            width: min(parent.width, 480px);
+                            height: at-list.preferred-height;
+                            background: Theme.c.popup-bg;
+                            border-radius: 8px;
+                            border-width: 1px;
+                            border-color: Theme.c.border;
+                            at-list := VerticalLayout {
+                                padding: 6px;
+                                for file[rank] in root.at-matches: Rectangle {
+                                    height: Theme.fs(26px);
+                                    border-radius: 5px;
+                                    background: rank == root.at-selected ? Theme.c.accent-bg
+                                        : at-ta.has-hover ? Theme.c.hover-strong : transparent;
+                                    at-ta := TouchArea {
+                                        clicked => { root.at-picked(file); }
+                                    }
+                                    HorizontalLayout {
+                                        padding-left: 8px;
+                                        padding-right: 8px;
+                                        Text {
+                                            text: root.at-files[file];
+                                            color: Theme.c.text-hi;
+                                            font-size: Theme.fs(12px);
+                                            vertical-alignment: center;
+                                            overflow: elide;
+                                            horizontal-stretch: 1;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+
                     // Files staged for the next prompt: one removable chip
                     // each. Kept above the input so pasting a screenshot has
                     // visible, undoable feedback before sending.
@@ -3022,6 +3132,22 @@ export component AppWindow inherits Window {
                         completion-active: root.slash-active && !root.slash-suppressed;
                         completion-text: root.slash-completion;
                         completion-dismissed => { root.slash-suppressed = true; }
+                        at-active: root.at-active && !root.at-suppressed;
+                        at-count: root.at-matches.length;
+                        at-selected <=> root.at-selected;
+                        cursor-seq: root.composer-cursor-seq;
+                        cursor-target: root.composer-cursor-target;
+                        at-accepted => {
+                            if (root.at-selected >= 0
+                                && root.at-selected < root.at-matches.length) {
+                                root.at-picked(root.at-matches[root.at-selected]);
+                            }
+                        }
+                        at-dismissed => { root.at-suppressed = true; }
+                        cursor-moved(offset) => {
+                            root.composer-cursor = offset;
+                            root.at-filter-changed(self.text, offset);
+                        }
                         paste-image-attempted => { root.paste-image-attempted() }
                         submitted(text) => {
                             root.send-message(text);

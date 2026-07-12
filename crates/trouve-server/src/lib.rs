@@ -121,6 +121,7 @@ impl IntoResponse for ApiError {
         session_mcp_servers,
         session_diff,
         session_files,
+        session_paths,
         session_file,
         open_terminal,
         kill_terminal,
@@ -256,6 +257,7 @@ pub fn build_router(engine: Arc<Engine>) -> Router {
         .route("/v1/sessions/{id}/mcp-servers", get(session_mcp_servers))
         .route("/v1/sessions/{id}/diff", get(session_diff))
         .route("/v1/sessions/{id}/files", get(session_files))
+        .route("/v1/sessions/{id}/paths", get(session_paths))
         .route("/v1/sessions/{id}/file", get(session_file))
         .route("/v1/sessions/{id}/terminal", post(open_terminal))
         .route("/v1/terminals/{id}", axum::routing::delete(kill_terminal))
@@ -1037,6 +1039,15 @@ async fn session_files(
     Query(q): Query<PathQuery>,
 ) -> Result<Json<Vec<DirEntry>>, ApiError> {
     Ok(Json(engine.session_list_dir(&id, &q.path).await?))
+}
+
+#[utoipa::path(get, path = "/v1/sessions/{id}/paths", params(("id" = String, Path,)),
+    responses((status = 200, body = [String]), (status = 404, body = ErrorBody)))]
+async fn session_paths(
+    State(engine): State<Arc<Engine>>,
+    Path(id): Path<String>,
+) -> Result<Json<Vec<String>>, ApiError> {
+    Ok(Json(engine.session_list_paths(&id).await?))
 }
 
 #[utoipa::path(get, path = "/v1/sessions/{id}/file",

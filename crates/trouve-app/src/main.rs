@@ -31,6 +31,28 @@ fn fuzzy_match_indices(items: &[String], query: &str) -> Vec<i32> {
     scored.into_iter().map(|(_, i)| i).collect()
 }
 
+/// The "@" file-mention token under the cursor: the byte offset of its '@'
+/// and the query typed after it. The token must run whitespace-free from the
+/// '@' to the cursor, and the '@' must start the draft or follow whitespace
+/// (so emails and mid-word '@'s don't pop the picker).
+fn at_token(text: &str, cursor: usize) -> Option<(usize, String)> {
+    if cursor > text.len() || !text.is_char_boundary(cursor) {
+        return None;
+    }
+    let head = &text[..cursor];
+    let at = head.rfind('@')?;
+    let query = &head[at + 1..];
+    if query.chars().any(char::is_whitespace) {
+        return None;
+    }
+    if let Some(prev) = head[..at].chars().next_back()
+        && !prev.is_whitespace()
+    {
+        return None;
+    }
+    Some((at, query.to_string()))
+}
+
 fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -258,6 +280,56 @@ fn main() -> anyhow::Result<()> {
                 }
                 None => window.set_slash_active(false),
             }
+        });
+    }
+    {
+        // "@" file mentions: re-rank the worktree paths against the token
+        // under the cursor on every edit or caret move. Activation also asks
+        // the controller for a (throttled) fresh path list, so files the
+        // agent just created show up.
+        let weak = window.as_weak();
+        let tx = tx.clone();
+        window.on_at_filter_changed(move |text, cursor| {
+            let window = weak.unwrap();
+            let Some((_, query)) = at_token(&text, cursor.max(0) as usize) else {
+                window.set_at_active(false);
+                return;
+            };
+            let _ = tx.send(UiCommand::RefreshAtFiles);
+            let files: Vec<String> = window.get_at_files().iter().map(|s| s.to_string()).collect();
+            let mut matches = fuzzy_match_indices(&files, &query);
+            matches.truncate(8);
+            if matches.is_empty() {
+                window.set_at_active(false);
+            } else {
+                window.set_at_matches(slint::ModelRc::new(slint::VecModel::from(matches)));
+                window.set_at_selected(0);
+                window.set_at_active(true);
+            }
+        });
+    }
+    {
+        // A mention was picked (click or Tab/Enter): splice "@path " over the
+        // token under the cursor and park the caret after it.
+        let weak = window.as_weak();
+        window.on_at_picked(move |file_idx| {
+            let window = weak.unwrap();
+            let text = window.get_composer_draft().to_string();
+            let cursor = window.get_composer_cursor().max(0) as usize;
+            let Some((at, _)) = at_token(&text, cursor) else {
+                return;
+            };
+            let files = window.get_at_files();
+            let Some(path) = files.row_data(file_idx as usize) else {
+                return;
+            };
+            let insert = format!("@{path} ");
+            let draft = format!("{}{}{}", &text[..at], insert, &text[cursor..]);
+            window.set_at_active(false);
+            window.set_composer_draft(draft.into());
+            window.set_composer_cursor((at + insert.len()) as i32);
+            window.set_composer_cursor_target((at + insert.len()) as i32);
+            window.set_composer_cursor_seq(window.get_composer_cursor_seq() + 1);
         });
     }
     {
@@ -1050,4 +1122,36 @@ fn clipboard_image_png() -> Option<Vec<u8>> {
         writer.write_image_data(&image.bytes).ok()?;
     }
     Some(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::at_token;
+
+    #[test]
+    fn at_token_finds_the_token_under_the_cursor() {
+        // Bare "@" at the start: empty query.
+        assert_eq!(at_token("@", 1), Some((0, String::new())));
+        // Query runs from the '@' to the cursor.
+        assert_eq!(at_token("fix @src/ma", 11), Some((4, "src/ma".into())));
+        // Cursor mid-token only sees the head of the query.
+        assert_eq!(at_token("fix @src/ma bug", 8), Some((4, "src".into())));
+        // Later mentions win (closest '@' before the cursor).
+        assert_eq!(at_token("@a and @b", 9), Some((7, "b".into())));
+    }
+
+    #[test]
+    fn at_token_rejects_non_mentions() {
+        // No '@' at all.
+        assert_eq!(at_token("plain text", 5), None);
+        // Whitespace between the '@' and the cursor: token is finished.
+        assert_eq!(at_token("@src/main.rs done", 17), None);
+        // Mid-word '@' (emails).
+        assert_eq!(at_token("mail me@example.com", 12), None);
+        // Cursor before the '@'.
+        assert_eq!(at_token("ab @cd", 2), None);
+        // Out-of-range or non-boundary cursors.
+        assert_eq!(at_token("@é", 2), None);
+        assert_eq!(at_token("@x", 99), None);
+    }
 }

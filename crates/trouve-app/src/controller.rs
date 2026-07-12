@@ -91,6 +91,9 @@ pub enum UiCommand {
     /// Chat viewport-y sampled by the shell's poll, bookmarked per thread.
     ChatScrolled(f32),
     SendMessage(String),
+    /// The "@" mention popup opened (or is filtering): refresh the worktree
+    /// path list feeding it. Throttled per session by the controller.
+    RefreshAtFiles,
     /// Composer 📎 button: pick files to ride with the next prompt.
     AttachFileDialog,
     /// A file's bytes staged as a prompt attachment (from the picker or a
@@ -437,6 +440,9 @@ struct Controller {
     /// Files staged for the next prompt (already base64-encoded uploads);
     /// consumed by the next send from either composer.
     pending_attachments: Vec<trouve_protocol::AttachmentUpload>,
+    /// Which session's worktree paths currently back the composer's "@"
+    /// mention popup, and when they were fetched (throttles refreshes).
+    at_files_fetched: Option<(String, std::time::Instant)>,
     expanded_tools: HashSet<String>,
     /// (thread id, turn) pairs showing raw text instead of styled markdown.
     raw_turns: HashSet<(String, u64)>,
@@ -571,6 +577,7 @@ pub async fn run(
         notify: crate::winstate::load_notifications(),
         window_focused,
         pending_attachments: Vec::new(),
+        at_files_fetched: None,
         expanded_tools: HashSet::new(),
         raw_turns: HashSet::new(),
         collapsed_cards: HashSet::new(),
@@ -1207,6 +1214,34 @@ impl Controller {
         });
     }
 
+    /// Refresh the composer's "@"-mention path list for the open session, at
+    /// most once per TTL (the popup pings on every keystroke, and renders
+    /// ping here too — the walk is a full worktree scan, so throttle it).
+    fn refresh_at_files(&mut self) {
+        const TTL: std::time::Duration = std::time::Duration::from_secs(10);
+        let session_id = self
+            .current_thread
+            .and_then(|i| self.threads.get(i))
+            .map(|t| t.session_id.clone())
+            .or_else(|| self.current_session_id());
+        let Some(session_id) = session_id else { return };
+        if let Some((sid, at)) = &self.at_files_fetched
+            && *sid == session_id
+            && at.elapsed() < TTL
+        {
+            return;
+        }
+        self.at_files_fetched = Some((session_id.clone(), std::time::Instant::now()));
+        let client = self.client.clone();
+        let ui = self.ui.clone();
+        tokio::spawn(async move {
+            match client.session_paths(&session_id).await {
+                Ok(paths) => ui::set_at_files(&ui, paths),
+                Err(e) => tracing::warn!("worktree path list for @-mentions failed: {e:#}"),
+            }
+        });
+    }
+
     /// Re-fold the current thread into chat rows. `scroll` jumps the list to
     /// the end — wanted when content arrives or threads switch, jarring for
     /// in-place toggles (tool details, raw view).
@@ -1218,6 +1253,9 @@ impl Controller {
             ui::set_slash_commands(&self.ui, Vec::new());
             return;
         };
+        // Keep the "@" mention paths roughly current while a thread is open
+        // (agents create files mid-turn); the helper self-throttles.
+        self.refresh_at_files();
         let raw_turns: HashSet<u64> = self
             .raw_turns
             .iter()
@@ -2696,6 +2734,7 @@ impl Controller {
                     }
                 }
             }
+            UiCommand::RefreshAtFiles => self.refresh_at_files(),
             UiCommand::AttachFileDialog => {
                 // The portal dialog can stay open indefinitely; run it off
                 // the command loop so events keep flowing meanwhile.

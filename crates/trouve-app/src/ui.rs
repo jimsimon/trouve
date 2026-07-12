@@ -326,6 +326,15 @@ pub fn set_slash_commands(ui: &Ui, commands: Vec<(String, String)>) {
     });
 }
 
+/// The session worktree's paths (files, dirs with a trailing '/') backing
+/// the composer's "@" file-mention popup.
+pub fn set_at_files(ui: &Ui, files: Vec<String>) {
+    let _ = ui.upgrade_in_event_loop(move |ui| {
+        let files: Vec<SharedString> = files.iter().map(|f| f.as_str().into()).collect();
+        ui.set_at_files(ModelRc::new(VecModel::from(files)));
+    });
+}
+
 /// The current thread's queued prompts (run order), a per-row badge
 /// ("📎2", empty for none — kept out of the editable text), and whether the
 /// thread is idle (idle + non-empty queue surfaces the "Send now" pill).
