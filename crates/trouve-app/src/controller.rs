@@ -4135,6 +4135,7 @@ fn context_label(token: &str) -> String {
 fn level_label(token: &str) -> String {
     match token {
         "off" => "Off".into(),
+        "on" => "On".into(),
         "none" => "None".into(),
         "minimal" => "Minimal".into(),
         "low" => "Low".into(),

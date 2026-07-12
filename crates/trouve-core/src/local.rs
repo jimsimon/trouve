@@ -42,6 +42,36 @@ pub struct CatalogEntry {
     pub size_bytes: u64,
     pub params: &'static str,
     pub notes: &'static str,
+    pub thinking: Thinking,
+}
+
+/// How a local model's reasoning is steered through its chat template.
+/// There is no universal knob in llama.cpp — it's per model family, applied
+/// via `chat_template_kwargs` on the request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Thinking {
+    /// Plain instruct model: no thinking controls.
+    None,
+    /// On/off via the `enable_thinking` template kwarg (Qwen3-style).
+    Toggle,
+    /// low/medium/high via the `reasoning_effort` template kwarg (GPT-OSS).
+    Effort,
+}
+
+/// Guess the thinking support of a user-added GGUF from its repo/filename
+/// (catalog entries declare it explicitly). Conservative: only families
+/// whose templates are known to take the kwargs.
+pub fn thinking_support(repo: &str, file: &str) -> Thinking {
+    let s = format!("{repo} {file}").to_ascii_lowercase();
+    if s.contains("gpt-oss") {
+        return Thinking::Effort;
+    }
+    // Qwen3-family hybrids honor enable_thinking; the Coder and Instruct
+    // variants are non-thinking and their templates reject the kwarg.
+    if s.contains("qwen3") && !s.contains("coder") && !s.contains("instruct") {
+        return Thinking::Toggle;
+    }
+    Thinking::None
 }
 
 /// Known-good coding models with working llama.cpp tool calling, smallest
@@ -56,6 +86,7 @@ pub const CATALOG: &[CatalogEntry] = &[
         size_bytes: 2_104_932_800,
         params: "3B",
         notes: "Smallest option; quick answers and light edits on any machine.",
+        thinking: Thinking::None,
     },
     CatalogEntry {
         id: "qwen2.5-coder-7b",
@@ -65,6 +96,7 @@ pub const CATALOG: &[CatalogEntry] = &[
         size_bytes: 4_683_073_536,
         params: "7B",
         notes: "Best pick for 8 GB GPUs; solid completions and small tasks.",
+        thinking: Thinking::None,
     },
     CatalogEntry {
         id: "gpt-oss-20b",
@@ -74,6 +106,7 @@ pub const CATALOG: &[CatalogEntry] = &[
         size_bytes: 12_109_566_560,
         params: "21B MoE",
         notes: "OpenAI's open-weight model; strong reasoning and tool use.",
+        thinking: Thinking::Effort,
     },
     CatalogEntry {
         id: "devstral-small-2507",
@@ -83,6 +116,7 @@ pub const CATALOG: &[CatalogEntry] = &[
         size_bytes: 14_333_915_904,
         params: "24B",
         notes: "Mistral's coding-agent specialist; good at multi-file edits.",
+        thinking: Thinking::None,
     },
     CatalogEntry {
         id: "qwen3.6-27b",
@@ -92,6 +126,7 @@ pub const CATALOG: &[CatalogEntry] = &[
         size_bytes: 16_817_244_384,
         params: "27B",
         notes: "Best all-round coding model for a single 24 GB GPU.",
+        thinking: Thinking::Toggle,
     },
     CatalogEntry {
         id: "qwen3-coder-30b",
@@ -101,6 +136,7 @@ pub const CATALOG: &[CatalogEntry] = &[
         size_bytes: 18_556_689_568,
         params: "30B MoE",
         notes: "Only 3B active parameters — usable even on CPU with enough RAM.",
+        thinking: Thinking::None,
     },
 ];
 
@@ -174,6 +210,7 @@ pub struct ModelEntry {
     pub params: String,
     pub notes: String,
     pub custom: bool,
+    pub thinking: Thinking,
 }
 
 /// Every model trouve can offer locally: the curated catalog plus the
@@ -190,11 +227,13 @@ pub fn all_entries(config_dir: Option<&Path>) -> Vec<ModelEntry> {
             params: c.params.into(),
             notes: c.notes.into(),
             custom: false,
+            thinking: c.thinking,
         })
         .collect();
     if let Some(dir) = config_dir {
         for custom in read_custom_models(&custom_models_path(dir)) {
             entries.retain(|e| e.id != custom.id);
+            let thinking = thinking_support(&custom.repo, &custom.file);
             entries.push(ModelEntry {
                 id: custom.id,
                 display_name: custom.display_name,
@@ -204,6 +243,7 @@ pub fn all_entries(config_dir: Option<&Path>) -> Vec<ModelEntry> {
                 params: String::new(),
                 notes: String::new(),
                 custom: true,
+                thinking,
             });
         }
     }
@@ -705,6 +745,61 @@ impl LocalProvider {
     }
 }
 
+/// Options schema for one local model — the composer's thinking dropdown
+/// renders from this (`thinking_level` / `reasoning_effort` are the keys
+/// clients look for).
+pub fn options_schema(thinking: Thinking) -> serde_json::Value {
+    match thinking {
+        Thinking::None => serde_json::json!({}),
+        Thinking::Toggle => serde_json::json!({
+            "type": "object",
+            "properties": {
+                "thinking_level": {
+                    "type": "string",
+                    "enum": ["off", "on"],
+                    "default": "on",
+                    "description": "Whether the model thinks before answering"
+                }
+            }
+        }),
+        Thinking::Effort => serde_json::json!({
+            "type": "object",
+            "properties": {
+                "reasoning_effort": {
+                    "type": "string",
+                    "enum": ["low", "medium", "high"],
+                    "default": "medium",
+                    "description": "How much thinking the model does before answering"
+                }
+            }
+        }),
+    }
+}
+
+/// Fold the thread's thinking option into llama.cpp `chat_template_kwargs`.
+/// The thinking keys are always stripped (model swaps can leave a stale key
+/// from the previous model's schema); only the supported kwarg is re-added.
+fn apply_thinking_options(
+    thinking: Thinking,
+    options: &mut serde_json::Map<String, serde_json::Value>,
+) {
+    let effort = options.remove("reasoning_effort");
+    let level = options.remove("thinking_level");
+    let kwargs = match thinking {
+        Thinking::None => None,
+        Thinking::Effort => {
+            effort.map(|v| serde_json::json!({"reasoning_effort": v}))
+        }
+        Thinking::Toggle => level
+            .as_ref()
+            .and_then(|v| v.as_str())
+            .map(|v| serde_json::json!({"enable_thinking": v != "off"})),
+    };
+    if let Some(kwargs) = kwargs {
+        options.insert("chat_template_kwargs".into(), kwargs);
+    }
+}
+
 #[async_trait::async_trait]
 impl Provider for LocalProvider {
     fn id(&self) -> &str {
@@ -721,7 +816,7 @@ impl Provider for LocalProvider {
                 supports_tools: true,
                 input_price_per_mtok: Some(0.0),
                 output_price_per_mtok: Some(0.0),
-                options_schema: serde_json::json!({}),
+                options_schema: options_schema(e.thinking),
             })
             .collect()
     }
@@ -763,7 +858,10 @@ impl Provider for LocalProvider {
             base_url,
             Arc::new(trouve_providers::auth::StaticToken(String::new())),
         );
-        inner.stream_chat(model, messages, tools, options).await
+        // Thinking knobs travel as template kwargs, not top-level fields.
+        let mut options = options.clone();
+        apply_thinking_options(entry.thinking, &mut options);
+        inner.stream_chat(model, messages, tools, &options).await
     }
 }
 
@@ -834,6 +932,84 @@ mod tests {
         let custom = entries.iter().find(|e| e.id == "my-model").unwrap();
         assert!(custom.custom);
         assert_eq!(entries.len(), CATALOG.len() + 1);
+    }
+
+    #[test]
+    fn thinking_support_is_guessed_from_repo_names() {
+        // GPT-OSS takes effort levels; Qwen3 hybrids take the on/off kwarg.
+        assert_eq!(
+            thinking_support("ggml-org/gpt-oss-120b-GGUF", "gpt-oss-120b-mxfp4.gguf"),
+            Thinking::Effort
+        );
+        assert_eq!(
+            thinking_support("unsloth/Qwen3-14B-GGUF", "Qwen3-14B-Q4_K_M.gguf"),
+            Thinking::Toggle
+        );
+        // Coder/Instruct Qwen3 variants don't think; unknown families get
+        // no knobs at all.
+        assert_eq!(
+            thinking_support(
+                "unsloth/Qwen3-Coder-30B-A3B-Instruct-GGUF",
+                "Qwen3-Coder-30B-A3B-Instruct-Q4_K_M.gguf"
+            ),
+            Thinking::None
+        );
+        assert_eq!(
+            thinking_support("mistralai/Devstral-Small-2507_gguf", "d.gguf"),
+            Thinking::None
+        );
+    }
+
+    #[test]
+    fn options_schema_matches_thinking_support() {
+        assert_eq!(options_schema(Thinking::None), serde_json::json!({}));
+        assert_eq!(
+            options_schema(Thinking::Toggle)
+                .pointer("/properties/thinking_level/enum")
+                .unwrap(),
+            &serde_json::json!(["off", "on"])
+        );
+        assert_eq!(
+            options_schema(Thinking::Effort)
+                .pointer("/properties/reasoning_effort/default")
+                .unwrap(),
+            &serde_json::json!("medium")
+        );
+    }
+
+    #[test]
+    fn thinking_options_become_template_kwargs() {
+        // Effort rides through as reasoning_effort.
+        let mut opts = serde_json::json!({"reasoning_effort": "high"})
+            .as_object()
+            .unwrap()
+            .clone();
+        apply_thinking_options(Thinking::Effort, &mut opts);
+        assert_eq!(
+            opts.get("chat_template_kwargs"),
+            Some(&serde_json::json!({"reasoning_effort": "high"}))
+        );
+        assert!(!opts.contains_key("reasoning_effort"));
+
+        // The toggle maps to enable_thinking.
+        let mut opts = serde_json::json!({"thinking_level": "off"})
+            .as_object()
+            .unwrap()
+            .clone();
+        apply_thinking_options(Thinking::Toggle, &mut opts);
+        assert_eq!(
+            opts.get("chat_template_kwargs"),
+            Some(&serde_json::json!({"enable_thinking": false}))
+        );
+
+        // Non-thinking models strip stale keys left by a model swap and
+        // send no kwargs at all.
+        let mut opts = serde_json::json!({"reasoning_effort": "high", "thinking_level": "on"})
+            .as_object()
+            .unwrap()
+            .clone();
+        apply_thinking_options(Thinking::None, &mut opts);
+        assert!(opts.is_empty());
     }
 
     #[test]
