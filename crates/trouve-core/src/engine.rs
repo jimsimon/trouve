@@ -3354,17 +3354,9 @@ impl Engine {
                 model: thread.model.clone(),
             },
         )?;
-
-        // Compact the transcript when it nears the model's context window,
-        // before this turn's user message joins it.
-        if let Err(e) = self
-            .maybe_compact(thread, turn, &provider, &model_name)
-            .await
-        {
-            // Compaction is best-effort; the turn proceeds with full history.
-            tracing::warn!("compaction failed for {}: {e}", thread.id);
-        }
-
+        // Show the prompt in the UI before any slow pre-turn work:
+        // compaction below can block for a while (its model probe may even
+        // spawn the local llama-server and load a model).
         self.store.append_event(
             scope.clone(),
             Event::UserMessage {
@@ -3373,6 +3365,17 @@ impl Engine {
                 attachments: attachments.clone(),
             },
         )?;
+
+        // Compact the transcript when it nears the model's context window,
+        // before this turn's user message joins it (the stored transcript —
+        // the event above is display-only).
+        if let Err(e) = self
+            .maybe_compact(thread, turn, &provider, &model_name)
+            .await
+        {
+            // Compaction is best-effort; the turn proceeds with full history.
+            tracing::warn!("compaction failed for {}: {e}", thread.id);
+        }
         // Native providers speak text-only; every attachment (images
         // included) becomes a path reference the model's file tools can
         // follow.

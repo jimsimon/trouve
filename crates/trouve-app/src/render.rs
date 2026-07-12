@@ -581,13 +581,21 @@ pub fn chat_rows(
         // Nest the activity row at the bottom of the Agent card being
         // streamed into, when one is open at the tail of the chat — it then
         // reads as "this card is still being populated". With no open card
-        // yet (turn just started, or the card was collapsed) it stands
-        // alone as before.
-        let agent_card_open = rows
-            .iter()
-            .rev()
-            .find(|r| r.kind == 7)
-            .is_some_and(|h| h.tool_name == "Agent" && h.expanded);
+        // for the *running* turn (turn just started and nothing has
+        // streamed, or the card was collapsed) it stands alone; the check
+        // on the card's turn keeps it out of the previous turn's card
+        // while a slow model spins up.
+        let running_turn = vm.items.iter().rev().find_map(|it| match it {
+            ChatItem::TurnStatus {
+                turn,
+                state: TurnState::Running,
+            } => Some(*turn as i32),
+            _ => None,
+        });
+        let agent_card_open =
+            rows.iter().rev().find(|r| r.kind == 7).is_some_and(|h| {
+                h.tool_name == "Agent" && h.expanded && running_turn == Some(h.turn)
+            });
         if agent_card_open {
             match rows.last_mut() {
                 // Take over as the card's last body row.
@@ -1804,13 +1812,19 @@ mod tests {
         );
         assert_eq!(rows.last().unwrap().text, "Thinking…");
 
-        // With an open Agent card at the tail, the activity row nests as
-        // the card's last body row instead of standing alone.
-        vm.items = vec![ChatItem::Assistant {
-            turn: 0,
-            content: "streaming…".into(),
-            complete: false,
-        }];
+        // With the running turn's Agent card open at the tail, the activity
+        // row nests as the card's last body row instead of standing alone.
+        vm.items = vec![
+            ChatItem::TurnStatus {
+                turn: 0,
+                state: TurnState::Running,
+            },
+            ChatItem::Assistant {
+                turn: 0,
+                content: "streaming…".into(),
+                complete: false,
+            },
+        ];
         let (rows, _) = chat_rows(
             &vm,
             &HashSet::new(),
@@ -1825,7 +1839,7 @@ mod tests {
         assert_eq!(rows[rows.len() - 2].card_pos, 2);
 
         // Collapsed card: the activity row stands alone again.
-        let collapsed: HashSet<String> = ["a:0".to_string()].into();
+        let collapsed: HashSet<String> = ["a:1".to_string()].into();
         let (rows, _) = chat_rows(
             &vm,
             &HashSet::new(),
@@ -1848,6 +1862,76 @@ mod tests {
             &HashMap::new(),
         );
         assert!(rows.is_empty());
+    }
+
+    #[test]
+    fn activity_row_stays_out_of_previous_turns_card() {
+        // A new turn started (prompt shown) but nothing has streamed yet —
+        // e.g. a local model loading. The pulse must trail the new prompt,
+        // not nest inside the previous turn's completed Agent card.
+        let vm = ThreadViewModel {
+            turn_running: true,
+            items: vec![
+                ChatItem::TurnStatus {
+                    turn: 1,
+                    state: TurnState::Completed {
+                        usage: Default::default(),
+                    },
+                },
+                ChatItem::User {
+                    turn: 1,
+                    content: "first".into(),
+                    attachments: vec![],
+                },
+                ChatItem::Assistant {
+                    turn: 1,
+                    content: "done".into(),
+                    complete: true,
+                },
+                ChatItem::TurnStatus {
+                    turn: 2,
+                    state: TurnState::Running,
+                },
+                ChatItem::User {
+                    turn: 2,
+                    content: "second".into(),
+                    attachments: vec![],
+                },
+            ],
+            ..Default::default()
+        };
+        let (rows, _) = chat_rows(
+            &vm,
+            &HashSet::new(),
+            &HashSet::new(),
+            &HashSet::new(),
+            &HashMap::new(),
+        );
+        let last = rows.last().unwrap();
+        assert_eq!(last.kind, 5);
+        // Standalone (card_pos 0), below the second prompt.
+        assert_eq!(last.card_pos, 0);
+        let prompt_idx = rows.iter().position(|r| r.text == "second").unwrap();
+        assert!(prompt_idx < rows.len() - 1);
+
+        // Once the new turn's card opens, the pulse nests inside *that* card.
+        let mut vm = vm;
+        vm.items.push(ChatItem::Assistant {
+            turn: 2,
+            content: "streaming…".into(),
+            complete: false,
+        });
+        let (rows, _) = chat_rows(
+            &vm,
+            &HashSet::new(),
+            &HashSet::new(),
+            &HashSet::new(),
+            &HashMap::new(),
+        );
+        let last = rows.last().unwrap();
+        assert_eq!(last.kind, 5);
+        assert_eq!(last.card_pos, 3);
+        assert_eq!(last.tool_name, "Agent");
     }
 
     fn two_questions() -> Vec<trouve_protocol::Question> {
