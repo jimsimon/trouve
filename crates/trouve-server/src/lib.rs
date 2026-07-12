@@ -326,7 +326,10 @@ fn write_private(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
 
 /// True when the `Host` header names a loopback address (or `localhost`).
 fn host_is_loopback(headers: &HeaderMap) -> bool {
-    let Some(host) = headers.get(axum::http::header::HOST).and_then(|v| v.to_str().ok()) else {
+    let Some(host) = headers
+        .get(axum::http::header::HOST)
+        .and_then(|v| v.to_str().ok())
+    else {
         // No Host header (HTTP/2 without one, or a raw client): allow — the
         // loopback bind is the backstop and there's no rebindable name.
         return true;

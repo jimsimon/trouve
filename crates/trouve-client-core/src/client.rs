@@ -527,7 +527,8 @@ impl ProtocolClient {
 
     /// Every worktree path (files, dirs with trailing '/'), for "@" mentions.
     pub async fn session_paths(&self, session_id: &str) -> Result<Vec<String>> {
-        self.get_json(&format!("/sessions/{session_id}/paths")).await
+        self.get_json(&format!("/sessions/{session_id}/paths"))
+            .await
     }
 
     pub async fn session_file(&self, session_id: &str, path: &str) -> Result<FileContent> {

@@ -74,9 +74,7 @@ async fn checked_addrs(url: &reqwest::Url, allow_private: bool) -> Result<Vec<So
     if addrs.is_empty() {
         return Err("host resolved to no addresses".to_string());
     }
-    if !allow_private
-        && let Some(bad) = addrs.iter().find(|a| !ip_is_public(a.ip()))
-    {
+    if !allow_private && let Some(bad) = addrs.iter().find(|a| !ip_is_public(a.ip())) {
         return Err(format!(
             "{} resolves to non-public address {}; refusing to fetch",
             url.host_str().unwrap_or("host"),
@@ -317,11 +315,7 @@ mod tests {
                     let mut buf = [0u8; 1024];
                     let n = sock.read(&mut buf).await.unwrap_or(0);
                     let req = String::from_utf8_lossy(&buf[..n]).into_owned();
-                    let path = req
-                        .split_whitespace()
-                        .nth(1)
-                        .unwrap_or("/")
-                        .to_string();
+                    let path = req.split_whitespace().nth(1).unwrap_or("/").to_string();
                     let _ = sock.write_all(resp_for_path(&path).as_bytes()).await;
                 });
             }
@@ -387,7 +381,12 @@ mod tests {
         let res = tool
             .run(&ctx, &json!({"url": format!("http://{addr}/start")}))
             .await;
-        assert_eq!(res.status, trouve_protocol::ToolStatus::Ok, "{:?}", res.result);
+        assert_eq!(
+            res.status,
+            trouve_protocol::ToolStatus::Ok,
+            "{:?}",
+            res.result
+        );
         assert_eq!(res.result["content"], "made it");
 
         // A redirect loop trips the hop limit rather than spinning.

@@ -2418,10 +2418,7 @@ impl Engine {
     /// Every path in the session worktree (files, plus directories with a
     /// trailing '/'), worktree-relative, honouring .gitignore — feeds the
     /// composer's "@" file-mention completion. Capped; alphabetical.
-    pub async fn session_list_paths(
-        &self,
-        session_id: &str,
-    ) -> Result<Vec<String>, EngineError> {
+    pub async fn session_list_paths(&self, session_id: &str) -> Result<Vec<String>, EngineError> {
         const MAX_PATHS: usize = 5000;
         let session = self.get_session(session_id)?;
         let worktree = PathBuf::from(&session.worktree_path);
@@ -3565,8 +3562,9 @@ impl Engine {
         // spawn grandchildren (also enforced at execution). They also respect
         // the mode's tool policy, so restrictive/read-only modes that don't
         // list them can't create branches or child agents.
-        let spawn_allowed =
-            |name: &str| mode.allowed_tools.is_empty() || mode.allowed_tools.iter().any(|t| t == name);
+        let spawn_allowed = |name: &str| {
+            mode.allowed_tools.is_empty() || mode.allowed_tools.iter().any(|t| t == name)
+        };
         if self.store.spawn_parent(&thread.id)?.is_none() {
             if spawn_allowed("spawn_thread") {
                 specs.push(spawn_thread_spec());
@@ -3756,8 +3754,13 @@ impl Engine {
                 usage_total.output_tokens,
             );
         }
-        self.store
-            .record_usage(&session.id, &thread.id, turn, &usage_total, context_input_tokens)?;
+        self.store.record_usage(
+            &session.id,
+            &thread.id,
+            turn,
+            &usage_total,
+            context_input_tokens,
+        )?;
 
         // Snapshot the worktree when the turn changed it. Lock-free child
         // turns never snapshot: they can't write, so any dirt is the
@@ -4405,8 +4408,13 @@ impl Engine {
         // Vendors report one usage per turn, so the totals already reflect
         // the last (only) request — use them as the context-size proxy.
         let context_input_tokens = usage_total.input_tokens + usage_total.cached_input_tokens;
-        self.store
-            .record_usage(&session.id, &thread.id, turn, &usage_total, context_input_tokens)?;
+        self.store.record_usage(
+            &session.id,
+            &thread.id,
+            turn,
+            &usage_total,
+            context_input_tokens,
+        )?;
         // Lock-free children (read-only spawned agents) never checkpoint:
         // they hold no session lock, so `git add`/write-tree here would race
         // the parent's concurrent turn and snapshot its half-finished work as
@@ -4843,9 +4851,7 @@ impl Engine {
             let active = self.active_threads.lock().unwrap();
             let running = children.iter().filter(|c| active.contains_key(*c)).count();
             if running >= MAX_CONCURRENT_CHILDREN {
-                bail!(
-                    "already {running} children running; collect some with spawn_output first"
-                );
+                bail!("already {running} children running; collect some with spawn_output first");
             }
         }
 
@@ -4889,8 +4895,13 @@ impl Engine {
                 .filter(|t| !t.is_empty())
                 .map(String::from)
                 .unwrap_or_else(|| {
-                    let snippet: String =
-                        prompt.lines().next().unwrap_or("").chars().take(48).collect();
+                    let snippet: String = prompt
+                        .lines()
+                        .next()
+                        .unwrap_or("")
+                        .chars()
+                        .take(48)
+                        .collect();
                     format!("Agent: {snippet}")
                 });
             // Base the child on the parent's latest checkpoint commit, not
@@ -4960,11 +4971,7 @@ impl Engine {
     /// idle), or pending (never ran). Includes the latest assistant message
     /// and aggregate token usage so the parent sees what its money bought.
     fn spawn_status(&self, thread_id: &str) -> Result<serde_json::Value> {
-        let running = self
-            .active_threads
-            .lock()
-            .unwrap()
-            .contains_key(thread_id);
+        let running = self.active_threads.lock().unwrap().contains_key(thread_id);
         let mut last_message = String::new();
         let mut completed_turns = 0u64;
         let mut failure: Option<String> = None;
@@ -5034,7 +5041,9 @@ impl Engine {
                 .get("thread_id")
                 .and_then(serde_json::Value::as_str)
                 .unwrap_or(&thread.id);
-            let t = self.get_thread(target).map_err(|e| anyhow!(e.to_string()))?;
+            let t = self
+                .get_thread(target)
+                .map_err(|e| anyhow!(e.to_string()))?;
             let s = self
                 .get_session(&t.session_id)
                 .map_err(|e| anyhow!(e.to_string()))?;
@@ -5048,7 +5057,9 @@ impl Engine {
                 .events_after(&Scope::Thread(target.to_string()), 0)?
             {
                 let item = match env.event {
-                    Event::UserMessage { turn: t, content, .. } if t == turn => {
+                    Event::UserMessage {
+                        turn: t, content, ..
+                    } if t == turn => {
                         serde_json::json!({"role": "user", "content": cap_chars(&content, TURN_ITEM_CAP)})
                     }
                     Event::AssistantMessage { turn: t, content } if t == turn => {
@@ -6163,7 +6174,9 @@ mod tests {
             other => panic!("expected result a, got {other:?}"),
         }
         match &out[3] {
-            Message::ToolResult { call_id, content, .. } => {
+            Message::ToolResult {
+                call_id, content, ..
+            } => {
                 assert_eq!(call_id, "b");
                 assert!(content.contains("interrupted"));
             }

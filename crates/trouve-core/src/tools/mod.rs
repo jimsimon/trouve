@@ -273,8 +273,7 @@ mod tests {
         };
 
         // A symlink whose target file exists outside the worktree.
-        std::os::unix::fs::symlink(outside.path().join("secret"), dir.path().join("leak"))
-            .unwrap();
+        std::os::unix::fs::symlink(outside.path().join("secret"), dir.path().join("leak")).unwrap();
         assert!(ctx.resolve("leak").is_err());
 
         // A symlinked directory: every path component is `Normal`, but the

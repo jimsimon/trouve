@@ -891,7 +891,10 @@ impl AppServer {
 
     async fn subscribe(&self, thread_id: &str) -> mpsc::Receiver<ServerMsg> {
         let (tx, rx) = mpsc::channel(256);
-        self.routes.lock().await.insert(thread_id.to_string(), tx.clone());
+        self.routes
+            .lock()
+            .await
+            .insert(thread_id.to_string(), tx.clone());
         // Flush anything the reader buffered for this thread before we
         // subscribed (notifications emitted right after thread/start).
         if let Some(msgs) = self.buffered.lock().await.remove(thread_id) {

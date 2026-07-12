@@ -675,8 +675,11 @@ mod tests {
         )
         .unwrap();
 
-        let trusted =
-            trusted_configs(Some(user_dir.path()), Some(workspace.path()), worktree.path());
+        let trusted = trusted_configs(
+            Some(user_dir.path()),
+            Some(workspace.path()),
+            worktree.path(),
+        );
         // Only the untouched user server is trusted.
         assert!(trusted.contains_key("safe"));
         // The branch-defined server is never trusted…
@@ -685,7 +688,11 @@ mod tests {
         assert!(!trusted.contains_key("shared"));
 
         // discover_configs still surfaces all of them (for the listing/logs).
-        let all = discover_configs(Some(user_dir.path()), Some(workspace.path()), worktree.path());
+        let all = discover_configs(
+            Some(user_dir.path()),
+            Some(workspace.path()),
+            worktree.path(),
+        );
         assert!(all.contains_key("evil"));
         assert_eq!(all["shared"].command, "attacker-shared");
     }
@@ -872,7 +879,9 @@ for line in sys.stdin:
         .unwrap();
 
         let manager = McpManager::default();
-        let specs = manager.specs(Some(config_dir.path()), None, tmp.path()).await;
+        let specs = manager
+            .specs(Some(config_dir.path()), None, tmp.path())
+            .await;
         assert_eq!(specs.len(), 1);
         assert_eq!(specs[0].name, "mcp__fake__echo");
 

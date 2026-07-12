@@ -2766,8 +2766,13 @@ async fn search_transcript_recovers_history() {
     // Turn mode replays the full messages of turn 1.
     let full = results.iter().find(|(id, _)| *id == "s3").unwrap().1;
     let messages = full["messages"].as_array().unwrap();
-    assert!(messages.iter().any(|m| m["role"] == "user"
-        && m["content"].as_str().unwrap().contains("remember the magic number")));
+    assert!(messages.iter().any(|m| {
+        m["role"] == "user"
+            && m["content"]
+                .as_str()
+                .unwrap()
+                .contains("remember the magic number")
+    }));
     assert!(
         messages
             .iter()
@@ -3032,16 +3037,12 @@ async fn spawn_thread_child_agent_end_to_end() {
     assert!(!parent["spawned"].as_bool().unwrap_or(false));
 
     // Depth guard: the child's own spawn attempt was refused.
-    let child_events = wait_for_event(
-        &client,
-        &format!("{base}/threads/{child_id}/events"),
-        |e| {
-            e["type"] == "tool.completed"
-                && e["result"]["error"]
-                    .as_str()
-                    .is_some_and(|s| s.contains("cannot spawn"))
-        },
-    )
+    let child_events = wait_for_event(&client, &format!("{base}/threads/{child_id}/events"), |e| {
+        e["type"] == "tool.completed"
+            && e["result"]["error"]
+                .as_str()
+                .is_some_and(|s| s.contains("cannot spawn"))
+    })
     .await;
     assert!(!child_events.is_empty());
 }
@@ -3079,7 +3080,11 @@ async fn spawn_session_child_agent_isolated() {
     // a resolved commit hash rather than the branch name.
     let based_on = spawn["based_on"].as_str().unwrap();
     assert_ne!(based_on, session["branch"].as_str().unwrap());
-    assert_eq!(based_on.len(), 40, "based_on should be a commit hash: {based_on}");
+    assert_eq!(
+        based_on.len(),
+        40,
+        "based_on should be a commit hash: {based_on}"
+    );
     assert!(based_on.chars().all(|c| c.is_ascii_hexdigit()));
     let output = results.iter().find(|(id, _)| *id == "p3").unwrap().1;
     assert_eq!(output["status"], "completed", "{output}");
@@ -3118,10 +3123,7 @@ async fn spawn_session_child_agent_isolated() {
         .json()
         .await
         .unwrap();
-    let child = threads
-        .iter()
-        .find(|t| t["id"] == child_thread_id)
-        .unwrap();
+    let child = threads.iter().find(|t| t["id"] == child_thread_id).unwrap();
     assert_eq!(child["spawned"], true, "{child}");
     assert_eq!(child["mode"], "code");
 }
@@ -3130,7 +3132,9 @@ async fn spawn_session_child_agent_isolated() {
 async fn secured_router_enforces_token_and_loopback_host() {
     let tmp = tempfile::tempdir().unwrap();
     let store = Store::open(&tmp.path().join("db/trouve.db")).unwrap();
-    let engine = Arc::new(Engine::new(store, tmp.path().join("data"), &Config::default()).with_config_dir(None));
+    let engine = Arc::new(
+        Engine::new(store, tmp.path().join("data"), &Config::default()).with_config_dir(None),
+    );
 
     let security = trouve_server::ServerSecurity {
         token: Some("s3cret-token".to_string()),

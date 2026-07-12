@@ -1492,7 +1492,9 @@ mod tests {
             created_at: chrono::Utc::now(),
             spawned: true,
         };
-        store.insert_thread(&child, &serde_json::Map::new()).unwrap();
+        store
+            .insert_thread(&child, &serde_json::Map::new())
+            .unwrap();
         store.insert_spawned("th_child", "th_1", "thread").unwrap();
 
         store.delete_session("se_1").unwrap();

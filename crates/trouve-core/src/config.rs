@@ -141,7 +141,10 @@ impl Config {
                 );
                 let backup = path.with_extension("toml.corrupt");
                 if let Err(e) = std::fs::copy(path, &backup) {
-                    tracing::warn!("could not back up broken config to {}: {e}", backup.display());
+                    tracing::warn!(
+                        "could not back up broken config to {}: {e}",
+                        backup.display()
+                    );
                 }
                 Self {
                     load_failed: true,
@@ -193,7 +196,11 @@ mod tests {
         assert!(path.with_extension("toml.corrupt").exists());
         assert!(cfg.save_to(&path).is_err());
         // The broken file is untouched.
-        assert!(std::fs::read_to_string(&path).unwrap().contains("not valid toml"));
+        assert!(
+            std::fs::read_to_string(&path)
+                .unwrap()
+                .contains("not valid toml")
+        );
 
         // A well-formed config loads and persists normally.
         std::fs::write(&path, "default_model = \"openai/gpt\"\n").unwrap();

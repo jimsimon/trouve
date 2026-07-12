@@ -144,10 +144,11 @@ impl Scrollback {
         // grow it without bound. Flush an over-long partial as its own row.
         if self.partial.len() > MAX_PARTIAL_BYTES {
             let flushed = std::mem::take(&mut self.partial);
-            let segments: Vec<TermSegment> = parse_ansi_line(flushed.trim_end_matches(['\n', '\r']))
-                .iter()
-                .map(to_widget)
-                .collect();
+            let segments: Vec<TermSegment> =
+                parse_ansi_line(flushed.trim_end_matches(['\n', '\r']))
+                    .iter()
+                    .map(to_widget)
+                    .collect();
             self.model.push(ModelRc::new(VecModel::from(segments)));
             while self.model.row_count() > self.max_lines {
                 self.model.remove(0);

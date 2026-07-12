@@ -280,7 +280,10 @@ mod tests {
         }
         // Quoted arguments without metacharacters stay first-token keyed.
         assert_eq!(
-            allow_key("shell", &serde_json::json!({"command": "git commit -m \"msg\""})),
+            allow_key(
+                "shell",
+                &serde_json::json!({"command": "git commit -m \"msg\""})
+            ),
             "shell:git"
         );
     }

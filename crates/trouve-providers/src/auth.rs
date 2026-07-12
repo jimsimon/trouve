@@ -373,7 +373,9 @@ pub async fn pkce_wait_for_code(
         // The provider redirects with `error=...` (no code) when the user
         // denies consent; fail now instead of waiting out the whole timeout.
         if let Some(error) = error {
-            return Err(ProviderError::Auth(format!("authorization denied: {error}")));
+            return Err(ProviderError::Auth(format!(
+                "authorization denied: {error}"
+            )));
         }
         if let (Some(code), true) = (code, state_ok) {
             return Ok(code);

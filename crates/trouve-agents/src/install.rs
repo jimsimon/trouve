@@ -362,7 +362,10 @@ pub async fn install(
     // the binary is present.
     let pointer = root.join("installed.json");
     let tmp = root.join(".installed.json.tmp");
-    std::fs::write(&tmp, serde_json::to_string_pretty(&info).unwrap().as_bytes())?;
+    std::fs::write(
+        &tmp,
+        serde_json::to_string_pretty(&info).unwrap().as_bytes(),
+    )?;
     std::fs::rename(&tmp, &pointer)?;
 
     let link = managed_bin(data_dir, id);
@@ -689,16 +692,13 @@ DOWNLOAD_URL="https://downloads.cursor.com/lab/2026.07.01-41b2de7/${OS}/${ARCH}/
         let mut buf = Vec::new();
         {
             let mut builder = tar::Builder::new(&mut buf);
-            builder
-                .append_link(&mut header, "link", "/tmp")
-                .unwrap();
+            builder.append_link(&mut header, "link", "/tmp").unwrap();
             builder.finish().unwrap();
         }
         let mut gz = Vec::new();
         {
             use std::io::Write;
-            let mut enc =
-                flate2::write::GzEncoder::new(&mut gz, flate2::Compression::default());
+            let mut enc = flate2::write::GzEncoder::new(&mut gz, flate2::Compression::default());
             enc.write_all(&buf).unwrap();
             enc.finish().unwrap();
         }

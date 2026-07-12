@@ -409,11 +409,7 @@ fn sse_to_events(
                                 if let Some(text) =
                                     v.pointer("/delta/thinking").and_then(Value::as_str)
                                 {
-                                    blocks
-                                        .entry(idx)
-                                        .or_default()
-                                        .thinking_text
-                                        .push_str(text);
+                                    blocks.entry(idx).or_default().thinking_text.push_str(text);
                                     let _ = tx
                                         .send(Ok(ProviderEvent::ThinkingDelta(text.to_string())))
                                         .await;
