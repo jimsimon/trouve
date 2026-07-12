@@ -300,14 +300,17 @@ impl Store {
         let ts = chrono::Utc::now();
         let payload = serde_json::to_string(&event)?;
         let (kind, id) = scope_cols(&scope);
-        let cursor: u64 = {
-            let conn = self.conn.lock().unwrap();
-            conn.execute(
-                "INSERT INTO events (scope_kind, scope_id, ts, payload) VALUES (?1, ?2, ?3, ?4)",
-                params![kind, id, ts.to_rfc3339(), payload],
-            )?;
-            conn.last_insert_rowid() as u64
-        };
+        // Assign the cursor and broadcast under the same lock, so two
+        // concurrent appends to one scope can never publish out of cursor
+        // order. Live SSE subscribers drop anything with cursor <= the last
+        // they saw, so an out-of-order broadcast (6 before 5) would lose
+        // event 5 permanently until reconnect.
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO events (scope_kind, scope_id, ts, payload) VALUES (?1, ?2, ?3, ?4)",
+            params![kind, id, ts.to_rfc3339(), payload],
+        )?;
+        let cursor = conn.last_insert_rowid() as u64;
         let envelope = EventEnvelope {
             cursor,
             scope,
@@ -339,11 +342,22 @@ impl Store {
         let mut out = Vec::new();
         for row in rows {
             let (cursor, kind, id, ts, payload) = row?;
+            // Skip a row we can't deserialize (e.g. an event type written by
+            // a newer build) rather than failing the whole scope's replay —
+            // otherwise one unknown event makes the session/thread
+            // permanently unloadable.
+            let event = match serde_json::from_str(&payload) {
+                Ok(e) => e,
+                Err(e) => {
+                    tracing::warn!("skipping undeserializable event {cursor}: {e}");
+                    continue;
+                }
+            };
             out.push(EventEnvelope {
                 cursor,
                 scope: scope_from_cols(&kind, id),
                 ts: ts.parse().unwrap_or_else(|_| chrono::Utc::now()),
-                event: serde_json::from_str(&payload)?,
+                event,
             });
         }
         Ok(out)
