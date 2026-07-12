@@ -444,6 +444,11 @@ struct Controller {
     /// mention popup, and when they were fetched (throttles refreshes).
     at_files_fetched: Option<(String, std::time::Instant)>,
     expanded_tools: HashSet<String>,
+    /// Last time a streaming-delta render ran, to coalesce bursts of deltas
+    /// into at most one full chat re-fold per interval (a full turn's worth
+    /// of deltas would otherwise re-fold and re-clone the whole transcript
+    /// on every token). Non-delta events always render immediately.
+    last_delta_render: Option<std::time::Instant>,
     /// (thread id, turn) pairs showing raw text instead of styled markdown.
     raw_turns: HashSet<(String, u64)>,
     /// (thread id, card key) pairs whose card body is collapsed.
@@ -579,6 +584,7 @@ pub async fn run(
         pending_attachments: Vec::new(),
         at_files_fetched: None,
         expanded_tools: HashSet::new(),
+        last_delta_render: None,
         raw_turns: HashSet::new(),
         collapsed_cards: HashSet::new(),
         row_call_ids: Vec::new(),
@@ -4020,7 +4026,26 @@ impl Controller {
                     // stream (queue_updated / turn.started / turn ends).
                     self.push_queue();
                     if changed.is_some() {
-                        self.render_chat(true);
+                        // Coalesce streaming deltas: re-folding the whole
+                        // transcript per token is O(n^2) over a turn. Render
+                        // at most every 50ms for deltas; every other event
+                        // (including the finalized assistant.message and
+                        // turn.completed) renders immediately, so the last
+                        // token is never left unshown.
+                        let is_delta = matches!(
+                            envelope.event,
+                            trouve_protocol::Event::AssistantDelta { .. }
+                                | trouve_protocol::Event::AssistantThinking { .. }
+                        );
+                        let now = std::time::Instant::now();
+                        let throttled = is_delta
+                            && self
+                                .last_delta_render
+                                .is_some_and(|t| now.duration_since(t).as_millis() < 50);
+                        if !throttled {
+                            self.render_chat(true);
+                            self.last_delta_render = if is_delta { Some(now) } else { None };
+                        }
                     }
                     if matches!(envelope.event, trouve_protocol::Event::TurnCompleted { .. }) {
                         let _ = self.refresh_diff().await;
