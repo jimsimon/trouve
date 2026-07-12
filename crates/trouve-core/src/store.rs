@@ -1196,22 +1196,26 @@ impl Store {
     /// position (standard undo-stack semantics).
     pub fn append_checkpoint(&self, row: &CheckpointRow) -> Result<()> {
         let conn = self.conn.lock().unwrap();
-        let undo_pos: Option<i64> = conn.query_row(
+        // One transaction: truncating the redo tail, clearing undo_pos, and
+        // inserting the checkpoint must be all-or-nothing, or a crash between
+        // them loses the redo tail without recording the new checkpoint.
+        let tx = conn.unchecked_transaction()?;
+        let undo_pos: Option<i64> = tx.query_row(
             "SELECT undo_pos FROM sessions WHERE id = ?1",
             params![row.session_id],
             |r| r.get(0),
         )?;
         if let Some(pos) = undo_pos {
-            conn.execute(
+            tx.execute(
                 "DELETE FROM checkpoints WHERE session_id = ?1 AND seq > ?2",
                 params![row.session_id, pos],
             )?;
-            conn.execute(
+            tx.execute(
                 "UPDATE sessions SET undo_pos = NULL WHERE id = ?1",
                 params![row.session_id],
             )?;
         }
-        conn.execute(
+        tx.execute(
             "INSERT INTO checkpoints (id, session_id, thread_id, turn, seq, commit_hash, created_at)
              VALUES (?1, ?2, ?3, ?4,
                      (SELECT COALESCE(MAX(seq), -1) + 1 FROM checkpoints WHERE session_id = ?2),
@@ -1225,6 +1229,7 @@ impl Store {
                 chrono::Utc::now().to_rfc3339()
             ],
         )?;
+        tx.commit()?;
         Ok(())
     }
 
