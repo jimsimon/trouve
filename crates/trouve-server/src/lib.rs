@@ -88,6 +88,7 @@ impl IntoResponse for ApiError {
         dispatch_queue,
         update_queued_prompt,
         delete_queued_prompt,
+        cancel_turn,
         resolve_approval,
         resolve_question,
         list_models,
@@ -508,6 +509,7 @@ pub fn build_router(engine: Arc<Engine>) -> Router {
         .route("/v1/attachments/{id}", get(get_attachment))
         .route("/v1/threads/{id}/queue", get(list_queue).put(reorder_queue))
         .route("/v1/threads/{id}/queue/dispatch", post(dispatch_queue))
+        .route("/v1/threads/{id}/cancel", post(cancel_turn))
         .route(
             "/v1/queue/{id}",
             axum::routing::patch(update_queued_prompt).delete(delete_queued_prompt),
@@ -794,6 +796,16 @@ async fn dispatch_queue(
             queued: turn.is_none(),
         }),
     ))
+}
+
+#[utoipa::path(post, path = "/v1/threads/{id}/cancel", params(("id" = String, Path,)),
+    responses((status = 204), (status = 400, body = ErrorBody)))]
+async fn cancel_turn(
+    State(engine): State<Arc<Engine>>,
+    Path(id): Path<String>,
+) -> Result<StatusCode, ApiError> {
+    engine.cancel_turn(&id)?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 #[utoipa::path(patch, path = "/v1/queue/{id}", params(("id" = String, Path,)),

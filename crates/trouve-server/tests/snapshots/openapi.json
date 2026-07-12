@@ -7,7 +7,7 @@
       "name": "MIT",
       "identifier": "MIT"
     },
-    "version": "0.16"
+    "version": "0.17"
   },
   "paths": {
     "/v1/approvals": {
@@ -2574,6 +2574,37 @@
         }
       }
     },
+    "/v1/threads/{id}/cancel": {
+      "post": {
+        "tags": [],
+        "operationId": "cancel_turn",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": ""
+          },
+          "400": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/v1/threads/{id}/messages": {
       "post": {
         "tags": [],
@@ -3549,6 +3580,27 @@
                 "type": "string",
                 "enum": [
                   "turn.failed"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "description": "The turn was interrupted by the user (via the cancel endpoint). Like\n`turn.failed` it pauses the queue, but it isn't an error condition.",
+            "required": [
+              "turn",
+              "type"
+            ],
+            "properties": {
+              "turn": {
+                "type": "integer",
+                "format": "int64",
+                "minimum": 0
+              },
+              "type": {
+                "type": "string",
+                "enum": [
+                  "turn.cancelled"
                 ]
               }
             }
@@ -4762,7 +4814,7 @@
           },
           "health": {
             "type": "string",
-            "description": "\"ok\" / \"error\" / \"unknown\" (unknown when listing skipped the probe)."
+            "description": "\"ok\" / \"error\" / \"unknown\" (unknown when listing skipped the probe) /\n\"untrusted\" (a repo-scoped server that is never auto-run)."
           },
           "name": {
             "type": "string"

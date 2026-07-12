@@ -67,6 +67,10 @@ pub struct Engine {
     /// while present just enqueue. The session ids feed `Session.active`
     /// and the `session.activity` server event.
     active_threads: Mutex<std::collections::HashMap<String, String>>,
+    /// Cancellation tokens for in-flight turns, keyed by thread id. Set while
+    /// a turn runs; `cancel_turn` trips one to interrupt the turn's provider
+    /// stream, tool calls, and approval waits at the next await point.
+    turn_cancels: Mutex<std::collections::HashMap<String, tokio_util::sync::CancellationToken>>,
     config: Mutex<Config>,
     /// Where provider configuration changes are persisted. `None` disables
     /// persistence (tests).
@@ -327,6 +331,7 @@ impl Engine {
             questions: Arc::new(QuestionHub::default()),
             session_locks: Mutex::new(HashMap::new()),
             active_threads: Mutex::new(std::collections::HashMap::new()),
+            turn_cancels: Mutex::new(std::collections::HashMap::new()),
             config: Mutex::new(config.clone()),
             // No write-back by default: only a caller that loaded `config`
             // from disk should enable persisting to that file (see
@@ -3278,7 +3283,13 @@ impl Engine {
         let mut content = content;
         let mut attachments = attachments;
         loop {
-            if let Err(e) = self.run_turn(&thread, turn, content, attachments).await {
+            let cancel = self.register_cancel(&thread.id);
+            let result = self
+                .run_turn(&thread, turn, content, attachments, cancel.clone())
+                .await;
+            let cancelled = cancel.is_cancelled();
+            self.clear_cancel(&thread.id);
+            if let Err(e) = result {
                 tracing::error!("turn {turn} of {} failed: {e}", thread.id);
                 let _ = self.store.append_event(
                     Scope::Thread(thread.id.clone()),
@@ -3286,6 +3297,16 @@ impl Engine {
                         turn,
                         error: e.to_string(),
                     },
+                );
+                self.release_thread(&thread.id);
+                return;
+            }
+            if cancelled {
+                // A user-cancelled turn pauses the queue (like a failure, but
+                // not an error): leave queued prompts for the user to resume.
+                let _ = self.store.append_event(
+                    Scope::Thread(thread.id.clone()),
+                    Event::TurnCancelled { turn },
                 );
                 self.release_thread(&thread.id);
                 return;
@@ -3338,6 +3359,36 @@ impl Engine {
         }
     }
 
+    /// Register a fresh cancellation token for a turn about to run.
+    fn register_cancel(&self, thread_id: &str) -> tokio_util::sync::CancellationToken {
+        let token = tokio_util::sync::CancellationToken::new();
+        self.turn_cancels
+            .lock()
+            .unwrap()
+            .insert(thread_id.to_string(), token.clone());
+        token
+    }
+
+    fn clear_cancel(&self, thread_id: &str) {
+        self.turn_cancels.lock().unwrap().remove(thread_id);
+    }
+
+    /// Interrupt the turn currently running on a thread. Trips its
+    /// cancellation token, which stops the provider stream, in-flight tool
+    /// call, or approval wait at the next await point. No-op error when the
+    /// thread has no running turn.
+    pub fn cancel_turn(&self, thread_id: &str) -> Result<(), EngineError> {
+        match self.turn_cancels.lock().unwrap().get(thread_id) {
+            Some(token) => {
+                token.cancel();
+                Ok(())
+            }
+            None => Err(EngineError::BadRequest(format!(
+                "no running turn to cancel on thread {thread_id}"
+            ))),
+        }
+    }
+
     /// Server-scope `session.activity` event — session lists light up (or
     /// dim) their indicator without refetching.
     fn emit_session_activity(&self, session_id: &str, active: bool) {
@@ -3364,6 +3415,7 @@ impl Engine {
         turn: u64,
         content: String,
         attachments: Vec<trouve_protocol::Attachment>,
+        cancel: tokio_util::sync::CancellationToken,
     ) -> Result<()> {
         let session = self
             .store
@@ -3413,6 +3465,7 @@ impl Engine {
                     content,
                     attachments,
                     concurrent_child,
+                    cancel,
                 )
                 .await;
         }
@@ -3488,6 +3541,9 @@ impl Engine {
         let mut context_input_tokens = 0u64;
 
         for _iteration in 0..MAX_ITERATIONS {
+            if cancel.is_cancelled() {
+                break;
+            }
             // Rebuild the transcript each iteration; the store is the truth.
             let mut messages = vec![Message::System(system.clone())];
             for payload in self.store.messages(&thread.id)? {
@@ -3509,7 +3565,15 @@ impl Engine {
             // persist and replay verbatim — Anthropic rejects a follow-up
             // tool-use turn whose thinking blocks aren't preserved.
             let mut reasoning: Vec<serde_json::Value> = Vec::new();
-            while let Some(ev) = stream.next().await {
+            loop {
+                let ev = tokio::select! {
+                    biased;
+                    _ = cancel.cancelled() => break,
+                    ev = stream.next() => match ev {
+                        Some(ev) => ev,
+                        None => break,
+                    },
+                };
                 match ev.map_err(|e| anyhow!("provider stream error: {e}"))? {
                     ProviderEvent::TextDelta(delta) => {
                         text.push_str(&delta);
@@ -3536,6 +3600,30 @@ impl Engine {
                         context_input_tokens = usage.input_tokens + usage.cached_input_tokens;
                     }
                 }
+            }
+
+            // Interrupted mid-stream: keep any streamed text for display, but
+            // drop the (unexecuted) tool calls so we don't strand tool_use
+            // without results, and stop the turn.
+            if cancel.is_cancelled() {
+                if !text.is_empty() {
+                    self.store.append_event(
+                        scope.clone(),
+                        Event::AssistantMessage {
+                            turn,
+                            content: text.clone(),
+                        },
+                    )?;
+                    self.store.append_message(
+                        &thread.id,
+                        &serde_json::to_value(Message::Assistant {
+                            content: text,
+                            tool_calls: Vec::new(),
+                            reasoning,
+                        })?,
+                    )?;
+                }
+                break;
             }
 
             if !text.is_empty() {
@@ -3568,7 +3656,7 @@ impl Engine {
 
             for call in tool_calls {
                 let (result_content, images) = self
-                    .handle_tool_call(&session, thread, turn, &mode, &ctx, &call)
+                    .handle_tool_call(&session, thread, turn, &mode, &ctx, &call, &cancel)
                     .await?;
                 self.store.append_message(
                     &thread.id,
@@ -3728,8 +3816,17 @@ impl Engine {
         // images, but no bridged vendor consumes them yet); the summary the
         // engine leaves in place of "_images" still tells the model the
         // image was read.
+        // Share the running turn's cancellation token when there is one, so a
+        // cancel also unblocks a bridged tool's approval wait.
+        let cancel = self
+            .turn_cancels
+            .lock()
+            .unwrap()
+            .get(thread_id)
+            .cloned()
+            .unwrap_or_default();
         let (content, _images) = self
-            .handle_tool_call(&session, &thread, turn, &mode, &ctx, &call)
+            .handle_tool_call(&session, &thread, turn, &mode, &ctx, &call, &cancel)
             .await
             .map_err(EngineError::Internal)?;
         Ok(content)
@@ -3934,6 +4031,7 @@ impl Engine {
         content: String,
         attachments: Vec<trouve_protocol::Attachment>,
         concurrent_child: bool,
+        cancel: tokio_util::sync::CancellationToken,
     ) -> Result<()> {
         let scope = Scope::Thread(thread.id.clone());
         // Vendor sessions are per (thread, backend): each vendor keeps its
@@ -4050,7 +4148,18 @@ impl Engine {
         let mut text = String::new();
         let mut segment = String::new();
         let mut usage_total = Usage::default();
-        while let Some(ev) = stream.next().await {
+        loop {
+            let ev = tokio::select! {
+                biased;
+                // Cancellation drops the backend stream, whose Drop kills the
+                // vendor process (kill_on_drop). We stop consuming and finish
+                // the turn with whatever streamed so far.
+                _ = cancel.cancelled() => break,
+                ev = stream.next() => match ev {
+                    Some(ev) => ev,
+                    None => break,
+                },
+            };
             match ev.map_err(|e| anyhow!("backend stream error: {e}"))? {
                 BackendEvent::SessionStarted { session_id } => {
                     self.store
@@ -4190,6 +4299,9 @@ impl Engine {
                 }
             }
         }
+        // Drop the backend stream promptly so a cancelled turn kills the
+        // vendor process now rather than at end of scope.
+        drop(stream);
 
         if !segment.is_empty() {
             self.store.append_event(
@@ -4397,6 +4509,7 @@ impl Engine {
         mode: &AgentMode,
         ctx: &ToolCtx,
         call: &trouve_providers::ToolCallRequest,
+        cancel: &tokio_util::sync::CancellationToken,
     ) -> Result<(String, Vec<trouve_providers::ToolImage>)> {
         let scope = Scope::Thread(thread.id.clone());
         let call_id = if call.id.is_empty() {
@@ -4526,7 +4639,13 @@ impl Engine {
                         call_id: call_id.clone(),
                     },
                 )?;
-                let decision = rx.await.unwrap_or(ApprovalDecision::Deny);
+                // A cancelled turn must not hang on an unanswered approval:
+                // treat cancellation as a denial so the wait unblocks.
+                let decision = tokio::select! {
+                    biased;
+                    _ = cancel.cancelled() => ApprovalDecision::Deny,
+                    d = rx => d.unwrap_or(ApprovalDecision::Deny),
+                };
                 self.store.append_event(
                     scope.clone(),
                     Event::ApprovalResolved {

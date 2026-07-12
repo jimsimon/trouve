@@ -280,6 +280,12 @@ impl ProtocolClient {
         .await
     }
 
+    /// Interrupt the turn currently running on a thread.
+    pub async fn cancel_turn(&self, thread_id: &str) -> Result<()> {
+        self.post_empty(&format!("/threads/{thread_id}/cancel"))
+            .await
+    }
+
     pub async fn resolve_approval(&self, call_id: &str, decision: ApprovalDecision) -> Result<()> {
         let resp = self
             .http
