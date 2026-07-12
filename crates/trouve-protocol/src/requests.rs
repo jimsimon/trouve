@@ -461,11 +461,16 @@ pub struct McpLogs {
 // --- integrations ----------------------------------------------------------
 
 /// Whether the GitHub integration can authenticate, and where the token
-/// came from ("environment", "settings", or "" when unconfigured).
+/// came from ("environment", "oauth", "settings", "gh-cli", or "" when
+/// unconfigured).
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct GithubIntegration {
     pub configured: bool,
     pub source: String,
+    /// Whether "Sign in with GitHub" (OAuth device flow) is available —
+    /// i.e. a GitHub OAuth app client id is configured or built in.
+    #[serde(default)]
+    pub oauth_available: bool,
 }
 
 /// Store (or, with an empty token, remove) the GitHub personal access

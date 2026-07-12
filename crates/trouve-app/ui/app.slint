@@ -1056,6 +1056,7 @@ export component AppWindow inherits Window {
     in-out property <int> settings-section: 0;
     in property <bool> settings-github-configured: false;
     in property <string> settings-github-source: "";
+    in property <bool> settings-github-oauth-available: false;
     callback github-token-saved(string);
     in property <[SubscriptionItem]> settings-subscriptions;
     in property <string> settings-subscriptions-status: "";
@@ -3880,6 +3881,7 @@ export component AppWindow inherits Window {
         section <=> root.settings-section;
         github-configured: root.settings-github-configured;
         github-source: root.settings-github-source;
+        github-oauth-available: root.settings-github-oauth-available;
         github-token-saved(token) => { root.github-token-saved(token); }
         subscriptions: root.settings-subscriptions;
         subscriptions-status: root.settings-subscriptions-status;

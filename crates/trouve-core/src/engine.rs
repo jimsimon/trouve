@@ -664,7 +664,19 @@ impl Engine {
             return self.start_cli_login(id, &kind, command).await;
         }
 
-        let oauth = {
+        let oauth = if id == "github" {
+            // "Sign in with GitHub" (Integrations, not a model provider):
+            // device flow against github.com; the resulting token lands in
+            // the same oauth secret github_token() reads.
+            let client_id = self.github_oauth_client_id().ok_or_else(|| {
+                EngineError::BadRequest(
+                    "GitHub OAuth is not configured: set github_client_id in config.toml \
+                     to a GitHub OAuth app client id with device flow enabled"
+                        .into(),
+                )
+            })?;
+            crate::github::oauth_config(&client_id)
+        } else {
             let config = self.config.lock().unwrap();
             config
                 .providers
@@ -1825,19 +1837,39 @@ impl Engine {
         let (owner, repo) = crate::github::parse_github_remote(&url).ok_or_else(|| {
             EngineError::BadRequest(format!("origin is not a GitHub remote: {url}"))
         })?;
-        let token = crate::github::token_from_env()
-            .or_else(|| {
-                self.secrets
-                    .get(&trouve_providers::secrets::api_key_secret("github"))
-                    .ok()
-                    .flatten()
-            })
-            .ok_or_else(|| {
-                EngineError::BadRequest(
-                    "no GitHub token: set GITHUB_TOKEN or `trouve auth set-key github`".into(),
-                )
-            })?;
+        let (token, _) = self.github_token().ok_or_else(|| {
+            EngineError::BadRequest(
+                "no GitHub auth: sign in (Settings → Integrations), set GITHUB_TOKEN, \
+                 or log in with the gh CLI"
+                    .into(),
+            )
+        })?;
         crate::github::GitHub::new(&token, &owner, &repo).map_err(EngineError::Internal)
+    }
+
+    /// The GitHub token and where it came from. Precedence: environment >
+    /// OAuth sign-in > pasted token > gh CLI keyring.
+    fn github_token(&self) -> Option<(String, &'static str)> {
+        if let Some(t) = crate::github::token_from_env() {
+            return Some((t, "environment"));
+        }
+        if let Ok(Some(raw)) = self
+            .secrets
+            .get(&trouve_providers::secrets::oauth_secret("github"))
+        {
+            // Device-flow tokens from classic OAuth apps don't expire; apps
+            // configured with expiring tokens just need a fresh sign-in.
+            if let Ok(tokens) = serde_json::from_str::<trouve_providers::auth::OAuthTokens>(&raw) {
+                return Some((tokens.access_token, "oauth"));
+            }
+        }
+        if let Ok(Some(t)) = self
+            .secrets
+            .get(&trouve_providers::secrets::api_key_secret("github"))
+        {
+            return Some((t, "settings"));
+        }
+        crate::github::token_from_gh_cli().map(|t| (t, "gh-cli"))
     }
 
     /// The open PR for the session branch, if one exists.
@@ -2103,28 +2135,36 @@ impl Engine {
 
     /// Whether GitHub calls can authenticate, and where the token lives.
     pub fn github_integration(&self) -> trouve_protocol::GithubIntegration {
-        let (configured, source) = if crate::github::token_from_env().is_some() {
-            (true, "environment")
-        } else if matches!(
-            self.secrets
-                .get(&trouve_providers::secrets::api_key_secret("github")),
-            Ok(Some(_))
-        ) {
-            (true, "settings")
-        } else {
-            (false, "")
+        let (configured, source) = match self.github_token() {
+            Some((_, source)) => (true, source),
+            None => (false, ""),
         };
         trouve_protocol::GithubIntegration {
             configured,
             source: source.to_string(),
+            oauth_available: self.github_oauth_client_id().is_some(),
         }
     }
 
-    /// Store the GitHub token in the secret store; empty removes it.
+    /// Client id for "Sign in with GitHub" (config `github_client_id`).
+    fn github_oauth_client_id(&self) -> Option<String> {
+        self.config
+            .lock()
+            .unwrap()
+            .github_client_id
+            .clone()
+            .filter(|id| !id.trim().is_empty())
+    }
+
+    /// Store the GitHub token in the secret store; empty disconnects (both
+    /// the pasted token and any OAuth sign-in).
     pub fn set_github_token(&self, token: &str) -> Result<(), EngineError> {
         let key = trouve_providers::secrets::api_key_secret("github");
         if token.trim().is_empty() {
             self.secrets.delete(&key).map_err(EngineError::Internal)?;
+            self.secrets
+                .delete(&trouve_providers::secrets::oauth_secret("github"))
+                .map_err(EngineError::Internal)?;
         } else {
             self.secrets
                 .set(&key, token.trim())

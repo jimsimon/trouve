@@ -7,7 +7,7 @@
       "name": "MIT",
       "identifier": "MIT"
     },
-    "version": "0.12"
+    "version": "0.13"
   },
   "paths": {
     "/v1/approvals": {
@@ -4106,7 +4106,7 @@
       },
       "GithubIntegration": {
         "type": "object",
-        "description": "Whether the GitHub integration can authenticate, and where the token\ncame from (\"environment\", \"settings\", or \"\" when unconfigured).",
+        "description": "Whether the GitHub integration can authenticate, and where the token\ncame from (\"environment\", \"oauth\", \"settings\", \"gh-cli\", or \"\" when\nunconfigured).",
         "required": [
           "configured",
           "source"
@@ -4114,6 +4114,10 @@
         "properties": {
           "configured": {
             "type": "boolean"
+          },
+          "oauth_available": {
+            "type": "boolean",
+            "description": "Whether \"Sign in with GitHub\" (OAuth device flow) is available —\ni.e. a GitHub OAuth app client id is configured or built in."
           },
           "source": {
             "type": "string"

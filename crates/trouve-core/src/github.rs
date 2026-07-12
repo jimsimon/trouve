@@ -34,6 +34,37 @@ pub fn token_from_env() -> Option<String> {
         .filter(|t| !t.is_empty())
 }
 
+/// GitHub token from the gh CLI's keyring (`gh auth token`), when the user
+/// is logged in there. Zero-config reuse of an auth most developers
+/// already have.
+pub fn token_from_gh_cli() -> Option<String> {
+    let out = std::process::Command::new("gh")
+        .args(["auth", "token"])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let token = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    (!token.is_empty()).then_some(token)
+}
+
+/// Device-flow OAuth endpoints for github.com. The client id comes from
+/// config (`github_client_id`): a GitHub OAuth app with device flow
+/// enabled.
+pub fn oauth_config(client_id: &str) -> trouve_providers::auth::OAuthConfig {
+    trouve_providers::auth::OAuthConfig {
+        client_id: client_id.to_string(),
+        device_authorization_url: Some("https://github.com/login/device/code".into()),
+        authorization_url: None,
+        token_url: "https://github.com/login/oauth/access_token".into(),
+        // Classic OAuth-app scope covering PR read/write and checks.
+        scopes: vec!["repo".into()],
+        redirect_port: None,
+        redirect_path: None,
+    }
+}
+
 pub struct GitHub {
     client: Octocrab,
     owner: String,

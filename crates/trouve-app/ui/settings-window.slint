@@ -95,6 +95,8 @@ export struct LocalModelItem {
     downloading: bool,
     // 0-99 while downloading.
     progress: int,
+    // "downloading… 1200 MB / 4700 MB (25%) · 12.3 MB/s" while downloading.
+    download-line: string,
     error: string,
     // User-added entries can be removed from the list entirely.
     custom: bool,
@@ -323,6 +325,9 @@ export component SettingsScreen inherits Rectangle {
     callback reduce-motion-toggled(bool);
     callback close();
 
+    // Whether "Sign in with GitHub" (OAuth device flow) is configured
+    // server-side.
+    in property <bool> github-oauth-available: false;
     // Integrations: GitHub token state comes from the server; saving an
     // empty token removes it.
     in property <bool> github-configured: false;
@@ -1305,7 +1310,7 @@ export component SettingsScreen inherits Rectangle {
                                                 }
                                                 Text {
                                                     text: model.error != "" ? "download failed: " + model.error
-                                                        : model.downloading ? "downloading… " + model.progress + "%"
+                                                        : model.downloading ? model.download-line
                                                         : model.notes;
                                                     color: model.error != "" ? Theme.c.err-soft : Theme.c.text-dim;
                                                     font-size: Theme.fs(11px);
@@ -1771,9 +1776,10 @@ export component SettingsScreen inherits Rectangle {
                                         }
                                         Text {
                                             text: root.github-configured
-                                                ? (root.github-source == "environment"
-                                                    ? "● connected (environment)"
-                                                    : "● connected")
+                                                ? (root.github-source == "environment" ? "● connected (environment)"
+                                                    : root.github-source == "oauth" ? "● connected (GitHub sign-in)"
+                                                    : root.github-source == "gh-cli" ? "● connected (gh CLI)"
+                                                    : "● connected (token)")
                                                 : "○ not configured";
                                             color: root.github-configured ? Theme.c.ok : Theme.c.text-soft;
                                             font-size: Theme.fs(12px);
@@ -1781,14 +1787,33 @@ export component SettingsScreen inherits Rectangle {
                                         }
                                     }
                                     Text {
-                                        text: "Powers the Pull Requests tab and PR creation. Create a fine-grained personal access token with read/write access to Pull requests (and read access to Checks) on github.com → Settings → Developer settings.";
+                                        text: "Powers the Pull Requests tab and PR creation. Sign in with GitHub below, or paste a personal access token; a GITHUB_TOKEN environment variable or a gh CLI login are picked up automatically.";
                                         color: Theme.c.text-soft;
                                         font-size: Theme.fs(11px);
                                         wrap: word-wrap;
                                     }
                                     if root.github-source == "environment": Text {
-                                        text: "The token currently comes from the GITHUB_TOKEN / GH_TOKEN environment variable, which takes precedence over one saved here.";
+                                        text: "The token currently comes from the GITHUB_TOKEN / GH_TOKEN environment variable, which takes precedence over a sign-in or saved token.";
                                         color: Theme.c.warn;
+                                        font-size: Theme.fs(11px);
+                                        wrap: word-wrap;
+                                    }
+                                    if root.github-oauth-available: HorizontalLayout {
+                                        spacing: 8px;
+                                        alignment: start;
+                                        Button {
+                                            text: root.github-source == "oauth" ? "Re-sign in with GitHub" : "Sign in with GitHub";
+                                            primary: root.github-source != "oauth";
+                                            clicked => { root.provider-login("github"); }
+                                        }
+                                        if root.github-source == "oauth": Button {
+                                            text: "Disconnect";
+                                            clicked => { root.github-token-saved(""); }
+                                        }
+                                    }
+                                    if !root.github-oauth-available: Text {
+                                        text: "To enable one-click sign-in, register a GitHub OAuth app (Settings → Developer settings → OAuth Apps, \"Enable Device Flow\") and set github_client_id in trouve's config.toml.";
+                                        color: Theme.c.text-soft;
                                         font-size: Theme.fs(11px);
                                         wrap: word-wrap;
                                     }
@@ -1803,7 +1828,7 @@ export component SettingsScreen inherits Rectangle {
                                         }
                                         Button {
                                             text: "Save";
-                                            primary: true;
+                                            primary: gh-token.text != "" && !root.github-oauth-available;
                                             enabled: gh-token.text != "";
                                             clicked => {
                                                 root.github-token-saved(gh-token.text);

@@ -590,11 +590,12 @@ pub fn set_mcp_logs(ui: &Ui, name: String, text: String) {
     });
 }
 
-pub fn set_github_integration(ui: &Ui, configured: bool, source: &str) {
+pub fn set_github_integration(ui: &Ui, configured: bool, source: &str, oauth_available: bool) {
     let source = source.to_string();
     let _ = ui.upgrade_in_event_loop(move |ui| {
         ui.set_settings_github_configured(configured);
         ui.set_settings_github_source(SharedString::from(source.as_str()));
+        ui.set_settings_github_oauth_available(oauth_available);
     });
 }
 
@@ -858,6 +859,8 @@ pub struct LocalModelView {
     pub downloading: bool,
     /// Download progress percent (0-99 while pending).
     pub progress: i32,
+    /// "downloading… 1200 MB / 4700 MB (25%) · 12.3 MB/s" while pending.
+    pub download_line: String,
     pub error: String,
     pub custom: bool,
 }
@@ -900,6 +903,7 @@ pub fn set_local(ui: &Ui, view: LocalView) {
                 downloaded: m.downloaded,
                 downloading: m.downloading,
                 progress: m.progress,
+                download_line: SharedString::from(m.download_line.as_str()),
                 error: SharedString::from(m.error.as_str()),
                 custom: m.custom,
             })

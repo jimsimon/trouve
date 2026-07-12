@@ -39,6 +39,11 @@ pub struct Config {
     /// active. Unset means enabled.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub local_enabled: Option<bool>,
+    /// Client id of a GitHub OAuth app (with device flow enabled) for
+    /// "Sign in with GitHub". Unset disables the OAuth path; a pasted
+    /// token, GITHUB_TOKEN, or the gh CLI still work.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub github_client_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

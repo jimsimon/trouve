@@ -38,7 +38,10 @@ pub use requests::*;
 // 0.12: automations — scheduled prompts (CRUD under /v1/automations, run-now
 // endpoint, automation.fired server event); each run creates a session and
 // sends the prompt (all additive).
-pub const PROTOCOL_VERSION: &str = "0.12";
+// 0.13: GitHub OAuth sign-in — GithubIntegration gains oauth_available and
+// new token sources ("oauth", "gh-cli"); POST /v1/providers/github/login
+// starts the device flow (all additive).
+pub const PROTOCOL_VERSION: &str = "0.13";
 
 pub type WorkspaceId = String;
 pub type SessionId = String;

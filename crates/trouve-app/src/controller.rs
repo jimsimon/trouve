@@ -377,6 +377,10 @@ struct Controller {
     /// GitHub integration state (None until the first fetch answers).
     github_configured: bool,
     github_source: String,
+    github_oauth_available: bool,
+    /// Bytes/sec estimates for in-flight downloads, keyed by download id
+    /// ("cli:claude", "model:…"). Fed by consecutive progress polls.
+    download_rates: HashMap<String, RateSample>,
     /// Local models: true while a poller is scheduled for an in-flight
     /// download/install, plus the last seen downloaded-model count (a
     /// change means the model catalog changed → reload pickers).
@@ -462,6 +466,15 @@ struct Controller {
     term_view: (u16, u16),
 }
 
+/// One point in a download's progress, plus the smoothed transfer rate
+/// derived from the previous point.
+struct RateSample {
+    bytes: u64,
+    at: std::time::Instant,
+    /// Smoothed bytes/sec (0 until two samples exist).
+    rate: f64,
+}
+
 /// Client-side state of one session's terminal.
 struct TermState {
     terminal_id: String,
@@ -513,6 +526,8 @@ pub async fn run(
         current_thread: None,
         github_configured: false,
         github_source: String::new(),
+        github_oauth_available: false,
+        download_rates: HashMap::new(),
         local_polling: false,
         local_downloaded: None,
         local_search: Vec::new(),
@@ -662,6 +677,7 @@ impl Controller {
         if let Ok(gh) = self.client.github_integration().await {
             self.github_configured = gh.configured;
             self.github_source = gh.source;
+            self.github_oauth_available = gh.oauth_available;
         }
         self.push_github_integration();
         self.push_prs();
@@ -1566,7 +1582,12 @@ impl Controller {
     }
 
     fn push_github_integration(&self) {
-        ui::set_github_integration(&self.ui, self.github_configured, &self.github_source);
+        ui::set_github_integration(
+            &self.ui,
+            self.github_configured,
+            &self.github_source,
+            self.github_oauth_available,
+        );
     }
 
     /// Fetch subscription health in the background (the Codex query may
@@ -1829,6 +1850,7 @@ impl Controller {
         if let Ok(gh) = self.client.github_integration().await {
             self.github_configured = gh.configured;
             self.github_source = gh.source;
+            self.github_oauth_available = gh.oauth_available;
             self.push_github_integration();
         }
         let providers = match self.client.list_providers().await {
@@ -1891,6 +1913,46 @@ impl Controller {
         self.refresh_local();
     }
 
+    /// Estimated bytes/sec for an in-flight download, from consecutive
+    /// progress polls (exponentially smoothed so the label doesn't jitter).
+    /// Returns None until there are two samples far enough apart.
+    fn download_rate(&mut self, key: &str, bytes: u64) -> Option<f64> {
+        let now = std::time::Instant::now();
+        match self.download_rates.get_mut(key) {
+            // Same download progressing: fold the newest interval in.
+            Some(s) if bytes >= s.bytes => {
+                let dt = now.duration_since(s.at).as_secs_f64();
+                // Two pollers can sample the same download back-to-back;
+                // a near-zero interval would just amplify noise.
+                if dt < 0.3 {
+                    return (s.rate > 0.0).then_some(s.rate);
+                }
+                let inst = (bytes - s.bytes) as f64 / dt;
+                s.rate = if s.rate > 0.0 {
+                    0.6 * s.rate + 0.4 * inst
+                } else {
+                    inst
+                };
+                s.bytes = bytes;
+                s.at = now;
+                (s.rate > 0.0).then_some(s.rate)
+            }
+            // First sample, or the byte count went backwards (a restarted
+            // download): start fresh.
+            _ => {
+                self.download_rates.insert(
+                    key.to_string(),
+                    RateSample {
+                        bytes,
+                        at: now,
+                        rate: 0.0,
+                    },
+                );
+                None
+            }
+        }
+    }
+
     /// Fetch managed vendor-CLI state and render the settings rows. Install
     /// progress is stateless: the server's install status drives the busy
     /// flag and status text on every refresh.
@@ -1927,6 +1989,9 @@ impl Controller {
             } else {
                 String::new()
             };
+            if install.as_ref().map(|s| s.status.as_str()) != Some("pending") {
+                self.download_rates.remove(&format!("cli:{}", cli.id));
+            }
             let (status, busy, progress) = match install.as_ref().map(|s| s.status.as_str()) {
                 Some("pending") => {
                     let s = install.as_ref().unwrap();
@@ -1934,7 +1999,9 @@ impl Controller {
                         Some(v) => format!("downloading {v}"),
                         None => "downloading".to_string(),
                     };
-                    let (text, pct) = download_progress(&label, s.received_bytes, s.total_bytes);
+                    let rate = self.download_rate(&format!("cli:{}", cli.id), s.received_bytes);
+                    let (text, pct) =
+                        download_progress(&label, s.received_bytes, s.total_bytes, rate);
                     (text, true, pct)
                 }
                 Some("failed") => (
@@ -1985,7 +2052,7 @@ impl Controller {
 
     /// Render local-model state into the settings section.
     fn push_local(
-        &self,
+        &mut self,
         status: &trouve_protocol::LocalStatus,
         install: &trouve_protocol::CliInstallStatus,
     ) {
@@ -2010,12 +2077,17 @@ impl Controller {
                 runtime_label.push_str(&format!(" — {latest} available"));
             }
         }
+        if install.status != "pending" {
+            self.download_rates.remove("cli:llama-server");
+        }
         let (runtime_busy, runtime_status, runtime_progress) = match install.status.as_str() {
             "pending" => {
+                let rate = self.download_rate("cli:llama-server", install.received_bytes);
                 let (text, pct) = download_progress(
                     "downloading llama.cpp",
                     install.received_bytes,
                     install.total_bytes,
+                    rate,
                 );
                 (true, text, pct)
             }
@@ -2059,6 +2131,14 @@ impl Controller {
             let progress = (m.download_bytes * 100)
                 .checked_div(m.size_bytes)
                 .map_or(0, |p| p.min(99) as i32);
+            let rate_key = format!("model:{}", m.id);
+            let download_line = if m.download_status == "pending" {
+                let rate = self.download_rate(&rate_key, m.download_bytes);
+                download_progress("downloading", m.download_bytes, m.size_bytes, rate).0
+            } else {
+                self.download_rates.remove(&rate_key);
+                String::new()
+            };
             let view = ui::LocalModelView {
                 id: m.id.clone(),
                 name: m.display_name.clone(),
@@ -2070,6 +2150,7 @@ impl Controller {
                 downloaded: m.downloaded,
                 downloading: m.download_status == "pending",
                 progress,
+                download_line,
                 error: m.download_error.clone(),
                 custom: m.custom,
             };
@@ -2094,6 +2175,7 @@ impl Controller {
             downloaded: false,
             downloading: false,
             progress: 0,
+            download_line: String::new(),
             error: String::new(),
             custom: false,
         };
@@ -3164,6 +3246,7 @@ impl Controller {
                     Ok(integration) => {
                         self.github_configured = integration.configured;
                         self.github_source = integration.source;
+                        self.github_oauth_available = integration.oauth_available;
                         self.push_github_integration();
                         // A fresh token usually means the PR tab was waiting.
                         self.refresh_prs();
@@ -4020,19 +4103,31 @@ fn human_count(n: u64) -> String {
 
 /// Download status line + bar percent: "label… 45 MB / 120 MB (37%)", or
 /// just the received count with -1 (no bar) when the total is unknown.
-fn download_progress(label: &str, received: u64, total: u64) -> (String, i32) {
+fn download_progress(label: &str, received: u64, total: u64, rate: Option<f64>) -> (String, i32) {
+    let speed = rate.map(human_rate).unwrap_or_default();
     if total == 0 {
-        return (format!("{label}… {}", human_mb(received)), -1);
+        return (format!("{label}… {}{speed}", human_mb(received)), -1);
     }
     let pct = ((received * 100) / total).min(100) as i32;
     (
         format!(
-            "{label}… {} / {} ({pct}%)",
+            "{label}… {} / {} ({pct}%){speed}",
             human_mb(received),
             human_mb(total)
         ),
         pct,
     )
+}
+
+/// " · 12.3 MB/s" — transfer-rate suffix for download status lines.
+fn human_rate(bytes_per_sec: f64) -> String {
+    if bytes_per_sec >= 1e6 {
+        format!(" · {:.1} MB/s", bytes_per_sec / 1e6)
+    } else if bytes_per_sec >= 1e3 {
+        format!(" · {:.0} kB/s", bytes_per_sec / 1e3)
+    } else {
+        format!(" · {bytes_per_sec:.0} B/s")
+    }
 }
 
 fn render_command_line(command: &str, args: &[String]) -> String {
@@ -4085,7 +4180,25 @@ fn parse_mcp_form(
 
 #[cfg(test)]
 mod tests {
-    use super::session_title;
+    use super::{download_progress, human_rate, session_title};
+
+    #[test]
+    fn download_progress_includes_speed() {
+        let (text, pct) = download_progress("downloading", 25_000_000, 100_000_000, Some(12.3e6));
+        assert_eq!(text, "downloading… 25 MB / 100 MB (25%) · 12.3 MB/s");
+        assert_eq!(pct, 25);
+        // No rate yet (first poll) → no speed suffix.
+        let (text, pct) = download_progress("downloading", 5_000_000, 0, None);
+        assert_eq!(text, "downloading… 5 MB");
+        assert_eq!(pct, -1);
+    }
+
+    #[test]
+    fn human_rate_picks_sane_units() {
+        assert_eq!(human_rate(12.34e6), " · 12.3 MB/s");
+        assert_eq!(human_rate(850e3), " · 850 kB/s");
+        assert_eq!(human_rate(120.0), " · 120 B/s");
+    }
 
     #[test]
     fn session_title_truncates_at_word_boundary() {
