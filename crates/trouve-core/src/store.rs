@@ -509,6 +509,20 @@ impl Store {
         )?;
         tx.execute("DELETE FROM usage WHERE session_id = ?1", params![id])?;
         tx.execute("DELETE FROM checkpoints WHERE session_id = ?1", params![id])?;
+        // attachments and spawned_threads both FK to threads(id); with
+        // foreign_keys=ON, deleting threads while these rows exist fails the
+        // whole transaction. Any session that ever took an attachment or used
+        // spawn_thread/spawn_session hit this, leaving a session the engine
+        // had already removed from disk still present in the DB.
+        tx.execute(
+            "DELETE FROM attachments WHERE thread_id IN (SELECT id FROM threads WHERE session_id = ?1)",
+            params![id],
+        )?;
+        tx.execute(
+            "DELETE FROM spawned_threads WHERE child_thread_id IN (SELECT id FROM threads WHERE session_id = ?1)
+             OR parent_thread_id IN (SELECT id FROM threads WHERE session_id = ?1)",
+            params![id],
+        )?;
         tx.execute("DELETE FROM threads WHERE session_id = ?1", params![id])?;
         tx.execute("DELETE FROM sessions WHERE id = ?1", params![id])?;
         tx.commit()?;
@@ -834,6 +848,18 @@ impl Store {
             ],
         )?;
         Ok(())
+    }
+
+    /// On-disk paths of every attachment belonging to a session's threads
+    /// (for cleaning up the files when the session is deleted).
+    pub fn session_attachment_paths(&self, session_id: &str) -> Result<Vec<String>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT path FROM attachments
+             WHERE thread_id IN (SELECT id FROM threads WHERE session_id = ?1)",
+        )?;
+        let rows = stmt.query_map(params![session_id], |r| r.get::<_, String>(0))?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
 
     /// Metadata plus the stored file path.
@@ -1423,11 +1449,38 @@ mod tests {
             .set_backend_session("th_1", "cursor", "vendor-abc")
             .unwrap();
         store.enqueue_prompt("th_1", "pending", &[]).unwrap();
+        // Attachments and spawned-thread rows also FK to threads and would
+        // otherwise fail the delete.
+        store
+            .add_attachment(
+                "th_1",
+                &trouve_protocol::Attachment {
+                    id: "at_1".into(),
+                    name: "shot.png".into(),
+                    mime: "image/png".into(),
+                    size_bytes: 3,
+                },
+                "/data/attachments/at_1.png",
+            )
+            .unwrap();
+        let child = Thread {
+            id: "th_child".into(),
+            session_id: "se_1".into(),
+            mode: "code".into(),
+            model: "p/m".into(),
+            model_options: serde_json::Map::new(),
+            permission_mode: PermissionMode::Ask,
+            created_at: chrono::Utc::now(),
+            spawned: true,
+        };
+        store.insert_thread(&child, &serde_json::Map::new()).unwrap();
+        store.insert_spawned("th_child", "th_1", "thread").unwrap();
 
         store.delete_session("se_1").unwrap();
         assert!(store.session("se_1").unwrap().is_none());
         assert!(store.backend_session("th_1", "cursor").unwrap().is_none());
         assert!(store.queued_prompts("th_1").unwrap().is_empty());
+        assert!(store.attachment("at_1").unwrap().is_none());
     }
 
     /// Vendor sessions are keyed per backend: swapping cursor → claude →

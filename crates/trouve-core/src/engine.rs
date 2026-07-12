@@ -2792,6 +2792,11 @@ impl Engine {
                 workspace_id: session.workspace_id.clone(),
             },
         )?;
+        // Remove attachment files from disk before dropping their DB rows;
+        // afterwards their paths are unrecoverable.
+        for path in self.store.session_attachment_paths(id)? {
+            let _ = std::fs::remove_file(&path);
+        }
         // Deleting the session deletes its events (privacy: see event-log doc).
         self.store.delete_session(id)?;
         if self.index_hooks {
