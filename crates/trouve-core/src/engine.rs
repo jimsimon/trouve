@@ -5851,8 +5851,10 @@ async fn download_gguf(
         .connect_timeout(std::time::Duration::from_secs(15))
         .build()?;
     let resp = client.get(&url).send().await?.error_for_status()?;
+    let content_length = resp.content_length();
     let mut stream = resp.bytes_stream();
     let mut file = tokio::fs::File::create(&part).await?;
+    let mut downloaded: u64 = 0;
     while let Some(chunk) = stream.try_next().await? {
         if cancel.load(std::sync::atomic::Ordering::Relaxed) {
             drop(file);
@@ -5860,10 +5862,44 @@ async fn download_gguf(
             return Ok(false);
         }
         file.write_all(&chunk).await?;
+        downloaded += chunk.len() as u64;
         counter.fetch_add(chunk.len() as u64, std::sync::atomic::Ordering::Relaxed);
     }
     file.flush().await?;
     drop(file);
+
+    // Integrity checks before promoting the .part file: catch a truncated
+    // download (connection dropped mid-stream) or a wrong file served from
+    // the mutable `main` ref. Without these a partial/corrupt GGUF would be
+    // renamed to final and loaded.
+    let verify = |ok: bool, msg: String| -> Result<()> {
+        if ok {
+            Ok(())
+        } else {
+            let _ = std::fs::remove_file(&part);
+            bail!(msg)
+        }
+    };
+    if let Some(expected) = content_length {
+        verify(
+            downloaded == expected,
+            format!("download truncated: got {downloaded} of {expected} bytes"),
+        )?;
+    }
+    if entry.size_bytes > 0 {
+        // Allow a small drift (the curated size can lag a re-quantization),
+        // but reject anything clearly wrong.
+        let expected = entry.size_bytes;
+        let tolerance = expected / 100; // 1%
+        let diff = downloaded.abs_diff(expected);
+        verify(
+            diff <= tolerance,
+            format!(
+                "downloaded size {downloaded} differs from the expected {expected} by more than 1%"
+            ),
+        )?;
+    }
+
     std::fs::rename(&part, &target)?;
     Ok(true)
 }
