@@ -885,6 +885,12 @@ fn main() -> anyhow::Result<()> {
     }
     {
         let tx = tx.clone();
+        window.on_local_search_filters_changed(move |gpu, cpu, large| {
+            let _ = tx.send(UiCommand::LocalSearchFilters { gpu, cpu, large });
+        });
+    }
+    {
+        let tx = tx.clone();
         window.on_close_settings(move || {
             let _ = tx.send(UiCommand::CloseSettings);
         });

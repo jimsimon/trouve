@@ -373,6 +373,12 @@ export component SettingsScreen inherits Rectangle {
     in property <string> local-status;
     // HuggingFace model search (replaces the old manual repo/file form).
     in-out property <string> local-search-query;
+    // Result filters by how a repo's files fit this machine; the
+    // controller filters the result list it pushes back.
+    in-out property <bool> local-search-fit-gpu: true;
+    in-out property <bool> local-search-fit-cpu: true;
+    in-out property <bool> local-search-fit-large: false;
+    callback local-search-filters-changed(/* gpu */ bool, /* cpu */ bool, /* too-large */ bool);
     in property <[LocalSearchItem]> local-search-results;
     // "Searching…", an error, or "" when idle.
     in property <string> local-search-status;
@@ -1382,6 +1388,46 @@ export component SettingsScreen inherits Rectangle {
                                         text: "Search";
                                         enabled: root.local-search-query != "";
                                         clicked => { root.local-search(root.local-search-query); }
+                                    }
+                                }
+                                HorizontalLayout {
+                                    spacing: 14px;
+                                    alignment: start;
+                                    Text {
+                                        text: "Show:";
+                                        color: Theme.c.text-soft;
+                                        font-size: Theme.fs(11px);
+                                        vertical-alignment: center;
+                                    }
+                                    CheckBox {
+                                        text: "fits GPU";
+                                        checked <=> root.local-search-fit-gpu;
+                                        toggled => {
+                                            root.local-search-filters-changed(
+                                                root.local-search-fit-gpu,
+                                                root.local-search-fit-cpu,
+                                                root.local-search-fit-large);
+                                        }
+                                    }
+                                    CheckBox {
+                                        text: "runs on CPU";
+                                        checked <=> root.local-search-fit-cpu;
+                                        toggled => {
+                                            root.local-search-filters-changed(
+                                                root.local-search-fit-gpu,
+                                                root.local-search-fit-cpu,
+                                                root.local-search-fit-large);
+                                        }
+                                    }
+                                    CheckBox {
+                                        text: "too large for this machine";
+                                        checked <=> root.local-search-fit-large;
+                                        toggled => {
+                                            root.local-search-filters-changed(
+                                                root.local-search-fit-gpu,
+                                                root.local-search-fit-cpu,
+                                                root.local-search-fit-large);
+                                        }
                                     }
                                 }
                                 if root.local-search-status != "": Text {

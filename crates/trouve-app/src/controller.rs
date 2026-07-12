@@ -237,6 +237,13 @@ pub enum UiCommand {
     },
     /// Search HuggingFace for GGUF repos to add as local models.
     LocalSearch(String),
+    /// HuggingFace search result filters: show repos with files that fit
+    /// the GPU / fit RAM (CPU) / don't fit at all.
+    LocalSearchFilters {
+        gpu: bool,
+        cpu: bool,
+        large: bool,
+    },
     /// Internal: a local-model search finished.
     LocalSearchLoaded(Result<Vec<trouve_protocol::LocalSearchResult>, String>),
     /// Open the full-window automations screen.
@@ -402,6 +409,9 @@ struct Controller {
     /// Last HuggingFace model-search results (kept so "✓ added" flags can
     /// be updated in place after an add).
     local_search: Vec<trouve_protocol::LocalSearchResult>,
+    /// Search result filters: which fit categories ("gpu", "cpu",
+    /// "too-large") stay visible. Mirrors the checkboxes in the UI.
+    local_search_fits: (bool, bool, bool),
     /// Automations, as last fetched (kept so pause/resume can resend the
     /// full definition).
     automations: Vec<trouve_protocol::Automation>,
@@ -547,6 +557,9 @@ pub async fn run(
         local_polling: false,
         local_downloaded: None,
         local_search: Vec::new(),
+        // Matches the UI defaults: models that fit somewhere show, ones
+        // this machine can't run are hidden.
+        local_search_fits: (true, true, false),
         automations: Vec::new(),
         automation_templates: Vec::new(),
         prs: Vec::new(),
@@ -2393,9 +2406,30 @@ impl Controller {
 
     /// Render the cached HuggingFace search results into the settings UI.
     fn push_local_search(&self, status: String) {
-        let results = self
+        // A repo stays visible while any of its files lands in an enabled
+        // fit category; its full file list stays intact once shown.
+        let (gpu, cpu, large) = self.local_search_fits;
+        let visible: Vec<_> = self
             .local_search
             .iter()
+            .filter(|r| {
+                r.files.iter().any(|f| match f.fit.as_str() {
+                    "gpu" => gpu,
+                    "cpu" => cpu,
+                    _ => large,
+                })
+            })
+            .collect();
+        let status = if status.is_empty() && visible.is_empty() && !self.local_search.is_empty() {
+            format!(
+                "all {} results hidden by the fit filters",
+                self.local_search.len()
+            )
+        } else {
+            status
+        };
+        let results = visible
+            .into_iter()
             .map(|r| ui::LocalSearchView {
                 repo: r.repo.clone(),
                 meta: format!(
@@ -3656,6 +3690,10 @@ impl Controller {
                     Err(e) => ui::set_local_status(&self.ui, format!("{e:#}")),
                 }
                 self.refresh_local();
+            }
+            UiCommand::LocalSearchFilters { gpu, cpu, large } => {
+                self.local_search_fits = (gpu, cpu, large);
+                self.push_local_search(String::new());
             }
             UiCommand::LocalSearch(query) => {
                 ui::set_local_search(&self.ui, Vec::new(), "searching HuggingFace…".into());

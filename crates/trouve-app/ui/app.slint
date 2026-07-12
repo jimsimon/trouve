@@ -1116,6 +1116,7 @@ export component AppWindow inherits Window {
     in property <[LocalSearchItem]> local-search-results;
     in property <string> local-search-status: "";
     callback local-search(/* query */ string);
+    callback local-search-filters-changed(/* gpu */ bool, /* cpu */ bool, /* too-large */ bool);
     callback local-refresh();
     callback local-enabled-toggled(bool);
     callback local-runtime-install();
@@ -3967,6 +3968,9 @@ export component AppWindow inherits Window {
         local-search-results: root.local-search-results;
         local-search-status: root.local-search-status;
         local-search(q) => { root.local-search(q); }
+        local-search-filters-changed(gpu, cpu, large) => {
+            root.local-search-filters-changed(gpu, cpu, large);
+        }
         local-refresh => { root.local-refresh(); }
         local-enabled-toggled(on) => { root.local-enabled-toggled(on); }
         local-runtime-install => { root.local-runtime-install(); }
