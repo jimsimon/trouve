@@ -17,8 +17,7 @@
 //!   with sha256 checksums; single static binary)
 //! - codex: GitHub `openai/codex` latest release tarball (musl build on Linux)
 
-use std::io::Write as _;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 use sha2::Digest;
@@ -327,6 +326,12 @@ pub async fn install(
     version: &str,
     progress: &Progress,
 ) -> Result<InstalledCli, InstallError> {
+    // `version` is scraped from vendor endpoints and also joined into
+    // filesystem paths (version dir, staging dir, download URLs). A crafted
+    // or compromised endpoint returning `1/../../../etc` would otherwise let
+    // `remove_dir_all`/`rename` touch an arbitrary directory. Constrain it to
+    // a strict, path-safe allowlist before it reaches the filesystem.
+    validate_version(version)?;
     let root = cli_root(data_dir, id);
     let version_dir = root.join(version);
     // Stage into a temp sibling so a failed install never half-replaces an
@@ -352,8 +357,13 @@ pub async fn install(
         version: version.to_string(),
         bin: bin.to_string_lossy().into_owned(),
     };
-    let mut f = std::fs::File::create(root.join("installed.json"))?;
-    f.write_all(serde_json::to_string_pretty(&info).unwrap().as_bytes())?;
+    // Write the pointer atomically: a crash mid-write would otherwise leave
+    // a truncated installed.json that parses as "not installed" even though
+    // the binary is present.
+    let pointer = root.join("installed.json");
+    let tmp = root.join(".installed.json.tmp");
+    std::fs::write(&tmp, serde_json::to_string_pretty(&info).unwrap().as_bytes())?;
+    std::fs::rename(&tmp, &pointer)?;
 
     let link = managed_bin(data_dir, id);
     std::fs::create_dir_all(link.parent().unwrap())?;
@@ -461,13 +471,95 @@ async fn install_into(
     }
 }
 
+/// A version string safe to use as a path component and in a download URL.
+fn validate_version(version: &str) -> Result<(), InstallError> {
+    let ok = !version.is_empty()
+        && version.len() <= 100
+        && version != "."
+        && version != ".."
+        && !version.contains("..")
+        && version
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'));
+    if ok {
+        Ok(())
+    } else {
+        Err(InstallError::Download(format!(
+            "refusing unsafe version string: {version:.40}"
+        )))
+    }
+}
+
+/// Whether a tar entry path (or link target) stays within the extraction
+/// root: relative, with no `..`, root, or drive-prefix components.
+fn path_is_contained(path: &Path) -> bool {
+    path.components()
+        .all(|c| matches!(c, Component::Normal(_) | Component::CurDir))
+}
+
 /// Unpack a gzipped tarball (already in memory) into `dir` off the async
-/// runtime.
+/// runtime. Every entry is validated before extraction: paths that escape
+/// `dir` (absolute or `..`) are rejected, and symlink/hardlink entries whose
+/// target escapes are refused — otherwise a crafted archive could plant a
+/// symlink and then write through it to an arbitrary location (tar-slip).
 async fn untar_gz(bytes: Vec<u8>, dir: &Path) -> Result<(), InstallError> {
     let dir = dir.to_path_buf();
-    tokio::task::spawn_blocking(move || {
+    tokio::task::spawn_blocking(move || -> Result<(), InstallError> {
         let decoder = flate2::read::GzDecoder::new(std::io::Cursor::new(bytes));
-        tar::Archive::new(decoder).unpack(&dir)
+        let mut archive = tar::Archive::new(decoder);
+        for entry in archive
+            .entries()
+            .map_err(|e| InstallError::Download(format!("reading archive: {e}")))?
+        {
+            let mut entry =
+                entry.map_err(|e| InstallError::Download(format!("archive entry: {e}")))?;
+            let path = entry
+                .path()
+                .map_err(|e| InstallError::Download(format!("archive entry path: {e}")))?
+                .into_owned();
+            if !path_is_contained(&path) {
+                return Err(InstallError::Download(format!(
+                    "archive entry escapes the extraction directory: {}",
+                    path.display()
+                )));
+            }
+            if matches!(
+                entry.header().entry_type(),
+                tar::EntryType::Symlink | tar::EntryType::Link
+            ) {
+                match entry.link_name() {
+                    Ok(Some(target)) if path_is_contained(&target) => {}
+                    Ok(Some(target)) => {
+                        return Err(InstallError::Download(format!(
+                            "archive link {} points outside the extraction directory: {}",
+                            path.display(),
+                            target.display()
+                        )));
+                    }
+                    Ok(None) => {
+                        return Err(InstallError::Download(format!(
+                            "archive link {} has no target",
+                            path.display()
+                        )));
+                    }
+                    Err(e) => {
+                        return Err(InstallError::Download(format!("archive link name: {e}")));
+                    }
+                }
+            }
+            // unpack_in re-checks containment as a second layer and returns
+            // false if it still refuses the path.
+            if !entry
+                .unpack_in(&dir)
+                .map_err(|e| InstallError::Download(format!("unpacking entry: {e}")))?
+            {
+                return Err(InstallError::Download(format!(
+                    "archive entry refused: {}",
+                    path.display()
+                )));
+            }
+        }
+        Ok(())
     })
     .await
     .map_err(|e| InstallError::Download(format!("unpack task: {e}")))??;
@@ -555,6 +647,67 @@ DOWNLOAD_URL="https://downloads.cursor.com/lab/2026.07.01-41b2de7/${OS}/${ARCH}/
             Some("2026.07.01-41b2de7")
         );
         assert_eq!(parse_cursor_install_version("nothing here"), None);
+    }
+
+    #[test]
+    fn version_validation_rejects_path_tricks() {
+        for good in ["1.2.3", "2026.07.01-41b2de7", "b9957", "rust-v0.5.0"] {
+            assert!(validate_version(good).is_ok(), "{good} should be valid");
+        }
+        for bad in [
+            "",
+            ".",
+            "..",
+            "1/../../etc",
+            "../evil",
+            "a/b",
+            "a\\b",
+            "1 2",
+            "x/..",
+        ] {
+            assert!(validate_version(bad).is_err(), "{bad} should be rejected");
+        }
+    }
+
+    #[test]
+    fn tar_entry_containment_checks() {
+        assert!(path_is_contained(Path::new("dist-package/cursor-agent")));
+        assert!(path_is_contained(Path::new("libllama.so.1")));
+        assert!(!path_is_contained(Path::new("../escape")));
+        assert!(!path_is_contained(Path::new("/etc/passwd")));
+        assert!(!path_is_contained(Path::new("a/../../b")));
+    }
+
+    #[tokio::test]
+    async fn untar_rejects_symlink_escape() {
+        // Build a tarball whose first entry is a symlink pointing outside the
+        // extraction dir, then a file "through" it — the classic tar-slip.
+        let mut header = tar::Header::new_gnu();
+        header.set_entry_type(tar::EntryType::Symlink);
+        header.set_size(0);
+        header.set_mode(0o777);
+        let mut buf = Vec::new();
+        {
+            let mut builder = tar::Builder::new(&mut buf);
+            builder
+                .append_link(&mut header, "link", "/tmp")
+                .unwrap();
+            builder.finish().unwrap();
+        }
+        let mut gz = Vec::new();
+        {
+            use std::io::Write;
+            let mut enc =
+                flate2::write::GzEncoder::new(&mut gz, flate2::Compression::default());
+            enc.write_all(&buf).unwrap();
+            enc.finish().unwrap();
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let err = untar_gz(gz, dir.path()).await.unwrap_err();
+        assert!(
+            matches!(err, InstallError::Download(m) if m.contains("outside")),
+            "expected a containment error"
+        );
     }
 
     #[test]
