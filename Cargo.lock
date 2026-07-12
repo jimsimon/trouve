@@ -8215,6 +8215,7 @@ dependencies = [
  "chrono",
  "dirs",
  "futures",
+ "globset",
  "ignore",
  "octocrab",
  "portable-pty",

@@ -32,6 +32,7 @@ pub fn builtin_modes() -> Vec<AgentMode> {
             allowed_tools: vec![
                 "read_file".into(),
                 "list_dir".into(),
+                "glob".into(),
                 "grep".into(),
                 "search".into(),
                 "find_related".into(),
@@ -50,6 +51,7 @@ pub fn builtin_modes() -> Vec<AgentMode> {
             allowed_tools: vec![
                 "read_file".into(),
                 "list_dir".into(),
+                "glob".into(),
                 "grep".into(),
                 "search".into(),
                 "find_related".into(),
@@ -80,6 +82,7 @@ pub fn builtin_modes() -> Vec<AgentMode> {
             allowed_tools: vec![
                 "read_file".into(),
                 "list_dir".into(),
+                "glob".into(),
                 "grep".into(),
                 "search".into(),
                 "find_related".into(),

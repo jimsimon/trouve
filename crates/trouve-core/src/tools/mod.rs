@@ -6,6 +6,7 @@
 //! container-backed implementation without touching the loop.
 
 mod fs;
+mod glob;
 mod grep;
 mod search;
 mod shell;
@@ -119,6 +120,7 @@ impl LocalToolExecutor {
                 Arc::new(fs::WriteFile),
                 Arc::new(fs::EditFile),
                 Arc::new(fs::ListDir),
+                Arc::new(glob::Glob),
                 Arc::new(shell::Shell),
                 Arc::new(grep::Grep),
                 Arc::new(search::Search {
