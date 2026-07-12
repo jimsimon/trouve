@@ -150,8 +150,28 @@ impl Provider for CodexResponsesProvider {
             body["reasoning"] = json!({ "effort": effort });
         }
 
-        let url = std::env::var("TROUVE_CODEX_RESPONSES_URL")
-            .unwrap_or_else(|_| CODEX_RESPONSES_URL.to_string());
+        let url = match std::env::var("TROUVE_CODEX_RESPONSES_URL") {
+            Ok(u) if !u.is_empty() => {
+                // This redirects the ChatGPT subscription bearer token to an
+                // arbitrary host — a test/debug hook only. Refuse a
+                // non-loopback override unless explicitly allowed, and log
+                // loudly so it can't be set silently.
+                let host_ok = reqwest::Url::parse(&u).ok().is_some_and(|parsed| {
+                    parsed
+                        .host_str()
+                        .is_some_and(|h| h == "localhost" || h.starts_with("127."))
+                });
+                if !host_ok && std::env::var_os("TROUVE_ALLOW_REMOTE").is_none() {
+                    return Err(ProviderError::Auth(format!(
+                        "refusing to send the ChatGPT token to {u}: set TROUVE_ALLOW_REMOTE \
+                         to override TROUVE_CODEX_RESPONSES_URL with a non-loopback host"
+                    )));
+                }
+                tracing::warn!("using TROUVE_CODEX_RESPONSES_URL override: {u}");
+                u
+            }
+            _ => CODEX_RESPONSES_URL.to_string(),
+        };
         let resp = self
             .http
             .post(&url)

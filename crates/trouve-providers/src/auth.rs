@@ -351,14 +351,16 @@ pub async fn pkce_wait_for_code(
         };
         let mut code = None;
         let mut state_ok = false;
+        let mut error = None;
         for (k, v) in url.query_pairs() {
             match &*k {
                 "code" => code = Some(v.to_string()),
                 "state" => state_ok = v == expected_state,
+                "error" => error = Some(v.to_string()),
                 _ => {}
             }
         }
-        let body = "<html><body>trouve: login complete, you can close this tab.</body></html>";
+        let body = "<html><body>trouve: you can close this tab.</body></html>";
         let _ = stream
             .write_all(
                 format!(
@@ -368,6 +370,11 @@ pub async fn pkce_wait_for_code(
                 .as_bytes(),
             )
             .await;
+        // The provider redirects with `error=...` (no code) when the user
+        // denies consent; fail now instead of waiting out the whole timeout.
+        if let Some(error) = error {
+            return Err(ProviderError::Auth(format!("authorization denied: {error}")));
+        }
         if let (Some(code), true) = (code, state_ok) {
             return Ok(code);
         }
