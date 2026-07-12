@@ -50,6 +50,11 @@ pub struct Config {
     /// Integrations, or by hand here.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub github_enterprise: Vec<GithubEnterpriseConfig>,
+    /// Set when the on-disk config failed to parse and we fell back to
+    /// defaults. Never serialized; `save_to` refuses to persist in this
+    /// state so a parse error can't pave over the user's real config.
+    #[serde(skip)]
+    pub load_failed: bool,
 }
 
 /// One GitHub Enterprise Server instance.
@@ -118,11 +123,30 @@ fn default_kind() -> String {
 
 impl Config {
     pub fn load() -> Self {
-        let path = config_path();
-        match std::fs::read_to_string(&path) {
+        Self::load_from(&config_path())
+    }
+
+    pub fn load_from(path: &std::path::Path) -> Self {
+        match std::fs::read_to_string(path) {
             Ok(text) => toml::from_str(&text).unwrap_or_else(|e| {
-                tracing::warn!("failed to parse {}: {e}; using defaults", path.display());
-                Self::default()
+                // A malformed file must not silently become defaults: the
+                // very next persisted setting change would then rewrite
+                // config.toml from that default snapshot, destroying the
+                // user's hand-written providers, hosts, and inline keys. Back
+                // the broken file up and refuse to persist over it (see
+                // save_to) so nothing is lost.
+                tracing::error!(
+                    "failed to parse {}: {e}; running with defaults but NOT overwriting the file",
+                    path.display()
+                );
+                let backup = path.with_extension("toml.corrupt");
+                if let Err(e) = std::fs::copy(path, &backup) {
+                    tracing::warn!("could not back up broken config to {}: {e}", backup.display());
+                }
+                Self {
+                    load_failed: true,
+                    ..Self::default()
+                }
             }),
             Err(_) => Self::default(),
         }
@@ -136,6 +160,13 @@ impl Config {
     }
 
     pub fn save_to(&self, path: &std::path::Path) -> Result<()> {
+        if self.load_failed {
+            anyhow::bail!(
+                "refusing to overwrite {}: it failed to parse at startup (a backup is at \
+                 <config>.toml.corrupt); fix or remove it, then restart",
+                path.display()
+            );
+        }
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)
                 .with_context(|| format!("creating {}", parent.display()))?;
@@ -143,5 +174,32 @@ impl Config {
         let text = toml::to_string_pretty(self).context("serializing config")?;
         std::fs::write(path, text).with_context(|| format!("writing {}", path.display()))?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn corrupt_config_is_preserved_not_overwritten() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("config.toml");
+        std::fs::write(&path, "default_model = \"a/b\"\n[not valid toml").unwrap();
+
+        let cfg = Config::load_from(&path);
+        assert!(cfg.load_failed);
+        // A backup was made, and saving over the original is refused.
+        assert!(path.with_extension("toml.corrupt").exists());
+        assert!(cfg.save_to(&path).is_err());
+        // The broken file is untouched.
+        assert!(std::fs::read_to_string(&path).unwrap().contains("not valid toml"));
+
+        // A well-formed config loads and persists normally.
+        std::fs::write(&path, "default_model = \"openai/gpt\"\n").unwrap();
+        let cfg = Config::load_from(&path);
+        assert!(!cfg.load_failed);
+        assert_eq!(cfg.default_model.as_deref(), Some("openai/gpt"));
+        cfg.save_to(&path).unwrap();
     }
 }
