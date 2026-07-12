@@ -530,6 +530,66 @@ pub fn fit(size_bytes: u64, hw: &Hardware) -> &'static str {
 
 // --- llama-server lifecycle ---------------------------------------------------
 
+/// Pidfile listing every llama-server this data dir has spawned and not yet
+/// cleanly killed. `kill_on_drop` only covers graceful exits — an app crash
+/// or SIGKILL leaves sidecars running (and holding VRAM), so the next start
+/// reaps whatever the file still lists.
+fn pids_path(data_dir: &Path) -> PathBuf {
+    data_dir.join("llama-server.pids")
+}
+
+fn read_pids(path: &Path) -> Vec<u32> {
+    std::fs::read_to_string(path)
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|l| l.trim().parse().ok())
+        .collect()
+}
+
+fn write_pids(path: &Path, pids: &[u32]) {
+    let body = pids
+        .iter()
+        .map(u32::to_string)
+        .collect::<Vec<_>>()
+        .join("\n");
+    if pids.is_empty() {
+        let _ = std::fs::remove_file(path);
+    } else if let Err(e) = std::fs::write(path, body) {
+        tracing::warn!("cannot write {}: {e}", path.display());
+    }
+}
+
+/// A process's command line, for identity checks before killing.
+fn process_cmdline(pid: u32) -> Option<String> {
+    #[cfg(target_os = "linux")]
+    {
+        std::fs::read_to_string(format!("/proc/{pid}/cmdline"))
+            .ok()
+            .filter(|s| !s.is_empty())
+            .map(|s| s.replace('\0', " "))
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let out = std::process::Command::new("ps")
+            .args(["-p", &pid.to_string(), "-o", "command="])
+            .output()
+            .ok()?;
+        let cmd = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        (out.status.success() && !cmd.is_empty()).then_some(cmd)
+    }
+}
+
+fn kill_pid(pid: u32) {
+    #[cfg(unix)]
+    let _ = std::process::Command::new("kill")
+        .args(["-9", &pid.to_string()])
+        .status();
+    #[cfg(not(unix))]
+    let _ = std::process::Command::new("taskkill")
+        .args(["/F", "/PID", &pid.to_string()])
+        .status();
+}
+
 struct Running {
     model_id: String,
     port: u16,
@@ -551,18 +611,62 @@ pub enum ServerState {
 pub struct LlamaManager {
     inner: tokio::sync::Mutex<Option<Running>>,
     state: std::sync::Mutex<ServerState>,
-}
-
-impl Default for LlamaManager {
-    fn default() -> Self {
-        Self {
-            inner: tokio::sync::Mutex::new(None),
-            state: std::sync::Mutex::new(ServerState::Stopped),
-        }
-    }
+    /// Pidfile tracking spawned servers across app runs (crash recovery).
+    pids: PathBuf,
 }
 
 impl LlamaManager {
+    /// Build the manager and reap any llama-server left over from a previous
+    /// run that ended without cleanup (crash/SIGKILL) — leaked servers keep
+    /// multi-GB VRAM allocations alive and starve the next load.
+    pub fn new(data_dir: &Path) -> Self {
+        let pids = pids_path(data_dir);
+        Self::reap_stale(&pids, data_dir);
+        Self {
+            inner: tokio::sync::Mutex::new(None),
+            state: std::sync::Mutex::new(ServerState::Stopped),
+            pids,
+        }
+    }
+
+    /// Kill every pid the pidfile lists, provided it still looks like one of
+    /// ours (its command line names llama-server under this data dir — a
+    /// recycled pid must never take down an innocent process).
+    fn reap_stale(pids_file: &Path, data_dir: &Path) {
+        let stale = read_pids(pids_file);
+        if stale.is_empty() {
+            return;
+        }
+        let data_dir = data_dir.to_string_lossy();
+        for pid in &stale {
+            let Some(cmd) = process_cmdline(*pid) else {
+                continue; // Already gone.
+            };
+            if cmd.contains("llama-server") && cmd.contains(data_dir.as_ref()) {
+                tracing::info!("reaping stale llama-server (pid {pid}) from a previous run");
+                kill_pid(*pid);
+            }
+        }
+        write_pids(pids_file, &[]);
+    }
+
+    fn pids_add(&self, pid: Option<u32>) {
+        if let Some(pid) = pid {
+            let mut pids = read_pids(&self.pids);
+            if !pids.contains(&pid) {
+                pids.push(pid);
+                write_pids(&self.pids, &pids);
+            }
+        }
+    }
+
+    fn pids_remove(&self, pid: Option<u32>) {
+        if let Some(pid) = pid {
+            let mut pids = read_pids(&self.pids);
+            pids.retain(|p| *p != pid);
+            write_pids(&self.pids, &pids);
+        }
+    }
     /// Sidecar state (non-blocking; safe to poll during a model load).
     pub fn state(&self) -> ServerState {
         self.state.lock().unwrap().clone()
@@ -582,7 +686,9 @@ impl LlamaManager {
 
     pub async fn stop(&self) {
         if let Some(mut running) = self.inner.lock().await.take() {
+            let pid = running.child.id();
             let _ = running.child.kill().await;
+            self.pids_remove(pid);
         }
         self.set_state(ServerState::Stopped);
     }
@@ -603,7 +709,9 @@ impl LlamaManager {
             if running.model_id == model_id && running.child.try_wait()?.is_none() {
                 return Ok(format!("http://127.0.0.1:{}/v1", running.port));
             }
+            let pid = running.child.id();
             let _ = running.child.kill().await;
+            self.pids_remove(pid);
             *inner = None;
         }
         self.set_state(ServerState::Starting(model_id.to_string()));
@@ -643,8 +751,10 @@ impl LlamaManager {
             .arg(port.to_string())
             .arg("-c")
             .arg(SERVE_CONTEXT.to_string())
-            // Offload everything the build supports; ignored on CPU builds.
-            .args(["-ngl", "999"])
+            // No -ngl: llama.cpp then auto-fits n_gpu_layers to *free* VRAM,
+            // spilling gracefully to CPU instead of into GTT/system memory
+            // over PCIe (forcing 999 disables the fit and runs at ~5 tok/s
+            // when another process holds VRAM).
             // Jinja chat templating enables OpenAI-style tool calling.
             .arg("--jinja")
             .stdin(std::process::Stdio::null())
@@ -669,6 +779,11 @@ impl LlamaManager {
         let mut child = cmd
             .spawn()
             .with_context(|| format!("spawning {}", bin.display()))?;
+        // Into the pidfile before anything can go wrong: a crash during the
+        // multi-minute model load must still leave a trail to reap. (Capture
+        // the pid now — Child::id() is None once the process is reaped.)
+        let pid = child.id();
+        self.pids_add(pid);
 
         // Wait for /health to go 200 (503 while the model loads).
         let url = format!("http://127.0.0.1:{port}/health");
@@ -676,6 +791,7 @@ impl LlamaManager {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(300);
         loop {
             if let Some(status) = child.try_wait()? {
+                self.pids_remove(pid);
                 bail!(
                     "llama-server exited during startup ({status}); log tail:\n{}",
                     log_tail(log_path)
@@ -688,6 +804,7 @@ impl LlamaManager {
             }
             if std::time::Instant::now() > deadline {
                 let _ = child.kill().await;
+                self.pids_remove(pid);
                 bail!(
                     "llama-server did not become healthy within 5 minutes; log tail:\n{}",
                     log_tail(log_path)
@@ -932,6 +1049,41 @@ mod tests {
         let custom = entries.iter().find(|e| e.id == "my-model").unwrap();
         assert!(custom.custom);
         assert_eq!(entries.len(), CATALOG.len() + 1);
+    }
+
+    #[test]
+    fn pidfile_round_trips_and_clears_when_empty() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = pids_path(tmp.path());
+        assert!(read_pids(&path).is_empty());
+        write_pids(&path, &[123, 456]);
+        assert_eq!(read_pids(&path), vec![123, 456]);
+        write_pids(&path, &[]);
+        assert!(!path.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reap_only_kills_processes_that_look_like_ours() {
+        // A live process that is *not* a llama-server under our data dir
+        // must survive a reap even when the pidfile (wrongly) lists it —
+        // pids get recycled, and killing an innocent process is the one
+        // unforgivable failure mode here.
+        let tmp = tempfile::tempdir().unwrap();
+        let mut bystander = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        let path = pids_path(tmp.path());
+        write_pids(&path, &[bystander.id()]);
+
+        LlamaManager::reap_stale(&path, tmp.path());
+
+        // Still alive (no exit status), and the pidfile is cleared.
+        assert!(bystander.try_wait().unwrap().is_none());
+        assert!(!path.exists());
+        let _ = bystander.kill();
+        let _ = bystander.wait();
     }
 
     #[test]

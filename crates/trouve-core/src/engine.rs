@@ -301,7 +301,9 @@ impl Engine {
         // unless the user disabled local models — it lists no models until
         // a GGUF is downloaded — and seeded as injected so config-driven
         // reloads keep it.
-        let local_manager = Arc::new(crate::local::LlamaManager::default());
+        // Construction reaps llama-servers leaked by a crashed previous run
+        // (they hold VRAM and would starve this run's model loads).
+        let local_manager = Arc::new(crate::local::LlamaManager::new(&data_dir));
         let local_provider: Arc<dyn Provider> = Arc::new(crate::local::LocalProvider::new(
             data_dir.clone(),
             config_dir.clone(),
