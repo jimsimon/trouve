@@ -1217,16 +1217,35 @@ impl Controller {
         self.vms.insert(thread_id.clone(), ThreadViewModel::new());
         let client = self.client.clone();
         let tx = self.tx.clone();
+        // Reconnect for the lifetime of the app. The server ends the stream
+        // on a store error or its own restart; without this the thread's
+        // chat would silently freeze (no deltas, tool cards, or approvals)
+        // until relaunch. Resume from the last cursor delivered — tracked in
+        // the closure so an error path (which loses the return value) still
+        // knows where to continue — so no event is replayed or dropped.
         tokio::spawn(async move {
-            let id = thread_id.clone();
-            let result = client
-                .follow_thread_events(&thread_id, 0, |envelope| {
-                    let _ = tx.send(UiCommand::Event(id.clone(), Box::new(envelope)));
-                    std::ops::ControlFlow::Continue(())
-                })
-                .await;
-            if let Err(e) = result {
-                tracing::warn!("event stream for {thread_id} ended: {e:#}");
+            use std::sync::atomic::{AtomicU64, Ordering};
+            let cursor = std::sync::Arc::new(AtomicU64::new(0));
+            loop {
+                let id = thread_id.clone();
+                let seen = cursor.clone();
+                let after = cursor.load(Ordering::Relaxed);
+                let result = client
+                    .follow_thread_events(&thread_id, after, |envelope| {
+                        seen.store(envelope.cursor, Ordering::Relaxed);
+                        let _ = tx.send(UiCommand::Event(id.clone(), Box::new(envelope)));
+                        std::ops::ControlFlow::Continue(())
+                    })
+                    .await;
+                match result {
+                    Ok(last) => {
+                        cursor.fetch_max(last, Ordering::Relaxed);
+                    }
+                    Err(e) => {
+                        tracing::warn!("event stream for {thread_id} reconnecting: {e:#}");
+                    }
+                }
+                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
             }
         });
     }
