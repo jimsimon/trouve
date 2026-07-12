@@ -3495,6 +3495,10 @@ impl Engine {
 
             let mut text = String::new();
             let mut tool_calls = Vec::new();
+            // Provider-native reasoning blocks (Anthropic signed thinking) to
+            // persist and replay verbatim — Anthropic rejects a follow-up
+            // tool-use turn whose thinking blocks aren't preserved.
+            let mut reasoning: Vec<serde_json::Value> = Vec::new();
             while let Some(ev) = stream.next().await {
                 match ev.map_err(|e| anyhow!("provider stream error: {e}"))? {
                     ProviderEvent::TextDelta(delta) => {
@@ -3511,6 +3515,9 @@ impl Engine {
                             Event::AssistantThinking { turn, text: delta },
                         )?;
                     }
+                    // Kept out of the UI (already streamed as ThinkingDelta);
+                    // carried in the transcript for replay only.
+                    ProviderEvent::Reasoning(block) => reasoning.push(block),
                     ProviderEvent::ToolCall(call) => tool_calls.push(call),
                     ProviderEvent::Completed { usage } => {
                         usage_total.input_tokens += usage.input_tokens;
@@ -3540,6 +3547,7 @@ impl Engine {
                     &serde_json::to_value(Message::Assistant {
                         content: text,
                         tool_calls: tool_calls.clone(),
+                        reasoning,
                     })?,
                 )?;
             }
@@ -4187,6 +4195,7 @@ impl Engine {
             &serde_json::to_value(Message::Assistant {
                 content: text,
                 tool_calls: Vec::new(),
+                reasoning: Vec::new(),
             })?,
         )?;
         self.store
@@ -5176,6 +5185,7 @@ fn sanitize_transcript(messages: Vec<Message>) -> Vec<Message> {
             Message::Assistant {
                 content,
                 tool_calls,
+                reasoning,
             } => {
                 if content.trim().is_empty() && tool_calls.is_empty() {
                     continue;
@@ -5184,6 +5194,7 @@ fn sanitize_transcript(messages: Vec<Message>) -> Vec<Message> {
                 out.push(Message::Assistant {
                     content,
                     tool_calls,
+                    reasoning,
                 });
                 if ids.is_empty() {
                     continue;
@@ -5717,6 +5728,7 @@ mod tests {
                     name: "write_file".into(),
                     arguments: "{}".into(),
                 }],
+                reasoning: vec![],
             },
             Message::ToolResult {
                 call_id: "1".into(),
@@ -5726,6 +5738,7 @@ mod tests {
             Message::Assistant {
                 content: "Done — login page added.".into(),
                 tool_calls: vec![],
+                reasoning: vec![],
             },
         ];
         let digest = render_history_digest(&messages, false).unwrap();
@@ -5834,6 +5847,7 @@ mod tests {
             Message::Assistant {
                 content: String::new(),
                 tool_calls: vec![call("a"), call("b")],
+                reasoning: vec![],
             },
             Message::ToolResult {
                 call_id: "a".into(),
@@ -5863,6 +5877,7 @@ mod tests {
             Message::Assistant {
                 content: "   ".into(),
                 tool_calls: vec![],
+                reasoning: vec![],
             },
         ]);
         assert_eq!(out.len(), 1);
@@ -5873,6 +5888,7 @@ mod tests {
             Message::Assistant {
                 content: String::new(),
                 tool_calls: vec![call("x")],
+                reasoning: vec![],
             },
             Message::ToolResult {
                 call_id: "x".into(),

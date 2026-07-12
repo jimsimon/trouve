@@ -52,6 +52,13 @@ pub enum Message {
     Assistant {
         content: String,
         tool_calls: Vec<ToolCallRequest>,
+        /// Provider-native reasoning blocks to replay verbatim on the next
+        /// request (Anthropic's signed `thinking`/`redacted_thinking`
+        /// blocks). Anthropic rejects a follow-up tool-use turn whose
+        /// thinking blocks aren't preserved, so these must survive the
+        /// round-trip. Opaque to other providers, which ignore them.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        reasoning: Vec<serde_json::Value>,
     },
     ToolResult {
         call_id: String,
@@ -69,6 +76,10 @@ pub enum ProviderEvent {
     TextDelta(String),
     /// Reasoning ("thinking") text, where the model/provider exposes it.
     ThinkingDelta(String),
+    /// A complete provider-native reasoning block to preserve for replay
+    /// (Anthropic signed `thinking`/`redacted_thinking`). Distinct from
+    /// `ThinkingDelta`, which is display-only streaming text.
+    Reasoning(serde_json::Value),
     ToolCall(ToolCallRequest),
     Completed {
         usage: Usage,

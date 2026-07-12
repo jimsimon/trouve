@@ -137,8 +137,12 @@ impl AnthropicProvider {
                 Message::Assistant {
                     content,
                     tool_calls,
+                    reasoning,
                 } => {
                     let mut blocks = Vec::new();
+                    // Signed thinking blocks must come first and be replayed
+                    // verbatim, or the API rejects a follow-up tool-use turn.
+                    blocks.extend(reasoning.iter().cloned());
                     if !content.is_empty() {
                         blocks.push(json!({"type": "text", "text": content}));
                     }
@@ -314,6 +318,12 @@ struct BlockState {
     tool_name: String,
     tool_json: String,
     is_tool: bool,
+    /// Thinking-block accumulation (for replay preservation).
+    is_thinking: bool,
+    is_redacted: bool,
+    thinking_text: String,
+    thinking_signature: String,
+    redacted_data: String,
 }
 
 fn sse_to_events(
@@ -358,20 +368,30 @@ fn sse_to_events(
                     "content_block_start" => {
                         let idx = v["index"].as_u64().unwrap_or(0);
                         let block = blocks.entry(idx).or_default();
-                        if v.pointer("/content_block/type").and_then(Value::as_str)
-                            == Some("tool_use")
-                        {
-                            block.is_tool = true;
-                            block.tool_id = v
-                                .pointer("/content_block/id")
-                                .and_then(Value::as_str)
-                                .unwrap_or("")
-                                .to_string();
-                            block.tool_name = v
-                                .pointer("/content_block/name")
-                                .and_then(Value::as_str)
-                                .unwrap_or("")
-                                .to_string();
+                        match v.pointer("/content_block/type").and_then(Value::as_str) {
+                            Some("tool_use") => {
+                                block.is_tool = true;
+                                block.tool_id = v
+                                    .pointer("/content_block/id")
+                                    .and_then(Value::as_str)
+                                    .unwrap_or("")
+                                    .to_string();
+                                block.tool_name = v
+                                    .pointer("/content_block/name")
+                                    .and_then(Value::as_str)
+                                    .unwrap_or("")
+                                    .to_string();
+                            }
+                            Some("thinking") => block.is_thinking = true,
+                            Some("redacted_thinking") => {
+                                block.is_redacted = true;
+                                block.redacted_data = v
+                                    .pointer("/content_block/data")
+                                    .and_then(Value::as_str)
+                                    .unwrap_or("")
+                                    .to_string();
+                            }
+                            _ => {}
                         }
                     }
                     "content_block_delta" => {
@@ -389,9 +409,25 @@ fn sse_to_events(
                                 if let Some(text) =
                                     v.pointer("/delta/thinking").and_then(Value::as_str)
                                 {
+                                    blocks
+                                        .entry(idx)
+                                        .or_default()
+                                        .thinking_text
+                                        .push_str(text);
                                     let _ = tx
                                         .send(Ok(ProviderEvent::ThinkingDelta(text.to_string())))
                                         .await;
+                                }
+                            }
+                            Some("signature_delta") => {
+                                if let Some(sig) =
+                                    v.pointer("/delta/signature").and_then(Value::as_str)
+                                {
+                                    blocks
+                                        .entry(idx)
+                                        .or_default()
+                                        .thinking_signature
+                                        .push_str(sig);
                                 }
                             }
                             Some("input_json_delta") => {
@@ -406,21 +442,38 @@ fn sse_to_events(
                     }
                     "content_block_stop" => {
                         let idx = v["index"].as_u64().unwrap_or(0);
-                        if let Some(block) = blocks.remove(&idx)
-                            && block.is_tool
-                        {
-                            let arguments: Value = if block.tool_json.is_empty() {
-                                json!({})
-                            } else {
-                                serde_json::from_str(&block.tool_json).unwrap_or(Value::Null)
-                            };
-                            let _ = tx
-                                .send(Ok(ProviderEvent::ToolCall(ToolCallRequest {
-                                    id: block.tool_id,
-                                    name: block.tool_name,
-                                    arguments,
-                                })))
-                                .await;
+                        if let Some(block) = blocks.remove(&idx) {
+                            if block.is_tool {
+                                let arguments: Value = if block.tool_json.is_empty() {
+                                    json!({})
+                                } else {
+                                    serde_json::from_str(&block.tool_json).unwrap_or(Value::Null)
+                                };
+                                let _ = tx
+                                    .send(Ok(ProviderEvent::ToolCall(ToolCallRequest {
+                                        id: block.tool_id,
+                                        name: block.tool_name,
+                                        arguments,
+                                    })))
+                                    .await;
+                            } else if block.is_thinking && !block.thinking_signature.is_empty() {
+                                // Preserve the signed thinking block so it can
+                                // be replayed on the next request.
+                                let _ = tx
+                                    .send(Ok(ProviderEvent::Reasoning(json!({
+                                        "type": "thinking",
+                                        "thinking": block.thinking_text,
+                                        "signature": block.thinking_signature,
+                                    }))))
+                                    .await;
+                            } else if block.is_redacted {
+                                let _ = tx
+                                    .send(Ok(ProviderEvent::Reasoning(json!({
+                                        "type": "redacted_thinking",
+                                        "data": block.redacted_data,
+                                    }))))
+                                    .await;
+                            }
                         }
                     }
                     "message_delta" => {
@@ -475,6 +528,7 @@ mod tests {
                         arguments: json!({}),
                     },
                 ],
+                reasoning: vec![],
             },
             Message::ToolResult {
                 call_id: "t1".into(),
@@ -492,6 +546,30 @@ mod tests {
         assert_eq!(wire.len(), 3);
         assert_eq!(wire[2]["role"], "user");
         assert_eq!(wire[2]["content"].as_array().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn reasoning_blocks_lead_the_assistant_turn() {
+        let messages = [Message::Assistant {
+            content: "answer".into(),
+            tool_calls: vec![ToolCallRequest {
+                id: "t1".into(),
+                name: "a".into(),
+                arguments: json!({}),
+            }],
+            reasoning: vec![json!({
+                "type": "thinking",
+                "thinking": "hmm",
+                "signature": "sig123",
+            })],
+        }];
+        let (_, wire) = AnthropicProvider::wire_messages(&messages);
+        let blocks = wire[0]["content"].as_array().unwrap();
+        // Signed thinking must be the first block, then text, then tool_use.
+        assert_eq!(blocks[0]["type"], "thinking");
+        assert_eq!(blocks[0]["signature"], "sig123");
+        assert_eq!(blocks[1]["type"], "text");
+        assert_eq!(blocks[2]["type"], "tool_use");
     }
 
     #[test]

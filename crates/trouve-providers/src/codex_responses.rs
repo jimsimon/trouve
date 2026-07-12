@@ -201,6 +201,7 @@ fn input_items(messages: &[Message]) -> Vec<Value> {
             Message::Assistant {
                 content,
                 tool_calls,
+                reasoning: _,
             } => {
                 if !content.is_empty() {
                     items.push(json!({
@@ -373,6 +374,7 @@ mod tests {
                     name: "read_file".into(),
                     arguments: json!({"path": "x"}),
                 }],
+                reasoning: vec![],
             },
             Message::ToolResult {
                 call_id: "c1".into(),

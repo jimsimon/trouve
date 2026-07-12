@@ -90,6 +90,8 @@ impl OpenAiCompatProvider {
                 Message::Assistant {
                     content,
                     tool_calls,
+                    // Anthropic-native reasoning blocks; not applicable here.
+                    reasoning: _,
                 } => {
                     let mut obj = json!({"role": "assistant", "content": content});
                     if !tool_calls.is_empty() {
