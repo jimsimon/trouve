@@ -117,6 +117,7 @@ impl LocalToolExecutor {
             tools: vec![
                 Arc::new(fs::ReadFile),
                 Arc::new(fs::WriteFile),
+                Arc::new(fs::EditFile),
                 Arc::new(fs::ListDir),
                 Arc::new(shell::Shell),
                 Arc::new(grep::Grep),

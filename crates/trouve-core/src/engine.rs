@@ -4292,13 +4292,18 @@ impl Engine {
             )
         };
 
+        // Display copy of the args: snippet edits (edit_file) pick up a
+        // "_line" hint locating the old text in the pre-edit file, so the
+        // UI diff can number its gutter. Stored/executed args stay pristine.
+        let mut display_args = call.arguments.clone();
+        annotate_edit_lines(Path::new(&session.worktree_path), &mut display_args);
         self.store.append_event(
             scope.clone(),
             Event::ToolRequested {
                 turn,
                 call_id: call_id.clone(),
                 tool: call.name.clone(),
-                args: call.arguments.clone(),
+                args: display_args,
                 requires_approval: decision == Gate::NeedsApproval,
             },
         )?;

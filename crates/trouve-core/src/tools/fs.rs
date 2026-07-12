@@ -122,6 +122,88 @@ impl Tool for WriteFile {
     }
 }
 
+pub struct EditFile;
+
+#[async_trait::async_trait]
+impl Tool for EditFile {
+    fn name(&self) -> &'static str {
+        "edit_file"
+    }
+    fn description(&self) -> &'static str {
+        "Replace an exact string in a workspace file. old_string must match the file content \
+         exactly (including whitespace and indentation) and must appear exactly once unless \
+         replace_all is set. Prefer this over write_file for changing part of a file."
+    }
+    fn parameters(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "path": {"type": "string", "description": "Workspace-relative file path"},
+                "old_string": {"type": "string", "description": "Exact text to replace; include surrounding lines to make it unique"},
+                "new_string": {"type": "string", "description": "Replacement text"},
+                "replace_all": {"type": "boolean", "description": "Replace every occurrence (default: false)"}
+            },
+            "required": ["path", "old_string", "new_string"]
+        })
+    }
+    fn mutates(&self) -> bool {
+        true
+    }
+
+    async fn run(&self, ctx: &ToolCtx, args: &Value) -> ToolResult {
+        let (Some(path), Some(old), Some(new)) = (
+            args.get("path").and_then(Value::as_str),
+            args.get("old_string").and_then(Value::as_str),
+            args.get("new_string").and_then(Value::as_str),
+        ) else {
+            return ToolResult::error("missing required arguments: path, old_string, new_string");
+        };
+        if old.is_empty() {
+            return ToolResult::error(
+                "old_string must not be empty (use write_file to create a file)",
+            );
+        }
+        if old == new {
+            return ToolResult::error("old_string and new_string are identical");
+        }
+        let replace_all = args
+            .get("replace_all")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let full = match ctx.resolve(path) {
+            Ok(p) => p,
+            Err(e) => return ToolResult::error(e),
+        };
+        let content = match tokio::fs::read_to_string(&full).await {
+            Ok(t) => t,
+            Err(e) => return ToolResult::error(format!("cannot read {path}: {e}")),
+        };
+        let count = content.matches(old).count();
+        if count == 0 {
+            return ToolResult::error(format!(
+                "old_string not found in {path}; re-read the file and match its content exactly"
+            ));
+        }
+        if count > 1 && !replace_all {
+            return ToolResult::error(format!(
+                "old_string matches {count} places in {path}; add surrounding context to make \
+                 it unique, or set replace_all"
+            ));
+        }
+        let updated = if replace_all {
+            content.replace(old, new)
+        } else {
+            content.replacen(old, new, 1)
+        };
+        match tokio::fs::write(&full, &updated).await {
+            Ok(()) => ToolResult::ok(json!({
+                "replacements": if replace_all { count } else { 1 },
+            })),
+            Err(e) => ToolResult::error(format!("cannot write {path}: {e}")),
+        }
+    }
+}
+
 pub struct ListDir;
 
 #[async_trait::async_trait]
@@ -197,5 +279,96 @@ mod tests {
 
         let res = ListDir.run(&ctx, &json!({"path": "a"})).await;
         assert_eq!(res.result["entries"][0]["name"], "b.txt");
+    }
+
+    #[tokio::test]
+    async fn edit_file_replaces_unique_match() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ctx = ToolCtx {
+            worktree: tmp.path().to_path_buf(),
+            ..Default::default()
+        };
+        std::fs::write(tmp.path().join("f.txt"), "alpha\nbeta\ngamma\n").unwrap();
+
+        let res = EditFile
+            .run(
+                &ctx,
+                &json!({"path": "f.txt", "old_string": "beta", "new_string": "BETA"}),
+            )
+            .await;
+        assert_eq!(res.status, trouve_protocol::ToolStatus::Ok);
+        assert_eq!(res.result["replacements"], 1);
+        assert_eq!(
+            std::fs::read_to_string(tmp.path().join("f.txt")).unwrap(),
+            "alpha\nBETA\ngamma\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn edit_file_rejects_missing_and_ambiguous_matches() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ctx = ToolCtx {
+            worktree: tmp.path().to_path_buf(),
+            ..Default::default()
+        };
+        std::fs::write(tmp.path().join("f.txt"), "x\nx\n").unwrap();
+
+        let res = EditFile
+            .run(
+                &ctx,
+                &json!({"path": "f.txt", "old_string": "nope", "new_string": "n"}),
+            )
+            .await;
+        assert_eq!(res.status, trouve_protocol::ToolStatus::Error);
+        assert!(res.result["error"].as_str().unwrap().contains("not found"));
+
+        let res = EditFile
+            .run(
+                &ctx,
+                &json!({"path": "f.txt", "old_string": "x", "new_string": "y"}),
+            )
+            .await;
+        assert_eq!(res.status, trouve_protocol::ToolStatus::Error);
+        assert!(res.result["error"].as_str().unwrap().contains("2 places"));
+
+        // replace_all resolves the ambiguity.
+        let res = EditFile
+            .run(
+                &ctx,
+                &json!({"path": "f.txt", "old_string": "x", "new_string": "y", "replace_all": true}),
+            )
+            .await;
+        assert_eq!(res.status, trouve_protocol::ToolStatus::Ok);
+        assert_eq!(res.result["replacements"], 2);
+        assert_eq!(
+            std::fs::read_to_string(tmp.path().join("f.txt")).unwrap(),
+            "y\ny\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn edit_file_rejects_degenerate_arguments() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ctx = ToolCtx {
+            worktree: tmp.path().to_path_buf(),
+            ..Default::default()
+        };
+        std::fs::write(tmp.path().join("f.txt"), "abc").unwrap();
+
+        let res = EditFile
+            .run(
+                &ctx,
+                &json!({"path": "f.txt", "old_string": "", "new_string": "y"}),
+            )
+            .await;
+        assert_eq!(res.status, trouve_protocol::ToolStatus::Error);
+
+        let res = EditFile
+            .run(
+                &ctx,
+                &json!({"path": "f.txt", "old_string": "abc", "new_string": "abc"}),
+            )
+            .await;
+        assert_eq!(res.status, trouve_protocol::ToolStatus::Error);
     }
 }
