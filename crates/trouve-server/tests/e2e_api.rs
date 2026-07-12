@@ -1466,6 +1466,18 @@ async fn queued_prompts_crud_and_in_order_dispatch() {
     assert_eq!(second["turn"], 0);
     send("three").await;
 
+    // While turn 1 is held open the session reports activity (drives the
+    // sidebar indicator in clients).
+    let sessions: Vec<serde_json::Value> = client
+        .get(format!("{base}/sessions"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(sessions[0]["active"], true);
+
     let queue: Vec<serde_json::Value> = client
         .get(format!("{base}/threads/{thread_id}/queue"))
         .send()
@@ -1556,6 +1568,25 @@ async fn queued_prompts_crud_and_in_order_dispatch() {
         .await
         .unwrap();
     assert!(queue.is_empty());
+
+    // Activity rode the server-scope event stream: active when turn 1
+    // claimed the thread, idle once the queue drained.
+    let server_events = wait_for_event(&client, &format!("{base}/events"), |e| {
+        e["type"] == "session.activity" && e["active"] == false
+    })
+    .await;
+    assert!(server_events
+        .iter()
+        .any(|e| e["type"] == "session.activity" && e["active"] == true));
+    let sessions: Vec<serde_json::Value> = client
+        .get(format!("{base}/sessions"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(sessions[0]["active"], false);
 }
 
 /// A queue on one session keeps draining while the user works in another:

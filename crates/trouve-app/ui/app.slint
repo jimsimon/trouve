@@ -39,6 +39,8 @@ export struct NavRow {
     selected: bool,
     archived: bool,
     expanded: bool,
+    // Session is processing a prompt right now (pulsing indicator).
+    busy: bool,
 }
 
 export struct ThreadTabItem {
@@ -1655,6 +1657,23 @@ export component AppWindow inherits Window {
                                     color: Theme.c.text-soft;
                                     font-size: Theme.fs(11px);
                                     overflow: elide;
+                                }
+                            }
+                            // Activity indicator: a pulsing accent dot while
+                            // any of the session's threads runs a turn.
+                            if row.busy: Rectangle {
+                                width: 16px;
+                                property <float> wave: Theme.reduce-motion
+                                    ? 1.0
+                                    : 0.55 + 0.45 * Math.sin(360deg * (animation-tick() / 1.6s));
+                                Rectangle {
+                                    width: 7px;
+                                    height: 7px;
+                                    x: (parent.width - self.width) / 2;
+                                    y: (parent.height - self.height) / 2;
+                                    border-radius: 3.5px;
+                                    background: Theme.c.accent;
+                                    opacity: wave;
                                 }
                             }
                             IconButton {

@@ -7,7 +7,7 @@
       "name": "MIT",
       "identifier": "MIT"
     },
-    "version": "0.13"
+    "version": "0.14"
   },
   "paths": {
     "/v1/approvals": {
@@ -4022,6 +4022,33 @@
           },
           {
             "type": "object",
+            "description": "A session started or stopped actively processing prompts (one of its\nthreads began running turns, or the last active one went idle).\nDrives the activity indicator in session lists; `Session.active`\ncarries the same state for initial fetches.",
+            "required": [
+              "session_id",
+              "workspace_id",
+              "active",
+              "type"
+            ],
+            "properties": {
+              "active": {
+                "type": "boolean"
+              },
+              "session_id": {
+                "$ref": "#/components/schemas/String"
+              },
+              "type": {
+                "type": "string",
+                "enum": [
+                  "session.activity"
+                ]
+              },
+              "workspace_id": {
+                "$ref": "#/components/schemas/String"
+              }
+            }
+          },
+          {
+            "type": "object",
             "description": "A scheduled automation ran (or failed to). Clients refetch the\nautomations list — and the sessions list when it succeeded, since a\nrun creates a session.",
             "required": [
               "automation_id",
@@ -5008,6 +5035,10 @@
           "created_at"
         ],
         "properties": {
+          "active": {
+            "type": "boolean",
+            "description": "One of the session's threads is actively processing prompts right\nnow. Live updates ride the server-scope `session.activity` event."
+          },
           "archived": {
             "type": "boolean",
             "description": "Archived sessions are hidden from default listings but keep their\nworktree and history."

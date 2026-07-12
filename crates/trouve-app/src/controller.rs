@@ -381,6 +381,10 @@ struct Controller {
     /// Bytes/sec estimates for in-flight downloads, keyed by download id
     /// ("cli:claude", "model:…"). Fed by consecutive progress polls.
     download_rates: HashMap<String, RateSample>,
+    /// Sessions with a turn running somewhere (any thread, any window).
+    /// Seeded from `Session.active`, kept live by `session.activity`
+    /// server events; drives the sidebar activity indicator.
+    busy_sessions: HashSet<String>,
     /// Local models: true while a poller is scheduled for an in-flight
     /// download/install, plus the last seen downloaded-model count (a
     /// change means the model catalog changed → reload pickers).
@@ -528,6 +532,7 @@ pub async fn run(
         github_source: String::new(),
         github_oauth_available: false,
         download_rates: HashMap::new(),
+        busy_sessions: HashSet::new(),
         local_polling: false,
         local_downloaded: None,
         local_search: Vec::new(),
@@ -768,6 +773,12 @@ impl Controller {
         let current_id = self.current_session_id();
         self.workspaces = self.client.list_workspaces().await?;
         self.sessions = self.client.list_sessions().await?;
+        self.busy_sessions = self
+            .sessions
+            .iter()
+            .filter(|s| s.active)
+            .map(|s| s.id.clone())
+            .collect();
         self.current_session =
             current_id.and_then(|id| self.sessions.iter().position(|s| s.id == id));
         self.push_nav();
@@ -808,6 +819,7 @@ impl Controller {
                     selected: self.current_session == Some(i),
                     archived: false,
                     expanded: false,
+                    busy: self.busy_sessions.contains(&session.id),
                 });
                 nav.push(NavEntry::Session(i));
             }
@@ -833,6 +845,7 @@ impl Controller {
                             selected: self.current_session == Some(i),
                             archived: true,
                             expanded: false,
+                            busy: self.busy_sessions.contains(&session.id),
                         });
                         nav.push(NavEntry::Session(i));
                     }
@@ -2304,6 +2317,20 @@ impl Controller {
             // reload explicitly; a second reload is cheap and idempotent).
             Event::SessionCreated { .. } | Event::SessionDeleted { .. } => {
                 let _ = self.reload_sessions().await;
+            }
+            // A session started or finished processing prompts: light up or
+            // dim its sidebar indicator.
+            Event::SessionActivity {
+                session_id, active, ..
+            } => {
+                let changed = if *active {
+                    self.busy_sessions.insert(session_id.clone())
+                } else {
+                    self.busy_sessions.remove(session_id)
+                };
+                if changed {
+                    self.push_nav();
+                }
             }
             _ => {}
         }

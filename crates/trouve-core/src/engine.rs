@@ -62,9 +62,11 @@ pub struct Engine {
     approvals: Arc<ApprovalHub>,
     questions: Arc<QuestionHub>,
     session_locks: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
-    /// Threads with a dispatcher currently running turns. A thread in this
-    /// set drains its own prompt queue; sends while present just enqueue.
-    active_threads: Mutex<std::collections::HashSet<String>>,
+    /// Threads with a dispatcher currently running turns, mapped to their
+    /// session. A thread in this map drains its own prompt queue; sends
+    /// while present just enqueue. The session ids feed `Session.active`
+    /// and the `session.activity` server event.
+    active_threads: Mutex<std::collections::HashMap<String, String>>,
     config: Mutex<Config>,
     /// Where provider configuration changes are persisted. `None` disables
     /// persistence (tests).
@@ -322,7 +324,7 @@ impl Engine {
             approvals: Arc::new(ApprovalHub::default()),
             questions: Arc::new(QuestionHub::default()),
             session_locks: Mutex::new(HashMap::new()),
-            active_threads: Mutex::new(std::collections::HashSet::new()),
+            active_threads: Mutex::new(std::collections::HashMap::new()),
             config: Mutex::new(config.clone()),
             // No write-back by default: only a caller that loaded `config`
             // from disk should enable persisting to that file (see
@@ -2474,6 +2476,7 @@ impl Engine {
             worktree_path: worktree_path.to_string_lossy().to_string(),
             base_ref,
             archived: false,
+            active: false,
             created_at: chrono::Utc::now(),
         };
         self.store.insert_session(&session)?;
@@ -2529,13 +2532,24 @@ impl Engine {
     }
 
     pub fn list_sessions(&self, workspace_id: Option<&str>) -> Result<Vec<Session>, EngineError> {
-        Ok(self.store.list_sessions(workspace_id)?)
+        let mut sessions = self.store.list_sessions(workspace_id)?;
+        let active = self.active_threads.lock().unwrap();
+        for session in &mut sessions {
+            session.active = active.values().any(|s| *s == session.id);
+        }
+        Ok(sessions)
     }
 
     pub fn get_session(&self, id: &str) -> Result<Session, EngineError> {
-        self.store
+        let mut session = self
+            .store
             .session(id)?
-            .ok_or_else(|| EngineError::NotFound(format!("session {id}")))
+            .ok_or_else(|| EngineError::NotFound(format!("session {id}")))?;
+        session.active = {
+            let active = self.active_threads.lock().unwrap();
+            active.values().any(|s| *s == session.id)
+        };
+        Ok(session)
     }
 
     /// Rename and/or (un)archive a session.
@@ -3030,17 +3044,21 @@ impl Engine {
         let thread = self.get_thread(thread_id)?;
         // Claim the thread and take the queue front atomically so two
         // concurrent sends can't both start a dispatcher.
-        let prompt = {
+        let (prompt, session_woke) = {
             let mut active = self.active_threads.lock().unwrap();
-            if active.contains(thread_id) {
+            if active.contains_key(thread_id) {
                 return Ok(None);
             }
             let Some(p) = self.store.pop_queued_prompt(thread_id)? else {
                 return Ok(None);
             };
-            active.insert(thread_id.to_string());
-            p
+            let was_active = active.values().any(|s| *s == thread.session_id);
+            active.insert(thread_id.to_string(), thread.session_id.clone());
+            (p, !was_active)
         };
+        if session_woke {
+            self.emit_session_activity(&thread.session_id, true);
+        }
         self.emit_queue(thread_id)?;
         let turn = self.store.next_turn(thread_id)?;
         let engine = self.clone();
@@ -3076,21 +3094,24 @@ impl Engine {
                         error: e.to_string(),
                     },
                 );
-                self.active_threads.lock().unwrap().remove(&thread.id);
+                self.release_thread(&thread.id);
                 return;
             }
             // Pop the next prompt; releasing the claim and inspecting the
             // queue must be atomic against concurrent send_message calls.
-            let next = {
+            let (next, session_idle) = {
                 let mut active = self.active_threads.lock().unwrap();
                 match self.store.pop_queued_prompt(&thread.id) {
-                    Ok(Some(p)) => Some(p),
+                    Ok(Some(p)) => (Some(p), false),
                     _ => {
                         active.remove(&thread.id);
-                        None
+                        (None, !active.values().any(|s| *s == thread.session_id))
                     }
                 }
             };
+            if session_idle {
+                self.emit_session_activity(&thread.session_id, false);
+            }
             let Some(next) = next else { return };
             let _ = self.emit_queue(&thread.id);
             // Thread settings may have changed between turns.
@@ -3101,13 +3122,47 @@ impl Engine {
                 Ok(t) => t,
                 Err(e) => {
                     tracing::error!("queue for {} stopped: {e}", thread.id);
-                    self.active_threads.lock().unwrap().remove(&thread.id);
+                    self.release_thread(&thread.id);
                     return;
                 }
             };
             content = next.content;
             attachments = next.attachments;
         }
+    }
+
+    /// Drop a thread's dispatcher claim; when it was the session's last
+    /// active thread, announce the session going idle.
+    fn release_thread(&self, thread_id: &str) {
+        let idle_session = {
+            let mut active = self.active_threads.lock().unwrap();
+            active
+                .remove(thread_id)
+                .filter(|session| !active.values().any(|s| s == session))
+        };
+        if let Some(session_id) = idle_session {
+            self.emit_session_activity(&session_id, false);
+        }
+    }
+
+    /// Server-scope `session.activity` event — session lists light up (or
+    /// dim) their indicator without refetching.
+    fn emit_session_activity(&self, session_id: &str, active: bool) {
+        let workspace_id = self
+            .store
+            .session(session_id)
+            .ok()
+            .flatten()
+            .map(|s| s.workspace_id)
+            .unwrap_or_default();
+        let _ = self.store.append_event(
+            Scope::Server,
+            Event::SessionActivity {
+                session_id: session_id.to_string(),
+                workspace_id,
+                active,
+            },
+        );
     }
 
     async fn run_turn(

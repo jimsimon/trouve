@@ -1122,6 +1122,8 @@ fn row_to_session(r: &rusqlite::Row<'_>) -> rusqlite::Result<Session> {
         worktree_path: r.get(4)?,
         base_ref: r.get(5)?,
         archived: r.get(6)?,
+        // Activity is runtime state owned by the engine, not persisted.
+        active: false,
         created_at: r
             .get::<_, String>(7)?
             .parse()
@@ -1228,6 +1230,7 @@ mod tests {
             worktree_path: "/tmp/wt".into(),
             base_ref: "main".into(),
             archived: false,
+            active: false,
             created_at: chrono::Utc::now(),
         };
         store.insert_session(&session).unwrap();
@@ -1263,6 +1266,7 @@ mod tests {
             worktree_path: "/tmp/wt".into(),
             base_ref: "main".into(),
             archived: false,
+            active: false,
             created_at: chrono::Utc::now(),
         };
         store.insert_session(&session).unwrap();
@@ -1307,6 +1311,7 @@ mod tests {
                     worktree_path: "/tmp/wt".into(),
                     base_ref: "main".into(),
                     archived: false,
+                    active: false,
                     created_at: chrono::Utc::now(),
                 })
                 .unwrap();
@@ -1496,6 +1501,7 @@ mod tests {
             worktree_path: "/tmp/wt".into(),
             base_ref: "main".into(),
             archived: false,
+            active: false,
             created_at: chrono::Utc::now(),
         };
         store.insert_session(&session).unwrap();
@@ -1547,6 +1553,7 @@ mod tests {
             worktree_path: "/tmp/wt".into(),
             base_ref: "main".into(),
             archived: false,
+            active: false,
             created_at: chrono::Utc::now(),
         };
         store.insert_session(&session).unwrap();

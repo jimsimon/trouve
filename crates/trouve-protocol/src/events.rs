@@ -274,6 +274,16 @@ pub enum Event {
         thread_id: ThreadId,
         session_id: SessionId,
     },
+    /// A session started or stopped actively processing prompts (one of its
+    /// threads began running turns, or the last active one went idle).
+    /// Drives the activity indicator in session lists; `Session.active`
+    /// carries the same state for initial fetches.
+    #[serde(rename = "session.activity")]
+    SessionActivity {
+        session_id: SessionId,
+        workspace_id: WorkspaceId,
+        active: bool,
+    },
     /// A scheduled automation ran (or failed to). Clients refetch the
     /// automations list — and the sessions list when it succeeded, since a
     /// run creates a session.

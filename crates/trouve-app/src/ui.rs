@@ -22,6 +22,8 @@ pub struct NavRowData {
     pub selected: bool,
     pub archived: bool,
     pub expanded: bool,
+    /// Session is processing a prompt right now (activity indicator).
+    pub busy: bool,
 }
 
 /// Bring the window to the front (notification clicks). Wayland
@@ -96,6 +98,7 @@ pub fn set_nav(ui: &Ui, rows: Vec<NavRowData>) {
                 selected: r.selected,
                 archived: r.archived,
                 expanded: r.expanded,
+                busy: r.busy,
             })
             .collect();
         ui.set_nav_rows(ModelRc::new(VecModel::from(items)));

@@ -121,6 +121,10 @@ pub struct Session {
     /// worktree and history.
     #[serde(default)]
     pub archived: bool,
+    /// One of the session's threads is actively processing prompts right
+    /// now. Live updates ride the server-scope `session.activity` event.
+    #[serde(default)]
+    pub active: bool,
     pub created_at: chrono::DateTime<chrono::Utc>,
 }
 
