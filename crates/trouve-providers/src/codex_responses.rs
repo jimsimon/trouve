@@ -16,7 +16,7 @@
 
 use std::path::PathBuf;
 
-use serde_json::{json, Map, Value};
+use serde_json::{Map, Value, json};
 use tokio::sync::mpsc;
 
 use crate::{EventStream, Message, Provider, ProviderError, ProviderEvent, ToolSpec};

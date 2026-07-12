@@ -9,8 +9,8 @@
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
-use serde_json::{json, Value};
-use trouve_search::mcp::{call_tool, IndexCache};
+use serde_json::{Value, json};
+use trouve_search::mcp::{IndexCache, call_tool};
 use trouve_search::types::ContentType;
 
 use super::{Tool, ToolCtx, ToolResult};

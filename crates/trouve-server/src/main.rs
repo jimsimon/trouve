@@ -2,9 +2,9 @@
 
 use std::sync::Arc;
 
-use trouve_core::config::{data_dir, Config};
-use trouve_core::store::Store;
 use trouve_core::Engine;
+use trouve_core::config::{Config, data_dir};
+use trouve_core::store::Store;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {

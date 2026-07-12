@@ -339,10 +339,10 @@ impl ThreadViewModel {
                 let idx = self.items.iter().rposition(
                     |i| matches!(i, ChatItem::Questions { request_id: r, .. } if r == request_id),
                 );
-                if let Some(idx) = idx {
-                    if let ChatItem::Questions { answers: a, .. } = &mut self.items[idx] {
-                        *a = Some(answers.clone());
-                    }
+                if let Some(idx) = idx
+                    && let ChatItem::Questions { answers: a, .. } = &mut self.items[idx]
+                {
+                    *a = Some(answers.clone());
                 }
                 idx
             }

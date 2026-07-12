@@ -14,8 +14,8 @@ use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
-use anyhow::{anyhow, Context, Result};
-use portable_pty::{native_pty_system, CommandBuilder, PtySize};
+use anyhow::{Context, Result, anyhow};
+use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 use tokio::sync::broadcast;
 
 /// Retained output per terminal. Enough for a few thousand lines of

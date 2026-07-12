@@ -2,7 +2,7 @@
 
 use proptest::prelude::*;
 
-use trouve_search::chunk::{chunk_lines, chunk_source, DESIRED_CHUNK_LENGTH};
+use trouve_search::chunk::{DESIRED_CHUNK_LENGTH, chunk_lines, chunk_source};
 
 fn assert_boundary_invariants(boundaries: &[trouve_search::chunk::ChunkBoundary], text_len: usize) {
     for b in boundaries {

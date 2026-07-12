@@ -29,7 +29,7 @@ use std::ops::Deref;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use bytemuck::{Pod, Zeroable};
 use memmap2::Mmap;
 use serde::{Deserialize, Serialize};
@@ -331,10 +331,11 @@ pub fn open_latest(dir: &Path, model_id: &str, content: &[String]) -> Option<Raw
         .collect();
     snaps.sort_by_key(|(mtime, _)| std::cmp::Reverse(*mtime));
     for (_, path) in snaps {
-        if let Ok(raw) = RawSnapshot::open(&path, None) {
-            if raw.meta.model_id == model_id && raw.meta.content == content {
-                return Some(raw);
-            }
+        if let Ok(raw) = RawSnapshot::open(&path, None)
+            && raw.meta.model_id == model_id
+            && raw.meta.content == content
+        {
+            return Some(raw);
         }
     }
     None
@@ -357,10 +358,10 @@ impl RawSnapshot {
         if &map[..8] != MAGIC {
             bail!("snapshot magic mismatch");
         }
-        if let Some(hash) = expect_hash {
-            if &map[8..40] != hash {
-                bail!("snapshot hash mismatch");
-            }
+        if let Some(hash) = expect_hash
+            && &map[8..40] != hash
+        {
+            bail!("snapshot hash mismatch");
         }
         let meta_len = u64::from_le_bytes(map[40..48].try_into().unwrap()) as usize;
         need(48 + meta_len)?;
@@ -973,11 +974,12 @@ mod tests {
         .unwrap();
         let snap = load(dir.path(), &hash, "m").unwrap();
         assert_eq!(snap.bm25.num_docs(), 1);
-        assert!(snap
-            .bm25
-            .get_scores(&["anything".into()], None)
-            .iter()
-            .all(|s| *s == 0.0));
+        assert!(
+            snap.bm25
+                .get_scores(&["anything".into()], None)
+                .iter()
+                .all(|s| *s == 0.0)
+        );
     }
 
     #[test]

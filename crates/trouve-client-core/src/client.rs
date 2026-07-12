@@ -1,6 +1,6 @@
 //! Typed protocol client (HTTP commands + SSE event stream).
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use futures::StreamExt;
 use trouve_protocol::*;
 

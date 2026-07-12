@@ -166,10 +166,12 @@ fn dirty_files_are_hashed_and_cached() {
     // Untracked file gets indexed too.
     write_file(root, "src/untracked.py", "def helper():\n    return true\n");
     let index = TrouveIndex::from_path(root, CODE, Some(model)).unwrap();
-    assert!(index
-        .chunks
-        .iter()
-        .any(|c| c.file_path == "src/untracked.py"));
+    assert!(
+        index
+            .chunks
+            .iter()
+            .any(|c| c.file_path == "src/untracked.py")
+    );
 }
 
 #[test]

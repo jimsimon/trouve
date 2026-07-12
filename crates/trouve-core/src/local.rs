@@ -24,7 +24,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use trouve_protocol::LocalGpu;
 use trouve_providers::Provider;
@@ -383,17 +383,16 @@ pub fn probe_hardware() -> Hardware {
             "--format=csv,noheader,nounits",
         ])
         .output()
+        && out.status.success()
     {
-        if out.status.success() {
-            for line in String::from_utf8_lossy(&out.stdout).lines() {
-                if let Some((name, mib)) = line.rsplit_once(',') {
-                    if let Ok(mib) = mib.trim().parse::<u64>() {
-                        gpus.push(LocalGpu {
-                            name: name.trim().to_string(),
-                            vram_bytes: mib * 1024 * 1024,
-                        });
-                    }
-                }
+        for line in String::from_utf8_lossy(&out.stdout).lines() {
+            if let Some((name, mib)) = line.rsplit_once(',')
+                && let Ok(mib) = mib.trim().parse::<u64>()
+            {
+                gpus.push(LocalGpu {
+                    name: name.trim().to_string(),
+                    vram_bytes: mib * 1024 * 1024,
+                });
             }
         }
     }
@@ -642,10 +641,10 @@ impl LlamaManager {
                     log_tail(log_path)
                 );
             }
-            if let Ok(resp) = http.get(&url).send().await {
-                if resp.status().is_success() {
-                    break;
-                }
+            if let Ok(resp) = http.get(&url).send().await
+                && resp.status().is_success()
+            {
+                break;
             }
             if std::time::Instant::now() > deadline {
                 let _ = child.kill().await;

@@ -585,9 +585,11 @@ done
     while let Some(ev) = stream.next().await {
         first.push(ev.unwrap());
     }
-    assert!(first
-        .iter()
-        .any(|e| matches!(e, BackendEvent::Completed { .. })));
+    assert!(
+        first
+            .iter()
+            .any(|e| matches!(e, BackendEvent::Completed { .. }))
+    );
 
     // Second turn resumes the session the process holds: no new spawn.
     let mut stream = start_turn(&backend, || {
@@ -602,9 +604,11 @@ done
     while let Some(ev) = stream.next().await {
         second.push(ev.unwrap());
     }
-    assert!(second
-        .iter()
-        .any(|e| matches!(e, BackendEvent::Completed { .. })));
+    assert!(
+        second
+            .iter()
+            .any(|e| matches!(e, BackendEvent::Completed { .. }))
+    );
 
     let spawns = std::fs::read_to_string(format!("{stub}.spawns")).unwrap();
     assert_eq!(spawns.lines().count(), 1, "expected one spawn: {spawns}");

@@ -23,15 +23,15 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use futures::StreamExt;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, Command};
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::{Mutex, mpsc};
 use trouve_protocol::{ModelInfo, Usage};
 
 use crate::{
-    async_stream, binary_on_path, AgentBackend, BackendError, BackendEvent, BackendEventStream,
-    BackendLogin, BackendPermission, BackendStatus, BackendTurn,
+    AgentBackend, BackendError, BackendEvent, BackendEventStream, BackendLogin, BackendPermission,
+    BackendStatus, BackendTurn, async_stream, binary_on_path,
 };
 
 /// Most live processes kept at once; the least recently used is evicted.

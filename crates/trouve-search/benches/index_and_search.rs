@@ -1,6 +1,6 @@
 //! Criterion micro-benchmarks for chunking, BM25, and dense search.
 
-use criterion::{criterion_group, criterion_main, Criterion};
+use criterion::{Criterion, criterion_group, criterion_main};
 use std::hint::black_box;
 
 use trouve_search::bm25::Bm25Index;

@@ -5,7 +5,7 @@
 
 use std::path::{Path, PathBuf};
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use trouve_protocol::{AgentMode, ModeInfo, PermissionMode};
 
 pub fn builtin_modes() -> Vec<AgentMode> {
@@ -196,10 +196,10 @@ fn user_mode_file(config_dir: &Path, id: &str) -> Option<PathBuf> {
         let Ok(text) = std::fs::read_to_string(&path) else {
             continue;
         };
-        if let Ok(mode) = toml::from_str::<AgentMode>(&text) {
-            if mode.id == id {
-                return Some(path);
-            }
+        if let Ok(mode) = toml::from_str::<AgentMode>(&text)
+            && mode.id == id
+        {
+            return Some(path);
         }
     }
     None

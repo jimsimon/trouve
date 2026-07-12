@@ -17,11 +17,11 @@
 
 use std::sync::Arc;
 
+use axum::Json;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
-use axum::Json;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use trouve_core::Engine;
 
 const MCP_PROTOCOL_VERSION: &str = "2025-03-26";

@@ -4,7 +4,7 @@
 //! this lexical tool keeps phase 1 offline and dependency-light.
 
 use regex::Regex;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use super::{Tool, ToolCtx, ToolResult};
 

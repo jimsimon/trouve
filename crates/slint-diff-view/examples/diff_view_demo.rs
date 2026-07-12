@@ -5,7 +5,7 @@ use std::cell::RefCell;
 use std::rc::Rc;
 
 use slint::ComponentHandle;
-use slint_diff_view::{parse_unified_diff, rows_model, DiffViewWindow};
+use slint_diff_view::{DiffViewWindow, parse_unified_diff, rows_model};
 
 fn main() {
     let mut diff = String::new();

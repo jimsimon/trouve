@@ -238,11 +238,13 @@ mod tests {
         let ok = WindowState::default();
         assert!(ok.sane());
         assert!(!WindowState { width: 0, ..ok }.sane());
-        assert!(!WindowState {
-            height: 99999,
-            ..ok
-        }
-        .sane());
+        assert!(
+            !WindowState {
+                height: 99999,
+                ..ok
+            }
+            .sane()
+        );
         assert!(!WindowState { x: -99999, ..ok }.sane());
     }
 }

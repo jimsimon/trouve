@@ -253,7 +253,7 @@ pub fn test_env() -> &'static str {
         std::fs::create_dir_all(&cache_dir).unwrap();
         // Safety: set before any test touches the cache; tests within one
         // binary share this environment.
-        std::env::set_var("TROUVE_CACHE_LOCATION", &cache_dir);
+        unsafe { std::env::set_var("TROUVE_CACHE_LOCATION", &cache_dir) };
         model_dir.to_string_lossy().into_owned()
     })
 }

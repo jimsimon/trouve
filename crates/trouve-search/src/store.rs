@@ -266,12 +266,12 @@ pub struct FsManifestRecord {
 pub fn clear_all_stores() -> Vec<PathBuf> {
     let store_root = resolve_cache_folder().join("store");
     let mut removed = Vec::new();
-    if store_root.exists() {
-        if let Ok(entries) = fs::read_dir(&store_root) {
-            for entry in entries.flatten() {
-                if fs::remove_dir_all(entry.path()).is_ok() {
-                    removed.push(entry.path());
-                }
+    if store_root.exists()
+        && let Ok(entries) = fs::read_dir(&store_root)
+    {
+        for entry in entries.flatten() {
+            if fs::remove_dir_all(entry.path()).is_ok() {
+                removed.push(entry.path());
             }
         }
     }

@@ -59,7 +59,7 @@ fn e2e_env() -> Option<&'static str> {
         std::fs::create_dir_all(&cache).unwrap();
         // Safety: set before any test builds an index; e2e tests within this
         // binary share the isolated cache.
-        std::env::set_var("TROUVE_CACHE_LOCATION", &cache);
+        unsafe { std::env::set_var("TROUVE_CACHE_LOCATION", &cache) };
         cache.to_string_lossy().into_owned()
     }))
 }

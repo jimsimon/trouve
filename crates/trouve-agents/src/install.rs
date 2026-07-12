@@ -285,10 +285,10 @@ fn llama_platform() -> Result<String, InstallError> {
 /// Whether libvulkan is available on this Linux system (via ldconfig's
 /// cache or the usual lib directories).
 fn linux_has_vulkan_loader() -> bool {
-    if let Ok(out) = std::process::Command::new("ldconfig").arg("-p").output() {
-        if String::from_utf8_lossy(&out.stdout).contains("libvulkan.so.1") {
-            return true;
-        }
+    if let Ok(out) = std::process::Command::new("ldconfig").arg("-p").output()
+        && String::from_utf8_lossy(&out.stdout).contains("libvulkan.so.1")
+    {
+        return true;
     }
     [
         "/usr/lib/libvulkan.so.1",

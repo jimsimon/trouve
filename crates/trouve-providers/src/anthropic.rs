@@ -1,14 +1,14 @@
 //! Anthropic Messages API provider (streaming).
 
 use futures::StreamExt;
-use serde_json::{json, Map, Value};
+use serde_json::{Map, Value, json};
 use std::sync::Arc;
 use trouve_protocol::Usage;
 
 use crate::auth::TokenSource;
 use crate::{
-    catalog, EventStream, Message, Provider, ProviderError, ProviderEvent, ToolCallRequest,
-    ToolSpec,
+    EventStream, Message, Provider, ProviderError, ProviderEvent, ToolCallRequest, ToolSpec,
+    catalog,
 };
 
 const ANTHROPIC_VERSION: &str = "2023-06-01";
@@ -164,11 +164,12 @@ impl AnthropicProvider {
                         "tool_use_id": call_id,
                         "content": content,
                     });
-                    if let Some(last) = wire.last_mut() {
-                        if last["role"] == "user" && last["content"].is_array() {
-                            last["content"].as_array_mut().unwrap().push(block);
-                            continue;
-                        }
+                    if let Some(last) = wire.last_mut()
+                        && last["role"] == "user"
+                        && last["content"].is_array()
+                    {
+                        last["content"].as_array_mut().unwrap().push(block);
+                        continue;
                     }
                     wire.push(json!({"role": "user", "content": [block]}));
                 }
@@ -190,10 +191,10 @@ impl Provider for AnthropicProvider {
 
     async fn list_models(&self) -> Vec<trouve_protocol::ModelInfo> {
         let mut cache = self.models_cache.lock().await;
-        if let Some((at, models)) = cache.as_ref() {
-            if at.elapsed() < MODELS_TTL {
-                return models.clone();
-            }
+        if let Some((at, models)) = cache.as_ref()
+            && at.elapsed() < MODELS_TTL
+        {
+            return models.clone();
         }
         match self.fetch_models().await {
             Ok(models) if !models.is_empty() => {
@@ -296,9 +297,9 @@ struct BlockState {
 
 fn sse_to_events(
     mut bytes: impl futures::Stream<Item = Result<bytes::Bytes, reqwest::Error>>
-        + Send
-        + Unpin
-        + 'static,
+    + Send
+    + Unpin
+    + 'static,
 ) -> EventStream {
     let (tx, rx) = tokio::sync::mpsc::channel::<Result<ProviderEvent, ProviderError>>(64);
     tokio::spawn(async move {
@@ -385,21 +386,21 @@ fn sse_to_events(
                     }
                     "content_block_stop" => {
                         let idx = v["index"].as_u64().unwrap_or(0);
-                        if let Some(block) = blocks.remove(&idx) {
-                            if block.is_tool {
-                                let arguments: Value = if block.tool_json.is_empty() {
-                                    json!({})
-                                } else {
-                                    serde_json::from_str(&block.tool_json).unwrap_or(Value::Null)
-                                };
-                                let _ = tx
-                                    .send(Ok(ProviderEvent::ToolCall(ToolCallRequest {
-                                        id: block.tool_id,
-                                        name: block.tool_name,
-                                        arguments,
-                                    })))
-                                    .await;
-                            }
+                        if let Some(block) = blocks.remove(&idx)
+                            && block.is_tool
+                        {
+                            let arguments: Value = if block.tool_json.is_empty() {
+                                json!({})
+                            } else {
+                                serde_json::from_str(&block.tool_json).unwrap_or(Value::Null)
+                            };
+                            let _ = tx
+                                .send(Ok(ProviderEvent::ToolCall(ToolCallRequest {
+                                    id: block.tool_id,
+                                    name: block.tool_name,
+                                    arguments,
+                                })))
+                                .await;
                         }
                     }
                     "message_delta" => {

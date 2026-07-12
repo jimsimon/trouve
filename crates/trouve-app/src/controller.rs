@@ -659,12 +659,12 @@ fn server_binary() -> Result<std::path::PathBuf> {
         return Ok(path.into());
     }
     let name = format!("trouve-server{}", std::env::consts::EXE_SUFFIX);
-    if let Ok(me) = std::env::current_exe() {
-        if let Some(dir) = me.parent() {
-            let sibling = dir.join(&name);
-            if sibling.exists() {
-                return Ok(sibling);
-            }
+    if let Ok(me) = std::env::current_exe()
+        && let Some(dir) = me.parent()
+    {
+        let sibling = dir.join(&name);
+        if sibling.exists() {
+            return Ok(sibling);
         }
     }
     Ok(name.into()) // resolved via PATH by Command::new
@@ -1049,10 +1049,10 @@ impl Controller {
         let Some(thread_id) = self.current_thread_id() else {
             return;
         };
-        if let Some(&y) = self.resume.thread_scroll.get(&thread_id) {
-            if y < 0.0 {
-                ui::set_chat_scroll(&self.ui, y);
-            }
+        if let Some(&y) = self.resume.thread_scroll.get(&thread_id)
+            && y < 0.0
+        {
+            ui::set_chat_scroll(&self.ui, y);
         }
     }
 
@@ -2102,10 +2102,10 @@ impl Controller {
             (true, None) => "installed".to_string(),
             (false, _) => "not installed".to_string(),
         };
-        if status.runtime_update_available {
-            if let Some(latest) = &status.runtime_latest_version {
-                runtime_label.push_str(&format!(" — {latest} available"));
-            }
+        if status.runtime_update_available
+            && let Some(latest) = &status.runtime_latest_version
+        {
+            runtime_label.push_str(&format!(" — {latest} available"));
         }
         if install.status != "pending" {
             self.download_rates.remove("cli:llama-server");
@@ -2561,11 +2561,10 @@ impl Controller {
                 // markdown preview rows behind it).
                 if let (Some(path), Some(session_id)) =
                     (self.open_file.clone(), self.current_session_id())
+                    && let Ok(file) = self.client.session_file(&session_id, &path).await
                 {
-                    if let Ok(file) = self.client.session_file(&session_id, &path).await {
-                        let lines = render::highlight_file(&file.path, &file.content);
-                        ui::set_file_view(&self.ui, path, file.content, lines);
-                    }
+                    let lines = render::highlight_file(&file.path, &file.content);
+                    ui::set_file_view(&self.ui, path, file.content, lines);
                 }
             }
             UiCommand::NewSession => self.open_new_session_screen(None).await?,
@@ -2628,11 +2627,11 @@ impl Controller {
                 // i == threads.len() is the provisional tab itself: no-op.
             }
             UiCommand::ChatScrolled(y) => {
-                if let Some(thread_id) = self.current_thread_id() {
-                    if self.resume.thread_scroll.get(&thread_id) != Some(&y) {
-                        self.resume.thread_scroll.insert(thread_id, y);
-                        crate::winstate::save_resume(&self.resume);
-                    }
+                if let Some(thread_id) = self.current_thread_id()
+                    && self.resume.thread_scroll.get(&thread_id) != Some(&y)
+                {
+                    self.resume.thread_scroll.insert(thread_id, y);
+                    crate::winstate::save_resume(&self.resume);
                 }
             }
             UiCommand::SendMessage(text) => {
@@ -2698,17 +2697,17 @@ impl Controller {
                 }
             }
             UiCommand::QueueEdit { index, content } => {
-                if let Some(id) = self.queued_prompt_id(index) {
-                    if let Err(e) = self.client.update_queued_prompt(&id, &content).await {
-                        self.error(&format!("{e:#}"));
-                    }
+                if let Some(id) = self.queued_prompt_id(index)
+                    && let Err(e) = self.client.update_queued_prompt(&id, &content).await
+                {
+                    self.error(&format!("{e:#}"));
                 }
             }
             UiCommand::QueueDelete(index) => {
-                if let Some(id) = self.queued_prompt_id(index) {
-                    if let Err(e) = self.client.delete_queued_prompt(&id).await {
-                        self.error(&format!("{e:#}"));
-                    }
+                if let Some(id) = self.queued_prompt_id(index)
+                    && let Err(e) = self.client.delete_queued_prompt(&id).await
+                {
+                    self.error(&format!("{e:#}"));
                 }
             }
             UiCommand::QueueMove { index, delta } => {
@@ -2746,10 +2745,10 @@ impl Controller {
                 }
             }
             UiCommand::QueueSendNow => {
-                if let Some(thread_id) = self.current_thread_id() {
-                    if let Err(e) = self.client.dispatch_queue(&thread_id).await {
-                        self.error(&format!("{e:#}"));
-                    }
+                if let Some(thread_id) = self.current_thread_id()
+                    && let Err(e) = self.client.dispatch_queue(&thread_id).await
+                {
+                    self.error(&format!("{e:#}"));
                 }
             }
             UiCommand::Approval { row, approved } => {
@@ -2763,71 +2762,69 @@ impl Controller {
                 }
             }
             UiCommand::QuestionOption { row, option } => {
-                if let Some((request_id, questions)) = self.question_at(row) {
-                    if let Some(w) = self.wizards.get_mut(&request_id) {
-                        if w.step < questions.len() {
-                            let q = &questions[w.step];
-                            let id = if option >= q.options.len() {
-                                render::OTHER_ID.to_string()
-                            } else {
-                                q.options[option].id.clone()
-                            };
-                            let sel = &mut w.selections[w.step];
-                            if q.allow_multiple {
-                                match sel.iter().position(|s| *s == id) {
-                                    Some(pos) => {
-                                        sel.remove(pos);
-                                    }
-                                    None => sel.push(id),
-                                }
-                            } else if sel.first() == Some(&id) {
-                                sel.clear();
-                            } else {
-                                *sel = vec![id];
+                if let Some((request_id, questions)) = self.question_at(row)
+                    && let Some(w) = self.wizards.get_mut(&request_id)
+                    && w.step < questions.len()
+                {
+                    let q = &questions[w.step];
+                    let id = if option >= q.options.len() {
+                        render::OTHER_ID.to_string()
+                    } else {
+                        q.options[option].id.clone()
+                    };
+                    let sel = &mut w.selections[w.step];
+                    if q.allow_multiple {
+                        match sel.iter().position(|s| *s == id) {
+                            Some(pos) => {
+                                sel.remove(pos);
                             }
-                            self.render_chat(false);
+                            None => sel.push(id),
                         }
+                    } else if sel.first() == Some(&id) {
+                        sel.clear();
+                    } else {
+                        *sel = vec![id];
                     }
+                    self.render_chat(false);
                 }
             }
             UiCommand::QuestionOtherEdited { row, text } => {
-                if let Some((request_id, questions)) = self.question_at(row) {
-                    if let Some(w) = self.wizards.get_mut(&request_id) {
-                        if w.step < questions.len() {
-                            let was_empty = w.other_texts[w.step].trim().is_empty();
-                            w.other_texts[w.step] = text;
-                            // Only the Next button's enabled state depends on
-                            // this text; re-render just when it flips so the
-                            // input isn't reset mid-typing.
-                            if was_empty != w.other_texts[w.step].trim().is_empty() {
-                                self.render_chat(false);
-                            }
-                        }
-                    }
-                }
-            }
-            UiCommand::QuestionBack(row) => {
-                if let Some((request_id, _)) = self.question_at(row) {
-                    if let Some(w) = self.wizards.get_mut(&request_id) {
-                        w.step = w.step.saturating_sub(1);
+                if let Some((request_id, questions)) = self.question_at(row)
+                    && let Some(w) = self.wizards.get_mut(&request_id)
+                    && w.step < questions.len()
+                {
+                    let was_empty = w.other_texts[w.step].trim().is_empty();
+                    w.other_texts[w.step] = text;
+                    // Only the Next button's enabled state depends on
+                    // this text; re-render just when it flips so the
+                    // input isn't reset mid-typing.
+                    if was_empty != w.other_texts[w.step].trim().is_empty() {
                         self.render_chat(false);
                     }
                 }
             }
+            UiCommand::QuestionBack(row) => {
+                if let Some((request_id, _)) = self.question_at(row)
+                    && let Some(w) = self.wizards.get_mut(&request_id)
+                {
+                    w.step = w.step.saturating_sub(1);
+                    self.render_chat(false);
+                }
+            }
             UiCommand::QuestionNext(row) => {
-                if let Some((request_id, questions)) = self.question_at(row) {
-                    if let Some(w) = self.wizards.get_mut(&request_id) {
-                        if w.step < questions.len() {
-                            w.step += 1;
-                            self.render_chat(false);
-                        } else {
-                            // Review page: submit. The wizard state stays
-                            // until question.resolved lands and prunes it.
-                            let answers = w.answers(&questions);
-                            self.client
-                                .resolve_question(&request_id, Some(answers))
-                                .await?;
-                        }
+                if let Some((request_id, questions)) = self.question_at(row)
+                    && let Some(w) = self.wizards.get_mut(&request_id)
+                {
+                    if w.step < questions.len() {
+                        w.step += 1;
+                        self.render_chat(false);
+                    } else {
+                        // Review page: submit. The wizard state stays
+                        // until question.resolved lands and prunes it.
+                        let answers = w.answers(&questions);
+                        self.client
+                            .resolve_question(&request_id, Some(answers))
+                            .await?;
                     }
                 }
             }
@@ -2936,11 +2933,11 @@ impl Controller {
                     return Ok(());
                 };
                 // Typing always snaps back to the live tail.
-                if let Some(state) = self.current_term_mut() {
-                    if state.grid.scrollback_offset() > 0 {
-                        state.grid.scroll_to_live();
-                        self.push_term();
-                    }
+                if let Some(state) = self.current_term_mut()
+                    && state.grid.scrollback_offset() > 0
+                {
+                    state.grid.scroll_to_live();
+                    self.push_term();
                 }
                 if let Err(e) = self.client.terminal_input(&id, &bytes).await {
                     self.error(&format!("terminal input: {e:#}"));
@@ -2999,12 +2996,12 @@ impl Controller {
                 let visible = self.current_session_id().as_deref() == Some(session_id.as_str());
                 // Guard against a stale follower racing a restart.
                 let mut applied = false;
-                if let Some(state) = self.terms.get_mut(&session_id) {
-                    if state.terminal_id == terminal_id {
-                        state.grid.process(&bytes);
-                        state.offset = offset;
-                        applied = true;
-                    }
+                if let Some(state) = self.terms.get_mut(&session_id)
+                    && state.terminal_id == terminal_id
+                {
+                    state.grid.process(&bytes);
+                    state.offset = offset;
+                    applied = true;
                 }
                 if applied && visible {
                     self.push_term();
@@ -3016,11 +3013,11 @@ impl Controller {
             } => {
                 let visible = self.current_session_id().as_deref() == Some(session_id.as_str());
                 let mut applied = false;
-                if let Some(state) = self.terms.get_mut(&session_id) {
-                    if state.terminal_id == terminal_id {
-                        state.exited = true;
-                        applied = true;
-                    }
+                if let Some(state) = self.terms.get_mut(&session_id)
+                    && state.terminal_id == terminal_id
+                {
+                    state.exited = true;
+                    applied = true;
                 }
                 if applied && visible {
                     self.push_term();
@@ -3046,12 +3043,11 @@ impl Controller {
                     // first expand and kept for later re-expands.
                     if !self.file_expanded.remove(&row.path) {
                         self.file_expanded.insert(row.path.clone());
-                        if !self.file_children.contains_key(&row.path) {
-                            if let Some(session_id) = self.current_session_id() {
-                                let entries =
-                                    self.client.session_files(&session_id, &row.path).await?;
-                                self.file_children.insert(row.path.clone(), entries);
-                            }
+                        if !self.file_children.contains_key(&row.path)
+                            && let Some(session_id) = self.current_session_id()
+                        {
+                            let entries = self.client.session_files(&session_id, &row.path).await?;
+                            self.file_children.insert(row.path.clone(), entries);
                         }
                     }
                     self.push_file_tree();
@@ -3144,10 +3140,10 @@ impl Controller {
                 }
             }
             UiCommand::OpenPrUrl(url) => {
-                if !url.is_empty() {
-                    if let Err(e) = open::that_detached(&url) {
-                        self.error(&format!("could not open {url}: {e}"));
-                    }
+                if !url.is_empty()
+                    && let Err(e) = open::that_detached(&url)
+                {
+                    self.error(&format!("could not open {url}: {e}"));
                 }
             }
             UiCommand::PrsLoaded(session_id, result) => {
@@ -3917,15 +3913,16 @@ impl Controller {
                 thread_id,
             } => {
                 ui::raise_window(&self.ui);
-                if !session_id.is_empty() && self.current_session_id() != Some(session_id.clone()) {
-                    if let Some(i) = self.sessions.iter().position(|s| s.id == session_id) {
-                        self.select_session(i).await?;
-                    }
+                if !session_id.is_empty()
+                    && self.current_session_id() != Some(session_id.clone())
+                    && let Some(i) = self.sessions.iter().position(|s| s.id == session_id)
+                {
+                    self.select_session(i).await?;
                 }
-                if let Some(i) = self.threads.iter().position(|t| t.id == thread_id) {
-                    if self.current_thread != Some(i) {
-                        let _ = self.tx.send(UiCommand::SelectThread(i));
-                    }
+                if let Some(i) = self.threads.iter().position(|t| t.id == thread_id)
+                    && self.current_thread != Some(i)
+                {
+                    let _ = self.tx.send(UiCommand::SelectThread(i));
                 }
             }
             UiCommand::QuitWhenIdle => {

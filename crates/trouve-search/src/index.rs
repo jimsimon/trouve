@@ -11,20 +11,20 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 
-use anyhow::{bail, Result};
+use anyhow::{Result, bail};
 use rayon::prelude::*;
 
 use crate::bm25::Bm25Index;
 use crate::chunk::chunk_source;
 use crate::dense::DenseIndex;
 use crate::embed::EmbeddingModel;
-use crate::languages::{detect_language, file_status_for_bytes, get_extensions, FileStatus};
-use crate::manifest::{build_manifest, detect_repo_identity, FileRecord, RepoIdentity};
+use crate::languages::{FileStatus, detect_language, file_status_for_bytes, get_extensions};
+use crate::manifest::{FileRecord, RepoIdentity, build_manifest, detect_repo_identity};
 use crate::search;
 use crate::snapshot;
 use crate::stats::save_search_stats;
 use crate::store::{ChunkStore, FileEntry, StoredChunk};
-use crate::tokens::{tokenize, TokenDocs};
+use crate::tokens::{TokenDocs, tokenize};
 use crate::types::{CallType, Chunk, ContentType, IndexStats, SearchResult};
 
 /// How the index build went: total files and how many needed fresh computation.
@@ -373,10 +373,10 @@ impl TrouveIndex {
         let plans: Vec<Plan> = manifest
             .iter()
             .map(|record| {
-                if let Some(entry) = old_by_path.get(record.rel_path.as_str()) {
-                    if entry.content_key == record.content_key {
-                        return Plan::Copy(record, entry.first_row, entry.n_rows);
-                    }
+                if let Some(entry) = old_by_path.get(record.rel_path.as_str())
+                    && entry.content_key == record.content_key
+                {
+                    return Plan::Copy(record, entry.first_row, entry.n_rows);
                 }
                 let language = detect_language(Path::new(&record.rel_path));
                 let key = ChunkStore::entry_key(&record.content_key, language, &model.model_id);

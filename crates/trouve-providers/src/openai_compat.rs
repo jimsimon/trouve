@@ -6,13 +6,13 @@
 use std::sync::Arc;
 
 use futures::StreamExt;
-use serde_json::{json, Map, Value};
+use serde_json::{Map, Value, json};
 use trouve_protocol::Usage;
 
 use crate::auth::{StaticToken, TokenSource};
 use crate::{
-    catalog, EventStream, Message, Provider, ProviderError, ProviderEvent, ToolCallRequest,
-    ToolSpec,
+    EventStream, Message, Provider, ProviderError, ProviderEvent, ToolCallRequest, ToolSpec,
+    catalog,
 };
 
 pub struct OpenAiCompatProvider {
@@ -195,10 +195,10 @@ impl Provider for OpenAiCompatProvider {
             return self.models();
         }
         let mut cache = self.models_cache.lock().await;
-        if let Some((at, models)) = cache.as_ref() {
-            if at.elapsed() < MODELS_TTL {
-                return models.clone();
-            }
+        if let Some((at, models)) = cache.as_ref()
+            && at.elapsed() < MODELS_TTL
+        {
+            return models.clone();
         }
         match self.fetch_models().await {
             Ok(models) if !models.is_empty() => {
@@ -272,9 +272,9 @@ impl Provider for OpenAiCompatProvider {
 /// Turn the SSE byte stream into `ProviderEvent`s.
 fn async_stream(
     mut bytes: impl futures::Stream<Item = Result<bytes::Bytes, reqwest::Error>>
-        + Send
-        + Unpin
-        + 'static,
+    + Send
+    + Unpin
+    + 'static,
 ) -> EventStream {
     let (tx, rx) = tokio::sync::mpsc::channel::<Result<ProviderEvent, ProviderError>>(64);
     tokio::spawn(async move {
@@ -331,20 +331,20 @@ fn async_stream(
                 let Some(delta) = v.pointer("/choices/0/delta") else {
                     continue;
                 };
-                if let Some(text) = delta.get("content").and_then(Value::as_str) {
-                    if !text.is_empty() {
-                        let _ = tx
-                            .send(Ok(ProviderEvent::TextDelta(text.to_string())))
-                            .await;
-                    }
+                if let Some(text) = delta.get("content").and_then(Value::as_str)
+                    && !text.is_empty()
+                {
+                    let _ = tx
+                        .send(Ok(ProviderEvent::TextDelta(text.to_string())))
+                        .await;
                 }
                 // DeepSeek-style reasoning stream on chat completions.
-                if let Some(text) = delta.get("reasoning_content").and_then(Value::as_str) {
-                    if !text.is_empty() {
-                        let _ = tx
-                            .send(Ok(ProviderEvent::ThinkingDelta(text.to_string())))
-                            .await;
-                    }
+                if let Some(text) = delta.get("reasoning_content").and_then(Value::as_str)
+                    && !text.is_empty()
+                {
+                    let _ = tx
+                        .send(Ok(ProviderEvent::ThinkingDelta(text.to_string())))
+                        .await;
                 }
                 if let Some(calls) = delta.get("tool_calls").and_then(Value::as_array) {
                     for call in calls {

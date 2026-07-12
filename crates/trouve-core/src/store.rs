@@ -10,7 +10,7 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result};
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{Connection, OptionalExtension, params};
 use tokio::sync::broadcast;
 use trouve_protocol::{Event, EventEnvelope, PermissionMode, Scope, Session, Thread, Workspace};
 
@@ -1519,13 +1519,17 @@ mod tests {
         assert!(!store.delete_queued_prompt(&a.id).unwrap());
 
         // Reorder requires the exact current id set...
-        assert!(!store
-            .reorder_queued_prompts("th_1", std::slice::from_ref(&c.id))
-            .unwrap());
+        assert!(
+            !store
+                .reorder_queued_prompts("th_1", std::slice::from_ref(&c.id))
+                .unwrap()
+        );
         // ...and applies the given order when it matches.
-        assert!(store
-            .reorder_queued_prompts("th_1", &[c.id.clone(), b.id.clone()])
-            .unwrap());
+        assert!(
+            store
+                .reorder_queued_prompts("th_1", &[c.id.clone(), b.id.clone()])
+                .unwrap()
+        );
 
         // Pop drains front-first in the new order.
         let p1 = store.pop_queued_prompt("th_1").unwrap().unwrap();

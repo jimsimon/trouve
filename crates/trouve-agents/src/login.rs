@@ -52,13 +52,13 @@ pub async fn spawn_login(command: &str, args: &[&str]) -> Result<BackendLogin, B
             // Only consume the one-shot sender when this line actually
             // holds a URL; taking it eagerly in a tuple pattern burned it
             // on the first URL-less line, dropping the real URL later.
-            if url_tx.is_some() {
-                if let Some(url) = find_url(&line) {
-                    let _ = url_tx
-                        .take()
-                        .expect("checked above")
-                        .send((url, find_user_code(&line)));
-                }
+            if url_tx.is_some()
+                && let Some(url) = find_url(&line)
+            {
+                let _ = url_tx
+                    .take()
+                    .expect("checked above")
+                    .send((url, find_user_code(&line)));
             }
         }
     });

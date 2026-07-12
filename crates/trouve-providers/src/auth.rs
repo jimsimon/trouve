@@ -7,8 +7,8 @@ use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::secrets::SecretStore;
 use crate::ProviderError;
+use crate::secrets::SecretStore;
 
 /// Something that can produce a bearer token/API key on demand. Providers
 /// take a `TokenSource` instead of a raw key so auth is swappable: static
@@ -254,7 +254,7 @@ pub async fn device_poll(
                 return Err(ProviderError::Auth(format!(
                     "device flow failed: {other}: {}",
                     body["error_description"].as_str().unwrap_or("")
-                )))
+                )));
             }
         }
     }

@@ -6,7 +6,7 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 
 fn git(dir: &Path, args: &[&str]) -> Result<String> {
     let out = Command::new("git")

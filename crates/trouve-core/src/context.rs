@@ -30,10 +30,10 @@ fn read_if_exists(path: &Path) -> Option<String> {
 pub fn system_prompt(mode: &AgentMode, config_dir: Option<&Path>, workspace_root: &Path) -> String {
     let mut sections = vec![BASE_PROMPT.to_string(), mode.system_prompt.clone()];
 
-    if let Some(dir) = config_dir {
-        if let Some(text) = read_if_exists(&dir.join("AGENTS.md")) {
-            sections.push(format!("## User instructions (global AGENTS.md)\n\n{text}"));
-        }
+    if let Some(dir) = config_dir
+        && let Some(text) = read_if_exists(&dir.join("AGENTS.md"))
+    {
+        sections.push(format!("## User instructions (global AGENTS.md)\n\n{text}"));
     }
     for candidate in [
         workspace_root.join("AGENTS.md"),

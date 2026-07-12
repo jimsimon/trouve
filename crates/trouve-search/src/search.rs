@@ -7,11 +7,11 @@
 
 use std::collections::HashMap;
 
-use crate::bm25::{selector_to_mask, Bm25Index};
+use crate::bm25::{Bm25Index, selector_to_mask};
 use crate::dense::DenseIndex;
 use crate::embed::EmbeddingModel;
 use crate::ranking::{
-    apply_query_boost, boost_multi_chunk_files, rerank_topk, resolve_alpha, ScoreMap,
+    ScoreMap, apply_query_boost, boost_multi_chunk_files, rerank_topk, resolve_alpha,
 };
 use crate::tokens::tokenize;
 use crate::types::{Chunk, SearchResult};

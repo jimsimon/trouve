@@ -18,20 +18,20 @@ use axum::{Json, Router};
 use futures::Stream;
 use serde::Deserialize;
 use tokio_stream::wrappers::ReceiverStream;
-use trouve_core::engine::EngineError;
 use trouve_core::Engine;
+use trouve_core::engine::EngineError;
 use trouve_protocol::{
     AddLocalModelRequest, AgentMode, Automation, BranchList, CliInfo, CliInstallStatus, CliList,
     CreatePrRequest, CreateSessionRequest, CreateThreadRequest, DirEntry, ErrorBody, FileContent,
     GithubIntegration, KnownProvider, LocalSearchResult, LocalStatus, LoginStarted, LoginStatus,
-    McpLogs, McpServerInfo, MergePrRequest, ModeInfo, ModelInfo, OpenTerminalRequest, PrInfo,
-    ProviderInfo, ProvidersResponse, QueuedPrompt, RegisterWorkspaceRequest, ReorderQueueRequest,
-    ResolveApprovalRequest, ResolveQuestionRequest, Scope, SendMessageRequest, ServerInfo, Session,
-    SessionDiff, SetDefaultModelRequest, SetGithubTokenRequest, SetLocalEnabledRequest,
-    SubscriptionHealth, TerminalInfo, TerminalInputRequest, TerminalResizeRequest, Thread,
-    TurnAccepted, UpdateQueuedPromptRequest, UpdateSessionRequest, UpdateThreadRequest,
-    UpsertAutomationRequest, UpsertMcpServerRequest, UpsertModeRequest, UpsertProviderRequest,
-    UsageSummary, Workspace, PROTOCOL_VERSION,
+    McpLogs, McpServerInfo, MergePrRequest, ModeInfo, ModelInfo, OpenTerminalRequest,
+    PROTOCOL_VERSION, PrInfo, ProviderInfo, ProvidersResponse, QueuedPrompt,
+    RegisterWorkspaceRequest, ReorderQueueRequest, ResolveApprovalRequest, ResolveQuestionRequest,
+    Scope, SendMessageRequest, ServerInfo, Session, SessionDiff, SetDefaultModelRequest,
+    SetGithubTokenRequest, SetLocalEnabledRequest, SubscriptionHealth, TerminalInfo,
+    TerminalInputRequest, TerminalResizeRequest, Thread, TurnAccepted, UpdateQueuedPromptRequest,
+    UpdateSessionRequest, UpdateThreadRequest, UpsertAutomationRequest, UpsertMcpServerRequest,
+    UpsertModeRequest, UpsertProviderRequest, UsageSummary, Workspace,
 };
 use utoipa::OpenApi;
 

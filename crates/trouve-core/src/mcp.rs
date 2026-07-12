@@ -16,12 +16,12 @@
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::path::Path;
 use std::process::Stdio;
-use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicI64, Ordering};
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, ChildStdout};
 use tokio::sync::Mutex;
@@ -192,10 +192,10 @@ pub fn discover_configs(
     if let Some(dir) = config_dir {
         servers.extend(read_servers(&user_config_path(dir)));
     }
-    if let Some(root) = workspace_root {
-        if root != worktree {
-            servers.extend(read_servers(&workspace_config_path(root)));
-        }
+    if let Some(root) = workspace_root
+        && root != worktree
+    {
+        servers.extend(read_servers(&workspace_config_path(root)));
     }
     servers.extend(read_servers(&workspace_config_path(worktree)));
     servers.retain(|_, config| !config.disabled);
@@ -221,10 +221,10 @@ pub fn discover_with_provenance(
     if let Some(dir) = config_dir {
         overlay(&user_config_path(dir), "app-wide");
     }
-    if let Some(root) = workspace_root {
-        if root != worktree {
-            overlay(&workspace_config_path(root), "workspace");
-        }
+    if let Some(root) = workspace_root
+        && root != worktree
+    {
+        overlay(&workspace_config_path(root), "workspace");
     }
     overlay(&workspace_config_path(worktree), "branch");
     servers
@@ -538,7 +538,8 @@ mod tests {
         assert_eq!(jira.command, "jira-mcp");
         assert_eq!(jira.args, vec!["--stdio"]);
 
-        std::env::set_var("TROUVE_TEST_JIRA_TOKEN", "sekrit");
+        // Safety: unique variable name, so parallel tests can't race on it.
+        unsafe { std::env::set_var("TROUVE_TEST_JIRA_TOKEN", "sekrit") };
         assert_eq!(expand_env("${TROUVE_TEST_JIRA_TOKEN}"), "sekrit");
         assert_eq!(
             expand_env("Bearer ${TROUVE_TEST_JIRA_TOKEN}!"),

@@ -16,7 +16,7 @@ use slint::{ComponentHandle, Model};
 /// Indices into `items` fuzzy-matching `query`, best score first (stable by
 /// position on ties). An empty query keeps the full list in its own order.
 fn fuzzy_match_indices(items: &[String], query: &str) -> Vec<i32> {
-    use fuzzy_matcher::{skim::SkimMatcherV2, FuzzyMatcher};
+    use fuzzy_matcher::{FuzzyMatcher, skim::SkimMatcherV2};
     let query = query.trim();
     if query.is_empty() {
         return (0..items.len() as i32).collect();

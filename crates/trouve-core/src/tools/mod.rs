@@ -10,12 +10,12 @@ mod grep;
 mod search;
 mod shell;
 
-pub use search::{gc_index_store_in_background, warm_index_in_background, VENDOR_SEARCH_GUIDANCE};
+pub use search::{VENDOR_SEARCH_GUIDANCE, gc_index_store_in_background, warm_index_in_background};
 
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 
-use anyhow::{bail, Result};
+use anyhow::{Result, bail};
 use serde_json::Value;
 use trouve_protocol::ToolStatus;
 use trouve_providers::ToolSpec;

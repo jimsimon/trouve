@@ -369,10 +369,11 @@ fn boost_stem_matches(scores: &mut ScoreMap, query: &str, max_score: f64, chunks
                 .parent()
                 .and_then(|p| p.file_name())
                 .and_then(|n| n.to_str())
+                && parent != "."
+                && parent != "/"
+                && parent != ".."
             {
-                if parent != "." && parent != "/" && parent != ".." {
-                    parts.extend(split_identifier(parent));
-                }
+                parts.extend(split_identifier(parent));
             }
             parts
         });

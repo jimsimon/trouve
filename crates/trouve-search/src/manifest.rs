@@ -15,7 +15,7 @@ use anyhow::{Context, Result};
 use rayon::prelude::*;
 
 use crate::store::{ChunkStore, FsManifestRecord};
-use crate::walker::{walk_files, TrouveIgnore, DEFAULT_IGNORED_DIRS};
+use crate::walker::{DEFAULT_IGNORED_DIRS, TrouveIgnore, walk_files};
 
 /// One file to index.
 #[derive(Debug, Clone)]

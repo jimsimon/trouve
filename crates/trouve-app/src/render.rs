@@ -4,7 +4,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use slint_markdown::{parse_blocks, BlockKind};
+use slint_markdown::{BlockKind, parse_blocks};
 use trouve_client_core::viewmodel::{ChatItem, ThreadViewModel, ToolCallStatus, TurnState};
 use trouve_protocol::QuestionAnswer;
 
@@ -1298,11 +1298,7 @@ fn patch_lines(patch: &str) -> Vec<DiffLine> {
             new_no += (new_no > 0) as i32;
         }
     }
-    if saw_change {
-        out
-    } else {
-        Vec::new()
-    }
+    if saw_change { out } else { Vec::new() }
 }
 
 /// Parse the old/new start lines out of a `@@ -a,b +c,d @@` hunk header.

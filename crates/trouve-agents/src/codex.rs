@@ -18,19 +18,19 @@
 
 use std::collections::HashMap;
 use std::process::Stdio;
-use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicI64, Ordering};
 
 use futures::StreamExt;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin};
-use tokio::sync::{mpsc, oneshot, Mutex};
+use tokio::sync::{Mutex, mpsc, oneshot};
 use trouve_protocol::{ModelInfo, Usage};
 
 use crate::{
-    async_stream, binary_on_path, model, spawn_login, AgentBackend, BackendError, BackendEvent,
-    BackendEventStream, BackendLogin, BackendPermission, BackendStatus, BackendTurn,
+    AgentBackend, BackendError, BackendEvent, BackendEventStream, BackendLogin, BackendPermission,
+    BackendStatus, BackendTurn, async_stream, binary_on_path, model, spawn_login,
 };
 
 pub struct CodexBackend {
@@ -75,10 +75,10 @@ impl CodexBackend {
 
     async fn server(&self) -> Result<Arc<AppServer>, BackendError> {
         let mut guard = self.server.lock().await;
-        if let Some(s) = guard.as_ref() {
-            if !s.is_closed() {
-                return Ok(s.clone());
-            }
+        if let Some(s) = guard.as_ref()
+            && !s.is_closed()
+        {
+            return Ok(s.clone());
         }
         let s = Arc::new(AppServer::spawn(&self.command).await?);
         s.handshake().await?;
@@ -107,12 +107,12 @@ impl AgentBackend for CodexBackend {
     async fn list_models(&self) -> Vec<ModelInfo> {
         {
             let cache = self.models_cache.lock().await;
-            if let Some((at, models)) = cache.as_ref() {
-                if at.elapsed() < MODELS_TTL {
-                    let mut models = models.clone();
-                    self.apply_observed_windows(&mut models);
-                    return models;
-                }
+            if let Some((at, models)) = cache.as_ref()
+                && at.elapsed() < MODELS_TTL
+            {
+                let mut models = models.clone();
+                self.apply_observed_windows(&mut models);
+                return models;
             }
         }
         let fetched = async {
@@ -783,19 +783,18 @@ impl AppServer {
                 let has_method = msg["method"].is_string();
                 if has_id && !has_method {
                     // Response to one of our requests.
-                    if let Some(id) = msg["id"].as_i64() {
-                        if let Some(tx) = pending.lock().await.remove(&id) {
-                            let result = if msg.get("error").map(|e| !e.is_null()).unwrap_or(false)
-                            {
-                                Err(msg["error"]["message"]
-                                    .as_str()
-                                    .unwrap_or("unknown error")
-                                    .to_string())
-                            } else {
-                                Ok(msg["result"].clone())
-                            };
-                            let _ = tx.send(result);
-                        }
+                    if let Some(id) = msg["id"].as_i64()
+                        && let Some(tx) = pending.lock().await.remove(&id)
+                    {
+                        let result = if msg.get("error").map(|e| !e.is_null()).unwrap_or(false) {
+                            Err(msg["error"]["message"]
+                                .as_str()
+                                .unwrap_or("unknown error")
+                                .to_string())
+                        } else {
+                            Ok(msg["result"].clone())
+                        };
+                        let _ = tx.send(result);
                     }
                 } else if has_method {
                     let method = msg["method"].as_str().unwrap_or("").to_string();

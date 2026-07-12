@@ -8,7 +8,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, RwLock};
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use futures::StreamExt;
 use trouve_agents::{AgentBackend, BackendEvent, BackendPermission, BackendTurn};
 use trouve_protocol::{
@@ -20,7 +20,7 @@ use trouve_protocol::{
 use trouve_providers::{Message, Provider, ProviderEvent, ToolSpec};
 
 use crate::config::{Config, ProviderConfig};
-use crate::permissions::{allow_key, gate, ApprovalHub, Gate, QuestionHub};
+use crate::permissions::{ApprovalHub, Gate, QuestionHub, allow_key, gate};
 use crate::store::{CheckpointRow, Store};
 use crate::tools::{LocalToolExecutor, ToolCtx, ToolExecutor};
 use crate::{context, git, modes, new_id};
@@ -225,22 +225,22 @@ fn build_all_providers(
         }
     }
     // Zero-config defaults from conventional env vars.
-    if !providers.contains_key("openai") {
-        if let Ok(p) = trouve_providers::openai_compat::OpenAiCompatProvider::openai_from_env() {
-            providers.insert("openai".into(), Arc::new(p));
-        }
+    if !providers.contains_key("openai")
+        && let Ok(p) = trouve_providers::openai_compat::OpenAiCompatProvider::openai_from_env()
+    {
+        providers.insert("openai".into(), Arc::new(p));
     }
-    if !providers.contains_key("anthropic") {
-        if let Ok(key) = std::env::var("ANTHROPIC_API_KEY") {
-            providers.insert(
-                "anthropic".into(),
-                Arc::new(trouve_providers::anthropic::AnthropicProvider::new(
-                    "anthropic",
-                    None,
-                    Arc::new(trouve_providers::auth::StaticToken(key)),
-                )),
-            );
-        }
+    if !providers.contains_key("anthropic")
+        && let Ok(key) = std::env::var("ANTHROPIC_API_KEY")
+    {
+        providers.insert(
+            "anthropic".into(),
+            Arc::new(trouve_providers::anthropic::AnthropicProvider::new(
+                "anthropic",
+                None,
+                Arc::new(trouve_providers::auth::StaticToken(key)),
+            )),
+        );
     }
     providers
 }
@@ -896,10 +896,10 @@ impl Engine {
         const TTL: std::time::Duration = std::time::Duration::from_secs(3600);
         {
             let cache = self.cli_latest.lock().unwrap();
-            if let Some((at, v)) = cache.get(id.as_str()) {
-                if at.elapsed() < TTL {
-                    return v.clone();
-                }
+            if let Some((at, v)) = cache.get(id.as_str())
+                && at.elapsed() < TTL
+            {
+                return v.clone();
             }
         }
         let fetched = tokio::time::timeout(
@@ -1608,14 +1608,14 @@ impl Engine {
         if gguf.exists() {
             std::fs::remove_file(&gguf).map_err(|e| EngineError::Internal(e.into()))?;
         }
-        if entry.custom {
-            if let Some(config_dir) = &self.config_dir {
-                let path = crate::local::custom_models_path(config_dir);
-                let mut models = crate::local::read_custom_models(&path);
-                models.retain(|m| m.id != id);
-                crate::local::write_custom_models(&path, &models)
-                    .map_err(|e| EngineError::Internal(e.into()))?;
-            }
+        if entry.custom
+            && let Some(config_dir) = &self.config_dir
+        {
+            let path = crate::local::custom_models_path(config_dir);
+            let mut models = crate::local::read_custom_models(&path);
+            models.retain(|m| m.id != id);
+            crate::local::write_custom_models(&path, &models)
+                .map_err(|e| EngineError::Internal(e.into()))?;
         }
         Ok(())
     }
@@ -1715,10 +1715,10 @@ impl Engine {
     }
 
     fn persist_config(&self, config: &Config) {
-        if let Some(path) = &self.config_file {
-            if let Err(e) = config.save_to(path) {
-                tracing::warn!("failed to persist config: {e}");
-            }
+        if let Some(path) = &self.config_file
+            && let Err(e) = config.save_to(path)
+        {
+            tracing::warn!("failed to persist config: {e}");
         }
     }
 
@@ -1809,12 +1809,12 @@ impl Engine {
             .config_dir
             .as_deref()
             .ok_or_else(|| EngineError::BadRequest("no config dir".into()))?;
-        if let Some(model) = req.default_model.as_deref() {
-            if !model.contains('/') {
-                return Err(EngineError::BadRequest(format!(
-                    "default_model must be provider-qualified (\"provider/model\"), got {model}"
-                )));
-            }
+        if let Some(model) = req.default_model.as_deref()
+            && !model.contains('/')
+        {
+            return Err(EngineError::BadRequest(format!(
+                "default_model must be provider-qualified (\"provider/model\"), got {model}"
+            )));
         }
         let mode = AgentMode {
             id: id.to_string(),
@@ -2000,10 +2000,11 @@ impl Engine {
             }
         }
         let workspaces = match workspace_id {
-            Some(id) => vec![self
-                .store
-                .workspace(id)?
-                .ok_or_else(|| EngineError::NotFound(format!("workspace {id}")))?],
+            Some(id) => vec![
+                self.store
+                    .workspace(id)?
+                    .ok_or_else(|| EngineError::NotFound(format!("workspace {id}")))?,
+            ],
             None => self.store.list_workspaces()?,
         };
         for ws in workspaces {
@@ -2682,10 +2683,10 @@ impl Engine {
         req: &UpdateSessionRequest,
     ) -> Result<Session, EngineError> {
         let session = self.get_session(id)?;
-        if let Some(title) = req.title.as_deref() {
-            if title.trim().is_empty() {
-                return Err(EngineError::BadRequest("title cannot be empty".into()));
-            }
+        if let Some(title) = req.title.as_deref()
+            && title.trim().is_empty()
+        {
+            return Err(EngineError::BadRequest("title cannot be empty".into()));
         }
         self.store
             .update_session(id, req.title.as_deref(), req.archived)?;
@@ -2696,10 +2697,12 @@ impl Engine {
                 workspace_id: session.workspace_id.clone(),
             },
         )?;
-        if self.index_hooks && req.archived == Some(true) && !session.archived {
-            if let Some(ws) = self.store.workspace(&session.workspace_id)? {
-                crate::tools::gc_index_store_in_background(PathBuf::from(&ws.path));
-            }
+        if self.index_hooks
+            && req.archived == Some(true)
+            && !session.archived
+            && let Some(ws) = self.store.workspace(&session.workspace_id)?
+        {
+            crate::tools::gc_index_store_in_background(PathBuf::from(&ws.path));
         }
         self.get_session(id)
     }
@@ -2814,12 +2817,12 @@ impl Engine {
             modes::find_mode(&all_modes, mode_id)
                 .ok_or_else(|| EngineError::BadRequest(format!("unknown mode: {mode_id}")))?;
         }
-        if let Some(model) = req.model.as_deref() {
-            if !model.contains('/') {
-                return Err(EngineError::BadRequest(format!(
-                    "model must be provider-qualified (e.g. openai/gpt-4.1-mini): {model}"
-                )));
-            }
+        if let Some(model) = req.model.as_deref()
+            && !model.contains('/')
+        {
+            return Err(EngineError::BadRequest(format!(
+                "model must be provider-qualified (e.g. openai/gpt-4.1-mini): {model}"
+            )));
         }
         self.store.update_thread(
             id,

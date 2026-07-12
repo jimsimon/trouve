@@ -31,8 +31,8 @@ pub struct NavRowData {
 /// user-attention request at least flashes the taskbar entry.
 pub fn raise_window(ui: &Ui) {
     let _ = ui.upgrade_in_event_loop(|ui| {
-        use slint::winit_030::{winit, WinitWindowAccessor};
         use slint::ComponentHandle;
+        use slint::winit_030::{WinitWindowAccessor, winit};
         ui.window().with_winit_window(|w| {
             w.set_minimized(false);
             w.focus_window();

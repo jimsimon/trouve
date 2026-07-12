@@ -4,14 +4,14 @@
 
 use std::path::Path;
 use std::process::Command;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use futures::StreamExt;
+use trouve_core::Engine;
 use trouve_core::config::Config;
 use trouve_core::store::Store;
-use trouve_core::Engine;
 use trouve_protocol::Usage;
 use trouve_providers::{
     EventStream, Message, Provider, ProviderError, ProviderEvent, ToolCallRequest, ToolSpec,
@@ -179,10 +179,12 @@ async fn full_turn_with_approval_checkpoint_and_undo() {
         .await
         .unwrap();
     let worktree = session["worktree_path"].as_str().unwrap().to_string();
-    assert!(session["branch"]
-        .as_str()
-        .unwrap()
-        .starts_with("trouve/test-session"));
+    assert!(
+        session["branch"]
+            .as_str()
+            .unwrap()
+            .starts_with("trouve/test-session")
+    );
     assert!(Path::new(&worktree).join("README.md").exists());
 
     let thread: serde_json::Value = client
@@ -239,9 +241,11 @@ async fn full_turn_with_approval_checkpoint_and_undo() {
         "mutating turn must checkpoint"
     );
     assert_eq!(completed["usage"]["input_tokens"], 30);
-    assert!(events
-        .iter()
-        .any(|e| e["type"] == "tool.completed" && e["status"] == "ok"));
+    assert!(
+        events
+            .iter()
+            .any(|e| e["type"] == "tool.completed" && e["status"] == "ok")
+    );
     assert_eq!(
         std::fs::read_to_string(Path::new(&worktree).join("hello.txt")).unwrap(),
         "hi\n"
@@ -445,9 +449,11 @@ async fn compaction_summarizes_transcript_near_context_window() {
         e["type"] == "turn.completed" && e["turn"] == 2
     })
     .await;
-    assert!(events
-        .iter()
-        .any(|e| e["type"] == "thread.compaction_started"));
+    assert!(
+        events
+            .iter()
+            .any(|e| e["type"] == "thread.compaction_started")
+    );
     let completed = events
         .iter()
         .find(|e| e["type"] == "thread.compaction_completed")
@@ -505,11 +511,13 @@ async fn session_and_thread_updates_and_provider_config() {
         .await
         .unwrap();
     assert_eq!(branches["head"], "main");
-    assert!(branches["branches"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .any(|b| b == "main"));
+    assert!(
+        branches["branches"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|b| b == "main")
+    );
 
     let session: serde_json::Value = client
         .post(format!("{base}/sessions"))
@@ -670,11 +678,13 @@ async fn session_and_thread_updates_and_provider_config() {
         .json()
         .await
         .unwrap();
-    assert!(providers["providers"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .any(|p| p["id"] == "openrouter"));
+    assert!(
+        providers["providers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|p| p["id"] == "openrouter")
+    );
 
     // Default model change persists.
     let resp = client
@@ -708,11 +718,13 @@ async fn session_and_thread_updates_and_provider_config() {
         .json()
         .await
         .unwrap();
-    assert!(!providers["providers"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .any(|p| p["id"] == "openrouter"));
+    assert!(
+        !providers["providers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|p| p["id"] == "openrouter")
+    );
 }
 
 #[tokio::test]
@@ -782,9 +794,11 @@ async fn read_only_mode_denies_mutations_without_prompting() {
     let client2 = client.clone();
     let events = wait_for_event(&client2, &events_url, |e| e["type"] == "turn.completed").await;
     // write_file isn't in plan mode's tool list: denied, no approval prompt.
-    assert!(events
-        .iter()
-        .any(|e| e["type"] == "tool.completed" && e["status"] == "denied"));
+    assert!(
+        events
+            .iter()
+            .any(|e| e["type"] == "tool.completed" && e["status"] == "denied")
+    );
     assert!(!events.iter().any(|e| e["type"] == "approval.requested"));
     let worktree = session["worktree_path"].as_str().unwrap();
     assert!(!Path::new(worktree).join("hello.txt").exists());
@@ -1368,11 +1382,13 @@ async fn backend_turns_bridge_approvals_resume_sessions_and_checkpoint() {
         .json()
         .await
         .unwrap();
-    assert!(models
-        .as_array()
-        .unwrap()
-        .iter()
-        .any(|m| m["id"] == "fake-agent/agent-model"));
+    assert!(
+        models
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|m| m["id"] == "fake-agent/agent-model")
+    );
 
     let ws: serde_json::Value = client
         .post(format!("{base}/workspaces"))
@@ -1444,9 +1460,11 @@ async fn backend_turns_bridge_approvals_resume_sessions_and_checkpoint() {
         "backend turn must checkpoint"
     );
     assert_eq!(completed["usage"]["input_tokens"], 40);
-    assert!(events
-        .iter()
-        .any(|e| e["type"] == "tool.completed" && e["status"] == "ok"));
+    assert!(
+        events
+            .iter()
+            .any(|e| e["type"] == "tool.completed" && e["status"] == "ok")
+    );
     assert_eq!(
         std::fs::read_to_string(Path::new(&worktree).join("agent.txt")).unwrap(),
         "from agent\n"
@@ -1816,9 +1834,11 @@ async fn queued_prompts_crud_and_in_order_dispatch() {
         e["type"] == "session.activity" && e["active"] == false
     })
     .await;
-    assert!(server_events
-        .iter()
-        .any(|e| e["type"] == "session.activity" && e["active"] == true));
+    assert!(
+        server_events
+            .iter()
+            .any(|e| e["type"] == "session.activity" && e["active"] == true)
+    );
     let sessions: Vec<serde_json::Value> = client
         .get(format!("{base}/sessions"))
         .send()
@@ -2153,10 +2173,10 @@ async fn terminal_shell_in_session_worktree() {
             while let Some(pos) = buf.find('\n') {
                 let line = buf[..pos].trim().to_string();
                 buf.drain(..=pos);
-                if let Some(data) = line.strip_prefix("data:") {
-                    if let Ok(bytes) = b64.decode(data.trim()) {
-                        out.extend_from_slice(&bytes);
-                    }
+                if let Some(data) = line.strip_prefix("data:")
+                    && let Ok(bytes) = b64.decode(data.trim())
+                {
+                    out.extend_from_slice(&bytes);
                 }
             }
             if String::from_utf8_lossy(&out).contains("README.md") {
@@ -2305,9 +2325,11 @@ async fn github_enterprise_host_crud() {
     assert_eq!(hosts[1]["removable"], true);
     assert_eq!(hosts[1]["oauth_available"], true);
     // The host landed in config.toml.
-    assert!(std::fs::read_to_string(&config_file)
-        .unwrap()
-        .contains("ghes.example.com"));
+    assert!(
+        std::fs::read_to_string(&config_file)
+            .unwrap()
+            .contains("ghes.example.com")
+    );
 
     // Duplicates conflict; garbage and github.com itself are rejected.
     for (body, status) in [

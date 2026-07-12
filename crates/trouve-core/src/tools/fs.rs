@@ -1,6 +1,6 @@
 //! File tools: read, write, list.
 
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use super::{Tool, ToolCtx, ToolResult};
 
@@ -110,10 +110,10 @@ impl Tool for WriteFile {
             Ok(p) => p,
             Err(e) => return ToolResult::error(e),
         };
-        if let Some(parent) = full.parent() {
-            if let Err(e) = tokio::fs::create_dir_all(parent).await {
-                return ToolResult::error(format!("cannot create parent dirs for {path}: {e}"));
-            }
+        if let Some(parent) = full.parent()
+            && let Err(e) = tokio::fs::create_dir_all(parent).await
+        {
+            return ToolResult::error(format!("cannot create parent dirs for {path}: {e}"));
         }
         match tokio::fs::write(&full, content).await {
             Ok(()) => ToolResult::ok(json!({"bytes_written": content.len()})),

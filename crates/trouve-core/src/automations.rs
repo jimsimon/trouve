@@ -69,10 +69,10 @@ pub fn next_run(schedule: &AutomationSchedule, after: DateTime<Local>) -> Option
             let time = parse_time(&schedule.time)?;
             for offset in 0..3 {
                 let day = after.date_naive() + Duration::days(offset);
-                if let Some(at) = local_at(day, time) {
-                    if at > after {
-                        return Some(at);
-                    }
+                if let Some(at) = local_at(day, time)
+                    && at > after
+                {
+                    return Some(at);
                 }
             }
             None
@@ -87,10 +87,10 @@ pub fn next_run(schedule: &AutomationSchedule, after: DateTime<Local>) -> Option
                 if !schedule.days.contains(&weekday) {
                     continue;
                 }
-                if let Some(at) = local_at(day, time) {
-                    if at > after {
-                        return Some(at);
-                    }
+                if let Some(at) = local_at(day, time)
+                    && at > after
+                {
+                    return Some(at);
                 }
             }
             None
@@ -277,13 +277,15 @@ mod tests {
         assert!(validate(&weekly("09:30", &[0, 4])).is_none());
         assert!(validate(&weekly("09:30", &[])).is_some());
         assert!(validate(&weekly("09:30", &[7])).is_some());
-        assert!(validate(&AutomationSchedule {
-            kind: "fortnightly".into(),
-            minute: 0,
-            time: String::new(),
-            days: vec![],
-        })
-        .is_some());
+        assert!(
+            validate(&AutomationSchedule {
+                kind: "fortnightly".into(),
+                minute: 0,
+                time: String::new(),
+                days: vec![],
+            })
+            .is_some()
+        );
     }
 
     #[test]

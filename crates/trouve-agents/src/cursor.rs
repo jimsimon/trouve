@@ -24,19 +24,19 @@
 
 use std::collections::{HashMap, HashSet};
 use std::process::Stdio;
-use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicI64, Ordering};
 
 use futures::StreamExt;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin};
-use tokio::sync::{mpsc, oneshot, Mutex};
+use tokio::sync::{Mutex, mpsc, oneshot};
 use trouve_protocol::{ModelInfo, Usage};
 
 use crate::{
-    async_stream, binary_on_path, model, spawn_login, AgentBackend, BackendError, BackendEvent,
-    BackendEventStream, BackendLogin, BackendPermission, BackendStatus, BackendTurn,
+    AgentBackend, BackendError, BackendEvent, BackendEventStream, BackendLogin, BackendPermission,
+    BackendStatus, BackendTurn, async_stream, binary_on_path, model, spawn_login,
 };
 
 pub struct CursorBackend {
@@ -64,10 +64,10 @@ impl CursorBackend {
 
     async fn server(&self) -> Result<Arc<AcpServer>, BackendError> {
         let mut guard = self.server.lock().await;
-        if let Some(s) = guard.as_ref() {
-            if !s.is_closed() {
-                return Ok(s.clone());
-            }
+        if let Some(s) = guard.as_ref()
+            && !s.is_closed()
+        {
+            return Ok(s.clone());
         }
         let s = Arc::new(AcpServer::spawn(&self.command, self.api_key.as_deref()).await?);
         s.handshake().await?;
@@ -91,10 +91,10 @@ impl AgentBackend for CursorBackend {
     async fn list_models(&self) -> Vec<ModelInfo> {
         {
             let cache = self.models_cache.lock().await;
-            if let Some((at, models)) = cache.as_ref() {
-                if at.elapsed() < MODELS_TTL {
-                    return models.clone();
-                }
+            if let Some((at, models)) = cache.as_ref()
+                && at.elapsed() < MODELS_TTL
+            {
+                return models.clone();
             }
         }
         let fetched = async {
@@ -259,14 +259,14 @@ async fn apply_model_config(
         })?;
     // Old cursor-agent builds (< 2026.07) accept the call but silently keep
     // the previous model; the response snapshot betrays them.
-    if let Some(current) = config_snapshot_value(&result, "model") {
-        if current != base {
-            return Err(BackendError::Protocol(format!(
-                "cursor-agent ignored the model change to {base} (still {current}); \
+    if let Some(current) = config_snapshot_value(&result, "model")
+        && current != base
+    {
+        return Err(BackendError::Protocol(format!(
+            "cursor-agent ignored the model change to {base} (still {current}); \
                  this build is too old for ACP model selection — update the CLI in \
                  Settings → Vendor CLIs"
-            )));
-        }
+        )));
     }
 
     // Options: schema-keyed values from the thread, plus legacy fallbacks.
@@ -402,12 +402,10 @@ async fn handle_msg(
                 if let BackendEvent::ToolCompleted {
                     call_id, result, ..
                 } = &mut ev
+                    && result.is_null()
+                    && let Some(plan) = server.plans.lock().await.remove(call_id)
                 {
-                    if result.is_null() {
-                        if let Some(plan) = server.plans.lock().await.remove(call_id) {
-                            *result = plan;
-                        }
-                    }
+                    *result = plan;
                 }
                 tx.send(Ok(ev)).await.map_err(|_| ())?;
             }
@@ -747,10 +745,10 @@ fn split_variant(id: &str) -> (&str, Option<&str>, bool) {
         Some(rest) => (rest, true),
         None => (id, false),
     };
-    if let Some((head, tail)) = rest.rsplit_once('-') {
-        if LEVELS.contains(&tail) {
-            return (head, Some(tail), fast);
-        }
+    if let Some((head, tail)) = rest.rsplit_once('-')
+        && LEVELS.contains(&tail)
+    {
+        return (head, Some(tail), fast);
     }
     (rest, None, fast)
 }
@@ -852,21 +850,20 @@ impl AcpServer {
                 let has_method = msg["method"].is_string();
                 if has_id && !has_method {
                     // Response to one of our requests.
-                    if let Some(id) = msg["id"].as_i64() {
-                        if let Some(tx) = pending.lock().await.remove(&id) {
-                            let result = if msg.get("error").map(|e| !e.is_null()).unwrap_or(false)
-                            {
-                                let e = &msg["error"];
-                                let detail = e["data"]["message"]
-                                    .as_str()
-                                    .or_else(|| e["message"].as_str())
-                                    .unwrap_or("unknown error");
-                                Err(detail.to_string())
-                            } else {
-                                Ok(msg["result"].clone())
-                            };
-                            let _ = tx.send(result);
-                        }
+                    if let Some(id) = msg["id"].as_i64()
+                        && let Some(tx) = pending.lock().await.remove(&id)
+                    {
+                        let result = if msg.get("error").map(|e| !e.is_null()).unwrap_or(false) {
+                            let e = &msg["error"];
+                            let detail = e["data"]["message"]
+                                .as_str()
+                                .or_else(|| e["message"].as_str())
+                                .unwrap_or("unknown error");
+                            Err(detail.to_string())
+                        } else {
+                            Ok(msg["result"].clone())
+                        };
+                        let _ = tx.send(result);
                     }
                 } else if has_method {
                     let method = msg["method"].as_str().unwrap_or("").to_string();
@@ -895,21 +892,21 @@ impl AcpServer {
                     // Remember which session owns each tool call: extension
                     // requests like cursor/ask_question are session-less and
                     // find their route through the toolCallId.
-                    if method == "session/update" && !session_id.is_empty() {
-                        if let Some(call_id) = params["update"]["toolCallId"].as_str() {
-                            let mut calls = calls.lock().await;
-                            calls.insert(call_id.to_string(), session_id.clone());
-                            if calls.len() > 4096 {
-                                calls.clear(); // crude bound; live calls re-register
-                            }
+                    if method == "session/update"
+                        && !session_id.is_empty()
+                        && let Some(call_id) = params["update"]["toolCallId"].as_str()
+                    {
+                        let mut calls = calls.lock().await;
+                        calls.insert(call_id.to_string(), session_id.clone());
+                        if calls.len() > 4096 {
+                            calls.clear(); // crude bound; live calls re-register
                         }
                     }
-                    if session_id.is_empty() {
-                        if let Some(call_id) = params["toolCallId"].as_str() {
-                            if let Some(owner) = calls.lock().await.get(call_id) {
-                                session_id = owner.clone();
-                            }
-                        }
+                    if session_id.is_empty()
+                        && let Some(call_id) = params["toolCallId"].as_str()
+                        && let Some(owner) = calls.lock().await.get(call_id)
+                    {
+                        session_id = owner.clone();
                     }
                     let routed = {
                         let routes = routes.lock().await;
@@ -1267,11 +1264,13 @@ mod tests {
                            "title": "`ls`", "kind": "execute", "status": "pending",
                            "rawInput": { "command": "ls" } });
         match map_update(&call).as_slice() {
-            [BackendEvent::ToolStarted {
-                call_id,
-                tool,
-                args,
-            }] => {
+            [
+                BackendEvent::ToolStarted {
+                    call_id,
+                    tool,
+                    args,
+                },
+            ] => {
                 assert_eq!(call_id, "t1");
                 assert_eq!(tool, "execute");
                 assert_eq!(args["command"], "ls");

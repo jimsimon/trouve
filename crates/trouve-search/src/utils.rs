@@ -4,7 +4,7 @@ use std::collections::HashSet;
 use std::sync::{Mutex, OnceLock};
 
 use regex::Regex;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use crate::types::{Chunk, SearchResult};
 
@@ -145,19 +145,20 @@ mod tests {
 
     #[test]
     fn env_var_compat_prefers_trouve_name() {
-        // Unique names so parallel tests never race on the same variables.
-        std::env::set_var("TROUVE_COMPAT_TEST_A", "new");
-        std::env::set_var("SEMBLE_COMPAT_TEST_A", "old");
+        // Safety: unique names, so parallel tests never race on the same
+        // variables.
+        unsafe { std::env::set_var("TROUVE_COMPAT_TEST_A", "new") };
+        unsafe { std::env::set_var("SEMBLE_COMPAT_TEST_A", "old") };
         assert_eq!(
             env_var_compat("TROUVE_COMPAT_TEST_A", "SEMBLE_COMPAT_TEST_A"),
             Some(("TROUVE_COMPAT_TEST_A", "new".to_string()))
         );
-        std::env::remove_var("TROUVE_COMPAT_TEST_A");
+        unsafe { std::env::remove_var("TROUVE_COMPAT_TEST_A") };
         assert_eq!(
             env_var_compat("TROUVE_COMPAT_TEST_A", "SEMBLE_COMPAT_TEST_A"),
             Some(("SEMBLE_COMPAT_TEST_A", "old".to_string()))
         );
-        std::env::remove_var("SEMBLE_COMPAT_TEST_A");
+        unsafe { std::env::remove_var("SEMBLE_COMPAT_TEST_A") };
         assert_eq!(
             env_var_compat("TROUVE_COMPAT_TEST_A", "SEMBLE_COMPAT_TEST_A"),
             None
