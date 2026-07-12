@@ -5645,12 +5645,12 @@ pub fn spawn_session_spec() -> ToolSpec {
     ToolSpec {
         name: "spawn_session".into(),
         description: "Start a child agent in a NEW session with its own git worktree and \
-                      branch, based on this session's branch (committed work only — not \
-                      uncommitted changes). Fully isolated: it cannot touch your files; \
-                      its work lands on its own branch for later review or merge. \
-                      Returns thread_id, session_id and branch immediately; collect \
-                      results with spawn_output. Use for risky experiments, best-of-N \
-                      attempts, or parallel feature work."
+                      branch, based on your latest checkpoint (your work up to the last \
+                      completed turn — not the current turn's uncommitted changes). Fully \
+                      isolated: it cannot touch your files; its work lands on its own \
+                      branch for later review or merge. Returns thread_id, session_id and \
+                      branch immediately; collect results with spawn_output. Use for risky \
+                      experiments, best-of-N attempts, or parallel feature work."
             .into(),
         parameters: serde_json::json!({
             "type": "object",

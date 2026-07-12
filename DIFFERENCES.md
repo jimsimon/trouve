@@ -9,7 +9,10 @@ lists every deliberate difference and why it exists.
 
 ## Module map
 
-Where upstream behaviour lives in this codebase:
+Where upstream behaviour lives in this codebase. Paths below are relative to
+the search crate root, `crates/trouve-search/` (e.g. `src/chunk.rs` is
+`crates/trouve-search/src/chunk.rs`), since the crate moved into the
+monorepo workspace.
 
 | Upstream (Python) | trouve (Rust) | Fidelity |
 | --- | --- | --- |
