@@ -469,12 +469,33 @@ pub struct McpLogs {
 /// unconfigured).
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct GithubIntegration {
+    /// github.com's state (mirrors `hosts[0]`; kept for older clients).
     pub configured: bool,
     pub source: String,
     /// Whether "Sign in with GitHub" (OAuth device flow) is available —
     /// i.e. a GitHub OAuth app client id is configured or built in.
     #[serde(default)]
     pub oauth_available: bool,
+    /// Every known host: github.com first, then the configured GitHub
+    /// Enterprise hosts in config order.
+    #[serde(default)]
+    pub hosts: Vec<GithubHostIntegration>,
+}
+
+/// Auth state of one GitHub host (github.com or a GitHub Enterprise
+/// instance).
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct GithubHostIntegration {
+    /// "github.com" or the enterprise hostname ("github.example.com").
+    pub host: String,
+    pub configured: bool,
+    /// "environment", "oauth", "settings", "gh-cli", or "" when
+    /// unconfigured.
+    pub source: String,
+    /// A device-flow OAuth app client id is configured for this host.
+    pub oauth_available: bool,
+    /// Enterprise hosts can be removed; github.com cannot.
+    pub removable: bool,
 }
 
 /// Store (or, with an empty token, remove) the GitHub personal access
@@ -482,6 +503,21 @@ pub struct GithubIntegration {
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct SetGithubTokenRequest {
     pub token: String,
+    /// Which host the token is for; empty/absent means github.com.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub host: String,
+}
+
+/// Register a self-hosted GitHub Enterprise instance
+/// (`POST /v1/integrations/github/hosts`).
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct AddGithubHostRequest {
+    /// Hostname only, e.g. "github.example.com".
+    pub host: String,
+    /// Client id of an OAuth app on that instance (device flow enabled);
+    /// enables "Sign in" for the host. A PAT works without one.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub client_id: String,
 }
 
 // --- branches --------------------------------------------------------------

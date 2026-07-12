@@ -2012,6 +2012,104 @@ async fn automation_templates_catalog() {
     assert_eq!(resp.status(), 404);
 }
 
+/// GitHub Enterprise hosts: the integration always lists github.com
+/// first, added hosts get their own entry (persisted to config),
+/// duplicates and bad hostnames are rejected, and removal works —
+/// github.com itself can't be removed or added.
+#[tokio::test]
+async fn github_enterprise_host_crud() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Store::open(&tmp.path().join("db/trouve.db")).unwrap();
+    let config_file = tmp.path().join("config.toml");
+    let engine = Arc::new(
+        Engine::new(store, tmp.path().join("data"), &Config::default())
+            .with_config_dir(None)
+            .with_config_file(Some(config_file.clone())),
+    );
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let router = trouve_server::build_router(engine);
+    tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+    let base = format!("http://{addr}/v1");
+    let client = reqwest::Client::new();
+
+    // Fresh state: only github.com, which is not removable.
+    let gh: serde_json::Value = client
+        .get(format!("{base}/integrations/github"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let hosts = gh["hosts"].as_array().unwrap();
+    assert_eq!(hosts.len(), 1);
+    assert_eq!(hosts[0]["host"], "github.com");
+    assert_eq!(hosts[0]["removable"], false);
+
+    // Add an enterprise host (scheme and trailing slash are tolerated).
+    let gh: serde_json::Value = client
+        .post(format!("{base}/integrations/github/hosts"))
+        .json(&serde_json::json!({"host": "https://GHES.Example.com/", "client_id": "Iv1.abc"}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let hosts = gh["hosts"].as_array().unwrap();
+    assert_eq!(hosts.len(), 2);
+    assert_eq!(hosts[1]["host"], "ghes.example.com");
+    assert_eq!(hosts[1]["removable"], true);
+    assert_eq!(hosts[1]["oauth_available"], true);
+    // The host landed in config.toml.
+    assert!(std::fs::read_to_string(&config_file)
+        .unwrap()
+        .contains("ghes.example.com"));
+
+    // Duplicates conflict; garbage and github.com itself are rejected.
+    for (body, status) in [
+        (serde_json::json!({"host": "ghes.example.com"}), 409),
+        (serde_json::json!({"host": "not a hostname"}), 400),
+        (serde_json::json!({"host": "github.com"}), 400),
+    ] {
+        let resp = client
+            .post(format!("{base}/integrations/github/hosts"))
+            .json(&body)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), status, "{body}");
+    }
+
+    // Tokens for unknown hosts are refused.
+    let resp = client
+        .put(format!("{base}/integrations/github"))
+        .json(&serde_json::json!({"token": "x", "host": "unknown.example.com"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 404);
+
+    // Remove the host; github.com can't be removed.
+    let gh: serde_json::Value = client
+        .delete(format!("{base}/integrations/github/hosts/ghes.example.com"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(gh["hosts"].as_array().unwrap().len(), 1);
+    let resp = client
+        .delete(format!("{base}/integrations/github/hosts/github.com"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 404);
+}
+
 /// The local-models enable toggle and the install-lifecycle endpoints:
 /// disabling unregisters the "local" provider (persisted), cancels 404
 /// when nothing is in flight, uninstall is a no-op for absent managed

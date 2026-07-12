@@ -45,7 +45,10 @@ pub use requests::*;
 // server event for live "processing a prompt" indicators (all additive).
 // 0.15: automation templates — GET /v1/automations/templates returns
 // pre-canned automations for common development tasks (additive).
-pub const PROTOCOL_VERSION: &str = "0.15";
+// 0.16: GitHub Enterprise — GithubIntegration.hosts (per-host auth state),
+// SetGithubTokenRequest.host, POST/DELETE /v1/integrations/github/hosts for
+// self-hosted instances, and provider-login ids "github:<host>" (additive).
+pub const PROTOCOL_VERSION: &str = "0.16";
 
 pub type WorkspaceId = String;
 pub type SessionId = String;

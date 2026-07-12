@@ -7,7 +7,7 @@
       "name": "MIT",
       "identifier": "MIT"
     },
-    "version": "0.15"
+    "version": "0.16"
   },
   "paths": {
     "/v1/approvals": {
@@ -536,6 +536,94 @@
             }
           },
           "400": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/integrations/github/hosts": {
+      "post": {
+        "tags": [],
+        "summary": "Register a self-hosted GitHub Enterprise instance.",
+        "operationId": "add_github_host",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AddGithubHostRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GithubIntegration"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/integrations/github/hosts/{host}": {
+      "delete": {
+        "tags": [],
+        "summary": "Remove an enterprise host (and forget its stored secrets).",
+        "operationId": "remove_github_host",
+        "parameters": [
+          {
+            "name": "host",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GithubIntegration"
+                }
+              }
+            }
+          },
+          "404": {
             "description": "",
             "content": {
               "application/json": {
@@ -2768,6 +2856,23 @@
   },
   "components": {
     "schemas": {
+      "AddGithubHostRequest": {
+        "type": "object",
+        "description": "Register a self-hosted GitHub Enterprise instance\n(`POST /v1/integrations/github/hosts`).",
+        "required": [
+          "host"
+        ],
+        "properties": {
+          "client_id": {
+            "type": "string",
+            "description": "Client id of an OAuth app on that instance (device flow enabled);\nenables \"Sign in\" for the host. A PAT works without one."
+          },
+          "host": {
+            "type": "string",
+            "description": "Hostname only, e.g. \"github.example.com\"."
+          }
+        }
+      },
       "AddLocalModelRequest": {
         "type": "object",
         "description": "Add a custom GGUF from a HuggingFace repo to the local model list.",
@@ -4183,6 +4288,38 @@
           }
         }
       },
+      "GithubHostIntegration": {
+        "type": "object",
+        "description": "Auth state of one GitHub host (github.com or a GitHub Enterprise\ninstance).",
+        "required": [
+          "host",
+          "configured",
+          "source",
+          "oauth_available",
+          "removable"
+        ],
+        "properties": {
+          "configured": {
+            "type": "boolean"
+          },
+          "host": {
+            "type": "string",
+            "description": "\"github.com\" or the enterprise hostname (\"github.example.com\")."
+          },
+          "oauth_available": {
+            "type": "boolean",
+            "description": "A device-flow OAuth app client id is configured for this host."
+          },
+          "removable": {
+            "type": "boolean",
+            "description": "Enterprise hosts can be removed; github.com cannot."
+          },
+          "source": {
+            "type": "string",
+            "description": "\"environment\", \"oauth\", \"settings\", \"gh-cli\", or \"\" when\nunconfigured."
+          }
+        }
+      },
       "GithubIntegration": {
         "type": "object",
         "description": "Whether the GitHub integration can authenticate, and where the token\ncame from (\"environment\", \"oauth\", \"settings\", \"gh-cli\", or \"\" when\nunconfigured).",
@@ -4192,7 +4329,15 @@
         ],
         "properties": {
           "configured": {
-            "type": "boolean"
+            "type": "boolean",
+            "description": "github.com's state (mirrors `hosts[0]`; kept for older clients)."
+          },
+          "hosts": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/GithubHostIntegration"
+            },
+            "description": "Every known host: github.com first, then the configured GitHub\nEnterprise hosts in config order."
           },
           "oauth_available": {
             "type": "boolean",
@@ -5152,6 +5297,10 @@
           "token"
         ],
         "properties": {
+          "host": {
+            "type": "string",
+            "description": "Which host the token is for; empty/absent means github.com."
+          },
           "token": {
             "type": "string"
           }

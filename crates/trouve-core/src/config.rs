@@ -44,6 +44,22 @@ pub struct Config {
     /// token, GITHUB_TOKEN, or the gh CLI still work.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub github_client_id: Option<String>,
+    /// Self-hosted GitHub Enterprise instances the integration should also
+    /// talk to (each with its own auth). Managed from Settings →
+    /// Integrations, or by hand here.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub github_enterprise: Vec<GithubEnterpriseConfig>,
+}
+
+/// One GitHub Enterprise Server instance.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GithubEnterpriseConfig {
+    /// Hostname only, e.g. "github.example.com".
+    pub host: String,
+    /// Client id of an OAuth app on that instance (device flow enabled)
+    /// for one-click sign-in. A PAT or the gh CLI work without one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

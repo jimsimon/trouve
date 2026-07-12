@@ -114,6 +114,16 @@ impl ProtocolClient {
         Ok(())
     }
 
+    async fn delete_json<T: serde::de::DeserializeOwned>(&self, path: &str) -> Result<T> {
+        let resp = self
+            .http
+            .delete(format!("{}{path}", self.base))
+            .send()
+            .await
+            .with_context(|| format!("DELETE {path}"))?;
+        decode(resp, path).await
+    }
+
     pub async fn info(&self) -> Result<ServerInfo> {
         self.get_json("/info").await
     }
@@ -688,15 +698,35 @@ impl ProtocolClient {
         self.get_json("/integrations/github").await
     }
 
-    /// Store the GitHub token server-side; an empty token removes it.
-    pub async fn set_github_token(&self, token: &str) -> Result<GithubIntegration> {
+    /// Store a GitHub token server-side (empty host = github.com); an
+    /// empty token disconnects the host.
+    pub async fn set_github_token(&self, token: &str, host: &str) -> Result<GithubIntegration> {
         self.put_json(
             "/integrations/github",
             &SetGithubTokenRequest {
                 token: token.to_string(),
+                host: host.to_string(),
             },
         )
         .await
+    }
+
+    /// Register a self-hosted GitHub Enterprise instance.
+    pub async fn add_github_host(&self, host: &str, client_id: &str) -> Result<GithubIntegration> {
+        self.post_json(
+            "/integrations/github/hosts",
+            &trouve_protocol::AddGithubHostRequest {
+                host: host.to_string(),
+                client_id: client_id.to_string(),
+            },
+        )
+        .await
+    }
+
+    /// Remove an enterprise host (github.com can't be removed).
+    pub async fn remove_github_host(&self, host: &str) -> Result<GithubIntegration> {
+        self.delete_json(&format!("/integrations/github/hosts/{host}"))
+            .await
     }
 
     pub async fn create_session_pr(

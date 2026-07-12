@@ -76,6 +76,18 @@ export struct ModeItem {
     model-index: int,
 }
 
+// Auth state of one GitHub host (github.com or an enterprise instance).
+export struct GithubHostItem {
+    host: string,
+    configured: bool,
+    // "environment" / "oauth" / "settings" / "gh-cli" / "".
+    source: string,
+    // The host has a device-flow OAuth app client id configured.
+    oauth-available: bool,
+    // Enterprise hosts can be removed; github.com cannot.
+    removable: bool,
+}
+
 // One local (offline) model: a curated or user-added GGUF with its
 // download state and how well it fits the machine's memory.
 export struct LocalModelItem {
@@ -325,15 +337,13 @@ export component SettingsScreen inherits Rectangle {
     callback reduce-motion-toggled(bool);
     callback close();
 
-    // Whether "Sign in with GitHub" (OAuth device flow) is configured
-    // server-side.
-    in property <bool> github-oauth-available: false;
-    // Integrations: GitHub token state comes from the server; saving an
-    // empty token removes it.
-    in property <bool> github-configured: false;
-    // "environment" (GITHUB_TOKEN/GH_TOKEN) or "settings" (secret store).
-    in property <string> github-source: "";
-    callback github-token-saved(string);
+    // Integrations: per-host GitHub auth state comes from the server —
+    // github.com first, then configured enterprise hosts. Saving an empty
+    // token disconnects a host.
+    in property <[GithubHostItem]> github-hosts;
+    callback github-token-saved(/* host */ string, /* token */ string);
+    callback github-host-added(/* host */ string, /* client-id */ string);
+    callback github-host-removed(/* host */ string);
 
     // Subscription health (Providers section).
     in property <[SubscriptionItem]> subscriptions;
@@ -1757,7 +1767,16 @@ export component SettingsScreen inherits Rectangle {
                                 font-weight: 700;
                             }
 
-                            Rectangle {
+                            Text {
+                                text: "Powers the Pull Requests tab and PR creation. Sign in below, or paste a personal access token; token environment variables and gh CLI logins are picked up automatically. Each host authenticates on its own.";
+                                color: Theme.c.text-soft;
+                                font-size: Theme.fs(11px);
+                                wrap: word-wrap;
+                            }
+
+                            // One card per GitHub host: github.com first,
+                            // then the configured enterprise instances.
+                            for gh in root.github-hosts: Rectangle {
                                 background: Theme.c.surface;
                                 border-radius: 6px;
                                 VerticalLayout {
@@ -1767,7 +1786,7 @@ export component SettingsScreen inherits Rectangle {
                                     HorizontalLayout {
                                         spacing: 8px;
                                         Text {
-                                            text: "GitHub";
+                                            text: gh.host == "github.com" ? "GitHub" : gh.host;
                                             color: Theme.c.text-hi;
                                             font-size: Theme.fs(14px);
                                             font-weight: 700;
@@ -1775,44 +1794,49 @@ export component SettingsScreen inherits Rectangle {
                                             horizontal-stretch: 1;
                                         }
                                         Text {
-                                            text: root.github-configured
-                                                ? (root.github-source == "environment" ? "● connected (environment)"
-                                                    : root.github-source == "oauth" ? "● connected (GitHub sign-in)"
-                                                    : root.github-source == "gh-cli" ? "● connected (gh CLI)"
+                                            text: gh.configured
+                                                ? (gh.source == "environment" ? "● connected (environment)"
+                                                    : gh.source == "oauth" ? "● connected (GitHub sign-in)"
+                                                    : gh.source == "gh-cli" ? "● connected (gh CLI)"
                                                     : "● connected (token)")
                                                 : "○ not configured";
-                                            color: root.github-configured ? Theme.c.ok : Theme.c.text-soft;
+                                            color: gh.configured ? Theme.c.ok : Theme.c.text-soft;
                                             font-size: Theme.fs(12px);
                                             vertical-alignment: center;
                                         }
+                                        if gh.removable: Button {
+                                            text: "Remove host";
+                                            clicked => { root.github-host-removed(gh.host); }
+                                        }
                                     }
-                                    Text {
-                                        text: "Powers the Pull Requests tab and PR creation. Sign in with GitHub below, or paste a personal access token; a GITHUB_TOKEN environment variable or a gh CLI login are picked up automatically.";
-                                        color: Theme.c.text-soft;
-                                        font-size: Theme.fs(11px);
-                                        wrap: word-wrap;
-                                    }
-                                    if root.github-source == "environment": Text {
-                                        text: "The token currently comes from the GITHUB_TOKEN / GH_TOKEN environment variable, which takes precedence over a sign-in or saved token.";
+                                    if gh.source == "environment": Text {
+                                        text: gh.host == "github.com"
+                                            ? "The token currently comes from the GITHUB_TOKEN / GH_TOKEN environment variable, which takes precedence over a sign-in or saved token."
+                                            : "The token currently comes from the GH_ENTERPRISE_TOKEN / GITHUB_ENTERPRISE_TOKEN environment variable, which takes precedence over a sign-in or saved token.";
                                         color: Theme.c.warn;
                                         font-size: Theme.fs(11px);
                                         wrap: word-wrap;
                                     }
-                                    if root.github-oauth-available: HorizontalLayout {
+                                    if gh.oauth-available: HorizontalLayout {
                                         spacing: 8px;
                                         alignment: start;
                                         Button {
-                                            text: root.github-source == "oauth" ? "Re-sign in with GitHub" : "Sign in with GitHub";
-                                            primary: root.github-source != "oauth";
-                                            clicked => { root.provider-login("github"); }
+                                            text: gh.source == "oauth" ? "Re-sign in with GitHub" : "Sign in with GitHub";
+                                            primary: gh.source != "oauth";
+                                            clicked => {
+                                                root.provider-login(gh.host == "github.com"
+                                                    ? "github" : "github:" + gh.host);
+                                            }
                                         }
-                                        if root.github-source == "oauth": Button {
+                                        if gh.source == "oauth": Button {
                                             text: "Disconnect";
-                                            clicked => { root.github-token-saved(""); }
+                                            clicked => { root.github-token-saved(gh.host, ""); }
                                         }
                                     }
-                                    if !root.github-oauth-available: Text {
-                                        text: "To enable one-click sign-in, register a GitHub OAuth app (Settings → Developer settings → OAuth Apps, \"Enable Device Flow\") and set github_client_id in trouve's config.toml.";
+                                    if !gh.oauth-available: Text {
+                                        text: gh.host == "github.com"
+                                            ? "To enable one-click sign-in, register a GitHub OAuth app (Settings → Developer settings → OAuth Apps, \"Enable Device Flow\") and set github_client_id in trouve's config.toml."
+                                            : "To enable one-click sign-in, register an OAuth app on this instance (device flow enabled) and re-add the host with its client id.";
                                         color: Theme.c.text-soft;
                                         font-size: Theme.fs(11px);
                                         wrap: word-wrap;
@@ -1820,7 +1844,7 @@ export component SettingsScreen inherits Rectangle {
                                     HorizontalLayout {
                                         spacing: 8px;
                                         gh-token := LineEdit {
-                                            placeholder-text: root.github-configured && root.github-source == "settings"
+                                            placeholder-text: gh.configured && gh.source == "settings"
                                                 ? "••••••••  (saved — enter a new token to replace)"
                                                 : "ghp_… or github_pat_…";
                                             input-type: password;
@@ -1828,16 +1852,60 @@ export component SettingsScreen inherits Rectangle {
                                         }
                                         Button {
                                             text: "Save";
-                                            primary: gh-token.text != "" && !root.github-oauth-available;
+                                            primary: gh-token.text != "" && !gh.oauth-available;
                                             enabled: gh-token.text != "";
                                             clicked => {
-                                                root.github-token-saved(gh-token.text);
+                                                root.github-token-saved(gh.host, gh-token.text);
                                                 gh-token.text = "";
                                             }
                                         }
-                                        if root.github-configured && root.github-source == "settings": Button {
+                                        if gh.configured && gh.source == "settings": Button {
                                             text: "Remove";
-                                            clicked => { root.github-token-saved(""); }
+                                            clicked => { root.github-token-saved(gh.host, ""); }
+                                        }
+                                    }
+                                }
+                            }
+
+                            // Register a self-hosted GitHub Enterprise
+                            // instance; it gets a card of its own above.
+                            Rectangle {
+                                background: Theme.c.surface;
+                                border-radius: 6px;
+                                VerticalLayout {
+                                    padding: 14px;
+                                    spacing: 10px;
+                                    Text {
+                                        text: "Add GitHub Enterprise host";
+                                        color: Theme.c.text-hi;
+                                        font-size: Theme.fs(14px);
+                                        font-weight: 700;
+                                    }
+                                    Text {
+                                        text: "Self-hosted GitHub Enterprise Server instances work like github.com: sessions whose origin remote lives on the host use its auth. The OAuth client id is optional — a token or gh CLI login works without one.";
+                                        color: Theme.c.text-soft;
+                                        font-size: Theme.fs(11px);
+                                        wrap: word-wrap;
+                                    }
+                                    HorizontalLayout {
+                                        spacing: 8px;
+                                        ghe-host := LineEdit {
+                                            placeholder-text: "github.example.com";
+                                            horizontal-stretch: 1;
+                                        }
+                                        ghe-client-id := LineEdit {
+                                            placeholder-text: "OAuth app client id (optional)";
+                                            horizontal-stretch: 1;
+                                        }
+                                        Button {
+                                            text: "Add";
+                                            primary: ghe-host.text != "";
+                                            enabled: ghe-host.text != "";
+                                            clicked => {
+                                                root.github-host-added(ghe-host.text, ghe-client-id.text);
+                                                ghe-host.text = "";
+                                                ghe-client-id.text = "";
+                                            }
                                         }
                                     }
                                 }

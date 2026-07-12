@@ -14,7 +14,7 @@ import { CodeView, TextSegment } from "code-view.slint";
 import { TerminalGrid, TermSpan } from "terminal-grid.slint";
 import {
     SettingsScreen, ProviderItem, CliItem, KnownProviderItem, McpServerItem,
-    SubscriptionItem, ModeItem, LocalModelItem, LocalSearchItem
+    SubscriptionItem, ModeItem, LocalModelItem, LocalSearchItem, GithubHostItem
 } from "settings-window.slint";
 import { AutomationsScreen, AutomationItem, AutomationTemplateItem } from "automations-screen.slint";
 import { ScrollKeys } from "scroll-keys.slint";
@@ -24,7 +24,7 @@ import { Palette } from "std-widgets.slint";
 // Theme re-exported so Rust can push the selected palette.
 export {
     DiffRow, TextSegment, TermSpan, ProviderItem, CliItem, KnownProviderItem, McpServerItem,
-    SubscriptionItem, ModeItem, LocalModelItem, LocalSearchItem, AutomationItem
+    SubscriptionItem, ModeItem, LocalModelItem, LocalSearchItem, AutomationItem, GithubHostItem
 }
 export { Theme, ThemePalette }
 
@@ -1057,10 +1057,10 @@ export component AppWindow inherits Window {
     // Which settings section shows when the screen opens (0 providers …
     // 3 integrations); the controller sets it before flipping center-screen.
     in-out property <int> settings-section: 0;
-    in property <bool> settings-github-configured: false;
-    in property <string> settings-github-source: "";
-    in property <bool> settings-github-oauth-available: false;
-    callback github-token-saved(string);
+    in property <[GithubHostItem]> settings-github-hosts;
+    callback github-token-saved(/* host */ string, /* token */ string);
+    callback github-host-added(/* host */ string, /* client-id */ string);
+    callback github-host-removed(/* host */ string);
     in property <[SubscriptionItem]> settings-subscriptions;
     in property <string> settings-subscriptions-status: "";
     in property <[McpServerItem]> settings-mcp-servers;
@@ -3900,10 +3900,10 @@ export component AppWindow inherits Window {
         settings-status: root.settings-status;
         preset-index <=> root.settings-preset-index;
         section <=> root.settings-section;
-        github-configured: root.settings-github-configured;
-        github-source: root.settings-github-source;
-        github-oauth-available: root.settings-github-oauth-available;
-        github-token-saved(token) => { root.github-token-saved(token); }
+        github-hosts: root.settings-github-hosts;
+        github-token-saved(host, token) => { root.github-token-saved(host, token); }
+        github-host-added(host, client-id) => { root.github-host-added(host, client-id); }
+        github-host-removed(host) => { root.github-host-removed(host); }
         subscriptions: root.settings-subscriptions;
         subscriptions-status: root.settings-subscriptions-status;
         mcp-servers: root.settings-mcp-servers;

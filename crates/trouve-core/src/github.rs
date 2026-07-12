@@ -10,36 +10,62 @@ use anyhow::{Context, Result};
 use octocrab::Octocrab;
 use trouve_protocol::{CheckRun, PrInfo, PrReview};
 
-/// Parse a git remote URL into (owner, repo). Supports
-/// `https://github.com/owner/repo(.git)` and `git@github.com:owner/repo(.git)`.
-pub fn parse_github_remote(url: &str) -> Option<(String, String)> {
-    let rest = url
-        .strip_prefix("https://github.com/")
-        .or_else(|| url.strip_prefix("http://github.com/"))
-        .or_else(|| url.strip_prefix("ssh://git@github.com/"))
-        .or_else(|| url.strip_prefix("git@github.com:"))?;
+/// The one GitHub host that is always known.
+pub const GITHUB_COM: &str = "github.com";
+
+/// Parse a git remote URL into (host, owner, repo). Supports
+/// `https://HOST/owner/repo(.git)`, `ssh://git@HOST/owner/repo`, and
+/// `git@HOST:owner/repo(.git)` — the host may be github.com or a GitHub
+/// Enterprise instance (whether it's one we know is the caller's problem).
+pub fn parse_remote(url: &str) -> Option<(String, String, String)> {
+    let (host, rest) = if let Some(rest) = url
+        .strip_prefix("https://")
+        .or_else(|| url.strip_prefix("http://"))
+    {
+        let rest = rest.strip_prefix("git@").unwrap_or(rest);
+        rest.split_once('/')?
+    } else if let Some(rest) = url.strip_prefix("ssh://") {
+        let rest = rest.strip_prefix("git@").unwrap_or(rest);
+        rest.split_once('/')?
+    } else if let Some(rest) = url.strip_prefix("git@") {
+        rest.split_once(':')?
+    } else {
+        return None;
+    };
+    // Strip an explicit port ("host:22"); hostnames have no colons.
+    let host = host.split(':').next()?.trim().to_ascii_lowercase();
     let rest = rest.trim_end_matches('/').trim_end_matches(".git");
     let (owner, repo) = rest.split_once('/')?;
-    if owner.is_empty() || repo.is_empty() || repo.contains('/') {
+    if host.is_empty() || !host.contains('.') || owner.is_empty() || repo.is_empty() {
         return None;
     }
-    Some((owner.to_string(), repo.to_string()))
+    if repo.contains('/') {
+        return None;
+    }
+    Some((host, owner.to_string(), repo.to_string()))
 }
 
-/// GitHub token: `GITHUB_TOKEN` / `GH_TOKEN` env vars.
-pub fn token_from_env() -> Option<String> {
-    std::env::var("GITHUB_TOKEN")
-        .or_else(|_| std::env::var("GH_TOKEN"))
-        .ok()
+/// Token from the environment for `host`. github.com reads
+/// `GITHUB_TOKEN` / `GH_TOKEN`; enterprise hosts read
+/// `GH_ENTERPRISE_TOKEN` / `GITHUB_ENTERPRISE_TOKEN` (the gh CLI's own
+/// convention).
+pub fn token_from_env(host: &str) -> Option<String> {
+    let vars: [&str; 2] = if host == GITHUB_COM {
+        ["GITHUB_TOKEN", "GH_TOKEN"]
+    } else {
+        ["GH_ENTERPRISE_TOKEN", "GITHUB_ENTERPRISE_TOKEN"]
+    };
+    vars.iter()
+        .find_map(|v| std::env::var(v).ok())
         .filter(|t| !t.is_empty())
 }
 
-/// GitHub token from the gh CLI's keyring (`gh auth token`), when the user
-/// is logged in there. Zero-config reuse of an auth most developers
-/// already have.
-pub fn token_from_gh_cli() -> Option<String> {
+/// GitHub token from the gh CLI's keyring (`gh auth token --hostname …`),
+/// when the user is logged in there. Zero-config reuse of an auth most
+/// developers already have.
+pub fn token_from_gh_cli(host: &str) -> Option<String> {
     let out = std::process::Command::new("gh")
-        .args(["auth", "token"])
+        .args(["auth", "token", "--hostname", host])
         .output()
         .ok()?;
     if !out.status.success() {
@@ -49,15 +75,15 @@ pub fn token_from_gh_cli() -> Option<String> {
     (!token.is_empty()).then_some(token)
 }
 
-/// Device-flow OAuth endpoints for github.com. The client id comes from
-/// config (`github_client_id`): a GitHub OAuth app with device flow
-/// enabled.
-pub fn oauth_config(client_id: &str) -> trouve_providers::auth::OAuthConfig {
+/// Device-flow OAuth endpoints for a GitHub host (github.com or a GHES
+/// instance — both serve the flow under /login). The client id comes from
+/// config: an OAuth app on that host with device flow enabled.
+pub fn oauth_config(host: &str, client_id: &str) -> trouve_providers::auth::OAuthConfig {
     trouve_providers::auth::OAuthConfig {
         client_id: client_id.to_string(),
-        device_authorization_url: Some("https://github.com/login/device/code".into()),
+        device_authorization_url: Some(format!("https://{host}/login/device/code")),
         authorization_url: None,
-        token_url: "https://github.com/login/oauth/access_token".into(),
+        token_url: format!("https://{host}/login/oauth/access_token"),
         // Classic OAuth-app scope covering PR read/write and checks.
         scopes: vec!["repo".into()],
         redirect_port: None,
@@ -72,11 +98,15 @@ pub struct GitHub {
 }
 
 impl GitHub {
-    pub fn new(token: &str, owner: &str, repo: &str) -> Result<Self> {
-        let client = Octocrab::builder()
-            .personal_token(token.to_string())
-            .build()
-            .context("building GitHub client")?;
+    pub fn new(token: &str, host: &str, owner: &str, repo: &str) -> Result<Self> {
+        let mut builder = Octocrab::builder().personal_token(token.to_string());
+        if host != GITHUB_COM {
+            // GitHub Enterprise Server exposes the REST API under /api/v3.
+            builder = builder
+                .base_uri(format!("https://{host}/api/v3"))
+                .context("enterprise API base URI")?;
+        }
+        let client = builder.build().context("building GitHub client")?;
         Ok(Self {
             client,
             owner: owner.to_string(),
@@ -251,12 +281,29 @@ mod tests {
             "ssh://git@github.com/jimsimon/trouve",
         ] {
             assert_eq!(
-                parse_github_remote(url),
-                Some(("jimsimon".into(), "trouve".into())),
+                parse_remote(url),
+                Some(("github.com".into(), "jimsimon".into(), "trouve".into())),
                 "{url}"
             );
         }
-        assert_eq!(parse_github_remote("https://gitlab.com/x/y.git"), None);
-        assert_eq!(parse_github_remote("git@github.com:broken"), None);
+        // Enterprise hosts parse the same way; whether they're configured
+        // is the engine's call.
+        for url in [
+            "https://GitHub.Example.com/team/tool.git",
+            "git@github.example.com:team/tool",
+            "ssh://git@github.example.com/team/tool.git",
+        ] {
+            assert_eq!(
+                parse_remote(url),
+                Some(("github.example.com".into(), "team".into(), "tool".into())),
+                "{url}"
+            );
+        }
+        assert_eq!(
+            parse_remote("https://gitlab.com/x/y.git"),
+            Some(("gitlab.com".into(), "x".into(), "y".into()))
+        );
+        assert_eq!(parse_remote("git@github.com:broken"), None);
+        assert_eq!(parse_remote("/local/path/repo.git"), None);
     }
 }

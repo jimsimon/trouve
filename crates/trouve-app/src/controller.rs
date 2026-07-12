@@ -272,7 +272,9 @@ pub enum UiCommand {
     /// Open settings straight to the Integrations section.
     OpenIntegrationsSettings,
     /// Store/remove the GitHub token (empty = remove).
-    SaveGithubToken(String),
+    SaveGithubToken(/* host */ String, /* token */ String),
+    AddGithubHost(/* host */ String, /* client id */ String),
+    RemoveGithubHost(String),
     /// Re-list MCP servers (quick list, then health probes).
     RefreshMcp,
     SaveMcpServer {
@@ -376,9 +378,11 @@ struct Controller {
     current_thread: Option<usize>,
 
     /// GitHub integration state (None until the first fetch answers).
+    /// Any GitHub host (github.com or enterprise) has working auth —
+    /// gates the PR tab's fetches.
     github_configured: bool,
-    github_source: String,
-    github_oauth_available: bool,
+    /// Per-host auth state for Settings → Integrations.
+    github_hosts: Vec<trouve_protocol::GithubHostIntegration>,
     /// Bytes/sec estimates for in-flight downloads, keyed by download id
     /// ("cli:claude", "model:…"). Fed by consecutive progress polls.
     download_rates: HashMap<String, RateSample>,
@@ -533,8 +537,7 @@ pub async fn run(
         threads: Vec::new(),
         current_thread: None,
         github_configured: false,
-        github_source: String::new(),
-        github_oauth_available: false,
+        github_hosts: Vec::new(),
         download_rates: HashMap::new(),
         busy_sessions: HashSet::new(),
         local_polling: false,
@@ -685,9 +688,7 @@ impl Controller {
         self.reload_sessions().await?;
 
         if let Ok(gh) = self.client.github_integration().await {
-            self.github_configured = gh.configured;
-            self.github_source = gh.source;
-            self.github_oauth_available = gh.oauth_available;
+            self.apply_github_integration(gh);
         }
         self.push_github_integration();
         self.push_prs();
@@ -1599,13 +1600,26 @@ impl Controller {
         );
     }
 
+    /// Record a fresh integration snapshot: per-host state plus the "any
+    /// host works" flag the PR tab keys off.
+    fn apply_github_integration(&mut self, gh: trouve_protocol::GithubIntegration) {
+        self.github_configured = gh.hosts.iter().any(|h| h.configured) || gh.configured;
+        self.github_hosts = gh.hosts;
+    }
+
     fn push_github_integration(&self) {
-        ui::set_github_integration(
-            &self.ui,
-            self.github_configured,
-            &self.github_source,
-            self.github_oauth_available,
-        );
+        let hosts = self
+            .github_hosts
+            .iter()
+            .map(|h| ui::GithubHostView {
+                host: h.host.clone(),
+                configured: h.configured,
+                source: h.source.clone(),
+                oauth_available: h.oauth_available,
+                removable: h.removable,
+            })
+            .collect();
+        ui::set_github_integration(&self.ui, hosts);
     }
 
     /// Fetch subscription health in the background (the Codex query may
@@ -1866,9 +1880,7 @@ impl Controller {
 
     async fn refresh_settings(&mut self) {
         if let Ok(gh) = self.client.github_integration().await {
-            self.github_configured = gh.configured;
-            self.github_source = gh.source;
-            self.github_oauth_available = gh.oauth_available;
+            self.apply_github_integration(gh);
             self.push_github_integration();
         }
         let providers = match self.client.list_providers().await {
@@ -3305,17 +3317,35 @@ impl Controller {
                     .collect();
                 ui::set_subscriptions(&self.ui, items, String::new());
             }
-            UiCommand::SaveGithubToken(token) => {
-                match self.client.set_github_token(&token).await {
+            UiCommand::SaveGithubToken(host, token) => {
+                match self.client.set_github_token(&token, &host).await {
                     Ok(integration) => {
-                        self.github_configured = integration.configured;
-                        self.github_source = integration.source;
-                        self.github_oauth_available = integration.oauth_available;
+                        self.apply_github_integration(integration);
                         self.push_github_integration();
                         // A fresh token usually means the PR tab was waiting.
                         self.refresh_prs();
                     }
                     Err(e) => self.error(&format!("saving GitHub token: {e:#}")),
+                }
+            }
+            UiCommand::AddGithubHost(host, client_id) => {
+                match self.client.add_github_host(&host, &client_id).await {
+                    Ok(integration) => {
+                        self.apply_github_integration(integration);
+                        self.push_github_integration();
+                        self.refresh_prs();
+                    }
+                    Err(e) => self.error(&format!("adding GitHub host: {e:#}")),
+                }
+            }
+            UiCommand::RemoveGithubHost(host) => {
+                match self.client.remove_github_host(&host).await {
+                    Ok(integration) => {
+                        self.apply_github_integration(integration);
+                        self.push_github_integration();
+                        self.refresh_prs();
+                    }
+                    Err(e) => self.error(&format!("removing GitHub host: {e:#}")),
                 }
             }
             UiCommand::RefreshSettings => {

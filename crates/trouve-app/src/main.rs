@@ -660,8 +660,26 @@ fn main() -> anyhow::Result<()> {
     }
     {
         let tx = tx.clone();
-        window.on_github_token_saved(move |token| {
-            let _ = tx.send(UiCommand::SaveGithubToken(token.to_string()));
+        window.on_github_token_saved(move |host, token| {
+            let _ = tx.send(UiCommand::SaveGithubToken(
+                host.to_string(),
+                token.to_string(),
+            ));
+        });
+    }
+    {
+        let tx = tx.clone();
+        window.on_github_host_added(move |host, client_id| {
+            let _ = tx.send(UiCommand::AddGithubHost(
+                host.to_string(),
+                client_id.to_string(),
+            ));
+        });
+    }
+    {
+        let tx = tx.clone();
+        window.on_github_host_removed(move |host| {
+            let _ = tx.send(UiCommand::RemoveGithubHost(host.to_string()));
         });
     }
     {

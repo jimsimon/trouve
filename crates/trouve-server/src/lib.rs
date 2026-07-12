@@ -133,6 +133,8 @@ impl IntoResponse for ApiError {
         list_session_prs,
         get_github_integration,
         set_github_integration,
+        add_github_host,
+        remove_github_host,
         list_mcp_servers,
         upsert_mcp_server,
         delete_mcp_server,
@@ -196,6 +198,8 @@ impl IntoResponse for ApiError {
         MergePrRequest,
         GithubIntegration,
         SetGithubTokenRequest,
+        trouve_protocol::GithubHostIntegration,
+        trouve_protocol::AddGithubHostRequest,
         McpServerInfo,
         UpsertMcpServerRequest,
         McpLogs,
@@ -267,6 +271,11 @@ pub fn build_router(engine: Arc<Engine>) -> Router {
         .route(
             "/v1/integrations/github",
             get(get_github_integration).put(set_github_integration),
+        )
+        .route("/v1/integrations/github/hosts", post(add_github_host))
+        .route(
+            "/v1/integrations/github/hosts/{host}",
+            axum::routing::delete(remove_github_host),
         )
         .route("/v1/mcp-servers", get(list_mcp_servers))
         .route(
@@ -1287,7 +1296,32 @@ async fn set_github_integration(
     State(engine): State<Arc<Engine>>,
     Json(req): Json<SetGithubTokenRequest>,
 ) -> Result<Json<GithubIntegration>, ApiError> {
-    engine.set_github_token(&req.token)?;
+    engine.set_github_token(&req.token, &req.host)?;
+    Ok(Json(engine.github_integration()))
+}
+
+/// Register a self-hosted GitHub Enterprise instance.
+#[utoipa::path(post, path = "/v1/integrations/github/hosts",
+    request_body = trouve_protocol::AddGithubHostRequest,
+    responses((status = 200, body = GithubIntegration), (status = 400, body = ErrorBody),
+              (status = 409, body = ErrorBody)))]
+async fn add_github_host(
+    State(engine): State<Arc<Engine>>,
+    Json(req): Json<trouve_protocol::AddGithubHostRequest>,
+) -> Result<Json<GithubIntegration>, ApiError> {
+    engine.add_github_host(&req.host, &req.client_id)?;
+    Ok(Json(engine.github_integration()))
+}
+
+/// Remove an enterprise host (and forget its stored secrets).
+#[utoipa::path(delete, path = "/v1/integrations/github/hosts/{host}",
+    params(("host" = String, Path,)),
+    responses((status = 200, body = GithubIntegration), (status = 404, body = ErrorBody)))]
+async fn remove_github_host(
+    State(engine): State<Arc<Engine>>,
+    Path(host): Path<String>,
+) -> Result<Json<GithubIntegration>, ApiError> {
+    engine.remove_github_host(&host)?;
     Ok(Json(engine.github_integration()))
 }
 

@@ -593,12 +593,28 @@ pub fn set_mcp_logs(ui: &Ui, name: String, text: String) {
     });
 }
 
-pub fn set_github_integration(ui: &Ui, configured: bool, source: &str, oauth_available: bool) {
-    let source = source.to_string();
+/// Per-host GitHub auth state for the Integrations section.
+pub struct GithubHostView {
+    pub host: String,
+    pub configured: bool,
+    pub source: String,
+    pub oauth_available: bool,
+    pub removable: bool,
+}
+
+pub fn set_github_integration(ui: &Ui, hosts: Vec<GithubHostView>) {
     let _ = ui.upgrade_in_event_loop(move |ui| {
-        ui.set_settings_github_configured(configured);
-        ui.set_settings_github_source(SharedString::from(source.as_str()));
-        ui.set_settings_github_oauth_available(oauth_available);
+        let items: Vec<crate::GithubHostItem> = hosts
+            .into_iter()
+            .map(|h| crate::GithubHostItem {
+                host: SharedString::from(h.host.as_str()),
+                configured: h.configured,
+                source: SharedString::from(h.source.as_str()),
+                oauth_available: h.oauth_available,
+                removable: h.removable,
+            })
+            .collect();
+        ui.set_settings_github_hosts(ModelRc::new(VecModel::from(items)));
     });
 }
 

@@ -666,18 +666,30 @@ impl Engine {
             return self.start_cli_login(id, &kind, command).await;
         }
 
-        let oauth = if id == "github" {
-            // "Sign in with GitHub" (Integrations, not a model provider):
-            // device flow against github.com; the resulting token lands in
-            // the same oauth secret github_token() reads.
-            let client_id = self.github_oauth_client_id().ok_or_else(|| {
-                EngineError::BadRequest(
-                    "GitHub OAuth is not configured: set github_client_id in config.toml \
-                     to a GitHub OAuth app client id with device flow enabled"
-                        .into(),
-                )
-            })?;
-            crate::github::oauth_config(&client_id)
+        // "Sign in with GitHub" (Integrations, not a model provider): id
+        // "github" is github.com, "github:<host>" a GitHub Enterprise
+        // instance. Device flow against that host; the token lands in the
+        // oauth secret github_token() reads, because the login id and the
+        // host's secret id are the same string.
+        let github_host = if id == "github" {
+            Some(crate::github::GITHUB_COM.to_string())
+        } else {
+            id.strip_prefix("github:").map(str::to_string)
+        };
+        let oauth = if let Some(host) = github_host {
+            let client_id = self
+                .github_hosts()
+                .into_iter()
+                .find(|(h, _)| *h == host)
+                .ok_or_else(|| EngineError::NotFound(format!("GitHub host {host}")))?
+                .1
+                .ok_or_else(|| {
+                    EngineError::BadRequest(format!(
+                        "GitHub OAuth is not configured for {host}: set a client id of an \
+                         OAuth app (device flow enabled) on that host"
+                    ))
+                })?;
+            crate::github::oauth_config(&host, &client_id)
         } else {
             let config = self.config.lock().unwrap();
             config
@@ -1828,7 +1840,8 @@ impl Engine {
             .map_err(|e| EngineError::BadRequest(format!("{e:#}")))
     }
 
-    /// GitHub client for the session's origin remote.
+    /// GitHub client for the session's origin remote. Routes to github.com
+    /// or a configured GitHub Enterprise host based on the remote URL.
     fn github_for_session(
         &self,
         session: &trouve_protocol::Session,
@@ -1836,28 +1849,66 @@ impl Engine {
         let worktree = PathBuf::from(&session.worktree_path);
         let url = git::remote_url(&worktree, "origin")
             .ok_or_else(|| EngineError::BadRequest("workspace has no 'origin' remote".into()))?;
-        let (owner, repo) = crate::github::parse_github_remote(&url).ok_or_else(|| {
-            EngineError::BadRequest(format!("origin is not a GitHub remote: {url}"))
+        let (host, owner, repo) = crate::github::parse_remote(&url).ok_or_else(|| {
+            EngineError::BadRequest(format!("origin is not a GitHub-style remote: {url}"))
         })?;
-        let (token, _) = self.github_token().ok_or_else(|| {
-            EngineError::BadRequest(
-                "no GitHub auth: sign in (Settings → Integrations), set GITHUB_TOKEN, \
-                 or log in with the gh CLI"
-                    .into(),
-            )
+        if !self.github_hosts().iter().any(|(h, _)| *h == host) {
+            return Err(EngineError::BadRequest(format!(
+                "origin remote is on {host}, which isn't github.com or a configured \
+                 GitHub Enterprise host — add it in Settings → Integrations"
+            )));
+        }
+        let (token, _) = self.github_token(&host).ok_or_else(|| {
+            EngineError::BadRequest(format!(
+                "no GitHub auth for {host}: sign in or paste a token \
+                 (Settings → Integrations), set the token env var, or log in with the gh CLI"
+            ))
         })?;
-        crate::github::GitHub::new(&token, &owner, &repo).map_err(EngineError::Internal)
+        crate::github::GitHub::new(&token, &host, &owner, &repo).map_err(EngineError::Internal)
     }
 
-    /// The GitHub token and where it came from. Precedence: environment >
-    /// OAuth sign-in > pasted token > gh CLI keyring.
-    fn github_token(&self) -> Option<(String, &'static str)> {
-        if let Some(t) = crate::github::token_from_env() {
+    /// Every GitHub host the integration knows: github.com first (always),
+    /// then the configured enterprise hosts, each with its optional OAuth
+    /// app client id.
+    fn github_hosts(&self) -> Vec<(String, Option<String>)> {
+        let config = self.config.lock().unwrap();
+        let mut hosts = vec![(
+            crate::github::GITHUB_COM.to_string(),
+            config
+                .github_client_id
+                .clone()
+                .filter(|id| !id.trim().is_empty()),
+        )];
+        for e in &config.github_enterprise {
+            hosts.push((
+                e.host.clone(),
+                e.client_id.clone().filter(|id| !id.trim().is_empty()),
+            ));
+        }
+        hosts
+    }
+
+    /// Secret-store / login id for a GitHub host. github.com keeps the
+    /// plain "github" id (pre-enterprise secrets stay valid); enterprise
+    /// hosts get "github:<host>".
+    fn github_secret_id(host: &str) -> String {
+        if host == crate::github::GITHUB_COM {
+            "github".to_string()
+        } else {
+            format!("github:{host}")
+        }
+    }
+
+    /// The GitHub token for a host and where it came from. Precedence:
+    /// environment > OAuth sign-in > pasted token > gh CLI keyring.
+    fn github_token(&self, host: &str) -> Option<(String, &'static str)> {
+        if let Some(t) = crate::github::token_from_env(host) {
             return Some((t, "environment"));
         }
+        let id = Self::github_secret_id(host);
         if let Ok(Some(raw)) = self
             .secrets
-            .get(&trouve_providers::secrets::oauth_secret("github"))
+            .get(&trouve_providers::secrets::oauth_secret(&id))
         {
             // Device-flow tokens from classic OAuth apps don't expire; apps
             // configured with expiring tokens just need a fresh sign-in.
@@ -1867,11 +1918,11 @@ impl Engine {
         }
         if let Ok(Some(t)) = self
             .secrets
-            .get(&trouve_providers::secrets::api_key_secret("github"))
+            .get(&trouve_providers::secrets::api_key_secret(&id))
         {
             return Some((t, "settings"));
         }
-        crate::github::token_from_gh_cli().map(|t| (t, "gh-cli"))
+        crate::github::token_from_gh_cli(host).map(|t| (t, "gh-cli"))
     }
 
     /// The open PR for the session branch, if one exists.
@@ -2135,43 +2186,115 @@ impl Engine {
         out
     }
 
-    /// Whether GitHub calls can authenticate, and where the token lives.
+    /// Whether GitHub calls can authenticate, per host. The top-level
+    /// fields mirror github.com (`hosts[0]`) for older clients.
     pub fn github_integration(&self) -> trouve_protocol::GithubIntegration {
-        let (configured, source) = match self.github_token() {
-            Some((_, source)) => (true, source),
-            None => (false, ""),
-        };
+        let hosts: Vec<trouve_protocol::GithubHostIntegration> = self
+            .github_hosts()
+            .into_iter()
+            .map(|(host, client_id)| {
+                let (configured, source) = match self.github_token(&host) {
+                    Some((_, source)) => (true, source),
+                    None => (false, ""),
+                };
+                trouve_protocol::GithubHostIntegration {
+                    removable: host != crate::github::GITHUB_COM,
+                    host,
+                    configured,
+                    source: source.to_string(),
+                    oauth_available: client_id.is_some(),
+                }
+            })
+            .collect();
         trouve_protocol::GithubIntegration {
-            configured,
-            source: source.to_string(),
-            oauth_available: self.github_oauth_client_id().is_some(),
+            configured: hosts[0].configured,
+            source: hosts[0].source.clone(),
+            oauth_available: hosts[0].oauth_available,
+            hosts,
         }
     }
 
-    /// Client id for "Sign in with GitHub" (config `github_client_id`).
-    fn github_oauth_client_id(&self) -> Option<String> {
-        self.config
-            .lock()
-            .unwrap()
-            .github_client_id
-            .clone()
-            .filter(|id| !id.trim().is_empty())
-    }
-
-    /// Store the GitHub token in the secret store; empty disconnects (both
-    /// the pasted token and any OAuth sign-in).
-    pub fn set_github_token(&self, token: &str) -> Result<(), EngineError> {
-        let key = trouve_providers::secrets::api_key_secret("github");
+    /// Store a GitHub token in the secret store (empty host = github.com);
+    /// an empty token disconnects the host (both the pasted token and any
+    /// OAuth sign-in).
+    pub fn set_github_token(&self, token: &str, host: &str) -> Result<(), EngineError> {
+        let host = if host.trim().is_empty() {
+            crate::github::GITHUB_COM.to_string()
+        } else {
+            host.trim().to_ascii_lowercase()
+        };
+        if !self.github_hosts().iter().any(|(h, _)| *h == host) {
+            return Err(EngineError::NotFound(format!("GitHub host {host}")));
+        }
+        let id = Self::github_secret_id(&host);
+        let key = trouve_providers::secrets::api_key_secret(&id);
         if token.trim().is_empty() {
             self.secrets.delete(&key).map_err(EngineError::Internal)?;
             self.secrets
-                .delete(&trouve_providers::secrets::oauth_secret("github"))
+                .delete(&trouve_providers::secrets::oauth_secret(&id))
                 .map_err(EngineError::Internal)?;
         } else {
             self.secrets
                 .set(&key, token.trim())
                 .map_err(EngineError::Internal)?;
         }
+        Ok(())
+    }
+
+    /// Register a self-hosted GitHub Enterprise instance so remotes on it
+    /// resolve and it can hold its own auth.
+    pub fn add_github_host(&self, host: &str, client_id: &str) -> Result<(), EngineError> {
+        let host = host
+            .trim()
+            .trim_start_matches("https://")
+            .trim_start_matches("http://")
+            .trim_end_matches('/')
+            .to_ascii_lowercase();
+        if host.is_empty() || !host.contains('.') || host.contains('/') || host.contains(':') {
+            return Err(EngineError::BadRequest(
+                "enter a bare hostname, e.g. github.example.com".into(),
+            ));
+        }
+        if host == crate::github::GITHUB_COM {
+            return Err(EngineError::BadRequest(
+                "github.com is always available; add only enterprise hosts".into(),
+            ));
+        }
+        let mut config = self.config.lock().unwrap();
+        if config.github_enterprise.iter().any(|e| e.host == host) {
+            return Err(EngineError::Conflict(format!("{host} is already added")));
+        }
+        config
+            .github_enterprise
+            .push(crate::config::GithubEnterpriseConfig {
+                host,
+                client_id: Some(client_id.trim().to_string()).filter(|c| !c.is_empty()),
+            });
+        let snapshot = config.clone();
+        drop(config);
+        self.persist_config(&snapshot);
+        Ok(())
+    }
+
+    /// Remove an enterprise host and forget its stored secrets.
+    pub fn remove_github_host(&self, host: &str) -> Result<(), EngineError> {
+        let host = host.trim().to_ascii_lowercase();
+        let mut config = self.config.lock().unwrap();
+        let before = config.github_enterprise.len();
+        config.github_enterprise.retain(|e| e.host != host);
+        if config.github_enterprise.len() == before {
+            return Err(EngineError::NotFound(format!("GitHub host {host}")));
+        }
+        let snapshot = config.clone();
+        drop(config);
+        self.persist_config(&snapshot);
+        let id = Self::github_secret_id(&host);
+        let _ = self
+            .secrets
+            .delete(&trouve_providers::secrets::api_key_secret(&id));
+        let _ = self
+            .secrets
+            .delete(&trouve_providers::secrets::oauth_secret(&id));
         Ok(())
     }
 
