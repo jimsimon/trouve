@@ -156,7 +156,7 @@ impl LocalToolExecutor {
                 Arc::new(shell::ShellOutput { jobs: jobs.clone() }),
                 Arc::new(shell::ShellKill { jobs }),
                 Arc::new(grep::Grep),
-                Arc::new(web::WebFetch),
+                Arc::new(web::WebFetch::default()),
                 Arc::new(todo::TodoWrite::default()),
                 Arc::new(search::Search {
                     cache: search_cache.clone(),

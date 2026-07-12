@@ -63,6 +63,19 @@ pub fn gate(
     allow_list: &HashSet<String>,
     key: &str,
 ) -> Gate {
+    // web_fetch mutates nothing, but fetching a model-chosen URL is an
+    // outbound side channel (prompt-injection exfiltration of anything the
+    // ungated read tools can see), so it requires approval in every
+    // permission mode — including read-only modes, where research is
+    // legitimate but silent exfiltration is not. "Always approve" unlocks
+    // the session via the allow-list.
+    if key == "web_fetch" {
+        return if allow_list.contains(key) {
+            Gate::Allow
+        } else {
+            Gate::NeedsApproval
+        };
+    }
     if !tool_mutates {
         return Gate::Allow;
     }
@@ -209,6 +222,22 @@ mod tests {
         mcp_listed.insert("mcp:jira".to_string());
         assert_eq!(
             gate(PermissionMode::Yolo, false, true, &mcp_listed, "mcp:jira"),
+            Gate::Allow
+        );
+        // web_fetch needs approval in every mode (exfiltration channel),
+        // read-only modes included, until allow-listed for the session.
+        assert_eq!(
+            gate(PermissionMode::Yolo, false, false, &empty, "web_fetch"),
+            Gate::NeedsApproval
+        );
+        assert_eq!(
+            gate(PermissionMode::Ask, true, false, &empty, "web_fetch"),
+            Gate::NeedsApproval
+        );
+        let mut web_listed = HashSet::new();
+        web_listed.insert("web_fetch".to_string());
+        assert_eq!(
+            gate(PermissionMode::Ask, true, false, &web_listed, "web_fetch"),
             Gate::Allow
         );
     }
