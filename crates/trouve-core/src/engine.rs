@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, RwLock};
 
 use anyhow::{Context, Result, anyhow, bail};
-use futures::StreamExt;
+use futures::{FutureExt, StreamExt};
 use trouve_agents::{AgentBackend, BackendEvent, BackendPermission, BackendTurn};
 use trouve_protocol::{
     AgentMode, ApprovalDecision, BranchList, CreateSessionRequest, CreateThreadRequest, Event,
@@ -3257,13 +3257,46 @@ impl Engine {
         if session_woke {
             self.emit_session_activity(&thread.session_id, true);
         }
-        self.emit_queue(thread_id)?;
-        let turn = self.store.next_turn(thread_id)?;
+        // If setup fails after claiming, release the claim — otherwise the
+        // thread stays "active" forever and can never dispatch again.
+        if let Err(e) = self.emit_queue(thread_id) {
+            self.release_thread(thread_id);
+            return Err(e.into());
+        }
+        let turn = match self.store.next_turn(thread_id) {
+            Ok(t) => t,
+            Err(e) => {
+                self.release_thread(thread_id);
+                return Err(e.into());
+            }
+        };
         let engine = self.clone();
         tokio::spawn(async move {
-            engine
-                .drain_queue(thread, turn, prompt.content, prompt.attachments)
-                .await;
+            let thread_id = thread.id.clone();
+            // Catch a panic in the turn machinery so the claim (and cancel
+            // token) are always released and the UI unsticks — tokio would
+            // otherwise swallow the panic and leave the thread wedged as
+            // "active" with no TurnFailed event.
+            let drained = std::panic::AssertUnwindSafe(engine.drain_queue(
+                thread,
+                turn,
+                prompt.content,
+                prompt.attachments,
+            ))
+            .catch_unwind()
+            .await;
+            if drained.is_err() {
+                tracing::error!("turn dispatcher for {thread_id} panicked");
+                let _ = engine.store.append_event(
+                    Scope::Thread(thread_id.clone()),
+                    Event::TurnFailed {
+                        turn,
+                        error: "internal error".into(),
+                    },
+                );
+                engine.clear_cancel(&thread_id);
+                engine.release_thread(&thread_id);
+            }
         });
         Ok(Some(turn))
     }
