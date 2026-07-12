@@ -3258,7 +3258,7 @@ impl Engine {
         // thread stays "active" forever and can never dispatch again.
         if let Err(e) = self.emit_queue(thread_id) {
             self.release_thread(thread_id);
-            return Err(e.into());
+            return Err(e);
         }
         let turn = match self.store.next_turn(thread_id) {
             Ok(t) => t,
@@ -4588,6 +4588,7 @@ impl Engine {
 
     /// Gate, (maybe) get approval for, and execute one tool call. Returns the
     /// content fed back to the model.
+    #[allow(clippy::too_many_arguments)]
     async fn handle_tool_call(
         self: &Arc<Self>,
         session: &Session,
