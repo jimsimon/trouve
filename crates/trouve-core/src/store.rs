@@ -62,9 +62,10 @@ CREATE TABLE IF NOT EXISTS usage (
   thread_id TEXT NOT NULL REFERENCES threads(id),
   session_id TEXT NOT NULL REFERENCES sessions(id),
   turn INTEGER NOT NULL,
-  input_tokens INTEGER NOT NULL,
+  input_tokens INTEGER NOT NULL,      -- summed across the turn's requests (cost)
   output_tokens INTEGER NOT NULL,
   cached_input_tokens INTEGER NOT NULL,
+  context_input_tokens INTEGER NOT NULL DEFAULT 0, -- last request's input (context size)
   cost_usd REAL,
   PRIMARY KEY (thread_id, turn)
 );
@@ -131,6 +132,9 @@ CREATE TABLE IF NOT EXISTS automations (
 const MIGRATIONS: &[&str] = &[
     "ALTER TABLE sessions ADD COLUMN archived INTEGER NOT NULL DEFAULT 0",
     "ALTER TABLE queued_prompts ADD COLUMN attachments TEXT NOT NULL DEFAULT '[]'",
+    // Context-size proxy for compaction/UI: the input tokens of the turn's
+    // *last* request, not the sum over its iterations (see record_usage).
+    "ALTER TABLE usage ADD COLUMN context_input_tokens INTEGER NOT NULL DEFAULT 0",
 ];
 
 fn apply_migrations(conn: &Connection) -> Result<()> {
@@ -1072,17 +1076,24 @@ impl Store {
 
     // --- usage accounting -------------------------------------------------------
 
+    /// Record a turn's usage. `usage` totals are summed across the turn's
+    /// requests (correct for billing); `context_input_tokens` is the input
+    /// size of the turn's *last* request — the only meaningful proxy for the
+    /// current context size, since summing per-iteration inputs over a
+    /// multi-tool turn inflates the figure many-fold and spuriously trips
+    /// compaction.
     pub fn record_usage(
         &self,
         session_id: &str,
         thread_id: &str,
         turn: u64,
         usage: &trouve_protocol::Usage,
+        context_input_tokens: u64,
     ) -> Result<()> {
         self.conn.lock().unwrap().execute(
             "INSERT OR REPLACE INTO usage
-             (thread_id, session_id, turn, input_tokens, output_tokens, cached_input_tokens, cost_usd)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+             (thread_id, session_id, turn, input_tokens, output_tokens, cached_input_tokens, context_input_tokens, cost_usd)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
             params![
                 thread_id,
                 session_id,
@@ -1090,19 +1101,22 @@ impl Store {
                 usage.input_tokens as i64,
                 usage.output_tokens as i64,
                 usage.cached_input_tokens as i64,
+                context_input_tokens as i64,
                 usage.cost_usd
             ],
         )?;
         Ok(())
     }
 
-    /// Input tokens reported for the thread's most recent turn (context size
-    /// proxy for the compaction trigger and the UI usage indicator).
+    /// Context size (in tokens) of the thread's most recent turn: the last
+    /// request's input, used by the compaction trigger and the UI usage
+    /// indicator. Older rows recorded before this column existed report 0
+    /// (the caller falls back to a character estimate).
     pub fn last_input_tokens(&self, thread_id: &str) -> Result<Option<u64>> {
         let conn = self.conn.lock().unwrap();
         Ok(conn
             .query_row(
-                "SELECT input_tokens + cached_input_tokens FROM usage
+                "SELECT context_input_tokens FROM usage
                  WHERE thread_id = ?1 ORDER BY turn DESC LIMIT 1",
                 params![thread_id],
                 |r| r.get::<_, i64>(0),

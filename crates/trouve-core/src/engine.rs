@@ -3470,6 +3470,11 @@ impl Engine {
 
         let system = context::system_prompt(&mode, self.config_dir.as_deref(), Path::new(&ws.path));
         let mut usage_total = Usage::default();
+        // The last request's input size — the context-size proxy for
+        // compaction. Summing per-iteration inputs (usage_total) would
+        // over-count a multi-tool turn many-fold; the final request carries
+        // the whole transcript, so its input is what "context size" means.
+        let mut context_input_tokens = 0u64;
 
         for _iteration in 0..MAX_ITERATIONS {
             // Rebuild the transcript each iteration; the store is the truth.
@@ -3510,6 +3515,7 @@ impl Engine {
                         usage_total.input_tokens += usage.input_tokens;
                         usage_total.output_tokens += usage.output_tokens;
                         usage_total.cached_input_tokens += usage.cached_input_tokens;
+                        context_input_tokens = usage.input_tokens + usage.cached_input_tokens;
                     }
                 }
             }
@@ -3565,7 +3571,7 @@ impl Engine {
             );
         }
         self.store
-            .record_usage(&session.id, &thread.id, turn, &usage_total)?;
+            .record_usage(&session.id, &thread.id, turn, &usage_total, context_input_tokens)?;
 
         // Snapshot the worktree when the turn changed it. Lock-free child
         // turns never snapshot: they can't write, so any dirt is the
@@ -4184,8 +4190,11 @@ impl Engine {
         self.store
             .mark_backend_seen(&thread.id, backend_id, seen_after)?;
 
+        // Vendors report one usage per turn, so the totals already reflect
+        // the last (only) request — use them as the context-size proxy.
+        let context_input_tokens = usage_total.input_tokens + usage_total.cached_input_tokens;
         self.store
-            .record_usage(&session.id, &thread.id, turn, &usage_total)?;
+            .record_usage(&session.id, &thread.id, turn, &usage_total, context_input_tokens)?;
         let checkpoint_id = self.maybe_checkpoint(session, thread, turn).await?;
         self.store.append_event(
             scope,
