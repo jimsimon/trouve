@@ -3402,6 +3402,7 @@ impl Engine {
                     model_name,
                     content,
                     attachments,
+                    concurrent_child,
                 )
                 .await;
         }
@@ -3914,6 +3915,7 @@ impl Engine {
         model_name: String,
         content: String,
         attachments: Vec<trouve_protocol::Attachment>,
+        concurrent_child: bool,
     ) -> Result<()> {
         let scope = Scope::Thread(thread.id.clone());
         // Vendor sessions are per (thread, backend): each vendor keeps its
@@ -4195,7 +4197,15 @@ impl Engine {
         let context_input_tokens = usage_total.input_tokens + usage_total.cached_input_tokens;
         self.store
             .record_usage(&session.id, &thread.id, turn, &usage_total, context_input_tokens)?;
-        let checkpoint_id = self.maybe_checkpoint(session, thread, turn).await?;
+        // Lock-free children (read-only spawned agents) never checkpoint:
+        // they hold no session lock, so `git add`/write-tree here would race
+        // the parent's concurrent turn and snapshot its half-finished work as
+        // the child's checkpoint. Matches the native path (invariant 4).
+        let checkpoint_id = if concurrent_child {
+            None
+        } else {
+            self.maybe_checkpoint(session, thread, turn).await?
+        };
         self.store.append_event(
             scope,
             Event::TurnCompleted {
