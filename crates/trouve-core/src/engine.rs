@@ -3459,7 +3459,7 @@ impl Engine {
             }
 
             for call in tool_calls {
-                let result_content = self
+                let (result_content, images) = self
                     .handle_tool_call(&session, thread, turn, &mode, &ctx, &call)
                     .await?;
                 self.store.append_message(
@@ -3467,6 +3467,7 @@ impl Engine {
                     &serde_json::to_value(Message::ToolResult {
                         call_id: call.id.clone(),
                         content: result_content,
+                        images,
                     })?,
                 )?;
             }
@@ -3602,9 +3603,15 @@ impl Engine {
             name: name.to_string(),
             arguments: arguments.clone(),
         };
-        self.handle_tool_call(&session, &thread, turn, &mode, &ctx, &call)
+        // Bridged responses are text-only (MCP content blocks could carry
+        // images, but no bridged vendor consumes them yet); the summary the
+        // engine leaves in place of "_images" still tells the model the
+        // image was read.
+        let (content, _images) = self
+            .handle_tool_call(&session, &thread, turn, &mode, &ctx, &call)
             .await
-            .map_err(EngineError::Internal)
+            .map_err(EngineError::Internal)?;
+        Ok(content)
     }
 
     /// Gate a vendor-side tool call (Claude Code's `--permission-prompt-tool`
@@ -4250,7 +4257,7 @@ impl Engine {
         mode: &AgentMode,
         ctx: &ToolCtx,
         call: &trouve_providers::ToolCallRequest,
-    ) -> Result<String> {
+    ) -> Result<(String, Vec<trouve_providers::ToolImage>)> {
         let scope = Scope::Thread(thread.id.clone());
         let call_id = if call.id.is_empty() {
             new_id("call")
@@ -4272,7 +4279,7 @@ impl Engine {
                 }
                 Err(e) => serde_json::json!({ "error": e }),
             };
-            return Ok(result.to_string());
+            return Ok((result.to_string(), Vec::new()));
         }
 
         let known = self.executor.tool_mutates(&call.name);
@@ -4320,7 +4327,10 @@ impl Engine {
                         }),
                     },
                 )?;
-                return Ok("Tool call denied: not permitted in this mode.".into());
+                return Ok((
+                    "Tool call denied: not permitted in this mode.".into(),
+                    Vec::new(),
+                ));
             }
             Gate::NeedsApproval => {
                 let rx = self.approvals.request(&call_id);
@@ -4359,7 +4369,7 @@ impl Engine {
                     result: serde_json::json!({"error": "denied by user"}),
                 },
             )?;
-            return Ok("Tool call denied by the user.".into());
+            return Ok(("Tool call denied by the user.".into(), Vec::new()));
         }
 
         self.store.append_event(
@@ -4368,10 +4378,14 @@ impl Engine {
                 call_id: call_id.clone(),
             },
         )?;
-        let outcome = self
+        let mut outcome = self
             .executor
             .execute(ctx, &call.name, &call.arguments)
             .await;
+        // Peel vision content ("_images") out of the result: megabytes of
+        // base64 must not land in the event log or the text transcript —
+        // it becomes native image input on the tool-result message instead.
+        let images = take_tool_images(&mut outcome.result);
         self.store.append_event(
             scope,
             Event::ToolCompleted {
@@ -4380,7 +4394,7 @@ impl Engine {
                 result: outcome.result.clone(),
             },
         )?;
-        Ok(outcome.result.to_string())
+        Ok((outcome.result.to_string(), images))
     }
 
     async fn maybe_checkpoint(
@@ -4563,6 +4577,32 @@ fn annotate_attachments(
         out.push_str(&format!("\n- {} ({}): {}", a.name, a.mime, path.display()));
     }
     out
+}
+
+/// Remove the `_images` vision payload from a tool result, leaving a small
+/// summary in its place (the event log and text transcript stay lean; the
+/// images travel on the provider message as native vision content).
+fn take_tool_images(result: &mut serde_json::Value) -> Vec<trouve_providers::ToolImage> {
+    let Some(payload) = result.as_object_mut().and_then(|o| o.remove("_images")) else {
+        return Vec::new();
+    };
+    let images: Vec<trouve_providers::ToolImage> =
+        serde_json::from_value(payload).unwrap_or_default();
+    if !images.is_empty() {
+        result["images"] = serde_json::json!(
+            images
+                .iter()
+                .map(|img| {
+                    serde_json::json!({
+                        "mime": img.mime,
+                        // Base64 expands bytes 4:3; report the real size.
+                        "bytes": img.data.len() * 3 / 4,
+                    })
+                })
+                .collect::<Vec<_>>()
+        );
+    }
+    images
 }
 
 fn annotate_edit_lines(worktree: &Path, args: &mut serde_json::Value) {
@@ -4917,6 +4957,7 @@ mod tests {
             Message::ToolResult {
                 call_id: "1".into(),
                 content: "long tool output that should not appear".into(),
+                images: vec![],
             },
             Message::Assistant {
                 content: "Done — login page added.".into(),

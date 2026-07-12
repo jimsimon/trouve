@@ -82,11 +82,11 @@ impl OpenAiCompatProvider {
     }
 
     fn wire_messages(messages: &[Message]) -> Vec<Value> {
-        messages
-            .iter()
-            .map(|m| match m {
-                Message::System(s) => json!({"role": "system", "content": s}),
-                Message::User(s) => json!({"role": "user", "content": s}),
+        let mut wire = Vec::with_capacity(messages.len());
+        for m in messages {
+            match m {
+                Message::System(s) => wire.push(json!({"role": "system", "content": s})),
+                Message::User(s) => wire.push(json!({"role": "user", "content": s})),
                 Message::Assistant {
                     content,
                     tool_calls,
@@ -109,13 +109,36 @@ impl OpenAiCompatProvider {
                                 .collect(),
                         );
                     }
-                    obj
+                    wire.push(obj);
                 }
-                Message::ToolResult { call_id, content } => {
-                    json!({"role": "tool", "tool_call_id": call_id, "content": content})
+                Message::ToolResult {
+                    call_id,
+                    content,
+                    images,
+                } => {
+                    wire.push(json!({"role": "tool", "tool_call_id": call_id, "content": content}));
+                    // The chat-completions tool role is text-only; images
+                    // follow as a user message with image_url parts (the
+                    // standard multimodal workaround).
+                    if !images.is_empty() {
+                        let mut parts = vec![json!({
+                            "type": "text",
+                            "text": format!("Image content from tool call {call_id}:"),
+                        })];
+                        parts.extend(images.iter().map(|img| {
+                            json!({
+                                "type": "image_url",
+                                "image_url": {
+                                    "url": format!("data:{};base64,{}", img.mime, img.data),
+                                }
+                            })
+                        }));
+                        wire.push(json!({"role": "user", "content": parts}));
+                    }
                 }
-            })
-            .collect()
+            }
+        }
+        wire
     }
 }
 

@@ -34,6 +34,15 @@ pub struct ToolCallRequest {
     pub arguments: serde_json::Value,
 }
 
+/// An image a tool returned (vision content for multimodal models).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ToolImage {
+    /// e.g. "image/png".
+    pub mime: String,
+    /// Base64-encoded image bytes.
+    pub data: String,
+}
+
 /// Conversation messages, provider-agnostic.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Message {
@@ -46,6 +55,10 @@ pub enum Message {
     ToolResult {
         call_id: String,
         content: String,
+        /// Images alongside the text (read_file on an image); providers
+        /// render them as native vision input where supported.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        images: Vec<ToolImage>,
     },
 }
 

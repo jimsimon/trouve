@@ -5,6 +5,21 @@ use serde_json::{Value, json};
 use super::{Tool, ToolCtx, ToolResult};
 
 const MAX_READ_BYTES: usize = 64 * 1024;
+/// Images larger than this are rejected rather than truncated (a partial
+/// image is useless as vision input).
+const MAX_IMAGE_BYTES: usize = 8 * 1024 * 1024;
+
+/// MIME type for paths `read_file` should return as vision content.
+fn image_mime(path: &str) -> Option<&'static str> {
+    let ext = std::path::Path::new(path).extension()?.to_str()?;
+    match ext.to_ascii_lowercase().as_str() {
+        "png" => Some("image/png"),
+        "jpg" | "jpeg" => Some("image/jpeg"),
+        "gif" => Some("image/gif"),
+        "webp" => Some("image/webp"),
+        _ => None,
+    }
+}
 
 pub struct ReadFile;
 
@@ -14,7 +29,8 @@ impl Tool for ReadFile {
         "read_file"
     }
     fn description(&self) -> &'static str {
-        "Read a UTF-8 text file from the workspace. Returns at most 64KB; use offset to page through larger files."
+        "Read a file from the workspace. Text returns at most 64KB (use offset to page through \
+         larger files); images (png/jpeg/gif/webp) are returned as vision content."
     }
     fn parameters(&self) -> Value {
         json!({
@@ -39,6 +55,26 @@ impl Tool for ReadFile {
             Ok(p) => p,
             Err(e) => return ToolResult::error(e),
         };
+        // Images return as vision content ("_images" — the engine moves it
+        // onto the provider message as native image input).
+        if let Some(mime) = image_mime(path) {
+            use base64::Engine as _;
+            let bytes = match tokio::fs::read(&full).await {
+                Ok(b) => b,
+                Err(e) => return ToolResult::error(format!("cannot read {path}: {e}")),
+            };
+            if bytes.len() > MAX_IMAGE_BYTES {
+                return ToolResult::error(format!(
+                    "image {path} is {} bytes; the limit is {MAX_IMAGE_BYTES}",
+                    bytes.len()
+                ));
+            }
+            let data = base64::engine::general_purpose::STANDARD.encode(&bytes);
+            return ToolResult::ok(json!({
+                "note": format!("{mime} image, {} bytes, attached as vision content", bytes.len()),
+                "_images": [{"mime": mime, "data": data}],
+            }));
+        }
         let text = match tokio::fs::read_to_string(&full).await {
             Ok(t) => t,
             Err(e) => return ToolResult::error(format!("cannot read {path}: {e}")),
@@ -279,6 +315,33 @@ mod tests {
 
         let res = ListDir.run(&ctx, &json!({"path": "a"})).await;
         assert_eq!(res.result["entries"][0]["name"], "b.txt");
+    }
+
+    #[tokio::test]
+    async fn read_file_returns_images_as_vision_content() {
+        use base64::Engine as _;
+        let tmp = tempfile::tempdir().unwrap();
+        let ctx = ToolCtx {
+            worktree: tmp.path().to_path_buf(),
+            ..Default::default()
+        };
+        // A 1x1 transparent PNG.
+        let png = base64::engine::general_purpose::STANDARD.decode(
+            "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==",
+        ).unwrap();
+        std::fs::write(tmp.path().join("dot.png"), &png).unwrap();
+
+        let res = ReadFile.run(&ctx, &json!({"path": "dot.png"})).await;
+        assert_eq!(res.status, trouve_protocol::ToolStatus::Ok);
+        assert_eq!(res.result["_images"][0]["mime"], "image/png");
+        let data = res.result["_images"][0]["data"].as_str().unwrap();
+        assert_eq!(
+            base64::engine::general_purpose::STANDARD
+                .decode(data)
+                .unwrap(),
+            png
+        );
+        assert!(res.result["note"].as_str().unwrap().contains("image/png"));
     }
 
     #[tokio::test]

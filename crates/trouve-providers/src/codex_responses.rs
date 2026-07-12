@@ -218,11 +218,36 @@ fn input_items(messages: &[Message]) -> Vec<Value> {
                     }));
                 }
             }
-            Message::ToolResult { call_id, content } => items.push(json!({
-                "type": "function_call_output",
-                "call_id": call_id,
-                "output": content,
-            })),
+            Message::ToolResult {
+                call_id,
+                content,
+                images,
+            } => {
+                items.push(json!({
+                    "type": "function_call_output",
+                    "call_id": call_id,
+                    "output": content,
+                }));
+                // Function outputs are text-only in the Responses API;
+                // images follow as a user message with input_image parts.
+                if !images.is_empty() {
+                    let mut parts = vec![json!({
+                        "type": "input_text",
+                        "text": format!("Image content from tool call {call_id}:"),
+                    })];
+                    parts.extend(images.iter().map(|img| {
+                        json!({
+                            "type": "input_image",
+                            "image_url": format!("data:{};base64,{}", img.mime, img.data),
+                        })
+                    }));
+                    items.push(json!({
+                        "type": "message",
+                        "role": "user",
+                        "content": parts,
+                    }));
+                }
+            }
         }
     }
     items
@@ -353,6 +378,7 @@ mod tests {
             Message::ToolResult {
                 call_id: "c1".into(),
                 content: "data".into(),
+                images: vec![],
             },
         ]);
         assert_eq!(items.len(), 5);
@@ -362,6 +388,26 @@ mod tests {
         assert_eq!(items[3]["type"], "function_call");
         assert_eq!(items[3]["arguments"], "{\"path\":\"x\"}");
         assert_eq!(items[4]["type"], "function_call_output");
+    }
+
+    #[test]
+    fn tool_result_images_follow_as_input_image() {
+        let items = input_items(&[Message::ToolResult {
+            call_id: "c1".into(),
+            content: "image read".into(),
+            images: vec![crate::ToolImage {
+                mime: "image/png".into(),
+                data: "QUJD".into(),
+            }],
+        }]);
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0]["type"], "function_call_output");
+        assert_eq!(items[1]["role"], "user");
+        assert_eq!(items[1]["content"][1]["type"], "input_image");
+        assert_eq!(
+            items[1]["content"][1]["image_url"],
+            "data:image/png;base64,QUJD"
+        );
     }
 
     #[test]

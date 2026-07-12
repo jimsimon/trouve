@@ -985,7 +985,9 @@ async fn ask_question_tool_round_trips_answers() {
     let result = fed
         .iter()
         .find_map(|m| match m {
-            Message::ToolResult { call_id, content } if call_id == "q_call_1" => Some(content),
+            Message::ToolResult {
+                call_id, content, ..
+            } if call_id == "q_call_1" => Some(content),
             _ => None,
         })
         .expect("ask_question result fed back to the model");

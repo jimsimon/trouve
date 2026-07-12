@@ -155,14 +155,35 @@ impl AnthropicProvider {
                     }
                     wire.push(json!({"role": "assistant", "content": blocks}));
                 }
-                Message::ToolResult { call_id, content } => {
+                Message::ToolResult {
+                    call_id,
+                    content,
+                    images,
+                } => {
                     // Tool results are user-role content blocks; consecutive
                     // results merge into the previous user message if it is
-                    // already a block list.
+                    // already a block list. Images ride inside the result as
+                    // native vision blocks.
+                    let content_value = if images.is_empty() {
+                        json!(content)
+                    } else {
+                        let mut blocks = vec![json!({"type": "text", "text": content})];
+                        blocks.extend(images.iter().map(|img| {
+                            json!({
+                                "type": "image",
+                                "source": {
+                                    "type": "base64",
+                                    "media_type": img.mime,
+                                    "data": img.data,
+                                }
+                            })
+                        }));
+                        json!(blocks)
+                    };
                     let block = json!({
                         "type": "tool_result",
                         "tool_use_id": call_id,
-                        "content": content,
+                        "content": content_value,
                     });
                     if let Some(last) = wire.last_mut()
                         && last["role"] == "user"
@@ -459,10 +480,12 @@ mod tests {
             Message::ToolResult {
                 call_id: "t1".into(),
                 content: "r1".into(),
+                images: vec![],
             },
             Message::ToolResult {
                 call_id: "t2".into(),
                 content: "r2".into(),
+                images: vec![],
             },
         ];
         let (system, wire) = AnthropicProvider::wire_messages(&messages);
@@ -470,5 +493,23 @@ mod tests {
         assert_eq!(wire.len(), 3);
         assert_eq!(wire[2]["role"], "user");
         assert_eq!(wire[2]["content"].as_array().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn tool_result_images_become_vision_blocks() {
+        let messages = [Message::ToolResult {
+            call_id: "t1".into(),
+            content: "image read".into(),
+            images: vec![crate::ToolImage {
+                mime: "image/png".into(),
+                data: "QUJD".into(),
+            }],
+        }];
+        let (_, wire) = AnthropicProvider::wire_messages(&messages);
+        let blocks = wire[0]["content"][0]["content"].as_array().unwrap();
+        assert_eq!(blocks[0]["type"], "text");
+        assert_eq!(blocks[1]["type"], "image");
+        assert_eq!(blocks[1]["source"]["media_type"], "image/png");
+        assert_eq!(blocks[1]["source"]["data"], "QUJD");
     }
 }
