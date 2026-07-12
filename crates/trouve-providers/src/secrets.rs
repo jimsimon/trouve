@@ -1,5 +1,6 @@
-//! Secret storage: OS keychain/keystore when available, with an encrypted-
-//! permissions file fallback for headless machines.
+//! Secret storage: OS keychain/keystore when available, with a plaintext
+//! JSON file fallback (owner-only 0600 permissions, no encryption at rest)
+//! for headless machines.
 //!
 //! Keys are namespaced strings like `provider:openai:api_key` or
 //! `provider:openai:oauth`.
@@ -69,7 +70,11 @@ impl FileStore {
 
     fn read_all(&self) -> Result<serde_json::Map<String, serde_json::Value>> {
         match std::fs::read_to_string(&self.path) {
-            Ok(text) => Ok(serde_json::from_str(&text).unwrap_or_default()),
+            // A corrupt file must surface as an error, not silently read as
+            // empty: `set` would then persist an empty map plus one key,
+            // wiping every other provider's stored credentials.
+            Ok(text) => serde_json::from_str(&text)
+                .with_context(|| format!("secrets file {} is corrupt", self.path.display())),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Default::default()),
             Err(e) => Err(e).context("reading secrets file"),
         }
@@ -80,7 +85,25 @@ impl FileStore {
             std::fs::create_dir_all(parent)?;
         }
         let text = serde_json::to_string_pretty(map)?;
-        std::fs::write(&self.path, text)?;
+        // Write to a temp file created with owner-only perms, then rename:
+        // secrets never exist on disk world-readable (not even briefly on
+        // first write), and a crash mid-write can't truncate the real file.
+        let tmp = self.path.with_extension("tmp");
+        {
+            let mut opts = std::fs::OpenOptions::new();
+            opts.write(true).create(true).truncate(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                opts.mode(0o600);
+            }
+            use std::io::Write as _;
+            let mut f = opts.open(&tmp).context("creating secrets temp file")?;
+            f.write_all(text.as_bytes())
+                .context("writing secrets temp file")?;
+            f.sync_all().ok();
+        }
+        std::fs::rename(&tmp, &self.path).context("replacing secrets file")?;
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -160,5 +183,17 @@ mod tests {
                 .mode();
             assert_eq!(mode & 0o777, 0o600);
         }
+    }
+
+    #[test]
+    fn corrupt_file_errors_instead_of_wiping_secrets() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("secrets.json");
+        std::fs::write(&path, "{ this is not json").unwrap();
+        let store = FileStore::new(path);
+        // A corrupt file must not read as empty (which would let the next
+        // set() overwrite it and destroy other providers' credentials).
+        assert!(store.get("k").is_err());
+        assert!(store.set("k", "v").is_err());
     }
 }

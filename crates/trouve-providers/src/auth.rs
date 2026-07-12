@@ -99,6 +99,11 @@ pub struct StoredOAuthToken {
     pub secret_key: String,
     pub oauth: OAuthConfig,
     pub http: reqwest::Client,
+    /// Serializes refreshes: concurrent turns sharing this token must not
+    /// each POST the same refresh_token. Providers that rotate refresh
+    /// tokens revoke the whole family when an old one is reused, logging the
+    /// user out; the racing `set`s would also clobber each other.
+    refresh_lock: tokio::sync::Mutex<()>,
 }
 
 impl StoredOAuthToken {
@@ -108,6 +113,7 @@ impl StoredOAuthToken {
             secret_key,
             oauth,
             http: reqwest::Client::new(),
+            refresh_lock: tokio::sync::Mutex::new(()),
         }
     }
 
@@ -167,10 +173,17 @@ impl StoredOAuthToken {
 impl TokenSource for StoredOAuthToken {
     async fn bearer(&self) -> Result<String, ProviderError> {
         let tokens = self.load()?;
-        if tokens.expired() {
-            return Ok(self.refresh(&tokens).await?.access_token);
+        if !tokens.expired() {
+            return Ok(tokens.access_token);
         }
-        Ok(tokens.access_token)
+        // Serialize the refresh; re-check under the lock in case another
+        // task already refreshed while we waited.
+        let _guard = self.refresh_lock.lock().await;
+        let tokens = self.load()?;
+        if !tokens.expired() {
+            return Ok(tokens.access_token);
+        }
+        Ok(self.refresh(&tokens).await?.access_token)
     }
 }
 
