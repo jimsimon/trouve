@@ -3116,3 +3116,54 @@ async fn spawn_session_child_agent_isolated() {
     assert_eq!(child["spawned"], true, "{child}");
     assert_eq!(child["mode"], "code");
 }
+
+#[tokio::test]
+async fn secured_router_enforces_token_and_loopback_host() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Store::open(&tmp.path().join("db/trouve.db")).unwrap();
+    let engine = Arc::new(Engine::new(store, tmp.path().join("data"), &Config::default()).with_config_dir(None));
+
+    let security = trouve_server::ServerSecurity {
+        token: Some("s3cret-token".to_string()),
+        require_loopback_host: true,
+    };
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let router = trouve_server::build_secured_router(engine, security);
+    tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+    let base = format!("http://{addr}/v1");
+    let client = reqwest::Client::new();
+
+    // No token -> 401.
+    let resp = client.get(format!("{base}/info")).send().await.unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::UNAUTHORIZED);
+
+    // Wrong token -> 401.
+    let resp = client
+        .get(format!("{base}/info"))
+        .bearer_auth("nope")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::UNAUTHORIZED);
+
+    // Correct token -> 200.
+    let resp = client
+        .get(format!("{base}/info"))
+        .bearer_auth("s3cret-token")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+
+    // Non-loopback Host header (DNS-rebinding attempt) -> 403, even with a
+    // valid token.
+    let resp = client
+        .get(format!("{base}/info"))
+        .bearer_auth("s3cret-token")
+        .header(reqwest::header::HOST, "attacker.example.com")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::FORBIDDEN);
+}

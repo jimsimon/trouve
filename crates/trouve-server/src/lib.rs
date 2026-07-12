@@ -234,6 +234,167 @@ pub fn openapi_json() -> serde_json::Value {
     serde_json::to_value(doc).expect("openapi doc serializes")
 }
 
+/// Access controls for the HTTP surface. The server drives an agent that
+/// runs shell commands and edits files, so an open local port is a
+/// privilege boundary: any other local process, or a web page via DNS
+/// rebinding, could otherwise drive it.
+#[derive(Clone, Default)]
+pub struct ServerSecurity {
+    /// Bearer token required on every `/v1` request. `None` disables the
+    /// token check (tests, and explicit opt-out).
+    pub token: Option<String>,
+    /// Reject requests whose `Host` header isn't loopback. Blocks DNS
+    /// rebinding: an attacker page rebinds its hostname to 127.0.0.1, but
+    /// the browser still sends that hostname in `Host`, which won't match.
+    pub require_loopback_host: bool,
+}
+
+impl ServerSecurity {
+    /// No auth and no host check — for in-process tests and embedders that
+    /// bind their own trusted listener.
+    pub fn open() -> Self {
+        Self::default()
+    }
+
+    /// Resolve from the environment and data dir:
+    /// - token: `TROUVE_AUTH_TOKEN`, else `<data_dir>/auth-token`, else a
+    ///   freshly generated token persisted there with 0600 perms.
+    ///   `TROUVE_NO_AUTH=1` disables the token (host check stays on).
+    /// - host: loopback-only unless `TROUVE_ALLOW_REMOTE` is set.
+    pub fn resolve(data_dir: &std::path::Path) -> Self {
+        let require_loopback_host = std::env::var_os("TROUVE_ALLOW_REMOTE").is_none();
+        if std::env::var("TROUVE_NO_AUTH").is_ok_and(|v| v == "1" || v == "true") {
+            tracing::warn!("TROUVE_NO_AUTH set: the API is unauthenticated");
+            return Self {
+                token: None,
+                require_loopback_host,
+            };
+        }
+        let token = match std::env::var("TROUVE_AUTH_TOKEN") {
+            Ok(t) if !t.is_empty() => t,
+            _ => Self::load_or_create_token(data_dir),
+        };
+        Self {
+            token: Some(token),
+            require_loopback_host,
+        }
+    }
+
+    fn load_or_create_token(data_dir: &std::path::Path) -> String {
+        let path = data_dir.join("auth-token");
+        if let Ok(existing) = std::fs::read_to_string(&path) {
+            let existing = existing.trim().to_string();
+            if !existing.is_empty() {
+                return existing;
+            }
+        }
+        let token = format!(
+            "{}{}",
+            uuid::Uuid::new_v4().simple(),
+            uuid::Uuid::new_v4().simple()
+        );
+        let _ = std::fs::create_dir_all(data_dir);
+        if write_private(&path, token.as_bytes()).is_err() {
+            tracing::warn!("could not persist auth token to {}", path.display());
+        } else {
+            tracing::info!("generated API auth token at {}", path.display());
+        }
+        token
+    }
+}
+
+/// Write a file readable only by the owner (0600 on unix).
+fn write_private(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(path)?;
+        f.write_all(bytes)
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::write(path, bytes)
+    }
+}
+
+/// True when the `Host` header names a loopback address (or `localhost`).
+fn host_is_loopback(headers: &HeaderMap) -> bool {
+    let Some(host) = headers.get(axum::http::header::HOST).and_then(|v| v.to_str().ok()) else {
+        // No Host header (HTTP/2 without one, or a raw client): allow — the
+        // loopback bind is the backstop and there's no rebindable name.
+        return true;
+    };
+    // Strip a trailing :port (but keep IPv6 brackets intact for parsing).
+    let hostname = if let Some(stripped) = host.strip_prefix('[') {
+        // [::1]:port or [::1]
+        stripped.split(']').next().unwrap_or(stripped)
+    } else {
+        host.rsplit_once(':').map(|(h, _)| h).unwrap_or(host)
+    };
+    if hostname.eq_ignore_ascii_case("localhost") {
+        return true;
+    }
+    hostname
+        .parse::<std::net::IpAddr>()
+        .map(|ip| ip.is_loopback())
+        .unwrap_or(false)
+}
+
+/// Constant-time-ish equality for the bearer token.
+fn token_matches(expected: &str, provided: &str) -> bool {
+    let (a, b) = (expected.as_bytes(), provided.as_bytes());
+    if a.len() != b.len() {
+        return false;
+    }
+    a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+}
+
+async fn enforce_security(
+    security: Arc<ServerSecurity>,
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    if security.require_loopback_host && !host_is_loopback(request.headers()) {
+        return (
+            StatusCode::FORBIDDEN,
+            "host not allowed (set TROUVE_ALLOW_REMOTE to serve non-loopback hosts)",
+        )
+            .into_response();
+    }
+    // The internal MCP bridge is dialed by the vendor CLI children the
+    // server spawned; it carries no bearer token, so it's exempt from the
+    // token check but still bound by the loopback-host check above.
+    let internal = request.uri().path().starts_with("/internal/");
+    if let Some(expected) = security.token.as_deref()
+        && !internal
+    {
+        let provided = request
+            .headers()
+            .get(axum::http::header::AUTHORIZATION)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.strip_prefix("Bearer "));
+        if !provided.is_some_and(|p| token_matches(expected, p)) {
+            return (StatusCode::UNAUTHORIZED, "missing or invalid auth token").into_response();
+        }
+    }
+    next.run(request).await
+}
+
+/// Wrap the router with host + token enforcement.
+pub fn build_secured_router(engine: Arc<Engine>, security: ServerSecurity) -> Router {
+    let security = Arc::new(security);
+    build_router(engine).layer(axum::middleware::from_fn(move |req, next| {
+        let security = security.clone();
+        async move { enforce_security(security, req, next).await }
+    }))
+}
+
 pub fn build_router(engine: Arc<Engine>) -> Router {
     Router::new()
         .route("/v1/info", get(info))
@@ -366,9 +527,13 @@ pub fn build_router(engine: Arc<Engine>) -> Router {
         .with_state(engine)
 }
 
-pub async fn serve(engine: Arc<Engine>, addr: std::net::SocketAddr) -> anyhow::Result<()> {
+pub async fn serve(
+    engine: Arc<Engine>,
+    addr: std::net::SocketAddr,
+    security: ServerSecurity,
+) -> anyhow::Result<()> {
     let listener = tokio::net::TcpListener::bind(addr).await?;
-    serve_listener(engine, listener).await
+    serve_listener(engine, listener, security).await
 }
 
 /// Serve on an already-bound listener (embedded mode: bind port 0, read the
@@ -376,11 +541,15 @@ pub async fn serve(engine: Arc<Engine>, addr: std::net::SocketAddr) -> anyhow::R
 pub async fn serve_listener(
     engine: Arc<Engine>,
     listener: tokio::net::TcpListener,
+    security: ServerSecurity,
 ) -> anyhow::Result<()> {
     // Backends dialing back in (MCP tool bridge) need our reachable URL.
+    // That endpoint (`/internal/...`) is exempt from the bearer check —
+    // it's dialed by the vendor CLI children the server itself spawned —
+    // but still loopback-only.
     engine.set_base_url(&format!("http://{}", listener.local_addr()?));
     engine.start_automation_scheduler();
-    let router = build_router(engine);
+    let router = build_secured_router(engine, security);
     tracing::info!(
         "trouve-server listening on http://{}",
         listener.local_addr()?

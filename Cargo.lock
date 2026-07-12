@@ -8269,6 +8269,7 @@ dependencies = [
  "tracing-subscriber",
  "trouve-client-core",
  "trouve-protocol",
+ "uuid",
 ]
 
 [[package]]
@@ -8454,6 +8455,7 @@ dependencies = [
  "trouve-protocol",
  "trouve-providers",
  "utoipa",
+ "uuid",
 ]
 
 [[package]]

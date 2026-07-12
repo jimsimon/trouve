@@ -637,7 +637,10 @@ pub async fn run(
 /// (possibly remote) server instead.
 async fn start_local_server() -> Result<(ProtocolClient, Option<tokio::process::Child>)> {
     if let Ok(url) = std::env::var("TROUVE_SERVER_URL") {
-        let client = ProtocolClient::new(&url);
+        // Connecting to an externally-managed server: the user supplies its
+        // token (if any) in the environment.
+        let token = std::env::var("TROUVE_AUTH_TOKEN").ok();
+        let client = ProtocolClient::with_token(&url, token);
         client
             .info()
             .await
@@ -652,8 +655,19 @@ async fn start_local_server() -> Result<(ProtocolClient, Option<tokio::process::
         .port();
     let addr = format!("127.0.0.1:{port}");
 
+    // A per-launch bearer token so no other local process can drive the
+    // server we just spawned (it can run shell and edit files).
+    let token = format!(
+        "{}{}",
+        uuid::Uuid::new_v4().simple(),
+        uuid::Uuid::new_v4().simple()
+    );
+
     let mut command = tokio::process::Command::new(&binary);
-    command.args(["--addr", &addr]).kill_on_drop(true);
+    command
+        .args(["--addr", &addr])
+        .env("TROUVE_AUTH_TOKEN", &token)
+        .kill_on_drop(true);
     #[cfg(target_os = "linux")]
     unsafe {
         // Tie the server's lifetime to ours even if we exit uncleanly.
@@ -666,7 +680,7 @@ async fn start_local_server() -> Result<(ProtocolClient, Option<tokio::process::
         .spawn()
         .with_context(|| format!("spawning {}", binary.display()))?;
 
-    let client = ProtocolClient::new(&format!("http://{addr}"));
+    let client = ProtocolClient::with_token(&format!("http://{addr}"), Some(token));
     for _ in 0..100 {
         if client.info().await.is_ok() {
             return Ok((client, Some(child)));
