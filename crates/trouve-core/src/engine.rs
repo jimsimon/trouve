@@ -3586,9 +3586,14 @@ impl Engine {
         // over-count a multi-tool turn many-fold; the final request carries
         // the whole transcript, so its input is what "context size" means.
         let mut context_input_tokens = 0u64;
+        // Becomes false when the loop ends because the model stopped calling
+        // tools (or was cancelled); stays true only if we exhaust the
+        // iteration budget mid-work, which we then surface to the user.
+        let mut hit_iteration_limit = true;
 
         for _iteration in 0..MAX_ITERATIONS {
             if cancel.is_cancelled() {
+                hit_iteration_limit = false;
                 break;
             }
             // Rebuild the transcript each iteration; the store is the truth.
@@ -3670,6 +3675,7 @@ impl Engine {
                         })?,
                     )?;
                 }
+                hit_iteration_limit = false;
                 break;
             }
 
@@ -3698,6 +3704,7 @@ impl Engine {
             }
 
             if tool_calls.is_empty() {
+                hit_iteration_limit = false;
                 break;
             }
 
@@ -3714,6 +3721,31 @@ impl Engine {
                     })?,
                 )?;
             }
+        }
+
+        // Truncated mid-work at the iteration budget: tell the user (and
+        // leave a transcript note the model sees next turn) instead of
+        // ending silently as if the work were finished.
+        if hit_iteration_limit {
+            let note = format!(
+                "Reached the {MAX_ITERATIONS}-step limit for one turn and stopped mid-task. \
+                 Send another message to continue."
+            );
+            self.store.append_event(
+                scope.clone(),
+                Event::AssistantMessage {
+                    turn,
+                    content: note.clone(),
+                },
+            )?;
+            self.store.append_message(
+                &thread.id,
+                &serde_json::to_value(Message::Assistant {
+                    content: note,
+                    tool_calls: Vec::new(),
+                    reasoning: Vec::new(),
+                })?,
+            )?;
         }
 
         // Dollar cost from the model catalog, when pricing is known.

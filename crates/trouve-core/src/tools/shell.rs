@@ -297,8 +297,22 @@ impl Tool for ShellOutput {
                 }
                 let out = job.output.lock().unwrap();
                 if out.bytes.len() > job.cursor || out.exit_code.is_some() {
-                    let new = String::from_utf8_lossy(&out.bytes[job.cursor..]).into_owned();
-                    job.cursor = out.bytes.len();
+                    let slice = &out.bytes[job.cursor..];
+                    // Decode only up to the last complete UTF-8 character so
+                    // a multi-byte char split across two reads isn't mangled
+                    // into replacement chars at the seam; keep the trailing
+                    // partial bytes for the next read. Once the process has
+                    // exited there is no more input, so flush the remainder.
+                    let take = if out.exit_code.is_some() {
+                        slice.len()
+                    } else {
+                        match std::str::from_utf8(slice) {
+                            Ok(s) => s.len(),
+                            Err(e) => e.valid_up_to(),
+                        }
+                    };
+                    let new = String::from_utf8_lossy(&slice[..take]).into_owned();
+                    job.cursor += take;
                     Some((new, out.exit_code, out.truncated, out.killed))
                 } else {
                     None

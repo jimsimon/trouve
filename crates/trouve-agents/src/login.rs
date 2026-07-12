@@ -125,11 +125,24 @@ fn find_url(line: &str) -> Option<String> {
 
 /// Device-flow style codes ("Enter code: ABCD-1234").
 fn find_user_code(line: &str) -> Option<String> {
+    // Find "code" case-insensitively on the original string, so the byte
+    // offset stays valid on `line` (to_lowercase can change byte length for
+    // non-ASCII, which would misindex or panic the slice).
     let lower = line.to_lowercase();
-    let idx = lower.find("code")?;
-    let rest = &line[idx + 4..];
+    let match_at = lower.find("code")?;
+    // Map the lowercase byte offset back to a char count, then to a byte
+    // offset in the original string.
+    let char_idx = lower[..match_at].chars().count();
+    let idx: usize = line
+        .char_indices()
+        .nth(char_idx)
+        .map(|(i, _)| i)
+        .unwrap_or(line.len());
+    let rest = &line[idx..];
+    // Skip the matched "code" (4 ASCII chars) via the char iterator.
     let code: String = rest
         .chars()
+        .skip(4)
         .skip_while(|c| !c.is_ascii_alphanumeric())
         .take_while(|c| c.is_ascii_alphanumeric() || *c == '-')
         .collect();
@@ -177,5 +190,10 @@ mod tests {
             Some("ABCD-1234".to_string())
         );
         assert_eq!(find_user_code("decode this"), None);
+        // Non-ASCII before the match must not panic the slice.
+        assert_eq!(
+            find_user_code("café — code: WXYZ-99"),
+            Some("WXYZ-99".to_string())
+        );
     }
 }
