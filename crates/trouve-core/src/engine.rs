@@ -2024,15 +2024,19 @@ impl Engine {
                 ));
             }
         }
-        let probes =
-            futures::future::join_all(entries.iter().map(|(name, _, _, _, config)| async {
-                if probe && !config.disabled {
+        let probes = futures::future::join_all(entries.iter().map(
+            |(name, scope, _, _, config)| async move {
+                // Only probe (spawn) user-scope servers: workspace-scope
+                // servers live in a repo's .agents/.mcp.json and are never
+                // auto-run, so opening settings must not execute them.
+                if probe && !config.disabled && scope == "user" {
                     Some(crate::mcp::probe(name, config, &self.mcp_logs).await)
                 } else {
                     None
                 }
-            }))
-            .await;
+            },
+        ))
+        .await;
         Ok(entries
             .into_iter()
             .zip(probes)
@@ -2040,6 +2044,13 @@ impl Engine {
                 |((name, scope, workspace_id, workspace_name, config), probed)| {
                     let (health, detail) = if config.disabled {
                         ("disabled".to_string(), "disabled in this scope".to_string())
+                    } else if scope == "workspace" {
+                        (
+                            "untrusted".to_string(),
+                            "defined in this repo's .agents/.mcp.json; not auto-run. \
+                             Copy it into your own config to trust and enable it."
+                                .to_string(),
+                        )
                     } else {
                         match probed {
                             Some(Ok(tools)) => ("ok".to_string(), format!("{tools} tools")),
@@ -3844,7 +3855,10 @@ impl Engine {
             .store
             .workspace(&session.workspace_id)?
             .map(|ws| PathBuf::from(ws.path));
-        let configs = crate::mcp::discover_configs(
+        // Only trusted (user-config) servers are handed to the vendor CLI:
+        // it would otherwise spawn a cloned repo's command with the expanded
+        // environment, same RCE/exfiltration risk as the native path.
+        let configs = crate::mcp::trusted_configs(
             self.config_dir.as_deref(),
             workspace_root.as_deref(),
             Path::new(&session.worktree_path),
