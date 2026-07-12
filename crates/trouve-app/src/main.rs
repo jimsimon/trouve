@@ -582,8 +582,8 @@ fn main() -> anyhow::Result<()> {
     }
     {
         let tx = tx.clone();
-        window.on_archived_filter_toggled(move || {
-            let _ = tx.send(UiCommand::ToggleArchivedFilter);
+        window.on_archived_filter_toggled(move |row| {
+            let _ = tx.send(UiCommand::ToggleArchivedFilter { row: row as usize });
         });
     }
 

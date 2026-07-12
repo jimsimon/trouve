@@ -24,6 +24,8 @@ pub struct NavRowData {
     pub expanded: bool,
     /// Session is processing a prompt right now (activity indicator).
     pub busy: bool,
+    /// Workspace headers: this workspace shows its archived sessions.
+    pub show_archived: bool,
 }
 
 /// Bring the window to the front (notification clicks). Wayland
@@ -99,6 +101,7 @@ pub fn set_nav(ui: &Ui, rows: Vec<NavRowData>) {
                 archived: r.archived,
                 expanded: r.expanded,
                 busy: r.busy,
+                show_archived: r.show_archived,
             })
             .collect();
         ui.set_nav_rows(ModelRc::new(VecModel::from(items)));
@@ -364,11 +367,6 @@ pub fn set_center_screen(ui: &Ui, screen: i32) {
 /// Right-panel tab: 0 = Diff, 1 = Files.
 pub fn set_right_tab(ui: &Ui, tab: i32) {
     let _ = ui.upgrade_in_event_loop(move |ui| ui.set_right_tab(tab));
-}
-
-/// Session-list filter: whether archived sessions are shown.
-pub fn set_show_archived(ui: &Ui, show: bool) {
-    let _ = ui.upgrade_in_event_loop(move |ui| ui.set_show_archived(show));
 }
 
 /// Restore the chat scroll offset (viewport-y; 0 or negative).

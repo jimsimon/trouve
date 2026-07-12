@@ -43,8 +43,11 @@ pub enum UiCommand {
     SessionDelete {
         row: usize,
     },
-    /// Flip the "show archived sessions" filter.
-    ToggleArchivedFilter,
+    /// Flip the "show archived sessions" filter of one workspace (by the
+    /// nav row of its header, where the funnel menu lives).
+    ToggleArchivedFilter {
+        row: usize,
+    },
     /// Quit once all running agent turns complete.
     QuitWhenIdle,
     /// Native folder picker → register the chosen directory as a workspace.
@@ -369,8 +372,9 @@ struct Controller {
     current_session: Option<usize>,
     archived_expanded: HashSet<String>,
     collapsed_workspaces: HashSet<String>,
-    /// Session-list filter: include archived sessions (default hidden).
-    show_archived: bool,
+    /// Session-list filter: workspaces showing their archived sessions
+    /// (each workspace header's funnel menu toggles its own entry).
+    show_archived: HashSet<String>,
     /// Quit once every agent turn finishes (armed from the quit dialog).
     quit_when_idle: bool,
 
@@ -532,7 +536,7 @@ pub async fn run(
         current_session: None,
         archived_expanded: HashSet::new(),
         collapsed_workspaces: HashSet::new(),
-        show_archived: false,
+        show_archived: HashSet::new(),
         quit_when_idle: false,
         threads: Vec::new(),
         current_thread: None,
@@ -797,10 +801,12 @@ impl Controller {
         let mut nav = Vec::new();
         for (wi, ws) in self.workspaces.iter().enumerate() {
             let expanded = !self.collapsed_workspaces.contains(&ws.id);
+            let show_archived = self.show_archived.contains(&ws.id);
             rows.push(NavRowData {
                 kind: 0,
                 title: ws.name.clone(),
                 expanded,
+                show_archived,
                 ..Default::default()
             });
             nav.push(NavEntry::Workspace(wi));
@@ -824,12 +830,12 @@ impl Controller {
                     session_index: i as i32,
                     selected: self.current_session == Some(i),
                     archived: false,
-                    expanded: false,
                     busy: self.busy_sessions.contains(&session.id),
+                    ..Default::default()
                 });
                 nav.push(NavEntry::Session(i));
             }
-            if archived_count > 0 && self.show_archived {
+            if archived_count > 0 && show_archived {
                 let expanded = self.archived_expanded.contains(&ws.id);
                 rows.push(NavRowData {
                     kind: 2,
@@ -850,8 +856,8 @@ impl Controller {
                             session_index: i as i32,
                             selected: self.current_session == Some(i),
                             archived: true,
-                            expanded: false,
                             busy: self.busy_sessions.contains(&session.id),
+                            ..Default::default()
                         });
                         nav.push(NavEntry::Session(i));
                     }
@@ -2482,10 +2488,16 @@ impl Controller {
                     self.reload_sessions().await?;
                 }
             }
-            UiCommand::ToggleArchivedFilter => {
-                self.show_archived = !self.show_archived;
-                ui::set_show_archived(&self.ui, self.show_archived);
-                self.push_nav();
+            UiCommand::ToggleArchivedFilter { row } => {
+                if let Some(NavEntry::Workspace(wi)) = self.nav.get(row)
+                    && let Some(ws) = self.workspaces.get(*wi)
+                {
+                    let id = ws.id.clone();
+                    if !self.show_archived.remove(&id) {
+                        self.show_archived.insert(id);
+                    }
+                    self.push_nav();
+                }
             }
             UiCommand::SessionDelete { row } => {
                 if let Some(i) = self.nav_session(row) {
