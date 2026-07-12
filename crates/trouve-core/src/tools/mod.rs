@@ -8,6 +8,7 @@
 mod fs;
 mod glob;
 mod grep;
+mod patch;
 mod search;
 mod shell;
 mod todo;
@@ -123,6 +124,7 @@ impl LocalToolExecutor {
                 Arc::new(fs::ReadFile),
                 Arc::new(fs::WriteFile),
                 Arc::new(fs::EditFile),
+                Arc::new(patch::ApplyPatch),
                 Arc::new(fs::ListDir),
                 Arc::new(glob::Glob),
                 Arc::new(shell::Shell { jobs: jobs.clone() }),
