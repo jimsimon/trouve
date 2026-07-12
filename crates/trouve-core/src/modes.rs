@@ -58,6 +58,8 @@ pub fn builtin_modes() -> Vec<AgentMode> {
                 "find_related".into(),
                 "todo_write".into(),
                 "shell".into(),
+                "shell_output".into(),
+                "shell_kill".into(),
             ],
             read_only: true,
             default_permission_mode: PermissionMode::Ask,
