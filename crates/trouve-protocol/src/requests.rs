@@ -811,6 +811,20 @@ pub struct UpsertAutomationRequest {
     pub enabled: bool,
 }
 
+/// A pre-canned automation for a common development task
+/// (`GET /v1/automations/templates`). Clients use these to pre-fill the
+/// create form; the user still picks the workspace and can edit anything.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct AutomationTemplate {
+    pub id: String,
+    pub name: String,
+    /// One-line summary shown in template pickers.
+    pub description: String,
+    pub prompt: String,
+    /// Suggested schedule (editable like the rest).
+    pub schedule: AutomationSchedule,
+}
+
 /// State of a CLI install started with `POST /v1/clis/{id}/install`.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct CliInstallStatus {

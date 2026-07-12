@@ -244,6 +244,7 @@ pub enum UiCommand {
     RefreshAutomations,
     /// Internal: the automations fetch finished.
     AutomationsLoaded(Result<Vec<trouve_protocol::Automation>, String>),
+    AutomationTemplatesLoaded(Vec<trouve_protocol::AutomationTemplate>),
     /// Create (id "") or update an automation from the form fields.
     SaveAutomation {
         id: String,
@@ -396,6 +397,9 @@ struct Controller {
     /// Automations, as last fetched (kept so pause/resume can resend the
     /// full definition).
     automations: Vec<trouve_protocol::Automation>,
+    /// Pre-canned automation templates (static server catalog, fetched on
+    /// first open of the screen).
+    automation_templates: Vec<trouve_protocol::AutomationTemplate>,
     /// PRs detected for the current session's branch, and the one shown.
     prs: Vec<trouve_protocol::PrInfo>,
     pr_selected: usize,
@@ -537,6 +541,7 @@ pub async fn run(
         local_downloaded: None,
         local_search: Vec::new(),
         automations: Vec::new(),
+        automation_templates: Vec::new(),
         prs: Vec::new(),
         pr_selected: 0,
         pr_error: String::new(),
@@ -2294,6 +2299,38 @@ impl Controller {
         ui::set_automations(&self.ui, rows, names, ids);
     }
 
+    /// Render the cached template catalog into the screen.
+    fn push_automation_templates(&self) {
+        let templates = self
+            .automation_templates
+            .iter()
+            .map(|t| {
+                let mut days = vec![false; 7];
+                for d in &t.schedule.days {
+                    if let Some(flag) = days.get_mut(*d as usize) {
+                        *flag = true;
+                    }
+                }
+                ui::AutomationTemplateView {
+                    id: t.id.clone(),
+                    name: t.name.clone(),
+                    description: t.description.clone(),
+                    schedule_line: schedule_summary(&t.schedule),
+                    prompt: t.prompt.clone(),
+                    kind: t.schedule.kind.clone(),
+                    minute_text: t.schedule.minute.to_string(),
+                    time: if t.schedule.time.is_empty() {
+                        "09:00".into()
+                    } else {
+                        t.schedule.time.clone()
+                    },
+                    days,
+                }
+            })
+            .collect();
+        ui::set_automation_templates(&self.ui, templates);
+    }
+
     /// React to a server-scope event. Only fresh envelopes count — on
     /// (re)connect the stream replays history, which must not trigger a
     /// reload storm.
@@ -3613,6 +3650,17 @@ impl Controller {
                 ui::set_automations_status(&self.ui, String::new());
                 self.push_automations(); // last known list while the fetch runs
                 self.refresh_automations();
+                // Templates are a static catalog: fetch once, silently — the
+                // screen just has no template section if this fails.
+                if self.automation_templates.is_empty() {
+                    let client = self.client.clone();
+                    let tx = self.tx.clone();
+                    tokio::spawn(async move {
+                        if let Ok(templates) = client.automation_templates().await {
+                            let _ = tx.send(UiCommand::AutomationTemplatesLoaded(templates));
+                        }
+                    });
+                }
                 ui::set_center_screen(&self.ui, 4);
             }
             UiCommand::CloseAutomations => {
@@ -3633,6 +3681,10 @@ impl Controller {
                 }
                 Err(e) => ui::set_automations_status(&self.ui, format!("loading failed: {e}")),
             },
+            UiCommand::AutomationTemplatesLoaded(templates) => {
+                self.automation_templates = templates;
+                self.push_automation_templates();
+            }
             UiCommand::SaveAutomation {
                 id,
                 name,

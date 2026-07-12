@@ -139,6 +139,7 @@ impl IntoResponse for ApiError {
         mcp_server_logs,
         subscription_health,
         list_automations,
+        automation_templates,
         create_automation,
         update_automation,
         delete_automation,
@@ -202,6 +203,7 @@ impl IntoResponse for ApiError {
         trouve_protocol::SubscriptionWindow,
         Automation,
         trouve_protocol::AutomationSchedule,
+        trouve_protocol::AutomationTemplate,
         UpsertAutomationRequest,
         ErrorBody,
         trouve_protocol::EventEnvelope,
@@ -302,6 +304,9 @@ pub fn build_router(engine: Arc<Engine>) -> Router {
             "/v1/automations",
             get(list_automations).post(create_automation),
         )
+        // Static segment must not collide with `{id}`: axum's router gives
+        // literal segments precedence, so /automations/templates wins.
+        .route("/v1/automations/templates", get(automation_templates))
         .route(
             "/v1/automations/{id}",
             axum::routing::put(update_automation).delete(delete_automation),
@@ -816,6 +821,13 @@ async fn list_automations(
     State(engine): State<Arc<Engine>>,
 ) -> Result<Json<Vec<Automation>>, ApiError> {
     Ok(Json(engine.list_automations()?))
+}
+
+/// Static catalog of pre-canned automations for common development tasks.
+#[utoipa::path(get, path = "/v1/automations/templates",
+    responses((status = 200, body = [trouve_protocol::AutomationTemplate])))]
+async fn automation_templates() -> Json<Vec<trouve_protocol::AutomationTemplate>> {
+    Json(trouve_core::automations::templates())
 }
 
 #[utoipa::path(post, path = "/v1/automations", request_body = UpsertAutomationRequest,

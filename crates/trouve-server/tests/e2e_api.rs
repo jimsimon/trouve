@@ -1963,6 +1963,55 @@ async fn terminal_shell_in_session_worktree() {
     assert_ne!(fresh["id"], *term_id);
 }
 
+/// The automation-template catalog: non-empty, every entry ready to
+/// pre-fill the create form, and the static /templates segment doesn't
+/// shadow (or get shadowed by) the /{id} routes.
+#[tokio::test]
+async fn automation_templates_catalog() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Store::open(&tmp.path().join("db/trouve.db")).unwrap();
+    let engine = Arc::new(
+        Engine::new(store, tmp.path().join("data"), &Config::default()).with_config_dir(None),
+    );
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let router = trouve_server::build_router(engine);
+    tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+    let base = format!("http://{addr}/v1");
+    let client = reqwest::Client::new();
+
+    let templates: Vec<serde_json::Value> = client
+        .get(format!("{base}/automations/templates"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(!templates.is_empty());
+    for t in &templates {
+        assert_ne!(t["id"], "");
+        assert_ne!(t["name"], "");
+        assert_ne!(t["description"], "");
+        assert_ne!(t["prompt"], "");
+        assert!(["hourly", "daily", "weekly"].contains(&t["schedule"]["kind"].as_str().unwrap()));
+    }
+
+    // The parameterized routes still resolve: an unknown automation id
+    // 404s rather than being eaten by the static /templates route.
+    let resp = client
+        .put(format!("{base}/automations/nope"))
+        .json(&serde_json::json!({
+            "name": "x", "prompt": "y", "workspace_id": "w",
+            "schedule": {"kind": "daily", "time": "09:00"}, "enabled": true
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 404);
+}
+
 /// The local-models enable toggle and the install-lifecycle endpoints:
 /// disabling unregisters the "local" provider (persisted), cancels 404
 /// when nothing is in flight, uninstall is a no-op for absent managed

@@ -43,7 +43,9 @@ pub use requests::*;
 // starts the device flow (all additive).
 // 0.14: session activity — Session.active flag and the session.activity
 // server event for live "processing a prompt" indicators (all additive).
-pub const PROTOCOL_VERSION: &str = "0.14";
+// 0.15: automation templates — GET /v1/automations/templates returns
+// pre-canned automations for common development tasks (additive).
+pub const PROTOCOL_VERSION: &str = "0.15";
 
 pub type WorkspaceId = String;
 pub type SessionId = String;

@@ -994,6 +994,40 @@ pub fn set_automations(
 }
 
 /// Error/status line for the automations screen.
+/// Plain-data mirror of the `AutomationTemplateItem` Slint struct.
+pub struct AutomationTemplateView {
+    pub id: String,
+    pub name: String,
+    pub description: String,
+    pub schedule_line: String,
+    pub prompt: String,
+    pub kind: String,
+    pub minute_text: String,
+    pub time: String,
+    /// 7 flags, Monday first.
+    pub days: Vec<bool>,
+}
+
+pub fn set_automation_templates(ui: &Ui, templates: Vec<AutomationTemplateView>) {
+    let _ = ui.upgrade_in_event_loop(move |ui| {
+        let items: Vec<crate::AutomationTemplateItem> = templates
+            .into_iter()
+            .map(|t| crate::AutomationTemplateItem {
+                id: SharedString::from(t.id.as_str()),
+                name: SharedString::from(t.name.as_str()),
+                description: SharedString::from(t.description.as_str()),
+                schedule_line: SharedString::from(t.schedule_line.as_str()),
+                prompt: SharedString::from(t.prompt.as_str()),
+                kind: SharedString::from(t.kind.as_str()),
+                minute_text: SharedString::from(t.minute_text.as_str()),
+                time: SharedString::from(t.time.as_str()),
+                days: ModelRc::new(VecModel::from(t.days)),
+            })
+            .collect();
+        ui.set_automation_templates(ModelRc::new(VecModel::from(items)));
+    });
+}
+
 pub fn set_automations_status(ui: &Ui, status: String) {
     let _ = ui.upgrade_in_event_loop(move |ui| {
         ui.set_automations_status(SharedString::from(status.as_str()));

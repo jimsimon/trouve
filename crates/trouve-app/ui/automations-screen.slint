@@ -29,6 +29,22 @@ export struct AutomationItem {
     days: [bool],       // 7 flags, Monday first
 }
 
+// A pre-canned automation for a common development task. Picking one
+// pre-fills the add form; the schedule fields ride along like they do on
+// AutomationItem so no round-trip is needed.
+export struct AutomationTemplateItem {
+    id: string,
+    name: string,
+    description: string,
+    // "Weekly · Mon at 06:00"
+    schedule-line: string,
+    prompt: string,
+    kind: string,        // "hourly" / "daily" / "weekly"
+    minute-text: string,
+    time: string,
+    days: [bool],        // 7 flags, Monday first
+}
+
 // A small Mon/Tue/… toggle used by the weekly schedule editor.
 component DayPill inherits Rectangle {
     in property <string> label;
@@ -55,6 +71,8 @@ export component AutomationsScreen inherits Rectangle {
     background: Theme.c.win-bg;
 
     in property <[AutomationItem]> automations;
+    // Pre-canned starting points, shown while the form is closed.
+    in property <[AutomationTemplateItem]> templates;
     // Error/status line ("" = nothing to say).
     in property <string> status: "";
     // Workspace picker (parallel arrays).
@@ -428,6 +446,88 @@ export component AutomationsScreen inherits Rectangle {
                                                 root.kind-name(), root.form-minute,
                                                 root.form-time, root.days-csv(),
                                                 root.form-enabled);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
+                        // ---------------- templates ----------------
+                        // Pre-canned starting points for common development
+                        // chores. Hidden while the form is up — picking one
+                        // is an alternative way to open it.
+                        if !root.form-open && root.templates.length > 0
+                            && root.workspace-names.length > 0: VerticalLayout {
+                            spacing: 8px;
+                            Text {
+                                text: "Start from a template";
+                                color: Theme.c.text-hi;
+                                font-size: Theme.fs(14px);
+                                font-weight: 700;
+                            }
+                            Text {
+                                text: "Common development chores, ready to schedule. Picking one just pre-fills the form — edit anything before saving.";
+                                color: Theme.c.text-soft;
+                                font-size: Theme.fs(11px);
+                                wrap: word-wrap;
+                            }
+                            for t in root.templates: Rectangle {
+                                background: Theme.c.surface;
+                                border-radius: 6px;
+                                height: tpl-row.preferred-height + 20px;
+                                tpl-row := HorizontalLayout {
+                                    padding: 10px;
+                                    spacing: 10px;
+                                    VerticalLayout {
+                                        spacing: 3px;
+                                        horizontal-stretch: 1;
+                                        HorizontalLayout {
+                                            spacing: 8px;
+                                            alignment: start;
+                                            Text {
+                                                text: t.name;
+                                                color: Theme.c.text-hi;
+                                                font-size: Theme.fs(13px);
+                                                font-weight: 700;
+                                                overflow: elide;
+                                            }
+                                            Text {
+                                                text: t.schedule-line;
+                                                color: Theme.c.text-dim;
+                                                font-size: Theme.fs(11px);
+                                                vertical-alignment: center;
+                                            }
+                                        }
+                                        Text {
+                                            text: t.description;
+                                            color: Theme.c.text-mid;
+                                            font-size: Theme.fs(11px);
+                                            wrap: word-wrap;
+                                        }
+                                    }
+                                    VerticalLayout {
+                                        alignment: center;
+                                        Button {
+                                            text: "Use";
+                                            clicked => {
+                                                root.form-id = "";
+                                                root.form-name = t.name;
+                                                root.form-prompt = t.prompt;
+                                                root.form-workspace-index = 0;
+                                                root.form-kind-index = t.kind == "hourly" ? 0
+                                                    : t.kind == "daily" ? 1 : 2;
+                                                root.form-minute = t.minute-text;
+                                                root.form-time = t.time;
+                                                root.form-day-0 = t.days[0];
+                                                root.form-day-1 = t.days[1];
+                                                root.form-day-2 = t.days[2];
+                                                root.form-day-3 = t.days[3];
+                                                root.form-day-4 = t.days[4];
+                                                root.form-day-5 = t.days[5];
+                                                root.form-day-6 = t.days[6];
+                                                root.form-enabled = true;
+                                                root.form-open = true;
+                                            }
                                         }
                                     }
                                 }

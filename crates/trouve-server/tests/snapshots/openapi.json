@@ -7,7 +7,7 @@
       "name": "MIT",
       "identifier": "MIT"
     },
-    "version": "0.14"
+    "version": "0.15"
   },
   "paths": {
     "/v1/approvals": {
@@ -140,6 +140,28 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/automations/templates": {
+      "get": {
+        "tags": [],
+        "summary": "Static catalog of pre-canned automations for common development tasks.",
+        "operationId": "automation_templates",
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/AutomationTemplate"
+                  }
                 }
               }
             }
@@ -2975,6 +2997,36 @@
           "time": {
             "type": "string",
             "description": "Daily/weekly: time of day as \"HH:MM\" (24h)."
+          }
+        }
+      },
+      "AutomationTemplate": {
+        "type": "object",
+        "description": "A pre-canned automation for a common development task\n(`GET /v1/automations/templates`). Clients use these to pre-fill the\ncreate form; the user still picks the workspace and can edit anything.",
+        "required": [
+          "id",
+          "name",
+          "description",
+          "prompt",
+          "schedule"
+        ],
+        "properties": {
+          "description": {
+            "type": "string",
+            "description": "One-line summary shown in template pickers."
+          },
+          "id": {
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          },
+          "prompt": {
+            "type": "string"
+          },
+          "schedule": {
+            "$ref": "#/components/schemas/AutomationSchedule",
+            "description": "Suggested schedule (editable like the rest)."
           }
         }
       },

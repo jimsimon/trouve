@@ -12,7 +12,7 @@
 //! boundaries) live and what the tests pin down.
 
 use chrono::{DateTime, Datelike, Duration, Local, NaiveTime, TimeZone, Timelike};
-use trouve_protocol::AutomationSchedule;
+use trouve_protocol::{AutomationSchedule, AutomationTemplate};
 
 /// Check a schedule coming in from a client. Returns a human-readable
 /// complaint, or None when it is usable.
@@ -104,6 +104,106 @@ pub fn next_run(schedule: &AutomationSchedule, after: DateTime<Local>) -> Option
 /// (fall-back).
 fn local_at(day: chrono::NaiveDate, time: NaiveTime) -> Option<DateTime<Local>> {
     Local.from_local_datetime(&day.and_time(time)).earliest()
+}
+
+/// Pre-canned automations for common development tasks. Static catalog:
+/// clients pre-fill the create form from these, the user picks the
+/// workspace and edits whatever they like. Suggested times sit in the
+/// early morning (or after hours for the digest) and are spread across
+/// weekdays so a workspace using several doesn't fire them all at once.
+pub fn templates() -> Vec<AutomationTemplate> {
+    fn weekly(day: u8, time: &str) -> AutomationSchedule {
+        AutomationSchedule {
+            kind: "weekly".into(),
+            minute: 0,
+            time: time.into(),
+            days: vec![day],
+        }
+    }
+    let t = |id: &str, name: &str, description: &str, prompt: &str, schedule| AutomationTemplate {
+        id: id.into(),
+        name: name.into(),
+        description: description.into(),
+        prompt: prompt.into(),
+        schedule,
+    };
+    vec![
+        t(
+            "dependency-updates",
+            "Dependency updates",
+            "Apply safe dependency updates weekly and flag the breaking ones.",
+            "Check this project's dependencies for available updates. Apply safe patch and \
+             minor updates, run the full test suite to confirm nothing breaks, and summarize \
+             what changed. List major-version updates separately with a short note on their \
+             breaking changes instead of applying them.",
+            weekly(0, "06:00"),
+        ),
+        t(
+            "security-audit",
+            "Security audit",
+            "Scan dependencies for known vulnerabilities and fix what's safe.",
+            "Audit this project's dependencies for known security vulnerabilities using the \
+             ecosystem's audit tooling (cargo audit, npm audit, pip-audit, or equivalent — \
+             install it if needed). For each finding, report the severity and whether an \
+             upgrade fixes it. Apply the straightforward fix upgrades and run the test suite; \
+             flag anything that would need a breaking change or a code rework.",
+            weekly(2, "06:00"),
+        ),
+        t(
+            "lint-sweep",
+            "Lint & warning sweep",
+            "Fix low-risk linter and compiler warnings before they pile up.",
+            "Run this project's linters and build with warnings enabled. Fix the low-risk \
+             findings — unused imports, dead code, deprecated APIs with drop-in replacements \
+             — run the test suite, and summarize what you fixed. Leave anything that changes \
+             behavior or needs human judgment as a report item instead.",
+            weekly(1, "06:00"),
+        ),
+        t(
+            "test-coverage",
+            "Test coverage gaps",
+            "Find weakly-tested core logic and add the highest-value tests.",
+            "Identify important code paths in this project with weak or missing test \
+             coverage — focus on error handling and edge cases in core logic rather than \
+             chasing a coverage number. Write tests for the highest-value gaps you find and \
+             make sure the whole suite passes.",
+            weekly(3, "06:00"),
+        ),
+        t(
+            "docs-drift",
+            "Documentation drift check",
+            "Keep README and docs in step with the code they describe.",
+            "Compare the README and other documentation against the current code: setup \
+             steps, commands, flags, configuration options, and API examples. Fix anything \
+             outdated or wrong, and note gaps where significant features are undocumented.",
+            weekly(4, "06:00"),
+        ),
+        t(
+            "todo-triage",
+            "TODO triage report",
+            "A weekly report of TODO/FIXME comments — quick wins, stale, or real bugs.",
+            "Collect the TODO, FIXME, and HACK comments in this codebase. Group them by \
+             area, use git blame to note how long each has existed, and produce a \
+             prioritized report: which are quick wins, which are stale and safe to delete, \
+             and which hide real bugs. Don't change any code.",
+            weekly(4, "07:00"),
+        ),
+        t(
+            "daily-digest",
+            "Daily activity digest",
+            "An end-of-day summary of what landed in the repository.",
+            "Summarize the work landed in this repository over the last 24 hours: read the \
+             commit log and diffs since yesterday and write a short digest grouped by area — \
+             what changed, why it matters, and anything that looks risky or needs follow-up. \
+             Don't change any code.",
+            AutomationSchedule {
+                kind: "daily".into(),
+                minute: 0,
+                time: "17:30".into(),
+                days: vec![],
+            },
+        ),
+    ]
 }
 
 /// Human summary for lists: "Hourly at :15", "Daily at 09:00",
@@ -219,6 +319,20 @@ mod tests {
         // Sunday-only, asked Monday → next Sunday (day 12).
         let next = next_run(&weekly("21:30", &[6]), at(2026, 7, 6, 8, 0)).unwrap();
         assert_eq!((next.day(), next.hour(), next.minute()), (12, 21, 30));
+    }
+
+    #[test]
+    fn templates_are_valid_and_unique() {
+        let templates = templates();
+        assert!(!templates.is_empty());
+        let mut ids: Vec<&str> = templates.iter().map(|t| t.id.as_str()).collect();
+        ids.sort_unstable();
+        ids.dedup();
+        assert_eq!(ids.len(), templates.len(), "duplicate template ids");
+        for t in &templates {
+            assert!(validate(&t.schedule).is_none(), "template {} invalid", t.id);
+            assert!(!t.name.is_empty() && !t.description.is_empty() && !t.prompt.is_empty());
+        }
     }
 
     #[test]

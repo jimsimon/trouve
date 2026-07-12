@@ -729,6 +729,11 @@ impl ProtocolClient {
         self.get_json("/automations").await
     }
 
+    /// Pre-canned automations for common development tasks (static catalog).
+    pub async fn automation_templates(&self) -> Result<Vec<trouve_protocol::AutomationTemplate>> {
+        self.get_json("/automations/templates").await
+    }
+
     pub async fn create_automation(
         &self,
         req: &trouve_protocol::UpsertAutomationRequest,
