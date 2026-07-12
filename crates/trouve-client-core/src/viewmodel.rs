@@ -91,6 +91,12 @@ pub struct ThreadViewModel {
     /// The model that ran each turn ("cursor/claude-fable-5"), from
     /// turn.started — shown in the agent card header.
     pub turn_models: HashMap<u64, String>,
+    /// When each turn started (the turn.started envelope timestamp);
+    /// paired with the completion envelope to compute wall-clock duration.
+    pub turn_started_at: HashMap<u64, chrono::DateTime<chrono::Utc>>,
+    /// How long each finished turn took, in milliseconds — shown in the
+    /// agent card header next to the token summary.
+    pub turn_duration_ms: HashMap<u64, u64>,
     /// Slash commands / skills the vendor harness accepts in prompts
     /// (latest announcement wins) — prompt-box completions.
     pub commands: Vec<trouve_protocol::CommandInfo>,
@@ -124,6 +130,15 @@ impl ThreadViewModel {
         }
     }
 
+    /// Wall-clock time of a finished turn, from its started/ended envelope
+    /// timestamps (persisted, so replayed history keeps its durations).
+    fn record_turn_duration(&mut self, turn: u64, ended: chrono::DateTime<chrono::Utc>) {
+        if let Some(started) = self.turn_started_at.get(&turn) {
+            let ms = (ended - *started).num_milliseconds().max(0) as u64;
+            self.turn_duration_ms.insert(turn, ms);
+        }
+    }
+
     /// Apply one event. Returns the index of the item that changed (for
     /// minimal UI updates), or `None` when nothing visible changed.
     pub fn apply(&mut self, envelope: &EventEnvelope) -> Option<usize> {
@@ -132,6 +147,7 @@ impl ThreadViewModel {
             Event::TurnStarted { turn, model, .. } => {
                 self.turn_running = true;
                 self.turn_models.insert(*turn, model.clone());
+                self.turn_started_at.insert(*turn, envelope.ts);
                 self.items.push(ChatItem::TurnStatus {
                     turn: *turn,
                     state: TurnState::Running,
@@ -352,6 +368,7 @@ impl ThreadViewModel {
                 self.finish_thinking();
                 self.pending_questions.clear();
                 self.last_usage = Some(usage.clone());
+                self.record_turn_duration(*turn, envelope.ts);
                 let idx = self.items.iter().rposition(|i| {
                     matches!(i, ChatItem::TurnStatus { turn: t, state: TurnState::Running } if t == turn)
                 });
@@ -370,6 +387,7 @@ impl ThreadViewModel {
                 self.compacting = false;
                 self.finish_thinking();
                 self.pending_questions.clear();
+                self.record_turn_duration(*turn, envelope.ts);
                 let idx = self.items.iter().rposition(|i| {
                     matches!(i, ChatItem::TurnStatus { turn: t, state: TurnState::Running } if t == turn)
                 });
@@ -406,6 +424,27 @@ mod tests {
 
     fn chrono_now() -> chrono::DateTime<chrono::Utc> {
         chrono::Utc::now()
+    }
+
+    #[test]
+    fn turn_duration_computed_from_envelope_timestamps() {
+        let mut vm = ThreadViewModel::new();
+        let start = chrono_now();
+        let mut started = env(Event::TurnStarted {
+            turn: 1,
+            mode: "code".into(),
+            model: "m".into(),
+        });
+        started.ts = start;
+        vm.apply(&started);
+        let mut completed = env(Event::TurnCompleted {
+            turn: 1,
+            usage: Usage::default(),
+            checkpoint_id: None,
+        });
+        completed.ts = start + chrono::Duration::milliseconds(12_400);
+        vm.apply(&completed);
+        assert_eq!(vm.turn_duration_ms.get(&1), Some(&12_400));
     }
 
     #[test]

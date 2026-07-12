@@ -463,7 +463,7 @@ pub fn chat_rows(
                     .iter()
                     .any(|it| matches!(it, ChatItem::Assistant { turn: t, .. } if t == turn));
                 let meta = match (last_of_turn, turn_state(vm, *turn)) {
-                    (true, Some(TurnState::Completed { usage })) => turn_summary(usage),
+                    (true, Some(TurnState::Completed { usage })) => turn_meta(vm, *turn, usage),
                     _ => String::new(),
                 };
                 let header = ChatRowData {
@@ -537,7 +537,7 @@ pub fn chat_rows(
                 // Orphan items mean no assistant item in this turn, so this
                 // card is where the turn summary lands once it completes.
                 let meta = match turn_state(vm, turn) {
-                    Some(TurnState::Completed { usage }) => turn_summary(usage),
+                    Some(TurnState::Completed { usage }) => turn_meta(vm, turn, usage),
                     _ => String::new(),
                 };
                 let header = ChatRowData {
@@ -1603,6 +1603,32 @@ fn plain_text(md: &str) -> String {
         .join("\n")
 }
 
+/// Full turn-header meta: the token/cost summary plus how long the turn
+/// took, when the viewmodel has both its start and end timestamps.
+fn turn_meta(vm: &ThreadViewModel, turn: u64, usage: &trouve_protocol::Usage) -> String {
+    let mut s = turn_summary(usage);
+    if let Some(ms) = vm.turn_duration_ms.get(&turn) {
+        s.push_str(&format!(" · {}", human_duration(*ms)));
+    }
+    s
+}
+
+/// "850ms", "12s", "1m 05s", "1h 02m" — coarser units as turns get longer.
+fn human_duration(ms: u64) -> String {
+    let secs = ms / 1000;
+    if secs < 1 {
+        return format!("{ms}ms");
+    }
+    if secs < 60 {
+        return format!("{secs}s");
+    }
+    let mins = secs / 60;
+    if mins < 60 {
+        return format!("{mins}m {:02}s", secs % 60);
+    }
+    format!("{}h {:02}m", mins / 60, mins % 60)
+}
+
 /// Turn header: token counts, plus the dollar cost for per-use APIs.
 /// Subscription backends never report a cost, so nothing shows there.
 fn turn_summary(usage: &trouve_protocol::Usage) -> String {
@@ -1785,6 +1811,47 @@ mod tests {
         assert_eq!(turn_summary(&usage), "1200 in / 340 out tokens");
         usage.cost_usd = Some(0.0231);
         assert_eq!(turn_summary(&usage), "1200 in / 340 out tokens · $0.0231");
+    }
+
+    #[test]
+    fn human_duration_scales_units() {
+        assert_eq!(human_duration(850), "850ms");
+        assert_eq!(human_duration(12_400), "12s");
+        assert_eq!(human_duration(65_000), "1m 05s");
+        assert_eq!(human_duration(3_720_000), "1h 02m");
+    }
+
+    #[test]
+    fn turn_header_includes_response_duration() {
+        let mut vm = ThreadViewModel {
+            items: vec![
+                ChatItem::Assistant {
+                    turn: 1,
+                    content: "answer".into(),
+                    complete: true,
+                },
+                ChatItem::TurnStatus {
+                    turn: 1,
+                    state: TurnState::Completed {
+                        usage: Default::default(),
+                    },
+                },
+            ],
+            ..Default::default()
+        };
+        vm.turn_duration_ms.insert(1, 12_400);
+        let (rows, _) = chat_rows(
+            &vm,
+            &HashSet::new(),
+            &HashSet::new(),
+            &HashSet::new(),
+            &HashMap::new(),
+        );
+        let header = rows
+            .iter()
+            .find(|r| r.kind == 7 && r.tool_name == "Agent")
+            .unwrap();
+        assert_eq!(header.meta, "0 in / 0 out tokens · 12s");
     }
 
     #[test]
