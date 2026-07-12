@@ -16,6 +16,7 @@ chrono.workspace = true
 dirs.workspace = true
 futures.workspace = true
 globset = "0.4.18"
+html2text = "0.17.1"
 ignore = "0.4.27"
 octocrab.workspace = true
 portable-pty = "0.9.0"

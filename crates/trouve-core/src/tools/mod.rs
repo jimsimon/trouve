@@ -10,6 +10,7 @@ mod glob;
 mod grep;
 mod search;
 mod shell;
+mod web;
 
 pub use search::{VENDOR_SEARCH_GUIDANCE, gc_index_store_in_background, warm_index_in_background};
 
@@ -123,6 +124,7 @@ impl LocalToolExecutor {
                 Arc::new(glob::Glob),
                 Arc::new(shell::Shell),
                 Arc::new(grep::Grep),
+                Arc::new(web::WebFetch),
                 Arc::new(search::Search {
                     cache: search_cache.clone(),
                 }),
