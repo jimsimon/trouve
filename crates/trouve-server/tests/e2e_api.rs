@@ -3073,7 +3073,14 @@ async fn spawn_session_child_agent_isolated() {
     let child_thread_id = spawn["thread_id"].as_str().unwrap();
     let child_session_id = spawn["session_id"].as_str().unwrap();
     assert_ne!(child_session_id, session["id"].as_str().unwrap());
-    assert_eq!(spawn["based_on"], session["branch"]);
+    // The child is based on the parent's latest checkpoint commit (its
+    // actual work), not the session branch — checkpoints never move the
+    // branch, so basing on the branch would show the child nothing. Expect
+    // a resolved commit hash rather than the branch name.
+    let based_on = spawn["based_on"].as_str().unwrap();
+    assert_ne!(based_on, session["branch"].as_str().unwrap());
+    assert_eq!(based_on.len(), 40, "based_on should be a commit hash: {based_on}");
+    assert!(based_on.chars().all(|c| c.is_ascii_hexdigit()));
     let output = results.iter().find(|(id, _)| *id == "p3").unwrap().1;
     assert_eq!(output["status"], "completed", "{output}");
     assert!(
@@ -3095,7 +3102,9 @@ async fn spawn_session_child_agent_isolated() {
         .await
         .unwrap();
     assert_eq!(child_session["title"], "Sub experiment");
-    assert_eq!(child_session["base_ref"], session["branch"]);
+    // base_ref is the parent's checkpoint commit (see based_on above), not
+    // the branch name.
+    assert_eq!(child_session["base_ref"], based_on);
     assert_ne!(child_session["branch"], session["branch"]);
     let child_worktree = child_session["worktree_path"].as_str().unwrap();
     assert_ne!(child_worktree, session["worktree_path"].as_str().unwrap());

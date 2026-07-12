@@ -3469,7 +3469,7 @@ impl Engine {
         let all_modes = modes::resolve_modes(self.config_dir.as_deref(), Some(Path::new(&ws.path)));
         let mode = modes::find_mode(&all_modes, &thread.mode)
             .cloned()
-            .unwrap_or_else(|| modes::builtin_modes().remove(0));
+            .unwrap_or_else(modes::fallback_mode);
 
         // Serialize worktree mutations across the session's threads — except
         // agent-spawned children in read-only modes: they can't write, and
@@ -3558,11 +3558,21 @@ impl Engine {
         specs.push(ask_question_spec());
         specs.push(search_transcript_spec());
         // Spawn tools are for top-level agents only: children don't get to
-        // spawn grandchildren (also enforced at execution).
+        // spawn grandchildren (also enforced at execution). They also respect
+        // the mode's tool policy, so restrictive/read-only modes that don't
+        // list them can't create branches or child agents.
+        let spawn_allowed =
+            |name: &str| mode.allowed_tools.is_empty() || mode.allowed_tools.iter().any(|t| t == name);
         if self.store.spawn_parent(&thread.id)?.is_none() {
-            specs.push(spawn_thread_spec());
-            specs.push(spawn_session_spec());
-            specs.push(spawn_output_spec());
+            if spawn_allowed("spawn_thread") {
+                specs.push(spawn_thread_spec());
+            }
+            if spawn_allowed("spawn_session") {
+                specs.push(spawn_session_spec());
+            }
+            if spawn_allowed("spawn_thread") || spawn_allowed("spawn_session") {
+                specs.push(spawn_output_spec());
+            }
         }
 
         let system = context::system_prompt(&mode, self.config_dir.as_deref(), Path::new(&ws.path));
@@ -3999,7 +4009,7 @@ impl Engine {
         let all_modes = modes::resolve_modes(self.config_dir.as_deref(), Some(Path::new(&ws.path)));
         let mode = modes::find_mode(&all_modes, &thread.mode)
             .cloned()
-            .unwrap_or_else(|| modes::builtin_modes().remove(0));
+            .unwrap_or_else(modes::fallback_mode);
         let ctx = ToolCtx {
             worktree: PathBuf::from(&session.worktree_path),
             config_dir: self.config_dir.clone(),
@@ -4779,9 +4789,18 @@ impl Engine {
         }
 
         // Depth guard: one level only. Fan-out stays useful; runaway
-        // recursive spawning does not.
+        // recursive spawning does not. Checked before the mode policy so a
+        // child always gets the depth message regardless of its mode.
         if self.store.spawn_parent(&thread.id)?.is_some() {
             bail!("spawned agents cannot spawn further agents");
+        }
+
+        // Respect the mode's tool policy: a restrictive/read-only mode that
+        // doesn't list the spawn tool can't create branches or child agents
+        // (the specs are already filtered, but a model may still emit the
+        // call — deny it here too).
+        if !(mode.allowed_tools.is_empty() || mode.allowed_tools.iter().any(|t| t == name)) {
+            bail!("{name} is not permitted in {} mode", mode.id);
         }
         let children = self.store.spawned_children(&thread.id)?;
         {
@@ -4838,19 +4857,30 @@ impl Engine {
                         prompt.lines().next().unwrap_or("").chars().take(48).collect();
                     format!("Agent: {snippet}")
                 });
+            // Base the child on the parent's latest checkpoint commit, not
+            // its branch: turn checkpoints are written to hidden refs and
+            // never move the session branch, so basing on the branch would
+            // show the child none of the parent's work. Fall back to the
+            // branch when there is no checkpoint yet.
+            let base_ref = match self.store.latest_checkpoint_seq(&session.id)? {
+                Some(seq) => self
+                    .store
+                    .checkpoint_at(&session.id, seq)?
+                    .map(|c| c.commit_hash)
+                    .unwrap_or_else(|| session.branch.clone()),
+                None => session.branch.clone(),
+            };
             let child_session = self
                 .create_session(CreateSessionRequest {
                     workspace_id: session.workspace_id.clone(),
                     title: Some(title),
-                    // The child sees the parent's committed work (its branch,
-                    // checkpoints included) — not uncommitted changes.
-                    base_ref: Some(session.branch.clone()),
+                    base_ref: Some(base_ref.clone()),
                 })
                 .await
                 .map_err(|e| anyhow!(e.to_string()))?;
             let extra = serde_json::json!({
                 "branch": child_session.branch,
-                "based_on": session.branch,
+                "based_on": base_ref,
                 "worktree": child_session.worktree_path,
             });
             (child_session.id, Some(extra))
