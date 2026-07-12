@@ -95,10 +95,8 @@ impl Tool for WebFetch {
 
         let text = if is_html {
             // Blocking CPU-bound parse; keep it off the async threads.
-            match tokio::task::spawn_blocking(move || {
-                html2text::from_read(bytes.as_slice(), 100)
-            })
-            .await
+            match tokio::task::spawn_blocking(move || html2text::from_read(bytes.as_slice(), 100))
+                .await
             {
                 Ok(Ok(t)) => t,
                 Ok(Err(e)) => return ToolResult::error(format!("cannot render HTML: {e}")),
@@ -109,11 +107,7 @@ impl Tool for WebFetch {
         };
 
         let total_chars = text.chars().count();
-        let page: String = text
-            .chars()
-            .skip(offset)
-            .take(MAX_RETURN_CHARS)
-            .collect();
+        let page: String = text.chars().skip(offset).take(MAX_RETURN_CHARS).collect();
         let truncated = offset + page.chars().count() < total_chars;
         ToolResult::ok(json!({
             "url": final_url,
@@ -153,8 +147,7 @@ mod tests {
                     use tokio::io::{AsyncReadExt, AsyncWriteExt};
                     let mut buf = [0u8; 1024];
                     let _ = sock.read(&mut buf).await;
-                    let body =
-                        "<html><body><h1>Title</h1><p>Hello <b>world</b>.</p></body></html>";
+                    let body = "<html><body><h1>Title</h1><p>Hello <b>world</b>.</p></body></html>";
                     let resp = format!(
                         "HTTP/1.1 200 OK\r\ncontent-type: text/html\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
                         body.len()

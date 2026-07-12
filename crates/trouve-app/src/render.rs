@@ -1352,6 +1352,56 @@ fn tool_row(
         detail.truncate(detail.floor_boundary(4000));
         detail.push('…');
     }
+    // The agent's task list titles as "Todos (done/total)" with the current
+    // item in the header and the full checklist as the expandable detail.
+    // The result holds the full merged list; the args may be a partial
+    // merge update, so they're only the fallback.
+    let base = tool.rsplit("__").next().unwrap_or(tool);
+    if matches!(base, "todo_write" | "TodoWrite") {
+        let todos = result
+            .as_ref()
+            .and_then(|r| r.get("todos"))
+            .and_then(serde_json::Value::as_array)
+            .or_else(|| args.get("todos").and_then(serde_json::Value::as_array));
+        if let Some(todos) = todos.filter(|t| !t.is_empty()) {
+            let field = |t: &serde_json::Value, k: &str| {
+                t.get(k)
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("")
+                    .to_string()
+            };
+            let glyph = |s: &str| match s {
+                "completed" => "✓",
+                "in_progress" => "▸",
+                "cancelled" => "✕",
+                _ => "○",
+            };
+            let checklist = todos
+                .iter()
+                .map(|t| format!("{} {}", glyph(&field(t, "status")), field(t, "content")))
+                .collect::<Vec<_>>()
+                .join("\n");
+            let done = todos
+                .iter()
+                .filter(|t| matches!(field(t, "status").as_str(), "completed" | "cancelled"))
+                .count();
+            let current = todos
+                .iter()
+                .find(|t| field(t, "status") == "in_progress")
+                .map(|t| field(t, "content"))
+                .filter(|c| !c.is_empty());
+            return ChatRowData {
+                kind: 2,
+                tool_name: "Todos".into(),
+                text: current.unwrap_or_else(|| format!("{done}/{} done", todos.len())),
+                meta: format!("{done}/{}", todos.len()),
+                tool_status: tool_status(status),
+                detail: checklist,
+                expanded: expanded.contains(call_id),
+                ..Default::default()
+            };
+        }
+    }
     // Edit-style tools title as "Edit <filename>" with a clickable
     // filename, +/− counts in the header, and the line diff as the body.
     if let Some(edit) = edit_view(tool, args) {
@@ -1811,6 +1861,43 @@ mod tests {
         assert_eq!(turn_summary(&usage), "1200 in / 340 out tokens");
         usage.cost_usd = Some(0.0231);
         assert_eq!(turn_summary(&usage), "1200 in / 340 out tokens · $0.0231");
+    }
+
+    #[test]
+    fn todo_write_renders_a_checklist_card() {
+        let args = serde_json::json!({"todos": [
+            {"id": "a", "content": "first", "status": "completed"},
+        ]});
+        let result = serde_json::json!({"todos": [
+            {"id": "a", "content": "first", "status": "completed"},
+            {"id": "b", "content": "second", "status": "in_progress"},
+            {"id": "c", "content": "third", "status": "pending"},
+        ]});
+        let row = tool_row(
+            "c1",
+            "todo_write",
+            &args,
+            ToolCallStatus::Ok,
+            &Some(result),
+            &HashSet::new(),
+        );
+        assert_eq!(row.tool_name, "Todos");
+        // Header shows the in-progress item; meta the progress count.
+        assert_eq!(row.text, "second");
+        assert_eq!(row.meta, "1/3");
+        assert_eq!(row.detail, "✓ first\n▸ second\n○ third");
+
+        // Without a result yet (streaming), the args render.
+        let row = tool_row(
+            "c1",
+            "todo_write",
+            &args,
+            ToolCallStatus::Running,
+            &None,
+            &HashSet::new(),
+        );
+        assert_eq!(row.meta, "1/1");
+        assert_eq!(row.text, "1/1 done");
     }
 
     #[test]
