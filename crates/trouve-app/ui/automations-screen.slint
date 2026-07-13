@@ -2,7 +2,9 @@
 // with the list of automations and an inline add/edit form. Each run
 // creates a fresh session in the chosen workspace and sends the prompt.
 
-import { Button, ComboBox, LineEdit, ListView, ScrollView, TextEdit } from "std-widgets.slint";
+import {
+    Button, CheckBox, ComboBox, LineEdit, ListView, ScrollView, TextEdit
+} from "std-widgets.slint";
 import { ScrollKeys } from "scroll-keys.slint";
 import { Theme } from "theme.slint";
 
@@ -25,6 +27,7 @@ export struct AutomationItem {
     workspace-index: int,
     kind: string,       // "hourly" / "daily" / "weekly"
     minute-text: string,
+    permission-index: int, // 0 Ask, 1 Allow-list, 2 Yolo
     time: string,
     days: [bool],       // 7 flags, Monday first
 }
@@ -89,6 +92,9 @@ export component AutomationsScreen inherits Rectangle {
     in-out property <int> form-kind-index: 1;
     in-out property <string> form-minute: "0";
     in-out property <string> form-time: "09:00";
+    // 0 Ask, 1 Allow-list, 2 explicitly confirmed unattended Yolo.
+    in-out property <int> form-permission-index: 0;
+    in-out property <bool> form-yolo-confirmed: false;
     in-out property <bool> form-day-0: false;
     in-out property <bool> form-day-1: false;
     in-out property <bool> form-day-2: false;
@@ -104,6 +110,7 @@ export component AutomationsScreen inherits Rectangle {
     callback saved(/* id */ string, /* name */ string, /* prompt */ string,
                    /* workspace-id */ string, /* kind */ string,
                    /* minute */ string, /* time */ string, /* days */ string,
+                   /* permission-index */ int,
                    /* enabled */ bool);
     callback toggled(/* id */ string, /* enabled */ bool);
     callback run-now(/* id */ string);
@@ -129,6 +136,8 @@ export component AutomationsScreen inherits Rectangle {
         root.form-kind-index = 1;
         root.form-minute = "0";
         root.form-time = "09:00";
+        root.form-permission-index = 0;
+        root.form-yolo-confirmed = false;
         root.form-day-0 = false;
         root.form-day-1 = false;
         root.form-day-2 = false;
@@ -268,6 +277,15 @@ export component AutomationsScreen inherits Rectangle {
                                             font-size: Theme.fs(10px);
                                             vertical-alignment: center;
                                         }
+                                        Text {
+                                            text: item.permission-index == 2 ? "YOLO"
+                                                : item.permission-index == 1 ? "allow-list" : "Ask";
+                                            color: item.permission-index == 2
+                                                ? Theme.c.warn : Theme.c.text-faint;
+                                            font-size: Theme.fs(10px);
+                                            font-weight: item.permission-index == 2 ? 700 : 400;
+                                            vertical-alignment: center;
+                                        }
                                     }
                                     Text {
                                         text: item.schedule-line;
@@ -311,6 +329,10 @@ export component AutomationsScreen inherits Rectangle {
                                                     : item.kind == "daily" ? 1 : 2;
                                                 root.form-minute = item.minute-text;
                                                 root.form-time = item.time;
+                                                root.form-permission-index = item.permission-index;
+                                                // Require a fresh acknowledgement
+                                                // whenever an unattended automation is edited.
+                                                root.form-yolo-confirmed = false;
                                                 root.form-day-0 = item.days[0];
                                                 root.form-day-1 = item.days[1];
                                                 root.form-day-2 = item.days[2];
@@ -376,6 +398,53 @@ export component AutomationsScreen inherits Rectangle {
                                     }
                                 }
 
+                                HorizontalLayout {
+                                    spacing: 8px;
+                                    Text {
+                                        text: "Permissions";
+                                        color: Theme.c.text-mid;
+                                        font-size: Theme.fs(12px);
+                                        vertical-alignment: center;
+                                    }
+                                    ComboBox {
+                                        model: [
+                                            "Ask before changes (safe)",
+                                            "Allow-list (approve as needed)",
+                                            "Unattended (YOLO)"
+                                        ];
+                                        current-index <=> root.form-permission-index;
+                                        horizontal-stretch: 1;
+                                    }
+                                }
+
+                                if root.form-permission-index == 2: Rectangle {
+                                    background: Theme.c.warn-bg;
+                                    border-width: 1px;
+                                    border-color: Theme.c.warn-border;
+                                    border-radius: 6px;
+                                    height: yolo-warning.preferred-height + 20px;
+                                    yolo-warning := VerticalLayout {
+                                        padding: 10px;
+                                        spacing: 8px;
+                                        Text {
+                                            text: "Unattended execution is dangerous";
+                                            color: Theme.c.warn;
+                                            font-size: Theme.fs(12px);
+                                            font-weight: 700;
+                                        }
+                                        Text {
+                                            text: "The agent can run shell commands and edit or delete files without asking. Repository content can influence those actions. This permission applies only to fresh sessions created by this automation and does not change global defaults.";
+                                            color: Theme.c.text-mid;
+                                            font-size: Theme.fs(11px);
+                                            wrap: word-wrap;
+                                        }
+                                        CheckBox {
+                                            text: "I understand and want this automation to run without approval";
+                                            checked <=> root.form-yolo-confirmed;
+                                        }
+                                    }
+                                }
+
                                 // Schedule: preset + the fields it needs.
                                 HorizontalLayout {
                                     spacing: 8px;
@@ -438,13 +507,16 @@ export component AutomationsScreen inherits Rectangle {
                                         primary: true;
                                         enabled: root.form-name != "" && root.form-prompt != ""
                                             && root.workspace-ids.length > root.form-workspace-index
-                                            && (root.form-kind-index != 2 || root.days-csv() != "");
+                                            && (root.form-kind-index != 2 || root.days-csv() != "")
+                                            && (root.form-permission-index != 2
+                                                || root.form-yolo-confirmed);
                                         clicked => {
                                             root.saved(root.form-id, root.form-name,
                                                 root.form-prompt,
                                                 root.workspace-ids[root.form-workspace-index],
                                                 root.kind-name(), root.form-minute,
                                                 root.form-time, root.days-csv(),
+                                                root.form-permission-index,
                                                 root.form-enabled);
                                         }
                                     }
@@ -518,6 +590,8 @@ export component AutomationsScreen inherits Rectangle {
                                                     : t.kind == "daily" ? 1 : 2;
                                                 root.form-minute = t.minute-text;
                                                 root.form-time = t.time;
+                                                root.form-permission-index = 0;
+                                                root.form-yolo-confirmed = false;
                                                 root.form-day-0 = t.days[0];
                                                 root.form-day-1 = t.days[1];
                                                 root.form-day-2 = t.days[2];

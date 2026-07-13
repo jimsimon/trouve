@@ -992,7 +992,16 @@ fn main() -> anyhow::Result<()> {
     {
         let tx = tx.clone();
         window.on_automation_saved(
-            move |id, name, prompt, workspace_id, kind, minute, time, days, enabled| {
+            move |id,
+                  name,
+                  prompt,
+                  workspace_id,
+                  kind,
+                  minute,
+                  time,
+                  days,
+                  permission_index,
+                  enabled| {
                 let _ = tx.send(UiCommand::SaveAutomation {
                     id: id.to_string(),
                     name: name.to_string(),
@@ -1002,6 +1011,7 @@ fn main() -> anyhow::Result<()> {
                     minute: minute.to_string(),
                     time: time.to_string(),
                     days: days.to_string(),
+                    permission_index,
                     enabled,
                 });
             },

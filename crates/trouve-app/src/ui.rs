@@ -970,6 +970,7 @@ pub struct AutomationView {
     pub workspace_index: i32,
     pub kind: String,
     pub minute_text: String,
+    pub permission_index: i32,
     pub time: String,
     /// 7 flags, Monday first.
     pub days: Vec<bool>,
@@ -997,6 +998,7 @@ pub fn set_automations(
                 workspace_index: a.workspace_index,
                 kind: SharedString::from(a.kind.as_str()),
                 minute_text: SharedString::from(a.minute_text.as_str()),
+                permission_index: a.permission_index,
                 time: SharedString::from(a.time.as_str()),
                 days: ModelRc::new(VecModel::from(a.days)),
             })

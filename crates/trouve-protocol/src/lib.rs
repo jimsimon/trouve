@@ -50,7 +50,9 @@ pub use requests::*;
 // self-hosted instances, and provider-login ids "github:<host>" (additive).
 // 0.17: turn cancellation — POST /v1/threads/{id}/cancel interrupts the
 // running turn, and the turn.cancelled event reports it (additive).
-pub const PROTOCOL_VERSION: &str = "0.17";
+// 0.18: per-automation permission_mode; omitted requests default to Ask,
+// while Yolo enables explicit unattended execution for that automation.
+pub const PROTOCOL_VERSION: &str = "0.18";
 
 pub type WorkspaceId = String;
 pub type SessionId = String;

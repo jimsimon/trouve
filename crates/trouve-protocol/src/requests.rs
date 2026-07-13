@@ -821,6 +821,10 @@ pub struct Automation {
     /// Model for the runs (None = the mode's default).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
+    /// Permission policy applied only to sessions created by this automation.
+    /// Defaults to Ask; Yolo is an explicit unattended-execution opt-in.
+    #[serde(default)]
+    pub permission_mode: PermissionMode,
     pub schedule: AutomationSchedule,
     pub enabled: bool,
     /// Next fire time (RFC3339), when enabled.
@@ -849,6 +853,10 @@ pub struct UpsertAutomationRequest {
     pub mode: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
+    /// Permission policy for each fresh automation session. Omitted by older
+    /// clients means Ask.
+    #[serde(default)]
+    pub permission_mode: PermissionMode,
     pub schedule: AutomationSchedule,
     pub enabled: bool,
 }
