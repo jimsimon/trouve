@@ -32,6 +32,7 @@ fn truncate_utf8(mut bytes: Vec<u8>) -> (String, bool) {
 /// the model's read cursor.
 struct Job {
     child: Arc<tokio::sync::Mutex<tokio::process::Child>>,
+    pid: Option<u32>,
     output: Arc<Mutex<JobOutput>>,
     /// Worktree the job was started from; other sessions cannot touch it.
     worktree: std::path::PathBuf,
@@ -56,6 +57,35 @@ pub struct JobRegistry {
 
 static JOB_SEQ: AtomicU64 = AtomicU64::new(1);
 
+#[cfg(unix)]
+fn isolate_process_group(command: &mut tokio::process::Command) {
+    command.process_group(0);
+}
+
+#[cfg(not(unix))]
+fn isolate_process_group(_command: &mut tokio::process::Command) {}
+
+async fn terminate_process(
+    child: &Arc<tokio::sync::Mutex<tokio::process::Child>>,
+    pid: Option<u32>,
+) -> std::io::Result<()> {
+    #[cfg(unix)]
+    if let Some(pid) = pid {
+        // The shell is the process-group leader. Kill the whole group so
+        // backgrounded grandchildren cannot outlive a timeout/session.
+        let result = unsafe { libc::kill(-(pid as i32), libc::SIGKILL) };
+        if result == 0 {
+            return Ok(());
+        }
+        let error = std::io::Error::last_os_error();
+        if error.raw_os_error() == Some(libc::ESRCH) {
+            return Ok(());
+        }
+        return Err(error);
+    }
+    child.lock().await.start_kill()
+}
+
 impl JobRegistry {
     /// Drop finished jobs (oldest first) until a slot is free; running jobs
     /// are never evicted. Errors when every slot holds a running job.
@@ -76,6 +106,24 @@ impl JobRegistry {
             None => Err(format!(
                 "{MAX_JOBS} background jobs are already running; kill one with shell_kill first"
             )),
+        }
+    }
+
+    /// Stop every running job belonging to a worktree being removed.
+    pub async fn kill_worktree(&self, worktree: &std::path::Path) {
+        let jobs: Vec<_> = {
+            let jobs = self.jobs.lock().unwrap();
+            jobs.values()
+                .filter(|job| job.worktree == worktree)
+                .filter(|job| job.output.lock().unwrap().exit_code.is_none())
+                .map(|job| {
+                    job.output.lock().unwrap().killed = true;
+                    (job.child.clone(), job.pid)
+                })
+                .collect()
+        };
+        for (child, pid) in jobs {
+            let _ = terminate_process(&child, pid).await;
         }
     }
 }
@@ -104,6 +152,17 @@ fn pump(
             }
         }
     });
+}
+
+async fn read_all(stream: Option<impl tokio::io::AsyncRead + Unpin>) -> std::io::Result<Vec<u8>> {
+    use tokio::io::AsyncReadExt as _;
+
+    let Some(mut stream) = stream else {
+        return Ok(Vec::new());
+    };
+    let mut bytes = Vec::new();
+    stream.read_to_end(&mut bytes).await?;
+    Ok(bytes)
 }
 
 pub struct Shell {
@@ -152,20 +211,55 @@ impl Tool for Shell {
                 .and_then(Value::as_u64)
                 .unwrap_or(DEFAULT_TIMEOUT_SECS),
         );
-        let child = tokio::process::Command::new("sh")
+        let mut command_process = tokio::process::Command::new("sh");
+        command_process
             .arg("-c")
             .arg(command)
             .current_dir(&ctx.worktree)
-            .kill_on_drop(true)
-            .output();
-        match tokio::time::timeout(timeout, child).await {
-            Err(_) => ToolResult::error(format!("command timed out after {}s", timeout.as_secs())),
-            Ok(Err(e)) => ToolResult::error(format!("failed to spawn: {e}")),
-            Ok(Ok(output)) => {
-                let (stdout, stdout_truncated) = truncate_utf8(output.stdout);
-                let (stderr, stderr_truncated) = truncate_utf8(output.stderr);
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .kill_on_drop(true);
+        isolate_process_group(&mut command_process);
+        let mut child = match command_process.spawn() {
+            Ok(child) => child,
+            Err(e) => return ToolResult::error(format!("failed to spawn: {e}")),
+        };
+        let pid = child.id();
+        let stdout = child.stdout.take();
+        let stderr = child.stderr.take();
+        let child = Arc::new(tokio::sync::Mutex::new(child));
+        // Drain both pipes while the process runs; waiting first can
+        // deadlock once a pipe fills its kernel buffer.
+        let stdout_task = tokio::spawn(read_all(stdout));
+        let stderr_task = tokio::spawn(read_all(stderr));
+        let wait = {
+            let child = child.clone();
+            async move { child.lock().await.wait().await }
+        };
+        match tokio::time::timeout(timeout, wait).await {
+            Err(_) => {
+                let _ = terminate_process(&child, pid).await;
+                stdout_task.abort();
+                stderr_task.abort();
+                ToolResult::error(format!("command timed out after {}s", timeout.as_secs()))
+            }
+            Ok(Err(e)) => ToolResult::error(format!("shell failed: {e}")),
+            Ok(Ok(status)) => {
+                let stdout = stdout_task
+                    .await
+                    .ok()
+                    .and_then(Result::ok)
+                    .unwrap_or_default();
+                let stderr = stderr_task
+                    .await
+                    .ok()
+                    .and_then(Result::ok)
+                    .unwrap_or_default();
+                let (stdout, stdout_truncated) = truncate_utf8(stdout);
+                let (stderr, stderr_truncated) = truncate_utf8(stderr);
                 ToolResult::ok(json!({
-                    "exit_code": output.status.code(),
+                    "exit_code": status.code(),
                     "stdout": stdout,
                     "stderr": stderr,
                     "truncated": stdout_truncated || stderr_truncated,
@@ -177,16 +271,17 @@ impl Tool for Shell {
 
 impl Shell {
     async fn spawn_background(&self, ctx: &ToolCtx, command: &str) -> ToolResult {
-        let mut child = match tokio::process::Command::new("sh")
+        let mut command_process = tokio::process::Command::new("sh");
+        command_process
             .arg("-c")
             .arg(command)
             .current_dir(&ctx.worktree)
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
-            .kill_on_drop(true)
-            .spawn()
-        {
+            .kill_on_drop(true);
+        isolate_process_group(&mut command_process);
+        let mut child = match command_process.spawn() {
             Ok(c) => c,
             Err(e) => return ToolResult::error(format!("failed to spawn: {e}")),
         };
@@ -202,9 +297,20 @@ impl Shell {
             let child = child.clone();
             let output = output.clone();
             tokio::spawn(async move {
-                let status = child.lock().await.wait().await;
-                let mut out = output.lock().unwrap();
-                out.exit_code = Some(status.ok().and_then(|s| s.code()).unwrap_or(-1));
+                loop {
+                    let status = child.lock().await.try_wait();
+                    match status {
+                        Ok(Some(status)) => {
+                            output.lock().unwrap().exit_code = Some(status.code().unwrap_or(-1));
+                            break;
+                        }
+                        Ok(None) => tokio::time::sleep(Duration::from_millis(50)).await,
+                        Err(_) => {
+                            output.lock().unwrap().exit_code = Some(-1);
+                            break;
+                        }
+                    }
+                }
             });
         }
         // Lifetime cap: kill anything still running after MAX_JOB_SECS.
@@ -215,7 +321,7 @@ impl Shell {
                 tokio::time::sleep(Duration::from_secs(MAX_JOB_SECS)).await;
                 if output.lock().unwrap().exit_code.is_none() {
                     output.lock().unwrap().killed = true;
-                    let _ = child.lock().await.start_kill();
+                    let _ = terminate_process(&child, pid).await;
                 }
             });
         }
@@ -227,7 +333,7 @@ impl Shell {
                 // Over the cap: don't leak the process we just started.
                 let child = child.clone();
                 tokio::spawn(async move {
-                    let _ = child.lock().await.start_kill();
+                    let _ = terminate_process(&child, pid).await;
                 });
                 return ToolResult::error(e);
             }
@@ -235,6 +341,7 @@ impl Shell {
                 id.clone(),
                 Job {
                     child,
+                    pid,
                     output,
                     worktree: ctx.worktree.clone(),
                     command: command.to_string(),
@@ -372,7 +479,7 @@ impl Tool for ShellKill {
         let Some(id) = args.get("job_id").and_then(Value::as_str) else {
             return ToolResult::error("missing required argument: job_id");
         };
-        let (child, output, command) = {
+        let (child, pid, output, command) = {
             let jobs = self.jobs.jobs.lock().unwrap();
             let Some(job) = jobs.get(id) else {
                 return ToolResult::error(format!("unknown job: {id}"));
@@ -380,7 +487,12 @@ impl Tool for ShellKill {
             if job.worktree != ctx.worktree {
                 return ToolResult::error(format!("unknown job: {id}"));
             }
-            (job.child.clone(), job.output.clone(), job.command.clone())
+            (
+                job.child.clone(),
+                job.pid,
+                job.output.clone(),
+                job.command.clone(),
+            )
         };
         if output.lock().unwrap().exit_code.is_some() {
             return ToolResult::ok(json!({
@@ -390,7 +502,7 @@ impl Tool for ShellKill {
             }));
         }
         output.lock().unwrap().killed = true;
-        if let Err(e) = child.lock().await.start_kill() {
+        if let Err(e) = terminate_process(&child, pid).await {
             return ToolResult::error(format!("cannot kill {id}: {e}"));
         }
         ToolResult::ok(json!({
@@ -517,6 +629,47 @@ mod tests {
             }
         }
         panic!("job never reported finished after kill");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn killing_job_terminates_descendants() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ctx = ToolCtx {
+            worktree: tmp.path().to_path_buf(),
+            ..Default::default()
+        };
+        let (shell, _, kill) = tools();
+        let res = shell
+            .run(
+                &ctx,
+                &json!({
+                    "command": "sleep 60 & child=$!; echo $child > child.pid; wait $child",
+                    "run_in_background": true
+                }),
+            )
+            .await;
+        let id = res.result["job_id"].as_str().unwrap().to_string();
+        let child_pid = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if let Ok(pid) = std::fs::read_to_string(tmp.path().join("child.pid")) {
+                    break pid.trim().parse::<u32>().unwrap();
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap();
+
+        let res = kill.run(&ctx, &json!({"job_id": id})).await;
+        assert_eq!(res.status, trouve_protocol::ToolStatus::Ok);
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while std::path::Path::new(&format!("/proc/{child_pid}")).exists() {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("descendant survived process-group kill");
     }
 
     #[tokio::test]

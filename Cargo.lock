@@ -8301,6 +8301,7 @@ dependencies = [
  "globset",
  "html2text",
  "ignore",
+ "libc",
  "octocrab",
  "portable-pty",
  "regex",
