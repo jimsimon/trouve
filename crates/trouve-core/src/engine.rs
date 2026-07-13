@@ -67,6 +67,10 @@ pub struct Engine {
     /// while present just enqueue. The session ids feed `Session.active`
     /// and the `session.activity` server event.
     active_threads: Mutex<std::collections::HashMap<String, String>>,
+    /// Sessions currently being deleted. Dispatch checks this while holding
+    /// `active_threads`, making "no active turns" and "no new turns" one
+    /// atomic state transition before destructive cleanup begins.
+    deleting_sessions: Mutex<std::collections::HashSet<String>>,
     /// Cancellation tokens for in-flight turns, keyed by thread id. Set while
     /// a turn runs; `cancel_turn` trips one to interrupt the turn's provider
     /// stream, tool calls, and approval waits at the next await point.
@@ -331,6 +335,7 @@ impl Engine {
             questions: Arc::new(QuestionHub::default()),
             session_locks: Mutex::new(HashMap::new()),
             active_threads: Mutex::new(std::collections::HashMap::new()),
+            deleting_sessions: Mutex::new(std::collections::HashSet::new()),
             turn_cancels: Mutex::new(std::collections::HashMap::new()),
             config: Mutex::new(config.clone()),
             // No write-back by default: only a caller that loaded `config`
@@ -2765,51 +2770,78 @@ impl Engine {
 
     pub async fn delete_session(&self, id: &str) -> Result<(), EngineError> {
         let session = self.get_session(id)?;
-        self.terminals.remove_session(id);
-        let ws = self
-            .store
-            .workspace(&session.workspace_id)?
-            .ok_or_else(|| EngineError::NotFound(format!("workspace {}", session.workspace_id)))?;
-        let repo = PathBuf::from(&ws.path);
-        let wt = PathBuf::from(&session.worktree_path);
-        if wt.exists() {
-            let res = tokio::task::spawn_blocking(move || git::remove_worktree(&repo, &wt))
-                .await
-                .map_err(|e| EngineError::Internal(anyhow!(e)))?;
-            if let Err(e) = res {
-                tracing::warn!("failed to remove worktree for {id}: {e}");
+        {
+            // Lock ordering is always active_threads -> deleting_sessions;
+            // dispatch_queue uses the same order. Once the marker is set, an
+            // idle session cannot acquire a new dispatcher while deletion is
+            // in progress.
+            let active = self.active_threads.lock().unwrap();
+            if active.values().any(|session_id| session_id == id) {
+                return Err(EngineError::Conflict(format!(
+                    "session {id} has an active turn"
+                )));
+            }
+            let mut deleting = self.deleting_sessions.lock().unwrap();
+            if !deleting.insert(id.to_string()) {
+                return Err(EngineError::Conflict(format!(
+                    "session {id} is already being deleted"
+                )));
             }
         }
-        self.store.append_event(
-            Scope::Session(id.to_string()),
-            Event::WorktreeRemoved {
-                path: session.worktree_path.clone(),
-                branch: session.branch.clone(),
-            },
-        )?;
-        self.store.append_event(
-            Scope::Server,
-            Event::SessionDeleted {
-                session_id: id.to_string(),
-                workspace_id: session.workspace_id.clone(),
-            },
-        )?;
-        // Release any MCP server processes spawned for this worktree, so they
-        // don't leak for the lifetime of the server.
-        self.executor
-            .evict_worktree(Path::new(&session.worktree_path))
-            .await;
-        // Remove attachment files from disk before dropping their DB rows;
-        // afterwards their paths are unrecoverable.
-        for path in self.store.session_attachment_paths(id)? {
-            let _ = std::fs::remove_file(&path);
+
+        let result = async {
+            self.terminals.remove_session(id);
+            let ws = self
+                .store
+                .workspace(&session.workspace_id)?
+                .ok_or_else(|| {
+                    EngineError::NotFound(format!("workspace {}", session.workspace_id))
+                })?;
+            let repo = PathBuf::from(&ws.path);
+            let wt = PathBuf::from(&session.worktree_path);
+            if wt.exists() {
+                let res = tokio::task::spawn_blocking(move || git::remove_worktree(&repo, &wt))
+                    .await
+                    .map_err(|e| EngineError::Internal(anyhow!(e)))?;
+                if let Err(e) = res {
+                    tracing::warn!("failed to remove worktree for {id}: {e}");
+                }
+            }
+            self.store.append_event(
+                Scope::Session(id.to_string()),
+                Event::WorktreeRemoved {
+                    path: session.worktree_path.clone(),
+                    branch: session.branch.clone(),
+                },
+            )?;
+            self.store.append_event(
+                Scope::Server,
+                Event::SessionDeleted {
+                    session_id: id.to_string(),
+                    workspace_id: session.workspace_id.clone(),
+                },
+            )?;
+            // Release any MCP server processes spawned for this worktree, so they
+            // don't leak for the lifetime of the server.
+            self.executor
+                .evict_worktree(Path::new(&session.worktree_path))
+                .await;
+            // Remove attachment files from disk before dropping their DB rows;
+            // afterwards their paths are unrecoverable.
+            for path in self.store.session_attachment_paths(id)? {
+                let _ = std::fs::remove_file(&path);
+            }
+            // Deleting the session deletes its events (privacy: see event-log doc).
+            self.store.delete_session(id)?;
+            if self.index_hooks {
+                crate::tools::gc_index_store_in_background(PathBuf::from(&ws.path));
+            }
+            Ok(())
         }
-        // Deleting the session deletes its events (privacy: see event-log doc).
-        self.store.delete_session(id)?;
-        if self.index_hooks {
-            crate::tools::gc_index_store_in_background(PathBuf::from(&ws.path));
-        }
-        Ok(())
+        .await;
+
+        self.deleting_sessions.lock().unwrap().remove(id);
+        result
     }
 
     // --- threads ------------------------------------------------------------
@@ -3241,6 +3273,17 @@ impl Engine {
         // concurrent sends can't both start a dispatcher.
         let (prompt, session_woke) = {
             let mut active = self.active_threads.lock().unwrap();
+            if self
+                .deleting_sessions
+                .lock()
+                .unwrap()
+                .contains(&thread.session_id)
+            {
+                return Err(EngineError::Conflict(format!(
+                    "session {} is being deleted",
+                    thread.session_id
+                )));
+            }
             if active.contains_key(thread_id) {
                 return Ok(None);
             }

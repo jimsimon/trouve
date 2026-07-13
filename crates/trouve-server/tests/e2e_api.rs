@@ -222,6 +222,19 @@ async fn full_turn_with_approval_checkpoint_and_undo() {
         .to_string();
     assert_eq!(call_id, "call_1");
 
+    // Destructive session cleanup must not race the active turn that is
+    // currently waiting for this approval.
+    let resp = client
+        .delete(format!(
+            "{base}/sessions/{}",
+            session["id"].as_str().unwrap()
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 409);
+    assert!(Path::new(&worktree).exists());
+
     // Approve; the turn then finishes with a checkpoint.
     let resp = client
         .post(format!("{base}/approvals"))
