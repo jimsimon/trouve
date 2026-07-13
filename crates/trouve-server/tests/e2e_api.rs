@@ -323,6 +323,123 @@ async fn full_turn_with_approval_checkpoint_and_undo() {
     assert_eq!(resp.status(), 404);
 }
 
+struct IterationLimitProvider {
+    calls: AtomicUsize,
+}
+
+#[async_trait::async_trait]
+impl Provider for IterationLimitProvider {
+    fn id(&self) -> &str {
+        "iteration-limit"
+    }
+
+    async fn stream_chat(
+        &self,
+        _model: &str,
+        _messages: &[Message],
+        tools: &[ToolSpec],
+        _options: &serde_json::Map<String, serde_json::Value>,
+    ) -> Result<EventStream, ProviderError> {
+        let call = self.calls.fetch_add(1, Ordering::SeqCst);
+        let events = if tools.is_empty() {
+            vec![
+                Ok(ProviderEvent::TextDelta(
+                    "I stopped at the step limit; continue to finish.".into(),
+                )),
+                Ok(ProviderEvent::Completed {
+                    usage: Usage::default(),
+                }),
+            ]
+        } else {
+            vec![
+                Ok(ProviderEvent::ToolCall(ToolCallRequest {
+                    id: format!("limit-call-{call}"),
+                    name: "read_file".into(),
+                    arguments: serde_json::json!({"path": "README.md"}),
+                })),
+                Ok(ProviderEvent::Completed {
+                    usage: Usage::default(),
+                }),
+            ]
+        };
+        Ok(Box::pin(futures::stream::iter(events)))
+    }
+}
+
+#[tokio::test]
+async fn iteration_limit_gets_a_final_tool_free_model_response() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path().join("repo");
+    std::fs::create_dir(&repo).unwrap();
+    init_repo(&repo);
+
+    let provider = Arc::new(IterationLimitProvider {
+        calls: AtomicUsize::new(0),
+    });
+    let store = Store::open(&tmp.path().join("db/trouve.db")).unwrap();
+    let engine = Arc::new(
+        Engine::new(store, tmp.path().join("data"), &Config::default())
+            .with_config_dir(None)
+            .with_provider("iteration-limit", provider.clone())
+            .with_default_model("iteration-limit/test"),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let router = trouve_server::build_router(engine);
+    tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+    let base = format!("http://{addr}/v1");
+    let client = reqwest::Client::new();
+
+    let workspace: serde_json::Value = client
+        .post(format!("{base}/workspaces"))
+        .json(&serde_json::json!({"path": repo}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let session: serde_json::Value = client
+        .post(format!("{base}/sessions"))
+        .json(&serde_json::json!({"workspace_id": workspace["id"]}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let thread: serde_json::Value = client
+        .post(format!("{base}/threads"))
+        .json(&serde_json::json!({"session_id": session["id"]}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let thread_id = thread["id"].as_str().unwrap();
+    client
+        .post(format!("{base}/threads/{thread_id}/messages"))
+        .json(&serde_json::json!({"content": "keep reading forever"}))
+        .send()
+        .await
+        .unwrap();
+
+    let events = wait_for_event(
+        &client,
+        &format!("{base}/threads/{thread_id}/events"),
+        |event| event["type"] == "turn.completed",
+    )
+    .await;
+    assert!(events.iter().any(|event| {
+        event["type"] == "assistant.message"
+            && event["content"]
+                .as_str()
+                .is_some_and(|text| text.contains("continue to finish"))
+    }));
+    assert_eq!(provider.calls.load(Ordering::SeqCst), 33);
+}
+
 /// Reports a model with a tiny context window; large usage on turn 1 forces
 /// compaction at the start of turn 2. Call sequence: turn 1, summarization,
 /// turn 2.

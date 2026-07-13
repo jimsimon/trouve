@@ -3875,27 +3875,83 @@ impl Engine {
             }
         }
 
-        // Truncated mid-work at the iteration budget: tell the user (and
-        // leave a transcript note the model sees next turn) instead of
-        // ending silently as if the work were finished.
+        // Truncated mid-work at the iteration budget: make one final
+        // tool-free provider pass over the last tool results so the user gets
+        // a truthful model-authored progress report rather than a completed
+        // turn whose transcript ends at a tool result.
         if hit_iteration_limit {
-            let note = format!(
-                "Reached the {MAX_ITERATIONS}-step limit for one turn and stopped mid-task. \
-                 Send another message to continue."
-            );
+            let mut messages = vec![Message::System(system.clone())];
+            for payload in self.store.messages(&thread.id)? {
+                messages.push(serde_json::from_value(payload)?);
+            }
+            let mut messages = sanitize_transcript(messages);
+            messages.push(Message::User(format!(
+                "You reached the hard {MAX_ITERATIONS}-step limit for this turn. Do not call any \
+                 more tools. Give the user a concise progress report based on the tool results \
+                 above, clearly identify unfinished work, and ask them to continue in a new turn."
+            )));
+            let mut final_text = String::new();
+            let mut final_reasoning = Vec::new();
+            match provider
+                .stream_chat(&model_name, &messages, &[], &model_options)
+                .await
+            {
+                Ok(mut stream) => {
+                    while let Some(event) = stream.next().await {
+                        match event {
+                            Ok(ProviderEvent::TextDelta(delta)) => {
+                                final_text.push_str(&delta);
+                                self.store.append_event(
+                                    scope.clone(),
+                                    Event::AssistantDelta { turn, text: delta },
+                                )?;
+                            }
+                            Ok(ProviderEvent::ThinkingDelta(delta)) => {
+                                self.store.append_event(
+                                    scope.clone(),
+                                    Event::AssistantThinking { turn, text: delta },
+                                )?;
+                            }
+                            Ok(ProviderEvent::Reasoning(block)) => final_reasoning.push(block),
+                            Ok(ProviderEvent::Completed { usage }) => {
+                                usage_total.input_tokens += usage.input_tokens;
+                                usage_total.output_tokens += usage.output_tokens;
+                                usage_total.cached_input_tokens += usage.cached_input_tokens;
+                                context_input_tokens =
+                                    usage.input_tokens + usage.cached_input_tokens;
+                            }
+                            // Tools are deliberately unavailable on this
+                            // final pass. Ignore a non-conforming provider's
+                            // request and fall back to the explicit note.
+                            Ok(ProviderEvent::ToolCall(_)) => {}
+                            Err(e) => {
+                                tracing::warn!("iteration-limit summary failed: {e}");
+                                break;
+                            }
+                        }
+                    }
+                }
+                Err(e) => tracing::warn!("iteration-limit summary failed: {e}"),
+            }
+            if final_text.trim().is_empty() {
+                final_text = format!(
+                    "Reached the {MAX_ITERATIONS}-step limit for one turn and stopped mid-task. \
+                     Send another message to continue."
+                );
+            }
             self.store.append_event(
                 scope.clone(),
                 Event::AssistantMessage {
                     turn,
-                    content: note.clone(),
+                    content: final_text.clone(),
                 },
             )?;
             self.store.append_message(
                 &thread.id,
                 &serde_json::to_value(Message::Assistant {
-                    content: note,
+                    content: final_text,
                     tool_calls: Vec::new(),
-                    reasoning: Vec::new(),
+                    reasoning: final_reasoning,
                 })?,
             )?;
         }
