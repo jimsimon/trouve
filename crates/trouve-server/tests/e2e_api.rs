@@ -2558,6 +2558,7 @@ async fn automation_records_the_turn_outcome_not_just_dispatch() {
             "name": "Fail after dispatch",
             "prompt": "run",
             "workspace_id": workspace["id"],
+            "permission_mode": "yolo",
             "schedule": {"kind": "daily", "time": "09:00"},
             "enabled": false
         }))
@@ -2567,6 +2568,7 @@ async fn automation_records_the_turn_outcome_not_just_dispatch() {
         .json()
         .await
         .unwrap();
+    assert_eq!(automation["permission_mode"], "yolo");
     let automation_id = automation["id"].as_str().unwrap();
     let resp = client
         .post(format!("{base}/automations/{automation_id}/run"))
@@ -2605,6 +2607,17 @@ async fn automation_records_the_turn_outcome_not_just_dispatch() {
         "{recorded}"
     );
     assert!(recorded["last_session_id"].is_string());
+    let session_id = recorded["last_session_id"].as_str().unwrap();
+    let threads: Vec<serde_json::Value> = client
+        .get(format!("{base}/threads?session_id={session_id}"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(threads.len(), 1);
+    assert_eq!(threads[0]["permission_mode"], "yolo");
 }
 
 /// GitHub Enterprise hosts: the integration always lists github.com

@@ -1079,6 +1079,7 @@ export component AppWindow inherits Window {
     callback automation-saved(/* id */ string, /* name */ string, /* prompt */ string,
                               /* workspace-id */ string, /* kind */ string,
                               /* minute */ string, /* time */ string, /* days */ string,
+                              /* permission-index */ int,
                               /* enabled */ bool);
     callback automation-toggled(/* id */ string, /* enabled */ bool);
     callback automation-run(/* id */ string);
@@ -4007,8 +4008,10 @@ export component AppWindow inherits Window {
         form-open <=> root.automations-screen-form-open;
         close => { root.close-automations(); }
         refresh => { root.automations-refresh(); }
-        saved(id, name, prompt, ws, kind, minute, time, days, enabled) => {
-            root.automation-saved(id, name, prompt, ws, kind, minute, time, days, enabled);
+        saved(id, name, prompt, ws, kind, minute, time, days, permission, enabled) => {
+            root.automation-saved(
+                id, name, prompt, ws, kind, minute, time, days, permission, enabled
+            );
         }
         toggled(id, on) => { root.automation-toggled(id, on); }
         run-now(id) => { root.automation-run(id); }

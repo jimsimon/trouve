@@ -117,6 +117,7 @@ CREATE TABLE IF NOT EXISTS automations (
   workspace_id TEXT NOT NULL REFERENCES workspaces(id),
   mode TEXT,
   model TEXT,
+  permission_mode TEXT NOT NULL DEFAULT 'ask',
   schedule TEXT NOT NULL,       -- JSON trouve_protocol::AutomationSchedule
   enabled INTEGER NOT NULL DEFAULT 1,
   next_run_at TEXT,             -- RFC3339; NULL while disabled
@@ -134,6 +135,7 @@ const MIGRATIONS: &[&str] = &[
     "ALTER TABLE sessions ADD COLUMN archived INTEGER NOT NULL DEFAULT 0",
     "ALTER TABLE queued_prompts ADD COLUMN attachments TEXT NOT NULL DEFAULT '[]'",
     "ALTER TABLE queued_prompts ADD COLUMN claimed INTEGER NOT NULL DEFAULT 0",
+    "ALTER TABLE automations ADD COLUMN permission_mode TEXT NOT NULL DEFAULT 'ask'",
     // Context-size proxy for compaction/UI: the input tokens of the turn's
     // *last* request, not the sum over its iterations (see record_usage).
     "ALTER TABLE usage ADD COLUMN context_input_tokens INTEGER NOT NULL DEFAULT 0",
@@ -200,7 +202,8 @@ fn parse_attachments(json: &str) -> Vec<trouve_protocol::Attachment> {
 
 /// One `automations` row (column order matches the SELECTs below).
 fn row_to_automation(r: &rusqlite::Row<'_>) -> rusqlite::Result<trouve_protocol::Automation> {
-    let schedule_json: String = r.get(6)?;
+    let permission_mode: String = r.get(6)?;
+    let schedule_json: String = r.get(7)?;
     Ok(trouve_protocol::Automation {
         id: r.get(0)?,
         name: r.get(1)?,
@@ -208,6 +211,7 @@ fn row_to_automation(r: &rusqlite::Row<'_>) -> rusqlite::Result<trouve_protocol:
         workspace_id: r.get(3)?,
         mode: r.get(4)?,
         model: r.get(5)?,
+        permission_mode: permission_mode_from(&permission_mode),
         schedule: serde_json::from_str(&schedule_json).unwrap_or(
             trouve_protocol::AutomationSchedule {
                 kind: "daily".into(),
@@ -216,12 +220,12 @@ fn row_to_automation(r: &rusqlite::Row<'_>) -> rusqlite::Result<trouve_protocol:
                 days: vec![],
             },
         ),
-        enabled: r.get(7)?,
-        next_run_at: r.get(8)?,
-        last_run_at: r.get(9)?,
-        last_session_id: r.get(10)?,
-        last_error: r.get(11)?,
-        created_at: r.get(12)?,
+        enabled: r.get(8)?,
+        next_run_at: r.get(9)?,
+        last_run_at: r.get(10)?,
+        last_session_id: r.get(11)?,
+        last_error: r.get(12)?,
+        created_at: r.get(13)?,
     })
 }
 
@@ -947,10 +951,10 @@ impl Store {
     pub fn insert_automation(&self, a: &trouve_protocol::Automation) -> Result<()> {
         let conn = self.conn.lock().unwrap();
         conn.execute(
-            "INSERT INTO automations (id, name, prompt, workspace_id, mode, model, schedule,
-                                      enabled, next_run_at, last_run_at, last_session_id,
-                                      last_error, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+            "INSERT INTO automations (id, name, prompt, workspace_id, mode, model,
+                                      permission_mode, schedule, enabled, next_run_at,
+                                      last_run_at, last_session_id, last_error, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
             params![
                 a.id,
                 a.name,
@@ -958,6 +962,7 @@ impl Store {
                 a.workspace_id,
                 a.mode,
                 a.model,
+                permission_mode_str(a.permission_mode),
                 serde_json::to_string(&a.schedule)?,
                 a.enabled,
                 a.next_run_at,
@@ -976,7 +981,8 @@ impl Store {
         let conn = self.conn.lock().unwrap();
         let n = conn.execute(
             "UPDATE automations SET name = ?2, prompt = ?3, workspace_id = ?4, mode = ?5,
-                    model = ?6, schedule = ?7, enabled = ?8, next_run_at = ?9
+                    model = ?6, permission_mode = ?7, schedule = ?8, enabled = ?9,
+                    next_run_at = ?10
              WHERE id = ?1",
             params![
                 a.id,
@@ -985,6 +991,7 @@ impl Store {
                 a.workspace_id,
                 a.mode,
                 a.model,
+                permission_mode_str(a.permission_mode),
                 serde_json::to_string(&a.schedule)?,
                 a.enabled,
                 a.next_run_at,
@@ -1037,7 +1044,7 @@ impl Store {
     pub fn list_automations(&self) -> Result<Vec<trouve_protocol::Automation>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT id, name, prompt, workspace_id, mode, model, schedule, enabled,
+            "SELECT id, name, prompt, workspace_id, mode, model, permission_mode, schedule, enabled,
                     next_run_at, last_run_at, last_session_id, last_error, created_at
              FROM automations ORDER BY created_at, id",
         )?;
@@ -1053,7 +1060,7 @@ impl Store {
         let conn = self.conn.lock().unwrap();
         Ok(conn
             .query_row(
-                "SELECT id, name, prompt, workspace_id, mode, model, schedule, enabled,
+                "SELECT id, name, prompt, workspace_id, mode, model, permission_mode, schedule, enabled,
                         next_run_at, last_run_at, last_session_id, last_error, created_at
                  FROM automations WHERE id = ?1",
                 params![id],
@@ -1770,6 +1777,7 @@ mod tests {
             workspace_id: "ws_1".into(),
             mode: Some("code".into()),
             model: None,
+            permission_mode: PermissionMode::Yolo,
             schedule: trouve_protocol::AutomationSchedule {
                 kind: "weekly".into(),
                 minute: 0,
@@ -1789,17 +1797,20 @@ mod tests {
         assert_eq!(listed.len(), 1);
         assert_eq!(listed[0].schedule, auto.schedule);
         assert_eq!(listed[0].mode.as_deref(), Some("code"));
+        assert_eq!(listed[0].permission_mode, PermissionMode::Yolo);
 
         // Edit: rename + disable clears the next fire time.
         let mut edited = auto.clone();
         edited.name = "Morning triage".into();
         edited.enabled = false;
         edited.next_run_at = None;
+        edited.permission_mode = PermissionMode::AllowList;
         assert!(store.update_automation(&edited).unwrap());
         let got = store.automation("auto_1").unwrap().unwrap();
         assert_eq!(got.name, "Morning triage");
         assert!(!got.enabled);
         assert!(got.next_run_at.is_none());
+        assert_eq!(got.permission_mode, PermissionMode::AllowList);
 
         // A run records its outcome without touching the definition.
         store

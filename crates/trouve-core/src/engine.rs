@@ -1113,6 +1113,7 @@ impl Engine {
             workspace_id: req.workspace_id,
             mode: req.mode,
             model: req.model,
+            permission_mode: req.permission_mode,
             schedule: req.schedule,
             enabled: req.enabled,
             next_run_at,
@@ -1140,6 +1141,7 @@ impl Engine {
         automation.workspace_id = req.workspace_id;
         automation.mode = req.mode;
         automation.model = req.model;
+        automation.permission_mode = req.permission_mode;
         automation.schedule = req.schedule;
         automation.enabled = req.enabled;
         automation.next_run_at = if req.enabled {
@@ -1319,7 +1321,9 @@ impl Engine {
             mode: automation.mode.clone(),
             model: automation.model.clone(),
             model_options: Default::default(),
-            permission_mode: None,
+            // Scoped to this fresh run session; it does not change global
+            // mode defaults or carry approvals into future runs.
+            permission_mode: Some(automation.permission_mode),
         })?;
         let accepted = self.send_message(&thread.id, automation.prompt.clone(), Vec::new())?;
         if accepted.queued || accepted.turn == 0 {

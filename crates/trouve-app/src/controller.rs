@@ -273,6 +273,8 @@ pub enum UiCommand {
         time: String,
         /// Comma-separated Monday-first day indices (weekly).
         days: String,
+        /// 0 Ask, 1 Allow-list, 2 Yolo.
+        permission_index: i32,
         enabled: bool,
     },
     /// Pause/resume an automation.
@@ -2429,7 +2431,10 @@ impl Controller {
                     .and_then(fmt_local_ts)
                     .map(|t| format!("next run {t}"))
                     .unwrap_or_default();
-                let last_line = if !a.last_error.is_empty() {
+                let awaiting_approval = a.last_error == "awaiting approval";
+                let last_line = if awaiting_approval {
+                    "waiting for approval".to_string()
+                } else if !a.last_error.is_empty() {
                     format!("last run failed: {}", a.last_error)
                 } else {
                     a.last_run_at
@@ -2450,13 +2455,18 @@ impl Controller {
                     schedule_line: format!("{} · {ws_name}", schedule_summary(&a.schedule)),
                     next_line,
                     last_line,
-                    last_failed: !a.last_error.is_empty(),
+                    last_failed: !a.last_error.is_empty() && !awaiting_approval,
                     enabled: a.enabled,
                     prompt: a.prompt.clone(),
                     workspace_index: ids.iter().position(|id| *id == a.workspace_id).unwrap_or(0)
                         as i32,
                     kind: a.schedule.kind.clone(),
                     minute_text: a.schedule.minute.to_string(),
+                    permission_index: match a.permission_mode {
+                        PermissionMode::Ask => 0,
+                        PermissionMode::AllowList => 1,
+                        PermissionMode::Yolo => 2,
+                    },
                     time: if a.schedule.time.is_empty() {
                         "09:00".into()
                     } else {
@@ -3952,6 +3962,7 @@ impl Controller {
                 minute,
                 time,
                 days,
+                permission_index,
                 enabled,
             } => {
                 let minute: u8 = match minute.trim().parse() {
@@ -3968,6 +3979,11 @@ impl Controller {
                     workspace_id,
                     mode: None,
                     model: None,
+                    permission_mode: match permission_index {
+                        1 => PermissionMode::AllowList,
+                        2 => PermissionMode::Yolo,
+                        _ => PermissionMode::Ask,
+                    },
                     schedule: trouve_protocol::AutomationSchedule {
                         kind,
                         minute,
@@ -4003,6 +4019,7 @@ impl Controller {
                     workspace_id: automation.workspace_id.clone(),
                     mode: automation.mode.clone(),
                     model: automation.model.clone(),
+                    permission_mode: automation.permission_mode,
                     schedule: automation.schedule.clone(),
                     enabled,
                 };

@@ -7,7 +7,7 @@
       "name": "MIT",
       "identifier": "MIT"
     },
-    "version": "0.17"
+    "version": "0.18"
   },
   "paths": {
     "/v1/approvals": {
@@ -3134,6 +3134,10 @@
             ],
             "description": "Next fire time (RFC3339), when enabled."
           },
+          "permission_mode": {
+            "$ref": "#/components/schemas/PermissionMode",
+            "description": "Permission policy applied only to sessions created by this automation.\nDefaults to Ask; Yolo is an explicit unattended-execution opt-in."
+          },
           "prompt": {
             "type": "string"
           },
@@ -5710,6 +5714,10 @@
           },
           "name": {
             "type": "string"
+          },
+          "permission_mode": {
+            "$ref": "#/components/schemas/PermissionMode",
+            "description": "Permission policy for each fresh automation session. Omitted by older\nclients means Ask."
           },
           "prompt": {
             "type": "string"
