@@ -296,7 +296,11 @@ fn main() -> anyhow::Result<()> {
                 return;
             };
             let _ = tx.send(UiCommand::RefreshAtFiles);
-            let files: Vec<String> = window.get_at_files().iter().map(|s| s.to_string()).collect();
+            let files: Vec<String> = window
+                .get_at_files()
+                .iter()
+                .map(|s| s.to_string())
+                .collect();
             let mut matches = fuzzy_match_indices(&files, &query);
             matches.truncate(8);
             if matches.is_empty() {
