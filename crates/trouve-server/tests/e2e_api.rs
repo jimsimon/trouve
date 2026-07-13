@@ -306,6 +306,21 @@ async fn full_turn_with_approval_checkpoint_and_undo() {
         std::fs::read_to_string(Path::new(&worktree).join("hello.txt")).unwrap(),
         "hi\n"
     );
+
+    // Once idle, deletion removes both the relational state and worktree.
+    let resp = client
+        .delete(format!("{base}/sessions/{session_id}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 204);
+    assert!(!Path::new(&worktree).exists());
+    let resp = client
+        .get(format!("{base}/sessions/{session_id}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 404);
 }
 
 /// Reports a model with a tiny context window; large usage on turn 1 forces

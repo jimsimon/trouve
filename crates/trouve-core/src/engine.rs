@@ -2790,13 +2790,27 @@ impl Engine {
         }
 
         let result = async {
-            self.terminals.remove_session(id);
             let ws = self
                 .store
                 .workspace(&session.workspace_id)?
                 .ok_or_else(|| {
                     EngineError::NotFound(format!("workspace {}", session.workspace_id))
                 })?;
+            // Capture cleanup paths while the relational rows still exist,
+            // then commit the database deletion before any irreversible
+            // filesystem work. A database error must leave the session and
+            // its worktree consistently intact.
+            let attachment_paths = self.store.session_attachment_paths(id)?;
+            self.store.delete_session(id)?;
+
+            self.terminals.remove_session(id);
+            self.executor
+                .evict_worktree(Path::new(&session.worktree_path))
+                .await;
+            for path in attachment_paths {
+                let _ = std::fs::remove_file(&path);
+            }
+
             let repo = PathBuf::from(&ws.path);
             let wt = PathBuf::from(&session.worktree_path);
             if wt.exists() {
@@ -2807,13 +2821,8 @@ impl Engine {
                     tracing::warn!("failed to remove worktree for {id}: {e}");
                 }
             }
-            self.store.append_event(
-                Scope::Session(id.to_string()),
-                Event::WorktreeRemoved {
-                    path: session.worktree_path.clone(),
-                    branch: session.branch.clone(),
-                },
-            )?;
+            // Session-scoped events are deleted with the session for privacy;
+            // the persisted server event is the replayable deletion signal.
             self.store.append_event(
                 Scope::Server,
                 Event::SessionDeleted {
@@ -2821,18 +2830,6 @@ impl Engine {
                     workspace_id: session.workspace_id.clone(),
                 },
             )?;
-            // Release any MCP server processes spawned for this worktree, so they
-            // don't leak for the lifetime of the server.
-            self.executor
-                .evict_worktree(Path::new(&session.worktree_path))
-                .await;
-            // Remove attachment files from disk before dropping their DB rows;
-            // afterwards their paths are unrecoverable.
-            for path in self.store.session_attachment_paths(id)? {
-                let _ = std::fs::remove_file(&path);
-            }
-            // Deleting the session deletes its events (privacy: see event-log doc).
-            self.store.delete_session(id)?;
             if self.index_hooks {
                 crate::tools::gc_index_store_in_background(PathBuf::from(&ws.path));
             }
