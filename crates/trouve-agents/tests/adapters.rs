@@ -494,7 +494,13 @@ EOF
 
     // The generated MCP config points at the engine's embedded HTTP MCP
     // endpoint for this thread.
-    let config_path = std::env::temp_dir().join("trouve-mcp-th_1.json");
+    let mut arg_lines = args.lines();
+    let config_path = loop {
+        let arg = arg_lines.next().expect("--mcp-config argument");
+        if arg == "--mcp-config" {
+            break std::path::PathBuf::from(arg_lines.next().expect("--mcp-config path argument"));
+        }
+    };
     let config: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(&config_path).unwrap()).unwrap();
     assert_eq!(config["mcpServers"]["trouve"]["type"], "http");
@@ -508,7 +514,24 @@ EOF
     assert_eq!(config["mcpServers"]["jira"]["command"], "jira-mcp");
     assert_eq!(config["mcpServers"]["jira"]["env"]["TOKEN"], "sekrit");
     assert!(!args.contains("mcp__jira"), "{args}");
-    let _ = std::fs::remove_file(config_path);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        assert_eq!(
+            std::fs::metadata(&config_path)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+    }
+    drop(stream);
+    drop(backend);
+    assert!(
+        !config_path.exists(),
+        "temporary MCP config was not removed"
+    );
 }
 
 #[tokio::test]

@@ -84,6 +84,7 @@ CREATE TABLE IF NOT EXISTS queued_prompts (
   position INTEGER NOT NULL,
   content TEXT NOT NULL,
   attachments TEXT NOT NULL DEFAULT '[]',  -- JSON [trouve_protocol::Attachment]
+  claimed INTEGER NOT NULL DEFAULT 0,
   created_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS queued_prompts_thread ON queued_prompts (thread_id, position);
@@ -132,6 +133,7 @@ CREATE TABLE IF NOT EXISTS automations (
 const MIGRATIONS: &[&str] = &[
     "ALTER TABLE sessions ADD COLUMN archived INTEGER NOT NULL DEFAULT 0",
     "ALTER TABLE queued_prompts ADD COLUMN attachments TEXT NOT NULL DEFAULT '[]'",
+    "ALTER TABLE queued_prompts ADD COLUMN claimed INTEGER NOT NULL DEFAULT 0",
     // Context-size proxy for compaction/UI: the input tokens of the turn's
     // *last* request, not the sum over its iterations (see record_usage).
     "ALTER TABLE usage ADD COLUMN context_input_tokens INTEGER NOT NULL DEFAULT 0",
@@ -272,6 +274,13 @@ impl Store {
         conn.pragma_update(None, "foreign_keys", "ON")?;
         conn.execute_batch(SCHEMA)?;
         apply_migrations(&conn)?;
+        // Claims belong to dispatcher tasks in this process. After a crash
+        // there is no worker to own them, so make the prompts visible and
+        // explicitly dispatchable again instead of losing them.
+        conn.execute(
+            "UPDATE queued_prompts SET claimed = 0 WHERE claimed != 0",
+            [],
+        )?;
         let (events_tx, _) = broadcast::channel(4096);
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
@@ -285,6 +294,10 @@ impl Store {
         conn.pragma_update(None, "foreign_keys", "ON")?;
         conn.execute_batch(SCHEMA)?;
         apply_migrations(&conn)?;
+        conn.execute(
+            "UPDATE queued_prompts SET claimed = 0 WHERE claimed != 0",
+            [],
+        )?;
         let (events_tx, _) = broadcast::channel(4096);
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
@@ -734,7 +747,7 @@ impl Store {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
             "SELECT id, position, content, attachments, created_at FROM queued_prompts
-             WHERE thread_id = ?1 ORDER BY position",
+             WHERE thread_id = ?1 AND claimed = 0 ORDER BY position",
         )?;
         let rows = stmt.query_map(params![thread_id], |r| {
             Ok(trouve_protocol::QueuedPrompt {
@@ -765,7 +778,7 @@ impl Store {
     pub fn update_queued_prompt(&self, id: &str, content: &str) -> Result<bool> {
         let conn = self.conn.lock().unwrap();
         let n = conn.execute(
-            "UPDATE queued_prompts SET content = ?2 WHERE id = ?1",
+            "UPDATE queued_prompts SET content = ?2 WHERE id = ?1 AND claimed = 0",
             params![id, content],
         )?;
         Ok(n > 0)
@@ -773,7 +786,10 @@ impl Store {
 
     pub fn delete_queued_prompt(&self, id: &str) -> Result<bool> {
         let conn = self.conn.lock().unwrap();
-        let n = conn.execute("DELETE FROM queued_prompts WHERE id = ?1", params![id])?;
+        let n = conn.execute(
+            "DELETE FROM queued_prompts WHERE id = ?1 AND claimed = 0",
+            params![id],
+        )?;
         Ok(n > 0)
     }
 
@@ -784,8 +800,10 @@ impl Store {
         let mut conn = self.conn.lock().unwrap();
         let tx = conn.transaction()?;
         let mut current: Vec<String> = {
-            let mut stmt =
-                tx.prepare("SELECT id FROM queued_prompts WHERE thread_id = ?1 ORDER BY position")?;
+            let mut stmt = tx.prepare(
+                "SELECT id FROM queued_prompts
+                     WHERE thread_id = ?1 AND claimed = 0 ORDER BY position",
+            )?;
             let rows = stmt.query_map(params![thread_id], |r| r.get::<_, String>(0))?;
             rows.collect::<std::result::Result<Vec<_>, _>>()?
         };
@@ -797,7 +815,7 @@ impl Store {
         }
         for (i, id) in ids.iter().enumerate() {
             tx.execute(
-                "UPDATE queued_prompts SET position = ?2 WHERE id = ?1",
+                "UPDATE queued_prompts SET position = ?2 WHERE id = ?1 AND claimed = 0",
                 params![id, (i + 1) as i64],
             )?;
         }
@@ -805,8 +823,10 @@ impl Store {
         Ok(true)
     }
 
-    /// Remove and return the front of the thread's queue.
-    pub fn pop_queued_prompt(
+    /// Hide and return the front prompt while a dispatcher prepares its
+    /// durable turn start. The row is deleted only after the user message is
+    /// persisted; setup failures release it back to the visible queue.
+    pub fn claim_queued_prompt(
         &self,
         thread_id: &str,
     ) -> Result<Option<trouve_protocol::QueuedPrompt>> {
@@ -815,7 +835,7 @@ impl Store {
         let front = tx
             .query_row(
                 "SELECT id, position, content, attachments, created_at FROM queued_prompts
-                 WHERE thread_id = ?1 ORDER BY position LIMIT 1",
+                 WHERE thread_id = ?1 AND claimed = 0 ORDER BY position LIMIT 1",
                 params![thread_id],
                 |r| {
                     Ok(trouve_protocol::QueuedPrompt {
@@ -830,10 +850,34 @@ impl Store {
             )
             .optional()?;
         if let Some(p) = &front {
-            tx.execute("DELETE FROM queued_prompts WHERE id = ?1", params![p.id])?;
+            tx.execute(
+                "UPDATE queued_prompts SET claimed = 1 WHERE id = ?1 AND claimed = 0",
+                params![p.id],
+            )?;
         }
         tx.commit()?;
         Ok(front)
+    }
+
+    /// Return a claimed prompt to the visible queue after setup failed.
+    pub fn release_queued_prompt(&self, id: &str) -> Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        let n = conn.execute(
+            "UPDATE queued_prompts SET claimed = 0 WHERE id = ?1 AND claimed = 1",
+            params![id],
+        )?;
+        Ok(n > 0)
+    }
+
+    /// Permanently consume a claimed prompt after its user message is
+    /// durable in the event log and provider transcript.
+    pub fn finish_queued_prompt(&self, id: &str) -> Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        let n = conn.execute(
+            "DELETE FROM queued_prompts WHERE id = ?1 AND claimed = 1",
+            params![id],
+        )?;
+        Ok(n > 0)
     }
 
     // --- attachments ------------------------------------------------------
@@ -965,6 +1009,17 @@ impl Store {
                     next_run_at = ?5
              WHERE id = ?1",
             params![id, ran_at, session_id, error, next_run_at],
+        )?;
+        Ok(())
+    }
+
+    /// Update the outcome of the most recently dispatched run without
+    /// changing its start time, session, or next scheduled occurrence.
+    pub fn set_automation_result(&self, id: &str, error: &str) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE automations SET last_error = ?2 WHERE id = ?1",
+            params![id, error],
         )?;
         Ok(())
     }
@@ -1662,12 +1717,19 @@ mod tests {
                 .unwrap()
         );
 
-        // Pop drains front-first in the new order.
-        let p1 = store.pop_queued_prompt("th_1").unwrap().unwrap();
+        // Claim hides the prompt while a dispatcher prepares the turn;
+        // releasing makes it visible again, finishing consumes it.
+        let p1 = store.claim_queued_prompt("th_1").unwrap().unwrap();
         assert_eq!(p1.content, "third");
-        let p2 = store.pop_queued_prompt("th_1").unwrap().unwrap();
+        assert_eq!(store.queued_prompts("th_1").unwrap().len(), 1);
+        assert!(store.release_queued_prompt(&p1.id).unwrap());
+        assert_eq!(store.queued_prompts("th_1").unwrap().len(), 2);
+        let p1 = store.claim_queued_prompt("th_1").unwrap().unwrap();
+        assert!(store.finish_queued_prompt(&p1.id).unwrap());
+        let p2 = store.claim_queued_prompt("th_1").unwrap().unwrap();
         assert_eq!(p2.content, "second v2");
-        assert!(store.pop_queued_prompt("th_1").unwrap().is_none());
+        assert!(store.finish_queued_prompt(&p2.id).unwrap());
+        assert!(store.claim_queued_prompt("th_1").unwrap().is_none());
 
         // The other thread's queue is untouched.
         assert_eq!(store.queued_prompts("th_2").unwrap().len(), 1);
@@ -1681,6 +1743,9 @@ mod tests {
             let store = Store::open(&path).unwrap();
             seed_thread(&store, "th_1");
             store.enqueue_prompt("th_1", "keep me", &[]).unwrap();
+            let claimed = store.claim_queued_prompt("th_1").unwrap().unwrap();
+            assert_eq!(claimed.content, "keep me");
+            assert!(store.queued_prompts("th_1").unwrap().is_empty());
         }
         let store = Store::open(&path).unwrap();
         let q = store.queued_prompts("th_1").unwrap();
@@ -1750,6 +1815,12 @@ mod tests {
         assert_eq!(got.last_session_id.as_deref(), Some("sess_9"));
         assert_eq!(got.last_error, "");
         assert_eq!(got.name, "Morning triage");
+        store
+            .set_automation_result("auto_1", "provider failed")
+            .unwrap();
+        let got = store.automation("auto_1").unwrap().unwrap();
+        assert_eq!(got.last_error, "provider failed");
+        assert_eq!(got.last_session_id.as_deref(), Some("sess_9"));
 
         assert!(store.delete_automation("auto_1").unwrap());
         assert!(!store.delete_automation("auto_1").unwrap());
@@ -1779,8 +1850,8 @@ mod tests {
             .unwrap();
         let q = store.queued_prompts("th_1").unwrap();
         assert_eq!(q[0].attachments, vec![att.clone()]);
-        let popped = store.pop_queued_prompt("th_1").unwrap().unwrap();
-        assert_eq!(popped.attachments, vec![att]);
+        let claimed = store.claim_queued_prompt("th_1").unwrap().unwrap();
+        assert_eq!(claimed.attachments, vec![att]);
     }
 
     #[test]

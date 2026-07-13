@@ -130,6 +130,7 @@ pub trait ToolExecutor: Send + Sync {
 pub struct LocalToolExecutor {
     tools: Vec<Arc<dyn Tool>>,
     mcp: crate::mcp::McpManager,
+    jobs: Arc<shell::JobRegistry>,
 }
 
 impl Default for LocalToolExecutor {
@@ -157,7 +158,7 @@ impl LocalToolExecutor {
                 Arc::new(glob::Glob),
                 Arc::new(shell::Shell { jobs: jobs.clone() }),
                 Arc::new(shell::ShellOutput { jobs: jobs.clone() }),
-                Arc::new(shell::ShellKill { jobs }),
+                Arc::new(shell::ShellKill { jobs: jobs.clone() }),
                 Arc::new(grep::Grep),
                 Arc::new(web::WebFetch::default()),
                 Arc::new(todo::TodoWrite::default()),
@@ -169,6 +170,7 @@ impl LocalToolExecutor {
                 }),
             ],
             mcp: crate::mcp::McpManager::with_logs(logs),
+            jobs,
         }
     }
 
@@ -238,6 +240,7 @@ impl ToolExecutor for LocalToolExecutor {
     }
 
     async fn evict_worktree(&self, worktree: &Path) {
+        self.jobs.kill_worktree(worktree).await;
         self.mcp.evict_worktree(worktree).await;
     }
 }

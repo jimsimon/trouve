@@ -27,6 +27,7 @@ const TERMINAL_TAB: i32 = 4;
 
 /// Terminal scrollback the client-side screen model keeps, in lines.
 const TERM_SCROLLBACK: usize = 5000;
+const TERM_FRAME_INTERVAL: std::time::Duration = std::time::Duration::from_millis(16);
 
 #[derive(Debug)]
 pub enum UiCommand {
@@ -341,6 +342,11 @@ pub enum UiCommand {
         offset: u64,
         bytes: Vec<u8>,
     },
+    /// Internal: flush a coalesced terminal frame after a burst of output.
+    FlushTerm {
+        session_id: String,
+        terminal_id: String,
+    },
     /// Internal: a terminal's output stream ended (shell exit / kill).
     TermEnded {
         session_id: String,
@@ -349,6 +355,9 @@ pub enum UiCommand {
 
     /// Internal: an event arrived on some thread's stream.
     Event(String, Box<EventEnvelope>),
+    /// Initial persisted history, coalesced so opening a long thread applies
+    /// and renders many envelopes in one controller command.
+    Events(String, Vec<EventEnvelope>),
 }
 
 /// What a left-nav row maps back to.
@@ -498,6 +507,10 @@ struct Controller {
     /// followers keep feeding backgrounded sessions so switching back is
     /// instant.
     terms: HashMap<String, TermState>,
+    /// Terminal output can arrive in tiny PTY chunks; cap full-grid model
+    /// rebuilds to roughly one per display frame.
+    last_term_render: Option<std::time::Instant>,
+    term_render_pending: Option<(String, String)>,
     /// Last grid size reported by the UI (used for opens before the first
     /// resize event lands).
     term_view: (u16, u16),
@@ -607,6 +620,8 @@ pub async fn run(
         open_file: None,
         right_tab: 0,
         terms: HashMap::new(),
+        last_term_render: None,
+        term_render_pending: None,
         term_view: (80, 24),
     };
 
@@ -1242,14 +1257,48 @@ impl Controller {
         tokio::spawn(async move {
             use std::sync::atomic::{AtomicU64, Ordering};
             let cursor = std::sync::Arc::new(AtomicU64::new(0));
+            let replay = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            let replay_flush_scheduled =
+                std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
             loop {
                 let id = thread_id.clone();
                 let seen = cursor.clone();
+                let replay = replay.clone();
+                let flush_scheduled = replay_flush_scheduled.clone();
+                let event_tx = tx.clone();
                 let after = cursor.load(Ordering::Relaxed);
                 let result = client
                     .follow_thread_events(&thread_id, after, |envelope| {
                         seen.store(envelope.cursor, Ordering::Relaxed);
-                        let _ = tx.send(UiCommand::Event(id.clone(), Box::new(envelope)));
+                        let persisted_replay = std::time::SystemTime::from(envelope.ts)
+                            .elapsed()
+                            .is_ok_and(|age| age > std::time::Duration::from_secs(2));
+                        if persisted_replay {
+                            replay.lock().unwrap().push(envelope);
+                            if !flush_scheduled.swap(true, Ordering::AcqRel) {
+                                let replay = replay.clone();
+                                let flush_scheduled = flush_scheduled.clone();
+                                let event_tx = event_tx.clone();
+                                let id = id.clone();
+                                tokio::spawn(async move {
+                                    // Let the local replay producer fill the
+                                    // batch before handing it to the
+                                    // controller's unbounded command queue.
+                                    tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+                                    flush_scheduled.store(false, Ordering::Release);
+                                    let batch = std::mem::take(&mut *replay.lock().unwrap());
+                                    if !batch.is_empty() {
+                                        let _ = event_tx.send(UiCommand::Events(id, batch));
+                                    }
+                                });
+                            }
+                        } else {
+                            let batch = std::mem::take(&mut *replay.lock().unwrap());
+                            if !batch.is_empty() {
+                                let _ = event_tx.send(UiCommand::Events(id.clone(), batch));
+                            }
+                            let _ = event_tx.send(UiCommand::Event(id.clone(), Box::new(envelope)));
+                        }
                         std::ops::ControlFlow::Continue(())
                     })
                     .await;
@@ -3141,7 +3190,47 @@ impl Controller {
                     applied = true;
                 }
                 if applied && visible {
-                    self.push_term();
+                    let now = std::time::Instant::now();
+                    let elapsed = self
+                        .last_term_render
+                        .map(|last| now.duration_since(last))
+                        .unwrap_or(TERM_FRAME_INTERVAL);
+                    if elapsed >= TERM_FRAME_INTERVAL {
+                        self.term_render_pending = None;
+                        self.push_term();
+                        self.last_term_render = Some(now);
+                    } else {
+                        let pending = (session_id.clone(), terminal_id.clone());
+                        if self.term_render_pending.as_ref() != Some(&pending) {
+                            self.term_render_pending = Some(pending);
+                            let tx = self.tx.clone();
+                            tokio::spawn(async move {
+                                tokio::time::sleep(TERM_FRAME_INTERVAL - elapsed).await;
+                                let _ = tx.send(UiCommand::FlushTerm {
+                                    session_id,
+                                    terminal_id,
+                                });
+                            });
+                        }
+                    }
+                }
+            }
+            UiCommand::FlushTerm {
+                session_id,
+                terminal_id,
+            } => {
+                let expected = (session_id.clone(), terminal_id.clone());
+                if self.term_render_pending.as_ref() == Some(&expected) {
+                    self.term_render_pending = None;
+                    let visible = self.current_session_id().as_deref() == Some(session_id.as_str());
+                    let current = self
+                        .terms
+                        .get(&session_id)
+                        .is_some_and(|state| state.terminal_id == terminal_id);
+                    if visible && current {
+                        self.push_term();
+                        self.last_term_render = Some(std::time::Instant::now());
+                    }
                 }
             }
             UiCommand::TermEnded {
@@ -3157,7 +3246,9 @@ impl Controller {
                     applied = true;
                 }
                 if applied && visible {
+                    self.term_render_pending = None;
                     self.push_term();
+                    self.last_term_render = Some(std::time::Instant::now());
                 }
             }
             // Background poll: swallow transient errors rather than flashing
@@ -4014,6 +4105,34 @@ impl Controller {
             }
             UiCommand::RefreshClis => {
                 self.refresh_clis().await;
+            }
+            UiCommand::Events(thread_id, envelopes) => {
+                let mut changed = false;
+                let mut completed = false;
+                for envelope in &envelopes {
+                    changed |= self
+                        .vms
+                        .entry(thread_id.clone())
+                        .or_default()
+                        .apply(envelope)
+                        .is_some();
+                    completed |=
+                        matches!(envelope.event, trouve_protocol::Event::TurnCompleted { .. });
+                    self.maybe_notify(&thread_id, envelope);
+                }
+                if self.current_thread_id().as_deref() == Some(&thread_id) {
+                    self.push_context();
+                    self.push_queue();
+                    if changed {
+                        self.render_chat(true);
+                        self.last_delta_render = None;
+                    }
+                    if completed {
+                        let _ = self.refresh_diff().await;
+                        self.refresh_usage_text().await;
+                    }
+                }
+                self.push_agents_running();
             }
             UiCommand::Event(thread_id, envelope) => {
                 let vm = self.vms.entry(thread_id.clone()).or_default();

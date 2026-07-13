@@ -516,9 +516,14 @@ fn turn_stream(
                             continue;
                         }
                         let (ok_tx, ok_rx) = oneshot::channel();
+                        // JSON-RPC request ids are unique for this app-server
+                        // process. Preserve that identity in trouve so
+                        // concurrent MCP approvals cannot overwrite the same
+                        // empty ApprovalHub key.
+                        let call_id = format!("codex-mcp-{}", json_rpc_id(&id));
                         let _ = tx
                             .send(Ok(BackendEvent::ApprovalNeeded {
-                                call_id: String::new(),
+                                call_id,
                                 tool: "mcpToolCall".into(),
                                 args: params.clone(),
                                 responder: ok_tx,
@@ -567,6 +572,13 @@ fn turn_stream(
         }
         server.unsubscribe(&codex_thread_id).await;
     })
+}
+
+fn json_rpc_id(id: &Value) -> String {
+    match id {
+        Value::String(value) => value.clone(),
+        other => other.to_string(),
+    }
 }
 
 /// Turn an `account/rateLimits/read` response into subscription health.
@@ -929,6 +941,12 @@ mod tests {
             mcp_bridge: None,
             mcp_servers: Vec::new(),
         }
+    }
+
+    #[test]
+    fn json_rpc_ids_make_stable_approval_ids() {
+        assert_eq!(json_rpc_id(&json!(42)), "42");
+        assert_eq!(json_rpc_id(&json!("request-7")), "request-7");
     }
 
     #[test]

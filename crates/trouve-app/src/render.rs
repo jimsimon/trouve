@@ -24,6 +24,9 @@ pub struct ChatRowData {
     pub md_indent: i32,
     /// Language tag for code-fence rows ("rust", "" when untagged).
     pub md_lang: String,
+    /// Syntax-highlighted code-fence lines, computed on the controller
+    /// thread so the Slint event loop only maps plain segment data.
+    pub code_lines: Vec<Vec<(String, u32)>>,
     pub text: String,
     /// Markdown source for inline styling (bold/italic/code/links) of
     /// non-code markdown blocks; the UI thread parses it into a Slint
@@ -1063,6 +1066,11 @@ fn activity_summary(vm: &ThreadViewModel, segments: &[Segment]) -> String {
 /// re-lays-out the whole chat.
 fn push_blocks(body: &mut Vec<(ChatRowData, Option<String>)>, content: &str) {
     for block in parse_blocks(content) {
+        let code_lines = if block.kind == BlockKind::Code {
+            highlight_code(&block.language, &block.text)
+        } else {
+            Vec::new()
+        };
         // Inline markup survives block parsing verbatim; hand it to
         // StyledText with block-level structure (heading weight, bullet
         // glyph) re-applied as markup. Code fences stay plain text.
@@ -1092,6 +1100,7 @@ fn push_blocks(body: &mut Vec<(ChatRowData, Option<String>)>, content: &str) {
                 md_kind: md_kind(block.kind),
                 md_indent: block.indent,
                 md_lang: block.language,
+                code_lines,
                 text: block.text,
                 styled_md,
                 ..Default::default()
@@ -1832,6 +1841,20 @@ fn highlight_lines(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fenced_code_is_highlighted_before_ui_mapping() {
+        let rows = markdown_rows("```rust\nfn main() {}\n```");
+        let code = rows.iter().find(|row| row.md_kind == 5).unwrap();
+        assert_eq!(code.md_lang, "rust");
+        assert!(!code.code_lines.is_empty());
+        assert!(
+            code.code_lines
+                .iter()
+                .flatten()
+                .any(|(text, _)| text.contains("fn"))
+        );
+    }
 
     #[test]
     fn code_spans_get_tinted_and_prose_stays_untouched() {

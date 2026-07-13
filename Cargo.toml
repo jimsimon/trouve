@@ -16,8 +16,8 @@ members = ["crates/*"]
 edition = "2024"
 license = "MIT"
 repository = "https://github.com/jimsimon/trouve"
-# Edition 2024 requires a recent toolchain; 1.89 is the floor we test against.
-rust-version = "1.89"
+# Slint 1.17 and its compiler crates require Rust 1.92.
+rust-version = "1.92"
 
 [workspace.dependencies]
 anyhow = "1.0.103"

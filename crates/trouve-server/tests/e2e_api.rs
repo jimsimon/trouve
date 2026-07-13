@@ -222,6 +222,19 @@ async fn full_turn_with_approval_checkpoint_and_undo() {
         .to_string();
     assert_eq!(call_id, "call_1");
 
+    // Destructive session cleanup must not race the active turn that is
+    // currently waiting for this approval.
+    let resp = client
+        .delete(format!(
+            "{base}/sessions/{}",
+            session["id"].as_str().unwrap()
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 409);
+    assert!(Path::new(&worktree).exists());
+
     // Approve; the turn then finishes with a checkpoint.
     let resp = client
         .post(format!("{base}/approvals"))
@@ -293,6 +306,138 @@ async fn full_turn_with_approval_checkpoint_and_undo() {
         std::fs::read_to_string(Path::new(&worktree).join("hello.txt")).unwrap(),
         "hi\n"
     );
+
+    // Once idle, deletion removes both the relational state and worktree.
+    let resp = client
+        .delete(format!("{base}/sessions/{session_id}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 204);
+    assert!(!Path::new(&worktree).exists());
+    let resp = client
+        .get(format!("{base}/sessions/{session_id}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 404);
+}
+
+struct IterationLimitProvider {
+    calls: AtomicUsize,
+}
+
+#[async_trait::async_trait]
+impl Provider for IterationLimitProvider {
+    fn id(&self) -> &str {
+        "iteration-limit"
+    }
+
+    async fn stream_chat(
+        &self,
+        _model: &str,
+        _messages: &[Message],
+        tools: &[ToolSpec],
+        _options: &serde_json::Map<String, serde_json::Value>,
+    ) -> Result<EventStream, ProviderError> {
+        let call = self.calls.fetch_add(1, Ordering::SeqCst);
+        let events = if tools.is_empty() {
+            vec![
+                Ok(ProviderEvent::TextDelta(
+                    "I stopped at the step limit; continue to finish.".into(),
+                )),
+                Ok(ProviderEvent::Completed {
+                    usage: Usage::default(),
+                }),
+            ]
+        } else {
+            vec![
+                Ok(ProviderEvent::ToolCall(ToolCallRequest {
+                    id: format!("limit-call-{call}"),
+                    name: "read_file".into(),
+                    arguments: serde_json::json!({"path": "README.md"}),
+                })),
+                Ok(ProviderEvent::Completed {
+                    usage: Usage::default(),
+                }),
+            ]
+        };
+        Ok(Box::pin(futures::stream::iter(events)))
+    }
+}
+
+#[tokio::test]
+async fn iteration_limit_gets_a_final_tool_free_model_response() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path().join("repo");
+    std::fs::create_dir(&repo).unwrap();
+    init_repo(&repo);
+
+    let provider = Arc::new(IterationLimitProvider {
+        calls: AtomicUsize::new(0),
+    });
+    let store = Store::open(&tmp.path().join("db/trouve.db")).unwrap();
+    let engine = Arc::new(
+        Engine::new(store, tmp.path().join("data"), &Config::default())
+            .with_config_dir(None)
+            .with_provider("iteration-limit", provider.clone())
+            .with_default_model("iteration-limit/test"),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let router = trouve_server::build_router(engine);
+    tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+    let base = format!("http://{addr}/v1");
+    let client = reqwest::Client::new();
+
+    let workspace: serde_json::Value = client
+        .post(format!("{base}/workspaces"))
+        .json(&serde_json::json!({"path": repo}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let session: serde_json::Value = client
+        .post(format!("{base}/sessions"))
+        .json(&serde_json::json!({"workspace_id": workspace["id"]}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let thread: serde_json::Value = client
+        .post(format!("{base}/threads"))
+        .json(&serde_json::json!({"session_id": session["id"]}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let thread_id = thread["id"].as_str().unwrap();
+    client
+        .post(format!("{base}/threads/{thread_id}/messages"))
+        .json(&serde_json::json!({"content": "keep reading forever"}))
+        .send()
+        .await
+        .unwrap();
+
+    let events = wait_for_event(
+        &client,
+        &format!("{base}/threads/{thread_id}/events"),
+        |event| event["type"] == "turn.completed",
+    )
+    .await;
+    assert!(events.iter().any(|event| {
+        event["type"] == "assistant.message"
+            && event["content"]
+                .as_str()
+                .is_some_and(|text| text.contains("continue to finish"))
+    }));
+    assert_eq!(provider.calls.load(Ordering::SeqCst), 33);
 }
 
 /// Reports a model with a tiny context window; large usage on turn 1 forces
@@ -2358,6 +2503,110 @@ async fn automation_templates_catalog() {
     assert_eq!(resp.status(), 404);
 }
 
+struct FailingAutomationProvider;
+
+#[async_trait::async_trait]
+impl Provider for FailingAutomationProvider {
+    fn id(&self) -> &str {
+        "automation-failure"
+    }
+
+    async fn stream_chat(
+        &self,
+        _model: &str,
+        _messages: &[Message],
+        _tools: &[ToolSpec],
+        _options: &serde_json::Map<String, serde_json::Value>,
+    ) -> Result<EventStream, ProviderError> {
+        Err(ProviderError::Api("automation provider failed".into()))
+    }
+}
+
+#[tokio::test]
+async fn automation_records_the_turn_outcome_not_just_dispatch() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path().join("repo");
+    std::fs::create_dir(&repo).unwrap();
+    init_repo(&repo);
+
+    let store = Store::open(&tmp.path().join("db/trouve.db")).unwrap();
+    let engine = Arc::new(
+        Engine::new(store, tmp.path().join("data"), &Config::default())
+            .with_config_dir(None)
+            .with_provider("automation-failure", Arc::new(FailingAutomationProvider))
+            .with_default_model("automation-failure/test"),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let router = trouve_server::build_router(engine);
+    tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+    let base = format!("http://{addr}/v1");
+    let client = reqwest::Client::new();
+
+    let workspace: serde_json::Value = client
+        .post(format!("{base}/workspaces"))
+        .json(&serde_json::json!({"path": repo}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let automation: serde_json::Value = client
+        .post(format!("{base}/automations"))
+        .json(&serde_json::json!({
+            "name": "Fail after dispatch",
+            "prompt": "run",
+            "workspace_id": workspace["id"],
+            "schedule": {"kind": "daily", "time": "09:00"},
+            "enabled": false
+        }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let automation_id = automation["id"].as_str().unwrap();
+    let resp = client
+        .post(format!("{base}/automations/{automation_id}/run"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 202);
+
+    let recorded = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let automations: Vec<serde_json::Value> = client
+                .get(format!("{base}/automations"))
+                .send()
+                .await
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+            let current = automations
+                .into_iter()
+                .find(|a| a["id"] == automation_id)
+                .unwrap();
+            if !current["last_error"].as_str().unwrap_or("").is_empty() {
+                break current;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("automation outcome was not recorded");
+    assert!(
+        recorded["last_error"]
+            .as_str()
+            .unwrap()
+            .contains("automation provider failed"),
+        "{recorded}"
+    );
+    assert!(recorded["last_session_id"].is_string());
+}
+
 /// GitHub Enterprise hosts: the integration always lists github.com
 /// first, added hosts get their own entry (persisted to config),
 /// duplicates and bad hostnames are rejected, and removal works —
@@ -3139,6 +3388,7 @@ async fn secured_router_enforces_token_and_loopback_host() {
     let security = trouve_server::ServerSecurity {
         token: Some("s3cret-token".to_string()),
         require_loopback_host: true,
+        internal_token: Some("bridge-secret".to_string()),
     };
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -3179,4 +3429,26 @@ async fn secured_router_enforces_token_and_loopback_host() {
         .await
         .unwrap();
     assert_eq!(resp.status(), reqwest::StatusCode::FORBIDDEN);
+
+    let initialize = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "initialize",
+        "params": {"protocolVersion": "2025-03-26"}
+    });
+    let internal = format!("http://{addr}/internal/threads/missing/mcp?tools=0&approval=0");
+    let resp = client
+        .post(&internal)
+        .json(&initialize)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::UNAUTHORIZED);
+    let resp = client
+        .post(format!("{internal}&bridge_token=bridge-secret"))
+        .json(&initialize)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
 }

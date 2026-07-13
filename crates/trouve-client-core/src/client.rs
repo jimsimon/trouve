@@ -914,15 +914,16 @@ impl LineBuffer {
 }
 
 fn urlencode(s: &str) -> String {
-    s.chars()
-        .flat_map(|c| {
-            if c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '/' | '~') {
-                vec![c]
-            } else {
-                format!("%{:02X}", c as u32).chars().collect()
-            }
-        })
-        .collect()
+    let mut encoded = String::with_capacity(s.len());
+    for byte in s.as_bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(*byte, b'-' | b'_' | b'.' | b'/' | b'~') {
+            encoded.push(*byte as char);
+        } else {
+            use std::fmt::Write as _;
+            write!(&mut encoded, "%{byte:02X}").expect("writing to String cannot fail");
+        }
+    }
+    encoded
 }
 
 async fn decode<T: serde::de::DeserializeOwned>(resp: reqwest::Response, path: &str) -> Result<T> {
@@ -935,4 +936,16 @@ async fn decode<T: serde::de::DeserializeOwned>(resp: reqwest::Response, path: &
         bail!("{path}: {message} ({status})");
     }
     serde_json::from_slice(&bytes).with_context(|| format!("decoding {path} response"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::urlencode;
+
+    #[test]
+    fn urlencode_percent_encodes_utf8_bytes() {
+        assert_eq!(urlencode("src/café.rs"), "src/caf%C3%A9.rs");
+        assert_eq!(urlencode("🙂 notes"), "%F0%9F%99%82%20notes");
+        assert_eq!(urlencode("a/b~c"), "a/b~c");
+    }
 }

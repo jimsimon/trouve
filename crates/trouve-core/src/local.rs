@@ -904,9 +904,7 @@ fn apply_thinking_options(
     let level = options.remove("thinking_level");
     let kwargs = match thinking {
         Thinking::None => None,
-        Thinking::Effort => {
-            effort.map(|v| serde_json::json!({"reasoning_effort": v}))
-        }
+        Thinking::Effort => effort.map(|v| serde_json::json!({"reasoning_effort": v})),
         Thinking::Toggle => level
             .as_ref()
             .and_then(|v| v.as_str())

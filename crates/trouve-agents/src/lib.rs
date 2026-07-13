@@ -2,7 +2,7 @@
 //! Code) driven through their sanctioned CLI/JSON interfaces, running inside
 //! trouve's session worktrees.
 //!
-//! Unlike a [`trouve-providers`] `Provider` (raw model inference inside
+//! Unlike a `trouve_providers::Provider` (raw model inference inside
 //! trouve's own agent loop), an [`AgentBackend`] owns the whole turn: the
 //! vendor harness plans, calls its own tools, and edits files. Trouve
 //! translates its event stream into the trouve protocol and bridges its

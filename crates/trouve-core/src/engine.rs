@@ -67,6 +67,10 @@ pub struct Engine {
     /// while present just enqueue. The session ids feed `Session.active`
     /// and the `session.activity` server event.
     active_threads: Mutex<std::collections::HashMap<String, String>>,
+    /// Sessions currently being deleted. Dispatch checks this while holding
+    /// `active_threads`, making "no active turns" and "no new turns" one
+    /// atomic state transition before destructive cleanup begins.
+    deleting_sessions: Mutex<std::collections::HashSet<String>>,
     /// Cancellation tokens for in-flight turns, keyed by thread id. Set while
     /// a turn runs; `cancel_turn` trips one to interrupt the turn's provider
     /// stream, tool calls, and approval waits at the next await point.
@@ -95,6 +99,8 @@ pub struct Engine {
     /// This server's reachable base URL (e.g. "http://127.0.0.1:7433"), set
     /// once the listener binds; the MCP tool bridge dials back through it.
     base_url: RwLock<Option<String>>,
+    /// Ephemeral credential appended only to internal MCP bridge URLs.
+    bridge_token: RwLock<Option<String>>,
     /// Warm the search index on session creation and GC the shared index
     /// store on archive/delete. Off by default so tests never touch the
     /// embedding model; the server enables it (`with_index_hooks`).
@@ -331,6 +337,7 @@ impl Engine {
             questions: Arc::new(QuestionHub::default()),
             session_locks: Mutex::new(HashMap::new()),
             active_threads: Mutex::new(std::collections::HashMap::new()),
+            deleting_sessions: Mutex::new(std::collections::HashSet::new()),
             turn_cancels: Mutex::new(std::collections::HashMap::new()),
             config: Mutex::new(config.clone()),
             // No write-back by default: only a caller that loaded `config`
@@ -354,6 +361,7 @@ impl Engine {
             hardware: std::sync::OnceLock::new(),
             cli_latest: Mutex::new(HashMap::new()),
             base_url: RwLock::new(None),
+            bridge_token: RwLock::new(None),
             index_hooks: false,
             mcp_logs,
             terminals: crate::terminal::TerminalManager::default(),
@@ -372,6 +380,13 @@ impl Engine {
     /// for backends configured with `tool_bridge = true`).
     pub fn set_base_url(&self, url: &str) {
         *self.base_url.write().unwrap() = Some(url.trim_end_matches('/').to_string());
+    }
+
+    /// Set the server-generated credential vendor children must present to
+    /// the internal MCP bridge. `None` keeps in-process open test routers
+    /// backwards-compatible.
+    pub fn set_bridge_token(&self, token: Option<String>) {
+        *self.bridge_token.write().unwrap() = token;
     }
 
     /// Swap the tool executor (cloud isolation hook, ADR 0004).
@@ -1230,37 +1245,64 @@ impl Engine {
     /// One run: session + thread + prompt, then bookkeeping and the
     /// server-scope event clients refresh on.
     async fn fire_and_record(self: &Arc<Self>, automation: &trouve_protocol::Automation) {
-        let (session_id, error) = match self.fire_automation(automation).await {
-            Ok(session_id) => (Some(session_id), String::new()),
-            Err(e) => (None, e.to_string()),
-        };
         let next = crate::automations::next_run(&automation.schedule, chrono::Local::now())
             .filter(|_| automation.enabled)
             .map(|t| t.to_rfc3339());
-        let _ = self.store.mark_automation_run(
-            &automation.id,
-            &chrono::Utc::now().to_rfc3339(),
-            session_id.as_deref(),
-            &error,
-            next.as_deref(),
-        );
-        if !error.is_empty() {
-            tracing::warn!("automation {} failed: {error}", automation.name);
+        let ran_at = chrono::Utc::now().to_rfc3339();
+        match self.fire_automation(automation).await {
+            Ok((session_id, thread_id, turn)) => {
+                // Advance the schedule as soon as dispatch succeeds so a
+                // long-running or approval-blocked turn cannot fire again on
+                // the next scheduler tick. The completion watcher records
+                // the actual outcome and only then emits automation.fired.
+                let _ = self.store.mark_automation_run(
+                    &automation.id,
+                    &ran_at,
+                    Some(&session_id),
+                    "",
+                    next.as_deref(),
+                );
+                let engine = self.clone();
+                let automation_id = automation.id.clone();
+                let automation_name = automation.name.clone();
+                tokio::spawn(async move {
+                    engine
+                        .monitor_automation_turn(
+                            automation_id,
+                            automation_name,
+                            session_id,
+                            thread_id,
+                            turn,
+                        )
+                        .await;
+                });
+            }
+            Err(e) => {
+                let error = e.to_string();
+                let _ = self.store.mark_automation_run(
+                    &automation.id,
+                    &ran_at,
+                    None,
+                    &error,
+                    next.as_deref(),
+                );
+                tracing::warn!("automation {} failed: {error}", automation.name);
+                let _ = self.store.append_event(
+                    Scope::Server,
+                    Event::AutomationFired {
+                        automation_id: automation.id.clone(),
+                        session_id: None,
+                        error,
+                    },
+                );
+            }
         }
-        let _ = self.store.append_event(
-            Scope::Server,
-            Event::AutomationFired {
-                automation_id: automation.id.clone(),
-                session_id,
-                error,
-            },
-        );
     }
 
     async fn fire_automation(
         self: &Arc<Self>,
         automation: &trouve_protocol::Automation,
-    ) -> Result<String, EngineError> {
+    ) -> Result<(String, String, u64), EngineError> {
         let session = self
             .create_session(trouve_protocol::CreateSessionRequest {
                 workspace_id: automation.workspace_id.clone(),
@@ -1279,8 +1321,90 @@ impl Engine {
             model_options: Default::default(),
             permission_mode: None,
         })?;
-        self.send_message(&thread.id, automation.prompt.clone(), Vec::new())?;
-        Ok(session.id)
+        let accepted = self.send_message(&thread.id, automation.prompt.clone(), Vec::new())?;
+        if accepted.queued || accepted.turn == 0 {
+            return Err(EngineError::Conflict(format!(
+                "automation thread {} did not dispatch",
+                thread.id
+            )));
+        }
+        Ok((session.id, thread.id, accepted.turn))
+    }
+
+    async fn monitor_automation_turn(
+        self: &Arc<Self>,
+        automation_id: String,
+        automation_name: String,
+        session_id: String,
+        thread_id: String,
+        turn: u64,
+    ) {
+        let scope = Scope::Thread(thread_id);
+        let mut live = self.store.subscribe();
+        let mut after = 0u64;
+        let mut replay = std::collections::VecDeque::from(
+            self.store.events_after(&scope, after).unwrap_or_default(),
+        );
+        let error = loop {
+            let envelope = match replay.pop_front() {
+                Some(envelope) => envelope,
+                None => match live.recv().await {
+                    Ok(envelope) => envelope,
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                        replay = std::collections::VecDeque::from(
+                            self.store.events_after(&scope, after).unwrap_or_default(),
+                        );
+                        continue;
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                        break "event stream closed before automation completed".to_string();
+                    }
+                },
+            };
+            if envelope.scope != scope || envelope.cursor <= after {
+                continue;
+            }
+            after = envelope.cursor;
+            match envelope.event {
+                Event::ApprovalRequested {
+                    turn: event_turn, ..
+                } if event_turn == turn => {
+                    // Ask remains the safe default for scheduled work; make
+                    // its blocked state explicit instead of reporting a
+                    // successful automation before the user responds.
+                    let _ = self
+                        .store
+                        .set_automation_result(&automation_id, "awaiting approval");
+                }
+                Event::ApprovalResolved { .. } => {
+                    let _ = self.store.set_automation_result(&automation_id, "");
+                }
+                Event::TurnCompleted {
+                    turn: event_turn, ..
+                } if event_turn == turn => break String::new(),
+                Event::TurnFailed {
+                    turn: event_turn,
+                    error,
+                } if event_turn == turn => break error,
+                Event::TurnCancelled { turn: event_turn } if event_turn == turn => {
+                    break "turn cancelled".to_string();
+                }
+                _ => {}
+            }
+        };
+
+        let _ = self.store.set_automation_result(&automation_id, &error);
+        if !error.is_empty() {
+            tracing::warn!("automation {automation_name} failed: {error}");
+        }
+        let _ = self.store.append_event(
+            Scope::Server,
+            Event::AutomationFired {
+                automation_id,
+                session_id: Some(session_id),
+                error,
+            },
+        );
     }
 
     // --- local models ---------------------------------------------------------
@@ -2765,51 +2889,75 @@ impl Engine {
 
     pub async fn delete_session(&self, id: &str) -> Result<(), EngineError> {
         let session = self.get_session(id)?;
-        self.terminals.remove_session(id);
-        let ws = self
-            .store
-            .workspace(&session.workspace_id)?
-            .ok_or_else(|| EngineError::NotFound(format!("workspace {}", session.workspace_id)))?;
-        let repo = PathBuf::from(&ws.path);
-        let wt = PathBuf::from(&session.worktree_path);
-        if wt.exists() {
-            let res = tokio::task::spawn_blocking(move || git::remove_worktree(&repo, &wt))
-                .await
-                .map_err(|e| EngineError::Internal(anyhow!(e)))?;
-            if let Err(e) = res {
-                tracing::warn!("failed to remove worktree for {id}: {e}");
+        {
+            // Lock ordering is always active_threads -> deleting_sessions;
+            // dispatch_queue uses the same order. Once the marker is set, an
+            // idle session cannot acquire a new dispatcher while deletion is
+            // in progress.
+            let active = self.active_threads.lock().unwrap();
+            if active.values().any(|session_id| session_id == id) {
+                return Err(EngineError::Conflict(format!(
+                    "session {id} has an active turn"
+                )));
+            }
+            let mut deleting = self.deleting_sessions.lock().unwrap();
+            if !deleting.insert(id.to_string()) {
+                return Err(EngineError::Conflict(format!(
+                    "session {id} is already being deleted"
+                )));
             }
         }
-        self.store.append_event(
-            Scope::Session(id.to_string()),
-            Event::WorktreeRemoved {
-                path: session.worktree_path.clone(),
-                branch: session.branch.clone(),
-            },
-        )?;
-        self.store.append_event(
-            Scope::Server,
-            Event::SessionDeleted {
-                session_id: id.to_string(),
-                workspace_id: session.workspace_id.clone(),
-            },
-        )?;
-        // Release any MCP server processes spawned for this worktree, so they
-        // don't leak for the lifetime of the server.
-        self.executor
-            .evict_worktree(Path::new(&session.worktree_path))
-            .await;
-        // Remove attachment files from disk before dropping their DB rows;
-        // afterwards their paths are unrecoverable.
-        for path in self.store.session_attachment_paths(id)? {
-            let _ = std::fs::remove_file(&path);
+
+        let result = async {
+            let ws = self
+                .store
+                .workspace(&session.workspace_id)?
+                .ok_or_else(|| {
+                    EngineError::NotFound(format!("workspace {}", session.workspace_id))
+                })?;
+            // Capture cleanup paths while the relational rows still exist,
+            // then commit the database deletion before any irreversible
+            // filesystem work. A database error must leave the session and
+            // its worktree consistently intact.
+            let attachment_paths = self.store.session_attachment_paths(id)?;
+            self.store.delete_session(id)?;
+
+            self.terminals.remove_session(id);
+            self.executor
+                .evict_worktree(Path::new(&session.worktree_path))
+                .await;
+            for path in attachment_paths {
+                let _ = std::fs::remove_file(&path);
+            }
+
+            let repo = PathBuf::from(&ws.path);
+            let wt = PathBuf::from(&session.worktree_path);
+            if wt.exists() {
+                let res = tokio::task::spawn_blocking(move || git::remove_worktree(&repo, &wt))
+                    .await
+                    .map_err(|e| EngineError::Internal(anyhow!(e)))?;
+                if let Err(e) = res {
+                    tracing::warn!("failed to remove worktree for {id}: {e}");
+                }
+            }
+            // Session-scoped events are deleted with the session for privacy;
+            // the persisted server event is the replayable deletion signal.
+            self.store.append_event(
+                Scope::Server,
+                Event::SessionDeleted {
+                    session_id: id.to_string(),
+                    workspace_id: session.workspace_id.clone(),
+                },
+            )?;
+            if self.index_hooks {
+                crate::tools::gc_index_store_in_background(PathBuf::from(&ws.path));
+            }
+            Ok(())
         }
-        // Deleting the session deletes its events (privacy: see event-log doc).
-        self.store.delete_session(id)?;
-        if self.index_hooks {
-            crate::tools::gc_index_store_in_background(PathBuf::from(&ws.path));
-        }
-        Ok(())
+        .await;
+
+        self.deleting_sessions.lock().unwrap().remove(id);
+        result
     }
 
     // --- threads ------------------------------------------------------------
@@ -3241,10 +3389,21 @@ impl Engine {
         // concurrent sends can't both start a dispatcher.
         let (prompt, session_woke) = {
             let mut active = self.active_threads.lock().unwrap();
+            if self
+                .deleting_sessions
+                .lock()
+                .unwrap()
+                .contains(&thread.session_id)
+            {
+                return Err(EngineError::Conflict(format!(
+                    "session {} is being deleted",
+                    thread.session_id
+                )));
+            }
             if active.contains_key(thread_id) {
                 return Ok(None);
             }
-            let Some(p) = self.store.pop_queued_prompt(thread_id)? else {
+            let Some(p) = self.store.claim_queued_prompt(thread_id)? else {
                 return Ok(None);
             };
             let was_active = active.values().any(|s| *s == thread.session_id);
@@ -3257,12 +3416,14 @@ impl Engine {
         // If setup fails after claiming, release the claim — otherwise the
         // thread stays "active" forever and can never dispatch again.
         if let Err(e) = self.emit_queue(thread_id) {
+            let _ = self.store.release_queued_prompt(&prompt.id);
             self.release_thread(thread_id);
             return Err(e);
         }
         let turn = match self.store.next_turn(thread_id) {
             Ok(t) => t,
             Err(e) => {
+                let _ = self.store.release_queued_prompt(&prompt.id);
                 self.release_thread(thread_id);
                 return Err(e.into());
             }
@@ -3270,20 +3431,18 @@ impl Engine {
         let engine = self.clone();
         tokio::spawn(async move {
             let thread_id = thread.id.clone();
+            let prompt_id = prompt.id.clone();
             // Catch a panic in the turn machinery so the claim (and cancel
             // token) are always released and the UI unsticks — tokio would
             // otherwise swallow the panic and leave the thread wedged as
             // "active" with no TurnFailed event.
-            let drained = std::panic::AssertUnwindSafe(engine.drain_queue(
-                thread,
-                turn,
-                prompt.content,
-                prompt.attachments,
-            ))
-            .catch_unwind()
-            .await;
+            let drained = std::panic::AssertUnwindSafe(engine.drain_queue(thread, turn, prompt))
+                .catch_unwind()
+                .await;
             if drained.is_err() {
                 tracing::error!("turn dispatcher for {thread_id} panicked");
+                let _ = engine.store.release_queued_prompt(&prompt_id);
+                let _ = engine.emit_queue(&thread_id);
                 let _ = engine.store.append_event(
                     Scope::Thread(thread_id.clone()),
                     Event::TurnFailed {
@@ -3305,22 +3464,20 @@ impl Engine {
         self: &Arc<Self>,
         thread: Thread,
         turn: u64,
-        content: String,
-        attachments: Vec<trouve_protocol::Attachment>,
+        prompt: trouve_protocol::QueuedPrompt,
     ) {
         let mut thread = thread;
         let mut turn = turn;
-        let mut content = content;
-        let mut attachments = attachments;
+        let mut prompt = prompt;
         loop {
             let cancel = self.register_cancel(&thread.id);
-            let result = self
-                .run_turn(&thread, turn, content, attachments, cancel.clone())
-                .await;
+            let result = self.run_turn(&thread, turn, &prompt, cancel.clone()).await;
             let cancelled = cancel.is_cancelled();
             self.clear_cancel(&thread.id);
             if let Err(e) = result {
                 tracing::error!("turn {turn} of {} failed: {e}", thread.id);
+                let _ = self.store.release_queued_prompt(&prompt.id);
+                let _ = self.emit_queue(&thread.id);
                 let _ = self.store.append_event(
                     Scope::Thread(thread.id.clone()),
                     Event::TurnFailed {
@@ -3345,7 +3502,7 @@ impl Engine {
             // queue must be atomic against concurrent send_message calls.
             let (next, session_idle) = {
                 let mut active = self.active_threads.lock().unwrap();
-                match self.store.pop_queued_prompt(&thread.id) {
+                match self.store.claim_queued_prompt(&thread.id) {
                     Ok(Some(p)) => (Some(p), false),
                     _ => {
                         active.remove(&thread.id);
@@ -3366,12 +3523,13 @@ impl Engine {
                 Ok(t) => t,
                 Err(e) => {
                     tracing::error!("queue for {} stopped: {e}", thread.id);
+                    let _ = self.store.release_queued_prompt(&next.id);
+                    let _ = self.emit_queue(&thread.id);
                     self.release_thread(&thread.id);
                     return;
                 }
             };
-            content = next.content;
-            attachments = next.attachments;
+            prompt = next;
         }
     }
 
@@ -3443,10 +3601,11 @@ impl Engine {
         self: &Arc<Self>,
         thread: &Thread,
         turn: u64,
-        content: String,
-        attachments: Vec<trouve_protocol::Attachment>,
+        prompt: &trouve_protocol::QueuedPrompt,
         cancel: tokio_util::sync::CancellationToken,
     ) -> Result<()> {
+        let content = prompt.content.clone();
+        let attachments = prompt.attachments.clone();
         let session = self
             .store
             .session(&thread.session_id)?
@@ -3496,6 +3655,7 @@ impl Engine {
                     attachments,
                     concurrent_child,
                     cancel,
+                    &prompt.id,
                 )
                 .await;
         }
@@ -3545,6 +3705,10 @@ impl Engine {
         let content = annotate_attachments(content, &materialized);
         self.store
             .append_message(&thread.id, &serde_json::to_value(Message::User(content))?)?;
+        if !self.store.finish_queued_prompt(&prompt.id)? {
+            bail!("queued prompt {} vanished before turn start", prompt.id);
+        }
+        self.emit_queue(&thread.id)?;
 
         // Tool policy: empty allowed_tools = all registered tools. The
         // engine-served ask_question tool always rides along (deferring to
@@ -3721,27 +3885,83 @@ impl Engine {
             }
         }
 
-        // Truncated mid-work at the iteration budget: tell the user (and
-        // leave a transcript note the model sees next turn) instead of
-        // ending silently as if the work were finished.
+        // Truncated mid-work at the iteration budget: make one final
+        // tool-free provider pass over the last tool results so the user gets
+        // a truthful model-authored progress report rather than a completed
+        // turn whose transcript ends at a tool result.
         if hit_iteration_limit {
-            let note = format!(
-                "Reached the {MAX_ITERATIONS}-step limit for one turn and stopped mid-task. \
-                 Send another message to continue."
-            );
+            let mut messages = vec![Message::System(system.clone())];
+            for payload in self.store.messages(&thread.id)? {
+                messages.push(serde_json::from_value(payload)?);
+            }
+            let mut messages = sanitize_transcript(messages);
+            messages.push(Message::User(format!(
+                "You reached the hard {MAX_ITERATIONS}-step limit for this turn. Do not call any \
+                 more tools. Give the user a concise progress report based on the tool results \
+                 above, clearly identify unfinished work, and ask them to continue in a new turn."
+            )));
+            let mut final_text = String::new();
+            let mut final_reasoning = Vec::new();
+            match provider
+                .stream_chat(&model_name, &messages, &[], &model_options)
+                .await
+            {
+                Ok(mut stream) => {
+                    while let Some(event) = stream.next().await {
+                        match event {
+                            Ok(ProviderEvent::TextDelta(delta)) => {
+                                final_text.push_str(&delta);
+                                self.store.append_event(
+                                    scope.clone(),
+                                    Event::AssistantDelta { turn, text: delta },
+                                )?;
+                            }
+                            Ok(ProviderEvent::ThinkingDelta(delta)) => {
+                                self.store.append_event(
+                                    scope.clone(),
+                                    Event::AssistantThinking { turn, text: delta },
+                                )?;
+                            }
+                            Ok(ProviderEvent::Reasoning(block)) => final_reasoning.push(block),
+                            Ok(ProviderEvent::Completed { usage }) => {
+                                usage_total.input_tokens += usage.input_tokens;
+                                usage_total.output_tokens += usage.output_tokens;
+                                usage_total.cached_input_tokens += usage.cached_input_tokens;
+                                context_input_tokens =
+                                    usage.input_tokens + usage.cached_input_tokens;
+                            }
+                            // Tools are deliberately unavailable on this
+                            // final pass. Ignore a non-conforming provider's
+                            // request and fall back to the explicit note.
+                            Ok(ProviderEvent::ToolCall(_)) => {}
+                            Err(e) => {
+                                tracing::warn!("iteration-limit summary failed: {e}");
+                                break;
+                            }
+                        }
+                    }
+                }
+                Err(e) => tracing::warn!("iteration-limit summary failed: {e}"),
+            }
+            if final_text.trim().is_empty() {
+                final_text = format!(
+                    "Reached the {MAX_ITERATIONS}-step limit for one turn and stopped mid-task. \
+                     Send another message to continue."
+                );
+            }
             self.store.append_event(
                 scope.clone(),
                 Event::AssistantMessage {
                     turn,
-                    content: note.clone(),
+                    content: final_text.clone(),
                 },
             )?;
             self.store.append_message(
                 &thread.id,
                 &serde_json::to_value(Message::Assistant {
-                    content: note,
+                    content: final_text,
                     tool_calls: Vec::new(),
-                    reasoning: Vec::new(),
+                    reasoning: final_reasoning,
                 })?,
             )?;
         }
@@ -3819,13 +4039,17 @@ impl Engine {
         // Codex approvals are native RPCs; serving Claude's permission-gate
         // tool would only tempt the model to call it.
         let approval = if kind == "codex-app-server" { 0 } else { 1 };
-        let url = format!(
+        let mut url = format!(
             "{}/internal/threads/{}/mcp?tools={}&approval={}",
             base_url.trim_end_matches('/'),
             thread_id,
             bridge_tools as u8,
             approval,
         );
+        if let Some(token) = self.bridge_token.read().unwrap().as_deref() {
+            url.push_str("&bridge_token=");
+            url.push_str(token);
+        }
         Some(trouve_agents::McpBridgeConfig {
             url,
             bridge_tools,
@@ -4114,6 +4338,7 @@ impl Engine {
         attachments: Vec<trouve_protocol::Attachment>,
         concurrent_child: bool,
         cancel: tokio_util::sync::CancellationToken,
+        queued_prompt_id: &str,
     ) -> Result<()> {
         let scope = Scope::Thread(thread.id.clone());
         // Vendor sessions are per (thread, backend): each vendor keeps its
@@ -4177,6 +4402,10 @@ impl Engine {
             &thread.id,
             &serde_json::to_value(Message::User(content.clone()))?,
         )?;
+        if !self.store.finish_queued_prompt(queued_prompt_id)? {
+            bail!("queued prompt {queued_prompt_id} vanished before turn start");
+        }
+        self.emit_queue(&thread.id)?;
 
         let permission = if mode.read_only {
             BackendPermission::ReadOnly
@@ -4486,7 +4715,12 @@ impl Engine {
                         decision,
                     },
                 )?;
-                if decision == ApprovalDecision::AlwaysApprove {
+                let unlocks_mcp_server =
+                    decision == ApprovalDecision::Approve && key.starts_with("mcp:");
+                if decision == ApprovalDecision::AlwaysApprove || unlocks_mcp_server {
+                    // MCP approval is first-use per server and session: a
+                    // plain approval unlocks this server, matching native MCP
+                    // calls without broadening approval to other servers.
                     self.approvals.extend_allow_list(&session.id, key);
                 }
                 Ok(decision != ApprovalDecision::Deny)
