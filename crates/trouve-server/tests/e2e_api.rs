@@ -2386,6 +2386,110 @@ async fn automation_templates_catalog() {
     assert_eq!(resp.status(), 404);
 }
 
+struct FailingAutomationProvider;
+
+#[async_trait::async_trait]
+impl Provider for FailingAutomationProvider {
+    fn id(&self) -> &str {
+        "automation-failure"
+    }
+
+    async fn stream_chat(
+        &self,
+        _model: &str,
+        _messages: &[Message],
+        _tools: &[ToolSpec],
+        _options: &serde_json::Map<String, serde_json::Value>,
+    ) -> Result<EventStream, ProviderError> {
+        Err(ProviderError::Api("automation provider failed".into()))
+    }
+}
+
+#[tokio::test]
+async fn automation_records_the_turn_outcome_not_just_dispatch() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path().join("repo");
+    std::fs::create_dir(&repo).unwrap();
+    init_repo(&repo);
+
+    let store = Store::open(&tmp.path().join("db/trouve.db")).unwrap();
+    let engine = Arc::new(
+        Engine::new(store, tmp.path().join("data"), &Config::default())
+            .with_config_dir(None)
+            .with_provider("automation-failure", Arc::new(FailingAutomationProvider))
+            .with_default_model("automation-failure/test"),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let router = trouve_server::build_router(engine);
+    tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+    let base = format!("http://{addr}/v1");
+    let client = reqwest::Client::new();
+
+    let workspace: serde_json::Value = client
+        .post(format!("{base}/workspaces"))
+        .json(&serde_json::json!({"path": repo}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let automation: serde_json::Value = client
+        .post(format!("{base}/automations"))
+        .json(&serde_json::json!({
+            "name": "Fail after dispatch",
+            "prompt": "run",
+            "workspace_id": workspace["id"],
+            "schedule": {"kind": "daily", "time": "09:00"},
+            "enabled": false
+        }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let automation_id = automation["id"].as_str().unwrap();
+    let resp = client
+        .post(format!("{base}/automations/{automation_id}/run"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 202);
+
+    let recorded = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let automations: Vec<serde_json::Value> = client
+                .get(format!("{base}/automations"))
+                .send()
+                .await
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+            let current = automations
+                .into_iter()
+                .find(|a| a["id"] == automation_id)
+                .unwrap();
+            if !current["last_error"].as_str().unwrap_or("").is_empty() {
+                break current;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("automation outcome was not recorded");
+    assert!(
+        recorded["last_error"]
+            .as_str()
+            .unwrap()
+            .contains("automation provider failed"),
+        "{recorded}"
+    );
+    assert!(recorded["last_session_id"].is_string());
+}
+
 /// GitHub Enterprise hosts: the integration always lists github.com
 /// first, added hosts get their own entry (persisted to config),
 /// duplicates and bad hostnames are rejected, and removal works —

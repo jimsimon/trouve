@@ -1013,6 +1013,17 @@ impl Store {
         Ok(())
     }
 
+    /// Update the outcome of the most recently dispatched run without
+    /// changing its start time, session, or next scheduled occurrence.
+    pub fn set_automation_result(&self, id: &str, error: &str) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE automations SET last_error = ?2 WHERE id = ?1",
+            params![id, error],
+        )?;
+        Ok(())
+    }
+
     /// Reset the next fire time alone (startup recompute after downtime).
     pub fn set_automation_next_run(&self, id: &str, next_run_at: Option<&str>) -> Result<()> {
         let conn = self.conn.lock().unwrap();
@@ -1804,6 +1815,12 @@ mod tests {
         assert_eq!(got.last_session_id.as_deref(), Some("sess_9"));
         assert_eq!(got.last_error, "");
         assert_eq!(got.name, "Morning triage");
+        store
+            .set_automation_result("auto_1", "provider failed")
+            .unwrap();
+        let got = store.automation("auto_1").unwrap().unwrap();
+        assert_eq!(got.last_error, "provider failed");
+        assert_eq!(got.last_session_id.as_deref(), Some("sess_9"));
 
         assert!(store.delete_automation("auto_1").unwrap());
         assert!(!store.delete_automation("auto_1").unwrap());

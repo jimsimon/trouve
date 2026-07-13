@@ -1235,37 +1235,64 @@ impl Engine {
     /// One run: session + thread + prompt, then bookkeeping and the
     /// server-scope event clients refresh on.
     async fn fire_and_record(self: &Arc<Self>, automation: &trouve_protocol::Automation) {
-        let (session_id, error) = match self.fire_automation(automation).await {
-            Ok(session_id) => (Some(session_id), String::new()),
-            Err(e) => (None, e.to_string()),
-        };
         let next = crate::automations::next_run(&automation.schedule, chrono::Local::now())
             .filter(|_| automation.enabled)
             .map(|t| t.to_rfc3339());
-        let _ = self.store.mark_automation_run(
-            &automation.id,
-            &chrono::Utc::now().to_rfc3339(),
-            session_id.as_deref(),
-            &error,
-            next.as_deref(),
-        );
-        if !error.is_empty() {
-            tracing::warn!("automation {} failed: {error}", automation.name);
+        let ran_at = chrono::Utc::now().to_rfc3339();
+        match self.fire_automation(automation).await {
+            Ok((session_id, thread_id, turn)) => {
+                // Advance the schedule as soon as dispatch succeeds so a
+                // long-running or approval-blocked turn cannot fire again on
+                // the next scheduler tick. The completion watcher records
+                // the actual outcome and only then emits automation.fired.
+                let _ = self.store.mark_automation_run(
+                    &automation.id,
+                    &ran_at,
+                    Some(&session_id),
+                    "",
+                    next.as_deref(),
+                );
+                let engine = self.clone();
+                let automation_id = automation.id.clone();
+                let automation_name = automation.name.clone();
+                tokio::spawn(async move {
+                    engine
+                        .monitor_automation_turn(
+                            automation_id,
+                            automation_name,
+                            session_id,
+                            thread_id,
+                            turn,
+                        )
+                        .await;
+                });
+            }
+            Err(e) => {
+                let error = e.to_string();
+                let _ = self.store.mark_automation_run(
+                    &automation.id,
+                    &ran_at,
+                    None,
+                    &error,
+                    next.as_deref(),
+                );
+                tracing::warn!("automation {} failed: {error}", automation.name);
+                let _ = self.store.append_event(
+                    Scope::Server,
+                    Event::AutomationFired {
+                        automation_id: automation.id.clone(),
+                        session_id: None,
+                        error,
+                    },
+                );
+            }
         }
-        let _ = self.store.append_event(
-            Scope::Server,
-            Event::AutomationFired {
-                automation_id: automation.id.clone(),
-                session_id,
-                error,
-            },
-        );
     }
 
     async fn fire_automation(
         self: &Arc<Self>,
         automation: &trouve_protocol::Automation,
-    ) -> Result<String, EngineError> {
+    ) -> Result<(String, String, u64), EngineError> {
         let session = self
             .create_session(trouve_protocol::CreateSessionRequest {
                 workspace_id: automation.workspace_id.clone(),
@@ -1284,8 +1311,90 @@ impl Engine {
             model_options: Default::default(),
             permission_mode: None,
         })?;
-        self.send_message(&thread.id, automation.prompt.clone(), Vec::new())?;
-        Ok(session.id)
+        let accepted = self.send_message(&thread.id, automation.prompt.clone(), Vec::new())?;
+        if accepted.queued || accepted.turn == 0 {
+            return Err(EngineError::Conflict(format!(
+                "automation thread {} did not dispatch",
+                thread.id
+            )));
+        }
+        Ok((session.id, thread.id, accepted.turn))
+    }
+
+    async fn monitor_automation_turn(
+        self: &Arc<Self>,
+        automation_id: String,
+        automation_name: String,
+        session_id: String,
+        thread_id: String,
+        turn: u64,
+    ) {
+        let scope = Scope::Thread(thread_id);
+        let mut live = self.store.subscribe();
+        let mut after = 0u64;
+        let mut replay = std::collections::VecDeque::from(
+            self.store.events_after(&scope, after).unwrap_or_default(),
+        );
+        let error = loop {
+            let envelope = match replay.pop_front() {
+                Some(envelope) => envelope,
+                None => match live.recv().await {
+                    Ok(envelope) => envelope,
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                        replay = std::collections::VecDeque::from(
+                            self.store.events_after(&scope, after).unwrap_or_default(),
+                        );
+                        continue;
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                        break "event stream closed before automation completed".to_string();
+                    }
+                },
+            };
+            if envelope.scope != scope || envelope.cursor <= after {
+                continue;
+            }
+            after = envelope.cursor;
+            match envelope.event {
+                Event::ApprovalRequested {
+                    turn: event_turn, ..
+                } if event_turn == turn => {
+                    // Ask remains the safe default for scheduled work; make
+                    // its blocked state explicit instead of reporting a
+                    // successful automation before the user responds.
+                    let _ = self
+                        .store
+                        .set_automation_result(&automation_id, "awaiting approval");
+                }
+                Event::ApprovalResolved { .. } => {
+                    let _ = self.store.set_automation_result(&automation_id, "");
+                }
+                Event::TurnCompleted {
+                    turn: event_turn, ..
+                } if event_turn == turn => break String::new(),
+                Event::TurnFailed {
+                    turn: event_turn,
+                    error,
+                } if event_turn == turn => break error,
+                Event::TurnCancelled { turn: event_turn } if event_turn == turn => {
+                    break "turn cancelled".to_string();
+                }
+                _ => {}
+            }
+        };
+
+        let _ = self.store.set_automation_result(&automation_id, &error);
+        if !error.is_empty() {
+            tracing::warn!("automation {automation_name} failed: {error}");
+        }
+        let _ = self.store.append_event(
+            Scope::Server,
+            Event::AutomationFired {
+                automation_id,
+                session_id: Some(session_id),
+                error,
+            },
+        );
     }
 
     // --- local models ---------------------------------------------------------
