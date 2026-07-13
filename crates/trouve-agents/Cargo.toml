@@ -19,11 +19,9 @@ serde.workspace = true
 serde_json.workspace = true
 sha2 = "0.10"
 tar = "0.4"
+tempfile.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 trouve-protocol.workspace = true
 trouve-providers.workspace = true
-
-[dev-dependencies]
-tempfile.workspace = true

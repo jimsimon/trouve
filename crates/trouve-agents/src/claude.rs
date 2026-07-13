@@ -116,6 +116,9 @@ struct ClaudeProc {
     /// Stdout lines; locked by the active turn for its whole duration.
     lines: Mutex<mpsc::Receiver<String>>,
     child: Mutex<Child>,
+    /// Claude reads user MCP credentials from this owner-only file. Keeping
+    /// the handle alive for the child lifetime also removes it on drop.
+    _mcp_config: Option<tempfile::NamedTempFile>,
     /// Spawn-time configuration; a differing turn forces a respawn.
     config_fp: String,
     /// Vendor session id the process is holding, updated from its events.
@@ -357,6 +360,7 @@ impl ClaudeBackend {
     /// thread. The prompt is NOT passed here; turns arrive over stdin.
     fn spawn(&self, turn: &BackendTurn, config_fp: String) -> Result<ClaudeProc, BackendError> {
         let mut cmd = Command::new(&self.command);
+        let mut mcp_config_file = None;
         cmd.arg("-p")
             .args(["--input-format", "stream-json"])
             .args(["--output-format", "stream-json"])
@@ -430,11 +434,21 @@ impl ClaudeBackend {
             );
         }
         if !mcp_servers.is_empty() {
+            use std::io::Write as _;
+
             let mcp_config = serde_json::json!({ "mcpServers": mcp_servers });
-            let path = std::env::temp_dir().join(format!("trouve-mcp-{}.json", turn.thread_id));
-            std::fs::write(&path, mcp_config.to_string())?;
-            cmd.arg("--mcp-config").arg(&path);
+            // NamedTempFile uses create-new semantics and mode 0600 on Unix,
+            // avoiding both shared-/tmp disclosure and symlink clobbering.
+            // The handle lives in ClaudeProc, so the credential-bearing file
+            // disappears as soon as the pooled child is evicted.
+            let mut file = tempfile::Builder::new()
+                .prefix("trouve-mcp-")
+                .suffix(".json")
+                .tempfile()?;
+            file.write_all(mcp_config.to_string().as_bytes())?;
+            cmd.arg("--mcp-config").arg(file.path());
             cmd.arg("--strict-mcp-config");
+            mcp_config_file = Some(file);
         }
         if let Some(bridge) = &turn.mcp_bridge {
             if bridge.bridge_tools {
@@ -521,6 +535,7 @@ impl ClaudeBackend {
             stdin: Mutex::new(stdin),
             lines: Mutex::new(line_rx),
             child: Mutex::new(child),
+            _mcp_config: mcp_config_file,
             config_fp,
             session: std::sync::Mutex::new(turn.session.clone()),
             last_used: std::sync::Mutex::new(Instant::now()),
