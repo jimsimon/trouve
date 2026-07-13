@@ -27,6 +27,7 @@ const TERMINAL_TAB: i32 = 4;
 
 /// Terminal scrollback the client-side screen model keeps, in lines.
 const TERM_SCROLLBACK: usize = 5000;
+const TERM_FRAME_INTERVAL: std::time::Duration = std::time::Duration::from_millis(16);
 
 #[derive(Debug)]
 pub enum UiCommand {
@@ -341,6 +342,11 @@ pub enum UiCommand {
         offset: u64,
         bytes: Vec<u8>,
     },
+    /// Internal: flush a coalesced terminal frame after a burst of output.
+    FlushTerm {
+        session_id: String,
+        terminal_id: String,
+    },
     /// Internal: a terminal's output stream ended (shell exit / kill).
     TermEnded {
         session_id: String,
@@ -501,6 +507,10 @@ struct Controller {
     /// followers keep feeding backgrounded sessions so switching back is
     /// instant.
     terms: HashMap<String, TermState>,
+    /// Terminal output can arrive in tiny PTY chunks; cap full-grid model
+    /// rebuilds to roughly one per display frame.
+    last_term_render: Option<std::time::Instant>,
+    term_render_pending: Option<(String, String)>,
     /// Last grid size reported by the UI (used for opens before the first
     /// resize event lands).
     term_view: (u16, u16),
@@ -610,6 +620,8 @@ pub async fn run(
         open_file: None,
         right_tab: 0,
         terms: HashMap::new(),
+        last_term_render: None,
+        term_render_pending: None,
         term_view: (80, 24),
     };
 
@@ -3178,7 +3190,47 @@ impl Controller {
                     applied = true;
                 }
                 if applied && visible {
-                    self.push_term();
+                    let now = std::time::Instant::now();
+                    let elapsed = self
+                        .last_term_render
+                        .map(|last| now.duration_since(last))
+                        .unwrap_or(TERM_FRAME_INTERVAL);
+                    if elapsed >= TERM_FRAME_INTERVAL {
+                        self.term_render_pending = None;
+                        self.push_term();
+                        self.last_term_render = Some(now);
+                    } else {
+                        let pending = (session_id.clone(), terminal_id.clone());
+                        if self.term_render_pending.as_ref() != Some(&pending) {
+                            self.term_render_pending = Some(pending);
+                            let tx = self.tx.clone();
+                            tokio::spawn(async move {
+                                tokio::time::sleep(TERM_FRAME_INTERVAL - elapsed).await;
+                                let _ = tx.send(UiCommand::FlushTerm {
+                                    session_id,
+                                    terminal_id,
+                                });
+                            });
+                        }
+                    }
+                }
+            }
+            UiCommand::FlushTerm {
+                session_id,
+                terminal_id,
+            } => {
+                let expected = (session_id.clone(), terminal_id.clone());
+                if self.term_render_pending.as_ref() == Some(&expected) {
+                    self.term_render_pending = None;
+                    let visible = self.current_session_id().as_deref() == Some(session_id.as_str());
+                    let current = self
+                        .terms
+                        .get(&session_id)
+                        .is_some_and(|state| state.terminal_id == terminal_id);
+                    if visible && current {
+                        self.push_term();
+                        self.last_term_render = Some(std::time::Instant::now());
+                    }
                 }
             }
             UiCommand::TermEnded {
@@ -3194,7 +3246,9 @@ impl Controller {
                     applied = true;
                 }
                 if applied && visible {
+                    self.term_render_pending = None;
                     self.push_term();
+                    self.last_term_render = Some(std::time::Instant::now());
                 }
             }
             // Background poll: swallow transient errors rather than flashing
