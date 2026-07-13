@@ -349,6 +349,9 @@ pub enum UiCommand {
 
     /// Internal: an event arrived on some thread's stream.
     Event(String, Box<EventEnvelope>),
+    /// Initial persisted history, coalesced so opening a long thread applies
+    /// and renders many envelopes in one controller command.
+    Events(String, Vec<EventEnvelope>),
 }
 
 /// What a left-nav row maps back to.
@@ -1242,14 +1245,48 @@ impl Controller {
         tokio::spawn(async move {
             use std::sync::atomic::{AtomicU64, Ordering};
             let cursor = std::sync::Arc::new(AtomicU64::new(0));
+            let replay = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            let replay_flush_scheduled =
+                std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
             loop {
                 let id = thread_id.clone();
                 let seen = cursor.clone();
+                let replay = replay.clone();
+                let flush_scheduled = replay_flush_scheduled.clone();
+                let event_tx = tx.clone();
                 let after = cursor.load(Ordering::Relaxed);
                 let result = client
                     .follow_thread_events(&thread_id, after, |envelope| {
                         seen.store(envelope.cursor, Ordering::Relaxed);
-                        let _ = tx.send(UiCommand::Event(id.clone(), Box::new(envelope)));
+                        let persisted_replay = std::time::SystemTime::from(envelope.ts)
+                            .elapsed()
+                            .is_ok_and(|age| age > std::time::Duration::from_secs(2));
+                        if persisted_replay {
+                            replay.lock().unwrap().push(envelope);
+                            if !flush_scheduled.swap(true, Ordering::AcqRel) {
+                                let replay = replay.clone();
+                                let flush_scheduled = flush_scheduled.clone();
+                                let event_tx = event_tx.clone();
+                                let id = id.clone();
+                                tokio::spawn(async move {
+                                    // Let the local replay producer fill the
+                                    // batch before handing it to the
+                                    // controller's unbounded command queue.
+                                    tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+                                    flush_scheduled.store(false, Ordering::Release);
+                                    let batch = std::mem::take(&mut *replay.lock().unwrap());
+                                    if !batch.is_empty() {
+                                        let _ = event_tx.send(UiCommand::Events(id, batch));
+                                    }
+                                });
+                            }
+                        } else {
+                            let batch = std::mem::take(&mut *replay.lock().unwrap());
+                            if !batch.is_empty() {
+                                let _ = event_tx.send(UiCommand::Events(id.clone(), batch));
+                            }
+                            let _ = event_tx.send(UiCommand::Event(id.clone(), Box::new(envelope)));
+                        }
                         std::ops::ControlFlow::Continue(())
                     })
                     .await;
@@ -4014,6 +4051,34 @@ impl Controller {
             }
             UiCommand::RefreshClis => {
                 self.refresh_clis().await;
+            }
+            UiCommand::Events(thread_id, envelopes) => {
+                let mut changed = false;
+                let mut completed = false;
+                for envelope in &envelopes {
+                    changed |= self
+                        .vms
+                        .entry(thread_id.clone())
+                        .or_default()
+                        .apply(envelope)
+                        .is_some();
+                    completed |=
+                        matches!(envelope.event, trouve_protocol::Event::TurnCompleted { .. });
+                    self.maybe_notify(&thread_id, envelope);
+                }
+                if self.current_thread_id().as_deref() == Some(&thread_id) {
+                    self.push_context();
+                    self.push_queue();
+                    if changed {
+                        self.render_chat(true);
+                        self.last_delta_render = None;
+                    }
+                    if completed {
+                        let _ = self.refresh_diff().await;
+                        self.refresh_usage_text().await;
+                    }
+                }
+                self.push_agents_running();
             }
             UiCommand::Event(thread_id, envelope) => {
                 let vm = self.vms.entry(thread_id.clone()).or_default();
