@@ -926,18 +926,6 @@ fn urlencode(s: &str) -> String {
     encoded
 }
 
-#[cfg(test)]
-mod tests {
-    use super::urlencode;
-
-    #[test]
-    fn urlencode_percent_encodes_utf8_bytes() {
-        assert_eq!(urlencode("src/café.rs"), "src/caf%C3%A9.rs");
-        assert_eq!(urlencode("🙂 notes"), "%F0%9F%99%82%20notes");
-        assert_eq!(urlencode("a/b~c"), "a/b~c");
-    }
-}
-
 async fn decode<T: serde::de::DeserializeOwned>(resp: reqwest::Response, path: &str) -> Result<T> {
     let status = resp.status();
     let bytes = resp.bytes().await?;
@@ -948,4 +936,16 @@ async fn decode<T: serde::de::DeserializeOwned>(resp: reqwest::Response, path: &
         bail!("{path}: {message} ({status})");
     }
     serde_json::from_slice(&bytes).with_context(|| format!("decoding {path} response"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::urlencode;
+
+    #[test]
+    fn urlencode_percent_encodes_utf8_bytes() {
+        assert_eq!(urlencode("src/café.rs"), "src/caf%C3%A9.rs");
+        assert_eq!(urlencode("🙂 notes"), "%F0%9F%99%82%20notes");
+        assert_eq!(urlencode("a/b~c"), "a/b~c");
+    }
 }
