@@ -3388,6 +3388,7 @@ async fn secured_router_enforces_token_and_loopback_host() {
     let security = trouve_server::ServerSecurity {
         token: Some("s3cret-token".to_string()),
         require_loopback_host: true,
+        internal_token: Some("bridge-secret".to_string()),
     };
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -3428,4 +3429,26 @@ async fn secured_router_enforces_token_and_loopback_host() {
         .await
         .unwrap();
     assert_eq!(resp.status(), reqwest::StatusCode::FORBIDDEN);
+
+    let initialize = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "initialize",
+        "params": {"protocolVersion": "2025-03-26"}
+    });
+    let internal = format!("http://{addr}/internal/threads/missing/mcp?tools=0&approval=0");
+    let resp = client
+        .post(&internal)
+        .json(&initialize)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::UNAUTHORIZED);
+    let resp = client
+        .post(format!("{internal}&bridge_token=bridge-secret"))
+        .json(&initialize)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
 }

@@ -99,6 +99,8 @@ pub struct Engine {
     /// This server's reachable base URL (e.g. "http://127.0.0.1:7433"), set
     /// once the listener binds; the MCP tool bridge dials back through it.
     base_url: RwLock<Option<String>>,
+    /// Ephemeral credential appended only to internal MCP bridge URLs.
+    bridge_token: RwLock<Option<String>>,
     /// Warm the search index on session creation and GC the shared index
     /// store on archive/delete. Off by default so tests never touch the
     /// embedding model; the server enables it (`with_index_hooks`).
@@ -359,6 +361,7 @@ impl Engine {
             hardware: std::sync::OnceLock::new(),
             cli_latest: Mutex::new(HashMap::new()),
             base_url: RwLock::new(None),
+            bridge_token: RwLock::new(None),
             index_hooks: false,
             mcp_logs,
             terminals: crate::terminal::TerminalManager::default(),
@@ -377,6 +380,13 @@ impl Engine {
     /// for backends configured with `tool_bridge = true`).
     pub fn set_base_url(&self, url: &str) {
         *self.base_url.write().unwrap() = Some(url.trim_end_matches('/').to_string());
+    }
+
+    /// Set the server-generated credential vendor children must present to
+    /// the internal MCP bridge. `None` keeps in-process open test routers
+    /// backwards-compatible.
+    pub fn set_bridge_token(&self, token: Option<String>) {
+        *self.bridge_token.write().unwrap() = token;
     }
 
     /// Swap the tool executor (cloud isolation hook, ADR 0004).
@@ -4029,13 +4039,17 @@ impl Engine {
         // Codex approvals are native RPCs; serving Claude's permission-gate
         // tool would only tempt the model to call it.
         let approval = if kind == "codex-app-server" { 0 } else { 1 };
-        let url = format!(
+        let mut url = format!(
             "{}/internal/threads/{}/mcp?tools={}&approval={}",
             base_url.trim_end_matches('/'),
             thread_id,
             bridge_tools as u8,
             approval,
         );
+        if let Some(token) = self.bridge_token.read().unwrap().as_deref() {
+            url.push_str("&bridge_token=");
+            url.push_str(token);
+        }
         Some(trouve_agents::McpBridgeConfig {
             url,
             bridge_tools,

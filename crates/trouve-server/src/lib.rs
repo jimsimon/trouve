@@ -248,6 +248,9 @@ pub struct ServerSecurity {
     /// rebinding: an attacker page rebinds its hostname to 127.0.0.1, but
     /// the browser still sends that hostname in `Host`, which won't match.
     pub require_loopback_host: bool,
+    /// Ephemeral credential for vendor CLI children calling `/internal/*`.
+    /// Unlike the API token this is never persisted or user-facing.
+    pub internal_token: Option<String>,
 }
 
 impl ServerSecurity {
@@ -264,11 +267,17 @@ impl ServerSecurity {
     /// - host: loopback-only unless `TROUVE_ALLOW_REMOTE` is set.
     pub fn resolve(data_dir: &std::path::Path) -> Self {
         let require_loopback_host = std::env::var_os("TROUVE_ALLOW_REMOTE").is_none();
+        let internal_token = Some(format!(
+            "{}{}",
+            uuid::Uuid::new_v4().simple(),
+            uuid::Uuid::new_v4().simple()
+        ));
         if std::env::var("TROUVE_NO_AUTH").is_ok_and(|v| v == "1" || v == "true") {
             tracing::warn!("TROUVE_NO_AUTH set: the API is unauthenticated");
             return Self {
                 token: None,
                 require_loopback_host,
+                internal_token,
             };
         }
         let token = match std::env::var("TROUVE_AUTH_TOKEN") {
@@ -278,6 +287,7 @@ impl ServerSecurity {
         Self {
             token: Some(token),
             require_loopback_host,
+            internal_token,
         }
     }
 
@@ -330,9 +340,7 @@ fn host_is_loopback(headers: &HeaderMap) -> bool {
         .get(axum::http::header::HOST)
         .and_then(|v| v.to_str().ok())
     else {
-        // No Host header (HTTP/2 without one, or a raw client): allow — the
-        // loopback bind is the backstop and there's no rebindable name.
-        return true;
+        return false;
     };
     // Strip a trailing :port (but keep IPv6 brackets intact for parsing).
     let hostname = if let Some(stripped) = host.strip_prefix('[') {
@@ -371,13 +379,21 @@ async fn enforce_security(
         )
             .into_response();
     }
-    // The internal MCP bridge is dialed by the vendor CLI children the
-    // server spawned; it carries no bearer token, so it's exempt from the
-    // token check but still bound by the loopback-host check above.
     let internal = request.uri().path().starts_with("/internal/");
-    if let Some(expected) = security.token.as_deref()
-        && !internal
-    {
+    if internal {
+        if let Some(expected) = security.internal_token.as_deref() {
+            let provided = request.uri().query().and_then(|query| {
+                query
+                    .split('&')
+                    .filter_map(|part| part.split_once('='))
+                    .find_map(|(key, value)| (key == "bridge_token").then_some(value))
+            });
+            if !provided.is_some_and(|token| token_matches(expected, token)) {
+                return (StatusCode::UNAUTHORIZED, "missing or invalid bridge token")
+                    .into_response();
+            }
+        }
+    } else if let Some(expected) = security.token.as_deref() {
         let provided = request
             .headers()
             .get(axum::http::header::AUTHORIZATION)
@@ -392,6 +408,7 @@ async fn enforce_security(
 
 /// Wrap the router with host + token enforcement.
 pub fn build_secured_router(engine: Arc<Engine>, security: ServerSecurity) -> Router {
+    engine.set_bridge_token(security.internal_token.clone());
     let security = Arc::new(security);
     build_router(engine).layer(axum::middleware::from_fn(move |req, next| {
         let security = security.clone();
@@ -548,10 +565,8 @@ pub async fn serve_listener(
     listener: tokio::net::TcpListener,
     security: ServerSecurity,
 ) -> anyhow::Result<()> {
-    // Backends dialing back in (MCP tool bridge) need our reachable URL.
-    // That endpoint (`/internal/...`) is exempt from the bearer check —
-    // it's dialed by the vendor CLI children the server itself spawned —
-    // but still loopback-only.
+    // Backends dialing back in (MCP tool bridge) need our reachable URL;
+    // build_secured_router injects their separate ephemeral bridge token.
     engine.set_base_url(&format!("http://{}", listener.local_addr()?));
     engine.start_automation_scheduler();
     let router = build_secured_router(engine, security);
