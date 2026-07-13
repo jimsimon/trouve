@@ -53,6 +53,15 @@ pub fn allow_key(tool: &str, args: &serde_json::Value) -> String {
     if let Some((server, _)) = crate::mcp::split_tool_name(tool) {
         return format!("mcp:{server}");
     }
+    // Codex app-server reports external MCP elicitations under this generic
+    // tool name. Recover the server from its structured arguments so one
+    // approval cannot unlock every configured MCP server.
+    if tool == "mcpToolCall"
+        && let Some(server) = args.get("serverName").and_then(serde_json::Value::as_str)
+        && !server.is_empty()
+    {
+        return format!("mcp:{server}");
+    }
     tool.to_string()
 }
 
@@ -255,6 +264,17 @@ mod tests {
         assert_eq!(
             allow_key("mcp__jira__create_issue", &serde_json::json!({})),
             "mcp:jira"
+        );
+        assert_eq!(
+            allow_key(
+                "mcpToolCall",
+                &serde_json::json!({"serverName": "github", "name": "create_issue"})
+            ),
+            "mcp:github"
+        );
+        assert_ne!(
+            allow_key("mcpToolCall", &serde_json::json!({"serverName": "github"})),
+            allow_key("mcpToolCall", &serde_json::json!({"serverName": "jira"}))
         );
     }
 

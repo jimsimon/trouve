@@ -4486,7 +4486,12 @@ impl Engine {
                         decision,
                     },
                 )?;
-                if decision == ApprovalDecision::AlwaysApprove {
+                let unlocks_mcp_server =
+                    decision == ApprovalDecision::Approve && key.starts_with("mcp:");
+                if decision == ApprovalDecision::AlwaysApprove || unlocks_mcp_server {
+                    // MCP approval is first-use per server and session: a
+                    // plain approval unlocks this server, matching native MCP
+                    // calls without broadening approval to other servers.
                     self.approvals.extend_allow_list(&session.id, key);
                 }
                 Ok(decision != ApprovalDecision::Deny)
