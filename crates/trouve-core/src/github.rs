@@ -27,10 +27,9 @@ pub fn parse_remote(url: &str) -> Option<(String, String, String)> {
     } else if let Some(rest) = url.strip_prefix("ssh://") {
         let rest = rest.strip_prefix("git@").unwrap_or(rest);
         rest.split_once('/')?
-    } else if let Some(rest) = url.strip_prefix("git@") {
-        rest.split_once(':')?
     } else {
-        return None;
+        let rest = url.strip_prefix("git@")?;
+        rest.split_once(':')?
     };
     // Strip an explicit port ("host:22"); hostnames have no colons.
     let host = host.split(':').next()?.trim().to_ascii_lowercase();
