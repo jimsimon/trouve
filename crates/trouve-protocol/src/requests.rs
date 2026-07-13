@@ -671,6 +671,7 @@ pub struct LocalGpu {
 /// download and hardware-fit state.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct LocalModelInfo {
+    #[allow(rustdoc::invalid_html_tags)]
     /// Stable id; runs as model "local/<id>".
     pub id: String,
     pub display_name: String,
