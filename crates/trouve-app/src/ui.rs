@@ -123,17 +123,18 @@ pub fn set_threads(ui: &Ui, threads: Vec<(String, String)>, current: i32) {
 }
 
 fn to_chat_row(r: &ChatRowData) -> ChatRow {
-    // Highlighting runs here — after the diff in `set_chat` — so only new
-    // or changed code blocks pay for syntect, not every block every frame.
+    // Syntect already ran on the controller thread; the UI event loop only
+    // maps its plain segments into Slint models.
     let code_lines: ModelRc<ModelRc<TextSegment>> = if r.kind == 1 && r.md_kind == 5 {
-        let lines: Vec<ModelRc<TextSegment>> = crate::render::highlight_code(&r.md_lang, &r.text)
-            .into_iter()
+        let lines: Vec<ModelRc<TextSegment>> = r
+            .code_lines
+            .iter()
             .map(|segments| {
                 let segs: Vec<TextSegment> = segments
-                    .into_iter()
+                    .iter()
                     .map(|(text, rgb)| TextSegment {
                         text: SharedString::from(text.as_str()),
-                        color: slint::Color::from_argb_encoded(0xff00_0000 | rgb),
+                        color: slint::Color::from_argb_encoded(0xff00_0000 | *rgb),
                     })
                     .collect();
                 ModelRc::new(VecModel::from(segs))
