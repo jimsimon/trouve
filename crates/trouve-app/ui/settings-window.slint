@@ -39,8 +39,9 @@ export struct CliItem {
     managed: bool,
 }
 
-// Subscription usage for one agent-backend provider (flat: up to two
-// metered windows, which is all any vendor reports today).
+// Subscription usage for one agent-backend provider (flat: up to four
+// metered windows — Codex reports two, Claude Code up to four with
+// model-scoped weekly buckets).
 export struct SubscriptionItem {
     provider: string,
     // "ok" / "unavailable" / "unsupported"
@@ -57,6 +58,14 @@ export struct SubscriptionItem {
     w2-label: string,
     w2-pct: int,
     w2-resets: string,
+    has-w3: bool,
+    w3-label: string,
+    w3-pct: int,
+    w3-resets: string,
+    has-w4: bool,
+    w4-label: string,
+    w4-pct: int,
+    w4-resets: string,
 }
 
 // One agent mode for the Modes & Models section. allowed-tools is
@@ -780,7 +789,7 @@ export component SettingsScreen inherits Rectangle {
                                 font-weight: 700;
                             }
                             Text {
-                                text: "How much of each subscription's metered allowance is used. Only Codex shares this with third-party apps — Cursor and Claude do not provide subscription information to third parties.";
+                                text: "How much of each subscription's metered allowance is used. Codex reports usage via its app-server and Claude Code via its CLI — Cursor does not provide subscription information to third parties.";
                                 color: Theme.c.text-soft;
                                 font-size: Theme.fs(11px);
                                 wrap: word-wrap;
@@ -839,6 +848,16 @@ export component SettingsScreen inherits Rectangle {
                                         label: sub.w2-label;
                                         pct: sub.w2-pct;
                                         resets: sub.w2-resets;
+                                    }
+                                    if sub.has-w3: SubscriptionMeter {
+                                        label: sub.w3-label;
+                                        pct: sub.w3-pct;
+                                        resets: sub.w3-resets;
+                                    }
+                                    if sub.has-w4: SubscriptionMeter {
+                                        label: sub.w4-label;
+                                        pct: sub.w4-pct;
+                                        resets: sub.w4-resets;
                                     }
                                 }
                             }

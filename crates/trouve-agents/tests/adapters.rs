@@ -149,6 +149,49 @@ EOF
     assert!(args.contains("--thinking-display"), "{args}");
 }
 
+#[tokio::test]
+async fn claude_adapter_reads_subscription_usage() {
+    let tmp = tempfile::tempdir().unwrap();
+    let soon = chrono::Utc::now().timestamp() + 2 * 3600 + 600;
+    let script = format!(
+        r#"#!/bin/bash
+printf '%s\n' "$@" > "$0.args"
+read -r line
+printf '%s\n' "$line" > "$0.request"
+cat <<EOF
+{{"type":"control_response","response":{{"subtype":"success","request_id":"trouve-usage","response":{{"session":{{"total_cost_usd":0}},"subscription_type":"max","rate_limits_available":true,"rate_limits":{{"five_hour":{{"utilization":62.0,"resets_at":{soon}}},"seven_day":{{"utilization":31.0,"resets_at":{later}}},"extra_usage":{{"is_enabled":false}}}},"behaviors":null}}}}}}
+EOF
+cat > /dev/null
+"#,
+        soon = soon,
+        later = soon + 86_400,
+    );
+    let stub = write_stub(tmp.path(), "claude", &script);
+    let backend = ClaudeBackend::new("claude-code", Some(stub.clone()));
+
+    let health = backend.subscription_health().await.unwrap();
+    assert_eq!(health.status, "ok", "{}", health.note);
+    assert_eq!(health.plan, "max");
+    assert_eq!(health.windows.len(), 2);
+    assert_eq!(health.windows[0].label, "5h window");
+    assert_eq!(health.windows[0].used_percent, 62);
+    assert!(health.windows[0].resets.starts_with("resets in 2h"));
+    assert_eq!(health.windows[1].label, "Weekly (all models)");
+
+    // The query is the sanctioned stream-json `get_usage` control request,
+    // sent to a print-mode process that must not touch the user's MCP
+    // servers or leave a session transcript behind.
+    let request = std::fs::read_to_string(format!("{stub}.request")).unwrap();
+    let request: serde_json::Value = serde_json::from_str(&request).unwrap();
+    assert_eq!(request["type"], "control_request");
+    assert_eq!(request["request"]["subtype"], "get_usage");
+    let args = std::fs::read_to_string(format!("{stub}.args")).unwrap();
+    assert!(args.contains("-p"), "{args}");
+    assert!(args.contains("stream-json"), "{args}");
+    assert!(args.contains("--strict-mcp-config"), "{args}");
+    assert!(args.contains("--no-session-persistence"), "{args}");
+}
+
 /// ACP stub for cursor-agent: answers the fixed request sequence of a fresh
 /// turn (initialize, session/new, set mode, set model, prompt), streams a
 /// text delta + tool call, raises one permission request, and records what

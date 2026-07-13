@@ -3535,18 +3535,17 @@ impl Controller {
             UiCommand::SubscriptionsLoaded(subs) => {
                 let items = subs
                     .into_iter()
-                    .map(|s| {
-                        let w1 = s.windows.first();
-                        let w2 = s.windows.get(1);
-                        ui::SubscriptionView {
-                            provider: s.provider_id,
-                            status: s.status,
-                            plan: s.plan,
-                            credits: s.credits,
-                            note: s.note,
-                            w1: w1.map(|w| (w.label.clone(), w.used_percent, w.resets.clone())),
-                            w2: w2.map(|w| (w.label.clone(), w.used_percent, w.resets.clone())),
-                        }
+                    .map(|s| ui::SubscriptionView {
+                        provider: s.provider_id,
+                        status: s.status,
+                        plan: s.plan,
+                        credits: s.credits,
+                        note: s.note,
+                        windows: s
+                            .windows
+                            .iter()
+                            .map(|w| (w.label.clone(), w.used_percent, w.resets.clone()))
+                            .collect(),
                     })
                     .collect();
                 ui::set_subscriptions(&self.ui, items, String::new());

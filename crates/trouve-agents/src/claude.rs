@@ -16,6 +16,11 @@
 //!
 //! Login is an interactive TUI (`/login` inside `claude`); we detect
 //! credentials but can't orchestrate the flow headlessly.
+//!
+//! Subscription usage (the data behind the TUI's `/usage` dialog) is read
+//! through the same stream-json surface: a short-lived print-mode process
+//! answers a `get_usage` control request with the plan and its metered
+//! rate-limit windows. No user message is sent, so no model turn runs.
 
 use std::collections::HashMap;
 use std::process::Stdio;
@@ -31,7 +36,7 @@ use trouve_protocol::{ModelInfo, Usage};
 
 use crate::{
     AgentBackend, BackendError, BackendEvent, BackendEventStream, BackendLogin, BackendPermission,
-    BackendStatus, BackendTurn, async_stream, binary_on_path,
+    BackendStatus, BackendTurn, async_stream, binary_on_path, format_reset,
 };
 
 /// Most live processes kept at once; the least recently used is evicted.
@@ -213,6 +218,20 @@ impl AgentBackend for ClaudeBackend {
         ))
     }
 
+    async fn subscription_health(&self) -> Option<trouve_protocol::SubscriptionHealth> {
+        Some(match self.query_usage().await {
+            Ok(payload) => parse_usage_health(&self.id, &payload),
+            Err(e) => trouve_protocol::SubscriptionHealth {
+                provider_id: self.id.clone(),
+                status: "unavailable".into(),
+                plan: String::new(),
+                windows: Vec::new(),
+                credits: String::new(),
+                note: format!("could not read usage from the Claude CLI: {e}"),
+            },
+        })
+    }
+
     async fn run_turn(&self, turn: BackendTurn) -> Result<BackendEventStream, BackendError> {
         self.start_reaper();
         let proc_ = self.proc_for(&turn).await?;
@@ -311,7 +330,85 @@ impl AgentBackend for ClaudeBackend {
     }
 }
 
+/// How long a `get_usage` query may take end to end (CLI cold start plus
+/// the CLI's own usage fetch, which retries internally).
+const USAGE_TIMEOUT: Duration = Duration::from_secs(20);
+
+/// Fixed request id for the usage control request (one per process, so no
+/// collision is possible).
+const USAGE_REQUEST_ID: &str = "trouve-usage";
+
 impl ClaudeBackend {
+    /// Ask a short-lived print-mode process for subscription usage via the
+    /// `get_usage` control request — the same data the TUI's `/usage`
+    /// dialog shows (which has no headless equivalent). Returns the inner
+    /// response payload (`subscription_type`, `rate_limits`, ...).
+    async fn query_usage(&self) -> Result<Value, BackendError> {
+        let mut child = Command::new(&self.command)
+            .arg("-p")
+            .args(["--input-format", "stream-json"])
+            .args(["--output-format", "stream-json"])
+            .arg("--verbose")
+            // No turn runs: skip the user's MCP servers and don't persist
+            // an empty session transcript for every poll.
+            .arg("--strict-mcp-config")
+            .arg("--no-session-persistence")
+            .current_dir(std::env::temp_dir())
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .kill_on_drop(true)
+            .spawn()
+            .map_err(|e| match e.kind() {
+                std::io::ErrorKind::NotFound => BackendError::NotInstalled(self.command.clone()),
+                _ => BackendError::Io(e),
+            })?;
+        let mut stdin = child.stdin.take().expect("stdin piped");
+        let stdout = child.stdout.take().expect("stdout piped");
+
+        let query = async move {
+            let request = json!({
+                "type": "control_request",
+                "request_id": USAGE_REQUEST_ID,
+                "request": { "subtype": "get_usage" },
+            });
+            stdin
+                .write_all(format!("{request}\n").as_bytes())
+                .await
+                .map_err(BackendError::Io)?;
+            stdin.flush().await.map_err(BackendError::Io)?;
+
+            let mut lines = BufReader::new(stdout).lines();
+            while let Some(line) = lines.next_line().await.map_err(BackendError::Io)? {
+                let Ok(ev) = serde_json::from_str::<Value>(&line) else {
+                    continue;
+                };
+                if ev["type"].as_str() != Some("control_response") {
+                    continue;
+                }
+                let response = &ev["response"];
+                if response["request_id"].as_str() != Some(USAGE_REQUEST_ID) {
+                    continue;
+                }
+                if response["subtype"].as_str() == Some("success") {
+                    return Ok(response["response"].clone());
+                }
+                return Err(BackendError::Protocol(format!(
+                    "get_usage failed: {}",
+                    response["error"].as_str().unwrap_or("unknown error")
+                )));
+            }
+            Err(BackendError::Protocol(
+                "claude exited before answering the usage query".into(),
+            ))
+        };
+        let result = tokio::time::timeout(USAGE_TIMEOUT, query).await;
+        // Reap the child either way (kill_on_drop only covers hard drops).
+        let _ = child.kill().await;
+        result
+            .map_err(|_| BackendError::Protocol("timed out waiting for the usage query".into()))?
+    }
+
     fn start_reaper(&self) {
         if self
             .pool
@@ -653,5 +750,237 @@ fn map_event(ev: &Value) -> Vec<BackendEvent> {
             events
         }
         _ => vec![],
+    }
+}
+
+/// Turn a `get_usage` control response payload into subscription health.
+///
+/// The payload mirrors the TUI's `/usage` data: `subscription_type`
+/// ("pro"/"max"/"team"), `rate_limits_available`, and `rate_limits` with
+/// the classic flat buckets (`five_hour`, `seven_day`, `seven_day_sonnet`,
+/// `seven_day_opus` — `utilization` percent + `resets_at`) plus a newer
+/// self-describing `limits` array that Anthropic is migrating to.
+fn parse_usage_health(provider_id: &str, payload: &Value) -> trouve_protocol::SubscriptionHealth {
+    let plan = payload["subscription_type"]
+        .as_str()
+        .unwrap_or("")
+        .to_string();
+    let rate_limits = &payload["rate_limits"];
+
+    let mut windows: Vec<trouve_protocol::SubscriptionWindow> = Vec::new();
+    let push = |windows: &mut Vec<trouve_protocol::SubscriptionWindow>,
+                label: String,
+                used: &Value,
+                resets: &Value| {
+        let Some(pct) = used.as_f64() else { return };
+        windows.push(trouve_protocol::SubscriptionWindow {
+            label,
+            used_percent: (pct.round() as i64).clamp(0, 100),
+            resets: parse_reset_at(resets).map(format_reset).unwrap_or_default(),
+        });
+    };
+
+    for (key, label) in [
+        ("five_hour", "5h window"),
+        ("seven_day", "Weekly (all models)"),
+        ("seven_day_sonnet", "Weekly (Sonnet)"),
+        ("seven_day_opus", "Weekly (Opus)"),
+    ] {
+        let bucket = &rate_limits[key];
+        push(
+            &mut windows,
+            label.to_string(),
+            &bucket["utilization"],
+            &bucket["resets_at"],
+        );
+    }
+
+    // Newer payloads carry the buckets in a self-describing `limits` array
+    // (the flat keys then come back null). Add whatever the flat pass
+    // didn't already cover.
+    for entry in rate_limits["limits"].as_array().into_iter().flatten() {
+        let label = match entry["kind"].as_str() {
+            Some("session") => "5h window".to_string(),
+            Some("weekly_all") => "Weekly (all models)".to_string(),
+            Some("weekly_scoped") => match entry["scope"]["model"]["display_name"].as_str() {
+                Some(name) => format!("Weekly ({name})"),
+                None => continue,
+            },
+            _ => continue,
+        };
+        if windows.iter().any(|w| w.label.eq_ignore_ascii_case(&label)) {
+            continue;
+        }
+        push(&mut windows, label, &entry["percent"], &entry["resets_at"]);
+    }
+
+    // Pay-per-use overage riding on top of the subscription, when enabled.
+    // `used_credits` / `monthly_limit` are cents.
+    let credits = rate_limits["extra_usage"]
+        .as_object()
+        .filter(|x| x.get("is_enabled").and_then(Value::as_bool) == Some(true))
+        .map(|x| {
+            let used = x.get("used_credits").and_then(Value::as_f64);
+            let limit = x
+                .get("monthly_limit")
+                .and_then(Value::as_f64)
+                .filter(|l| *l > 0.0);
+            match (used, limit) {
+                (Some(u), Some(l)) => {
+                    format!("extra usage: ${:.2} of ${:.2}", u / 100.0, l / 100.0)
+                }
+                (Some(u), None) => format!("extra usage: ${:.2}", u / 100.0),
+                _ => "extra usage enabled".to_string(),
+            }
+        })
+        .unwrap_or_default();
+
+    if windows.is_empty() {
+        let note = if payload["rate_limits_available"].as_bool() == Some(true) {
+            "the Claude CLI reported no usage windows".to_string()
+        } else {
+            "the Claude CLI reported no usage data — subscription usage needs a \
+             claude.ai login (run `claude` and use /login)"
+                .to_string()
+        };
+        return trouve_protocol::SubscriptionHealth {
+            provider_id: provider_id.to_string(),
+            status: "unavailable".into(),
+            plan,
+            windows,
+            credits,
+            note,
+        };
+    }
+    trouve_protocol::SubscriptionHealth {
+        provider_id: provider_id.to_string(),
+        status: "ok".into(),
+        plan,
+        windows,
+        credits,
+        note: String::new(),
+    }
+}
+
+/// `resets_at` arrives as RFC 3339 in the flat buckets and unix seconds in
+/// the `limits` array; accept both.
+fn parse_reset_at(v: &Value) -> Option<i64> {
+    if let Some(n) = v.as_i64() {
+        return Some(n);
+    }
+    if let Some(f) = v.as_f64() {
+        return Some(f as i64);
+    }
+    chrono::DateTime::parse_from_rfc3339(v.as_str()?)
+        .ok()
+        .map(|t| t.timestamp())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn rfc3339_in(secs: i64) -> String {
+        chrono::DateTime::from_timestamp(chrono::Utc::now().timestamp() + secs, 0)
+            .unwrap()
+            .to_rfc3339()
+    }
+
+    #[test]
+    fn parses_flat_usage_buckets() {
+        let payload = json!({
+            "subscription_type": "max",
+            "rate_limits_available": true,
+            "rate_limits": {
+                "five_hour": { "utilization": 42.4, "resets_at": rfc3339_in(2 * 3600 + 600) },
+                "seven_day": { "utilization": 13.0, "resets_at": rfc3339_in(3 * 86_400 + 600) },
+                "seven_day_sonnet": { "utilization": 7.6, "resets_at": rfc3339_in(86_400) },
+                "seven_day_opus": null,
+                "extra_usage": { "is_enabled": false },
+            },
+        });
+        let health = parse_usage_health("claude-code", &payload);
+        assert_eq!(health.status, "ok");
+        assert_eq!(health.plan, "max");
+        assert_eq!(health.credits, "");
+        let labels: Vec<&str> = health.windows.iter().map(|w| w.label.as_str()).collect();
+        assert_eq!(
+            labels,
+            vec!["5h window", "Weekly (all models)", "Weekly (Sonnet)"]
+        );
+        assert_eq!(health.windows[0].used_percent, 42);
+        assert!(health.windows[0].resets.starts_with("resets in 2h"));
+        assert_eq!(health.windows[2].used_percent, 8, "rounded");
+        assert!(health.windows[1].resets.starts_with("resets in 3d"));
+    }
+
+    #[test]
+    fn parses_limits_array_and_dedupes_flat_buckets() {
+        // Transitional payloads can carry both shapes for the same bucket;
+        // the scoped Opus week exists only in the array.
+        let soon = chrono::Utc::now().timestamp() + 3600;
+        let payload = json!({
+            "subscription_type": "pro",
+            "rate_limits_available": true,
+            "rate_limits": {
+                "five_hour": { "utilization": 30.0, "resets_at": rfc3339_in(3600) },
+                "seven_day": null,
+                "limits": [
+                    { "kind": "session", "percent": 30.0, "resets_at": soon },
+                    { "kind": "weekly_all", "percent": 55.0, "resets_at": soon + 86_400 },
+                    {
+                        "kind": "weekly_scoped",
+                        "percent": 61.0,
+                        "resets_at": soon,
+                        "scope": { "model": { "display_name": "Opus" } },
+                    },
+                    { "kind": "mystery", "percent": 1.0 },
+                ],
+            },
+        });
+        let health = parse_usage_health("claude-code", &payload);
+        assert_eq!(health.status, "ok");
+        let labels: Vec<&str> = health.windows.iter().map(|w| w.label.as_str()).collect();
+        assert_eq!(
+            labels,
+            vec!["5h window", "Weekly (all models)", "Weekly (Opus)"],
+            "session came from the flat bucket; the array filled the rest"
+        );
+        assert_eq!(health.windows[1].used_percent, 55);
+        assert!(health.windows[2].resets.starts_with("resets in "));
+    }
+
+    #[test]
+    fn formats_extra_usage_credits() {
+        let payload = json!({
+            "subscription_type": "max",
+            "rate_limits_available": true,
+            "rate_limits": {
+                "five_hour": { "utilization": 10.0 },
+                "extra_usage": {
+                    "is_enabled": true,
+                    "monthly_limit": 5000,
+                    "used_credits": 42.0,
+                },
+            },
+        });
+        let health = parse_usage_health("claude-code", &payload);
+        assert_eq!(health.credits, "extra usage: $0.42 of $50.00");
+        assert_eq!(health.windows[0].resets, "", "no reset info is fine");
+    }
+
+    #[test]
+    fn no_rate_limits_means_unavailable() {
+        // Not logged in (or API-key auth): the CLI answers the control
+        // request but has no subscription data.
+        let payload = json!({
+            "subscription_type": null,
+            "rate_limits_available": false,
+            "rate_limits": null,
+        });
+        let health = parse_usage_health("claude-code", &payload);
+        assert_eq!(health.status, "unavailable");
+        assert!(health.note.contains("claude.ai login"));
+        assert!(health.windows.is_empty());
     }
 }

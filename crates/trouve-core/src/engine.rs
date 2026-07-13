@@ -2292,9 +2292,9 @@ impl Engine {
     }
 
     /// Subscription usage for every configured agent-backend provider.
-    /// Codex answers live via its app-server; Cursor and Claude do not
-    /// expose subscription data to third parties, so their entries carry
-    /// an explanatory note instead.
+    /// Codex answers live via its app-server and Claude Code via its CLI's
+    /// stream-json usage query; Cursor does not expose subscription data
+    /// to third parties, so its entries carry an explanatory note instead.
     pub async fn subscription_health(&self) -> Vec<trouve_protocol::SubscriptionHealth> {
         let backends: Vec<(String, Arc<dyn AgentBackend>)> = {
             let map = self.backends.read().unwrap();
@@ -2317,7 +2317,6 @@ impl Engine {
                 None => {
                     let vendor = match kinds.get(&id).map(String::as_str) {
                         Some("cursor-cli") => "Cursor",
-                        Some("claude-cli") => "Anthropic",
                         _ => "This vendor",
                     };
                     out.push(trouve_protocol::SubscriptionHealth {

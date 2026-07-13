@@ -485,15 +485,15 @@ pub fn set_prs(
 }
 
 /// Plain-data mirror of the Slint SubscriptionItem struct; windows are
-/// (label, used-percent, resets) tuples.
+/// (label, used-percent, resets) tuples. The Slint struct is flat, so only
+/// the first four windows are shown.
 pub struct SubscriptionView {
     pub provider: String,
     pub status: String,
     pub plan: String,
     pub credits: String,
     pub note: String,
-    pub w1: Option<(String, i64, String)>,
-    pub w2: Option<(String, i64, String)>,
+    pub windows: Vec<(String, i64, String)>,
 }
 
 pub fn set_subscriptions(ui: &Ui, items: Vec<SubscriptionView>, status: String) {
@@ -501,25 +501,38 @@ pub fn set_subscriptions(ui: &Ui, items: Vec<SubscriptionView>, status: String) 
         let items: Vec<crate::SubscriptionItem> = items
             .into_iter()
             .map(|s| {
-                let window = |w: &Option<(String, i64, String)>| {
-                    w.clone().unwrap_or((String::new(), 0, String::new()))
+                let window = |i: usize| {
+                    s.windows
+                        .get(i)
+                        .cloned()
+                        .unwrap_or((String::new(), 0, String::new()))
                 };
-                let (w1_label, w1_pct, w1_resets) = window(&s.w1);
-                let (w2_label, w2_pct, w2_resets) = window(&s.w2);
+                let (w1_label, w1_pct, w1_resets) = window(0);
+                let (w2_label, w2_pct, w2_resets) = window(1);
+                let (w3_label, w3_pct, w3_resets) = window(2);
+                let (w4_label, w4_pct, w4_resets) = window(3);
                 crate::SubscriptionItem {
                     provider: SharedString::from(s.provider.as_str()),
                     status: SharedString::from(s.status.as_str()),
                     plan: SharedString::from(s.plan.as_str()),
                     credits: SharedString::from(s.credits.as_str()),
                     note: SharedString::from(s.note.as_str()),
-                    has_w1: s.w1.is_some(),
+                    has_w1: !s.windows.is_empty(),
                     w1_label: SharedString::from(w1_label.as_str()),
                     w1_pct: w1_pct as i32,
                     w1_resets: SharedString::from(w1_resets.as_str()),
-                    has_w2: s.w2.is_some(),
+                    has_w2: s.windows.len() > 1,
                     w2_label: SharedString::from(w2_label.as_str()),
                     w2_pct: w2_pct as i32,
                     w2_resets: SharedString::from(w2_resets.as_str()),
+                    has_w3: s.windows.len() > 2,
+                    w3_label: SharedString::from(w3_label.as_str()),
+                    w3_pct: w3_pct as i32,
+                    w3_resets: SharedString::from(w3_resets.as_str()),
+                    has_w4: s.windows.len() > 3,
+                    w4_label: SharedString::from(w4_label.as_str()),
+                    w4_pct: w4_pct as i32,
+                    w4_resets: SharedString::from(w4_resets.as_str()),
                 }
             })
             .collect();

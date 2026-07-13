@@ -250,7 +250,8 @@ pub trait AgentBackend: Send + Sync {
 
     /// Live subscription usage (plan, metered rate-limit windows) where the
     /// vendor exposes it to third-party apps. `None` means the vendor does
-    /// not share this data (Cursor, Claude); only Codex supports it today.
+    /// not share this data (Cursor); Codex (app-server) and Claude Code
+    /// (stream-json `get_usage` control request) support it.
     async fn subscription_health(&self) -> Option<trouve_protocol::SubscriptionHealth> {
         None
     }
@@ -289,6 +290,26 @@ where
 /// Simple options-schema for backend models: vendors own the knobs.
 pub(crate) fn empty_schema() -> serde_json::Value {
     serde_json::json!({"type": "object", "properties": {}})
+}
+
+/// "resets in 2h 10m" from a unix timestamp (seconds; tolerates millis).
+pub(crate) fn format_reset(at: i64) -> String {
+    let at = if at > 100_000_000_000 { at / 1000 } else { at };
+    let now = chrono::Utc::now().timestamp();
+    let secs = at - now;
+    if secs <= 0 {
+        return "resets shortly".to_string();
+    }
+    let days = secs / 86_400;
+    let hours = (secs % 86_400) / 3600;
+    let mins = (secs % 3600) / 60;
+    if days > 0 {
+        format!("resets in {days}d {hours}h")
+    } else if hours > 0 {
+        format!("resets in {hours}h {mins}m")
+    } else {
+        format!("resets in {}m", mins.max(1))
+    }
 }
 
 /// Build a ModelInfo for a backend model.

@@ -30,7 +30,7 @@ use trouve_protocol::{ModelInfo, Usage};
 
 use crate::{
     AgentBackend, BackendError, BackendEvent, BackendEventStream, BackendLogin, BackendPermission,
-    BackendStatus, BackendTurn, async_stream, binary_on_path, model, spawn_login,
+    BackendStatus, BackendTurn, async_stream, binary_on_path, format_reset, model, spawn_login,
 };
 
 pub struct CodexBackend {
@@ -662,26 +662,6 @@ fn window_label(mins: Option<i64>) -> String {
         Some(m) if m > 0 && m % 60 == 0 => format!("{}h window", m / 60),
         Some(m) if m > 0 => format!("{m}m window"),
         _ => "Usage window".to_string(),
-    }
-}
-
-/// "resets in 2h 10m" from a unix timestamp (seconds; tolerates millis).
-fn format_reset(at: i64) -> String {
-    let at = if at > 100_000_000_000 { at / 1000 } else { at };
-    let now = chrono::Utc::now().timestamp();
-    let secs = at - now;
-    if secs <= 0 {
-        return "resets shortly".to_string();
-    }
-    let days = secs / 86_400;
-    let hours = (secs % 86_400) / 3600;
-    let mins = (secs % 3600) / 60;
-    if days > 0 {
-        format!("resets in {days}d {hours}h")
-    } else if hours > 0 {
-        format!("resets in {hours}h {mins}m")
-    } else {
-        format!("resets in {}m", mins.max(1))
     }
 }
 
