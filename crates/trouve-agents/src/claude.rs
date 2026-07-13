@@ -1,7 +1,7 @@
 //! Claude Code backend, driving the `claude` CLI in print mode.
 //!
 //! One persistent `claude -p --input-format stream-json` process is kept per
-//! trouve thread (see [`Pool`]): turns after the first skip the CLI's cold
+//! trouve thread (see the internal process pool): turns after the first skip the CLI's cold
 //! start, the transcript re-read, and the MCP bridge re-handshake. The pool
 //! is bounded (LRU cap + idle reaping); killing a process loses nothing
 //! because Claude Code persists the transcript and `--resume` restores it.

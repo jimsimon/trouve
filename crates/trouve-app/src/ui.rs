@@ -907,7 +907,7 @@ pub struct LocalView {
     /// A newer llama.cpp build is available for a managed install.
     pub runtime_update: bool,
     pub runtime_status: String,
-    /// "llama-server is running <model>" or "" when stopped.
+    /// "llama-server is running MODEL" or "" when stopped.
     pub server_line: String,
     /// Sidecar is loading a model (stop/restart hidden until it settles).
     pub server_busy: bool,
