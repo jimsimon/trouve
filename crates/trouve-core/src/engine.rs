@@ -3284,7 +3284,7 @@ impl Engine {
             if active.contains_key(thread_id) {
                 return Ok(None);
             }
-            let Some(p) = self.store.pop_queued_prompt(thread_id)? else {
+            let Some(p) = self.store.claim_queued_prompt(thread_id)? else {
                 return Ok(None);
             };
             let was_active = active.values().any(|s| *s == thread.session_id);
@@ -3297,12 +3297,14 @@ impl Engine {
         // If setup fails after claiming, release the claim — otherwise the
         // thread stays "active" forever and can never dispatch again.
         if let Err(e) = self.emit_queue(thread_id) {
+            let _ = self.store.release_queued_prompt(&prompt.id);
             self.release_thread(thread_id);
             return Err(e);
         }
         let turn = match self.store.next_turn(thread_id) {
             Ok(t) => t,
             Err(e) => {
+                let _ = self.store.release_queued_prompt(&prompt.id);
                 self.release_thread(thread_id);
                 return Err(e.into());
             }
@@ -3310,20 +3312,18 @@ impl Engine {
         let engine = self.clone();
         tokio::spawn(async move {
             let thread_id = thread.id.clone();
+            let prompt_id = prompt.id.clone();
             // Catch a panic in the turn machinery so the claim (and cancel
             // token) are always released and the UI unsticks — tokio would
             // otherwise swallow the panic and leave the thread wedged as
             // "active" with no TurnFailed event.
-            let drained = std::panic::AssertUnwindSafe(engine.drain_queue(
-                thread,
-                turn,
-                prompt.content,
-                prompt.attachments,
-            ))
-            .catch_unwind()
-            .await;
+            let drained = std::panic::AssertUnwindSafe(engine.drain_queue(thread, turn, prompt))
+                .catch_unwind()
+                .await;
             if drained.is_err() {
                 tracing::error!("turn dispatcher for {thread_id} panicked");
+                let _ = engine.store.release_queued_prompt(&prompt_id);
+                let _ = engine.emit_queue(&thread_id);
                 let _ = engine.store.append_event(
                     Scope::Thread(thread_id.clone()),
                     Event::TurnFailed {
@@ -3345,22 +3345,20 @@ impl Engine {
         self: &Arc<Self>,
         thread: Thread,
         turn: u64,
-        content: String,
-        attachments: Vec<trouve_protocol::Attachment>,
+        prompt: trouve_protocol::QueuedPrompt,
     ) {
         let mut thread = thread;
         let mut turn = turn;
-        let mut content = content;
-        let mut attachments = attachments;
+        let mut prompt = prompt;
         loop {
             let cancel = self.register_cancel(&thread.id);
-            let result = self
-                .run_turn(&thread, turn, content, attachments, cancel.clone())
-                .await;
+            let result = self.run_turn(&thread, turn, &prompt, cancel.clone()).await;
             let cancelled = cancel.is_cancelled();
             self.clear_cancel(&thread.id);
             if let Err(e) = result {
                 tracing::error!("turn {turn} of {} failed: {e}", thread.id);
+                let _ = self.store.release_queued_prompt(&prompt.id);
+                let _ = self.emit_queue(&thread.id);
                 let _ = self.store.append_event(
                     Scope::Thread(thread.id.clone()),
                     Event::TurnFailed {
@@ -3385,7 +3383,7 @@ impl Engine {
             // queue must be atomic against concurrent send_message calls.
             let (next, session_idle) = {
                 let mut active = self.active_threads.lock().unwrap();
-                match self.store.pop_queued_prompt(&thread.id) {
+                match self.store.claim_queued_prompt(&thread.id) {
                     Ok(Some(p)) => (Some(p), false),
                     _ => {
                         active.remove(&thread.id);
@@ -3406,12 +3404,13 @@ impl Engine {
                 Ok(t) => t,
                 Err(e) => {
                     tracing::error!("queue for {} stopped: {e}", thread.id);
+                    let _ = self.store.release_queued_prompt(&next.id);
+                    let _ = self.emit_queue(&thread.id);
                     self.release_thread(&thread.id);
                     return;
                 }
             };
-            content = next.content;
-            attachments = next.attachments;
+            prompt = next;
         }
     }
 
@@ -3483,10 +3482,11 @@ impl Engine {
         self: &Arc<Self>,
         thread: &Thread,
         turn: u64,
-        content: String,
-        attachments: Vec<trouve_protocol::Attachment>,
+        prompt: &trouve_protocol::QueuedPrompt,
         cancel: tokio_util::sync::CancellationToken,
     ) -> Result<()> {
+        let content = prompt.content.clone();
+        let attachments = prompt.attachments.clone();
         let session = self
             .store
             .session(&thread.session_id)?
@@ -3536,6 +3536,7 @@ impl Engine {
                     attachments,
                     concurrent_child,
                     cancel,
+                    &prompt.id,
                 )
                 .await;
         }
@@ -3585,6 +3586,10 @@ impl Engine {
         let content = annotate_attachments(content, &materialized);
         self.store
             .append_message(&thread.id, &serde_json::to_value(Message::User(content))?)?;
+        if !self.store.finish_queued_prompt(&prompt.id)? {
+            bail!("queued prompt {} vanished before turn start", prompt.id);
+        }
+        self.emit_queue(&thread.id)?;
 
         // Tool policy: empty allowed_tools = all registered tools. The
         // engine-served ask_question tool always rides along (deferring to
@@ -4154,6 +4159,7 @@ impl Engine {
         attachments: Vec<trouve_protocol::Attachment>,
         concurrent_child: bool,
         cancel: tokio_util::sync::CancellationToken,
+        queued_prompt_id: &str,
     ) -> Result<()> {
         let scope = Scope::Thread(thread.id.clone());
         // Vendor sessions are per (thread, backend): each vendor keeps its
@@ -4217,6 +4223,10 @@ impl Engine {
             &thread.id,
             &serde_json::to_value(Message::User(content.clone()))?,
         )?;
+        if !self.store.finish_queued_prompt(queued_prompt_id)? {
+            bail!("queued prompt {queued_prompt_id} vanished before turn start");
+        }
+        self.emit_queue(&thread.id)?;
 
         let permission = if mode.read_only {
             BackendPermission::ReadOnly
