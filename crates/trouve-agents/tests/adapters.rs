@@ -192,6 +192,115 @@ cat > /dev/null
     assert!(args.contains("--no-session-persistence"), "{args}");
 }
 
+/// Minimal HTTP stub for Cursor's dashboard Connect-RPC endpoints: answers
+/// GetCurrentPeriodUsage / GetPlanInfo with canned JSON and records each
+/// request's path and Authorization header.
+fn spawn_dashboard_stub(
+    listener: tokio::net::TcpListener,
+    seen: std::sync::Arc<std::sync::Mutex<Vec<(String, String)>>>,
+) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    tokio::spawn(async move {
+        while let Ok((mut sock, _)) = listener.accept().await {
+            let seen = seen.clone();
+            tokio::spawn(async move {
+                let mut buf = Vec::new();
+                let mut tmp = [0u8; 1024];
+                loop {
+                    let Ok(n) = sock.read(&mut tmp).await else {
+                        return;
+                    };
+                    if n == 0 {
+                        return;
+                    }
+                    buf.extend_from_slice(&tmp[..n]);
+                    if buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                let head = String::from_utf8_lossy(&buf).to_string();
+                let path = head.split_whitespace().nth(1).unwrap_or("").to_string();
+                let auth = head
+                    .lines()
+                    .find_map(|l| {
+                        let (name, value) = l.split_once(": ")?;
+                        name.eq_ignore_ascii_case("authorization")
+                            .then(|| value.trim().to_string())
+                    })
+                    .unwrap_or_default();
+                let body = if path.contains("GetCurrentPeriodUsage") {
+                    r#"{"billingCycleEnd":"1782696817000","planUsage":{"totalPercentUsed":35.7,"apiPercentUsed":100,"autoPercentUsed":1.5},"spendLimitUsage":{"individualUsed":241122,"individualLimit":250000}}"#
+                } else {
+                    r#"{"planInfo":{"planName":"Ultra","price":"$200/mo"}}"#
+                };
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+                     Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len(),
+                );
+                let _ = sock.write_all(response.as_bytes()).await;
+                seen.lock().unwrap().push((path, auth));
+            });
+        }
+    });
+}
+
+#[tokio::test]
+async fn cursor_adapter_reads_dashboard_usage() {
+    let dir = tempfile::tempdir().unwrap();
+    let auth_file = dir.path().join("auth.json");
+    std::fs::write(
+        &auth_file,
+        r#"{"accessToken":"cli-token","refreshToken":"r"}"#,
+    )
+    .unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    spawn_dashboard_stub(listener, seen.clone());
+
+    let backend = CursorBackend::new("cursor", None, None).with_dashboard(auth_file, base);
+    let health = backend.subscription_health().await.unwrap();
+    assert_eq!(health.status, "ok", "{}", health.note);
+    assert_eq!(health.plan, "Ultra");
+    assert_eq!(health.credits, "on-demand: $2411.22 of $2500.00");
+    let labels: Vec<&str> = health.windows.iter().map(|w| w.label.as_str()).collect();
+    assert_eq!(
+        labels,
+        vec![
+            "Included usage",
+            "Included (API models)",
+            "Included (Auto)",
+            "On-demand spend"
+        ]
+    );
+    assert_eq!(health.windows[3].used_percent, 96);
+    assert_eq!(
+        health.windows[0].resets, "resets shortly",
+        "cycle end in the past"
+    );
+
+    // Both RPCs authenticated with the CLI's stored token, never a refresh.
+    let seen = seen.lock().unwrap();
+    let paths: Vec<&str> = seen.iter().map(|(p, _)| p.as_str()).collect();
+    assert!(paths.contains(&"/aiserver.v1.DashboardService/GetCurrentPeriodUsage"));
+    assert!(paths.contains(&"/aiserver.v1.DashboardService/GetPlanInfo"));
+    assert!(
+        seen.iter().all(|(_, a)| a == "Bearer cli-token"),
+        "{seen:?}"
+    );
+}
+
+#[tokio::test]
+async fn cursor_api_key_backend_reports_no_subscription() {
+    // Usage-billed API-key providers have no subscription allowance; the
+    // entry explains itself instead of querying the dashboard.
+    let backend = CursorBackend::new("cursor-api", None, Some("key-1".into()));
+    let health = backend.subscription_health().await.unwrap();
+    assert_eq!(health.status, "unsupported");
+    assert!(health.note.contains("API key"), "{}", health.note);
+}
+
 /// ACP stub for cursor-agent: answers the fixed request sequence of a fresh
 /// turn (initialize, session/new, set mode, set model, prompt), streams a
 /// text delta + tool call, raises one permission request, and records what

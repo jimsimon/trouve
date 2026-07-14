@@ -2292,9 +2292,9 @@ impl Engine {
     }
 
     /// Subscription usage for every configured agent-backend provider.
-    /// Codex answers live via its app-server and Claude Code via its CLI's
-    /// stream-json usage query; Cursor does not expose subscription data
-    /// to third parties, so its entries carry an explanatory note instead.
+    /// Codex answers via its app-server, Claude Code via its CLI's
+    /// stream-json usage query, and Cursor via the dashboard's undocumented
+    /// usage RPC (read with the CLI's stored login).
     pub async fn subscription_health(&self) -> Vec<trouve_protocol::SubscriptionHealth> {
         let backends: Vec<(String, Arc<dyn AgentBackend>)> = {
             let map = self.backends.read().unwrap();
@@ -2302,34 +2302,19 @@ impl Engine {
             list.sort_by(|a, b| a.0.cmp(&b.0));
             list
         };
-        let kinds: HashMap<String, String> = {
-            let config = self.config.lock().unwrap();
-            config
-                .providers
-                .iter()
-                .map(|(id, pc)| (id.clone(), pc.kind.clone()))
-                .collect()
-        };
         let mut out = Vec::new();
         for (id, backend) in backends {
             match backend.subscription_health().await {
                 Some(health) => out.push(health),
-                None => {
-                    let vendor = match kinds.get(&id).map(String::as_str) {
-                        Some("cursor-cli") => "Cursor",
-                        _ => "This vendor",
-                    };
-                    out.push(trouve_protocol::SubscriptionHealth {
-                        provider_id: id,
-                        status: "unsupported".into(),
-                        plan: String::new(),
-                        windows: Vec::new(),
-                        credits: String::new(),
-                        note: format!(
-                            "{vendor} does not provide subscription usage to third-party apps."
-                        ),
-                    });
-                }
+                None => out.push(trouve_protocol::SubscriptionHealth {
+                    provider_id: id,
+                    status: "unsupported".into(),
+                    plan: String::new(),
+                    windows: Vec::new(),
+                    credits: String::new(),
+                    note: "This vendor does not provide subscription usage to third-party apps."
+                        .into(),
+                }),
             }
         }
         out

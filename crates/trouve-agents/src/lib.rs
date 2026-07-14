@@ -248,10 +248,11 @@ pub trait AgentBackend: Send + Sync {
 
     fn status(&self) -> BackendStatus;
 
-    /// Live subscription usage (plan, metered rate-limit windows) where the
-    /// vendor exposes it to third-party apps. `None` means the vendor does
-    /// not share this data (Cursor); Codex (app-server) and Claude Code
-    /// (stream-json `get_usage` control request) support it.
+    /// Live subscription usage (plan, metered allowance windows). Codex
+    /// answers via its app-server, Claude Code via a stream-json `get_usage`
+    /// control request, and Cursor via the dashboard's undocumented usage
+    /// RPC (using the CLI's stored login). `None` means the vendor shares
+    /// nothing at all.
     async fn subscription_health(&self) -> Option<trouve_protocol::SubscriptionHealth> {
         None
     }
