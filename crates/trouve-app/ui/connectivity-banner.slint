@@ -1,0 +1,40 @@
+// Connectivity banner: a persistent offline warning (amber) or a transient
+// "back online" notice (green). Mount behind an `if warning != "" ||
+// notice != ""` so it takes no space while silent; the warning wins when
+// both are set.
+
+import { Theme } from "theme.slint";
+
+export component ConnectivityBanner inherits Rectangle {
+    in property <string> warning;
+    in property <string> notice;
+    property <bool> is-warning: root.warning != "";
+
+    height: row.preferred-height + 16px;
+    background: root.is-warning ? Theme.c.warn-bg : Theme.c.accent-bg;
+    border-width: 1px;
+    border-color: root.is-warning ? Theme.c.warn-border : Theme.c.primary-border;
+    border-radius: 6px;
+
+    row := HorizontalLayout {
+        padding-left: 10px;
+        padding-right: 10px;
+        padding-top: 8px;
+        padding-bottom: 8px;
+        spacing: 8px;
+        Text {
+            text: root.is-warning ? "⚠" : "✓";
+            color: root.is-warning ? Theme.c.warn : Theme.c.ok;
+            font-size: Theme.fs(12px);
+            vertical-alignment: center;
+        }
+        Text {
+            text: root.is-warning ? root.warning : root.notice;
+            color: root.is-warning ? Theme.c.warn : Theme.c.ok;
+            font-size: Theme.fs(12px);
+            wrap: word-wrap;
+            vertical-alignment: center;
+            horizontal-stretch: 1;
+        }
+    }
+}

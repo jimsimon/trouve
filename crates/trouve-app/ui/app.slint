@@ -17,6 +17,7 @@ import {
     SubscriptionItem, ModeItem, LocalModelItem, LocalSearchItem, GithubHostItem
 } from "settings-window.slint";
 import { AutomationsScreen, AutomationItem, AutomationTemplateItem } from "automations-screen.slint";
+import { ConnectivityBanner } from "connectivity-banner.slint";
 import { ScrollKeys } from "scroll-keys.slint";
 import { Theme, ThemePalette } from "theme.slint";
 import { Palette } from "std-widgets.slint";
@@ -814,6 +815,11 @@ component NewChatForm inherits VerticalLayout {
     in property <[int]> model-matches;
     in-out property <int> model-index;
     in property <string> error-text;
+    // Offline with nothing usable: every input is disabled and the banner
+    // explains why (see AppWindow.connectivity-*).
+    in property <bool> blocked;
+    in property <string> offline-warning;
+    in property <string> online-notice;
     callback start(int, int, int, int, string);
     callback cancel();
     callback workspace-changed(int);
@@ -839,12 +845,18 @@ component NewChatForm inherits VerticalLayout {
         wrap: word-wrap;
     }
 
+    if root.offline-warning != "" || root.online-notice != "": ConnectivityBanner {
+        warning: root.offline-warning;
+        notice: root.online-notice;
+    }
+
     if root.session-form: VerticalLayout {
         spacing: 6px;
         Text { text: "Workspace"; color: Theme.c.text-mid; font-size: Theme.fs(12px); font-weight: 700; }
         ComboBox {
             model: root.workspaces;
             current-index <=> root.workspace-index;
+            enabled: !root.blocked;
             selected => { root.workspace-changed(self.current-index); }
         }
         HorizontalLayout {
@@ -852,10 +864,11 @@ component NewChatForm inherits VerticalLayout {
             ws-path := LineEdit {
                 horizontal-stretch: 1;
                 placeholder-text: "…or register a git repo by absolute path";
+                enabled: !root.blocked;
             }
             Button {
                 text: "Add";
-                enabled: ws-path.text != "";
+                enabled: ws-path.text != "" && !root.blocked;
                 clicked => {
                     root.register-workspace(ws-path.text);
                     ws-path.text = "";
@@ -870,6 +883,7 @@ component NewChatForm inherits VerticalLayout {
         ComboBox {
             model: root.branches;
             current-index <=> root.branch-index;
+            enabled: !root.blocked;
         }
     }
 
@@ -882,6 +896,7 @@ component NewChatForm inherits VerticalLayout {
             ComboBox {
                 model: root.modes;
                 current-index <=> root.mode-index;
+                enabled: !root.blocked;
                 selected => {
                     if (root.mode-index >= 0
                         && root.mode-index < root.mode-model-indices.length
@@ -900,6 +915,7 @@ component NewChatForm inherits VerticalLayout {
                 options: root.models;
                 matches: root.model-matches;
                 current-index <=> root.model-index;
+                enabled: !root.blocked;
                 placeholder: "model";
                 filter-edited(q) => { root.model-filter(q); }
             }
@@ -910,9 +926,12 @@ component NewChatForm inherits VerticalLayout {
         spacing: 6px;
         Text { text: "First message"; color: Theme.c.text-mid; font-size: Theme.fs(12px); font-weight: 700; }
         prompt-edit := PromptBox {
-            placeholder: "What should the agent do?  (Shift+Enter for a new line)";
+            placeholder: root.blocked
+                ? "Offline — prompts are disabled"
+                : "What should the agent do?  (Shift+Enter for a new line)";
+            enabled: !root.blocked;
             submitted(text) => {
-                if (!root.session-form || root.workspace-index >= 0) {
+                if (!root.blocked && (!root.session-form || root.workspace-index >= 0)) {
                     root.start(root.workspace-index, root.branch-index,
                         root.mode-index, root.model-index, text);
                     self.text = "";
@@ -926,7 +945,7 @@ component NewChatForm inherits VerticalLayout {
         Button {
             text: root.session-form ? "Start session" : "Start thread";
             primary: true;
-            enabled: prompt-edit.text != ""
+            enabled: prompt-edit.text != "" && !root.blocked
                 && (!root.session-form || root.workspace-index >= 0);
             clicked => {
                 root.start(root.workspace-index, root.branch-index,
@@ -1319,6 +1338,15 @@ export component AppWindow inherits Window {
     }
 
     in-out property <string> error-text: "";
+
+    // Server connectivity. While `connectivity-text` is set an offline
+    // banner shows on the composer, the new-chat form, and the automations
+    // screen; `connectivity-blocked` additionally disables all prompt entry
+    // (offline with no local models to fall back on). The notice is the
+    // transient "back online" confirmation, cleared by the controller.
+    in property <bool> connectivity-blocked: false;
+    in property <string> connectivity-text: "";
+    in property <string> connectivity-notice: "";
 
     in property <[string]> modes;
     // Aligned with modes: each mode's default model as an index into
@@ -1935,6 +1963,9 @@ export component AppWindow inherits Window {
                     models: root.models;
                     model-matches: root.model-filter-matches;
                     model-index <=> root.nc-model-index;
+                    blocked: root.connectivity-blocked;
+                    offline-warning: root.connectivity-text;
+                    online-notice: root.connectivity-notice;
                     start(ws, br, mode, model, prompt) => {
                         root.start-new-chat(ws, br, mode, model, prompt);
                     }
@@ -2830,6 +2861,12 @@ export component AppWindow inherits Window {
                     spacing: 6px;
                     vertical-stretch: 0;
 
+                    // Offline warning / back-online notice for the composer.
+                    if root.connectivity-text != "" || root.connectivity-notice != "": ConnectivityBanner {
+                        warning: root.connectivity-text;
+                        notice: root.connectivity-notice;
+                    }
+
                     // Queued prompts: waiting their turn behind the running
                     // one. Edit in place, reorder with the arrows, delete,
                     // or — when the thread is idle — kick the queue off.
@@ -2853,7 +2890,7 @@ export component AppWindow inherits Window {
                                     vertical-alignment: center;
                                     horizontal-stretch: 1;
                                 }
-                                if root.queue-idle: PillButton {
+                                if root.queue-idle && !root.connectivity-blocked: PillButton {
                                     label: "Send now";
                                     primary: true;
                                     clicked => { root.queue-send-now(); }
@@ -3126,10 +3163,12 @@ export component AppWindow inherits Window {
 
                     composer := PromptBox {
                         text <=> root.composer-draft;
-                        placeholder: root.composer-enabled
-                            ? "Message the agent…  (Shift+Enter for a new line)"
-                            : "Select or create a thread first";
-                        enabled: root.composer-enabled;
+                        placeholder: !root.composer-enabled
+                            ? "Select or create a thread first"
+                            : root.connectivity-blocked
+                            ? "Offline — prompts are disabled"
+                            : "Message the agent…  (Shift+Enter for a new line)";
+                        enabled: root.composer-enabled && !root.connectivity-blocked;
                         completion-active: root.slash-active && !root.slash-suppressed;
                         completion-text: root.slash-completion;
                         completion-dismissed => { root.slash-suppressed = true; }
@@ -3166,7 +3205,7 @@ export component AppWindow inherits Window {
                             width: 130px;
                             options: root.modes;
                             current-index <=> root.mode-index;
-                            enabled: root.composer-enabled;
+                            enabled: root.composer-enabled && !root.connectivity-blocked;
                             placeholder: "mode";
                             changed(i) => { root.composer-mode-changed(i); }
                         }
@@ -3179,7 +3218,7 @@ export component AppWindow inherits Window {
                             options: root.models;
                             matches: root.model-filter-matches;
                             current-index <=> root.model-index;
-                            enabled: root.composer-enabled;
+                            enabled: root.composer-enabled && !root.connectivity-blocked;
                             placeholder: "model";
                             changed(i) => { root.composer-model-changed(i); }
                             filter-edited(q) => { root.model-filter-changed(q); }
@@ -3192,7 +3231,7 @@ export component AppWindow inherits Window {
                             width: 110px;
                             options: root.thinking-options;
                             current-index <=> root.thinking-index;
-                            enabled: root.composer-enabled;
+                            enabled: root.composer-enabled && !root.connectivity-blocked;
                             placeholder: "thinking";
                             changed(i) => { root.composer-thinking-changed(i); }
                         }
@@ -3204,7 +3243,7 @@ export component AppWindow inherits Window {
                             width: 90px;
                             options: root.context-options;
                             current-index <=> root.context-index;
-                            enabled: root.composer-enabled;
+                            enabled: root.composer-enabled && !root.connectivity-blocked;
                             placeholder: "context";
                             changed(i) => { root.composer-context-changed(i); }
                         }
@@ -3220,7 +3259,7 @@ export component AppWindow inherits Window {
                             border-width: 1px;
                             border-color: root.fast-checked ? Theme.c.primary-border : Theme.c.border;
                             TouchArea {
-                                enabled: root.composer-enabled;
+                                enabled: root.composer-enabled && !root.connectivity-blocked;
                                 clicked => {
                                     root.fast-checked = !root.fast-checked;
                                     root.composer-fast-toggled(root.fast-checked);
@@ -3245,7 +3284,7 @@ export component AppWindow inherits Window {
                             icon-size: Theme.fs(14px);
                             width: Theme.fs(30px);
                             height: Theme.fs(30px);
-                            enabled: root.composer-enabled;
+                            enabled: root.composer-enabled && !root.connectivity-blocked;
                             clicked => { root.attach-file(); }
                         }
                     }
@@ -3255,7 +3294,7 @@ export component AppWindow inherits Window {
                         Button {
                             text: "Send";
                             primary: true;
-                            enabled: root.composer-enabled
+                            enabled: root.composer-enabled && !root.connectivity-blocked
                                 && (composer.text != "" || root.composer-attachments.length > 0);
                             clicked => {
                                 root.send-message(composer.text);
@@ -3333,6 +3372,9 @@ export component AppWindow inherits Window {
                 model-matches: root.model-filter-matches;
                 model-index <=> root.nc-model-index;
                 error-text: root.error-text;
+                blocked: root.connectivity-blocked;
+                offline-warning: root.connectivity-text;
+                online-notice: root.connectivity-notice;
                 start(ws, br, mode, model, prompt) => {
                     root.start-new-chat(ws, br, mode, model, prompt);
                 }
@@ -4005,6 +4047,9 @@ export component AppWindow inherits Window {
         status: root.automations-status;
         workspace-names: root.automation-workspace-names;
         workspace-ids: root.automation-workspace-ids;
+        blocked: root.connectivity-blocked;
+        offline-warning: root.connectivity-text;
+        online-notice: root.connectivity-notice;
         form-open <=> root.automations-screen-form-open;
         close => { root.close-automations(); }
         refresh => { root.automations-refresh(); }

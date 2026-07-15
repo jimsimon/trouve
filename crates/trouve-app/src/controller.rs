@@ -285,6 +285,10 @@ pub enum UiCommand {
     /// Internal: a server-scope event (session lifecycle, automation runs)
     /// arrived on the global stream.
     ServerEvent(Box<trouve_protocol::EventEnvelope>),
+    /// Internal: the transient "back online" notice timed out. Carries the
+    /// sequence number of the notice it should clear, so a newer notice
+    /// survives an older notice's timer.
+    ConnectivityNoticeExpired(u64),
     /// Open settings straight to the Integrations section.
     OpenIntegrationsSettings,
     /// Store/remove the GitHub token (empty = remove).
@@ -415,6 +419,14 @@ struct Controller {
     /// Seeded from `Session.active`, kept live by `session.activity`
     /// server events; drives the sidebar activity indicator.
     busy_sessions: HashSet<String>,
+    /// The server can't reach the internet (seeded from `ServerInfo.online`,
+    /// kept live by `server.connectivity_changed` events). While set, the
+    /// model list holds only offline-capable (local) models; when it is
+    /// empty too, all prompt entry is blocked with an explanatory banner.
+    offline: bool,
+    /// Monotonic id of the latest transient connectivity notice, so an old
+    /// notice's expiry timer can't clear a newer notice.
+    connectivity_notice_seq: u64,
     /// Local models: true while a poller is scheduled for an in-flight
     /// download/install, plus the last seen downloaded-model count (a
     /// change means the model catalog changed → reload pickers).
@@ -580,6 +592,8 @@ pub async fn run(
         github_hosts: Vec::new(),
         download_rates: HashMap::new(),
         busy_sessions: HashSet::new(),
+        offline: false,
+        connectivity_notice_seq: 0,
         local_polling: false,
         local_downloaded: None,
         local_search: Vec::new(),
@@ -745,6 +759,12 @@ impl Controller {
             .context("registering current directory as workspace")?;
         self.home_workspace_id = workspace.id.clone();
 
+        // Seed connectivity before the first catalog load: when the server
+        // started offline, the model list is already filtered and the
+        // banner must say why (transitions arrive as server events later).
+        if let Ok(info) = self.client.info().await {
+            self.offline = !info.online;
+        }
         self.reload_catalogs().await;
         self.reload_sessions().await?;
 
@@ -826,6 +846,53 @@ impl Controller {
                 .collect(),
         );
         self.push_picker_indices();
+        // The offline banner depends on the (server-filtered) model list:
+        // local models keep prompts usable, an empty list blocks them.
+        self.push_connectivity();
+    }
+
+    /// Push the offline banner + input gate. Offline with local models
+    /// available keeps prompt entry usable (restricted to those models);
+    /// offline with nothing usable blocks it and says why.
+    fn push_connectivity(&self) {
+        let blocked = self.offline && self.models.is_empty();
+        let warning = if blocked {
+            "You're offline and no local models are available — prompts are \
+             disabled until the connection returns. To work offline in the \
+             future, set up a model under Settings → Local Models."
+        } else if self.offline {
+            "You're offline — only local models are available until the \
+             connection returns."
+        } else {
+            ""
+        };
+        ui::set_connectivity(&self.ui, blocked, warning.into());
+    }
+
+    /// React to a `server.connectivity_changed` event: refresh the model
+    /// catalog (the server filters it while offline), regate the inputs,
+    /// and on recovery show a short self-clearing notice.
+    async fn apply_connectivity_change(&mut self, online: bool) {
+        let was_offline = self.offline;
+        self.offline = !online;
+        self.reload_catalogs().await;
+        if online && was_offline {
+            self.connectivity_notice_seq += 1;
+            let seq = self.connectivity_notice_seq;
+            ui::set_connectivity_notice(
+                &self.ui,
+                "Back online — the full model list is available again.".into(),
+            );
+            let tx = self.tx.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_secs(6)).await;
+                let _ = tx.send(UiCommand::ConnectivityNoticeExpired(seq));
+            });
+        } else if !online {
+            // A stale recovery notice must not outlive going offline again.
+            self.connectivity_notice_seq += 1;
+            ui::set_connectivity_notice(&self.ui, String::new());
+        }
     }
 
     /// Index of a provider-qualified model id in the models catalog.
@@ -2549,6 +2616,12 @@ impl Controller {
                     self.push_nav();
                 }
             }
+            // The server's internet reachability flipped: refresh the model
+            // list (filtered while offline), regate prompt entry, announce
+            // recovery.
+            Event::ConnectivityChanged { online } => {
+                self.apply_connectivity_change(*online).await;
+            }
             _ => {}
         }
     }
@@ -4040,6 +4113,11 @@ impl Controller {
             },
             UiCommand::ServerEvent(envelope) => {
                 self.handle_server_event(*envelope).await;
+            }
+            UiCommand::ConnectivityNoticeExpired(seq) => {
+                if seq == self.connectivity_notice_seq {
+                    ui::set_connectivity_notice(&self.ui, String::new());
+                }
             }
             UiCommand::CliInstall(id) => match self.client.start_cli_install(&id).await {
                 Ok(()) => {
