@@ -110,6 +110,13 @@ pub struct Engine {
     mcp_logs: crate::mcp::McpLogStore,
     /// Interactive shells (one per session) for the client terminal panel.
     terminals: crate::terminal::TerminalManager,
+    /// Whether the server can reach the internet. Defaults to true; only a
+    /// configured probe (`with_connectivity_probe`) or `set_online` ever
+    /// flips it, so probe-less engines (tests, embedders) never go offline.
+    online: std::sync::atomic::AtomicBool,
+    /// Reachability check driven by the connectivity monitor. `None`
+    /// disables monitoring entirely.
+    connectivity_probe: Option<crate::connectivity::Probe>,
 }
 
 #[derive(Debug, Clone)]
@@ -205,16 +212,18 @@ fn provider_auth_kind(pc: &ProviderConfig) -> String {
         "oauth".into()
     } else if pc.api_key.is_none()
         && pc.api_key_env.is_none()
-        && pc
-            .base_url
-            .as_deref()
-            .map(|u| u.contains("://localhost") || u.contains("://127.0.0.1"))
-            .unwrap_or(false)
+        && pc.base_url.as_deref().is_some_and(is_loopback_base_url)
     {
         "none".into()
     } else {
         "api-key".into()
     }
+}
+
+/// Whether a provider endpoint lives on this machine (Ollama, llama.cpp,
+/// vLLM, …) and therefore keeps working without internet.
+fn is_loopback_base_url(url: &str) -> bool {
+    url.contains("://localhost") || url.contains("://127.0.0.1") || url.contains("://[::1]")
 }
 
 /// Build the provider registry from config + zero-config env defaults.
@@ -365,6 +374,8 @@ impl Engine {
             index_hooks: false,
             mcp_logs,
             terminals: crate::terminal::TerminalManager::default(),
+            online: std::sync::atomic::AtomicBool::new(true),
+            connectivity_probe: None,
         }
     }
 
@@ -374,6 +385,77 @@ impl Engine {
     pub fn with_index_hooks(mut self) -> Self {
         self.index_hooks = true;
         self
+    }
+
+    /// Enable internet-reachability monitoring with the given probe (the
+    /// server binary passes [`crate::connectivity::system_probe`]; tests can
+    /// inject a scripted one). Without a probe the engine always reports
+    /// online and never touches the network.
+    pub fn with_connectivity_probe(mut self, probe: crate::connectivity::Probe) -> Self {
+        self.connectivity_probe = Some(probe);
+        self
+    }
+
+    /// Whether the server can currently reach the internet.
+    pub fn is_online(&self) -> bool {
+        self.online.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Force the connectivity state (tests/embedders). Emits the
+    /// `server.connectivity_changed` event on an actual transition, exactly
+    /// like the probe-driven monitor.
+    pub fn set_online(&self, online: bool) {
+        self.transition_connectivity(online);
+    }
+
+    fn transition_connectivity(&self, online: bool) {
+        let was = self
+            .online
+            .swap(online, std::sync::atomic::Ordering::Relaxed);
+        if was == online {
+            return;
+        }
+        if online {
+            tracing::info!("connectivity restored");
+        } else {
+            tracing::warn!("connectivity lost: model vendors are unreachable");
+        }
+        let _ = self
+            .store
+            .append_event(Scope::Server, Event::ConnectivityChanged { online });
+    }
+
+    /// Run the first connectivity probe (no-op without one). Called before
+    /// the server starts accepting requests so an offline start never serves
+    /// a model list it will immediately retract.
+    pub async fn init_connectivity(&self) {
+        if let Some(probe) = self.connectivity_probe.clone() {
+            let online = probe().await;
+            self.transition_connectivity(online);
+        }
+    }
+
+    /// Poll the connectivity probe for the lifetime of the server: slowly
+    /// while online (going offline is rarely urgent), quickly while offline
+    /// (clients unblock prompt entry off the recovery event). No-op without
+    /// a probe.
+    pub fn start_connectivity_monitor(self: &Arc<Self>) {
+        let Some(probe) = self.connectivity_probe.clone() else {
+            return;
+        };
+        let engine = self.clone();
+        tokio::spawn(async move {
+            loop {
+                let interval = if engine.is_online() {
+                    crate::connectivity::ONLINE_POLL
+                } else {
+                    crate::connectivity::OFFLINE_POLL
+                };
+                tokio::time::sleep(interval).await;
+                let online = probe().await;
+                engine.transition_connectivity(online);
+            }
+        });
     }
 
     /// Record the server's reachable base URL (enables the MCP tool bridge
@@ -457,26 +539,61 @@ impl Engine {
     /// catalog (cached inside the backend). Backends without credentials are
     /// skipped entirely — their models can't run, so listing them only
     /// clutters the picker.
+    ///
+    /// While the server is offline, only models that can actually run are
+    /// listed: the built-in local provider and loopback endpoints (Ollama
+    /// etc.). Remote providers and vendor backends are dropped instead of
+    /// degrading to static/fallback catalogs of models every turn would
+    /// fail on; clients gate prompt entry on this list being non-empty.
     pub async fn list_models(&self) -> Vec<trouve_protocol::ModelInfo> {
-        let providers: Vec<_> = self.providers.read().unwrap().values().cloned().collect();
+        let online = self.is_online();
+        let offline_capable = if online {
+            std::collections::HashSet::new()
+        } else {
+            self.offline_capable_provider_ids()
+        };
+        let providers: Vec<_> = self
+            .providers
+            .read()
+            .unwrap()
+            .iter()
+            .filter(|(id, _)| online || offline_capable.contains(id.as_str()))
+            .map(|(_, p)| p.clone())
+            .collect();
         let provider_lists =
             futures::future::join_all(providers.iter().map(|p| p.list_models())).await;
         let mut models: Vec<_> = provider_lists.into_iter().flatten().collect();
-        let ready: Vec<_> = self
-            .backends
-            .read()
-            .unwrap()
-            .values()
-            .filter(|b| {
-                let status = b.status();
-                status.installed && status.has_credentials
-            })
-            .cloned()
-            .collect();
+        let ready: Vec<_> = if online {
+            self.backends
+                .read()
+                .unwrap()
+                .values()
+                .filter(|b| {
+                    let status = b.status();
+                    status.installed && status.has_credentials
+                })
+                .cloned()
+                .collect()
+        } else {
+            Vec::new() // vendor backends all need their cloud
+        };
         let listings = futures::future::join_all(ready.iter().map(|b| b.list_models())).await;
         models.extend(listings.into_iter().flatten());
         models.sort_by(|a, b| a.id.cmp(&b.id));
         models
+    }
+
+    /// Provider ids that keep working without internet: the built-in local
+    /// provider plus configured loopback endpoints.
+    fn offline_capable_provider_ids(&self) -> std::collections::HashSet<String> {
+        let mut ids: std::collections::HashSet<String> = ["local".to_string()].into();
+        let config = self.config.lock().unwrap();
+        for (id, pc) in &config.providers {
+            if pc.base_url.as_deref().is_some_and(is_loopback_base_url) {
+                ids.insert(id.clone());
+            }
+        }
+        ids
     }
 
     // --- provider configuration ----------------------------------------------

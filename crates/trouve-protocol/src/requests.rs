@@ -75,6 +75,11 @@ pub struct ServerInfo {
     pub name: String,
     pub version: String,
     pub protocol_version: String,
+    /// Whether the server can currently reach the internet (see the
+    /// `server.connectivity_changed` event). Absent on older servers, which
+    /// never report offline.
+    #[serde(default = "default_true")]
+    pub online: bool,
 }
 
 // --- workspaces ----------------------------------------------------------

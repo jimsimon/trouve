@@ -568,6 +568,11 @@ pub async fn serve_listener(
     // Backends dialing back in (MCP tool bridge) need our reachable URL;
     // build_secured_router injects their separate ephemeral bridge token.
     engine.set_base_url(&format!("http://{}", listener.local_addr()?));
+    // Resolve connectivity before accepting requests so an offline start
+    // never serves a model list it immediately retracts (no-op without a
+    // configured probe).
+    engine.init_connectivity().await;
+    engine.start_connectivity_monitor();
     engine.start_automation_scheduler();
     let router = build_secured_router(engine, security);
     tracing::info!(
@@ -581,11 +586,12 @@ pub async fn serve_listener(
 // --- handlers --------------------------------------------------------------
 
 #[utoipa::path(get, path = "/v1/info", responses((status = 200, body = ServerInfo)))]
-async fn info() -> Json<ServerInfo> {
+async fn info(State(engine): State<Arc<Engine>>) -> Json<ServerInfo> {
     Json(ServerInfo {
         name: "trouve-server".into(),
         version: env!("CARGO_PKG_VERSION").into(),
         protocol_version: PROTOCOL_VERSION.into(),
+        online: engine.is_online(),
     })
 }
 

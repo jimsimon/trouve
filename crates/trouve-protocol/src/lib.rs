@@ -52,7 +52,10 @@ pub use requests::*;
 // running turn, and the turn.cancelled event reports it (additive).
 // 0.18: per-automation permission_mode; omitted requests default to Ask,
 // while Yolo enables explicit unattended execution for that automation.
-pub const PROTOCOL_VERSION: &str = "0.18";
+// 0.19: connectivity — the server.connectivity_changed event and
+// ServerInfo.online report internet reachability; while offline
+// GET /v1/models lists only models that run without internet (additive).
+pub const PROTOCOL_VERSION: &str = "0.19";
 
 pub type WorkspaceId = String;
 pub type SessionId = String;

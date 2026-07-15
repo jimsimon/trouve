@@ -301,6 +301,14 @@ pub enum Event {
         #[serde(default, skip_serializing_if = "String::is_empty")]
         error: String,
     },
+    /// The server's internet reachability changed (it is the one talking to
+    /// model vendors, so it owns this state). While offline, `/v1/models`
+    /// lists only models that can run without internet (local provider,
+    /// loopback endpoints); clients gate prompt entry on having usable
+    /// models and announce recovery. `ServerInfo.online` carries the same
+    /// state for initial fetches.
+    #[serde(rename = "server.connectivity_changed")]
+    ConnectivityChanged { online: bool },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]

@@ -88,6 +88,10 @@ Server scope:
 
 - `workspace.registered` `{workspace_id, path}`
 - `session.created` / `session.deleted` `{session_id, workspace_id}`
+- `server.connectivity_changed` `{online}` — the server's internet
+  reachability flipped; while offline `/v1/models` lists only models that
+  run without internet, and clients gate prompt entry on that list
+  (`ServerInfo.online` carries the same state for initial fetches)
 
 ## Persistence
 

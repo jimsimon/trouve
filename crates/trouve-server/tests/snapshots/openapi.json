@@ -7,7 +7,7 @@
       "name": "MIT",
       "identifier": "MIT"
     },
-    "version": "0.18"
+    "version": "0.19"
   },
   "paths": {
     "/v1/approvals": {
@@ -4334,6 +4334,25 @@
                 ]
               }
             }
+          },
+          {
+            "type": "object",
+            "description": "The server's internet reachability changed (it is the one talking to\nmodel vendors, so it owns this state). While offline, `/v1/models`\nlists only models that can run without internet (local provider,\nloopback endpoints); clients gate prompt entry on having usable\nmodels and announce recovery. `ServerInfo.online` carries the same\nstate for initial fetches.",
+            "required": [
+              "online",
+              "type"
+            ],
+            "properties": {
+              "online": {
+                "type": "boolean"
+              },
+              "type": {
+                "type": "string",
+                "enum": [
+                  "server.connectivity_changed"
+                ]
+              }
+            }
           }
         ],
         "description": "Every event type in the log. Serialized with a `type` tag using\ndot-namespaced names, per the event-log design doc."
@@ -5308,6 +5327,10 @@
         "properties": {
           "name": {
             "type": "string"
+          },
+          "online": {
+            "type": "boolean",
+            "description": "Whether the server can currently reach the internet (see the\n`server.connectivity_changed` event). Absent on older servers, which\nnever report offline."
           },
           "protocol_version": {
             "type": "string"
