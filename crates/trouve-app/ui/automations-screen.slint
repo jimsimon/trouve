@@ -84,9 +84,11 @@ export component AutomationsScreen inherits Rectangle {
     // Workspace picker (parallel arrays).
     in property <[string]> workspace-names;
     in property <[string]> workspace-ids;
-    // Offline with nothing usable: adding/editing/running automations is
-    // disabled and the banner explains why (see AppWindow.connectivity-*).
+    // Offline/disconnected with nothing usable: adding/editing/running
+    // automations is disabled and the banner explains why (see
+    // AppWindow.connectivity-*).
     in property <bool> blocked;
+    in property <bool> blocked-severe;
     in property <string> offline-warning;
     in property <string> online-notice;
 
@@ -249,6 +251,7 @@ export component AutomationsScreen inherits Rectangle {
                         if root.offline-warning != "" || root.online-notice != "": ConnectivityBanner {
                             warning: root.offline-warning;
                             notice: root.online-notice;
+                            severe: root.blocked-severe;
                         }
 
                         // ---------------- list ----------------

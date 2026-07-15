@@ -1,19 +1,29 @@
-// Connectivity banner: a persistent offline warning (amber) or a transient
-// "back online" notice (green). Mount behind an `if warning != "" ||
-// notice != ""` so it takes no space while silent; the warning wins when
-// both are set.
+// Connectivity banner: a persistent warning — red when the connection to
+// the server itself is gone (severe), amber when the server merely lost
+// internet — or a transient "back online" notice (green). Mount behind an
+// `if warning != "" || notice != ""` so it takes no space while silent;
+// the warning wins when both are set.
 
 import { Theme } from "theme.slint";
 
 export component ConnectivityBanner inherits Rectangle {
     in property <string> warning;
     in property <string> notice;
+    // The client can't reach the server at all (renders red).
+    in property <bool> severe;
     property <bool> is-warning: root.warning != "";
+    property <color> tone: root.is-warning
+        ? (root.severe ? Theme.c.err : Theme.c.warn)
+        : Theme.c.ok;
 
     height: row.preferred-height + 16px;
-    background: root.is-warning ? Theme.c.warn-bg : Theme.c.accent-bg;
+    background: root.is-warning
+        ? (root.severe ? Theme.c.err-bg : Theme.c.warn-bg)
+        : Theme.c.accent-bg;
     border-width: 1px;
-    border-color: root.is-warning ? Theme.c.warn-border : Theme.c.primary-border;
+    border-color: root.is-warning
+        ? (root.severe ? Theme.c.err : Theme.c.warn-border)
+        : Theme.c.primary-border;
     border-radius: 6px;
 
     row := HorizontalLayout {
@@ -24,13 +34,13 @@ export component ConnectivityBanner inherits Rectangle {
         spacing: 8px;
         Text {
             text: root.is-warning ? "⚠" : "✓";
-            color: root.is-warning ? Theme.c.warn : Theme.c.ok;
+            color: root.tone;
             font-size: Theme.fs(12px);
             vertical-alignment: center;
         }
         Text {
             text: root.is-warning ? root.warning : root.notice;
-            color: root.is-warning ? Theme.c.warn : Theme.c.ok;
+            color: root.tone;
             font-size: Theme.fs(12px);
             wrap: word-wrap;
             vertical-alignment: center;

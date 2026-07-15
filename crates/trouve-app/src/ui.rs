@@ -67,12 +67,15 @@ pub fn set_picker_indices(ui: &Ui, mode: i32, model: i32) {
     });
 }
 
-/// Offline state: `blocked` disables all prompt entry (composer, new-chat
-/// form, automation form); `warning` explains why ("" hides the banner).
-pub fn set_connectivity(ui: &Ui, blocked: bool, warning: String) {
+/// Connectivity state: `blocked` disables all prompt entry (composer,
+/// new-chat form, automation form); `warning` explains why ("" hides the
+/// banner). `severe` renders the banner red — the connection to the server
+/// itself is gone, not just the server's internet.
+pub fn set_connectivity(ui: &Ui, blocked: bool, warning: String, severe: bool) {
     let _ = ui.upgrade_in_event_loop(move |ui| {
         ui.set_connectivity_blocked(blocked);
         ui.set_connectivity_text(SharedString::from(warning));
+        ui.set_connectivity_severe(severe);
     });
 }
 

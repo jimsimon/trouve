@@ -289,6 +289,14 @@ pub enum UiCommand {
     /// sequence number of the notice it should clear, so a newer notice
     /// survives an older notice's timer.
     ConnectivityNoticeExpired(u64),
+    /// Internal: the server stopped answering (several consecutive probes
+    /// failed after the event stream dropped).
+    ServerConnectionLost,
+    /// Internal: a probe succeeded again after the connection had been
+    /// reported lost.
+    ServerConnectionRestored,
+    /// Internal: the locally spawned server process exited (status text).
+    ServerExited(String),
     /// Open settings straight to the Integrations section.
     OpenIntegrationsSettings,
     /// Store/remove the GitHub token (empty = remove).
@@ -427,6 +435,22 @@ struct Controller {
     /// Monotonic id of the latest transient connectivity notice, so an old
     /// notice's expiry timer can't clear a newer notice.
     connectivity_notice_seq: u64,
+    /// The client can't reach the server at all (distinct from `offline`,
+    /// which is the server's own internet state, and strictly worse: every
+    /// request fails and event streams are frozen, so all prompt entry is
+    /// blocked with a red banner until a probe answers again).
+    server_unreachable: bool,
+    /// An automatic server respawn failed or the process is crash-looping;
+    /// the banner asks for an app restart instead of promising recovery.
+    server_failed: bool,
+    /// When the last automatic respawn happened (crash-loop guard: a second
+    /// death right after a respawn means restarting won't help).
+    last_respawn: Option<std::time::Instant>,
+    /// Base URL of the server, for connection-error messages.
+    server_url: String,
+    /// How to respawn the locally spawned server when its process dies
+    /// (`None` when connected to an external server via TROUVE_SERVER_URL).
+    server_spawn: Option<ServerSpawnInfo>,
     /// Local models: true while a poller is scheduled for an in-flight
     /// download/install, plus the last seen downloaded-model count (a
     /// change means the model catalog changed → reload pickers).
@@ -565,12 +589,16 @@ pub async fn run(
     mut rx: mpsc::UnboundedReceiver<UiCommand>,
     window_focused: std::sync::Arc<std::sync::atomic::AtomicBool>,
 ) {
-    let (client, _server) = match start_local_server().await {
-        Ok(pair) => pair,
+    let (client, server_url, spawned) = match start_local_server().await {
+        Ok(parts) => parts,
         Err(e) => {
             ui::set_error(&ui, &format!("failed to start server: {e:#}"));
             return;
         }
+    };
+    let (server_spawn, server_child) = match spawned {
+        Some((info, child)) => (Some(info), Some(child)),
+        None => (None, None),
     };
 
     let mut ctl = Controller {
@@ -594,6 +622,11 @@ pub async fn run(
         busy_sessions: HashSet::new(),
         offline: false,
         connectivity_notice_seq: 0,
+        server_unreachable: false,
+        server_failed: false,
+        last_respawn: None,
+        server_url,
+        server_spawn,
         local_polling: false,
         local_downloaded: None,
         local_search: Vec::new(),
@@ -641,6 +674,12 @@ pub async fn run(
         term_view: (80, 24),
     };
 
+    // Report the spawned server's death to the command loop, which will
+    // attempt one automatic respawn before surfacing the failure.
+    if let Some(child) = server_child {
+        watch_server_child(ctl.tx.clone(), child);
+    }
+
     if let Err(e) = ctl.bootstrap().await {
         ctl.error(&format!("startup error: {e:#}"));
     }
@@ -672,7 +711,11 @@ pub async fn run(
 /// Spawn `trouve-server` on an ephemeral local port and wait for it to
 /// answer. `TROUVE_SERVER_URL` skips spawning and connects to an existing
 /// (possibly remote) server instead.
-async fn start_local_server() -> Result<(ProtocolClient, Option<tokio::process::Child>)> {
+async fn start_local_server() -> Result<(
+    ProtocolClient,
+    String,
+    Option<(ServerSpawnInfo, tokio::process::Child)>,
+)> {
     if let Ok(url) = std::env::var("TROUVE_SERVER_URL") {
         // Connecting to an externally-managed server: the user supplies its
         // token (if any) in the environment.
@@ -682,7 +725,7 @@ async fn start_local_server() -> Result<(ProtocolClient, Option<tokio::process::
             .info()
             .await
             .with_context(|| format!("connecting to {url}"))?;
-        return Ok((client, None));
+        return Ok((client, url, None));
     }
 
     let binary = server_binary()?;
@@ -700,10 +743,34 @@ async fn start_local_server() -> Result<(ProtocolClient, Option<tokio::process::
         uuid::Uuid::new_v4().simple()
     );
 
-    let mut command = tokio::process::Command::new(&binary);
+    let spawn = ServerSpawnInfo {
+        binary,
+        addr: addr.clone(),
+        token: token.clone(),
+    };
+    let child = spawn_server_process(&spawn)?;
+    let url = format!("http://{addr}");
+    let client = ProtocolClient::with_token(&url, Some(token));
+    wait_server_ready(&client)
+        .await
+        .with_context(|| format!("trouve-server did not become ready on {addr}"))?;
+    Ok((client, url, Some((spawn, child))))
+}
+
+/// Everything needed to relaunch the locally spawned server on the same
+/// address with the same per-launch token (the client keeps both).
+#[derive(Clone)]
+struct ServerSpawnInfo {
+    binary: std::path::PathBuf,
+    addr: String,
+    token: String,
+}
+
+fn spawn_server_process(spawn: &ServerSpawnInfo) -> Result<tokio::process::Child> {
+    let mut command = tokio::process::Command::new(&spawn.binary);
     command
-        .args(["--addr", &addr])
-        .env("TROUVE_AUTH_TOKEN", &token)
+        .args(["--addr", &spawn.addr])
+        .env("TROUVE_AUTH_TOKEN", &spawn.token)
         .kill_on_drop(true);
     #[cfg(target_os = "linux")]
     unsafe {
@@ -713,18 +780,32 @@ async fn start_local_server() -> Result<(ProtocolClient, Option<tokio::process::
             Ok(())
         });
     }
-    let child = command
+    command
         .spawn()
-        .with_context(|| format!("spawning {}", binary.display()))?;
+        .with_context(|| format!("spawning {}", spawn.binary.display()))
+}
 
-    let client = ProtocolClient::with_token(&format!("http://{addr}"), Some(token));
+async fn wait_server_ready(client: &ProtocolClient) -> Result<()> {
     for _ in 0..100 {
         if client.info().await.is_ok() {
-            return Ok((client, Some(child)));
+            return Ok(());
         }
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     }
-    anyhow::bail!("trouve-server did not become ready on {addr}");
+    anyhow::bail!("server did not answer /v1/info in time")
+}
+
+/// Own the spawned server child and report its death to the command loop.
+/// The task owning it preserves kill-on-drop: when the runtime shuts down
+/// the task is dropped and the child killed with it.
+fn watch_server_child(tx: mpsc::UnboundedSender<UiCommand>, mut child: tokio::process::Child) {
+    tokio::spawn(async move {
+        let status = match child.wait().await {
+            Ok(status) => status.to_string(),
+            Err(e) => format!("wait failed: {e}"),
+        };
+        let _ = tx.send(UiCommand::ServerExited(status));
+    });
 }
 
 /// Locate the server binary: `TROUVE_SERVER_BIN`, next to our own
@@ -778,11 +859,17 @@ impl Controller {
         // sessions created in the background (scheduled automations) and
         // automation run outcomes arrive here. The handler ignores stale
         // envelopes, so the history replay on (re)connect is harmless.
+        //
+        // The task doubles as the connection watchdog: whenever the stream
+        // drops it probes /v1/info until the server answers again. A couple
+        // of failed probes are a blip; a sustained outage (and its recovery)
+        // becomes UI state via ServerConnectionLost/Restored.
         {
             let client = self.client.clone();
             let tx = self.tx.clone();
             tokio::spawn(async move {
                 let mut after = 0u64;
+                let mut lost_reported = false;
                 loop {
                     if let Ok(last) = client
                         .follow_server_events(after, |envelope| {
@@ -793,7 +880,30 @@ impl Controller {
                     {
                         after = after.max(last);
                     }
-                    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                    let mut failures = 0u32;
+                    loop {
+                        if client.info().await.is_ok() {
+                            if lost_reported {
+                                lost_reported = false;
+                                if tx.send(UiCommand::ServerConnectionRestored).is_err() {
+                                    return;
+                                }
+                            }
+                            break;
+                        }
+                        failures += 1;
+                        if failures == 3 && !lost_reported {
+                            lost_reported = true;
+                            if tx.send(UiCommand::ServerConnectionLost).is_err() {
+                                return;
+                            }
+                        }
+                        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                    }
+                    // The probe answered: reconnect the stream (the cursor
+                    // makes replay lossless). The pause keeps a stream that
+                    // ends immediately from spinning hot.
+                    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
                 }
             });
         }
@@ -851,10 +961,30 @@ impl Controller {
         self.push_connectivity();
     }
 
-    /// Push the offline banner + input gate. Offline with local models
-    /// available keeps prompt entry usable (restricted to those models);
-    /// offline with nothing usable blocks it and says why.
+    /// Push the connectivity banner + input gate. A lost client→server
+    /// connection outranks the server's own internet state — nothing works
+    /// while the server is gone, so that banner is red and blocks
+    /// everything. Otherwise: offline with local models available keeps
+    /// prompt entry usable (restricted to those models); offline with
+    /// nothing usable blocks it and says why.
     fn push_connectivity(&self) {
+        if self.server_unreachable {
+            let warning = if self.server_failed {
+                "The trouve server stopped and could not be restarted — \
+                 please restart the app."
+                    .into()
+            } else if self.server_spawn.is_some() {
+                "Lost the connection to the trouve server — reconnecting…".into()
+            } else {
+                format!(
+                    "Can't reach the trouve server at {} — check your \
+                     connection. Retrying…",
+                    self.server_url
+                )
+            };
+            ui::set_connectivity(&self.ui, true, warning, true);
+            return;
+        }
         let blocked = self.offline && self.models.is_empty();
         let warning = if blocked {
             "You're offline and no local models are available — prompts are \
@@ -866,7 +996,28 @@ impl Controller {
         } else {
             ""
         };
-        ui::set_connectivity(&self.ui, blocked, warning.into());
+        ui::set_connectivity(&self.ui, blocked, warning.into(), false);
+    }
+
+    /// Show a transient connectivity notice that clears itself after a few
+    /// seconds (sequence-guarded so an older notice's timer can't clear a
+    /// newer notice).
+    fn show_connectivity_notice(&mut self, text: &str) {
+        self.connectivity_notice_seq += 1;
+        let seq = self.connectivity_notice_seq;
+        ui::set_connectivity_notice(&self.ui, text.into());
+        let tx = self.tx.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_secs(6)).await;
+            let _ = tx.send(UiCommand::ConnectivityNoticeExpired(seq));
+        });
+    }
+
+    /// Drop any transient notice immediately (bad news must not sit next to
+    /// a stale "back online" line).
+    fn clear_connectivity_notice(&mut self) {
+        self.connectivity_notice_seq += 1;
+        ui::set_connectivity_notice(&self.ui, String::new());
     }
 
     /// React to a `server.connectivity_changed` event: refresh the model
@@ -877,21 +1028,66 @@ impl Controller {
         self.offline = !online;
         self.reload_catalogs().await;
         if online && was_offline {
-            self.connectivity_notice_seq += 1;
-            let seq = self.connectivity_notice_seq;
-            ui::set_connectivity_notice(
-                &self.ui,
-                "Back online — the full model list is available again.".into(),
-            );
-            let tx = self.tx.clone();
-            tokio::spawn(async move {
-                tokio::time::sleep(std::time::Duration::from_secs(6)).await;
-                let _ = tx.send(UiCommand::ConnectivityNoticeExpired(seq));
-            });
+            self.show_connectivity_notice("Back online — the full model list is available again.");
         } else if !online {
-            // A stale recovery notice must not outlive going offline again.
-            self.connectivity_notice_seq += 1;
-            ui::set_connectivity_notice(&self.ui, String::new());
+            self.clear_connectivity_notice();
+        }
+    }
+
+    /// Re-sync after the connection to the server came back. Event streams
+    /// replay losslessly from their cursors, but the handler drops stale
+    /// envelopes — a connectivity transition that happened during the gap
+    /// would be lost, so the snapshot is refetched; catalogs and sessions
+    /// reload for the same reason.
+    async fn resync_after_reconnect(&mut self, notice: &str) {
+        if let Ok(info) = self.client.info().await {
+            self.offline = !info.online;
+        }
+        self.reload_catalogs().await; // re-pushes the connectivity banner
+        let _ = self.reload_sessions().await;
+        self.show_connectivity_notice(notice);
+    }
+
+    /// The locally spawned server process died: attempt one automatic
+    /// respawn on the same address/token. A crash loop (dying again within
+    /// a minute of a respawn) or a failed spawn gives up and asks for an
+    /// app restart — retrying can't fix a bad binary or port conflict.
+    async fn handle_server_exited(&mut self, status: &str) {
+        let Some(spawn) = self.server_spawn.clone() else {
+            // Externally-managed server: the watchdog handles messaging.
+            return;
+        };
+        tracing::warn!("trouve-server exited ({status})");
+        self.server_unreachable = true;
+        self.clear_connectivity_notice();
+        if self
+            .last_respawn
+            .is_some_and(|at| at.elapsed() < std::time::Duration::from_secs(60))
+        {
+            self.server_failed = true;
+            self.push_connectivity();
+            return;
+        }
+        self.last_respawn = Some(std::time::Instant::now());
+        self.push_connectivity();
+        let restarted = match spawn_server_process(&spawn) {
+            Ok(child) => {
+                watch_server_child(self.tx.clone(), child);
+                wait_server_ready(&self.client).await.is_ok()
+            }
+            Err(e) => {
+                tracing::warn!("respawning trouve-server: {e:#}");
+                false
+            }
+        };
+        if restarted {
+            self.server_unreachable = false;
+            self.server_failed = false;
+            self.resync_after_reconnect("The trouve server stopped and was restarted.")
+                .await;
+        } else {
+            self.server_failed = true;
+            self.push_connectivity();
         }
     }
 
@@ -4118,6 +4314,20 @@ impl Controller {
                 if seq == self.connectivity_notice_seq {
                     ui::set_connectivity_notice(&self.ui, String::new());
                 }
+            }
+            UiCommand::ServerConnectionLost => {
+                self.server_unreachable = true;
+                self.clear_connectivity_notice();
+                self.push_connectivity();
+            }
+            UiCommand::ServerConnectionRestored => {
+                self.server_unreachable = false;
+                self.server_failed = false;
+                self.resync_after_reconnect("Reconnected to the trouve server.")
+                    .await;
+            }
+            UiCommand::ServerExited(status) => {
+                self.handle_server_exited(&status).await;
             }
             UiCommand::CliInstall(id) => match self.client.start_cli_install(&id).await {
                 Ok(()) => {

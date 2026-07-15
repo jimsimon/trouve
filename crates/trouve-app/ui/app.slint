@@ -815,9 +815,10 @@ component NewChatForm inherits VerticalLayout {
     in property <[int]> model-matches;
     in-out property <int> model-index;
     in property <string> error-text;
-    // Offline with nothing usable: every input is disabled and the banner
-    // explains why (see AppWindow.connectivity-*).
+    // Offline/disconnected with nothing usable: every input is disabled
+    // and the banner explains why (see AppWindow.connectivity-*).
     in property <bool> blocked;
+    in property <bool> blocked-severe;
     in property <string> offline-warning;
     in property <string> online-notice;
     callback start(int, int, int, int, string);
@@ -848,6 +849,7 @@ component NewChatForm inherits VerticalLayout {
     if root.offline-warning != "" || root.online-notice != "": ConnectivityBanner {
         warning: root.offline-warning;
         notice: root.online-notice;
+        severe: root.blocked-severe;
     }
 
     if root.session-form: VerticalLayout {
@@ -926,7 +928,9 @@ component NewChatForm inherits VerticalLayout {
         spacing: 6px;
         Text { text: "First message"; color: Theme.c.text-mid; font-size: Theme.fs(12px); font-weight: 700; }
         prompt-edit := PromptBox {
-            placeholder: root.blocked
+            placeholder: root.blocked && root.blocked-severe
+                ? "Server unavailable — prompts are disabled"
+                : root.blocked
                 ? "Offline — prompts are disabled"
                 : "What should the agent do?  (Shift+Enter for a new line)";
             enabled: !root.blocked;
@@ -1339,12 +1343,15 @@ export component AppWindow inherits Window {
 
     in-out property <string> error-text: "";
 
-    // Server connectivity. While `connectivity-text` is set an offline
-    // banner shows on the composer, the new-chat form, and the automations
-    // screen; `connectivity-blocked` additionally disables all prompt entry
-    // (offline with no local models to fall back on). The notice is the
-    // transient "back online" confirmation, cleared by the controller.
+    // Server connectivity. While `connectivity-text` is set a banner shows
+    // on the composer, the new-chat form, and the automations screen;
+    // `connectivity-blocked` additionally disables all prompt entry (server
+    // unreachable, or offline with no local models to fall back on).
+    // `connectivity-severe` renders it red: the connection to the server
+    // itself is gone, not just the server's internet. The notice is the
+    // transient recovery confirmation, cleared by the controller.
     in property <bool> connectivity-blocked: false;
+    in property <bool> connectivity-severe: false;
     in property <string> connectivity-text: "";
     in property <string> connectivity-notice: "";
 
@@ -1964,6 +1971,7 @@ export component AppWindow inherits Window {
                     model-matches: root.model-filter-matches;
                     model-index <=> root.nc-model-index;
                     blocked: root.connectivity-blocked;
+                    blocked-severe: root.connectivity-severe;
                     offline-warning: root.connectivity-text;
                     online-notice: root.connectivity-notice;
                     start(ws, br, mode, model, prompt) => {
@@ -2861,10 +2869,11 @@ export component AppWindow inherits Window {
                     spacing: 6px;
                     vertical-stretch: 0;
 
-                    // Offline warning / back-online notice for the composer.
+                    // Connectivity warning / recovery notice for the composer.
                     if root.connectivity-text != "" || root.connectivity-notice != "": ConnectivityBanner {
                         warning: root.connectivity-text;
                         notice: root.connectivity-notice;
+                        severe: root.connectivity-severe;
                     }
 
                     // Queued prompts: waiting their turn behind the running
@@ -3165,6 +3174,8 @@ export component AppWindow inherits Window {
                         text <=> root.composer-draft;
                         placeholder: !root.composer-enabled
                             ? "Select or create a thread first"
+                            : root.connectivity-blocked && root.connectivity-severe
+                            ? "Server unavailable — prompts are disabled"
                             : root.connectivity-blocked
                             ? "Offline — prompts are disabled"
                             : "Message the agent…  (Shift+Enter for a new line)";
@@ -3373,6 +3384,7 @@ export component AppWindow inherits Window {
                 model-index <=> root.nc-model-index;
                 error-text: root.error-text;
                 blocked: root.connectivity-blocked;
+                blocked-severe: root.connectivity-severe;
                 offline-warning: root.connectivity-text;
                 online-notice: root.connectivity-notice;
                 start(ws, br, mode, model, prompt) => {
@@ -4048,6 +4060,7 @@ export component AppWindow inherits Window {
         workspace-names: root.automation-workspace-names;
         workspace-ids: root.automation-workspace-ids;
         blocked: root.connectivity-blocked;
+        blocked-severe: root.connectivity-severe;
         offline-warning: root.connectivity-text;
         online-notice: root.connectivity-notice;
         form-open <=> root.automations-screen-form-open;
