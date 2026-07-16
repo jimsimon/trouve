@@ -21,5 +21,13 @@
       groupName: 'GitHub Actions',
       matchManagers: ['github-actions'],
     },
+    {
+      // Batch all semver patch and minor updates into a single PR. Same as
+      // the group:allNonMajor preset, but declared last so it wins over the
+      // groups above; those still apply to major and digest updates.
+      groupName: 'all non-major dependencies',
+      groupSlug: 'all-minor-patch',
+      matchUpdateTypes: ['minor', 'patch'],
+    },
   ],
 }
