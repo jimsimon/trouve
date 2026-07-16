@@ -11,7 +11,7 @@ use std::collections::HashMap;
 use std::io::{BufRead, Write};
 use std::path::PathBuf;
 use std::process::ExitCode;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
@@ -34,26 +34,44 @@ const INSTRUCTIONS: &str = "Instant code search for any local git repository. Ca
     `find_related` to discover similar code elsewhere in the same repo. Pass the project \
     root as `repo`.";
 
-struct CachedIndex {
+struct BuiltIndex {
     index: TrouveIndex,
     built_at: Instant,
     build_duration: Duration,
-    last_used: Instant,
 }
 
-/// LRU cache of built indexes, re-validated after a cooldown. Public so
-/// embedders (e.g. the trouve harness's native tools) can share one cache
-/// across in-process [`call_tool`] invocations.
+/// One repo's slot in the cache: its own lock, held across (re)build and
+/// query, so concurrent calls for the *same* repo coordinate while calls
+/// for unrelated repos proceed in parallel.
+struct RepoEntry {
+    last_used: Mutex<Instant>,
+    built: Mutex<Option<BuiltIndex>>,
+}
+
+/// Lock, ignoring poisoning: a panicked call must not wedge every later
+/// request (the cached state is rebuilt from disk if it is suspect).
+fn lock_unpoisoned<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// LRU cache of built indexes, re-validated after a cooldown. Internally
+/// synchronized: the map-level lock is held only for entry lookup, insert,
+/// and eviction, and each repo has its own entry lock, so sessions touching
+/// different repos never serialize on each other's builds or searches.
+/// Public so embedders (e.g. the trouve harness's native tools) can share
+/// one cache across in-process [`call_tool`] invocations.
 pub struct IndexCache {
     content: Vec<ContentType>,
-    entries: HashMap<String, CachedIndex>,
+    entries: Mutex<HashMap<String, Arc<RepoEntry>>>,
 }
 
 impl IndexCache {
     pub fn new(content: Vec<ContentType>) -> IndexCache {
         IndexCache {
             content,
-            entries: HashMap::new(),
+            entries: Mutex::new(HashMap::new()),
         }
     }
 
@@ -64,7 +82,10 @@ impl IndexCache {
             .unwrap_or_else(|_| repo.to_string())
     }
 
-    fn get(&mut self, repo: &str) -> Result<&TrouveIndex, String> {
+    /// Look up or create the repo's entry, holding the map lock only for
+    /// that. Eviction removes the LRU entry from the map; in-flight calls
+    /// keep their `Arc` alive until they finish.
+    fn entry(&self, repo: &str) -> Result<Arc<RepoEntry>, String> {
         if is_git_url(repo) {
             return Err(format!(
                 "Remote git URLs are not supported; only local directory paths are accepted as \
@@ -72,7 +93,35 @@ impl IndexCache {
             ));
         }
         let key = self.cache_key(repo);
-        let needs_build = match self.entries.get(&key) {
+        let mut entries = lock_unpoisoned(&self.entries);
+        if let Some(entry) = entries.get(&key) {
+            *lock_unpoisoned(&entry.last_used) = Instant::now();
+            return Ok(Arc::clone(entry));
+        }
+        if entries.len() >= CACHE_MAX_SIZE {
+            // Evict least-recently-used.
+            if let Some(lru) = entries
+                .iter()
+                .min_by_key(|(_, v)| *lock_unpoisoned(&v.last_used))
+                .map(|(k, _)| k.clone())
+            {
+                entries.remove(&lru);
+            }
+        }
+        let entry = Arc::new(RepoEntry {
+            last_used: Mutex::new(Instant::now()),
+            built: Mutex::new(None),
+        });
+        entries.insert(key, Arc::clone(&entry));
+        Ok(entry)
+    }
+
+    /// Run `f` against the repo's up-to-date index, (re)building it first
+    /// if needed. Holds only this repo's entry lock for the duration.
+    fn with_index<R>(&self, repo: &str, f: impl FnOnce(&TrouveIndex) -> R) -> Result<R, String> {
+        let entry = self.entry(repo)?;
+        let mut built = lock_unpoisoned(&entry.built);
+        let needs_build = match built.as_ref() {
             None => true,
             Some(cached) => {
                 // Re-validated once outside the cooldown window: rebuilds
@@ -82,32 +131,15 @@ impl IndexCache {
         };
         if needs_build {
             let start = Instant::now();
-            let built = TrouveIndex::from_path(&PathBuf::from(repo), &self.content, None)
+            let index = TrouveIndex::from_path(&PathBuf::from(repo), &self.content, None)
                 .map_err(|e| format!("Failed to index {repo:?}: {e}"))?;
-            if self.entries.len() >= CACHE_MAX_SIZE && !self.entries.contains_key(&key) {
-                // Evict least-recently-used.
-                if let Some(lru) = self
-                    .entries
-                    .iter()
-                    .min_by_key(|(_, v)| v.last_used)
-                    .map(|(k, _)| k.clone())
-                {
-                    self.entries.remove(&lru);
-                }
-            }
-            self.entries.insert(
-                key.clone(),
-                CachedIndex {
-                    index: built,
-                    built_at: Instant::now(),
-                    build_duration: start.elapsed(),
-                    last_used: Instant::now(),
-                },
-            );
+            *built = Some(BuiltIndex {
+                index,
+                built_at: Instant::now(),
+                build_duration: start.elapsed(),
+            });
         }
-        let entry = self.entries.get_mut(&key).unwrap();
-        entry.last_used = Instant::now();
-        Ok(&entry.index)
+        Ok(f(&built.as_ref().unwrap().index))
     }
 }
 
@@ -176,8 +208,10 @@ fn arg_snippet_lines(args: &Value) -> Option<usize> {
 
 /// Run the `search` / `find_related` tool with MCP-shaped arguments;
 /// `Err` becomes an `isError: true` tool result (or an embedder's tool
-/// error). Public for in-process embedding alongside [`IndexCache`].
-pub fn call_tool(cache: &mut IndexCache, name: &str, args: &Value) -> Result<String, String> {
+/// error). Public for in-process embedding alongside [`IndexCache`];
+/// the cache synchronizes internally, so concurrent calls only serialize
+/// when they touch the same repo.
+pub fn call_tool(cache: &IndexCache, name: &str, args: &Value) -> Result<String, String> {
     match name {
         "search" => {
             let Some(query) = args.get("query").and_then(|v| v.as_str()) else {
@@ -188,13 +222,14 @@ pub fn call_tool(cache: &mut IndexCache, name: &str, args: &Value) -> Result<Str
             };
             let top_k = arg_top_k(args)?;
             let max_snippet_lines = arg_snippet_lines(args);
-            let index = cache.get(repo)?;
-            let results = index.search(query, top_k, None, None, None, None, max_snippet_lines);
-            if results.is_empty() {
-                Ok("No results found.".to_string())
-            } else {
-                Ok(format_results(query, &results, max_snippet_lines).to_string())
-            }
+            cache.with_index(repo, |index| {
+                let results = index.search(query, top_k, None, None, None, None, max_snippet_lines);
+                if results.is_empty() {
+                    "No results found.".to_string()
+                } else {
+                    format_results(query, &results, max_snippet_lines).to_string()
+                }
+            })
         }
         "find_related" => {
             let Some(file_path) = args.get("file_path").and_then(|v| v.as_str()) else {
@@ -208,26 +243,28 @@ pub fn call_tool(cache: &mut IndexCache, name: &str, args: &Value) -> Result<Str
             };
             let top_k = arg_top_k(args)?;
             let max_snippet_lines = arg_snippet_lines(args);
-            let index = cache.get(repo)?;
-            let Some(chunk) = resolve_chunk(&index.chunks, file_path, line as u32).cloned() else {
-                return Err(format!(
-                    "No chunk found at {file_path}:{line}. Make sure the file is indexed and the \
-                     line number is within a known chunk."
-                ));
-            };
-            let results = index.find_related(&chunk, top_k, max_snippet_lines);
-            if results.is_empty() {
-                Ok(format!("No related chunks found for {file_path}:{line}."))
-            } else {
-                let label = format!("Chunks related to {file_path}:{line}");
-                Ok(format_results(&label, &results, max_snippet_lines).to_string())
-            }
+            cache.with_index(repo, |index| {
+                let Some(chunk) = resolve_chunk(&index.chunks, file_path, line as u32).cloned()
+                else {
+                    return Err(format!(
+                        "No chunk found at {file_path}:{line}. Make sure the file is indexed and \
+                         the line number is within a known chunk."
+                    ));
+                };
+                let results = index.find_related(&chunk, top_k, max_snippet_lines);
+                if results.is_empty() {
+                    Ok(format!("No related chunks found for {file_path}:{line}."))
+                } else {
+                    let label = format!("Chunks related to {file_path}:{line}");
+                    Ok(format_results(&label, &results, max_snippet_lines).to_string())
+                }
+            })?
         }
         other => Err(format!("Unknown tool: {other}")),
     }
 }
 
-pub(crate) fn handle_request(cache: &Mutex<IndexCache>, request: &Value) -> Option<Value> {
+pub(crate) fn handle_request(cache: &IndexCache, request: &Value) -> Option<Value> {
     let id = request.get("id");
     let has_id = !(id.is_none() || id == Some(&Value::Null));
     let Some(method) = request.get("method").and_then(|m| m.as_str()) else {
@@ -272,16 +309,12 @@ pub(crate) fn handle_request(cache: &Mutex<IndexCache>, request: &Value) -> Opti
             let args = request
                 .pointer("/params/arguments")
                 .unwrap_or(&default_args);
-            // The cache is locked per call (not per connection) so that
-            // daemon connections serving other sessions can still answer
-            // ping/initialize while a slow index build runs. Poisoning is
-            // ignored: a panicked call must not wedge every later request.
-            let mut cache = cache
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            // The cache locks per repo internally, so a slow index build
+            // only stalls calls for that repo — other sessions' searches,
+            // ping, and initialize proceed concurrently.
             // Tool failures are still tool *results* per MCP, but must be
             // flagged so clients treat them as failed calls.
-            let (text, is_error) = match call_tool(&mut cache, name, args) {
+            let (text, is_error) = match call_tool(cache, name, args) {
                 Ok(text) => (text, false),
                 Err(text) => (text, true),
             };
@@ -299,7 +332,7 @@ pub(crate) fn handle_request(cache: &Mutex<IndexCache>, request: &Value) -> Opti
 }
 
 /// Answer one raw request line, or `None` for notifications.
-pub(crate) fn respond_line(cache: &Mutex<IndexCache>, line: &str) -> Option<Value> {
+pub(crate) fn respond_line(cache: &IndexCache, line: &str) -> Option<Value> {
     match serde_json::from_str::<Value>(line) {
         Ok(request) => handle_request(cache, &request),
         Err(_) => Some(
@@ -310,31 +343,29 @@ pub(crate) fn respond_line(cache: &Mutex<IndexCache>, line: &str) -> Option<Valu
 
 /// Serve newline-delimited JSON-RPC requests from `reader`, writing
 /// responses to `writer`, until `reader` is exhausted. Shared by the stdio
-/// server and each connection of the unix-socket daemon; the cache is behind
-/// a mutex so daemon connections serialize index access exactly like the
-/// harness's in-process tools do.
-pub(crate) fn serve_lines<R: BufRead, W: Write>(
-    cache: &Mutex<IndexCache>,
-    reader: R,
-    mut writer: W,
-) {
+/// server and each connection of the unix-socket daemon; the cache
+/// synchronizes internally per repo, so connections only contend when they
+/// query the same repository.
+pub(crate) fn serve_lines<R: BufRead, W: Write>(cache: &IndexCache, reader: R, mut writer: W) {
     for line in reader.lines() {
         let Ok(line) = line else { break };
         if line.trim().is_empty() {
             continue;
         }
         if let Some(response) = respond_line(cache, &line) {
-            if writeln!(writer, "{response}").is_err() {
+            // A buffered writer can accept the write and only fail on
+            // flush; either way the client is gone, so stop serving
+            // instead of executing further calls nobody will hear about.
+            if writeln!(writer, "{response}").is_err() || writer.flush().is_err() {
                 break;
             }
-            let _ = writer.flush();
         }
     }
 }
 
 /// Start an MCP stdio server (blocks until stdin closes).
 pub fn serve(content: &[ContentType]) -> ExitCode {
-    let cache = Mutex::new(IndexCache::new(content.to_vec()));
+    let cache = IndexCache::new(content.to_vec());
     let stdin = std::io::stdin();
     let stdout = std::io::stdout();
     serve_lines(&cache, stdin.lock(), stdout.lock());
@@ -345,8 +376,8 @@ pub fn serve(content: &[ContentType]) -> ExitCode {
 mod tests {
     use super::*;
 
-    fn test_cache() -> Mutex<IndexCache> {
-        Mutex::new(IndexCache::new(vec![ContentType::Code]))
+    fn test_cache() -> IndexCache {
+        IndexCache::new(vec![ContentType::Code])
     }
 
     #[test]
@@ -382,14 +413,14 @@ mod tests {
 
     #[test]
     fn rejects_git_urls() {
-        let mut cache = IndexCache::new(vec![ContentType::Code]);
+        let cache = IndexCache::new(vec![ContentType::Code]);
         for repo in [
             "https://github.com/org/repo",
             "git://host/repo",
             "ssh://git@host/repo",
             "git@github.com:org/repo.git",
         ] {
-            let err = cache.get(repo).err().unwrap();
+            let err = cache.entry(repo).err().unwrap();
             assert!(err.contains("not supported"), "repo: {repo}, got: {err}");
         }
     }

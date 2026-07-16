@@ -148,14 +148,17 @@ clone costs the same.
 
 On unix, the bare `trouve-search` MCP entry is a thin proxy: the first
 session starts a detached daemon (`trouve-search daemon`) on a unix socket
-under the cache folder, and every session forwards its JSON-RPC lines to
-it. The daemon idles out after 15 minutes with no sessions; a proxy that
+under the cache folder, and every session with the same configuration
+(binary version, content types, and embedding model) forwards its JSON-RPC
+lines to it; a session with a different configuration gets its own daemon.
+The daemon idles out after 15 minutes with no sessions; a proxy that
 cannot reach it (or loses it mid-session) falls back to serving in-process.
 Upstream runs one full server per session (see ADR 0007).
 
 **Why:** each server holds up to 10 full in-memory indexes plus the
 embedding model; across many concurrent agent sessions that multiplies RAM
-for identical state. One daemon bounds it at a single instance.
+for identical state. One daemon per matching configuration bounds it at a
+single instance.
 
 ## What did *not* change
 

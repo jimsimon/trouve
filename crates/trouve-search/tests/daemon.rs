@@ -150,6 +150,118 @@ fn concurrent_sessions_share_one_daemon() {
     b.close();
 }
 
+/// Spawn a foreground `trouve-search daemon` and wait for its socket.
+fn spawn_daemon(cache: &str, model: &str) -> Child {
+    let child = Command::new(env!("CARGO_BIN_EXE_trouve-search"))
+        .arg("daemon")
+        .env("TROUVE_CACHE_LOCATION", cache)
+        .env("TROUVE_MODEL_NAME", model)
+        .env("TROUVE_DAEMON_IDLE_SECONDS", "30")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn trouve-search daemon");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while socket_count(cache) == 0 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "daemon never bound its socket"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    child
+}
+
+#[test]
+fn proxy_reconnects_after_daemon_death() {
+    let model = test_env();
+    let cache = format!("/tmp/trouve-daemon-reconnect-{}", std::process::id());
+    std::fs::create_dir_all(&cache).unwrap();
+    let repo = sample_repo();
+
+    // The session connects to a daemon we control.
+    let mut daemon = spawn_daemon(&cache, model);
+    let mut session = McpSession::spawn(&cache, model, true);
+    initialize(&mut session);
+    let response = search(&mut session, 2, repo.path(), "authenticate");
+    assert_eq!(response["result"]["isError"], false, "got {response}");
+
+    // Kill the daemon out from under the session. The next request hits
+    // the dead connection; the proxy must respawn a daemon, reconnect,
+    // and replay the line transparently.
+    daemon.kill().unwrap();
+    daemon.wait().unwrap();
+    let response = search(&mut session, 3, repo.path(), "database connection");
+    assert_eq!(response["result"]["isError"], false, "got {response}");
+    let text = response["result"]["content"][0]["text"].as_str().unwrap();
+    assert!(text.contains("db.py"), "got {text}");
+    assert_eq!(socket_count(&cache), 1, "respawned daemon should be bound");
+    session.close();
+}
+
+#[test]
+fn proxy_falls_back_in_process_when_daemon_dies_unrestartably() {
+    let model = test_env();
+    let cache = format!("/tmp/trouve-daemon-fallback-{}", std::process::id());
+    std::fs::create_dir_all(&cache).unwrap();
+    let repo = sample_repo();
+
+    let mut daemon = spawn_daemon(&cache, model);
+    let mut session = McpSession::spawn(&cache, model, true);
+    initialize(&mut session);
+    let response = search(&mut session, 2, repo.path(), "authenticate");
+    assert_eq!(response["result"]["isError"], false, "got {response}");
+
+    // Kill the daemon and make respawning impossible: a regular file where
+    // the daemon directory belongs fails the successor's create_dir_all.
+    daemon.kill().unwrap();
+    daemon.wait().unwrap();
+    let daemon_dir = PathBuf::from(&cache).join("daemon");
+    std::fs::remove_dir_all(&daemon_dir).unwrap();
+    std::fs::write(&daemon_dir, b"not a directory").unwrap();
+
+    // The reconnect attempt times out (~10s), then the session finishes
+    // in-process rather than going dark.
+    let response = search(&mut session, 3, repo.path(), "database connection");
+    assert_eq!(response["result"]["isError"], false, "got {response}");
+    let text = response["result"]["content"][0]["text"].as_str().unwrap();
+    assert!(text.contains("db.py"), "got {text}");
+    session.close();
+    std::fs::remove_file(&daemon_dir).unwrap();
+}
+
+#[test]
+fn proxy_serves_in_process_when_the_socket_path_cannot_exist() {
+    let model = test_env();
+    // sockaddr_un caps socket paths (104 bytes on macOS, 108 on Linux); a
+    // cache location deeper than that can never host a daemon socket. The
+    // proxy must detect this immediately and serve in-process, not spawn
+    // doomed daemons and wait on them.
+    let cache = format!(
+        "/tmp/trouve-daemon-longpath-{}-{}",
+        std::process::id(),
+        "x".repeat(110)
+    );
+    std::fs::create_dir_all(&cache).unwrap();
+    let repo = sample_repo();
+
+    let start = std::time::Instant::now();
+    let mut session = McpSession::spawn(&cache, model, true);
+    initialize(&mut session);
+    let response = search(&mut session, 2, repo.path(), "authenticate");
+    assert_eq!(response["result"]["isError"], false, "got {response}");
+    let text = response["result"]["content"][0]["text"].as_str().unwrap();
+    assert!(text.contains("auth.py"), "got {text}");
+    // Well under the 10s spawn wait: the fallback was immediate.
+    assert!(
+        start.elapsed() < std::time::Duration::from_secs(8),
+        "fallback should not wait for a daemon that can never bind"
+    );
+    assert_eq!(socket_count(&cache), 0);
+    session.close();
+}
+
 #[test]
 fn daemon_disabled_serves_in_process() {
     let model = test_env();

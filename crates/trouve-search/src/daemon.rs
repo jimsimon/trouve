@@ -59,8 +59,8 @@ mod unix {
     use std::os::unix::net::{UnixListener, UnixStream};
     use std::path::{Path, PathBuf};
     use std::process::ExitCode;
+    use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::sync::{Arc, Mutex};
     use std::time::{Duration, Instant};
 
     use serde_json::Value;
@@ -128,8 +128,13 @@ mod unix {
             return ExitCode::FAILURE;
         }
         // Owner-only: the socket accepts tool calls from anyone who can
-        // connect, same trust boundary as the cache files next to it.
-        let _ = fs::set_permissions(dir, fs::Permissions::from_mode(0o700));
+        // connect, same trust boundary as the cache files next to it. This
+        // is the actual isolation mechanism, so refusing to run beats
+        // silently serving from a world-traversable directory.
+        if let Err(e) = fs::set_permissions(dir, fs::Permissions::from_mode(0o700)) {
+            eprintln!("cannot restrict permissions on {}: {e}", dir.display());
+            return ExitCode::FAILURE;
+        }
 
         let lock_path = sock.with_extension("lock");
         let Ok(lock) = fs::File::create(&lock_path) else {
@@ -150,10 +155,14 @@ mod unix {
                 return ExitCode::FAILURE;
             }
         };
-        // Non-blocking accept so the loop can notice idleness.
-        let _ = listener.set_nonblocking(true);
+        // Non-blocking accept so the loop can notice idleness. A blocking
+        // listener would hang in accept() forever and never idle out.
+        if let Err(e) = listener.set_nonblocking(true) {
+            eprintln!("cannot configure {} as non-blocking: {e}", sock.display());
+            return ExitCode::FAILURE;
+        }
 
-        let cache = Arc::new(Mutex::new(IndexCache::new(content.to_vec())));
+        let cache = Arc::new(IndexCache::new(content.to_vec()));
         let active = Arc::new(AtomicUsize::new(0));
         let idle = idle_timeout();
         let mut last_activity = Instant::now();
@@ -162,8 +171,14 @@ mod unix {
                 Ok((stream, _)) => {
                     last_activity = Instant::now();
                     // Some platforms make accepted sockets inherit the
-                    // listener's non-blocking flag.
-                    let _ = stream.set_nonblocking(false);
+                    // listener's non-blocking flag; serve_lines would then
+                    // misread WouldBlock as a closed stream. Drop the
+                    // connection rather than serve it wrongly configured —
+                    // the proxy falls back to serving in-process.
+                    if let Err(e) = stream.set_nonblocking(false) {
+                        eprintln!("cannot configure accepted daemon connection: {e}");
+                        continue;
+                    }
                     active.fetch_add(1, Ordering::SeqCst);
                     let cache = Arc::clone(&cache);
                     let active = Arc::clone(&active);
@@ -336,11 +351,11 @@ mod unix {
         let sock = socket_path(content);
         enum Backend {
             Daemon(DaemonConn),
-            Local(Mutex<IndexCache>),
+            Local(IndexCache),
         }
         let mut backend = match connect_or_spawn(&sock, content) {
             Some(conn) => Backend::Daemon(conn),
-            None => Backend::Local(Mutex::new(IndexCache::new(content.to_vec()))),
+            None => Backend::Local(IndexCache::new(content.to_vec())),
         };
 
         let stdin = std::io::stdin();
@@ -370,7 +385,7 @@ mod unix {
                     Err(_) => {
                         // Daemon gone and not restartable: finish the
                         // session in-process rather than going dark.
-                        backend = Backend::Local(Mutex::new(IndexCache::new(content.to_vec())));
+                        backend = Backend::Local(IndexCache::new(content.to_vec()));
                     }
                 }
             }

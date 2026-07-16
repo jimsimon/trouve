@@ -78,10 +78,13 @@ trouve-search                           # run as an MCP stdio server
 The bare MCP entry shares one daemon across sessions on unix: the first
 session starts a detached `trouve-search daemon` and every session proxies
 to it over a unix socket, so concurrent agent sessions share a single
-embedding model and index cache instead of each holding their own. The
-daemon exits on its own after 15 idle minutes (`TROUVE_DAEMON_IDLE_SECONDS`
-overrides; `0` disables). Set `TROUVE_DAEMON=0` to serve each session
-in-process instead (always the case on Windows).
+embedding model and index cache instead of each holding their own. Sharing
+is per matching configuration — sessions with the same binary version,
+`--content` types, and embedding model share one daemon; a session with a
+different configuration gets its own. The daemon exits on its own after 15
+idle minutes (`TROUVE_DAEMON_IDLE_SECONDS` overrides; `0` disables). Set
+`TROUVE_DAEMON=0` to serve each session in-process instead (always the
+case on Windows).
 
 `--content` selects what to index: `code` (default), `docs`, `config`, or
 `all`.
@@ -97,8 +100,8 @@ step-by-step instructions for every route and agent.
 | --- | --- | --- | --- | --- | --- |
 | Agents | OpenCode, Kilo Code | Claude Code, Codex | OpenCode | any MCP-capable agent (Cursor, Gemini, Copilot, VS Code, Windsurf, Zed, …) | anything with a shell |
 | Tool surface | native `trouve_search` / `trouve_find_related` | MCP (`mcp__trouve-search__*`) | native `trouve_search` / `trouve_find_related` | MCP (`mcp__trouve-search__*`) | `trouve-search` CLI via bash |
-| trouve process | shared daemon (one for all sessions) | shared daemon (one for all sessions) | one process per call | shared daemon (one for all sessions) | one process per call |
-| In-session index cache | yes, shared across sessions | yes, shared across sessions | disk store only | yes, shared across sessions | disk store only |
+| trouve process | shared daemon (one per matching configuration) | shared daemon (one per matching configuration) | one process per call | shared daemon (one per matching configuration) | one process per call |
+| In-session index cache | yes, shared across matching sessions | yes, shared across matching sessions | disk store only | yes, shared across matching sessions | disk store only |
 | Index warmed at session start | yes, + re-warm on idle turns | Claude: yes (hook) · Codex: no | no | no | no |
 | Bundled guidance | rich tool descriptions | workflow skill (+ sub-agent on Claude) | rich tool descriptions | tool descriptions | sub-agent docs |
 | Setup | one `plugin` entry in your config | managed by the plugin marketplace | copy one file | one config entry | nothing |
@@ -113,7 +116,8 @@ How to choose:
   lockstep with the crate, install/uninstall as one unit, and are the only
   routes with session-start index warming. For OpenCode and Kilo Code the
   plugin also avoids MCP entirely: tools are native, and the shared daemon
-  keeps indexes cached across calls and sessions.
+  keeps indexes cached across calls and across sessions with the same
+  configuration.
 - **For OpenCode without npm, use the native tool file**: copy
   [`src/agents/opencode-tool.ts`](src/agents/opencode-tool.ts) to
   `~/.config/opencode/tools/trouve.ts`. It exposes `trouve_search` /

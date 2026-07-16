@@ -32,9 +32,11 @@ domain socket under the trouve cache folder; all sessions forward to it.
 
 ## Consequences
 
-- Memory across N sessions is bounded by one daemon instead of N servers.
-  Cold builds serialize across sessions on the shared cache mutex (same
-  policy as the harness's in-process shared cache).
+- Memory across N sessions with a matching configuration is bounded by one
+  daemon instead of N servers; sessions whose binary version, content
+  types, or model differ get separate daemons. The cache locks per repo:
+  cold builds of the same repo serialize across sessions, while sessions
+  querying different repos proceed concurrently.
 - Every stdio entry route — MCP configs, the OpenCode/Kilo plugin's
   persistent child — gains sharing without configuration changes.
 - The daemon trusts any process that can connect; the socket directory is
