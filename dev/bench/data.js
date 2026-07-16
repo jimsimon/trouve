@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1784237453168,
+  "lastUpdate": 1784237581851,
   "repoUrl": "https://github.com/jimsimon/trouve",
   "entries": {
     "e2e-benchmarks": [
@@ -2641,6 +2641,54 @@ window.BENCHMARK_DATA = {
             "name": "dense_query_20k_rows",
             "value": 1342374.7621527778,
             "range": "± 7456",
+            "unit": "ns"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "jim.j.simon@gmail.com",
+            "name": "Jim Simon",
+            "username": "jimsimon"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "8044d09df6862b62dcd83e84b6932e3c64f87292",
+          "message": "Read Cursor subscription usage from the dashboard RPC via the CLI's login (#48)\n\n* Read Cursor subscription usage from the dashboard RPC via the CLI's login\n\nThe Cursor CLI has no usage surface (no subcommand, no ACP method), but\nthe token it stores in auth.json is accepted by the dashboard's\nConnect-RPC endpoint — verified against a real logged-in Ultra account:\naiserver.v1.DashboardService/GetCurrentPeriodUsage returns per-bucket\nincluded-usage percentages (total / API models / Auto), the on-demand\nspend limit in cents, and the billing cycle bounds; GetPlanInfo carries\nthe plan name.\n\nCursorBackend::subscription_health reads the CLI's auth.json (mirroring\nthe CLI's own per-platform path resolution; the token is never\nrefreshed by us — same policy as the direct-Codex provider) and makes\nthe two unary Connect-JSON calls. Windows map to the meters the\nsettings screen already renders (four fit the cap added for Claude):\nincluded total/API/Auto percent plus on-demand spend, all resetting at\nthe billing cycle end (int64 millis-as-string handled). The on-demand\ndollars ride in the credits line. API-key providers (cursor-api) are\nusage-billed with no allowance, so they report 'unsupported' with an\nexplanation instead of querying the dashboard.\n\nLike codex-api, this endpoint is tolerated rather than contracted; the\nsettings-screen description now says Cursor's read is undocumented and\nmay break. The engine's per-vendor fallback note is gone since all\nthree shipped backends now answer for themselves.\n\nTested with unit tests over the real payload shapes, an adapter e2e\ntest against a local HTTP stub asserting both RPC paths and the Bearer\ntoken from auth.json, and an api-key test for the unsupported path.\n\nCo-authored-by: Jim Simon <jimsimon@users.noreply.github.com>\n\n* Address review feedback on the dashboard usage query\n\n- Cap the whole usage lookup at USAGE_TIMEOUT: the reqwest client\n  timeout is per request, so the optional GetPlanInfo call now gets\n  only the time GetCurrentPeriodUsage left over, degrading to no plan\n  name when the budget is spent instead of stretching to ~2x.\n- Test stub records the request before writing the response, so the\n  client can no longer finish and assert before the recording lands.\n\nCo-authored-by: Jim Simon <jimsimon@users.noreply.github.com>\n\n---------\n\nCo-authored-by: Cursor Agent <cursoragent@cursor.com>\nCo-authored-by: Jim Simon <jimsimon@users.noreply.github.com>",
+          "timestamp": "2026-07-16T17:29:03-04:00",
+          "tree_id": "c4737d027df30ad3fc25666b06693b6ab923eb3a",
+          "url": "https://github.com/jimsimon/trouve/commit/8044d09df6862b62dcd83e84b6932e3c64f87292"
+        },
+        "date": 1784237580897,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "bm25_build_5k_docs",
+            "value": 4905535,
+            "range": "± 9296",
+            "unit": "ns"
+          },
+          {
+            "name": "bm25_query_5k_docs",
+            "value": 36915.74973945807,
+            "range": "± 11",
+            "unit": "ns"
+          },
+          {
+            "name": "chunk_python_200_functions",
+            "value": 3031010.117647059,
+            "range": "± 1874",
+            "unit": "ns"
+          },
+          {
+            "name": "dense_query_20k_rows",
+            "value": 1344240.5948616602,
+            "range": "± 17873",
             "unit": "ns"
           }
         ]
