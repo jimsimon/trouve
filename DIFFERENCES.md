@@ -144,6 +144,22 @@ freshness, eviction, concurrent access — is out of scope for a search tool.
 Clone the repository yourself and pass the local path; indexing a local
 clone costs the same.
 
+### 11. Shared MCP daemon across sessions
+
+On unix, the bare `trouve-search` MCP entry is a thin proxy: the first
+session starts a detached daemon (`trouve-search daemon`) on a unix socket
+under the cache folder, and every session with the same configuration
+(binary version, content types, and embedding model) forwards its JSON-RPC
+lines to it; a session with a different configuration gets its own daemon.
+The daemon idles out after 15 minutes with no sessions; a proxy that
+cannot reach it (or loses it mid-session) falls back to serving in-process.
+Upstream runs one full server per session (see ADR 0007).
+
+**Why:** each server holds up to 10 full in-memory indexes plus the
+embedding model; across many concurrent agent sessions that multiplies RAM
+for identical state. One daemon per matching configuration bounds it at a
+single instance.
+
 ## What did *not* change
 
 - The embedding model (`potion-code-16M`) and its semantics.

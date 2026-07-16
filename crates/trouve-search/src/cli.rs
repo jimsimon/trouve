@@ -106,6 +106,14 @@ enum CliCommand {
     },
     /// Show token savings and usage stats.
     Savings,
+    /// Run the shared MCP daemon in the foreground (unix only). The bare
+    /// `trouve-search` MCP entry starts one automatically and proxies to it,
+    /// so concurrent agent sessions share a single index cache; run this
+    /// yourself only for supervised setups (e.g. a systemd user unit).
+    Daemon {
+        #[command(flatten)]
+        content: ContentArgs,
+    },
     /// Show index stats for a path (files, chunks, cache hit rate).
     Stats {
         /// Local path (default: current directory).
@@ -259,7 +267,8 @@ fn run_stats(path: &str, content: &[ContentType]) -> ExitCode {
 pub fn main() -> ExitCode {
     let cli = Cli::parse();
     match cli.command {
-        None => crate::mcp::serve(&cli.content.resolve()),
+        None => crate::daemon::serve_default(&cli.content.resolve()),
+        Some(CliCommand::Daemon { content }) => crate::daemon::run_daemon(&content.resolve()),
         Some(CliCommand::Search {
             query,
             path,
