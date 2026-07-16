@@ -1839,6 +1839,17 @@ export component SettingsScreen inherits Rectangle {
                                 wrap: word-wrap;
                             }
 
+                            // Sign-in progress ("opening browser — enter code
+                            // XXXX-XXXX at …") lands in settings-status; this
+                            // section must render it or the device code the
+                            // OAuth flow asks for is never shown.
+                            if root.settings-status != "": Text {
+                                text: root.settings-status;
+                                color: Theme.c.accent-tint;
+                                font-size: Theme.fs(12px);
+                                wrap: word-wrap;
+                            }
+
                             // One card per GitHub host: github.com first,
                             // then the configured enterprise instances.
                             for gh in root.github-hosts: Rectangle {
