@@ -7,6 +7,7 @@
 
 pub mod automations;
 pub mod config;
+pub mod connectivity;
 pub mod context;
 pub mod engine;
 pub mod git;

@@ -29,7 +29,10 @@ async fn main() -> anyhow::Result<()> {
             // This engine loaded the real config file, so provider changes
             // write back to it.
             .with_config_file(Some(trouve_core::config::config_path()))
-            .with_index_hooks(),
+            .with_index_hooks()
+            // Real internet probing only in the standalone binary; embedded
+            // and test engines stay always-online (offline-safe tests).
+            .with_connectivity_probe(trouve_core::connectivity::system_probe()),
     );
     trouve_server::serve(engine, addr, security).await
 }

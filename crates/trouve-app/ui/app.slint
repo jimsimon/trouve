@@ -17,6 +17,7 @@ import {
     SubscriptionItem, ModeItem, LocalModelItem, LocalSearchItem, GithubHostItem
 } from "settings-window.slint";
 import { AutomationsScreen, AutomationItem, AutomationTemplateItem } from "automations-screen.slint";
+import { ConnectivityBanner } from "connectivity-banner.slint";
 import { ScrollKeys } from "scroll-keys.slint";
 import { Theme, ThemePalette } from "theme.slint";
 import { Palette } from "std-widgets.slint";
@@ -181,6 +182,14 @@ component DropUpPicker inherits Rectangle {
     background: Theme.c.control-bg;
     border-radius: 6px;
 
+    // An already-open popup must not keep taking clicks after the picker
+    // is disabled (e.g. the connection drops mid-interaction).
+    changed enabled => {
+        if (!root.enabled) {
+            popup.close();
+        }
+    }
+
     popup := PopupWindow {
         x: 0;
         y: -min(root.options.length, 10) * Theme.fs(28px) - 8px;
@@ -197,6 +206,7 @@ component DropUpPicker inherits Rectangle {
                     height: Theme.fs(28px);
                     background: idx == root.current-index ? Theme.c.accent-bg : transparent;
                     TouchArea {
+                        enabled: root.enabled;
                         clicked => {
                             root.current-index = idx;
                             root.changed(idx);
@@ -264,6 +274,14 @@ component SearchPicker inherits Rectangle {
     background: Theme.c.control-bg;
     border-radius: 6px;
 
+    // An already-open popup must not keep taking clicks or Enter after
+    // the picker is disabled (e.g. the connection drops mid-interaction).
+    changed enabled => {
+        if (!root.enabled) {
+            popup.close();
+        }
+    }
+
     popup := PopupWindow {
         close-policy: close-on-click-outside;
         x: 0;
@@ -284,11 +302,12 @@ component SearchPicker inherits Rectangle {
                     font-size: Theme.fs(12px);
                     placeholder-text: "Search models…";
                     text <=> root.query;
+                    enabled: root.enabled;
                     init => { self.focus(); }
                     edited => { root.filter-edited(self.text); }
                     // Enter picks the top match.
                     accepted => {
-                        if (root.matches.length > 0) {
+                        if (root.enabled && root.matches.length > 0) {
                             root.current-index = root.matches[0];
                             root.changed(root.matches[0]);
                             popup.close();
@@ -311,6 +330,7 @@ component SearchPicker inherits Rectangle {
                         background: oi == root.current-index ? Theme.c.accent-bg
                             : opt-ta.has-hover ? Theme.c.hover-bg : transparent;
                         opt-ta := TouchArea {
+                            enabled: root.enabled;
                             clicked => {
                                 root.current-index = oi;
                                 root.changed(oi);
@@ -814,6 +834,12 @@ component NewChatForm inherits VerticalLayout {
     in property <[int]> model-matches;
     in-out property <int> model-index;
     in property <string> error-text;
+    // Offline/disconnected with nothing usable: every input is disabled
+    // and the banner explains why (see AppWindow.connectivity-*).
+    in property <bool> blocked;
+    in property <bool> blocked-severe;
+    in property <string> offline-warning;
+    in property <string> online-notice;
     callback start(int, int, int, int, string);
     callback cancel();
     callback workspace-changed(int);
@@ -839,12 +865,19 @@ component NewChatForm inherits VerticalLayout {
         wrap: word-wrap;
     }
 
+    if root.offline-warning != "" || root.online-notice != "": ConnectivityBanner {
+        warning: root.offline-warning;
+        notice: root.online-notice;
+        severe: root.blocked-severe;
+    }
+
     if root.session-form: VerticalLayout {
         spacing: 6px;
         Text { text: "Workspace"; color: Theme.c.text-mid; font-size: Theme.fs(12px); font-weight: 700; }
         ComboBox {
             model: root.workspaces;
             current-index <=> root.workspace-index;
+            enabled: !root.blocked;
             selected => { root.workspace-changed(self.current-index); }
         }
         HorizontalLayout {
@@ -852,10 +885,11 @@ component NewChatForm inherits VerticalLayout {
             ws-path := LineEdit {
                 horizontal-stretch: 1;
                 placeholder-text: "…or register a git repo by absolute path";
+                enabled: !root.blocked;
             }
             Button {
                 text: "Add";
-                enabled: ws-path.text != "";
+                enabled: ws-path.text != "" && !root.blocked;
                 clicked => {
                     root.register-workspace(ws-path.text);
                     ws-path.text = "";
@@ -870,6 +904,7 @@ component NewChatForm inherits VerticalLayout {
         ComboBox {
             model: root.branches;
             current-index <=> root.branch-index;
+            enabled: !root.blocked;
         }
     }
 
@@ -882,6 +917,7 @@ component NewChatForm inherits VerticalLayout {
             ComboBox {
                 model: root.modes;
                 current-index <=> root.mode-index;
+                enabled: !root.blocked;
                 selected => {
                     if (root.mode-index >= 0
                         && root.mode-index < root.mode-model-indices.length
@@ -900,6 +936,7 @@ component NewChatForm inherits VerticalLayout {
                 options: root.models;
                 matches: root.model-matches;
                 current-index <=> root.model-index;
+                enabled: !root.blocked;
                 placeholder: "model";
                 filter-edited(q) => { root.model-filter(q); }
             }
@@ -910,9 +947,14 @@ component NewChatForm inherits VerticalLayout {
         spacing: 6px;
         Text { text: "First message"; color: Theme.c.text-mid; font-size: Theme.fs(12px); font-weight: 700; }
         prompt-edit := PromptBox {
-            placeholder: "What should the agent do?  (Shift+Enter for a new line)";
+            placeholder: root.blocked && root.blocked-severe
+                ? "Server unavailable — prompts are disabled"
+                : root.blocked
+                ? "Offline — prompts are disabled"
+                : "What should the agent do?  (Shift+Enter for a new line)";
+            enabled: !root.blocked;
             submitted(text) => {
-                if (!root.session-form || root.workspace-index >= 0) {
+                if (!root.blocked && (!root.session-form || root.workspace-index >= 0)) {
                     root.start(root.workspace-index, root.branch-index,
                         root.mode-index, root.model-index, text);
                     self.text = "";
@@ -926,7 +968,7 @@ component NewChatForm inherits VerticalLayout {
         Button {
             text: root.session-form ? "Start session" : "Start thread";
             primary: true;
-            enabled: prompt-edit.text != ""
+            enabled: prompt-edit.text != "" && !root.blocked
                 && (!root.session-form || root.workspace-index >= 0);
             clicked => {
                 root.start(root.workspace-index, root.branch-index,
@@ -1317,8 +1359,29 @@ export component AppWindow inherits Window {
         root.queue-drag-from = -1;
         root.queue-drag-dy = 0px;
     }
+    // Connectivity loss mid-drag or mid-edit: the controls disable, so a
+    // stuck drag or an orphaned editor must be dropped too.
+    changed connectivity-blocked => {
+        if (root.connectivity-blocked) {
+            root.queue-editing = -1;
+            root.queue-drag-from = -1;
+            root.queue-drag-dy = 0px;
+        }
+    }
 
     in-out property <string> error-text: "";
+
+    // Server connectivity. While `connectivity-text` is set a banner shows
+    // on the composer, the new-chat form, and the automations screen;
+    // `connectivity-blocked` additionally disables all prompt entry (server
+    // unreachable, or offline with no local models to fall back on).
+    // `connectivity-severe` renders it red: the connection to the server
+    // itself is gone, not just the server's internet. The notice is the
+    // transient recovery confirmation, cleared by the controller.
+    in property <bool> connectivity-blocked: false;
+    in property <bool> connectivity-severe: false;
+    in property <string> connectivity-text: "";
+    in property <string> connectivity-notice: "";
 
     in property <[string]> modes;
     // Aligned with modes: each mode's default model as an index into
@@ -1935,6 +1998,10 @@ export component AppWindow inherits Window {
                     models: root.models;
                     model-matches: root.model-filter-matches;
                     model-index <=> root.nc-model-index;
+                    blocked: root.connectivity-blocked;
+                    blocked-severe: root.connectivity-severe;
+                    offline-warning: root.connectivity-text;
+                    online-notice: root.connectivity-notice;
                     start(ws, br, mode, model, prompt) => {
                         root.start-new-chat(ws, br, mode, model, prompt);
                     }
@@ -2830,6 +2897,13 @@ export component AppWindow inherits Window {
                     spacing: 6px;
                     vertical-stretch: 0;
 
+                    // Connectivity warning / recovery notice for the composer.
+                    if root.connectivity-text != "" || root.connectivity-notice != "": ConnectivityBanner {
+                        warning: root.connectivity-text;
+                        notice: root.connectivity-notice;
+                        severe: root.connectivity-severe;
+                    }
+
                     // Queued prompts: waiting their turn behind the running
                     // one. Edit in place, reorder with the arrows, delete,
                     // or — when the thread is idle — kick the queue off.
@@ -2853,7 +2927,7 @@ export component AppWindow inherits Window {
                                     vertical-alignment: center;
                                     horizontal-stretch: 1;
                                 }
-                                if root.queue-idle: PillButton {
+                                if root.queue-idle && !root.connectivity-blocked: PillButton {
                                     label: "Send now";
                                     primary: true;
                                     clicked => { root.queue-send-now(); }
@@ -2878,8 +2952,11 @@ export component AppWindow inherits Window {
                                     Rectangle {
                                         width: Theme.fs(14px);
                                         qdrag-ta := TouchArea {
-                                            mouse-cursor: root.queue-drag-from == qi
-                                                ? MouseCursor.grabbing : MouseCursor.grab;
+                                            enabled: !root.connectivity-blocked;
+                                            mouse-cursor: !root.connectivity-blocked
+                                                ? (root.queue-drag-from == qi
+                                                    ? MouseCursor.grabbing : MouseCursor.grab)
+                                                : MouseCursor.default;
                                             moved => {
                                                 root.queue-editing = -1;
                                                 root.queue-drag-from = qi;
@@ -2933,18 +3010,20 @@ export component AppWindow inherits Window {
                                     IconButton {
                                         icon: "↑";
                                         tip: "Run earlier";
-                                        enabled: qi > 0;
+                                        enabled: qi > 0 && !root.connectivity-blocked;
                                         clicked => { root.queue-moved(qi, -1); }
                                     }
                                     IconButton {
                                         icon: "↓";
                                         tip: "Run later";
-                                        enabled: qi < root.queue-prompts.length - 1;
+                                        enabled: qi < root.queue-prompts.length - 1
+                                            && !root.connectivity-blocked;
                                         clicked => { root.queue-moved(qi, 1); }
                                     }
                                     IconButton {
                                         icon: "✎";
                                         tip: "Edit";
+                                        enabled: !root.connectivity-blocked;
                                         clicked => {
                                             root.queue-editing =
                                                 root.queue-editing == qi ? -1 : qi;
@@ -2953,6 +3032,7 @@ export component AppWindow inherits Window {
                                     IconButton {
                                         icon: "✕";
                                         tip: "Remove from queue";
+                                        enabled: !root.connectivity-blocked;
                                         clicked => { root.queue-deleted(qi); }
                                     }
                                     }
@@ -2975,6 +3055,7 @@ export component AppWindow inherits Window {
                                         PillButton {
                                             label: "Save";
                                             primary: true;
+                                            enabled: !root.connectivity-blocked;
                                             clicked => {
                                                 root.queue-edited(qi, qedit.text);
                                                 root.queue-editing = -1;
@@ -3126,10 +3207,14 @@ export component AppWindow inherits Window {
 
                     composer := PromptBox {
                         text <=> root.composer-draft;
-                        placeholder: root.composer-enabled
-                            ? "Message the agent…  (Shift+Enter for a new line)"
-                            : "Select or create a thread first";
-                        enabled: root.composer-enabled;
+                        placeholder: !root.composer-enabled
+                            ? "Select or create a thread first"
+                            : root.connectivity-blocked && root.connectivity-severe
+                            ? "Server unavailable — prompts are disabled"
+                            : root.connectivity-blocked
+                            ? "Offline — prompts are disabled"
+                            : "Message the agent…  (Shift+Enter for a new line)";
+                        enabled: root.composer-enabled && !root.connectivity-blocked;
                         completion-active: root.slash-active && !root.slash-suppressed;
                         completion-text: root.slash-completion;
                         completion-dismissed => { root.slash-suppressed = true; }
@@ -3166,7 +3251,7 @@ export component AppWindow inherits Window {
                             width: 130px;
                             options: root.modes;
                             current-index <=> root.mode-index;
-                            enabled: root.composer-enabled;
+                            enabled: root.composer-enabled && !root.connectivity-blocked;
                             placeholder: "mode";
                             changed(i) => { root.composer-mode-changed(i); }
                         }
@@ -3179,7 +3264,7 @@ export component AppWindow inherits Window {
                             options: root.models;
                             matches: root.model-filter-matches;
                             current-index <=> root.model-index;
-                            enabled: root.composer-enabled;
+                            enabled: root.composer-enabled && !root.connectivity-blocked;
                             placeholder: "model";
                             changed(i) => { root.composer-model-changed(i); }
                             filter-edited(q) => { root.model-filter-changed(q); }
@@ -3192,7 +3277,7 @@ export component AppWindow inherits Window {
                             width: 110px;
                             options: root.thinking-options;
                             current-index <=> root.thinking-index;
-                            enabled: root.composer-enabled;
+                            enabled: root.composer-enabled && !root.connectivity-blocked;
                             placeholder: "thinking";
                             changed(i) => { root.composer-thinking-changed(i); }
                         }
@@ -3204,7 +3289,7 @@ export component AppWindow inherits Window {
                             width: 90px;
                             options: root.context-options;
                             current-index <=> root.context-index;
-                            enabled: root.composer-enabled;
+                            enabled: root.composer-enabled && !root.connectivity-blocked;
                             placeholder: "context";
                             changed(i) => { root.composer-context-changed(i); }
                         }
@@ -3220,7 +3305,7 @@ export component AppWindow inherits Window {
                             border-width: 1px;
                             border-color: root.fast-checked ? Theme.c.primary-border : Theme.c.border;
                             TouchArea {
-                                enabled: root.composer-enabled;
+                                enabled: root.composer-enabled && !root.connectivity-blocked;
                                 clicked => {
                                     root.fast-checked = !root.fast-checked;
                                     root.composer-fast-toggled(root.fast-checked);
@@ -3245,7 +3330,7 @@ export component AppWindow inherits Window {
                             icon-size: Theme.fs(14px);
                             width: Theme.fs(30px);
                             height: Theme.fs(30px);
-                            enabled: root.composer-enabled;
+                            enabled: root.composer-enabled && !root.connectivity-blocked;
                             clicked => { root.attach-file(); }
                         }
                     }
@@ -3255,7 +3340,7 @@ export component AppWindow inherits Window {
                         Button {
                             text: "Send";
                             primary: true;
-                            enabled: root.composer-enabled
+                            enabled: root.composer-enabled && !root.connectivity-blocked
                                 && (composer.text != "" || root.composer-attachments.length > 0);
                             clicked => {
                                 root.send-message(composer.text);
@@ -3333,6 +3418,10 @@ export component AppWindow inherits Window {
                 model-matches: root.model-filter-matches;
                 model-index <=> root.nc-model-index;
                 error-text: root.error-text;
+                blocked: root.connectivity-blocked;
+                blocked-severe: root.connectivity-severe;
+                offline-warning: root.connectivity-text;
+                online-notice: root.connectivity-notice;
                 start(ws, br, mode, model, prompt) => {
                     root.start-new-chat(ws, br, mode, model, prompt);
                 }
@@ -4005,6 +4094,10 @@ export component AppWindow inherits Window {
         status: root.automations-status;
         workspace-names: root.automation-workspace-names;
         workspace-ids: root.automation-workspace-ids;
+        blocked: root.connectivity-blocked;
+        blocked-severe: root.connectivity-severe;
+        offline-warning: root.connectivity-text;
+        online-notice: root.connectivity-notice;
         form-open <=> root.automations-screen-form-open;
         close => { root.close-automations(); }
         refresh => { root.automations-refresh(); }

@@ -3465,3 +3465,124 @@ async fn secured_router_enforces_token_and_loopback_host() {
         .unwrap();
     assert_eq!(resp.status(), reqwest::StatusCode::OK);
 }
+
+// --- connectivity -------------------------------------------------------------
+
+/// A provider that only exists to publish a one-model catalog.
+struct StaticModelProvider {
+    id: &'static str,
+}
+
+#[async_trait::async_trait]
+impl Provider for StaticModelProvider {
+    fn id(&self) -> &str {
+        self.id
+    }
+
+    fn models(&self) -> Vec<trouve_protocol::ModelInfo> {
+        vec![trouve_protocol::ModelInfo {
+            id: format!("{}/m", self.id),
+            display_name: self.id.into(),
+            context_window: 100_000,
+            supports_tools: true,
+            input_price_per_mtok: None,
+            output_price_per_mtok: None,
+            options_schema: serde_json::json!({"type": "object", "properties": {}}),
+        }]
+    }
+
+    async fn stream_chat(
+        &self,
+        _model: &str,
+        _messages: &[Message],
+        _tools: &[ToolSpec],
+        _options: &serde_json::Map<String, serde_json::Value>,
+    ) -> Result<EventStream, ProviderError> {
+        Err(ProviderError::Request("catalog-only provider".into()))
+    }
+}
+
+/// Offline behavior: `/v1/info` reports the state, `/v1/models` keeps only
+/// models that run without internet (the local provider) — remote providers
+/// and vendor backends disappear instead of degrading to fallback catalogs —
+/// and each transition lands exactly once in the server-scope event log.
+#[tokio::test]
+async fn offline_filters_models_and_reports_connectivity() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Store::open(&tmp.path().join("db/trouve.db")).unwrap();
+    let engine = Arc::new(
+        Engine::new(store, tmp.path().join("data"), &Config::default())
+            .with_config_dir(None)
+            // Stands in for the built-in local provider (same "local" id).
+            .with_provider("local", Arc::new(StaticModelProvider { id: "local" }))
+            .with_provider("remote", Arc::new(StaticModelProvider { id: "remote" }))
+            .with_backend("agent-a", Arc::new(HandoffBackend::new("agent-a"))),
+    );
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let router = trouve_server::build_router(engine.clone());
+    tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+    let base = format!("http://{addr}/v1");
+    let client = reqwest::Client::new();
+
+    let model_ids = || {
+        let client = client.clone();
+        let url = format!("{base}/models");
+        async move {
+            let models: Vec<serde_json::Value> =
+                client.get(url).send().await.unwrap().json().await.unwrap();
+            models
+                .iter()
+                .map(|m| m["id"].as_str().unwrap().to_string())
+                .collect::<Vec<_>>()
+        }
+    };
+    let online_flag = || {
+        let client = client.clone();
+        let url = format!("{base}/info");
+        async move {
+            let info: serde_json::Value =
+                client.get(url).send().await.unwrap().json().await.unwrap();
+            info["online"].as_bool().unwrap()
+        }
+    };
+
+    // Online (the default without a probe): everything is listed.
+    assert!(online_flag().await);
+    assert_eq!(model_ids().await, ["agent-a/m", "local/m", "remote/m"]);
+
+    // Offline: only the local provider survives; no fallback entries.
+    engine.set_online(false);
+    assert!(!online_flag().await);
+    assert_eq!(model_ids().await, ["local/m"]);
+
+    // Recovery restores the full list.
+    engine.set_online(true);
+    assert!(online_flag().await);
+    assert_eq!(model_ids().await, ["agent-a/m", "local/m", "remote/m"]);
+
+    // Both transitions were logged, and repeating the current state is not
+    // a transition (no duplicate events).
+    engine.set_online(true);
+    let events = engine
+        .store()
+        .events_after(&trouve_protocol::Scope::Server, 0)
+        .unwrap();
+    let transitions: Vec<bool> = events
+        .iter()
+        .filter_map(|env| match env.event {
+            trouve_protocol::Event::ConnectivityChanged { online } => Some(online),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(transitions, [false, true]);
+
+    // The SSE stream delivers the transition like any other server event.
+    engine.set_online(false);
+    let seen = wait_for_event(&client, &format!("{base}/events"), |event| {
+        event["type"] == "server.connectivity_changed" && event["online"] == false
+    })
+    .await;
+    assert!(!seen.is_empty());
+}
