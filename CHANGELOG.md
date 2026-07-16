@@ -6,6 +6,15 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed
+
+- **Screen artifacts in the desktop app**: the app now prefers Slint's Skia
+  renderer over the default FemtoVG renderer, whose glyph atlas corrupts on
+  some Linux drivers — flashing garbage across the window while typing or
+  whenever a repaint hits (e.g. a desktop notification appearing). If Skia
+  can't initialize, the app falls back to the previous renderer, and an
+  explicit `SLINT_BACKEND` still overrides the choice.
+
 ### Removed
 
 - **Remote git URL support**: trouve no longer clones repositories on the

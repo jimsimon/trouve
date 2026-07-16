@@ -60,13 +60,29 @@ fn main() -> anyhow::Result<()> {
         )
         .init();
 
+    // Prefer the Skia renderer: the default FemtoVG renderer corrupts its
+    // glyph atlas on some Linux drivers, flashing screen artifacts whenever
+    // text changes (typing) or the window repaints (e.g. a desktop
+    // notification occluding it). An explicit SLINT_BACKEND still wins —
+    // BackendSelector only reads the env var for requirements left unset,
+    // so we must not pin the renderer when the user chose one.
+    if std::env::var_os("SLINT_BACKEND").is_some() {
+        slint::BackendSelector::new()
+            .select()
+            .map_err(|e| anyhow::anyhow!("failed to initialize UI backend: {e}"))?;
+    } else if let Err(e) = slint::BackendSelector::new()
+        .renderer_name("skia".into())
+        .select()
+    {
+        tracing::warn!("Skia renderer unavailable ({e}); using default renderer");
+        slint::BackendSelector::new()
+            .select()
+            .map_err(|e| anyhow::anyhow!("failed to initialize UI backend: {e}"))?;
+    }
     // Wayland/X11 app id. Compositors resolve taskbar/titlebar icons through a
     // desktop file matching this id (see packaging/linux/trouve.desktop);
     // must be set after the backend is initialized but before the window is
     // created.
-    slint::BackendSelector::new()
-        .select()
-        .map_err(|e| anyhow::anyhow!("failed to initialize UI backend: {e}"))?;
     slint::set_xdg_app_id("trouve")?;
 
     let window = AppWindow::new()?;

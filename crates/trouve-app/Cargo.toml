@@ -19,7 +19,10 @@ serde.workspace = true
 serde_json.workspace = true
 # unstable-winit-030 exposes the winit window (focus tracking + raise for
 # notification clicks); the winit backend itself is already the default.
-slint = { workspace = true, features = ["unstable-winit-030"] }
+# renderer-skia is preferred at startup (see main.rs): the default FemtoVG
+# renderer corrupts its glyph atlas on some Linux drivers, showing screen
+# artifacts whenever text changes (typing) or the window repaints.
+slint = { workspace = true, features = ["unstable-winit-030", "renderer-skia"] }
 tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
