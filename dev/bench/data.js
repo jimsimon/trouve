@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1784227822339,
+  "lastUpdate": 1784237335213,
   "repoUrl": "https://github.com/jimsimon/trouve",
   "entries": {
     "e2e-benchmarks": [
@@ -2497,6 +2497,54 @@ window.BENCHMARK_DATA = {
             "name": "dense_query_20k_rows",
             "value": 1370150.6257375912,
             "range": "± 9661",
+            "unit": "ns"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "jim.j.simon@gmail.com",
+            "name": "Jim Simon",
+            "username": "jimsimon"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "dde35349457fb61a6897187e7f36e5b09ac7965b",
+          "message": "Batch semver minor and patch updates into one Renovate PR (#51)\n\nAdd a catch-all package rule (equivalent to the group:allNonMajor preset)\ndeclared last so it takes precedence over the tree-sitter and GitHub\nActions groups for non-major updates; those groups still apply to major\nand digest updates.\n\nCo-authored-by: Cursor Agent <cursoragent@cursor.com>\nCo-authored-by: Jim Simon <jimsimon@users.noreply.github.com>",
+          "timestamp": "2026-07-16T17:26:44-04:00",
+          "tree_id": "265dddfd2b0b42c9cab7ff2ed217248290e91f4b",
+          "url": "https://github.com/jimsimon/trouve/commit/dde35349457fb61a6897187e7f36e5b09ac7965b"
+        },
+        "date": 1784237334290,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "bm25_build_5k_docs",
+            "value": 4941921.300000001,
+            "range": "± 9335",
+            "unit": "ns"
+          },
+          {
+            "name": "bm25_query_5k_docs",
+            "value": 37011.81151461517,
+            "range": "± 10",
+            "unit": "ns"
+          },
+          {
+            "name": "chunk_python_200_functions",
+            "value": 3047146.2352941176,
+            "range": "± 2463",
+            "unit": "ns"
+          },
+          {
+            "name": "dense_query_20k_rows",
+            "value": 1342374.7621527778,
+            "range": "± 7456",
             "unit": "ns"
           }
         ]
