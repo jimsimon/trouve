@@ -1359,6 +1359,15 @@ export component AppWindow inherits Window {
         root.queue-drag-from = -1;
         root.queue-drag-dy = 0px;
     }
+    // Connectivity loss mid-drag or mid-edit: the controls disable, so a
+    // stuck drag or an orphaned editor must be dropped too.
+    changed connectivity-blocked => {
+        if (root.connectivity-blocked) {
+            root.queue-editing = -1;
+            root.queue-drag-from = -1;
+            root.queue-drag-dy = 0px;
+        }
+    }
 
     in-out property <string> error-text: "";
 
@@ -2943,8 +2952,11 @@ export component AppWindow inherits Window {
                                     Rectangle {
                                         width: Theme.fs(14px);
                                         qdrag-ta := TouchArea {
-                                            mouse-cursor: root.queue-drag-from == qi
-                                                ? MouseCursor.grabbing : MouseCursor.grab;
+                                            enabled: !root.connectivity-blocked;
+                                            mouse-cursor: !root.connectivity-blocked
+                                                ? (root.queue-drag-from == qi
+                                                    ? MouseCursor.grabbing : MouseCursor.grab)
+                                                : MouseCursor.default;
                                             moved => {
                                                 root.queue-editing = -1;
                                                 root.queue-drag-from = qi;
@@ -2998,18 +3010,20 @@ export component AppWindow inherits Window {
                                     IconButton {
                                         icon: "↑";
                                         tip: "Run earlier";
-                                        enabled: qi > 0;
+                                        enabled: qi > 0 && !root.connectivity-blocked;
                                         clicked => { root.queue-moved(qi, -1); }
                                     }
                                     IconButton {
                                         icon: "↓";
                                         tip: "Run later";
-                                        enabled: qi < root.queue-prompts.length - 1;
+                                        enabled: qi < root.queue-prompts.length - 1
+                                            && !root.connectivity-blocked;
                                         clicked => { root.queue-moved(qi, 1); }
                                     }
                                     IconButton {
                                         icon: "✎";
                                         tip: "Edit";
+                                        enabled: !root.connectivity-blocked;
                                         clicked => {
                                             root.queue-editing =
                                                 root.queue-editing == qi ? -1 : qi;
@@ -3018,6 +3032,7 @@ export component AppWindow inherits Window {
                                     IconButton {
                                         icon: "✕";
                                         tip: "Remove from queue";
+                                        enabled: !root.connectivity-blocked;
                                         clicked => { root.queue-deleted(qi); }
                                     }
                                     }
@@ -3040,6 +3055,7 @@ export component AppWindow inherits Window {
                                         PillButton {
                                             label: "Save";
                                             primary: true;
+                                            enabled: !root.connectivity-blocked;
                                             clicked => {
                                                 root.queue-edited(qi, qedit.text);
                                                 root.queue-editing = -1;

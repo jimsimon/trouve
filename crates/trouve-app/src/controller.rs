@@ -961,6 +961,14 @@ impl Controller {
         self.push_connectivity();
     }
 
+    /// Whether prompt entry and prompt-adjacent mutations are blocked: the
+    /// server is unreachable, or it is offline with nothing runnable. One
+    /// predicate feeds both the banner/input gate and the command-loop
+    /// rejection in [`Self::handle`], so the two can't disagree.
+    fn connectivity_blocked(&self) -> bool {
+        self.server_unreachable || (self.offline && self.models.is_empty())
+    }
+
     /// Push the connectivity banner + input gate. A lost client→server
     /// connection outranks the server's own internet state — nothing works
     /// while the server is gone, so that banner is red and blocks
@@ -985,7 +993,7 @@ impl Controller {
             ui::set_connectivity(&self.ui, true, warning, true);
             return;
         }
-        let blocked = self.offline && self.models.is_empty();
+        let blocked = self.connectivity_blocked();
         let warning = if blocked {
             "You're offline and no local models are available — prompts are \
              disabled until the connection returns. To work offline in the \
@@ -2900,6 +2908,40 @@ impl Controller {
     // --- command dispatch --------------------------------------------------------
 
     async fn handle(&mut self, command: UiCommand) -> Result<()> {
+        // The UI disables these controls while blocked, but a command that
+        // was already queued when connectivity flipped (or a click racing
+        // the banner) still lands here — the gate must be authoritative on
+        // this side, not just cosmetic in the UI.
+        if self.connectivity_blocked() {
+            let reason = if self.server_unreachable {
+                "the trouve server is unreachable"
+            } else {
+                "you're offline with no local models"
+            };
+            match &command {
+                UiCommand::SendMessage(_)
+                | UiCommand::StartNewChat { .. }
+                | UiCommand::QueueEdit { .. }
+                | UiCommand::QueueDelete(_)
+                | UiCommand::QueueMove { .. }
+                | UiCommand::QueueReorder { .. }
+                | UiCommand::QueueSendNow => {
+                    self.error(&format!("Can't do that right now — {reason}."));
+                    return Ok(());
+                }
+                UiCommand::SaveAutomation { .. }
+                | UiCommand::AutomationToggled(..)
+                | UiCommand::RunAutomation(_)
+                | UiCommand::DeleteAutomation(_) => {
+                    ui::set_automations_status(
+                        &self.ui,
+                        format!("Can't do that right now — {reason}."),
+                    );
+                    return Ok(());
+                }
+                _ => {}
+            }
+        }
         match command {
             UiCommand::NavRowClicked(row) => match self.nav.get(row).cloned() {
                 Some(NavEntry::Session(i)) => self.select_session(i).await?,
