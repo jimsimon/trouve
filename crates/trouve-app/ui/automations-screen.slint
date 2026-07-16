@@ -328,6 +328,7 @@ export component AutomationsScreen inherits Rectangle {
                                         spacing: 6px;
                                         Button {
                                             text: item.enabled ? "Pause" : "Resume";
+                                            enabled: !root.blocked;
                                             clicked => { root.toggled(item.id, !item.enabled); }
                                         }
                                         Button {
@@ -364,6 +365,7 @@ export component AutomationsScreen inherits Rectangle {
                                         }
                                         Button {
                                             text: "Delete";
+                                            enabled: !root.blocked;
                                             clicked => { root.deleted(item.id); }
                                         }
                                     }

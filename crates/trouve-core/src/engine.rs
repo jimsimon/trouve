@@ -221,9 +221,26 @@ fn provider_auth_kind(pc: &ProviderConfig) -> String {
 }
 
 /// Whether a provider endpoint lives on this machine (Ollama, llama.cpp,
-/// vLLM, …) and therefore keeps working without internet.
+/// vLLM, …) and therefore keeps working without internet. Parses the
+/// authority and requires the exact host `localhost` or a loopback IP —
+/// a substring check would also accept remote hosts like
+/// `localhost.attacker.example` and mislabel them as offline-capable
+/// keyless endpoints.
 fn is_loopback_base_url(url: &str) -> bool {
-    url.contains("://localhost") || url.contains("://127.0.0.1") || url.contains("://[::1]")
+    let Ok(parsed) = reqwest::Url::parse(url) else {
+        return false;
+    };
+    let Some(host) = parsed.host_str() else {
+        return false;
+    };
+    if host.eq_ignore_ascii_case("localhost") {
+        return true;
+    }
+    // IPv6 hosts come back bracketed; IpAddr parsing wants them bare.
+    host.trim_start_matches('[')
+        .trim_end_matches(']')
+        .parse::<std::net::IpAddr>()
+        .is_ok_and(|ip| ip.is_loopback())
 }
 
 /// Build the provider registry from config + zero-config env defaults.
@@ -6324,11 +6341,7 @@ fn build_provider(
         .or_else(|| pc.api_key_env.as_ref().and_then(|v| std::env::var(v).ok()))
         .or_else(|| secrets.get(&api_key_secret(id)).ok().flatten());
     // Local endpoints (e.g. Ollama) don't need a key; send an empty token.
-    let local = pc
-        .base_url
-        .as_deref()
-        .map(|u| u.contains("://localhost") || u.contains("://127.0.0.1"))
-        .unwrap_or(false);
+    let local = pc.base_url.as_deref().is_some_and(is_loopback_base_url);
     let mut oauth_bearer = false;
     let token: Arc<dyn TokenSource> = match (api_key, &pc.oauth) {
         (Some(key), _) => Arc::new(StaticToken(key)),
@@ -6374,6 +6387,34 @@ fn build_provider(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn loopback_base_url_requires_an_exact_loopback_host() {
+        for url in [
+            "http://localhost:11434",
+            "http://LOCALHOST:11434/v1",
+            "http://127.0.0.1:8080/v1",
+            "https://127.1.2.3", // whole 127/8 block is loopback
+            "http://[::1]:8000",
+        ] {
+            assert!(is_loopback_base_url(url), "should be loopback: {url}");
+        }
+        for url in [
+            // Suffix tricks: remote hosts that merely contain a loopback
+            // string must not be treated as local, or offline mode would
+            // enable prompts that still need the internet.
+            "https://localhost.attacker.example",
+            "https://127.0.0.1.attacker.example",
+            "https://attacker.example/path?q=://localhost",
+            "https://user:pw@attacker.example#://127.0.0.1",
+            "https://api.example.com",
+            "http://192.168.1.10:11434",
+            "http://[::2]:8000",
+            "not a url",
+        ] {
+            assert!(!is_loopback_base_url(url), "should not be loopback: {url}");
+        }
+    }
 
     #[test]
     fn history_digest_renders_text_skips_tools_and_caps_length() {

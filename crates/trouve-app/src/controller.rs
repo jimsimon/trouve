@@ -1071,9 +1071,18 @@ impl Controller {
         self.last_respawn = Some(std::time::Instant::now());
         self.push_connectivity();
         let restarted = match spawn_server_process(&spawn) {
-            Ok(child) => {
-                watch_server_child(self.tx.clone(), child);
-                wait_server_ready(&self.client).await.is_ok()
+            Ok(mut child) => {
+                if wait_server_ready(&self.client).await.is_ok() {
+                    // Hand ownership to the watcher only once the server
+                    // answers; an unready child must not linger unwatched.
+                    watch_server_child(self.tx.clone(), child);
+                    true
+                } else {
+                    if let Err(e) = child.kill().await {
+                        tracing::warn!("killing unready trouve-server: {e:#}");
+                    }
+                    false
+                }
             }
             Err(e) => {
                 tracing::warn!("respawning trouve-server: {e:#}");
@@ -4315,16 +4324,26 @@ impl Controller {
                     ui::set_connectivity_notice(&self.ui, String::new());
                 }
             }
+            // The watchdog and the child watcher enqueue independently, so
+            // a queued transition can be stale by the time it runs (a
+            // Restored overtaken by a newer exit, a Lost overtaken by a
+            // successful respawn). Both handlers revalidate against the
+            // server before applying, so an outdated message can neither
+            // unblock a dead server nor re-block a recovered one.
             UiCommand::ServerConnectionLost => {
-                self.server_unreachable = true;
-                self.clear_connectivity_notice();
-                self.push_connectivity();
+                if self.client.info().await.is_err() {
+                    self.server_unreachable = true;
+                    self.clear_connectivity_notice();
+                    self.push_connectivity();
+                }
             }
             UiCommand::ServerConnectionRestored => {
-                self.server_unreachable = false;
-                self.server_failed = false;
-                self.resync_after_reconnect("Reconnected to the trouve server.")
-                    .await;
+                if self.client.info().await.is_ok() {
+                    self.server_unreachable = false;
+                    self.server_failed = false;
+                    self.resync_after_reconnect("Reconnected to the trouve server.")
+                        .await;
+                }
             }
             UiCommand::ServerExited(status) => {
                 self.handle_server_exited(&status).await;

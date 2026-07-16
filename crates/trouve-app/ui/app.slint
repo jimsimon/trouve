@@ -182,6 +182,14 @@ component DropUpPicker inherits Rectangle {
     background: Theme.c.control-bg;
     border-radius: 6px;
 
+    // An already-open popup must not keep taking clicks after the picker
+    // is disabled (e.g. the connection drops mid-interaction).
+    changed enabled => {
+        if (!root.enabled) {
+            popup.close();
+        }
+    }
+
     popup := PopupWindow {
         x: 0;
         y: -min(root.options.length, 10) * Theme.fs(28px) - 8px;
@@ -198,6 +206,7 @@ component DropUpPicker inherits Rectangle {
                     height: Theme.fs(28px);
                     background: idx == root.current-index ? Theme.c.accent-bg : transparent;
                     TouchArea {
+                        enabled: root.enabled;
                         clicked => {
                             root.current-index = idx;
                             root.changed(idx);
@@ -265,6 +274,14 @@ component SearchPicker inherits Rectangle {
     background: Theme.c.control-bg;
     border-radius: 6px;
 
+    // An already-open popup must not keep taking clicks or Enter after
+    // the picker is disabled (e.g. the connection drops mid-interaction).
+    changed enabled => {
+        if (!root.enabled) {
+            popup.close();
+        }
+    }
+
     popup := PopupWindow {
         close-policy: close-on-click-outside;
         x: 0;
@@ -285,11 +302,12 @@ component SearchPicker inherits Rectangle {
                     font-size: Theme.fs(12px);
                     placeholder-text: "Search models…";
                     text <=> root.query;
+                    enabled: root.enabled;
                     init => { self.focus(); }
                     edited => { root.filter-edited(self.text); }
                     // Enter picks the top match.
                     accepted => {
-                        if (root.matches.length > 0) {
+                        if (root.enabled && root.matches.length > 0) {
                             root.current-index = root.matches[0];
                             root.changed(root.matches[0]);
                             popup.close();
@@ -312,6 +330,7 @@ component SearchPicker inherits Rectangle {
                         background: oi == root.current-index ? Theme.c.accent-bg
                             : opt-ta.has-hover ? Theme.c.hover-bg : transparent;
                         opt-ta := TouchArea {
+                            enabled: root.enabled;
                             clicked => {
                                 root.current-index = oi;
                                 root.changed(oi);
