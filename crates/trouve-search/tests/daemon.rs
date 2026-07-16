@@ -249,15 +249,17 @@ fn proxy_serves_in_process_when_the_socket_path_cannot_exist() {
     let start = std::time::Instant::now();
     let mut session = McpSession::spawn(&cache, model, true);
     initialize(&mut session);
-    let response = search(&mut session, 2, repo.path(), "authenticate");
-    assert_eq!(response["result"]["isError"], false, "got {response}");
-    let text = response["result"]["content"][0]["text"].as_str().unwrap();
-    assert!(text.contains("auth.py"), "got {text}");
-    // Well under the 10s spawn wait: the fallback was immediate.
+    // Well under the 10s spawn wait: backend selection was immediate.
+    // Measured before the search so model loading and indexing on a slow
+    // runner can't eat the margin.
     assert!(
         start.elapsed() < std::time::Duration::from_secs(8),
         "fallback should not wait for a daemon that can never bind"
     );
+    let response = search(&mut session, 2, repo.path(), "authenticate");
+    assert_eq!(response["result"]["isError"], false, "got {response}");
+    let text = response["result"]["content"][0]["text"].as_str().unwrap();
+    assert!(text.contains("auth.py"), "got {text}");
     assert_eq!(socket_count(&cache), 0);
     session.close();
 }

@@ -99,9 +99,14 @@ impl IndexCache {
             return Ok(Arc::clone(entry));
         }
         if entries.len() >= CACHE_MAX_SIZE {
-            // Evict least-recently-used.
+            // Evict the least-recently-used entry nobody is using. The map
+            // owns one reference; more means an in-flight call, and evicting
+            // under it would let the next call for that repo build a
+            // duplicate index behind a second lock. Only the map hands out
+            // new references, and we hold its lock, so the count is stable.
             if let Some(lru) = entries
                 .iter()
+                .filter(|(_, entry)| Arc::strong_count(entry) == 1)
                 .min_by_key(|(_, v)| *lock_unpoisoned(&v.last_used))
                 .map(|(k, _)| k.clone())
             {
