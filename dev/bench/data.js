@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1784239779479,
+  "lastUpdate": 1784244581887,
   "repoUrl": "https://github.com/jimsimon/trouve",
   "entries": {
     "e2e-benchmarks": [
@@ -1391,6 +1391,54 @@ window.BENCHMARK_DATA = {
             "name": "non-git warm query",
             "value": 70.82841580000002,
             "range": "± 12.9",
+            "unit": "ms"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "jim.j.simon@gmail.com",
+            "name": "Jim Simon",
+            "username": "jimsimon"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "479651d54acf0500041f4cbc74e51416e28e78a5",
+          "message": "Prefer the Skia renderer to fix screen artifacts while typing (#57)\n\nThe default FemtoVG renderer corrupts its glyph atlas on some Linux\ndrivers, flashing garbage across the window whenever text changes\n(typing) or the window repaints (e.g. a desktop notification appearing).\nRequest Skia at startup, fall back to the default selection if it can't\ninitialize, and leave the choice alone when SLINT_BACKEND is set —\nBackendSelector only reads the env var for requirements left unset.\n\nCo-authored-by: Claude Fable 5 <noreply@anthropic.com>",
+          "timestamp": "2026-07-16T19:27:12-04:00",
+          "tree_id": "d6180a19c46aac5cd9b14088f5620cae26de5604",
+          "url": "https://github.com/jimsimon/trouve/commit/479651d54acf0500041f4cbc74e51416e28e78a5"
+        },
+        "date": 1784244581153,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "cold index + query",
+            "value": 134.94346622,
+            "range": "± 5.7",
+            "unit": "ms"
+          },
+          {
+            "name": "warm query",
+            "value": 66.58929520000001,
+            "range": "± 3.5",
+            "unit": "ms"
+          },
+          {
+            "name": "incremental (1 file modified)",
+            "value": 77.70967986000001,
+            "range": "± 1",
+            "unit": "ms"
+          },
+          {
+            "name": "non-git warm query",
+            "value": 65.6521817,
+            "range": "± 2",
             "unit": "ms"
           }
         ]
