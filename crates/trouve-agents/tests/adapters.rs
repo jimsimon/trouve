@@ -238,8 +238,11 @@ fn spawn_dashboard_stub(
                      Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
                     body.len(),
                 );
-                let _ = sock.write_all(response.as_bytes()).await;
+                // Record before responding: once the response is written
+                // the client can finish and assert on `seen` before this
+                // task gets scheduled again.
                 seen.lock().unwrap().push((path, auth));
+                let _ = sock.write_all(response.as_bytes()).await;
             });
         }
     });

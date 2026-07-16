@@ -307,10 +307,20 @@ impl CursorBackend {
             .timeout(USAGE_TIMEOUT)
             .build()
             .map_err(|e| BackendError::Protocol(e.to_string()))?;
+        // The client timeout is per request, so two sequential RPCs could
+        // take ~2x the budget. Give the optional plan lookup only whatever
+        // the usage call left over; when that runs out, degrade to no plan
+        // name rather than stretching the deadline or failing the query.
+        let started = std::time::Instant::now();
         let usage = self
             .dashboard_rpc(&http, &token, "GetCurrentPeriodUsage")
             .await?;
-        let plan_info = self.dashboard_rpc(&http, &token, "GetPlanInfo").await.ok();
+        let remaining = USAGE_TIMEOUT.saturating_sub(started.elapsed());
+        let plan_info =
+            tokio::time::timeout(remaining, self.dashboard_rpc(&http, &token, "GetPlanInfo"))
+                .await
+                .ok()
+                .and_then(Result::ok);
         Ok((usage, plan_info))
     }
 
