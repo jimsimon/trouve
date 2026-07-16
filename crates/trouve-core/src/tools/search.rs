@@ -7,7 +7,7 @@
 //! index cache across all threads and sessions.
 
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use serde_json::{Value, json};
 use trouve_search::mcp::{IndexCache, call_tool};
@@ -97,9 +97,11 @@ locating implementations, or understanding how something works.
   the primary definition.";
 
 /// One cache for the whole executor: indexes are expensive to build and
-/// cheap to re-validate, so every session shares them.
-pub fn shared_cache() -> Arc<Mutex<IndexCache>> {
-    Arc::new(Mutex::new(IndexCache::new(vec![ContentType::Code])))
+/// cheap to re-validate, so every session shares them. The cache locks
+/// per repo internally, so sessions searching different repos don't
+/// serialize on each other.
+pub fn shared_cache() -> Arc<IndexCache> {
+    Arc::new(IndexCache::new(vec![ContentType::Code]))
 }
 
 /// Resolve the `repo` argument: session worktree by default, or a
@@ -120,7 +122,7 @@ fn resolve_repo(ctx: &ToolCtx, args: &Value) -> Result<String, String> {
 /// Run one trouve-search tool off the async threads (indexing is CPU-heavy
 /// and the first call may download the embedding model).
 async fn run_search_tool(
-    cache: &Arc<Mutex<IndexCache>>,
+    cache: &Arc<IndexCache>,
     name: &'static str,
     ctx: &ToolCtx,
     args: &Value,
@@ -132,12 +134,9 @@ async fn run_search_tool(
     let mut args = args.clone();
     args["repo"] = json!(repo);
     let cache = cache.clone();
-    let out = tokio::task::spawn_blocking(move || {
-        let mut cache = cache.lock().unwrap();
-        call_tool(&mut cache, name, &args)
-    })
-    .await
-    .unwrap_or_else(|e| Err(format!("{name} panicked: {e}")));
+    let out = tokio::task::spawn_blocking(move || call_tool(&cache, name, &args))
+        .await
+        .unwrap_or_else(|e| Err(format!("{name} panicked: {e}")));
     match out {
         Ok(text) => ToolResult::ok(Value::String(text)),
         Err(e) => ToolResult::error(e),
@@ -150,7 +149,7 @@ const SNIPPET_PARAM: &str = "Lines of source per result. Default (10): signature
      body lines. 0: path and line range only.";
 
 pub struct Search {
-    pub(super) cache: Arc<Mutex<IndexCache>>,
+    pub(super) cache: Arc<IndexCache>,
 }
 
 #[async_trait::async_trait]
@@ -187,7 +186,7 @@ impl Tool for Search {
 }
 
 pub struct FindRelated {
-    pub(super) cache: Arc<Mutex<IndexCache>>,
+    pub(super) cache: Arc<IndexCache>,
 }
 
 #[async_trait::async_trait]
