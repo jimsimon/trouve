@@ -789,7 +789,7 @@ export component SettingsScreen inherits Rectangle {
                                 font-weight: 700;
                             }
                             Text {
-                                text: "How much of each subscription's metered allowance is used. Codex reports usage via its app-server and Claude Code via its CLI — Cursor does not provide subscription information to third parties.";
+                                text: "How much of each subscription's metered allowance is used. Codex and Claude Code report usage through their CLIs; Cursor's is read from an undocumented dashboard endpoint using the CLI's login, so it may break or be restricted at any time.";
                                 color: Theme.c.text-soft;
                                 font-size: Theme.fs(11px);
                                 wrap: word-wrap;

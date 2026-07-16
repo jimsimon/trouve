@@ -21,6 +21,16 @@
 //!
 //! Auth: `cursor-agent login` (subscription) or the `CURSOR_API_KEY` env
 //! var / configured API key — both handled by the CLI.
+//!
+//! Subscription usage: the CLI has no usage surface (no subcommand, no ACP
+//! method), but the token it stores in `auth.json` is accepted by the
+//! dashboard's Connect-RPC endpoint
+//! (`aiserver.v1.DashboardService/GetCurrentPeriodUsage`), the same call
+//! Cursor's own dashboard makes. Like the direct-Codex provider, this is
+//! tolerated, not contracted: the endpoint is undocumented and may break or
+//! be restricted at any time, and we never refresh the token ourselves —
+//! when it goes stale the user runs any `cursor-agent` command, which
+//! refreshes `auth.json` through the sanctioned path.
 
 use std::collections::{HashMap, HashSet};
 use std::process::Stdio;
@@ -36,7 +46,7 @@ use trouve_protocol::{ModelInfo, Usage};
 
 use crate::{
     AgentBackend, BackendError, BackendEvent, BackendEventStream, BackendLogin, BackendPermission,
-    BackendStatus, BackendTurn, async_stream, binary_on_path, model, spawn_login,
+    BackendStatus, BackendTurn, async_stream, binary_on_path, format_reset, model, spawn_login,
 };
 
 pub struct CursorBackend {
@@ -46,10 +56,21 @@ pub struct CursorBackend {
     server: Mutex<Option<Arc<AcpServer>>>,
     /// `cursor/list_available_models` result, cached for [`MODELS_TTL`].
     models_cache: Mutex<Option<(std::time::Instant, Vec<ModelInfo>)>>,
+    /// The CLI's credential file, read (never written) for the usage query.
+    auth_file: std::path::PathBuf,
+    /// Dashboard Connect-RPC origin (overridable for tests).
+    dashboard_base: String,
 }
 
 /// How long a fetched vendor model list stays fresh.
 const MODELS_TTL: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// Where the dashboard Connect-RPC services live (same origin the CLI and
+/// IDE talk to).
+const DASHBOARD_BASE: &str = "https://api2.cursor.sh";
+
+/// End-to-end budget for one dashboard usage query.
+const USAGE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
 impl CursorBackend {
     pub fn new(id: impl Into<String>, command: Option<String>, api_key: Option<String>) -> Self {
@@ -59,7 +80,21 @@ impl CursorBackend {
             api_key,
             server: Mutex::new(None),
             models_cache: Mutex::new(None),
+            auth_file: cli_auth_file(),
+            dashboard_base: DASHBOARD_BASE.into(),
         }
+    }
+
+    /// Point the usage query at a different credential file and dashboard
+    /// origin (tests).
+    pub fn with_dashboard(
+        mut self,
+        auth_file: std::path::PathBuf,
+        base: impl Into<String>,
+    ) -> Self {
+        self.auth_file = auth_file;
+        self.dashboard_base = base.into();
+        self
     }
 
     async fn server(&self) -> Result<Arc<AcpServer>, BackendError> {
@@ -138,6 +173,32 @@ impl AgentBackend for CursorBackend {
 
     async fn start_login(&self) -> Result<BackendLogin, BackendError> {
         spawn_login(&self.command, &["login"]).await
+    }
+
+    async fn subscription_health(&self) -> Option<trouve_protocol::SubscriptionHealth> {
+        // API-key providers are usage-billed per request; there is no
+        // subscription allowance to meter.
+        if self.api_key.is_some() {
+            return Some(trouve_protocol::SubscriptionHealth {
+                provider_id: self.id.clone(),
+                status: "unsupported".into(),
+                plan: String::new(),
+                windows: Vec::new(),
+                credits: String::new(),
+                note: "usage-billed via API key — no subscription allowance to report.".into(),
+            });
+        }
+        Some(match self.query_dashboard_usage().await {
+            Ok((usage, plan_info)) => parse_dashboard_usage(&self.id, &usage, plan_info.as_ref()),
+            Err(e) => trouve_protocol::SubscriptionHealth {
+                provider_id: self.id.clone(),
+                status: "unavailable".into(),
+                plan: String::new(),
+                windows: Vec::new(),
+                credits: String::new(),
+                note: format!("could not read usage from Cursor's dashboard API: {e}"),
+            },
+        })
     }
 
     async fn run_turn(&self, turn: BackendTurn) -> Result<BackendEventStream, BackendError> {
@@ -235,6 +296,201 @@ impl AgentBackend for CursorBackend {
         );
         Ok(stream.boxed())
     }
+}
+
+impl CursorBackend {
+    /// Ask the dashboard for the current billing period's usage (and, best
+    /// effort, the plan name) using the CLI's stored login token.
+    async fn query_dashboard_usage(&self) -> Result<(Value, Option<Value>), BackendError> {
+        let token = read_cli_token(&self.auth_file)?;
+        let http = reqwest::Client::builder()
+            .timeout(USAGE_TIMEOUT)
+            .build()
+            .map_err(|e| BackendError::Protocol(e.to_string()))?;
+        // The client timeout is per request, so two sequential RPCs could
+        // take ~2x the budget. Give the optional plan lookup only whatever
+        // the usage call left over; when that runs out, degrade to no plan
+        // name rather than stretching the deadline or failing the query.
+        let started = std::time::Instant::now();
+        let usage = self
+            .dashboard_rpc(&http, &token, "GetCurrentPeriodUsage")
+            .await?;
+        let remaining = USAGE_TIMEOUT.saturating_sub(started.elapsed());
+        let plan_info =
+            tokio::time::timeout(remaining, self.dashboard_rpc(&http, &token, "GetPlanInfo"))
+                .await
+                .ok()
+                .and_then(Result::ok);
+        Ok((usage, plan_info))
+    }
+
+    /// One unary Connect-RPC call (JSON encoding) on the DashboardService.
+    async fn dashboard_rpc(
+        &self,
+        http: &reqwest::Client,
+        token: &str,
+        method: &str,
+    ) -> Result<Value, BackendError> {
+        let url = format!(
+            "{}/aiserver.v1.DashboardService/{method}",
+            self.dashboard_base
+        );
+        let response = http
+            .post(&url)
+            .header("Content-Type", "application/json")
+            .header("Connect-Protocol-Version", "1")
+            .bearer_auth(token)
+            .body("{}")
+            .send()
+            .await
+            .map_err(|e| BackendError::Protocol(format!("{method}: {e}")))?;
+        let status = response.status();
+        let body: Value = response.json().await.unwrap_or(Value::Null);
+        if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
+            return Err(BackendError::Auth(
+                "Cursor rejected the CLI's stored login — run any cursor-agent \
+                 command (e.g. `cursor-agent status`) to refresh it, or log in again"
+                    .into(),
+            ));
+        }
+        if !status.is_success() {
+            return Err(BackendError::Protocol(format!(
+                "{method}: HTTP {status}: {}",
+                body["message"].as_str().unwrap_or("")
+            )));
+        }
+        Ok(body)
+    }
+}
+
+/// The CLI's `auth.json` path, mirroring its own per-platform resolution
+/// (Windows: `%APPDATA%\Cursor`, macOS: `~/.cursor`, else XDG config).
+fn cli_auth_file() -> std::path::PathBuf {
+    match std::env::consts::OS {
+        "windows" => std::env::var_os("APPDATA")
+            .map(std::path::PathBuf::from)
+            .or_else(|| dirs::home_dir().map(|h| h.join("AppData").join("Roaming")))
+            .unwrap_or_default()
+            .join("Cursor")
+            .join("auth.json"),
+        "macos" => dirs::home_dir()
+            .unwrap_or_default()
+            .join(".cursor")
+            .join("auth.json"),
+        _ => std::env::var_os("XDG_CONFIG_HOME")
+            .map(std::path::PathBuf::from)
+            .or_else(|| dirs::home_dir().map(|h| h.join(".config")))
+            .unwrap_or_default()
+            .join("cursor")
+            .join("auth.json"),
+    }
+}
+
+/// Read the login token from the CLI's auth file, failing with actionable
+/// messages. Deliberately never refreshed here (see module docs).
+fn read_cli_token(path: &std::path::Path) -> Result<String, BackendError> {
+    let raw = std::fs::read_to_string(path).map_err(|_| {
+        BackendError::Auth(format!(
+            "no Cursor CLI credentials at {} — run `cursor-agent login` first",
+            path.display()
+        ))
+    })?;
+    let auth: Value = serde_json::from_str(&raw)
+        .map_err(|e| BackendError::Auth(format!("unreadable cursor auth.json: {e}")))?;
+    auth["accessToken"]
+        .as_str()
+        .or_else(|| auth["apiKey"].as_str())
+        .map(str::to_string)
+        .ok_or_else(|| BackendError::Auth("cursor auth.json has no access token".into()))
+}
+
+/// Turn a `GetCurrentPeriodUsage` response (plus an optional `GetPlanInfo`
+/// one) into subscription health.
+///
+/// Cursor's plans are dollar-metered: an included allowance per billing
+/// cycle (with per-bucket percentages for the Auto tier and named/API
+/// models), plus an optional on-demand spend limit on top. Amounts are USD
+/// cents; int64 fields arrive as JSON strings.
+fn parse_dashboard_usage(
+    provider_id: &str,
+    usage: &Value,
+    plan_info: Option<&Value>,
+) -> trouve_protocol::SubscriptionHealth {
+    let plan = plan_info
+        .and_then(|p| p["planInfo"]["planName"].as_str())
+        .unwrap_or("")
+        .to_string();
+    let resets = i64_flex(&usage["billingCycleEnd"])
+        .map(format_reset)
+        .unwrap_or_default();
+
+    let mut windows = Vec::new();
+    let mut push = |label: &str, pct: f64| {
+        windows.push(trouve_protocol::SubscriptionWindow {
+            label: label.to_string(),
+            used_percent: (pct.round() as i64).clamp(0, 100),
+            resets: resets.clone(),
+        });
+    };
+
+    let plan_usage = &usage["planUsage"];
+    if let Some(pct) = plan_usage["totalPercentUsed"].as_f64() {
+        push("Included usage", pct);
+    }
+    if let Some(pct) = plan_usage["apiPercentUsed"].as_f64() {
+        push("Included (API models)", pct);
+    }
+    if let Some(pct) = plan_usage["autoPercentUsed"].as_f64() {
+        push("Included (Auto)", pct);
+    }
+
+    // On-demand spend rides on top of the included allowance; individual
+    // limits take precedence, team-pooled ones are the fallback.
+    let spend = &usage["spendLimitUsage"];
+    let on_demand = [
+        ("individualUsed", "individualLimit"),
+        ("pooledUsed", "pooledLimit"),
+    ]
+    .iter()
+    .find_map(|(used_key, limit_key)| {
+        let used = i64_flex(&spend[*used_key])?;
+        let limit = i64_flex(&spend[*limit_key]).filter(|l| *l > 0)?;
+        Some((used, limit))
+    });
+    let mut credits = String::new();
+    if let Some((used, limit)) = on_demand {
+        push("On-demand spend", used as f64 / limit as f64 * 100.0);
+        credits = format!(
+            "on-demand: ${:.2} of ${:.2}",
+            used as f64 / 100.0,
+            limit as f64 / 100.0
+        );
+    }
+
+    if windows.is_empty() {
+        return trouve_protocol::SubscriptionHealth {
+            provider_id: provider_id.to_string(),
+            status: "unavailable".into(),
+            plan,
+            windows,
+            credits,
+            note: "the dashboard reported no usage data — is cursor-agent logged in?".into(),
+        };
+    }
+    trouve_protocol::SubscriptionHealth {
+        provider_id: provider_id.to_string(),
+        status: "ok".into(),
+        plan,
+        windows,
+        credits,
+        note: String::new(),
+    }
+}
+
+/// Protobuf int64 fields serialize as JSON strings in Connect's JSON
+/// encoding; accept both shapes.
+fn i64_flex(v: &Value) -> Option<i64> {
+    v.as_i64().or_else(|| v.as_str()?.parse().ok())
 }
 
 /// Set the session's model and its config options (thinking/context/effort/
@@ -1122,6 +1378,115 @@ fn acp_mcp_servers(servers: &[crate::McpServerLaunch]) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parses_dashboard_usage() {
+        // Field shapes from a real GetCurrentPeriodUsage response: cents
+        // for money, int64s as strings, percentages precomputed.
+        let cycle_end_ms = (chrono::Utc::now().timestamp() + 9 * 86_400 + 600) * 1000;
+        let usage = json!({
+            "billingCycleStart": "1782696817000",
+            "billingCycleEnd": cycle_end_ms.to_string(),
+            "planUsage": {
+                "totalSpend": 53573,
+                "includedSpend": 40000,
+                "bonusSpend": 13573,
+                "limit": 40000,
+                "autoPercentUsed": 1.525,
+                "apiPercentUsed": 100,
+                "totalPercentUsed": 35.715333333333334,
+            },
+            "spendLimitUsage": {
+                "totalSpend": 241122,
+                "individualLimit": 250000,
+                "individualUsed": 241122,
+                "individualRemaining": 8878,
+                "limitType": "user",
+            },
+            "enabled": true,
+            "displayMessage": "You've used 97% of your included usage",
+        });
+        let plan_info = json!({
+            "planInfo": { "planName": "Ultra", "includedAmountCents": 40000, "price": "$200/mo" },
+        });
+        let health = parse_dashboard_usage("cursor", &usage, Some(&plan_info));
+        assert_eq!(health.status, "ok");
+        assert_eq!(health.plan, "Ultra");
+        assert_eq!(health.credits, "on-demand: $2411.22 of $2500.00");
+        let windows: Vec<(&str, i64)> = health
+            .windows
+            .iter()
+            .map(|w| (w.label.as_str(), w.used_percent))
+            .collect();
+        assert_eq!(
+            windows,
+            vec![
+                ("Included usage", 36),
+                ("Included (API models)", 100),
+                ("Included (Auto)", 2),
+                ("On-demand spend", 96),
+            ]
+        );
+        // billingCycleEnd is millis-as-string; all meters share the reset.
+        assert!(health.windows[0].resets.starts_with("resets in 9d"));
+        assert!(
+            health
+                .windows
+                .iter()
+                .all(|w| w.resets == health.windows[0].resets)
+        );
+    }
+
+    #[test]
+    fn dashboard_usage_pooled_spend_and_missing_pieces() {
+        // Team accounts pool the on-demand limit; missing plan buckets and
+        // plan info must not produce windows or a plan name.
+        let usage = json!({
+            "planUsage": { "totalPercentUsed": 12.4 },
+            "spendLimitUsage": { "pooledLimit": 100000, "pooledUsed": 25000 },
+        });
+        let health = parse_dashboard_usage("cursor", &usage, None);
+        assert_eq!(health.status, "ok");
+        assert_eq!(health.plan, "");
+        let windows: Vec<(&str, i64)> = health
+            .windows
+            .iter()
+            .map(|w| (w.label.as_str(), w.used_percent))
+            .collect();
+        assert_eq!(
+            windows,
+            vec![("Included usage", 12), ("On-demand spend", 25)]
+        );
+        assert_eq!(health.credits, "on-demand: $250.00 of $1000.00");
+        assert_eq!(health.windows[0].resets, "", "no cycle end reported");
+
+        // Nothing usable at all → unavailable.
+        let health = parse_dashboard_usage("cursor", &json!({}), None);
+        assert_eq!(health.status, "unavailable");
+        assert!(health.note.contains("logged in"));
+    }
+
+    #[test]
+    fn reads_cli_token_from_auth_json() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("auth.json");
+
+        std::fs::write(&path, r#"{"accessToken":"tok-1","refreshToken":"r"}"#).unwrap();
+        assert_eq!(read_cli_token(&path).unwrap(), "tok-1");
+
+        // API-key logins store only apiKey.
+        std::fs::write(&path, r#"{"apiKey":"key-1"}"#).unwrap();
+        assert_eq!(read_cli_token(&path).unwrap(), "key-1");
+
+        std::fs::write(&path, r#"{}"#).unwrap();
+        let err = read_cli_token(&path).unwrap_err().to_string();
+        assert!(err.contains("no access token"), "{err}");
+
+        let err = read_cli_token(&dir.path().join("missing.json"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("cursor-agent login"), "{err}");
+    }
 
     #[test]
     fn acp_mcp_servers_shape() {
