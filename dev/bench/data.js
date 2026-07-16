@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1784227758137,
+  "lastUpdate": 1784227822339,
   "repoUrl": "https://github.com/jimsimon/trouve",
   "entries": {
     "e2e-benchmarks": [
@@ -2449,6 +2449,54 @@ window.BENCHMARK_DATA = {
             "name": "dense_query_20k_rows",
             "value": 1382023.9784946237,
             "range": "± 8998",
+            "unit": "ns"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "29139614+renovate[bot]@users.noreply.github.com",
+            "name": "renovate[bot]",
+            "username": "renovate[bot]"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "535ba8a92c4822065cd15153270198895c8a3728",
+          "message": "Update Rust crate bytemuck to v1.25.1 (#46)\n\nCo-authored-by: renovate[bot] <29139614+renovate[bot]@users.noreply.github.com>",
+          "timestamp": "2026-07-16T13:46:47-05:00",
+          "tree_id": "e9febd89c0e08058f27790ba658469b137f33750",
+          "url": "https://github.com/jimsimon/trouve/commit/535ba8a92c4822065cd15153270198895c8a3728"
+        },
+        "date": 1784227822018,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "bm25_build_5k_docs",
+            "value": 4847701.300000001,
+            "range": "± 7624",
+            "unit": "ns"
+          },
+          {
+            "name": "bm25_query_5k_docs",
+            "value": 37080.558209351315,
+            "range": "± 9",
+            "unit": "ns"
+          },
+          {
+            "name": "chunk_python_200_functions",
+            "value": 3023624.205882353,
+            "range": "± 1680",
+            "unit": "ns"
+          },
+          {
+            "name": "dense_query_20k_rows",
+            "value": 1370150.6257375912,
+            "range": "± 9661",
             "unit": "ns"
           }
         ]
