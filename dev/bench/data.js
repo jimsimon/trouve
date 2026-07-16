@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1784237335213,
+  "lastUpdate": 1784237356611,
   "repoUrl": "https://github.com/jimsimon/trouve",
   "entries": {
     "e2e-benchmarks": [
@@ -1247,6 +1247,54 @@ window.BENCHMARK_DATA = {
             "name": "non-git warm query",
             "value": 66.3395722,
             "range": "± 1.7",
+            "unit": "ms"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "jim.j.simon@gmail.com",
+            "name": "Jim Simon",
+            "username": "jimsimon"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "dde35349457fb61a6897187e7f36e5b09ac7965b",
+          "message": "Batch semver minor and patch updates into one Renovate PR (#51)\n\nAdd a catch-all package rule (equivalent to the group:allNonMajor preset)\ndeclared last so it takes precedence over the tree-sitter and GitHub\nActions groups for non-major updates; those groups still apply to major\nand digest updates.\n\nCo-authored-by: Cursor Agent <cursoragent@cursor.com>\nCo-authored-by: Jim Simon <jimsimon@users.noreply.github.com>",
+          "timestamp": "2026-07-16T17:26:44-04:00",
+          "tree_id": "265dddfd2b0b42c9cab7ff2ed217248290e91f4b",
+          "url": "https://github.com/jimsimon/trouve/commit/dde35349457fb61a6897187e7f36e5b09ac7965b"
+        },
+        "date": 1784237355679,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "cold index + query",
+            "value": 127.28705942000002,
+            "range": "± 3.2",
+            "unit": "ms"
+          },
+          {
+            "name": "warm query",
+            "value": 67.12356890000001,
+            "range": "± 1.1",
+            "unit": "ms"
+          },
+          {
+            "name": "incremental (1 file modified)",
+            "value": 77.02380334,
+            "range": "± 1.3",
+            "unit": "ms"
+          },
+          {
+            "name": "non-git warm query",
+            "value": 64.71711210000001,
+            "range": "± 1",
             "unit": "ms"
           }
         ]
