@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1784237581851,
+  "lastUpdate": 1784239748164,
   "repoUrl": "https://github.com/jimsimon/trouve",
   "entries": {
     "e2e-benchmarks": [
@@ -1343,6 +1343,54 @@ window.BENCHMARK_DATA = {
             "name": "non-git warm query",
             "value": 71.39290584,
             "range": "± 0.9",
+            "unit": "ms"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "jim.j.simon@gmail.com",
+            "name": "Jim Simon",
+            "username": "jimsimon"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "df291297455e495895baf13dd73de45d176fa3b2",
+          "message": "Offline mode: gate prompt entry, keep local models usable, announce recovery (#49)\n\n* Report server connectivity; list only runnable models offline\n\nThe server owns internet reachability (it talks to the model vendors):\nan opt-in probe monitors it, transitions land in the event log as\nserver.connectivity_changed, and ServerInfo.online carries the snapshot.\nWhile offline /v1/models drops remote providers and vendor backends\ninstead of degrading to static fallback catalogs (the lone cursor/default\nentry) — only the local provider and loopback endpoints survive, so\nclients can gate prompt entry on the list being non-empty.\n\nProbing is wired only in the standalone server binary; probe-less\nengines always report online, keeping cargo test offline-safe.\n\nProtocol 0.18 -> 0.19 (additive).\n\nCo-authored-by: Jim Simon <jimsimon@users.noreply.github.com>\n\n* Gate prompt entry and explain when the server is offline\n\nInstead of silently showing vendor fallback models, the app now reacts\nto the server's connectivity state: an offline banner appears on the\nchat composer, the new-session/new-thread form, and the automations\nscreen. With local models available the pickers stay usable (restricted\nto them by the server-filtered list); with nothing usable all prompt\ninputs — composer, pickers, model knobs, attach/send, queue send-now,\nautomation add/edit/run — are disabled with the reason shown. Recovery\nre-enables everything, refreshes the model list, and shows a transient\nback-online notice.\n\nCo-authored-by: Jim Simon <jimsimon@users.noreply.github.com>\n\n* Detect a lost server connection; auto-respawn the local server\n\nThe offline banner only covers what the server reports about its own\ninternet — it says nothing when the server itself becomes unreachable\n(crashed local child, or the client's network for TROUVE_SERVER_URL\nsetups). The app previously just went quiet with stale data.\n\nThe server-events follow task now doubles as a connection watchdog:\nwhen the stream drops it probes /v1/info; three consecutive failures\nraise a red blocking banner (worded for local vs remote), and the first\nsuccessful probe clears it, refetches the connectivity snapshot (replay\ndrops stale connectivity events, so the offline flag could otherwise\nstick wrong), reloads catalogs/sessions, and shows a transient\nreconnected notice.\n\nFor the locally spawned server, a watcher task owns the child and\nreports its exit; the app respawns it once on the same address/token\n(60s crash-loop guard) and only asks for an app restart when that\nfails.\n\nCo-authored-by: Jim Simon <jimsimon@users.noreply.github.com>\n\n* Address review feedback on offline mode\n\n- is_loopback_base_url parses the URL authority and requires an exact\n  localhost host or a loopback IP; substring matching also accepted\n  remote hosts like localhost.attacker.example and would have enabled\n  offline prompts against endpoints that still need the internet.\n  build_provider's keyless-local check now shares the same parser.\n  Regression tests cover the hostname-suffix tricks.\n- ServerConnectionLost/Restored revalidate client.info() before\n  applying: the watchdog and child watcher enqueue independently, so a\n  queued transition can be stale and must not unblock a dead server or\n  re-block a recovered one.\n- A respawned server that never becomes ready is killed and reaped\n  instead of lingering unwatched; ownership moves to the child watcher\n  only after readiness.\n- Automations Pause/Resume and Delete gate on !root.blocked like Run\n  now and Edit.\n- DropUpPicker and SearchPicker close their popup when disabled and\n  ignore clicks/Enter inside an already-open popup, so a mid-\n  interaction disconnect can't submit through a stale popup.\n\nCo-authored-by: Jim Simon <jimsimon@users.noreply.github.com>\n\n* Make connectivity blocking authoritative in the command loop\n\nThe UI disabling controls is cosmetic: a command already queued when\nconnectivity flipped (or a click racing the banner) still reached the\nclient. A shared connectivity_blocked() predicate now feeds both the\nbanner gate and an early rejection in handle() for prompt, queue, and\nautomation commands, so the two sides can't disagree.\n\nOn the UI side the queued-prompt panel now disables drag, reorder,\nedit, save, and delete alongside Send now while blocked, and a\nmid-drag or mid-edit connectivity loss drops the drag state and the\nopen editor instead of leaving them stuck.\n\nCo-authored-by: Jim Simon <jimsimon@users.noreply.github.com>\n\n* Gate composer knob changes behind the connectivity block too\n\nThe mode/model/thinking/context/fast pickers were only UI-disabled\nwhile blocked; a queued command racing the flip could still mutate the\nthread's model and options through update_current_thread. They now sit\nin the same authoritative rejection list as SendMessage and the queue\ncommands. Pickers re-sync from actual thread state on reconnect, so a\nrejected change can't leave them silently drifted.\n\nCo-authored-by: Jim Simon <jimsimon@users.noreply.github.com>\n\n---------\n\nCo-authored-by: Cursor Agent <cursoragent@cursor.com>\nCo-authored-by: Jim Simon <jimsimon@users.noreply.github.com>",
+          "timestamp": "2026-07-16T18:07:34-04:00",
+          "tree_id": "94f1e14456bf8490f3834a93deca40c468b01156",
+          "url": "https://github.com/jimsimon/trouve/commit/df291297455e495895baf13dd73de45d176fa3b2"
+        },
+        "date": 1784239747092,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "cold index + query",
+            "value": 126.73487752000001,
+            "range": "± 18.2",
+            "unit": "ms"
+          },
+          {
+            "name": "warm query",
+            "value": 72.27744544000001,
+            "range": "± 1.4",
+            "unit": "ms"
+          },
+          {
+            "name": "incremental (1 file modified)",
+            "value": 80.94189304000001,
+            "range": "± 1.3",
+            "unit": "ms"
+          },
+          {
+            "name": "non-git warm query",
+            "value": 70.82841580000002,
+            "range": "± 12.9",
             "unit": "ms"
           }
         ]
