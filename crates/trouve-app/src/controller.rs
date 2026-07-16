@@ -2925,7 +2925,12 @@ impl Controller {
                 | UiCommand::QueueDelete(_)
                 | UiCommand::QueueMove { .. }
                 | UiCommand::QueueReorder { .. }
-                | UiCommand::QueueSendNow => {
+                | UiCommand::QueueSendNow
+                | UiCommand::ComposerModeChanged(_)
+                | UiCommand::ComposerModelChanged(_)
+                | UiCommand::ComposerThinkingChanged(_)
+                | UiCommand::ComposerContextChanged(_)
+                | UiCommand::ComposerFastToggled(_) => {
                     self.error(&format!("Can't do that right now — {reason}."));
                     return Ok(());
                 }
