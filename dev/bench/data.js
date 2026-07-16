@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1784244581887,
+  "lastUpdate": 1784244652130,
   "repoUrl": "https://github.com/jimsimon/trouve",
   "entries": {
     "e2e-benchmarks": [
@@ -2833,6 +2833,54 @@ window.BENCHMARK_DATA = {
             "name": "dense_query_20k_rows",
             "value": 1374265.0645586299,
             "range": "± 7451",
+            "unit": "ns"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "jim.j.simon@gmail.com",
+            "name": "Jim Simon",
+            "username": "jimsimon"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "479651d54acf0500041f4cbc74e51416e28e78a5",
+          "message": "Prefer the Skia renderer to fix screen artifacts while typing (#57)\n\nThe default FemtoVG renderer corrupts its glyph atlas on some Linux\ndrivers, flashing garbage across the window whenever text changes\n(typing) or the window repaints (e.g. a desktop notification appearing).\nRequest Skia at startup, fall back to the default selection if it can't\ninitialize, and leave the choice alone when SLINT_BACKEND is set —\nBackendSelector only reads the env var for requirements left unset.\n\nCo-authored-by: Claude Fable 5 <noreply@anthropic.com>",
+          "timestamp": "2026-07-16T19:27:12-04:00",
+          "tree_id": "d6180a19c46aac5cd9b14088f5620cae26de5604",
+          "url": "https://github.com/jimsimon/trouve/commit/479651d54acf0500041f4cbc74e51416e28e78a5"
+        },
+        "date": 1784244651347,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "bm25_build_5k_docs",
+            "value": 4867041.818181818,
+            "range": "± 9421",
+            "unit": "ns"
+          },
+          {
+            "name": "bm25_query_5k_docs",
+            "value": 37113.87608932462,
+            "range": "± 9",
+            "unit": "ns"
+          },
+          {
+            "name": "chunk_python_200_functions",
+            "value": 3011513.4117647056,
+            "range": "± 6461",
+            "unit": "ns"
+          },
+          {
+            "name": "dense_query_20k_rows",
+            "value": 1363207.825,
+            "range": "± 7188",
             "unit": "ns"
           }
         ]
