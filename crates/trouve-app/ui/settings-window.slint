@@ -1,0 +1,2143 @@
+// Settings screen: provider configuration (incl. vendor CLIs), default
+// model, agent modes, and the About section (AboutSlint attribution lives
+// here, reachable from the left-column footer — royalty-free license
+// requirement). Rendered full-window over the main layout; a side nav
+// switches between sections and the header's Close button returns to the
+// previous screen.
+//
+// Like the main window, this is dumb: models in, callbacks out.
+
+import {
+    AboutSlint, Button, CheckBox, ComboBox, LineEdit, ListView, ScrollView, Switch, TextEdit
+} from "std-widgets.slint";
+import { ScrollKeys } from "scroll-keys.slint";
+import { Theme } from "theme.slint";
+
+export struct ProviderItem {
+    id: string,
+    kind: string,
+    base-url: string,
+    has-credentials: bool,
+    auth: string,
+    experimental: bool,
+}
+
+// A vendor CLI (cursor-agent, claude, codex) trouve can download and manage.
+export struct CliItem {
+    id: string,
+    display-name: string,
+    // "not installed" / "1.2.3 (system)" / "1.2.3 (managed)" ...
+    version-label: string,
+    // "Install" / "Update" / "" (hidden when up to date and managed)
+    action-label: string,
+    // In-flight install feedback ("downloading…", "failed: …").
+    status: string,
+    busy: bool,
+    // Download percent while busy (-1 when the size is unknown).
+    progress: int,
+    // trouve-managed install exists (can be uninstalled).
+    managed: bool,
+}
+
+// Subscription usage for one agent-backend provider (flat: up to four
+// metered windows — Codex reports two, Claude Code up to four with
+// model-scoped weekly buckets).
+export struct SubscriptionItem {
+    provider: string,
+    // "ok" / "unavailable" / "unsupported"
+    status: string,
+    plan: string,
+    credits: string,
+    // Explanation for unavailable/unsupported entries.
+    note: string,
+    has-w1: bool,
+    w1-label: string,
+    w1-pct: int,
+    w1-resets: string,
+    has-w2: bool,
+    w2-label: string,
+    w2-pct: int,
+    w2-resets: string,
+    has-w3: bool,
+    w3-label: string,
+    w3-pct: int,
+    w3-resets: string,
+    has-w4: bool,
+    w4-label: string,
+    w4-pct: int,
+    w4-resets: string,
+}
+
+// One agent mode for the Modes & Models section. allowed-tools is
+// comma-joined for display and the edit form; model-index is the mode's
+// default model as an index into the models list (-1 = global default).
+export struct ModeItem {
+    id: string,
+    display-name: string,
+    // "builtin" (pristine), "customized" (built-in with a user override),
+    // "custom" (user-added), "workspace" (.agents/modes — file-managed).
+    origin: string,
+    read-only: bool,
+    system-prompt: string,
+    allowed-tools: string,
+    // 0 ask, 1 allow-list, 2 yolo.
+    permission-index: int,
+    model-index: int,
+}
+
+// Auth state of one GitHub host (github.com or an enterprise instance).
+export struct GithubHostItem {
+    host: string,
+    configured: bool,
+    // "environment" / "oauth" / "settings" / "gh-cli" / "".
+    source: string,
+    // The host has a device-flow OAuth app client id configured.
+    oauth-available: bool,
+    // Enterprise hosts can be removed; github.com cannot.
+    removable: bool,
+}
+
+// One local (offline) model: a curated or user-added GGUF with its
+// download state and how well it fits the machine's memory.
+export struct LocalModelItem {
+    id: string,
+    name: string,
+    // Non-empty renders this row as a section header ("On this machine",
+    // "Recommended") instead of a model row; other fields are ignored.
+    header: string,
+    // "7B · 4.7 GB"
+    meta: string,
+    // "gpu" / "cpu" / "too-large"
+    fit: string,
+    // "fits your GPU" / "runs on CPU (slower)" / "needs more memory"
+    fit-label: string,
+    notes: string,
+    downloaded: bool,
+    downloading: bool,
+    // 0-99 while downloading.
+    progress: int,
+    // "downloading… 1200 MB / 4700 MB (25%) · 12.3 MB/s" while downloading.
+    download-line: string,
+    error: string,
+    // User-added entries can be removed from the list entirely.
+    custom: bool,
+}
+
+// One HuggingFace repo matching a local-model search. Parallel arrays
+// describe its single-file GGUFs; `recommended` picks the default.
+export struct LocalSearchItem {
+    repo: string,
+    // "180k downloads · 313 likes"
+    meta: string,
+    // Quant picker options ("Q4_K_M · 4.4 GB"; filename when no quant).
+    file-labels: [string],
+    // Repo-relative filenames, ready for local-added(repo, file).
+    file-names: [string],
+    // Per file: "gpu" / "cpu" / "too-large" and its human label.
+    file-fits: [string],
+    file-fit-labels: [string],
+    // Per file: already in the local model list.
+    file-added: [bool],
+    recommended: int,
+}
+
+// A user-managed MCP server (first-party servers trouve injects itself are
+// never listed). command-line and env-lines are pre-rendered for display
+// and round-trip through the edit form.
+export struct McpServerItem {
+    name: string,
+    // "user" (app-wide config dir, every workspace) or "workspace"
+    // (.agents/.mcp.json).
+    scope: string,
+    // Which workspace's config the entry lives in (workspace scope only).
+    workspace-id: string,
+    workspace-name: string,
+    // Command plus args, shell-quoted.
+    command-line: string,
+    // One KEY=VALUE per line ("" when none).
+    env-lines: string,
+    // "ok" / "error" / "disabled" / "checking"
+    health: string,
+    // "5 tools" or the failure reason.
+    detail: string,
+}
+
+// A well-known provider preset served by the backend; picking one prefills
+// the add/edit form so nothing has to be typed by hand.
+export struct KnownProviderItem {
+    id: string,
+    display-name: string,
+    kind: string,
+    base-url: string,
+    api-key-env: string,
+    // "api-key", "oauth" (subscription login), "cli" (vendor CLI holds the
+    // subscription auth), or "none" (keyless local).
+    auth: string,
+    // Undocumented vendor endpoint; may break or be restricted at any time.
+    experimental: bool,
+}
+
+// A thin determinate download bar (accent fill over the control track).
+component DownloadBar inherits Rectangle {
+    in property <int> pct; // 0-100
+    height: 5px;
+    border-radius: 2.5px;
+    background: Theme.c.control-bg;
+    clip: true;
+    Rectangle {
+        x: 0;
+        width: max(parent.width * min(root.pct, 100) / 100, root.pct > 0 ? 5px : 0px);
+        height: parent.height;
+        border-radius: 2.5px;
+        background: Theme.c.accent;
+    }
+}
+
+// An On/Off pill with a wrapping description beside it (the style the
+// Appearance section's "Reduce motion" established).
+component ToggleRow inherits HorizontalLayout {
+    in-out property <bool> on;
+    in property <string> label;
+    callback toggled(bool);
+    spacing: 10px;
+    Rectangle {
+        width: 44px;
+        height: Theme.fs(26px);
+        background: root.on ? Theme.c.accent-bg : Theme.c.control-bg;
+        border-radius: 6px;
+        border-width: 1px;
+        border-color: root.on ? Theme.c.primary-border : Theme.c.border;
+        TouchArea {
+            clicked => {
+                root.on = !root.on;
+                root.toggled(root.on);
+            }
+        }
+        Text {
+            text: root.on ? "On" : "Off";
+            color: root.on ? Theme.c.text-hi : Theme.c.text-soft;
+            font-size: Theme.fs(12px);
+            horizontal-alignment: center;
+            vertical-alignment: center;
+        }
+    }
+    Text {
+        text: root.label;
+        color: Theme.c.text-mid;
+        font-size: Theme.fs(12px);
+        vertical-alignment: center;
+        wrap: word-wrap;
+        horizontal-stretch: 1;
+    }
+}
+
+// One metered subscription window: label, usage bar, reset note. The bar
+// shifts to warn/err colors as the window fills up.
+component SubscriptionMeter inherits VerticalLayout {
+    in property <string> label;
+    in property <int> pct;
+    in property <string> resets;
+    spacing: 3px;
+    HorizontalLayout {
+        Text {
+            text: root.label;
+            color: Theme.c.text-mid;
+            font-size: Theme.fs(11px);
+            horizontal-stretch: 1;
+        }
+        Text {
+            text: root.pct + "% used" + (root.resets != "" ? " · " + root.resets : "");
+            color: root.pct >= 90 ? Theme.c.err : Theme.c.text-mid;
+            font-size: Theme.fs(11px);
+        }
+    }
+    Rectangle {
+        height: 6px;
+        border-radius: 3px;
+        background: Theme.c.control-bg;
+        Rectangle {
+            x: 0;
+            width: max(parent.width * root.pct / 100, root.pct > 0 ? 6px : 0px);
+            height: parent.height;
+            border-radius: 3px;
+            background: root.pct >= 90 ? Theme.c.err
+                : root.pct >= 70 ? Theme.c.warn : Theme.c.ok;
+        }
+    }
+}
+
+export component SettingsScreen inherits Rectangle {
+    background: Theme.c.win-bg;
+
+    in property <[ProviderItem]> providers;
+    in property <[CliItem]> clis;
+    in property <[KnownProviderItem]> known-providers;
+    // Preset display names (alphabetical; index i maps to
+    // known-providers[i]) followed by "Custom" as the last entry.
+    in property <[string]> known-provider-names;
+    in property <[string]> models;
+    in property <int> default-model-index: -1;
+    // Modes & Models section: full mode cards plus the per-mode model
+    // picker options ("Global default" followed by every model id).
+    in property <[ModeItem]> mode-items;
+    in property <[string]> mode-model-names;
+    in property <string> settings-status: "";
+
+    // Provider form state (prefilled by "Edit" or a preset).
+    in-out property <string> form-id: "";
+    in-out property <string> form-base-url: "";
+    in-out property <int> form-kind-index: 0;
+    // Wire kind actually saved; presets can carry kinds beyond the custom
+    // combo's two entries (codex-app-server, cursor-cli, claude-cli, ...).
+    in-out property <string> form-kind: "openai-compat";
+    in-out property <string> form-hint: "";
+    in-out property <bool> form-warning: false;
+    // Index into known-provider-names: a preset (fields hidden, prefilled
+    // from known-providers[index]) or the trailing "Custom" entry (id/kind/
+    // url fields shown). The controller points it at Custom on load.
+    in-out property <int> preset-index: 0;
+    property <bool> preset-is-custom: root.preset-index >= root.known-providers.length;
+    property <string> preset-auth:
+        !root.preset-is-custom && root.preset-index >= 0
+            ? root.known-providers[root.preset-index].auth
+            : "api-key";
+
+    // Appearance: built-in theme names, font sizes, and font families come
+    // from Rust; the pickers report index selections back.
+    in property <[string]> theme-names;
+    in-out property <int> theme-index: 0;
+    in property <[string]> font-size-names;
+    in-out property <int> font-size-index: 0;
+    in property <[string]> font-names;
+    in-out property <int> font-index: 0;
+    in-out property <bool> reduce-motion: false;
+
+    // Desktop notifications: master switch, per-event toggles, sound.
+    // Toggles report through notify-pref-toggled(which, on) — which is
+    // 0 enabled, 1 finish, 2 fail, 3 attention, 4 sound.
+    in-out property <bool> notify-enabled: true;
+    in-out property <bool> notify-finish: true;
+    in-out property <bool> notify-fail: true;
+    in-out property <bool> notify-attention: true;
+    in-out property <bool> notify-sound: false;
+    callback notify-pref-toggled(/* which */ int, /* on */ bool);
+    callback notify-test();
+
+    callback provider-saved(/* id */ string, /* kind */ string,
+                            /* base-url */ string, /* api-key */ string);
+    callback provider-deleted(string);
+    callback provider-login(string);
+    callback default-model-picked(int);
+    // Mode CRUD. mode-deleted covers both "Remove" (custom modes) and
+    // "Reset to defaults" (customized built-ins) — both drop the user file.
+    callback mode-saved(/* id */ string, /* display-name */ string,
+                        /* system-prompt */ string, /* allowed-tools */ string,
+                        /* read-only */ bool, /* permission-index */ int,
+                        /* model-index */ int);
+    callback mode-deleted(string);
+    callback mode-model-picked(/* id */ string, /* model-index */ int);
+    callback refresh-settings();
+    callback cli-install(/* id */ string);
+    callback cli-cancel(/* id */ string);
+    callback cli-uninstall(/* id */ string);
+    callback theme-picked(int);
+    callback font-size-picked(int);
+    callback font-picked(int);
+    callback reduce-motion-toggled(bool);
+    callback close();
+
+    // Integrations: per-host GitHub auth state comes from the server —
+    // github.com first, then configured enterprise hosts. Saving an empty
+    // token disconnects a host.
+    in property <[GithubHostItem]> github-hosts;
+    callback github-token-saved(/* host */ string, /* token */ string);
+    callback github-host-added(/* host */ string, /* client-id */ string);
+    callback github-host-removed(/* host */ string);
+
+    // Subscription health (Providers section).
+    in property <[SubscriptionItem]> subscriptions;
+    in property <string> subscriptions-status: "";
+
+    // Local Models section: hardware line, llama.cpp runtime state, the
+    // running sidecar, and the model list.
+    in property <[LocalModelItem]> local-models;
+    in property <bool> local-enabled: true;
+    in property <string> local-hw-line;
+    in property <string> local-runtime-label;
+    // "Install" when not installed, "" otherwise (updates are a separate
+    // button shown only when one is actually available).
+    in property <string> local-runtime-action;
+    in property <bool> local-runtime-busy;
+    // Download percent while busy (-1 when the size is unknown).
+    in property <int> local-runtime-progress: -1;
+    // trouve-managed runtime install (updatable / uninstallable here).
+    in property <bool> local-runtime-managed;
+    // A newer llama.cpp build is available for a managed install.
+    in property <bool> local-runtime-update;
+    in property <string> local-runtime-status;
+    // "llama-server is running <model>" or "" when stopped.
+    in property <string> local-server-line;
+    // Sidecar is loading a model (no stop/restart until it settles).
+    in property <bool> local-server-busy;
+    in property <string> local-status;
+    // HuggingFace model search (replaces the old manual repo/file form).
+    in-out property <string> local-search-query;
+    // Result filters by how a repo's files fit this machine; the
+    // controller filters the result list it pushes back.
+    in-out property <bool> local-search-fit-gpu: true;
+    in-out property <bool> local-search-fit-cpu: true;
+    in-out property <bool> local-search-fit-large: false;
+    callback local-search-filters-changed(/* gpu */ bool, /* cpu */ bool, /* too-large */ bool);
+    in property <[LocalSearchItem]> local-search-results;
+    // "Searching…", an error, or "" when idle.
+    in property <string> local-search-status;
+    callback local-search(/* query */ string);
+    callback local-refresh();
+    callback local-enabled-toggled(bool);
+    callback local-runtime-install();
+    callback local-runtime-cancel();
+    callback local-runtime-uninstall();
+    callback local-download(/* id */ string);
+    callback local-cancel(/* id */ string);
+    callback local-delete(/* id */ string);
+    callback local-stop-server();
+    callback local-restart-server();
+    callback local-added(/* repo */ string, /* file */ string);
+
+    // MCP servers (app-wide config + every registered workspace).
+    in property <[McpServerItem]> mcp-servers;
+    in property <string> mcp-status: "";
+    // Logs viewer: non-empty name shows the panel.
+    in property <string> mcp-logs-name: "";
+    in property <string> mcp-logs-text: "";
+    // Registered workspaces for the workspace-scope picker (parallel
+    // arrays: names for display, ids for the callbacks).
+    in property <[string]> mcp-workspace-names;
+    in property <[string]> mcp-workspace-ids;
+    // Add/edit form state. scope is fixed by the button that opened the
+    // form; editing locks the name (it is the file key) and the workspace.
+    in-out property <bool> mcp-form-open: false;
+    in-out property <bool> mcp-form-editing: false;
+    in-out property <string> mcp-form-scope: "user";
+    in-out property <string> mcp-form-name: "";
+    in-out property <string> mcp-form-command: "";
+    in-out property <string> mcp-form-env: "";
+    in-out property <string> mcp-form-workspace-id: "";
+    in-out property <string> mcp-form-workspace-name: "";
+    callback mcp-refresh();
+    callback mcp-saved(/* name */ string, /* scope */ string,
+                       /* command-line */ string, /* env-lines */ string,
+                       /* workspace-id */ string);
+    callback mcp-deleted(/* name */ string, /* scope */ string,
+                         /* workspace-id */ string);
+    callback mcp-logs-requested(string);
+    callback mcp-logs-closed();
+
+    // Mode add/edit form state. Editing locks the id (it is the file key);
+    // saving under a built-in id customizes that built-in.
+    in-out property <bool> mode-form-open: false;
+    in-out property <bool> mode-form-editing: false;
+    in-out property <string> mode-form-id: "";
+    in-out property <string> mode-form-display: "";
+    in-out property <string> mode-form-prompt: "";
+    in-out property <string> mode-form-tools: "";
+    in-out property <bool> mode-form-readonly: false;
+    in-out property <int> mode-form-permission: 0;
+    in-out property <int> mode-form-model: -1;
+
+    // Side-nav selection: 0 providers, 1 modes & models, 2 local models,
+    // 3 mcp servers, 4 integrations, 5 appearance, 6 notifications,
+    // 7 about. in-out so the app can open straight to a section (e.g. the
+    // PR tab's "set up GitHub" button).
+    in-out property <int> section: 0;
+    property <[string]> section-names: ["Providers", "Modes & Models", "Local Models", "MCP Servers", "Integrations", "Appearance", "Notifications", "About"];
+
+    VerticalLayout {
+        // Header: title + a way back to wherever the user came from.
+        Rectangle {
+            height: Theme.fs(44px);
+            background: Theme.c.panel-bg;
+            HorizontalLayout {
+                padding-left: 16px;
+                padding-right: 10px;
+                spacing: 8px;
+                Text {
+                    text: "Settings";
+                    color: Theme.c.text-hi;
+                    font-size: Theme.fs(16px);
+                    font-weight: 700;
+                    vertical-alignment: center;
+                    horizontal-stretch: 1;
+                }
+                VerticalLayout {
+                    alignment: center;
+                    Button {
+                        text: "✕ Close";
+                        clicked => { root.close(); }
+                    }
+                }
+            }
+        }
+
+        // Centered fixed-width block: section nav on the left, the active
+        // section's content beside it.
+        HorizontalLayout {
+            vertical-stretch: 1;
+            Rectangle { horizontal-stretch: 1; }
+
+            // ---------------- section nav ----------------
+            VerticalLayout {
+                width: 170px;
+                padding-top: 20px;
+                padding-right: 12px;
+                spacing: 2px;
+                alignment: start;
+                for name[i] in root.section-names: Rectangle {
+                    height: Theme.fs(32px);
+                    border-radius: 6px;
+                    background: root.section == i ? Theme.c.accent-bg
+                        : section-ta.has-hover ? Theme.c.raised-bg : transparent;
+                    section-ta := TouchArea {
+                        clicked => { root.section = i; }
+                    }
+                    Text {
+                        x: 12px;
+                        width: parent.width - 24px;
+                        height: 100%;
+                        text: name;
+                        // accent-bg pairs with the normal text ramp (not
+                        // on-accent, which is tuned for primary-bg).
+                        color: root.section == i ? Theme.c.text-hi : Theme.c.text-mid;
+                        font-size: Theme.fs(13px);
+                        vertical-alignment: center;
+                        overflow: elide;
+                    }
+                }
+            }
+
+            // ---------------- section content ----------------
+            Rectangle {
+                width: 640px;
+                ScrollKeys {
+                    target-y <=> body.viewport-y;
+                    page: body.visible-height;
+                    total: body.viewport-height;
+                body := ScrollView {
+                    width: 100%;
+                    height: 100%;
+                    VerticalLayout {
+                        padding: 16px;
+                        spacing: 12px;
+                        alignment: start;
+
+                        // ---------------- providers ----------------
+                        if root.section == 0: VerticalLayout {
+                            spacing: 12px;
+
+                            HorizontalLayout {
+                                Text {
+                                    text: "Providers";
+                                    color: Theme.c.text-hi;
+                                    font-size: Theme.fs(16px);
+                                    font-weight: 700;
+                                    vertical-alignment: center;
+                                    horizontal-stretch: 1;
+                                }
+                                Button {
+                                    text: "Refresh";
+                                    clicked => { root.refresh-settings(); }
+                                }
+                            }
+
+                            Rectangle {
+                                background: Theme.c.surface;
+                                border-radius: 6px;
+                                height: 150px;
+                                ListView {
+                                    for provider in root.providers: Rectangle {
+                                        height: Theme.fs(34px);
+                                        HorizontalLayout {
+                                            padding-left: 10px;
+                                            padding-right: 6px;
+                                            spacing: 8px;
+                                            Text {
+                                                text: provider.id;
+                                                color: Theme.c.text-hi;
+                                                font-size: Theme.fs(13px);
+                                                font-weight: 700;
+                                                vertical-alignment: center;
+                                                width: 110px;
+                                                overflow: elide;
+                                            }
+                                            Text {
+                                                text: provider.kind
+                                                    + (provider.base-url != "" ? "  ·  " + provider.base-url : "");
+                                                color: Theme.c.text-dim;
+                                                font-size: Theme.fs(12px);
+                                                vertical-alignment: center;
+                                                overflow: elide;
+                                                horizontal-stretch: 1;
+                                            }
+                                            if provider.experimental: Text {
+                                                text: "⚠ experimental";
+                                                color: Theme.c.err;
+                                                font-size: Theme.fs(11px);
+                                                vertical-alignment: center;
+                                            }
+                                            Text {
+                                                text: provider.auth == "oauth"
+                                                    ? (provider.has-credentials ? "✓ logged in" : "not logged in")
+                                                    : (provider.auth == "cli"
+                                                        ? (provider.has-credentials ? "✓ CLI ready" : "CLI not set up")
+                                                        : (provider.has-credentials ? "✓ credentials" : "no credentials"));
+                                                color: provider.has-credentials ? Theme.c.ok : Theme.c.warn;
+                                                font-size: Theme.fs(11px);
+                                                vertical-alignment: center;
+                                            }
+                                            if provider.auth == "oauth" || provider.auth == "cli": Button {
+                                                text: provider.has-credentials ? "Re-login" : "Log in";
+                                                clicked => { root.provider-login(provider.id); }
+                                            }
+                                            Button {
+                                                text: "Edit";
+                                                clicked => {
+                                                    root.preset-index = root.known-providers.length;
+                                                    root.form-id = provider.id;
+                                                    root.form-base-url = provider.base-url;
+                                                    root.form-kind-index = provider.kind == "anthropic" ? 1 : 0;
+                                                    root.form-kind = provider.kind;
+                                                    root.form-hint = "";
+                                                    root.form-warning = false;
+                                                }
+                                            }
+                                            Button {
+                                                text: "Remove";
+                                                clicked => { root.provider-deleted(provider.id); }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+
+                            // Provider add/edit form.
+                            Text {
+                                text: "Add or edit a provider";
+                                color: Theme.c.text-mid;
+                                font-size: Theme.fs(13px);
+                                font-weight: 700;
+                            }
+                            // Provider picker: a known preset prefills (and
+                            // hides) the id / protocol / URL details;
+                            // "Custom" shows them for hand entry.
+                            preset-box := ComboBox {
+                                model: root.known-provider-names;
+                                current-index <=> root.preset-index;
+                                selected => {
+                                    if (!root.preset-is-custom) {
+                                        root.form-id = root.known-providers[root.preset-index].id;
+                                        root.form-base-url = root.known-providers[root.preset-index].base-url;
+                                        root.form-kind = root.known-providers[root.preset-index].kind;
+                                        root.form-kind-index =
+                                            root.known-providers[root.preset-index].kind == "anthropic" ? 1 : 0;
+                                        root.form-warning = root.known-providers[root.preset-index].experimental;
+                                        root.form-hint =
+                                            root.known-providers[root.preset-index].experimental
+                                            ? "Experimental: talks to an undocumented vendor endpoint using your `codex login` token. OpenAI may break or restrict it at any time — use at your own risk. Save, then log in via the Codex CLI."
+                                            : (root.known-providers[root.preset-index].auth == "cli"
+                                                ? "Subscription via the vendor's CLI: install it, save, then click \"Log in\" in the list above (or log in from a terminal)."
+                                                : (root.known-providers[root.preset-index].auth == "oauth"
+                                                    ? "Subscription login: save, then click \"Log in\" in the list above."
+                                                    : (root.known-providers[root.preset-index].auth == "api-key"
+                                                        ? "Paste your API key below and save. Also honors the "
+                                                            + root.known-providers[root.preset-index].api-key-env
+                                                            + " environment variable."
+                                                        : "No API key needed — just save.")));
+                                    } else {
+                                        root.form-kind = root.form-kind-index == 1 ? "anthropic" : "openai-compat";
+                                        root.form-hint = "";
+                                        root.form-warning = false;
+                                    }
+                                }
+                            }
+                            if root.preset-is-custom: HorizontalLayout {
+                                spacing: 8px;
+                                LineEdit {
+                                    width: 150px;
+                                    placeholder-text: "id (e.g. openai)";
+                                    text <=> root.form-id;
+                                }
+                                ComboBox {
+                                    width: 150px;
+                                    model: ["openai-compat", "anthropic"];
+                                    current-index <=> root.form-kind-index;
+                                    selected => {
+                                        root.form-kind = root.form-kind-index == 1 ? "anthropic" : "openai-compat";
+                                    }
+                                }
+                                LineEdit {
+                                    horizontal-stretch: 1;
+                                    placeholder-text: "base URL (optional)";
+                                    text <=> root.form-base-url;
+                                }
+                            }
+                            HorizontalLayout {
+                                spacing: 8px;
+                                key-edit := LineEdit {
+                                    horizontal-stretch: 1;
+                                    visible: root.preset-auth == "api-key";
+                                    placeholder-text: "API key (stored in the OS keychain; leave empty to keep)";
+                                    input-type: password;
+                                }
+                                Button {
+                                    text: "Save provider";
+                                    primary: true;
+                                    enabled: root.form-id != "";
+                                    clicked => {
+                                        root.provider-saved(
+                                            root.form-id,
+                                            root.form-kind,
+                                            root.form-base-url,
+                                            key-edit.text);
+                                        key-edit.text = "";
+                                        root.form-hint = "";
+                                        root.form-warning = false;
+                                    }
+                                }
+                            }
+                            if root.form-hint != "": Text {
+                                text: root.form-hint;
+                                color: root.form-warning ? Theme.c.err : Theme.c.ok-dim;
+                                font-size: Theme.fs(12px);
+                                wrap: word-wrap;
+                            }
+                            if root.settings-status != "": Text {
+                                text: root.settings-status;
+                                color: Theme.c.accent-tint;
+                                font-size: Theme.fs(12px);
+                                wrap: word-wrap;
+                            }
+
+                            // ---------------- vendor CLIs ----------------
+                            Text {
+                                text: "Vendor CLIs";
+                                color: Theme.c.text-hi;
+                                font-size: Theme.fs(16px);
+                                font-weight: 700;
+                            }
+                            Text {
+                                text: "Agent backends (Cursor, Claude Code, Codex) run through the vendor's CLI. trouve can download and update these directly — managed installs live in trouve's data directory and take precedence over system packages.";
+                                color: Theme.c.text-soft;
+                                font-size: Theme.fs(11px);
+                                wrap: word-wrap;
+                            }
+                            Rectangle {
+                                background: Theme.c.surface;
+                                border-radius: 6px;
+                                height: 130px;
+                                ListView {
+                                    for cli in root.clis: Rectangle {
+                                        height: Theme.fs(42px);
+                                        HorizontalLayout {
+                                            padding-left: 10px;
+                                            padding-right: 6px;
+                                            spacing: 8px;
+                                            Text {
+                                                text: cli.display-name;
+                                                color: Theme.c.text-hi;
+                                                font-size: Theme.fs(13px);
+                                                font-weight: 700;
+                                                vertical-alignment: center;
+                                                width: 110px;
+                                                overflow: elide;
+                                            }
+                                            VerticalLayout {
+                                                alignment: center;
+                                                spacing: 4px;
+                                                horizontal-stretch: 1;
+                                                Text {
+                                                    text: cli.status != "" ? cli.status : cli.version-label;
+                                                    color: cli.status != "" ? Theme.c.accent-tint : Theme.c.text-dim;
+                                                    font-size: Theme.fs(12px);
+                                                    overflow: elide;
+                                                }
+                                                if cli.busy && cli.progress >= 0: DownloadBar {
+                                                    pct: cli.progress;
+                                                }
+                                            }
+                                            if cli.busy: Button {
+                                                text: "Cancel";
+                                                clicked => { root.cli-cancel(cli.id); }
+                                            }
+                                            if !cli.busy && cli.action-label != "": Button {
+                                                text: cli.action-label;
+                                                clicked => { root.cli-install(cli.id); }
+                                            }
+                                            if !cli.busy && cli.managed: Button {
+                                                text: "Uninstall";
+                                                clicked => { root.cli-uninstall(cli.id); }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+
+                            // ---------------- subscription health ----------------
+                            Text {
+                                text: "Subscription health";
+                                color: Theme.c.text-hi;
+                                font-size: Theme.fs(16px);
+                                font-weight: 700;
+                            }
+                            Text {
+                                text: "How much of each subscription's metered allowance is used. Codex reports usage via its app-server and Claude Code via its CLI — Cursor does not provide subscription information to third parties.";
+                                color: Theme.c.text-soft;
+                                font-size: Theme.fs(11px);
+                                wrap: word-wrap;
+                            }
+                            if root.subscriptions-status != "": Text {
+                                text: root.subscriptions-status;
+                                color: Theme.c.text-soft;
+                                font-size: Theme.fs(12px);
+                            }
+                            if root.subscriptions.length == 0 && root.subscriptions-status == "": Text {
+                                text: "No agent-backend providers configured.";
+                                color: Theme.c.text-soft;
+                                font-size: Theme.fs(12px);
+                            }
+                            for sub in root.subscriptions: Rectangle {
+                                background: Theme.c.surface;
+                                border-radius: 6px;
+                                VerticalLayout {
+                                    padding: 12px;
+                                    spacing: 8px;
+                                    HorizontalLayout {
+                                        spacing: 8px;
+                                        Text {
+                                            text: sub.provider;
+                                            color: Theme.c.text-hi;
+                                            font-size: Theme.fs(13px);
+                                            font-weight: 700;
+                                            vertical-alignment: center;
+                                            horizontal-stretch: 1;
+                                        }
+                                        if sub.plan != "": Text {
+                                            text: sub.plan + " plan";
+                                            color: Theme.c.accent-tint;
+                                            font-size: Theme.fs(11px);
+                                            vertical-alignment: center;
+                                        }
+                                        if sub.credits != "": Text {
+                                            text: sub.credits;
+                                            color: Theme.c.text-mid;
+                                            font-size: Theme.fs(11px);
+                                            vertical-alignment: center;
+                                        }
+                                    }
+                                    if sub.status != "ok": Text {
+                                        text: sub.note;
+                                        color: sub.status == "unavailable" ? Theme.c.warn : Theme.c.text-soft;
+                                        font-size: Theme.fs(11px);
+                                        wrap: word-wrap;
+                                    }
+                                    if sub.has-w1: SubscriptionMeter {
+                                        label: sub.w1-label;
+                                        pct: sub.w1-pct;
+                                        resets: sub.w1-resets;
+                                    }
+                                    if sub.has-w2: SubscriptionMeter {
+                                        label: sub.w2-label;
+                                        pct: sub.w2-pct;
+                                        resets: sub.w2-resets;
+                                    }
+                                    if sub.has-w3: SubscriptionMeter {
+                                        label: sub.w3-label;
+                                        pct: sub.w3-pct;
+                                        resets: sub.w3-resets;
+                                    }
+                                    if sub.has-w4: SubscriptionMeter {
+                                        label: sub.w4-label;
+                                        pct: sub.w4-pct;
+                                        resets: sub.w4-resets;
+                                    }
+                                }
+                            }
+                        }
+
+                        // ---------------- modes & models ----------------
+                        if root.section == 1: VerticalLayout {
+                            spacing: 12px;
+
+                            Text {
+                                text: "Modes & Models";
+                                color: Theme.c.text-hi;
+                                font-size: Theme.fs(16px);
+                                font-weight: 700;
+                            }
+
+                            // No providers → every model selector below is
+                            // disabled; send the user to fix that first.
+                            if root.models.length == 0: Rectangle {
+                                background: Theme.c.surface;
+                                border-radius: 6px;
+                                height: no-models.preferred-height + 20px;
+                                no-models := HorizontalLayout {
+                                    padding: 10px;
+                                    spacing: 10px;
+                                    Text {
+                                        text: "No models available — configure a provider to enable the model selectors.";
+                                        color: Theme.c.warn;
+                                        font-size: Theme.fs(12px);
+                                        wrap: word-wrap;
+                                        vertical-alignment: center;
+                                        horizontal-stretch: 1;
+                                    }
+                                    Button {
+                                        text: "Configure providers";
+                                        primary: true;
+                                        clicked => { root.section = 0; }
+                                    }
+                                }
+                            }
+
+                            Text {
+                                text: "Global default model — used by new threads whose mode has no default of its own.";
+                                color: Theme.c.text-soft;
+                                font-size: Theme.fs(11px);
+                                wrap: word-wrap;
+                            }
+                            HorizontalLayout {
+                                spacing: 8px;
+                                model-box := ComboBox {
+                                    horizontal-stretch: 1;
+                                    model: root.models;
+                                    current-index: root.default-model-index;
+                                    enabled: root.models.length > 0;
+                                }
+                                Button {
+                                    text: "Set default";
+                                    enabled: root.models.length > 0 && model-box.current-index >= 0;
+                                    clicked => { root.default-model-picked(model-box.current-index); }
+                                }
+                            }
+
+                            Text {
+                                text: "Modes";
+                                color: Theme.c.text-hi;
+                                font-size: Theme.fs(14px);
+                                font-weight: 700;
+                            }
+                            Text {
+                                text: "A mode is a prompt, a tool policy, and default permissions. Editing a built-in saves an override in ~/.config/trouve/modes/; Reset removes it. Workspace modes (.agents/modes/) are file-managed and read-only here.";
+                                color: Theme.c.text-soft;
+                                font-size: Theme.fs(11px);
+                                wrap: word-wrap;
+                            }
+
+                            Rectangle {
+                                background: Theme.c.surface;
+                                border-radius: 6px;
+                                height: 240px;
+                                ListView {
+                                    for mode in root.mode-items: Rectangle {
+                                        height: Theme.fs(44px);
+                                        HorizontalLayout {
+                                            padding-left: 10px;
+                                            padding-right: 6px;
+                                            spacing: 8px;
+                                            VerticalLayout {
+                                                alignment: center;
+                                                horizontal-stretch: 1;
+                                                HorizontalLayout {
+                                                    spacing: 6px;
+                                                    alignment: start;
+                                                    Text {
+                                                        text: mode.display-name;
+                                                        color: Theme.c.text-hi;
+                                                        font-size: Theme.fs(13px);
+                                                        font-weight: 700;
+                                                        overflow: elide;
+                                                    }
+                                                    Text {
+                                                        text: mode.id
+                                                            + (mode.origin == "builtin" ? "" : "  ·  " + mode.origin)
+                                                            + (mode.read-only ? "  ·  read-only" : "");
+                                                        color: mode.origin == "customized" || mode.origin == "custom"
+                                                            ? Theme.c.accent-tint : Theme.c.text-dim;
+                                                        font-size: Theme.fs(11px);
+                                                        vertical-alignment: center;
+                                                    }
+                                                }
+                                                Text {
+                                                    text: mode.system-prompt;
+                                                    color: Theme.c.text-dim;
+                                                    font-size: Theme.fs(11px);
+                                                    overflow: elide;
+                                                }
+                                            }
+                                            // Per-mode default model; entry 0
+                                            // is "Global default".
+                                            VerticalLayout {
+                                                alignment: center;
+                                                ComboBox {
+                                                    width: 190px;
+                                                    model: root.mode-model-names;
+                                                    current-index: mode.model-index + 1;
+                                                    enabled: root.models.length > 0
+                                                        && mode.origin != "workspace";
+                                                    selected => {
+                                                        root.mode-model-picked(mode.id, self.current-index - 1);
+                                                    }
+                                                }
+                                            }
+                                            if mode.origin != "workspace": Button {
+                                                text: "Edit";
+                                                clicked => {
+                                                    root.mode-form-open = true;
+                                                    root.mode-form-editing = true;
+                                                    root.mode-form-id = mode.id;
+                                                    root.mode-form-display = mode.display-name;
+                                                    root.mode-form-prompt = mode.system-prompt;
+                                                    root.mode-form-tools = mode.allowed-tools;
+                                                    root.mode-form-readonly = mode.read-only;
+                                                    root.mode-form-permission = mode.permission-index;
+                                                    root.mode-form-model = mode.model-index;
+                                                }
+                                            }
+                                            if mode.origin == "customized": Button {
+                                                text: "Reset";
+                                                clicked => { root.mode-deleted(mode.id); }
+                                            }
+                                            if mode.origin == "custom": Button {
+                                                text: "Remove";
+                                                clicked => { root.mode-deleted(mode.id); }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+
+                            if !root.mode-form-open: HorizontalLayout {
+                                alignment: start;
+                                Button {
+                                    text: "+ Add mode";
+                                    clicked => {
+                                        root.mode-form-open = true;
+                                        root.mode-form-editing = false;
+                                        root.mode-form-id = "";
+                                        root.mode-form-display = "";
+                                        root.mode-form-prompt = "";
+                                        root.mode-form-tools = "";
+                                        root.mode-form-readonly = false;
+                                        root.mode-form-permission = 0;
+                                        root.mode-form-model = -1;
+                                    }
+                                }
+                            }
+
+                            // ----- add / edit form -----
+                            if root.mode-form-open: Rectangle {
+                                background: Theme.c.surface;
+                                border-radius: 6px;
+                                height: mode-form.preferred-height + 24px;
+                                mode-form := VerticalLayout {
+                                    padding: 12px;
+                                    spacing: 8px;
+                                    Text {
+                                        text: root.mode-form-editing
+                                            ? "Edit mode \"" + root.mode-form-id + "\""
+                                            : "Add mode";
+                                        color: Theme.c.text-mid;
+                                        font-size: Theme.fs(13px);
+                                        font-weight: 700;
+                                    }
+                                    HorizontalLayout {
+                                        spacing: 8px;
+                                        if !root.mode-form-editing: LineEdit {
+                                            width: 150px;
+                                            placeholder-text: "id (e.g. docs)";
+                                            text <=> root.mode-form-id;
+                                        }
+                                        LineEdit {
+                                            horizontal-stretch: 1;
+                                            placeholder-text: "display name";
+                                            text <=> root.mode-form-display;
+                                        }
+                                    }
+                                    Text {
+                                        text: "System prompt (appended to the base prompt):";
+                                        color: Theme.c.text-soft;
+                                        font-size: Theme.fs(11px);
+                                    }
+                                    TextEdit {
+                                        height: 90px;
+                                        text <=> root.mode-form-prompt;
+                                        wrap: word-wrap;
+                                    }
+                                    LineEdit {
+                                        placeholder-text: "allowed tools, comma-separated (empty = all tools)";
+                                        text <=> root.mode-form-tools;
+                                    }
+                                    HorizontalLayout {
+                                        spacing: 12px;
+                                        CheckBox {
+                                            text: "Read-only (never mutates the worktree)";
+                                            checked <=> root.mode-form-readonly;
+                                        }
+                                        Rectangle { horizontal-stretch: 1; }
+                                    }
+                                    HorizontalLayout {
+                                        spacing: 8px;
+                                        VerticalLayout {
+                                            spacing: 2px;
+                                            Text {
+                                                text: "Default permissions";
+                                                color: Theme.c.text-soft;
+                                                font-size: Theme.fs(10px);
+                                            }
+                                            ComboBox {
+                                                width: 150px;
+                                                model: ["Ask", "Allow list", "Yolo"];
+                                                current-index <=> root.mode-form-permission;
+                                            }
+                                        }
+                                        VerticalLayout {
+                                            spacing: 2px;
+                                            horizontal-stretch: 1;
+                                            Text {
+                                                text: "Default model";
+                                                color: Theme.c.text-soft;
+                                                font-size: Theme.fs(10px);
+                                            }
+                                            form-model-box := ComboBox {
+                                                model: root.mode-model-names;
+                                                current-index: root.mode-form-model + 1;
+                                                enabled: root.models.length > 0;
+                                                selected => {
+                                                    root.mode-form-model = self.current-index - 1;
+                                                }
+                                            }
+                                        }
+                                    }
+                                    HorizontalLayout {
+                                        spacing: 8px;
+                                        alignment: start;
+                                        Button {
+                                            text: root.mode-form-editing ? "Save mode" : "Add mode";
+                                            primary: true;
+                                            enabled: root.mode-form-id != "" && root.mode-form-display != "";
+                                            clicked => {
+                                                root.mode-saved(
+                                                    root.mode-form-id,
+                                                    root.mode-form-display,
+                                                    root.mode-form-prompt,
+                                                    root.mode-form-tools,
+                                                    root.mode-form-readonly,
+                                                    root.mode-form-permission,
+                                                    root.mode-form-model);
+                                                root.mode-form-open = false;
+                                            }
+                                        }
+                                        Button {
+                                            text: "Cancel";
+                                            clicked => { root.mode-form-open = false; }
+                                        }
+                                    }
+                                }
+                            }
+
+                            if root.settings-status != "": Text {
+                                text: root.settings-status;
+                                color: Theme.c.accent-tint;
+                                font-size: Theme.fs(12px);
+                                wrap: word-wrap;
+                            }
+                        }
+
+                        // ---------------- local models ----------------
+                        if root.section == 2: VerticalLayout {
+                            spacing: 12px;
+
+                            HorizontalLayout {
+                                spacing: 12px;
+                                Text {
+                                    text: "Local Models";
+                                    color: Theme.c.text-hi;
+                                    font-size: Theme.fs(18px);
+                                    font-weight: 700;
+                                    horizontal-stretch: 1;
+                                }
+                                Switch {
+                                    text: root.local-enabled ? "Enabled" : "Disabled";
+                                    checked: root.local-enabled;
+                                    toggled => { root.local-enabled-toggled(self.checked); }
+                                }
+                                if root.local-enabled: Button {
+                                    text: "⟳ Refresh";
+                                    clicked => { root.local-refresh(); }
+                                }
+                            }
+                            Text {
+                                text: "Run models fully offline. trouve manages the llama.cpp runtime and downloads models from HuggingFace; downloaded models appear in the model picker as local/<model>. Expect far less capability than the cloud providers — this is an offline fallback tier, not a peer.";
+                                color: Theme.c.text-soft;
+                                font-size: Theme.fs(11px);
+                                wrap: word-wrap;
+                            }
+                            if !root.local-enabled: Text {
+                                text: "Local models are disabled: the llama-server sidecar is stopped and local models are hidden from the model pickers. Downloaded files stay on disk.";
+                                color: Theme.c.text-mid;
+                                font-size: Theme.fs(12px);
+                                wrap: word-wrap;
+                            }
+                            if root.local-enabled: Text {
+                                text: "Your machine: " + root.local-hw-line;
+                                color: Theme.c.text-mid;
+                                font-size: Theme.fs(12px);
+                                wrap: word-wrap;
+                            }
+
+                            // Runtime install state.
+                            if root.local-enabled: Rectangle {
+                                background: Theme.c.surface;
+                                border-radius: 6px;
+                                height: local-runtime-row.preferred-height + 20px;
+                                local-runtime-row := HorizontalLayout {
+                                    padding: 10px;
+                                    spacing: 8px;
+                                    VerticalLayout {
+                                        alignment: center;
+                                        spacing: 4px;
+                                        horizontal-stretch: 1;
+                                        Text {
+                                            text: "llama.cpp runtime — " + root.local-runtime-label;
+                                            color: Theme.c.text;
+                                            font-size: Theme.fs(13px);
+                                        }
+                                        if root.local-runtime-status != "": Text {
+                                            text: root.local-runtime-status;
+                                            color: Theme.c.text-soft;
+                                            font-size: Theme.fs(11px);
+                                            wrap: word-wrap;
+                                        }
+                                        if root.local-runtime-busy && root.local-runtime-progress >= 0: DownloadBar {
+                                            pct: root.local-runtime-progress;
+                                        }
+                                    }
+                                    VerticalLayout {
+                                        alignment: center;
+                                        HorizontalLayout {
+                                            spacing: 6px;
+                                            if root.local-runtime-busy: Button {
+                                                text: "Cancel";
+                                                clicked => { root.local-runtime-cancel(); }
+                                            }
+                                            if !root.local-runtime-busy && root.local-runtime-action != "": Button {
+                                                text: root.local-runtime-action;
+                                                clicked => { root.local-runtime-install(); }
+                                            }
+                                            if !root.local-runtime-busy && root.local-runtime-update: Button {
+                                                text: "Update";
+                                                clicked => { root.local-runtime-install(); }
+                                            }
+                                            if !root.local-runtime-busy && root.local-runtime-managed: Button {
+                                                text: "Uninstall";
+                                                clicked => { root.local-runtime-uninstall(); }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+
+                            // Running sidecar (memory can be freed).
+                            if root.local-enabled && root.local-server-line != "": Rectangle {
+                                background: Theme.c.accent-bg;
+                                border-radius: 6px;
+                                height: local-server-row.preferred-height + 16px;
+                                local-server-row := HorizontalLayout {
+                                    padding: 8px;
+                                    spacing: 8px;
+                                    Text {
+                                        text: root.local-server-line;
+                                        color: Theme.c.accent-tint;
+                                        font-size: Theme.fs(12px);
+                                        vertical-alignment: center;
+                                        horizontal-stretch: 1;
+                                        overflow: elide;
+                                    }
+                                    if !root.local-server-busy: Button {
+                                        text: "⟳ Restart";
+                                        clicked => { root.local-restart-server(); }
+                                    }
+                                    if !root.local-server-busy: Button {
+                                        text: "Stop (free memory)";
+                                        clicked => { root.local-stop-server(); }
+                                    }
+                                }
+                            }
+
+                            if root.local-enabled && root.local-status != "": Text {
+                                text: root.local-status;
+                                color: Theme.c.err;
+                                font-size: Theme.fs(12px);
+                                wrap: word-wrap;
+                            }
+
+                            // Model list.
+                            if root.local-enabled: Rectangle {
+                                background: Theme.c.surface;
+                                border-radius: 6px;
+                                vertical-stretch: 1;
+                                min-height: 220px;
+                                ListView {
+                                    for model in root.local-models: Rectangle {
+                                        height: model.header != "" ? Theme.fs(30px) : Theme.fs(58px);
+                                        // Section header ("On this machine" / "Recommended").
+                                        if model.header != "": HorizontalLayout {
+                                            padding-left: 10px;
+                                            padding-top: 8px;
+                                            Text {
+                                                text: model.header;
+                                                color: Theme.c.text-faint;
+                                                font-size: Theme.fs(10px);
+                                                font-weight: 700;
+                                                letter-spacing: 0.8px;
+                                                vertical-alignment: center;
+                                            }
+                                        }
+                                        if model.header == "": HorizontalLayout {
+                                            padding-left: 10px;
+                                            padding-right: 6px;
+                                            spacing: 8px;
+                                            VerticalLayout {
+                                                alignment: center;
+                                                spacing: 3px;
+                                                horizontal-stretch: 1;
+                                                HorizontalLayout {
+                                                    spacing: 6px;
+                                                    alignment: start;
+                                                    Text {
+                                                        text: model.name;
+                                                        color: Theme.c.text-hi;
+                                                        font-size: Theme.fs(13px);
+                                                        font-weight: 700;
+                                                        overflow: elide;
+                                                    }
+                                                    Text {
+                                                        text: model.meta;
+                                                        color: Theme.c.text-mid;
+                                                        font-size: Theme.fs(11px);
+                                                        vertical-alignment: center;
+                                                    }
+                                                    // Hardware-fit badge.
+                                                    Text {
+                                                        text: model.fit-label;
+                                                        color: model.fit == "gpu" ? Theme.c.ok
+                                                            : model.fit == "cpu" ? Theme.c.warn
+                                                            : Theme.c.err;
+                                                        font-size: Theme.fs(10px);
+                                                        vertical-alignment: center;
+                                                    }
+                                                    if model.custom: Text {
+                                                        text: "custom";
+                                                        color: Theme.c.accent-tint;
+                                                        font-size: Theme.fs(10px);
+                                                        vertical-alignment: center;
+                                                    }
+                                                }
+                                                Text {
+                                                    text: model.error != "" ? "download failed: " + model.error
+                                                        : model.downloading ? model.download-line
+                                                        : model.notes;
+                                                    color: model.error != "" ? Theme.c.err-soft : Theme.c.text-dim;
+                                                    font-size: Theme.fs(11px);
+                                                    overflow: elide;
+                                                }
+                                                if model.downloading: DownloadBar {
+                                                    pct: model.progress;
+                                                }
+                                            }
+                                            if model.downloaded: VerticalLayout {
+                                                alignment: center;
+                                                Text {
+                                                    text: "✓ downloaded";
+                                                    color: Theme.c.ok;
+                                                    font-size: Theme.fs(11px);
+                                                }
+                                            }
+                                            if model.downloading: Button {
+                                                text: "Cancel";
+                                                min-width: Theme.fs(96px);
+                                                clicked => { root.local-cancel(model.id); }
+                                            }
+                                            if !model.downloaded && !model.downloading: Button {
+                                                text: model.error != "" ? "Retry" : "Download";
+                                                min-width: Theme.fs(96px);
+                                                clicked => { root.local-download(model.id); }
+                                            }
+                                            if !model.downloading && (model.downloaded || model.custom): Button {
+                                                text: "Remove";
+                                                min-width: Theme.fs(96px);
+                                                clicked => { root.local-delete(model.id); }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+
+                            // Add more models: search HuggingFace's GGUF repos,
+                            // pick a file (defaulting to the best fit for this
+                            // machine), add it to the list above.
+                            if root.local-enabled: VerticalLayout {
+                                spacing: 6px;
+                                Text {
+                                    text: "Add more models — search HuggingFace:";
+                                    color: Theme.c.text-soft;
+                                    font-size: Theme.fs(11px);
+                                }
+                                HorizontalLayout {
+                                    spacing: 8px;
+                                    LineEdit {
+                                        placeholder-text: "search models (e.g. qwen coder, llama 3.2)";
+                                        text <=> root.local-search-query;
+                                        horizontal-stretch: 1;
+                                        accepted(text) => {
+                                            if (text != "") { root.local-search(text); }
+                                        }
+                                    }
+                                    Button {
+                                        text: "Search";
+                                        enabled: root.local-search-query != "";
+                                        clicked => { root.local-search(root.local-search-query); }
+                                    }
+                                }
+                                HorizontalLayout {
+                                    spacing: 14px;
+                                    alignment: start;
+                                    Text {
+                                        text: "Show:";
+                                        color: Theme.c.text-soft;
+                                        font-size: Theme.fs(11px);
+                                        vertical-alignment: center;
+                                    }
+                                    CheckBox {
+                                        text: "fits GPU";
+                                        checked <=> root.local-search-fit-gpu;
+                                        toggled => {
+                                            root.local-search-filters-changed(
+                                                root.local-search-fit-gpu,
+                                                root.local-search-fit-cpu,
+                                                root.local-search-fit-large);
+                                        }
+                                    }
+                                    CheckBox {
+                                        text: "runs on CPU";
+                                        checked <=> root.local-search-fit-cpu;
+                                        toggled => {
+                                            root.local-search-filters-changed(
+                                                root.local-search-fit-gpu,
+                                                root.local-search-fit-cpu,
+                                                root.local-search-fit-large);
+                                        }
+                                    }
+                                    CheckBox {
+                                        text: "too large for this machine";
+                                        checked <=> root.local-search-fit-large;
+                                        toggled => {
+                                            root.local-search-filters-changed(
+                                                root.local-search-fit-gpu,
+                                                root.local-search-fit-cpu,
+                                                root.local-search-fit-large);
+                                        }
+                                    }
+                                }
+                                if root.local-search-status != "": Text {
+                                    text: root.local-search-status;
+                                    color: Theme.c.text-mid;
+                                    font-size: Theme.fs(11px);
+                                    wrap: word-wrap;
+                                }
+                                for item in root.local-search-results: Rectangle {
+                                    background: Theme.c.surface;
+                                    border-radius: 6px;
+                                    height: search-row.preferred-height + 16px;
+                                    search-row := HorizontalLayout {
+                                        padding: 8px;
+                                        spacing: 8px;
+                                        property <int> pick: item.recommended;
+                                        VerticalLayout {
+                                            spacing: 4px;
+                                            horizontal-stretch: 1;
+                                            HorizontalLayout {
+                                                spacing: 6px;
+                                                alignment: start;
+                                                Text {
+                                                    text: item.repo;
+                                                    color: Theme.c.text-hi;
+                                                    font-size: Theme.fs(12px);
+                                                    font-weight: 700;
+                                                    overflow: elide;
+                                                }
+                                                Text {
+                                                    text: item.meta;
+                                                    color: Theme.c.text-faint;
+                                                    font-size: Theme.fs(10px);
+                                                    vertical-alignment: center;
+                                                }
+                                            }
+                                            HorizontalLayout {
+                                                spacing: 8px;
+                                                alignment: start;
+                                                ComboBox {
+                                                    min-width: Theme.fs(190px);
+                                                    model: item.file-labels;
+                                                    current-index <=> search-row.pick;
+                                                }
+                                                // Same hardware-fit guidance as the
+                                                // model list, for the picked file.
+                                                Text {
+                                                    text: item.file-fit-labels[search-row.pick];
+                                                    color: item.file-fits[search-row.pick] == "gpu" ? Theme.c.ok
+                                                        : item.file-fits[search-row.pick] == "cpu" ? Theme.c.warn
+                                                        : Theme.c.err;
+                                                    font-size: Theme.fs(11px);
+                                                    vertical-alignment: center;
+                                                }
+                                            }
+                                        }
+                                        VerticalLayout {
+                                            alignment: center;
+                                            if item.file-added[search-row.pick]: Text {
+                                                text: "✓ added";
+                                                color: Theme.c.ok;
+                                                font-size: Theme.fs(11px);
+                                            }
+                                            if !item.file-added[search-row.pick]: Button {
+                                                text: "Add";
+                                                min-width: Theme.fs(72px);
+                                                clicked => {
+                                                    root.local-added(item.repo,
+                                                        item.file-names[search-row.pick]);
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
+                        // ---------------- mcp servers ----------------
+                        if root.section == 3: VerticalLayout {
+                            spacing: 12px;
+
+                            HorizontalLayout {
+                                Text {
+                                    text: "MCP Servers";
+                                    color: Theme.c.text-hi;
+                                    font-size: Theme.fs(16px);
+                                    font-weight: 700;
+                                    vertical-alignment: center;
+                                    horizontal-stretch: 1;
+                                }
+                                Button {
+                                    text: "⟳ Refresh";
+                                    clicked => { root.mcp-refresh(); }
+                                }
+                            }
+                            Text {
+                                text: "External tool servers offered to the agent as mcp__<server>__<tool>. Each one needs first-use approval per session. trouve's own built-in servers are not listed.";
+                                color: Theme.c.text-soft;
+                                font-size: Theme.fs(11px);
+                                wrap: word-wrap;
+                            }
+                            Text {
+                                text: "Sessions merge these by name: the app-wide list (applies to every workspace), then the session workspace's list. A session branch can override or disable entries via its own committed .agents/.mcp.json — those per-branch files are managed in git, not here.";
+                                color: Theme.c.text-soft;
+                                font-size: Theme.fs(11px);
+                                wrap: word-wrap;
+                            }
+                            if root.mcp-status != "": Text {
+                                text: root.mcp-status;
+                                color: Theme.c.text-soft;
+                                font-size: Theme.fs(12px);
+                                wrap: word-wrap;
+                            }
+
+                            Rectangle {
+                                background: Theme.c.surface;
+                                border-radius: 6px;
+                                height: 180px;
+                                if root.mcp-servers.length == 0: Text {
+                                    text: "No MCP servers configured.";
+                                    color: Theme.c.text-soft;
+                                    font-size: Theme.fs(12px);
+                                    horizontal-alignment: center;
+                                    vertical-alignment: center;
+                                }
+                                ListView {
+                                    for server in root.mcp-servers: Rectangle {
+                                        height: Theme.fs(40px);
+                                        HorizontalLayout {
+                                            padding-left: 10px;
+                                            padding-right: 6px;
+                                            spacing: 8px;
+                                            Text {
+                                                text: server.health == "ok" ? "●"
+                                                    : server.health == "error" ? "●" : "○";
+                                                color: server.health == "ok" ? Theme.c.ok
+                                                    : server.health == "error" ? Theme.c.err
+                                                    : Theme.c.text-soft;
+                                                font-size: Theme.fs(12px);
+                                                vertical-alignment: center;
+                                            }
+                                            VerticalLayout {
+                                                alignment: center;
+                                                horizontal-stretch: 1;
+                                                HorizontalLayout {
+                                                    spacing: 6px;
+                                                    alignment: start;
+                                                    Text {
+                                                        text: server.name;
+                                                        color: Theme.c.text-hi;
+                                                        font-size: Theme.fs(13px);
+                                                        font-weight: 700;
+                                                        overflow: elide;
+                                                    }
+                                                    Text {
+                                                        text: server.scope == "workspace"
+                                                            ? "workspace · " + server.workspace-name
+                                                            : server.scope == "user"
+                                                                ? "app-wide" : server.scope;
+                                                        color: Theme.c.accent-tint;
+                                                        font-size: Theme.fs(10px);
+                                                        vertical-alignment: center;
+                                                    }
+                                                }
+                                                Text {
+                                                    text: server.command-line
+                                                        + (server.detail != "" ? "  ·  " + server.detail : "");
+                                                    color: server.health == "error"
+                                                        ? Theme.c.err-soft : Theme.c.text-dim;
+                                                    font-size: Theme.fs(11px);
+                                                    overflow: elide;
+                                                }
+                                            }
+                                            Button {
+                                                text: "Logs";
+                                                clicked => { root.mcp-logs-requested(server.name); }
+                                            }
+                                            Button {
+                                                text: "Edit";
+                                                clicked => {
+                                                    root.mcp-form-open = true;
+                                                    root.mcp-form-editing = true;
+                                                    root.mcp-form-scope = server.scope;
+                                                    root.mcp-form-name = server.name;
+                                                    root.mcp-form-command = server.command-line;
+                                                    root.mcp-form-env = server.env-lines;
+                                                    root.mcp-form-workspace-id = server.workspace-id;
+                                                    root.mcp-form-workspace-name = server.workspace-name;
+                                                }
+                                            }
+                                            Button {
+                                                text: "Remove";
+                                                clicked => {
+                                                    root.mcp-deleted(server.name, server.scope,
+                                                        server.workspace-id);
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+
+                            HorizontalLayout {
+                                spacing: 8px;
+                                Button {
+                                    text: "+ Add app-wide";
+                                    clicked => {
+                                        root.mcp-form-open = true;
+                                        root.mcp-form-editing = false;
+                                        root.mcp-form-scope = "user";
+                                        root.mcp-form-name = "";
+                                        root.mcp-form-command = "";
+                                        root.mcp-form-env = "";
+                                        root.mcp-form-workspace-id = "";
+                                        root.mcp-form-workspace-name = "";
+                                    }
+                                }
+                                Button {
+                                    text: "+ Add to workspace";
+                                    enabled: root.mcp-workspace-ids.length > 0;
+                                    clicked => {
+                                        root.mcp-form-open = true;
+                                        root.mcp-form-editing = false;
+                                        root.mcp-form-scope = "workspace";
+                                        root.mcp-form-name = "";
+                                        root.mcp-form-command = "";
+                                        root.mcp-form-env = "";
+                                        root.mcp-form-workspace-id = root.mcp-workspace-ids[0];
+                                        root.mcp-form-workspace-name = root.mcp-workspace-names[0];
+                                    }
+                                }
+                                Rectangle { horizontal-stretch: 1; }
+                            }
+
+                            // Add/edit form.
+                            if root.mcp-form-open: Rectangle {
+                                background: Theme.c.surface;
+                                border-radius: 6px;
+                                VerticalLayout {
+                                    padding: 14px;
+                                    spacing: 8px;
+                                    Text {
+                                        text: (root.mcp-form-editing ? "Edit " : "New ")
+                                            + (root.mcp-form-scope == "user"
+                                                ? "app-wide server (~/.config/trouve/mcp.json — every workspace)"
+                                                : "workspace server (.agents/.mcp.json)");
+                                        color: Theme.c.text-mid;
+                                        font-size: Theme.fs(12px);
+                                        font-weight: 700;
+                                    }
+                                    // Workspace scope: pick which workspace's
+                                    // file to edit (locked when editing).
+                                    if root.mcp-form-scope == "workspace": HorizontalLayout {
+                                        spacing: 8px;
+                                        Text {
+                                            text: "Workspace:";
+                                            color: Theme.c.text-soft;
+                                            font-size: Theme.fs(11px);
+                                            vertical-alignment: center;
+                                        }
+                                        if root.mcp-form-editing: Text {
+                                            text: root.mcp-form-workspace-name;
+                                            color: Theme.c.text-mid;
+                                            font-size: Theme.fs(12px);
+                                            vertical-alignment: center;
+                                            horizontal-stretch: 1;
+                                        }
+                                        if !root.mcp-form-editing: ComboBox {
+                                            horizontal-stretch: 1;
+                                            model: root.mcp-workspace-names;
+                                            current-index: 0;
+                                            selected => {
+                                                if (self.current-index >= 0
+                                                    && self.current-index < root.mcp-workspace-ids.length) {
+                                                    root.mcp-form-workspace-id =
+                                                        root.mcp-workspace-ids[self.current-index];
+                                                    root.mcp-form-workspace-name =
+                                                        root.mcp-workspace-names[self.current-index];
+                                                }
+                                            }
+                                        }
+                                    }
+                                    HorizontalLayout {
+                                        spacing: 8px;
+                                        LineEdit {
+                                            text <=> root.mcp-form-name;
+                                            placeholder-text: "name (e.g. jira)";
+                                            enabled: !root.mcp-form-editing;
+                                            width: 160px;
+                                        }
+                                        LineEdit {
+                                            text <=> root.mcp-form-command;
+                                            placeholder-text: "command and args (e.g. npx -y jira-mcp --stdio)";
+                                            horizontal-stretch: 1;
+                                        }
+                                    }
+                                    TextEdit {
+                                        text <=> root.mcp-form-env;
+                                        placeholder-text: "environment, one KEY=VALUE per line; ${VAR} expands at launch";
+                                        height: Theme.fs(64px);
+                                        wrap: no-wrap;
+                                    }
+                                    HorizontalLayout {
+                                        spacing: 8px;
+                                        Button {
+                                            text: root.mcp-form-editing ? "Save changes" : "Add server";
+                                            primary: true;
+                                            enabled: root.mcp-form-name != "" && root.mcp-form-command != "";
+                                            clicked => {
+                                                root.mcp-saved(root.mcp-form-name, root.mcp-form-scope,
+                                                    root.mcp-form-command, root.mcp-form-env,
+                                                    root.mcp-form-workspace-id);
+                                                root.mcp-form-open = false;
+                                            }
+                                        }
+                                        Button {
+                                            text: "Cancel";
+                                            clicked => { root.mcp-form-open = false; }
+                                        }
+                                        Rectangle { horizontal-stretch: 1; }
+                                    }
+                                }
+                            }
+
+                            // Logs viewer.
+                            if root.mcp-logs-name != "": Rectangle {
+                                background: Theme.c.surface;
+                                border-radius: 6px;
+                                VerticalLayout {
+                                    padding: 10px;
+                                    spacing: 6px;
+                                    HorizontalLayout {
+                                        Text {
+                                            text: "Logs — " + root.mcp-logs-name;
+                                            color: Theme.c.text-hi;
+                                            font-size: Theme.fs(12px);
+                                            font-weight: 700;
+                                            vertical-alignment: center;
+                                            horizontal-stretch: 1;
+                                        }
+                                        Button {
+                                            text: "⟳";
+                                            clicked => { root.mcp-logs-requested(root.mcp-logs-name); }
+                                        }
+                                        Button {
+                                            text: "✕";
+                                            clicked => { root.mcp-logs-closed(); }
+                                        }
+                                    }
+                                    Rectangle {
+                                        background: Theme.c.code-bg;
+                                        border-radius: 4px;
+                                        height: 180px;
+                                        mcp-log-scroll := ScrollView {
+                                            width: 100%;
+                                            height: 100%;
+                                            VerticalLayout {
+                                                padding: 8px;
+                                                Text {
+                                                    text: root.mcp-logs-text == ""
+                                                        ? "No log lines yet — logs appear after a health check or the first tool call."
+                                                        : root.mcp-logs-text;
+                                                    color: Theme.c.code-fg;
+                                                    font-family: "monospace";
+                                                    font-size: Theme.fs(11px);
+                                                    wrap: word-wrap;
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
+                        // ---------------- integrations ----------------
+                        if root.section == 4: VerticalLayout {
+                            spacing: 12px;
+
+                            Text {
+                                text: "Integrations";
+                                color: Theme.c.text-hi;
+                                font-size: Theme.fs(16px);
+                                font-weight: 700;
+                            }
+
+                            Text {
+                                text: "Powers the Pull Requests tab and PR creation. Sign in below, or paste a personal access token; token environment variables and gh CLI logins are picked up automatically. Each host authenticates on its own.";
+                                color: Theme.c.text-soft;
+                                font-size: Theme.fs(11px);
+                                wrap: word-wrap;
+                            }
+
+                            // One card per GitHub host: github.com first,
+                            // then the configured enterprise instances.
+                            for gh in root.github-hosts: Rectangle {
+                                background: Theme.c.surface;
+                                border-radius: 6px;
+                                VerticalLayout {
+                                    padding: 14px;
+                                    spacing: 10px;
+
+                                    HorizontalLayout {
+                                        spacing: 8px;
+                                        Text {
+                                            text: gh.host == "github.com" ? "GitHub" : gh.host;
+                                            color: Theme.c.text-hi;
+                                            font-size: Theme.fs(14px);
+                                            font-weight: 700;
+                                            vertical-alignment: center;
+                                            horizontal-stretch: 1;
+                                        }
+                                        Text {
+                                            text: gh.configured
+                                                ? (gh.source == "environment" ? "● connected (environment)"
+                                                    : gh.source == "oauth" ? "● connected (GitHub sign-in)"
+                                                    : gh.source == "gh-cli" ? "● connected (gh CLI)"
+                                                    : "● connected (token)")
+                                                : "○ not configured";
+                                            color: gh.configured ? Theme.c.ok : Theme.c.text-soft;
+                                            font-size: Theme.fs(12px);
+                                            vertical-alignment: center;
+                                        }
+                                        if gh.removable: Button {
+                                            text: "Remove host";
+                                            clicked => { root.github-host-removed(gh.host); }
+                                        }
+                                    }
+                                    if gh.source == "environment": Text {
+                                        text: gh.host == "github.com"
+                                            ? "The token currently comes from the GITHUB_TOKEN / GH_TOKEN environment variable, which takes precedence over a sign-in or saved token."
+                                            : "The token currently comes from the GH_ENTERPRISE_TOKEN / GITHUB_ENTERPRISE_TOKEN environment variable, which takes precedence over a sign-in or saved token.";
+                                        color: Theme.c.warn;
+                                        font-size: Theme.fs(11px);
+                                        wrap: word-wrap;
+                                    }
+                                    if gh.oauth-available: HorizontalLayout {
+                                        spacing: 8px;
+                                        alignment: start;
+                                        Button {
+                                            text: gh.source == "oauth" ? "Re-sign in with GitHub" : "Sign in with GitHub";
+                                            primary: gh.source != "oauth";
+                                            clicked => {
+                                                root.provider-login(gh.host == "github.com"
+                                                    ? "github" : "github:" + gh.host);
+                                            }
+                                        }
+                                        if gh.source == "oauth": Button {
+                                            text: "Disconnect";
+                                            clicked => { root.github-token-saved(gh.host, ""); }
+                                        }
+                                    }
+                                    // Only enterprise hosts can lack an OAuth path:
+                                    // github.com always has the built-in shared app.
+                                    if !gh.oauth-available: Text {
+                                        text: "To enable one-click sign-in, register an OAuth app on this instance (device flow enabled) and re-add the host with its client id.";
+                                        color: Theme.c.text-soft;
+                                        font-size: Theme.fs(11px);
+                                        wrap: word-wrap;
+                                    }
+                                    HorizontalLayout {
+                                        spacing: 8px;
+                                        gh-token := LineEdit {
+                                            placeholder-text: gh.configured && gh.source == "settings"
+                                                ? "••••••••  (saved — enter a new token to replace)"
+                                                : "ghp_… or github_pat_…";
+                                            input-type: password;
+                                            horizontal-stretch: 1;
+                                        }
+                                        Button {
+                                            text: "Save";
+                                            primary: gh-token.text != "" && !gh.oauth-available;
+                                            enabled: gh-token.text != "";
+                                            clicked => {
+                                                root.github-token-saved(gh.host, gh-token.text);
+                                                gh-token.text = "";
+                                            }
+                                        }
+                                        if gh.configured && gh.source == "settings": Button {
+                                            text: "Remove";
+                                            clicked => { root.github-token-saved(gh.host, ""); }
+                                        }
+                                    }
+                                }
+                            }
+
+                            // Register a self-hosted GitHub Enterprise
+                            // instance; it gets a card of its own above.
+                            Rectangle {
+                                background: Theme.c.surface;
+                                border-radius: 6px;
+                                VerticalLayout {
+                                    padding: 14px;
+                                    spacing: 10px;
+                                    Text {
+                                        text: "Add GitHub Enterprise host";
+                                        color: Theme.c.text-hi;
+                                        font-size: Theme.fs(14px);
+                                        font-weight: 700;
+                                    }
+                                    Text {
+                                        text: "Self-hosted GitHub Enterprise Server instances work like github.com: sessions whose origin remote lives on the host use its auth. The OAuth client id is optional — a token or gh CLI login works without one.";
+                                        color: Theme.c.text-soft;
+                                        font-size: Theme.fs(11px);
+                                        wrap: word-wrap;
+                                    }
+                                    HorizontalLayout {
+                                        spacing: 8px;
+                                        ghe-host := LineEdit {
+                                            placeholder-text: "github.example.com";
+                                            horizontal-stretch: 1;
+                                        }
+                                        ghe-client-id := LineEdit {
+                                            placeholder-text: "OAuth app client id (optional)";
+                                            horizontal-stretch: 1;
+                                        }
+                                        Button {
+                                            text: "Add";
+                                            primary: ghe-host.text != "";
+                                            enabled: ghe-host.text != "";
+                                            clicked => {
+                                                root.github-host-added(ghe-host.text, ghe-client-id.text);
+                                                ghe-host.text = "";
+                                                ghe-client-id.text = "";
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
+                        // ---------------- appearance ----------------
+                        if root.section == 5: VerticalLayout {
+                            spacing: 12px;
+
+                            Text {
+                                text: "Appearance";
+                                color: Theme.c.text-hi;
+                                font-size: Theme.fs(16px);
+                                font-weight: 700;
+                            }
+
+                            VerticalLayout {
+                                spacing: 6px;
+                                Text {
+                                    text: "Theme";
+                                    color: Theme.c.text-mid;
+                                    font-size: Theme.fs(12px);
+                                    font-weight: 700;
+                                }
+                                ComboBox {
+                                    model: root.theme-names;
+                                    current-index <=> root.theme-index;
+                                    selected => { root.theme-picked(self.current-index); }
+                                }
+                                Text {
+                                    text: "Every theme is contrast-checked as a whole (WCAG AA), so individual colors can't be overridden. The colorblind themes put success and errors on a blue/orange axis instead of green/red.";
+                                    color: Theme.c.text-soft;
+                                    font-size: Theme.fs(11px);
+                                    wrap: word-wrap;
+                                }
+                            }
+
+                            HorizontalLayout {
+                                spacing: 12px;
+                                VerticalLayout {
+                                    spacing: 6px;
+                                    horizontal-stretch: 0;
+                                    Text {
+                                        text: "Base font size";
+                                        color: Theme.c.text-mid;
+                                        font-size: Theme.fs(12px);
+                                        font-weight: 700;
+                                    }
+                                    ComboBox {
+                                        width: 120px;
+                                        model: root.font-size-names;
+                                        current-index <=> root.font-size-index;
+                                        selected => { root.font-size-picked(self.current-index); }
+                                    }
+                                }
+                                VerticalLayout {
+                                    spacing: 6px;
+                                    horizontal-stretch: 1;
+                                    Text {
+                                        text: "Font";
+                                        color: Theme.c.text-mid;
+                                        font-size: Theme.fs(12px);
+                                        font-weight: 700;
+                                    }
+                                    ComboBox {
+                                        model: root.font-names;
+                                        current-index <=> root.font-index;
+                                        selected => { root.font-picked(self.current-index); }
+                                    }
+                                }
+                            }
+                            Text {
+                                text: "The size scales the whole interface; code keeps its monospace font.";
+                                color: Theme.c.text-soft;
+                                font-size: Theme.fs(11px);
+                                wrap: word-wrap;
+                            }
+
+                            ToggleRow {
+                                on <=> root.reduce-motion;
+                                label: "Reduce motion — replace spinners and other animation with static indicators.";
+                                toggled(on) => { root.reduce-motion-toggled(on); }
+                            }
+                        }
+
+                        // ---------------- notifications ----------------
+                        if root.section == 6: VerticalLayout {
+                            spacing: 12px;
+
+                            Text {
+                                text: "Notifications";
+                                color: Theme.c.text-hi;
+                                font-size: Theme.fs(16px);
+                                font-weight: 700;
+                            }
+                            Text {
+                                text: "System notifications for agent activity you'd otherwise miss: they fire when the window is in the background or the event belongs to a session that isn't on screen.";
+                                color: Theme.c.text-soft;
+                                font-size: Theme.fs(11px);
+                                wrap: word-wrap;
+                            }
+
+                            ToggleRow {
+                                on <=> root.notify-enabled;
+                                label: "Enable desktop notifications.";
+                                toggled(on) => { root.notify-pref-toggled(0, on); }
+                            }
+
+                            if root.notify-enabled: VerticalLayout {
+                                spacing: 12px;
+                                padding-left: 12px;
+                                ToggleRow {
+                                    on <=> root.notify-finish;
+                                    label: "Agent finished — a turn completed.";
+                                    toggled(on) => { root.notify-pref-toggled(1, on); }
+                                }
+                                ToggleRow {
+                                    on <=> root.notify-fail;
+                                    label: "Turn failed — a turn ended with an error.";
+                                    toggled(on) => { root.notify-pref-toggled(2, on); }
+                                }
+                                ToggleRow {
+                                    on <=> root.notify-attention;
+                                    label: "Needs attention — the agent is waiting on an approval or a question.";
+                                    toggled(on) => { root.notify-pref-toggled(3, on); }
+                                }
+                                ToggleRow {
+                                    on <=> root.notify-sound;
+                                    label: "Play a sound with each notification.";
+                                    toggled(on) => { root.notify-pref-toggled(4, on); }
+                                }
+                            }
+
+                            HorizontalLayout {
+                                alignment: start;
+                                Button {
+                                    text: "Send test notification";
+                                    enabled: root.notify-enabled;
+                                    clicked => { root.notify-test(); }
+                                }
+                            }
+                        }
+
+                        // ---------------- about ----------------
+                        if root.section == 7: VerticalLayout {
+                            spacing: 12px;
+
+                            Text {
+                                text: "About";
+                                color: Theme.c.text-hi;
+                                font-size: Theme.fs(16px);
+                                font-weight: 700;
+                            }
+                            Text {
+                                text: "trouve — a protocol-first AI coding harness.";
+                                color: Theme.c.text-dim;
+                                font-size: Theme.fs(12px);
+                            }
+                            AboutSlint { }
+                        }
+                    }
+                }
+                }
+            }
+
+            Rectangle { horizontal-stretch: 1; }
+        }
+    }
+}

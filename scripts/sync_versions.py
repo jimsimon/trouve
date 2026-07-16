@@ -1,11 +1,15 @@
 #!/usr/bin/env python3
 """Keep every published artifact's version in sync with the trouve-search crate.
 
-The crate version in Cargo.toml is the single source of truth. Everything
-else that carries a version — npm packages under npm/*, package-lock.json
-files, Claude Code and Codex plugin manifests, @trouve-ai/search-core
+The crate version in crates/trouve-search/Cargo.toml is the single source of
+truth for the search tool's distribution artifacts. Everything else that
+carries a version — npm packages under npm/*, package-lock.json files,
+Claude Code and Codex plugin manifests, @trouve-ai/search-core
 optionalDependencies, and @trouve-ai/search-plugin's search-core dependency
 — must match it exactly.
+
+Other workspace crates (the trouve harness crates) are versioned
+independently and are not covered by this script.
 
 Usage:
   python3 scripts/sync_versions.py          # rewrite manifests to the crate version
@@ -20,14 +24,15 @@ import tomllib
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
+CRATE_MANIFEST = ROOT / "crates" / "trouve-search" / "Cargo.toml"
 
 
 def crate_version() -> str:
-    with (ROOT / "Cargo.toml").open("rb") as f:
+    with CRATE_MANIFEST.open("rb") as f:
         manifest = tomllib.load(f)
     version = manifest.get("package", {}).get("version")
     if not isinstance(version, str) or not version:
-        sys.exit("Cargo.toml has no package.version field")
+        sys.exit(f"{CRATE_MANIFEST} has no package.version field")
     return version
 
 
@@ -110,7 +115,7 @@ def main() -> None:
         print(f"All versions in sync at {expected}.")
         return
     if check:
-        print(f"Versions out of sync with Cargo.toml ({expected}):")
+        print(f"Versions out of sync with crates/trouve-search/Cargo.toml ({expected}):")
         for line in out_of_sync:
             print(f"  {line}")
         print("Run `python3 scripts/sync_versions.py` to fix.")

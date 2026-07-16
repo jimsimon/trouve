@@ -1,0 +1,31 @@
+[package]
+name = "trouve-providers"
+version = "0.1.0"
+edition.workspace = true
+description = "LLM provider abstraction and implementations for the trouve AI coding harness."
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+async-trait.workspace = true
+base64 = "0.22"
+bytes.workspace = true
+dirs.workspace = true
+futures.workspace = true
+getrandom = "0.3"
+keyring = { version = "3", features = ["apple-native", "windows-native", "sync-secret-service"] }
+sha2 = "0.10"
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tokio-stream.workspace = true
+tracing.workspace = true
+trouve-protocol.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+tokio.workspace = true

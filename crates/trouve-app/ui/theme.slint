@@ -1,0 +1,155 @@
+// Theme global: every color in the UI resolves through this palette, and
+// every font size through `fs()`. Rust owns the theme definitions (see
+// src/theme.rs, where a unit test enforces WCAG AA contrast for each
+// built-in theme) and pushes a whole Palette at once; the defaults below
+// mirror the built-in Dark theme so previews render sensibly.
+//
+// Users pick a theme but can't override individual colors — palettes are
+// contrast-checked as a unit, and a single swapped color could silently
+// break accessibility.
+
+// Semantic color roles. Grouped: neutral surfaces (dark → light), chrome,
+// text tiers (readable tiers are contrast-checked; faint and below are
+// decorative/disabled and exempt), accent, and status colors.
+export struct ThemePalette {
+    // Surfaces.
+    win-bg: color,
+    panel-bg: color,
+    sidebar-bg: color,
+    surface: color,
+    inset-bg: color,
+    code-bg: color,
+    control-bg: color,
+    raised-bg: color,
+    popup-bg: color,
+    pill-bg: color,
+    hover-bg: color,
+    hover-strong: color,
+    // Chrome.
+    border: color,
+    border-strong: color,
+    card-border: color,
+    rule: color,
+    scroll-thumb: color,
+    scroll-thumb-hover: color,
+    scroll-thumb-active: color,
+    scrim: color,
+    // Text tiers. hi/normal/mid/dim are readable text (AA-checked);
+    // faint is decorative (gutters, chevrons), disabled/ghost are
+    // disabled-state colors (WCAG-exempt).
+    text-hi: color,
+    text: color,
+    text-mid: color,
+    text-dim: color,
+    text-soft: color,
+    text-faint: color,
+    text-disabled: color,
+    text-ghost: color,
+    gutter: color,
+    code-fg: color,
+    // Accent.
+    accent: color,
+    accent-hover: color,
+    accent-tint: color,
+    text-accent-soft: color,
+    on-accent: color,
+    primary-bg: color,
+    primary-hover: color,
+    primary-border: color,
+    selection: color,
+    accent-bg: color,
+    accent-dim: color,
+    accent-veil: color,
+    user-bg: color,
+    user-border: color,
+    // Status: success / error / warning.
+    ok: color,
+    ok-dim: color,
+    agent-bg: color,
+    agent-border: color,
+    diff-add-bg: color,
+    err: color,
+    err-soft: color,
+    err-bg: color,
+    err-hover: color,
+    diff-del-bg: color,
+    warn: color,
+    warn-bg: color,
+    warn-border: color,
+}
+
+export global Theme {
+    // Built-in Dark; Rust replaces this wholesale on startup/theme switch.
+    in-out property <ThemePalette> c: {
+        win-bg: #141414,
+        panel-bg: #181818,
+        sidebar-bg: #1a1a1a,
+        surface: #1e1e1e,
+        inset-bg: #17191c,
+        code-bg: #1f2226,
+        control-bg: #222222,
+        raised-bg: #232323,
+        popup-bg: #262626,
+        pill-bg: #2a2a2a,
+        hover-bg: #2e2e2e,
+        hover-strong: #333333,
+        border: #3a3a3a,
+        border-strong: #454545,
+        card-border: #3a3f46,
+        rule: #33363b,
+        scroll-thumb: #3a3e44,
+        scroll-thumb-hover: #565b63,
+        scroll-thumb-active: #6a6f78,
+        scrim: #000000aa,
+        text-hi: #e8e8e8,
+        text: #d8d8d8,
+        text-mid: #c8c8c8,
+        text-dim: #9a9a9a,
+        text-soft: #949494,
+        text-faint: #8a8a8a,
+        text-disabled: #6a6a6a,
+        text-ghost: #5a5a5a,
+        gutter: #6e6e6e,
+        code-fg: #d8d8c8,
+        accent: #6fa8dc,
+        accent-hover: #a8ccf0,
+        accent-tint: #9cbdde,
+        text-accent-soft: #dbe6f5,
+        on-accent: #e8eef8,
+        primary-bg: #35598f,
+        primary-hover: #3f6db3,
+        primary-border: #4f7dc3,
+        selection: #3d5a80,
+        accent-bg: #2b3d55,
+        accent-dim: #24344a,
+        accent-veil: #2b3d5533,
+        user-bg: #232c3d,
+        user-border: #3a4a68,
+        ok: #7fd18a,
+        ok-dim: #8fae8f,
+        agent-bg: #1f2a22,
+        agent-border: #33503c,
+        diff-add-bg: #1e3a24,
+        err: #e39ea6,
+        err-soft: #f2c4ca,
+        err-bg: #4a2328,
+        err-hover: #5d2e35,
+        diff-del-bg: #42272b,
+        warn: #e5c07b,
+        warn-bg: #262117,
+        warn-border: #5a4d2e,
+    };
+
+    // Base font scale: 1.0 = the design's 13px body text. All font sizes
+    // (and text-row heights) multiply through fs() so the whole type ramp
+    // follows the user's base size choice.
+    in-out property <float> scale: 1.0;
+    // Empty = system/default font.
+    in-out property <string> font-family: "";
+    // Disables non-essential animation (spinners render as static glyphs).
+    in-out property <bool> reduce-motion: false;
+
+    pure public function fs(base: length) -> length {
+        return base * self.scale;
+    }
+}

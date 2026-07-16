@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=Trouve
+GenericName=AI Coding Harness
+Comment=Run coding agents in parallel worktree sessions
+Exec=trouve
+Icon=trouve
+Terminal=false
+Categories=Development;IDE;
+Keywords=agent;ai;coding;harness;
+StartupWMClass=trouve

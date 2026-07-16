@@ -1,0 +1,190 @@
+// DiffView: virtualized unified diff rendering.
+//
+// The host flattens a parsed diff into one model row per visual line
+// (file headers, hunk headers, context/add/del lines) — the flat model is
+// what keeps a 3k-line diff cheap in a ListView. File collapse is handled
+// by the host rebuilding the row model (see the Rust helpers).
+
+import { ListView } from "std-widgets.slint";
+
+export struct DiffRow {
+    // 0 = file header, 1 = hunk header, 2 = context, 3 = add, 4 = delete
+    kind: int,
+    old-no: string,
+    new-no: string,
+    text: string,
+    // Index of the file this row belongs to (for collapse toggling).
+    file-index: int,
+    // Only meaningful on file header rows.
+    collapsed: bool,
+}
+
+export component DiffView inherits Rectangle {
+    in property <[DiffRow]> rows;
+    // Raw per-file diff text, parallel to file indices (for the header
+    // copy buttons; see split_file_diffs in the Rust helpers).
+    in property <[string]> file-diffs;
+    in property <length> code-font-size: 13px;
+    in property <length> line-height: code-font-size * 1.5;
+    in property <string> font-family: "monospace";
+    // Themable colors (defaults match the built-in dark look).
+    in property <color> file-header-bg: #2d2d2d;
+    in property <color> file-header-fg: #e8e8e8;
+    in property <color> hunk-bg: #253547;
+    in property <color> hunk-fg: #9cbdde;
+    in property <color> add-bg: #1e3a24;
+    in property <color> add-fg: #7fd18a;
+    in property <color> del-bg: #42272b;
+    in property <color> del-fg: #e39ea6;
+    in property <color> gutter-fg: #6e6e6e;
+    in property <color> text-fg: #d4d4d4;
+
+    callback file-toggled(int);
+
+    background: #1e1e1e;
+    forward-focus: keys;
+
+    // Clipboard plumbing for the per-file copy buttons: Slint only exposes
+    // the clipboard through TextInput, so copies route through this hidden
+    // one. copied-file drives the transient ✓ feedback on the header icon.
+    property <int> copied-file: -1;
+    function copy-file-diff(i: int) {
+        clip.text = root.file-diffs[i];
+        clip.select-all();
+        clip.copy();
+        clip.text = "";
+        root.copied-file = i;
+    }
+    clip := TextInput {
+        visible: false;
+        width: 0;
+        height: 0;
+        single-line: false;
+    }
+    Timer {
+        interval: 1.2s;
+        running: root.copied-file >= 0;
+        triggered => { root.copied-file = -1; }
+    }
+
+    // Keyboard scrolling (the view gains focus when clicked). Home/End and
+    // the macOS ⌘↑/⌘↓ equivalents jump; PageUp/PageDown page; arrows nudge.
+    function scroll-to(y: length) {
+        list.viewport-y = clamp(
+            y, min(0px, list.visible-height - list.viewport-height), 0px);
+    }
+
+    keys := FocusScope {
+        key-pressed(event) => {
+            if (event.text == Key.PageDown) {
+                root.scroll-to(list.viewport-y - max(40px, list.visible-height - 40px));
+                return accept;
+            }
+            if (event.text == Key.PageUp) {
+                root.scroll-to(list.viewport-y + max(40px, list.visible-height - 40px));
+                return accept;
+            }
+            if (event.text == Key.Home
+                || (event.text == Key.UpArrow && event.modifiers.meta)) {
+                root.scroll-to(0px);
+                return accept;
+            }
+            if (event.text == Key.End
+                || (event.text == Key.DownArrow && event.modifiers.meta)) {
+                root.scroll-to(list.visible-height - list.viewport-height);
+                return accept;
+            }
+            if (event.text == Key.UpArrow) {
+                root.scroll-to(list.viewport-y + root.line-height * 3);
+                return accept;
+            }
+            if (event.text == Key.DownArrow) {
+                root.scroll-to(list.viewport-y - root.line-height * 3);
+                return accept;
+            }
+            reject
+        }
+
+    list := ListView {
+        for row[idx] in root.rows: Rectangle {
+            height: root.line-height;
+            background: row.kind == 0 ? root.file-header-bg
+                : row.kind == 1 ? root.hunk-bg
+                : row.kind == 3 ? root.add-bg
+                : row.kind == 4 ? root.del-bg
+                : transparent;
+
+            if row.kind == 0: TouchArea {
+                clicked => { root.file-toggled(row.file-index); }
+            }
+
+            HorizontalLayout {
+                spacing: 0;
+                if row.kind == 0: Text {
+                    text: (row.collapsed ? "▸ " : "▾ ") + row.text;
+                    color: root.file-header-fg;
+                    font-family: root.font-family;
+                    font-size: root.code-font-size;
+                    font-weight: 700;
+                    vertical-alignment: center;
+                    horizontal-stretch: 1;
+                }
+                // Right-aligned copy button; sits above the row's collapse
+                // TouchArea (declared later = on top).
+                if row.kind == 0: Rectangle {
+                    width: root.line-height * 1.4;
+                    border-radius: 4px;
+                    background: copy-ta.has-hover ? root.hunk-bg : transparent;
+                    copy-ta := TouchArea {
+                        clicked => { root.copy-file-diff(row.file-index); }
+                    }
+                    Text {
+                        text: root.copied-file == row.file-index ? "✓" : "⧉";
+                        color: root.copied-file == row.file-index ? root.add-fg
+                            : copy-ta.has-hover ? root.file-header-fg
+                            : root.gutter-fg;
+                        font-size: root.code-font-size;
+                        horizontal-alignment: center;
+                        vertical-alignment: center;
+                    }
+                }
+                if row.kind != 0: Text {
+                    width: 44px;
+                    text: row.old-no;
+                    color: root.gutter-fg;
+                    horizontal-alignment: right;
+                    vertical-alignment: center;
+                    font-family: root.font-family;
+                    font-size: root.code-font-size;
+                }
+                if row.kind != 0: Text {
+                    width: 44px;
+                    text: row.new-no;
+                    color: root.gutter-fg;
+                    horizontal-alignment: right;
+                    vertical-alignment: center;
+                    font-family: root.font-family;
+                    font-size: root.code-font-size;
+                }
+                if row.kind != 0: Text {
+                    width: 20px;
+                    text: row.kind == 3 ? "+" : row.kind == 4 ? "-" : " ";
+                    color: row.kind == 3 ? root.add-fg
+                        : row.kind == 4 ? root.del-fg : root.gutter-fg;
+                    horizontal-alignment: center;
+                    vertical-alignment: center;
+                    font-family: root.font-family;
+                    font-size: root.code-font-size;
+                }
+                if row.kind != 0: Text {
+                    text: row.text;
+                    color: row.kind == 1 ? root.hunk-fg : root.text-fg;
+                    vertical-alignment: center;
+                    font-family: root.font-family;
+                    font-size: root.code-font-size;
+                }
+            }
+        }
+    }
+    }
+}

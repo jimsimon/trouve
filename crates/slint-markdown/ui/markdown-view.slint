@@ -1,0 +1,61 @@
+// MarkdownView: block-based markdown rendering designed for streaming.
+//
+// The host parses markdown into a flat block model; streaming appends only
+// mutate the trailing blocks (see the Rust StreamingMarkdown helper), so a
+// growing assistant message never re-lays-out the whole document.
+
+import { ListView } from "std-widgets.slint";
+
+export struct MarkdownBlock {
+    // 0 paragraph, 1 h1, 2 h2, 3 h3, 4 bullet, 5 code fence, 6 numbered
+    kind: int,
+    text: string,
+    language: string,
+    // Nesting level for list items (0 = top level).
+    indent: int,
+}
+
+export component MarkdownView inherits Rectangle {
+    in property <[MarkdownBlock]> blocks;
+    in property <length> body-font-size: 14px;
+    in property <color> foreground: #d4d4d4;
+    in property <string> code-font-family: "monospace";
+
+    background: transparent;
+
+    ListView {
+        for block in root.blocks: Rectangle {
+            height: content.preferred-height + (block.kind == 5 ? 16px : 6px);
+            background: block.kind == 5 ? #161616 : transparent;
+            border-radius: block.kind == 5 ? 6px : 0;
+
+            content := VerticalLayout {
+                // Headings get room above; list items stay tight so a list
+                // reads as one group; paragraphs breathe.
+                padding-top: block.kind == 5 ? 8px
+                    : block.kind >= 1 && block.kind <= 3 ? 10px
+                    : block.kind == 4 || block.kind == 6 ? 2px
+                    : 5px;
+                padding-bottom: block.kind == 5 ? 8px
+                    : block.kind == 4 || block.kind == 6 ? 2px
+                    : 5px;
+                padding-left: block.kind == 4 || block.kind == 6
+                    ? 18px + block.indent * 18px
+                    : block.kind == 5 ? 10px : 0px;
+                padding-right: 4px;
+
+                Text {
+                    text: block.kind == 4 ? "•  " + block.text : block.text;
+                    wrap: word-wrap;
+                    color: root.foreground;
+                    font-size: block.kind == 1 ? root.body-font-size * 1.6
+                        : block.kind == 2 ? root.body-font-size * 1.35
+                        : block.kind == 3 ? root.body-font-size * 1.15
+                        : root.body-font-size;
+                    font-weight: block.kind >= 1 && block.kind <= 3 ? 700 : 400;
+                    font-family: block.kind == 5 ? root.code-font-family : "";
+                }
+            }
+        }
+    }
+}

@@ -9,7 +9,10 @@ lists every deliberate difference and why it exists.
 
 ## Module map
 
-Where upstream behaviour lives in this codebase:
+Where upstream behaviour lives in this codebase. Paths below are relative to
+the search crate root, `crates/trouve-search/` (e.g. `src/chunk.rs` is
+`crates/trouve-search/src/chunk.rs`), since the crate moved into the
+monorepo workspace.
 
 | Upstream (Python) | trouve (Rust) | Fidelity |
 | --- | --- | --- |
@@ -130,17 +133,16 @@ The CLI adds a `stats` subcommand (index size, cache hit rate).
 **Why:** the revalidation policy leans on rebuilds being sub-second; upstream
 cannot re-validate cheaply, so it caches more conservatively.
 
-### 10. Persistent clone cache for remote repositories
+### 10. No remote repository support
 
-Upstream (and trouve before 1.1) shallow-cloned a git URL into a throwaway
-temp directory on every call. Clones now persist in the trouve cache dir
-keyed by URL (and optional ref), guarded by advisory file locks, refreshed
-with a `git fetch` at most once per freshness window (`TROUVE_CLONE_TTL`),
-and evicted after a week idle.
+Upstream shallow-clones a git URL into a temp directory when given one.
+trouve indexes local directories only and rejects git URLs with an error
+(trouve 1.1–2.0 had a persistent clone cache; it was removed).
 
-**Why:** the content-addressed store already made re-indexing an unchanged
-remote repo nearly free — the network-bound re-clone was the only repeated
-cost left. A warm remote query now costs the same as a local one.
+**Why:** managing clones of other people's repositories — credentials,
+freshness, eviction, concurrent access — is out of scope for a search tool.
+Clone the repository yourself and pass the local path; indexing a local
+clone costs the same.
 
 ## What did *not* change
 
@@ -155,9 +157,9 @@ cost left. A warm remote query now costs the same as a local one.
 - Reranking: same boosts and penalties, ported constant-for-constant.
 - CLI/MCP surface, cache-location resolution, savings tracking. (User-facing
   names are trouve's own — `.trouveignore`, `TROUVE_CACHE_LOCATION`,
-  `TROUVE_MODEL_NAME`, `TROUVE_CLONE_TIMEOUT` — with the semble equivalents
-  still honoured as deprecated fallbacks. Upstream's interactive installer
-  is not ported; [INSTALL.md](INSTALL.md) documents manual setup.)
+  `TROUVE_MODEL_NAME` — with the semble equivalents still honoured as
+  deprecated fallbacks. Upstream's interactive installer is not ported;
+  [INSTALL.md](INSTALL.md) documents manual setup.)
 - CPU-only execution (static embeddings are table lookups + mean pooling;
   there is no neural forward pass to put on a GPU).
 

@@ -1,0 +1,44 @@
+[package]
+name = "trouve-core"
+version = "0.1.0"
+edition.workspace = true
+description = "Core engine of the trouve AI coding harness: sessions, worktrees, event log, checkpoints, tools, and the agent loop."
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+async-trait.workspace = true
+base64 = "0.22.1"
+bytes.workspace = true
+chrono.workspace = true
+dirs.workspace = true
+futures.workspace = true
+globset = "0.4.18"
+html2text = "0.17.1"
+ignore = "0.4.27"
+libc = "0.2.186"
+octocrab.workspace = true
+portable-pty = "0.9.0"
+regex = "1.12.4"
+# Local-model downloads (HuggingFace GGUFs) and llama-server health checks.
+reqwest.workspace = true
+rusqlite.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tokio-util = "0.7"
+toml.workspace = true
+tracing.workspace = true
+trouve-agents.workspace = true
+trouve-protocol.workspace = true
+trouve-providers.workspace = true
+# Native semantic code search (invariant: search is a first-class harness
+# tool, not an external MCP add-on).
+trouve-search.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

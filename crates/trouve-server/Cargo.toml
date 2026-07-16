@@ -1,0 +1,32 @@
+[package]
+name = "trouve-server"
+version = "0.1.0"
+edition.workspace = true
+description = "Headless HTTP/SSE server exposing the trouve AI coding harness protocol."
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+axum.workspace = true
+base64 = "0.22.1"
+chrono.workspace = true
+futures.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tokio-stream.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+trouve-core.workspace = true
+trouve-protocol.workspace = true
+utoipa.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+async-trait.workspace = true
+reqwest.workspace = true
+tempfile.workspace = true
+trouve-agents.workspace = true
+trouve-providers.workspace = true

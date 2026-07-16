@@ -90,7 +90,7 @@ step-by-step instructions for every route and agent.
 | Agents | OpenCode, Kilo Code | Claude Code, Codex | OpenCode | any MCP-capable agent (Cursor, Gemini, Copilot, VS Code, Windsurf, Zed, …) | anything with a shell |
 | Tool surface | native `trouve_search` / `trouve_find_related` | MCP (`mcp__trouve-search__*`) | native `trouve_search` / `trouve_find_related` | MCP (`mcp__trouve-search__*`) | `trouve-search` CLI via bash |
 | trouve process | one persistent server per session | one MCP server per session | one process per call | one MCP server per session | one process per call |
-| In-session index cache (incl. remote URLs) | yes | yes | disk store only | yes | disk store only |
+| In-session index cache | yes | yes | disk store only | yes | disk store only |
 | Index warmed at session start | yes, + re-warm on idle turns | Claude: yes (hook) · Codex: no | no | no | no |
 | Bundled guidance | rich tool descriptions | workflow skill (+ sub-agent on Claude) | rich tool descriptions | tool descriptions | sub-agent docs |
 | Setup | one `plugin` entry in your config | managed by the plugin marketplace | copy one file | one config entry | nothing |
@@ -102,8 +102,7 @@ How to choose:
   lockstep with the crate, install/uninstall as one unit, and are the only
   routes with session-start index warming. For OpenCode and Kilo Code the
   plugin also avoids MCP entirely: tools are native, and the persistent
-  server keeps remote-repository indexes cached across calls within a
-  session.
+  server keeps indexes cached across calls within a session.
 - **For OpenCode without npm, use the native tool file**: copy
   [`src/agents/opencode-tool.ts`](src/agents/opencode-tool.ts) to
   `~/.config/opencode/tools/trouve.ts`. It exposes `trouve_search` /
@@ -184,41 +183,36 @@ two-line change (a dependency in `Cargo.toml` and a match arm in
 
 Resolved in order: `TROUVE_CACHE_LOCATION` (absolute path), then the platform
 cache dir (`~/.cache/trouve` on Linux). Set `TROUVE_MODEL_NAME` to override
-the embedding model, and `TROUVE_CLONE_TIMEOUT` (seconds, default 60) to
-adjust the git network timeout used when cloning or fetching remote
-repositories.
+the embedding model.
 
 The upstream semble environment variables (`SEMBLE_CACHE_LOCATION`,
-`SEMBLE_MODEL_NAME`, `SEMBLE_CLONE_TIMEOUT`) are still honoured as fallbacks
-when the corresponding `TROUVE_CACHE_LOCATION`, `TROUVE_MODEL_NAME`, or
-`TROUVE_CLONE_TIMEOUT` is unset, but are deprecated and will be removed in a
-future release. (`TROUVE_CLONE_TTL`, below, is trouve-only and has no semble
-fallback.)
+`SEMBLE_MODEL_NAME`) are still honoured as fallbacks when the corresponding
+`TROUVE_CACHE_LOCATION` or `TROUVE_MODEL_NAME` is unset, but are deprecated
+and will be removed in a future release.
 
 The store garbage-collects itself: after a snapshot write (at most once per
 day per store), entries not referenced by any kept snapshot are deleted, with
 a one-hour grace period protecting concurrent builds. Deleted entries are
 never wrong — the store is a cache, and a miss just recomputes the file.
 
-Remote repositories (git URLs) are cloned once into `<cache>/clones` and
-reused: repeat queries refresh the clone with a cheap `git fetch` at most
-once per freshness window (`TROUVE_CLONE_TTL` seconds, default 300; `0`
-fetches on every query) instead of re-cloning. Clones unused for a week are
-evicted automatically, and `trouve-search clear index` removes them all.
-
 ## Development
 
+This repository is a Cargo workspace (the trouve monorepo); the search tool
+lives in `crates/trouve-search`. From the repo root:
+
 ```bash
-cargo test                        # unit + integration tests (offline)
-TROUVE_E2E=1 cargo test -- --ignored   # end-to-end tests (downloads the model)
+cargo test -p trouve-search       # unit + integration tests (offline)
+TROUVE_E2E=1 cargo test -p trouve-search -- --ignored   # e2e tests (downloads the model)
 ./scripts/fetch-reference.sh      # clone upstream Python semble into reference/
-python3 tests/parity/run_parity.py --binary target/release/trouve-search
+python3 crates/trouve-search/tests/parity/run_parity.py --binary target/release/trouve-search
 ./benchmarks/run_benchmarks.sh    # hyperfine comparison vs Python semble
 ```
 
-Releases version everything together: the crate version in `Cargo.toml` is
-the single source of truth, and every published plugin/package manifest must
-match it exactly (enforced in CI). After bumping `Cargo.toml`, run:
+trouve-search's distribution artifacts version together: the crate version in
+`crates/trouve-search/Cargo.toml` is the single source of truth, and every
+published plugin/package manifest must match it exactly (enforced in CI).
+Releases are tagged per crate (`trouve-search-vX.Y.Z`). After bumping the
+crate version, run:
 
 ```bash
 python3 scripts/sync_versions.py  # rewrite all plugin manifests to match

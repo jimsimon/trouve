@@ -1,0 +1,54 @@
+// Keyboard scrolling for panes built on ListView/ScrollView: wrap the
+// scrolling element and bind the viewport properties. Clicking an empty
+// spot in the pane focuses it (FocusScope default); keys rejected by inner
+// widgets (e.g. PageUp in a text input) bubble here too.
+//
+// Bindings: PageUp/PageDown page, Home/End (plain, Ctrl, or macOS ⌘↑/⌘↓)
+// jump to the top/bottom, and plain arrows nudge.
+
+export component ScrollKeys inherits FocusScope {
+    // Two-way bound to the pane's viewport-y (0 or negative).
+    in-out property <length> target-y;
+    // The pane's visible height and content height.
+    in property <length> page;
+    in property <length> total;
+    // Keys pass through untouched while false (pane hidden/inapplicable).
+    in property <bool> active: true;
+
+    function scroll-to(y: length) {
+        root.target-y = clamp(y, min(0px, root.page - root.total), 0px);
+    }
+
+    key-pressed(event) => {
+        if (!root.active) {
+            return reject;
+        }
+        if (event.text == Key.PageDown) {
+            root.scroll-to(root.target-y - max(40px, root.page - 40px));
+            return accept;
+        }
+        if (event.text == Key.PageUp) {
+            root.scroll-to(root.target-y + max(40px, root.page - 40px));
+            return accept;
+        }
+        if (event.text == Key.Home
+            || (event.text == Key.UpArrow && event.modifiers.meta)) {
+            root.scroll-to(0px);
+            return accept;
+        }
+        if (event.text == Key.End
+            || (event.text == Key.DownArrow && event.modifiers.meta)) {
+            root.scroll-to(root.page - root.total);
+            return accept;
+        }
+        if (event.text == Key.UpArrow) {
+            root.scroll-to(root.target-y + 60px);
+            return accept;
+        }
+        if (event.text == Key.DownArrow) {
+            root.scroll-to(root.target-y - 60px);
+            return accept;
+        }
+        reject
+    }
+}

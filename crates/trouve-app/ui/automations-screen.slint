@@ -1,0 +1,617 @@
+// Automations: prompts on a schedule. Full-window screen (like settings)
+// with the list of automations and an inline add/edit form. Each run
+// creates a fresh session in the chosen workspace and sends the prompt.
+
+import {
+    Button, CheckBox, ComboBox, LineEdit, ListView, ScrollView, TextEdit
+} from "std-widgets.slint";
+import { ScrollKeys } from "scroll-keys.slint";
+import { Theme } from "theme.slint";
+
+// One automation row. The schedule/next/last lines are pre-rendered by the
+// controller; the raw fields ride along so Edit can fill the form without
+// a round-trip.
+export struct AutomationItem {
+    id: string,
+    name: string,
+    // "Daily at 09:00 · myproject"
+    schedule-line: string,
+    // "next run Jul 13 09:00" ("" while disabled)
+    next-line: string,
+    // "last run Jul 12 09:00" or the failure reason
+    last-line: string,
+    last-failed: bool,
+    enabled: bool,
+    // Edit round-trip.
+    prompt: string,
+    workspace-index: int,
+    kind: string,       // "hourly" / "daily" / "weekly"
+    minute-text: string,
+    permission-index: int, // 0 Ask, 1 Allow-list, 2 Yolo
+    time: string,
+    days: [bool],       // 7 flags, Monday first
+}
+
+// A pre-canned automation for a common development task. Picking one
+// pre-fills the add form; the schedule fields ride along like they do on
+// AutomationItem so no round-trip is needed.
+export struct AutomationTemplateItem {
+    id: string,
+    name: string,
+    description: string,
+    // "Weekly · Mon at 06:00"
+    schedule-line: string,
+    prompt: string,
+    kind: string,        // "hourly" / "daily" / "weekly"
+    minute-text: string,
+    time: string,
+    days: [bool],        // 7 flags, Monday first
+}
+
+// A small Mon/Tue/… toggle used by the weekly schedule editor.
+component DayPill inherits Rectangle {
+    in property <string> label;
+    in-out property <bool> on;
+    width: Theme.fs(44px);
+    height: Theme.fs(26px);
+    border-radius: 6px;
+    background: root.on ? Theme.c.accent-bg : Theme.c.control-bg;
+    border-width: 1px;
+    border-color: root.on ? Theme.c.primary-border : Theme.c.border;
+    TouchArea {
+        clicked => { root.on = !root.on; }
+    }
+    Text {
+        text: root.label;
+        color: root.on ? Theme.c.text-hi : Theme.c.text-soft;
+        font-size: Theme.fs(11px);
+        horizontal-alignment: center;
+        vertical-alignment: center;
+    }
+}
+
+export component AutomationsScreen inherits Rectangle {
+    background: Theme.c.win-bg;
+
+    in property <[AutomationItem]> automations;
+    // Pre-canned starting points, shown while the form is closed.
+    in property <[AutomationTemplateItem]> templates;
+    // Error/status line ("" = nothing to say).
+    in property <string> status: "";
+    // Workspace picker (parallel arrays).
+    in property <[string]> workspace-names;
+    in property <[string]> workspace-ids;
+
+    // Add/edit form state. form-id "" = creating.
+    in-out property <bool> form-open: false;
+    in-out property <string> form-id: "";
+    in-out property <string> form-name: "";
+    in-out property <string> form-prompt: "";
+    in-out property <int> form-workspace-index: 0;
+    // 0 hourly, 1 daily, 2 weekly.
+    in-out property <int> form-kind-index: 1;
+    in-out property <string> form-minute: "0";
+    in-out property <string> form-time: "09:00";
+    // 0 Ask, 1 Allow-list, 2 explicitly confirmed unattended Yolo.
+    in-out property <int> form-permission-index: 0;
+    in-out property <bool> form-yolo-confirmed: false;
+    in-out property <bool> form-day-0: false;
+    in-out property <bool> form-day-1: false;
+    in-out property <bool> form-day-2: false;
+    in-out property <bool> form-day-3: false;
+    in-out property <bool> form-day-4: false;
+    in-out property <bool> form-day-5: false;
+    in-out property <bool> form-day-6: false;
+    in-out property <bool> form-enabled: true;
+
+    callback close();
+    callback refresh();
+    // days is "0,2,4" (Monday-first indices).
+    callback saved(/* id */ string, /* name */ string, /* prompt */ string,
+                   /* workspace-id */ string, /* kind */ string,
+                   /* minute */ string, /* time */ string, /* days */ string,
+                   /* permission-index */ int,
+                   /* enabled */ bool);
+    callback toggled(/* id */ string, /* enabled */ bool);
+    callback run-now(/* id */ string);
+    callback deleted(/* id */ string);
+
+    function kind-name() -> string {
+        root.form-kind-index == 0 ? "hourly"
+            : root.form-kind-index == 1 ? "daily" : "weekly";
+    }
+
+    function days-csv() -> string {
+        (root.form-day-0 ? "0," : "") + (root.form-day-1 ? "1," : "")
+            + (root.form-day-2 ? "2," : "") + (root.form-day-3 ? "3," : "")
+            + (root.form-day-4 ? "4," : "") + (root.form-day-5 ? "5," : "")
+            + (root.form-day-6 ? "6," : "");
+    }
+
+    public function open-blank-form() {
+        root.form-id = "";
+        root.form-name = "";
+        root.form-prompt = "";
+        root.form-workspace-index = 0;
+        root.form-kind-index = 1;
+        root.form-minute = "0";
+        root.form-time = "09:00";
+        root.form-permission-index = 0;
+        root.form-yolo-confirmed = false;
+        root.form-day-0 = false;
+        root.form-day-1 = false;
+        root.form-day-2 = false;
+        root.form-day-3 = false;
+        root.form-day-4 = false;
+        root.form-day-5 = false;
+        root.form-day-6 = false;
+        root.form-enabled = true;
+        root.form-open = true;
+    }
+
+    VerticalLayout {
+        // ---------------- header ----------------
+        Rectangle {
+            height: 52px;
+            background: Theme.c.sidebar-bg;
+            HorizontalLayout {
+                padding-left: 16px;
+                padding-right: 16px;
+                Text {
+                    text: "Automations";
+                    color: Theme.c.text-hi;
+                    font-size: Theme.fs(18px);
+                    font-weight: 700;
+                    vertical-alignment: center;
+                    horizontal-stretch: 1;
+                }
+                VerticalLayout {
+                    alignment: center;
+                    Button {
+                        text: "✕ Close";
+                        clicked => { root.close(); }
+                    }
+                }
+            }
+        }
+
+        // ---------------- body (centered column) ----------------
+        HorizontalLayout {
+            vertical-stretch: 1;
+            Rectangle { horizontal-stretch: 1; }
+            Rectangle {
+                width: 680px;
+                ScrollKeys {
+                    target-y <=> body.viewport-y;
+                    page: body.visible-height;
+                    total: body.viewport-height;
+                body := ScrollView {
+                    width: 100%;
+                    height: 100%;
+                    VerticalLayout {
+                        padding: 16px;
+                        spacing: 12px;
+                        alignment: start;
+
+                        HorizontalLayout {
+                            Text {
+                                text: "Scheduled prompts";
+                                color: Theme.c.text-hi;
+                                font-size: Theme.fs(16px);
+                                font-weight: 700;
+                                vertical-alignment: center;
+                                horizontal-stretch: 1;
+                            }
+                            HorizontalLayout {
+                                spacing: 8px;
+                                Button {
+                                    text: "⟳ Refresh";
+                                    clicked => { root.refresh(); }
+                                }
+                                Button {
+                                    text: "+ New automation";
+                                    primary: true;
+                                    enabled: root.workspace-names.length > 0;
+                                    clicked => { root.open-blank-form(); }
+                                }
+                            }
+                        }
+
+                        Text {
+                            text: "Each run creates a fresh session in the chosen workspace and sends the prompt — exactly as if you had typed it. Times follow this machine's clock; runs missed while trouve was closed are skipped.";
+                            color: Theme.c.text-soft;
+                            font-size: Theme.fs(11px);
+                            wrap: word-wrap;
+                        }
+
+                        if root.workspace-names.length == 0: Text {
+                            text: "Open a workspace first — automations run their prompts inside one.";
+                            color: Theme.c.warn;
+                            font-size: Theme.fs(12px);
+                            wrap: word-wrap;
+                        }
+
+                        if root.status != "": Text {
+                            text: root.status;
+                            color: Theme.c.err;
+                            font-size: Theme.fs(12px);
+                            wrap: word-wrap;
+                        }
+
+                        // ---------------- list ----------------
+                        if root.automations.length == 0 && !root.form-open: Rectangle {
+                            background: Theme.c.surface;
+                            border-radius: 6px;
+                            height: 72px;
+                            Text {
+                                text: "No automations yet.";
+                                color: Theme.c.text-dim;
+                                font-size: Theme.fs(13px);
+                                horizontal-alignment: center;
+                                vertical-alignment: center;
+                            }
+                        }
+                        for item in root.automations: Rectangle {
+                            background: Theme.c.surface;
+                            border-radius: 6px;
+                            height: auto-row.preferred-height + 20px;
+                            auto-row := HorizontalLayout {
+                                padding: 10px;
+                                spacing: 10px;
+                                VerticalLayout {
+                                    spacing: 3px;
+                                    horizontal-stretch: 1;
+                                    HorizontalLayout {
+                                        spacing: 8px;
+                                        alignment: start;
+                                        Text {
+                                            text: item.name;
+                                            color: Theme.c.text-hi;
+                                            font-size: Theme.fs(13px);
+                                            font-weight: 700;
+                                            overflow: elide;
+                                        }
+                                        if !item.enabled: Text {
+                                            text: "paused";
+                                            color: Theme.c.text-faint;
+                                            font-size: Theme.fs(10px);
+                                            vertical-alignment: center;
+                                        }
+                                        Text {
+                                            text: item.permission-index == 2 ? "YOLO"
+                                                : item.permission-index == 1 ? "allow-list" : "Ask";
+                                            color: item.permission-index == 2
+                                                ? Theme.c.warn : Theme.c.text-faint;
+                                            font-size: Theme.fs(10px);
+                                            font-weight: item.permission-index == 2 ? 700 : 400;
+                                            vertical-alignment: center;
+                                        }
+                                    }
+                                    Text {
+                                        text: item.schedule-line;
+                                        color: Theme.c.text-mid;
+                                        font-size: Theme.fs(11px);
+                                        overflow: elide;
+                                    }
+                                    if item.next-line != "": Text {
+                                        text: item.next-line;
+                                        color: Theme.c.text-dim;
+                                        font-size: Theme.fs(11px);
+                                        overflow: elide;
+                                    }
+                                    if item.last-line != "": Text {
+                                        text: item.last-line;
+                                        color: item.last-failed ? Theme.c.err-soft : Theme.c.text-dim;
+                                        font-size: Theme.fs(11px);
+                                        overflow: elide;
+                                    }
+                                }
+                                VerticalLayout {
+                                    alignment: center;
+                                    HorizontalLayout {
+                                        spacing: 6px;
+                                        Button {
+                                            text: item.enabled ? "Pause" : "Resume";
+                                            clicked => { root.toggled(item.id, !item.enabled); }
+                                        }
+                                        Button {
+                                            text: "Run now";
+                                            clicked => { root.run-now(item.id); }
+                                        }
+                                        Button {
+                                            text: "Edit";
+                                            clicked => {
+                                                root.form-id = item.id;
+                                                root.form-name = item.name;
+                                                root.form-prompt = item.prompt;
+                                                root.form-workspace-index = item.workspace-index;
+                                                root.form-kind-index = item.kind == "hourly" ? 0
+                                                    : item.kind == "daily" ? 1 : 2;
+                                                root.form-minute = item.minute-text;
+                                                root.form-time = item.time;
+                                                root.form-permission-index = item.permission-index;
+                                                // Require a fresh acknowledgement
+                                                // whenever an unattended automation is edited.
+                                                root.form-yolo-confirmed = false;
+                                                root.form-day-0 = item.days[0];
+                                                root.form-day-1 = item.days[1];
+                                                root.form-day-2 = item.days[2];
+                                                root.form-day-3 = item.days[3];
+                                                root.form-day-4 = item.days[4];
+                                                root.form-day-5 = item.days[5];
+                                                root.form-day-6 = item.days[6];
+                                                root.form-enabled = item.enabled;
+                                                root.form-open = true;
+                                            }
+                                        }
+                                        Button {
+                                            text: "Delete";
+                                            clicked => { root.deleted(item.id); }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
+                        // ---------------- add/edit form ----------------
+                        if root.form-open: Rectangle {
+                            background: Theme.c.raised-bg;
+                            border-radius: 6px;
+                            border-width: 1px;
+                            border-color: Theme.c.border;
+                            height: form-col.preferred-height + 28px;
+                            form-col := VerticalLayout {
+                                padding: 14px;
+                                spacing: 10px;
+
+                                Text {
+                                    text: root.form-id == "" ? "New automation" : "Edit automation";
+                                    color: Theme.c.text-hi;
+                                    font-size: Theme.fs(14px);
+                                    font-weight: 700;
+                                }
+
+                                LineEdit {
+                                    placeholder-text: "name (e.g. Nightly dependency audit)";
+                                    text <=> root.form-name;
+                                }
+
+                                TextEdit {
+                                    height: Theme.fs(90px);
+                                    placeholder-text: "prompt to send";
+                                    text <=> root.form-prompt;
+                                    wrap: word-wrap;
+                                }
+
+                                HorizontalLayout {
+                                    spacing: 8px;
+                                    Text {
+                                        text: "Workspace";
+                                        color: Theme.c.text-mid;
+                                        font-size: Theme.fs(12px);
+                                        vertical-alignment: center;
+                                    }
+                                    ComboBox {
+                                        model: root.workspace-names;
+                                        current-index <=> root.form-workspace-index;
+                                        horizontal-stretch: 1;
+                                    }
+                                }
+
+                                HorizontalLayout {
+                                    spacing: 8px;
+                                    Text {
+                                        text: "Permissions";
+                                        color: Theme.c.text-mid;
+                                        font-size: Theme.fs(12px);
+                                        vertical-alignment: center;
+                                    }
+                                    ComboBox {
+                                        model: [
+                                            "Ask before changes (safe)",
+                                            "Allow-list (approve as needed)",
+                                            "Unattended (YOLO)"
+                                        ];
+                                        current-index <=> root.form-permission-index;
+                                        horizontal-stretch: 1;
+                                    }
+                                }
+
+                                if root.form-permission-index == 2: Rectangle {
+                                    background: Theme.c.warn-bg;
+                                    border-width: 1px;
+                                    border-color: Theme.c.warn-border;
+                                    border-radius: 6px;
+                                    height: yolo-warning.preferred-height + 20px;
+                                    yolo-warning := VerticalLayout {
+                                        padding: 10px;
+                                        spacing: 8px;
+                                        Text {
+                                            text: "Unattended execution is dangerous";
+                                            color: Theme.c.warn;
+                                            font-size: Theme.fs(12px);
+                                            font-weight: 700;
+                                        }
+                                        Text {
+                                            text: "The agent can run shell commands and edit or delete files without asking. Repository content can influence those actions. This permission applies only to fresh sessions created by this automation and does not change global defaults.";
+                                            color: Theme.c.text-mid;
+                                            font-size: Theme.fs(11px);
+                                            wrap: word-wrap;
+                                        }
+                                        CheckBox {
+                                            text: "I understand and want this automation to run without approval";
+                                            checked <=> root.form-yolo-confirmed;
+                                        }
+                                    }
+                                }
+
+                                // Schedule: preset + the fields it needs.
+                                HorizontalLayout {
+                                    spacing: 8px;
+                                    Text {
+                                        text: "Runs";
+                                        color: Theme.c.text-mid;
+                                        font-size: Theme.fs(12px);
+                                        vertical-alignment: center;
+                                    }
+                                    ComboBox {
+                                        model: ["Hourly", "Daily", "Weekly"];
+                                        current-index <=> root.form-kind-index;
+                                    }
+                                    if root.form-kind-index == 0: Text {
+                                        text: "at minute";
+                                        color: Theme.c.text-mid;
+                                        font-size: Theme.fs(12px);
+                                        vertical-alignment: center;
+                                    }
+                                    if root.form-kind-index == 0: LineEdit {
+                                        width: Theme.fs(64px);
+                                        placeholder-text: "0-59";
+                                        text <=> root.form-minute;
+                                    }
+                                    if root.form-kind-index != 0: Text {
+                                        text: "at";
+                                        color: Theme.c.text-mid;
+                                        font-size: Theme.fs(12px);
+                                        vertical-alignment: center;
+                                    }
+                                    if root.form-kind-index != 0: LineEdit {
+                                        width: Theme.fs(84px);
+                                        placeholder-text: "HH:MM";
+                                        text <=> root.form-time;
+                                    }
+                                    Rectangle { horizontal-stretch: 1; }
+                                }
+
+                                if root.form-kind-index == 2: HorizontalLayout {
+                                    spacing: 6px;
+                                    alignment: start;
+                                    DayPill { label: "Mon"; on <=> root.form-day-0; }
+                                    DayPill { label: "Tue"; on <=> root.form-day-1; }
+                                    DayPill { label: "Wed"; on <=> root.form-day-2; }
+                                    DayPill { label: "Thu"; on <=> root.form-day-3; }
+                                    DayPill { label: "Fri"; on <=> root.form-day-4; }
+                                    DayPill { label: "Sat"; on <=> root.form-day-5; }
+                                    DayPill { label: "Sun"; on <=> root.form-day-6; }
+                                }
+
+                                HorizontalLayout {
+                                    spacing: 8px;
+                                    Rectangle { horizontal-stretch: 1; }
+                                    Button {
+                                        text: "Cancel";
+                                        clicked => { root.form-open = false; }
+                                    }
+                                    Button {
+                                        text: root.form-id == "" ? "Create" : "Save";
+                                        primary: true;
+                                        enabled: root.form-name != "" && root.form-prompt != ""
+                                            && root.workspace-ids.length > root.form-workspace-index
+                                            && (root.form-kind-index != 2 || root.days-csv() != "")
+                                            && (root.form-permission-index != 2
+                                                || root.form-yolo-confirmed);
+                                        clicked => {
+                                            root.saved(root.form-id, root.form-name,
+                                                root.form-prompt,
+                                                root.workspace-ids[root.form-workspace-index],
+                                                root.kind-name(), root.form-minute,
+                                                root.form-time, root.days-csv(),
+                                                root.form-permission-index,
+                                                root.form-enabled);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
+                        // ---------------- templates ----------------
+                        // Pre-canned starting points for common development
+                        // chores. Hidden while the form is up — picking one
+                        // is an alternative way to open it.
+                        if !root.form-open && root.templates.length > 0
+                            && root.workspace-names.length > 0: VerticalLayout {
+                            spacing: 8px;
+                            Text {
+                                text: "Start from a template";
+                                color: Theme.c.text-hi;
+                                font-size: Theme.fs(14px);
+                                font-weight: 700;
+                            }
+                            Text {
+                                text: "Common development chores, ready to schedule. Picking one just pre-fills the form — edit anything before saving.";
+                                color: Theme.c.text-soft;
+                                font-size: Theme.fs(11px);
+                                wrap: word-wrap;
+                            }
+                            for t in root.templates: Rectangle {
+                                background: Theme.c.surface;
+                                border-radius: 6px;
+                                height: tpl-row.preferred-height + 20px;
+                                tpl-row := HorizontalLayout {
+                                    padding: 10px;
+                                    spacing: 10px;
+                                    VerticalLayout {
+                                        spacing: 3px;
+                                        horizontal-stretch: 1;
+                                        HorizontalLayout {
+                                            spacing: 8px;
+                                            alignment: start;
+                                            Text {
+                                                text: t.name;
+                                                color: Theme.c.text-hi;
+                                                font-size: Theme.fs(13px);
+                                                font-weight: 700;
+                                                overflow: elide;
+                                            }
+                                            Text {
+                                                text: t.schedule-line;
+                                                color: Theme.c.text-dim;
+                                                font-size: Theme.fs(11px);
+                                                vertical-alignment: center;
+                                            }
+                                        }
+                                        Text {
+                                            text: t.description;
+                                            color: Theme.c.text-mid;
+                                            font-size: Theme.fs(11px);
+                                            wrap: word-wrap;
+                                        }
+                                    }
+                                    VerticalLayout {
+                                        alignment: center;
+                                        Button {
+                                            text: "Use";
+                                            clicked => {
+                                                root.form-id = "";
+                                                root.form-name = t.name;
+                                                root.form-prompt = t.prompt;
+                                                root.form-workspace-index = 0;
+                                                root.form-kind-index = t.kind == "hourly" ? 0
+                                                    : t.kind == "daily" ? 1 : 2;
+                                                root.form-minute = t.minute-text;
+                                                root.form-time = t.time;
+                                                root.form-permission-index = 0;
+                                                root.form-yolo-confirmed = false;
+                                                root.form-day-0 = t.days[0];
+                                                root.form-day-1 = t.days[1];
+                                                root.form-day-2 = t.days[2];
+                                                root.form-day-3 = t.days[3];
+                                                root.form-day-4 = t.days[4];
+                                                root.form-day-5 = t.days[5];
+                                                root.form-day-6 = t.days[6];
+                                                root.form-enabled = true;
+                                                root.form-open = true;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                }
+            }
+            Rectangle { horizontal-stretch: 1; }
+        }
+    }
+}

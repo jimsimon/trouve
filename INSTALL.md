@@ -54,7 +54,7 @@ options are in the [search-plugin README](npm/search-plugin/README.md).
 A single custom-tool file exposing `trouve_search` and `trouve_find_related`
 as native OpenCode tools — no MCP server process, no JSON config edits.
 Unlike the OpenCode plugin it runs one CLI process per call (no in-session
-remote-index cache and no session-start warming), but it also needs no npm
+index cache and no session-start warming), but it also needs no npm
 package.
 
 Copy [`src/agents/opencode-tool.ts`](src/agents/opencode-tool.ts) to

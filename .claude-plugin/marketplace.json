@@ -8,7 +8,7 @@
     {
       "name": "trouve-search",
       "source": "./npm/search-plugin",
-      "description": "Fast, accurate code search: hybrid semantic + BM25 search over any local or remote git repository, with incremental branch-aware indexing. Installs the native binary via npm (@trouve-ai/search-core)."
+      "description": "Fast, accurate code search: hybrid semantic + BM25 search over any local git repository, with incremental branch-aware indexing. Installs the native binary via npm (@trouve-ai/search-core)."
     }
   ]
 }

@@ -1,0 +1,5931 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "trouve harness protocol",
+    "description": "Commands are POST endpoints; state flows back on cursor-addressed SSE event streams.",
+    "license": {
+      "name": "MIT",
+      "identifier": "MIT"
+    },
+    "version": "0.18"
+  },
+  "paths": {
+    "/v1/approvals": {
+      "post": {
+        "tags": [],
+        "operationId": "resolve_approval",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ResolveApprovalRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "204": {
+            "description": ""
+          },
+          "404": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/attachments/{id}": {
+      "get": {
+        "tags": [],
+        "summary": "Raw bytes of a stored prompt attachment, with its uploaded MIME type.",
+        "operationId": "get_attachment",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/automations": {
+      "get": {
+        "tags": [],
+        "operationId": "list_automations",
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/Automation"
+                  }
+                }
+              }
+            }
+          }
+        }
+      },
+      "post": {
+        "tags": [],
+        "operationId": "create_automation",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UpsertAutomationRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Automation"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/automations/templates": {
+      "get": {
+        "tags": [],
+        "summary": "Static catalog of pre-canned automations for common development tasks.",
+        "operationId": "automation_templates",
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/AutomationTemplate"
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/automations/{id}": {
+      "put": {
+        "tags": [],
+        "operationId": "update_automation",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UpsertAutomationRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Automation"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      },
+      "delete": {
+        "tags": [],
+        "operationId": "delete_automation",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": ""
+          },
+          "404": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/automations/{id}/run": {
+      "post": {
+        "tags": [],
+        "summary": "Fire the automation immediately (in the background); the outcome shows\nup on the automation's last_* fields and an `automation.fired` event.",
+        "operationId": "run_automation",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "202": {
+            "description": ""
+          },
+          "404": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/clis": {
+      "get": {
+        "tags": [],
+        "operationId": "list_clis",
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CliList"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/clis/{id}": {
+      "delete": {
+        "tags": [],
+        "summary": "Remove the managed install of a CLI (a system install found on PATH is\nuntouched and will be used again if present).",
+        "operationId": "uninstall_cli",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": ""
+          },
+          "404": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/clis/{id}/install": {
+      "get": {
+        "tags": [],
+        "operationId": "cli_install_status",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CliInstallStatus"
+                }
+              }
+            }
+          }
+        }
+      },
+      "post": {
+        "tags": [],
+        "operationId": "start_cli_install",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "202": {
+            "description": ""
+          },
+          "404": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      },
+      "delete": {
+        "tags": [],
+        "summary": "Cancel an in-flight install; the CLI returns to its previous state.",
+        "operationId": "cancel_cli_install",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": ""
+          },
+          "404": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/config/default-model": {
+      "put": {
+        "tags": [],
+        "operationId": "set_default_model",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SetDefaultModelRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "204": {
+            "description": ""
+          },
+          "400": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/info": {
+      "get": {
+        "tags": [],
+        "operationId": "info",
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ServerInfo"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/integrations/github": {
+      "get": {
+        "tags": [],
+        "operationId": "get_github_integration",
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GithubIntegration"
+                }
+              }
+            }
+          }
+        }
+      },
+      "put": {
+        "tags": [],
+        "operationId": "set_github_integration",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SetGithubTokenRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GithubIntegration"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/integrations/github/hosts": {
+      "post": {
+        "tags": [],
+        "summary": "Register a self-hosted GitHub Enterprise instance.",
+        "operationId": "add_github_host",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AddGithubHostRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GithubIntegration"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/integrations/github/hosts/{host}": {
+      "delete": {
+        "tags": [],
+        "summary": "Remove an enterprise host (and forget its stored secrets).",
+        "operationId": "remove_github_host",
+        "parameters": [
+          {
+            "name": "host",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GithubIntegration"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/local": {
+      "get": {
+        "tags": [],
+        "operationId": "local_status",
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/LocalStatus"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/local/enabled": {
+      "put": {
+        "tags": [],
+        "summary": "Enable or disable local models. Disabling stops the llama-server\nsidecar and unregisters the \"local\" provider.",
+        "operationId": "set_local_enabled",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SetLocalEnabledRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "204": {
+            "description": ""
+          }
+        }
+      }
+    },
+    "/v1/local/models": {
+      "post": {
+        "tags": [],
+        "operationId": "add_local_model",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AddLocalModelRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "204": {
+            "description": ""
+          },
+          "400": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/local/models/{id}": {
+      "delete": {
+        "tags": [],
+        "operationId": "delete_local_model",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": ""
+          },
+          "404": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/local/models/{id}/download": {
+      "post": {
+        "tags": [],
+        "operationId": "start_local_model_download",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "202": {
+            "description": ""
+          },
+          "404": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      },
+      "delete": {
+        "tags": [],
+        "summary": "Cancel an in-flight model download; the partial file is deleted.",
+        "operationId": "cancel_local_model_download",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": ""
+          },
+          "404": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/local/search": {
+      "get": {
+        "tags": [],
+        "summary": "Search HuggingFace for GGUF repos, with per-file hardware-fit guidance\nfor this machine.",
+        "operationId": "search_local_models",
+        "parameters": [
+          {
+            "name": "q",
+            "in": "query",
+            "description": "Search text",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/LocalSearchResult"
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/local/server/restart": {
+      "post": {
+        "tags": [],
+        "summary": "Restart llama-server with the model it is serving (reload happens in\nthe background; poll `GET /v1/local` for server_status).",
+        "operationId": "restart_local_server",
+        "responses": {
+          "202": {
+            "description": ""
+          },
+          "404": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/local/server/stop": {
+      "post": {
+        "tags": [],
+        "operationId": "stop_local_server",
+        "responses": {
+          "204": {
+            "description": ""
+          }
+        }
+      }
+    },
+    "/v1/mcp-servers": {
+      "get": {
+        "tags": [],
+        "operationId": "list_mcp_servers",
+        "parameters": [
+          {
+            "name": "workspace_id",
+            "in": "query",
+            "description": "Include the workspace's .agents servers",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "probe",
+            "in": "query",
+            "description": "Health-check each server",
+            "required": false,
+            "schema": {
+              "type": "boolean"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/McpServerInfo"
+                  }
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/mcp-servers/{name}": {
+      "put": {
+        "tags": [],
+        "operationId": "upsert_mcp_server",
+        "parameters": [
+          {
+            "name": "name",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UpsertMcpServerRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "204": {
+            "description": ""
+          },
+          "400": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      },
+      "delete": {
+        "tags": [],
+        "operationId": "delete_mcp_server",
+        "parameters": [
+          {
+            "name": "name",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "scope",
+            "in": "query",
+            "description": "user or workspace",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "workspace_id",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": ""
+          },
+          "400": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/mcp-servers/{name}/logs": {
+      "get": {
+        "tags": [],
+        "operationId": "mcp_server_logs",
+        "parameters": [
+          {
+            "name": "name",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/McpLogs"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/mode-infos": {
+      "get": {
+        "tags": [],
+        "operationId": "list_mode_infos",
+        "parameters": [
+          {
+            "name": "workspace_id",
+            "in": "query",
+            "description": "Include the workspace's .agents modes",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/ModeInfo"
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/models": {
+      "get": {
+        "tags": [],
+        "operationId": "list_models",
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/ModelInfo"
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/modes": {
+      "get": {
+        "tags": [],
+        "operationId": "list_modes",
+        "parameters": [
+          {
+            "name": "workspace_id",
+            "in": "query",
+            "description": "Include the workspace's .agents modes",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/AgentMode"
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/modes/{id}": {
+      "put": {
+        "tags": [],
+        "operationId": "upsert_mode",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UpsertModeRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "204": {
+            "description": ""
+          },
+          "400": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      },
+      "delete": {
+        "tags": [],
+        "operationId": "delete_mode",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": ""
+          },
+          "400": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/providers": {
+      "get": {
+        "tags": [],
+        "operationId": "list_providers",
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProvidersResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/providers/known": {
+      "get": {
+        "tags": [],
+        "operationId": "known_providers",
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/KnownProvider"
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/providers/{id}": {
+      "put": {
+        "tags": [],
+        "operationId": "upsert_provider",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UpsertProviderRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProviderInfo"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      },
+      "delete": {
+        "tags": [],
+        "operationId": "delete_provider",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": ""
+          },
+          "404": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/providers/{id}/login": {
+      "get": {
+        "tags": [],
+        "operationId": "login_status",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/LoginStatus"
+                }
+              }
+            }
+          }
+        }
+      },
+      "post": {
+        "tags": [],
+        "operationId": "start_login",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/LoginStarted"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/questions": {
+      "post": {
+        "tags": [],
+        "operationId": "resolve_question",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ResolveQuestionRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "204": {
+            "description": ""
+          },
+          "404": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/queue/{id}": {
+      "delete": {
+        "tags": [],
+        "operationId": "delete_queued_prompt",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": ""
+          },
+          "404": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      },
+      "patch": {
+        "tags": [],
+        "operationId": "update_queued_prompt",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UpdateQueuedPromptRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "204": {
+            "description": ""
+          },
+          "404": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/sessions": {
+      "get": {
+        "tags": [],
+        "operationId": "list_sessions",
+        "parameters": [
+          {
+            "name": "workspace_id",
+            "in": "query",
+            "description": "Filter by workspace",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/Session"
+                  }
+                }
+              }
+            }
+          }
+        }
+      },
+      "post": {
+        "tags": [],
+        "operationId": "create_session",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateSessionRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Session"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/sessions/{id}": {
+      "get": {
+        "tags": [],
+        "operationId": "get_session",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Session"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      },
+      "delete": {
+        "tags": [],
+        "operationId": "delete_session",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": ""
+          },
+          "404": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      },
+      "patch": {
+        "tags": [],
+        "operationId": "update_session",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UpdateSessionRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Session"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/sessions/{id}/diff": {
+      "get": {
+        "tags": [],
+        "operationId": "session_diff",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SessionDiff"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/sessions/{id}/file": {
+      "get": {
+        "tags": [],
+        "operationId": "session_file",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "path",
+            "in": "query",
+            "description": "Worktree-relative file",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/FileContent"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/sessions/{id}/files": {
+      "get": {
+        "tags": [],
+        "operationId": "session_files",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "path",
+            "in": "query",
+            "description": "Worktree-relative directory",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/DirEntry"
+                  }
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/sessions/{id}/mcp-servers": {
+      "get": {
+        "tags": [],
+        "operationId": "session_mcp_servers",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/McpServerInfo"
+                  }
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/sessions/{id}/paths": {
+      "get": {
+        "tags": [],
+        "operationId": "session_paths",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  }
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/sessions/{id}/pr": {
+      "get": {
+        "tags": [],
+        "operationId": "get_session_pr",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "oneOf": [
+                    {
+                      "type": "null"
+                    },
+                    {
+                      "$ref": "#/components/schemas/PrInfo"
+                    }
+                  ]
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      },
+      "post": {
+        "tags": [],
+        "operationId": "create_session_pr",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreatePrRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PrInfo"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/sessions/{id}/pr/merge": {
+      "post": {
+        "tags": [],
+        "operationId": "merge_session_pr",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/MergePrRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "204": {
+            "description": ""
+          },
+          "400": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/sessions/{id}/prs": {
+      "get": {
+        "tags": [],
+        "operationId": "list_session_prs",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/PrInfo"
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/sessions/{id}/redo": {
+      "post": {
+        "tags": [],
+        "operationId": "redo_session",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": ""
+          },
+          "400": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/sessions/{id}/terminal": {
+      "post": {
+        "tags": [],
+        "operationId": "open_terminal",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/OpenTerminalRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TerminalInfo"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/sessions/{id}/undo": {
+      "post": {
+        "tags": [],
+        "operationId": "undo_session",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": ""
+          },
+          "400": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/sessions/{id}/usage": {
+      "get": {
+        "tags": [],
+        "operationId": "session_usage",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/UsageSummary"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/subscriptions": {
+      "get": {
+        "tags": [],
+        "operationId": "subscription_health",
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/SubscriptionHealth"
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/terminals/{id}": {
+      "delete": {
+        "tags": [],
+        "operationId": "kill_terminal",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": ""
+          },
+          "404": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/terminals/{id}/input": {
+      "post": {
+        "tags": [],
+        "operationId": "terminal_input",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/TerminalInputRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "204": {
+            "description": ""
+          },
+          "404": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/terminals/{id}/output": {
+      "get": {
+        "tags": [],
+        "summary": "PTY output as SSE: each event's `id` is the byte offset *after* the\nchunk, data is base64. `?after=` resumes from an offset (bytes older\nthan the retained backlog are silently skipped). A final `exit` event\nmarks shell exit. Ephemeral — not part of the persisted event log.",
+        "operationId": "terminal_output",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "after",
+            "in": "query",
+            "description": "Resume byte offset",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int64",
+              "minimum": 0
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "SSE stream of base64 output chunks"
+          },
+          "404": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/terminals/{id}/resize": {
+      "post": {
+        "tags": [],
+        "operationId": "terminal_resize",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/TerminalResizeRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "204": {
+            "description": ""
+          },
+          "404": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/threads": {
+      "get": {
+        "tags": [],
+        "operationId": "list_threads",
+        "parameters": [
+          {
+            "name": "session_id",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/Thread"
+                  }
+                }
+              }
+            }
+          }
+        }
+      },
+      "post": {
+        "tags": [],
+        "operationId": "create_thread",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateThreadRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Thread"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/threads/{id}": {
+      "get": {
+        "tags": [],
+        "operationId": "get_thread",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Thread"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      },
+      "patch": {
+        "tags": [],
+        "operationId": "update_thread",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UpdateThreadRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Thread"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/threads/{id}/cancel": {
+      "post": {
+        "tags": [],
+        "operationId": "cancel_turn",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": ""
+          },
+          "400": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/threads/{id}/messages": {
+      "post": {
+        "tags": [],
+        "operationId": "send_message",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SendMessageRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "202": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TurnAccepted"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/threads/{id}/queue": {
+      "get": {
+        "tags": [],
+        "operationId": "list_queue",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/QueuedPrompt"
+                  }
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      },
+      "put": {
+        "tags": [],
+        "operationId": "reorder_queue",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ReorderQueueRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/QueuedPrompt"
+                  }
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/threads/{id}/queue/dispatch": {
+      "post": {
+        "tags": [],
+        "summary": "Kick an idle thread into draining its queue. Queued prompts never\nauto-run at startup (a crash may have cut the previous turn short) and a\nfailed turn pauses its queue — both wait for this explicit resume.",
+        "operationId": "dispatch_queue",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "202": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TurnAccepted"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/threads/{id}/usage": {
+      "get": {
+        "tags": [],
+        "operationId": "thread_usage",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/UsageSummary"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/workspaces": {
+      "get": {
+        "tags": [],
+        "operationId": "list_workspaces",
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/Workspace"
+                  }
+                }
+              }
+            }
+          }
+        }
+      },
+      "post": {
+        "tags": [],
+        "operationId": "register_workspace",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RegisterWorkspaceRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Workspace"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/workspaces/{id}/branches": {
+      "get": {
+        "tags": [],
+        "operationId": "workspace_branches",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BranchList"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "components": {
+    "schemas": {
+      "AddGithubHostRequest": {
+        "type": "object",
+        "description": "Register a self-hosted GitHub Enterprise instance\n(`POST /v1/integrations/github/hosts`).",
+        "required": [
+          "host"
+        ],
+        "properties": {
+          "client_id": {
+            "type": "string",
+            "description": "Client id of an OAuth app on that instance (device flow enabled);\nenables \"Sign in\" for the host. A PAT works without one."
+          },
+          "host": {
+            "type": "string",
+            "description": "Hostname only, e.g. \"github.example.com\"."
+          }
+        }
+      },
+      "AddLocalModelRequest": {
+        "type": "object",
+        "description": "Add a custom GGUF from a HuggingFace repo to the local model list.",
+        "required": [
+          "repo",
+          "file"
+        ],
+        "properties": {
+          "display_name": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "file": {
+            "type": "string",
+            "description": "GGUF filename inside the repo."
+          },
+          "repo": {
+            "type": "string",
+            "description": "HuggingFace repo id, e.g. \"unsloth/Qwen3.6-27B-GGUF\"."
+          }
+        }
+      },
+      "AgentMode": {
+        "type": "object",
+        "description": "A data-driven agent mode: prompt + tool policy + default permissions.\nAdding a mode is configuration, not code (AGENTS.md invariant 6).",
+        "required": [
+          "id",
+          "display_name",
+          "system_prompt"
+        ],
+        "properties": {
+          "allowed_tools": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Tool names this mode may use; empty means all registered tools."
+          },
+          "default_model": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Preferred model for threads started in this mode (\"provider/model\").\nNone falls back to the global default model."
+          },
+          "default_permission_mode": {
+            "$ref": "#/components/schemas/PermissionMode"
+          },
+          "display_name": {
+            "type": "string"
+          },
+          "id": {
+            "type": "string",
+            "description": "Stable identifier, e.g. \"code\", \"plan\", \"review\"."
+          },
+          "read_only": {
+            "type": "boolean",
+            "description": "When true the mode can never mutate the worktree regardless of the\nthread's permission mode (e.g. plan/question modes)."
+          },
+          "system_prompt": {
+            "type": "string",
+            "description": "Appended to the base system prompt."
+          }
+        }
+      },
+      "ApprovalDecision": {
+        "type": "string",
+        "description": "Permission decision for an approval request.",
+        "enum": [
+          "approve",
+          "always_approve",
+          "deny"
+        ]
+      },
+      "Attachment": {
+        "type": "object",
+        "description": "A stored prompt attachment. Bytes are served at\n`GET /v1/attachments/{id}`.",
+        "required": [
+          "id",
+          "name",
+          "mime",
+          "size_bytes"
+        ],
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "mime": {
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          },
+          "size_bytes": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          }
+        }
+      },
+      "AttachmentUpload": {
+        "type": "object",
+        "description": "One file uploaded with a prompt.",
+        "required": [
+          "name",
+          "mime",
+          "data"
+        ],
+        "properties": {
+          "data": {
+            "type": "string",
+            "description": "Base64-encoded contents (standard alphabet, padded)."
+          },
+          "mime": {
+            "type": "string",
+            "description": "MIME type (\"image/png\"). `image/*` attachments are passed to agents\nas native image inputs; anything else is referenced by path."
+          },
+          "name": {
+            "type": "string",
+            "description": "Display name (\"screenshot.png\"); the server keeps it for rendering\nand derives the stored file's extension from it."
+          }
+        }
+      },
+      "Automation": {
+        "type": "object",
+        "description": "A scheduled prompt. Each run creates a fresh session (worktree) in the\nworkspace, a thread with the configured mode/model, and sends the\nprompt — exactly as if the user had typed it.",
+        "required": [
+          "id",
+          "name",
+          "prompt",
+          "workspace_id",
+          "schedule",
+          "enabled",
+          "created_at"
+        ],
+        "properties": {
+          "created_at": {
+            "type": "string"
+          },
+          "enabled": {
+            "type": "boolean"
+          },
+          "id": {
+            "type": "string"
+          },
+          "last_error": {
+            "type": "string",
+            "description": "Why the last run failed (\"\" = it didn't)."
+          },
+          "last_run_at": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Last fire time (RFC3339)."
+          },
+          "last_session_id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Session created by the last run."
+          },
+          "mode": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Agent mode for the runs (None = the default mode)."
+          },
+          "model": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Model for the runs (None = the mode's default)."
+          },
+          "name": {
+            "type": "string"
+          },
+          "next_run_at": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Next fire time (RFC3339), when enabled."
+          },
+          "permission_mode": {
+            "$ref": "#/components/schemas/PermissionMode",
+            "description": "Permission policy applied only to sessions created by this automation.\nDefaults to Ask; Yolo is an explicit unattended-execution opt-in."
+          },
+          "prompt": {
+            "type": "string"
+          },
+          "schedule": {
+            "$ref": "#/components/schemas/AutomationSchedule"
+          },
+          "workspace_id": {
+            "$ref": "#/components/schemas/String"
+          }
+        }
+      },
+      "AutomationSchedule": {
+        "type": "object",
+        "description": "When an automation fires. Times are the server's local time zone.",
+        "required": [
+          "kind"
+        ],
+        "properties": {
+          "days": {
+            "type": "array",
+            "items": {
+              "type": "integer",
+              "format": "int32",
+              "minimum": 0
+            },
+            "description": "Weekly: days it fires (0 = Monday … 6 = Sunday); at least one."
+          },
+          "kind": {
+            "type": "string",
+            "description": "\"hourly\", \"daily\", or \"weekly\"."
+          },
+          "minute": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Hourly: minute of the hour (0-59).",
+            "minimum": 0
+          },
+          "time": {
+            "type": "string",
+            "description": "Daily/weekly: time of day as \"HH:MM\" (24h)."
+          }
+        }
+      },
+      "AutomationTemplate": {
+        "type": "object",
+        "description": "A pre-canned automation for a common development task\n(`GET /v1/automations/templates`). Clients use these to pre-fill the\ncreate form; the user still picks the workspace and can edit anything.",
+        "required": [
+          "id",
+          "name",
+          "description",
+          "prompt",
+          "schedule"
+        ],
+        "properties": {
+          "description": {
+            "type": "string",
+            "description": "One-line summary shown in template pickers."
+          },
+          "id": {
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          },
+          "prompt": {
+            "type": "string"
+          },
+          "schedule": {
+            "$ref": "#/components/schemas/AutomationSchedule",
+            "description": "Suggested schedule (editable like the rest)."
+          }
+        }
+      },
+      "BranchList": {
+        "type": "object",
+        "description": "Local branches of a workspace repository, for base-ref selection.",
+        "required": [
+          "branches",
+          "head"
+        ],
+        "properties": {
+          "branches": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "head": {
+            "type": "string",
+            "description": "The branch HEAD currently points at (default selection)."
+          }
+        }
+      },
+      "CheckRun": {
+        "type": "object",
+        "required": [
+          "name",
+          "status"
+        ],
+        "properties": {
+          "conclusion": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "success / failure / … (None while running)"
+          },
+          "name": {
+            "type": "string"
+          },
+          "status": {
+            "type": "string",
+            "description": "queued / in_progress / completed"
+          }
+        }
+      },
+      "CliInfo": {
+        "type": "object",
+        "description": "A vendor CLI trouve can download and manage (cursor-agent, claude,\ncodex), with its current install state.",
+        "required": [
+          "id",
+          "display_name",
+          "kinds",
+          "source",
+          "update_available"
+        ],
+        "properties": {
+          "display_name": {
+            "type": "string"
+          },
+          "id": {
+            "type": "string",
+            "description": "Stable id, also the binary name: \"cursor-agent\", \"claude\", \"codex\"."
+          },
+          "installed_version": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Version of the binary trouve would run, when one was resolved."
+          },
+          "kinds": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Provider kinds served by this CLI (e.g. [\"cursor-cli\"])."
+          },
+          "latest_version": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Newest version the vendor serves (None when the check failed)."
+          },
+          "path": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Absolute path of the resolved binary, when known."
+          },
+          "source": {
+            "type": "string",
+            "description": "Where that binary comes from: \"managed\" (trouve-installed),\n\"path\" (system install), or \"none\"."
+          },
+          "update_available": {
+            "type": "boolean"
+          }
+        }
+      },
+      "CliInstallStatus": {
+        "type": "object",
+        "description": "State of a CLI install started with `POST /v1/clis/{id}/install`.",
+        "required": [
+          "status"
+        ],
+        "properties": {
+          "error": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "received_bytes": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Bytes downloaded so far (pending only).",
+            "minimum": 0
+          },
+          "status": {
+            "type": "string",
+            "description": "\"none\" (nothing running), \"pending\", \"success\", or \"failed\"."
+          },
+          "total_bytes": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Expected total from Content-Length; 0 when unknown.",
+            "minimum": 0
+          },
+          "version": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Version being (or just) installed, when known."
+          }
+        }
+      },
+      "CliList": {
+        "type": "object",
+        "required": [
+          "clis"
+        ],
+        "properties": {
+          "clis": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/CliInfo"
+            }
+          }
+        }
+      },
+      "CommandInfo": {
+        "type": "object",
+        "description": "One slash command / skill the vendor harness accepts in prompts (e.g.\n\"/simplify\"), surfaced by clients as prompt-box completions.",
+        "required": [
+          "name"
+        ],
+        "properties": {
+          "description": {
+            "type": "string"
+          },
+          "name": {
+            "type": "string",
+            "description": "Name without the leading slash."
+          }
+        }
+      },
+      "CreatePrRequest": {
+        "type": "object",
+        "required": [
+          "title"
+        ],
+        "properties": {
+          "base": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Base branch (default: the session's base ref without `origin/`)."
+          },
+          "body": {
+            "type": "string"
+          },
+          "draft": {
+            "type": "boolean"
+          },
+          "title": {
+            "type": "string"
+          }
+        }
+      },
+      "CreateSessionRequest": {
+        "type": "object",
+        "required": [
+          "workspace_id"
+        ],
+        "properties": {
+          "base_ref": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Base ref the session branch is created from (default: workspace HEAD)."
+          },
+          "title": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Human-readable title; also used to derive the branch slug."
+          },
+          "workspace_id": {
+            "$ref": "#/components/schemas/String"
+          }
+        }
+      },
+      "CreateThreadRequest": {
+        "type": "object",
+        "required": [
+          "session_id"
+        ],
+        "properties": {
+          "mode": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Agent mode id (default: \"code\")."
+          },
+          "model": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Provider/model identifier, e.g. \"openai/gpt-4.1\"."
+          },
+          "model_options": {
+            "type": "object",
+            "description": "Model-specific options validated against the model's options schema.",
+            "additionalProperties": {},
+            "propertyNames": {
+              "type": "string"
+            }
+          },
+          "permission_mode": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/PermissionMode"
+              }
+            ]
+          },
+          "session_id": {
+            "$ref": "#/components/schemas/String"
+          }
+        }
+      },
+      "DirEntry": {
+        "type": "object",
+        "required": [
+          "name",
+          "is_dir"
+        ],
+        "properties": {
+          "is_dir": {
+            "type": "boolean"
+          },
+          "name": {
+            "type": "string"
+          }
+        }
+      },
+      "ErrorBody": {
+        "type": "object",
+        "description": "Uniform error body for non-2xx responses.",
+        "required": [
+          "code",
+          "message"
+        ],
+        "properties": {
+          "code": {
+            "type": "string"
+          },
+          "message": {
+            "type": "string"
+          }
+        }
+      },
+      "Event": {
+        "oneOf": [
+          {
+            "type": "object",
+            "required": [
+              "turn",
+              "mode",
+              "model",
+              "type"
+            ],
+            "properties": {
+              "mode": {
+                "type": "string"
+              },
+              "model": {
+                "type": "string"
+              },
+              "turn": {
+                "type": "integer",
+                "format": "int64",
+                "minimum": 0
+              },
+              "type": {
+                "type": "string",
+                "enum": [
+                  "turn.started"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "turn",
+              "usage",
+              "type"
+            ],
+            "properties": {
+              "checkpoint_id": {
+                "oneOf": [
+                  {
+                    "type": "null"
+                  },
+                  {
+                    "$ref": "#/components/schemas/String"
+                  }
+                ]
+              },
+              "turn": {
+                "type": "integer",
+                "format": "int64",
+                "minimum": 0
+              },
+              "type": {
+                "type": "string",
+                "enum": [
+                  "turn.completed"
+                ]
+              },
+              "usage": {
+                "$ref": "#/components/schemas/Usage"
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "turn",
+              "error",
+              "type"
+            ],
+            "properties": {
+              "error": {
+                "type": "string"
+              },
+              "turn": {
+                "type": "integer",
+                "format": "int64",
+                "minimum": 0
+              },
+              "type": {
+                "type": "string",
+                "enum": [
+                  "turn.failed"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "description": "The turn was interrupted by the user (via the cancel endpoint). Like\n`turn.failed` it pauses the queue, but it isn't an error condition.",
+            "required": [
+              "turn",
+              "type"
+            ],
+            "properties": {
+              "turn": {
+                "type": "integer",
+                "format": "int64",
+                "minimum": 0
+              },
+              "type": {
+                "type": "string",
+                "enum": [
+                  "turn.cancelled"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "turn",
+              "content",
+              "type"
+            ],
+            "properties": {
+              "attachments": {
+                "type": "array",
+                "items": {
+                  "$ref": "#/components/schemas/Attachment"
+                },
+                "description": "Files the user attached to the prompt (bytes at\n`GET /v1/attachments/{id}`)."
+              },
+              "content": {
+                "type": "string"
+              },
+              "turn": {
+                "type": "integer",
+                "format": "int64",
+                "minimum": 0
+              },
+              "type": {
+                "type": "string",
+                "enum": [
+                  "user.message"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "description": "Streamed model output. Replaying all deltas of a turn reproduces the\nfinal message exactly.",
+            "required": [
+              "turn",
+              "text",
+              "type"
+            ],
+            "properties": {
+              "text": {
+                "type": "string"
+              },
+              "turn": {
+                "type": "integer",
+                "format": "int64",
+                "minimum": 0
+              },
+              "type": {
+                "type": "string",
+                "enum": [
+                  "assistant.delta"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "description": "Streamed model reasoning (\"thinking\") text, where the provider\nexposes it. Display-only: never part of the provider transcript.",
+            "required": [
+              "turn",
+              "text",
+              "type"
+            ],
+            "properties": {
+              "text": {
+                "type": "string"
+              },
+              "turn": {
+                "type": "integer",
+                "format": "int64",
+                "minimum": 0
+              },
+              "type": {
+                "type": "string",
+                "enum": [
+                  "assistant.thinking"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "description": "Folded final assistant text for the turn.",
+            "required": [
+              "turn",
+              "content",
+              "type"
+            ],
+            "properties": {
+              "content": {
+                "type": "string"
+              },
+              "turn": {
+                "type": "integer",
+                "format": "int64",
+                "minimum": 0
+              },
+              "type": {
+                "type": "string",
+                "enum": [
+                  "assistant.message"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "turn",
+              "call_id",
+              "tool",
+              "args",
+              "requires_approval",
+              "type"
+            ],
+            "properties": {
+              "args": {},
+              "call_id": {
+                "$ref": "#/components/schemas/String"
+              },
+              "requires_approval": {
+                "type": "boolean"
+              },
+              "tool": {
+                "type": "string"
+              },
+              "turn": {
+                "type": "integer",
+                "format": "int64",
+                "minimum": 0
+              },
+              "type": {
+                "type": "string",
+                "enum": [
+                  "tool.requested"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "turn",
+              "call_id",
+              "type"
+            ],
+            "properties": {
+              "call_id": {
+                "$ref": "#/components/schemas/String"
+              },
+              "turn": {
+                "type": "integer",
+                "format": "int64",
+                "minimum": 0
+              },
+              "type": {
+                "type": "string",
+                "enum": [
+                  "approval.requested"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "call_id",
+              "decision",
+              "type"
+            ],
+            "properties": {
+              "call_id": {
+                "$ref": "#/components/schemas/String"
+              },
+              "decision": {
+                "$ref": "#/components/schemas/ApprovalDecision"
+              },
+              "type": {
+                "type": "string",
+                "enum": [
+                  "approval.resolved"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "call_id",
+              "type"
+            ],
+            "properties": {
+              "call_id": {
+                "$ref": "#/components/schemas/String"
+              },
+              "type": {
+                "type": "string",
+                "enum": [
+                  "tool.started"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "call_id",
+              "chunk",
+              "type"
+            ],
+            "properties": {
+              "call_id": {
+                "$ref": "#/components/schemas/String"
+              },
+              "chunk": {
+                "type": "string"
+              },
+              "type": {
+                "type": "string",
+                "enum": [
+                  "tool.output"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "call_id",
+              "status",
+              "result",
+              "type"
+            ],
+            "properties": {
+              "call_id": {
+                "$ref": "#/components/schemas/String"
+              },
+              "result": {},
+              "status": {
+                "$ref": "#/components/schemas/ToolStatus"
+              },
+              "type": {
+                "type": "string",
+                "enum": [
+                  "tool.completed"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "description": "The agent asked the user one or more questions; the turn is blocked\nuntil `question.resolved`. Clients render an answer wizard.",
+            "required": [
+              "turn",
+              "request_id",
+              "questions",
+              "type"
+            ],
+            "properties": {
+              "questions": {
+                "type": "array",
+                "items": {
+                  "$ref": "#/components/schemas/Question"
+                }
+              },
+              "request_id": {
+                "$ref": "#/components/schemas/String"
+              },
+              "title": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "turn": {
+                "type": "integer",
+                "format": "int64",
+                "minimum": 0
+              },
+              "type": {
+                "type": "string",
+                "enum": [
+                  "question.requested"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "description": "Answers submitted (or `answers: null` when the user skipped).",
+            "required": [
+              "request_id",
+              "type"
+            ],
+            "properties": {
+              "answers": {
+                "type": [
+                  "array",
+                  "null"
+                ],
+                "items": {
+                  "$ref": "#/components/schemas/QuestionAnswer"
+                }
+              },
+              "request_id": {
+                "$ref": "#/components/schemas/String"
+              },
+              "type": {
+                "type": "string",
+                "enum": [
+                  "question.resolved"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "description": "The slash commands / skills the vendor harness currently accepts in\nprompts. Replaces any previously announced list for the thread.",
+            "required": [
+              "commands",
+              "type"
+            ],
+            "properties": {
+              "commands": {
+                "type": "array",
+                "items": {
+                  "$ref": "#/components/schemas/CommandInfo"
+                }
+              },
+              "type": {
+                "type": "string",
+                "enum": [
+                  "thread.commands_updated"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "description": "The thread's queue of pending prompts changed (enqueue, edit,\nreorder, delete, or dispatch). Carries the full remaining queue in\nrun order; clients replace any previous list.",
+            "required": [
+              "prompts",
+              "type"
+            ],
+            "properties": {
+              "prompts": {
+                "type": "array",
+                "items": {
+                  "$ref": "#/components/schemas/QueuedPrompt"
+                }
+              },
+              "type": {
+                "type": "string",
+                "enum": [
+                  "thread.queue_updated"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "description": "The thread's transcript neared the model's context window; the engine\nis summarizing older messages. Clients show a busy indicator.",
+            "required": [
+              "turn",
+              "type"
+            ],
+            "properties": {
+              "turn": {
+                "type": "integer",
+                "format": "int64",
+                "minimum": 0
+              },
+              "type": {
+                "type": "string",
+                "enum": [
+                  "thread.compaction_started"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "turn",
+              "messages_compacted",
+              "type"
+            ],
+            "properties": {
+              "messages_compacted": {
+                "type": "integer",
+                "format": "int64",
+                "description": "Provider-transcript messages folded into the summary.",
+                "minimum": 0
+              },
+              "turn": {
+                "type": "integer",
+                "format": "int64",
+                "minimum": 0
+              },
+              "type": {
+                "type": "string",
+                "enum": [
+                  "thread.compaction_completed"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "checkpoint_id",
+              "thread_id",
+              "turn",
+              "commit",
+              "type"
+            ],
+            "properties": {
+              "checkpoint_id": {
+                "$ref": "#/components/schemas/String"
+              },
+              "commit": {
+                "type": "string",
+                "description": "Git commit hash the checkpoint points at."
+              },
+              "thread_id": {
+                "$ref": "#/components/schemas/String"
+              },
+              "turn": {
+                "type": "integer",
+                "format": "int64",
+                "minimum": 0
+              },
+              "type": {
+                "type": "string",
+                "enum": [
+                  "checkpoint.created"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "checkpoint_id",
+              "direction",
+              "type"
+            ],
+            "properties": {
+              "checkpoint_id": {
+                "$ref": "#/components/schemas/String"
+              },
+              "direction": {
+                "$ref": "#/components/schemas/RestoreDirection"
+              },
+              "type": {
+                "type": "string",
+                "enum": [
+                  "checkpoint.restored"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "path",
+              "branch",
+              "type"
+            ],
+            "properties": {
+              "branch": {
+                "type": "string"
+              },
+              "path": {
+                "type": "string"
+              },
+              "type": {
+                "type": "string",
+                "enum": [
+                  "worktree.created"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "path",
+              "branch",
+              "type"
+            ],
+            "properties": {
+              "branch": {
+                "type": "string"
+              },
+              "path": {
+                "type": "string"
+              },
+              "type": {
+                "type": "string",
+                "enum": [
+                  "worktree.removed"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "workspace_id",
+              "path",
+              "type"
+            ],
+            "properties": {
+              "path": {
+                "type": "string"
+              },
+              "type": {
+                "type": "string",
+                "enum": [
+                  "workspace.registered"
+                ]
+              },
+              "workspace_id": {
+                "$ref": "#/components/schemas/String"
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "session_id",
+              "workspace_id",
+              "type"
+            ],
+            "properties": {
+              "session_id": {
+                "$ref": "#/components/schemas/String"
+              },
+              "type": {
+                "type": "string",
+                "enum": [
+                  "session.created"
+                ]
+              },
+              "workspace_id": {
+                "$ref": "#/components/schemas/String"
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "number",
+              "url",
+              "type"
+            ],
+            "properties": {
+              "number": {
+                "type": "integer",
+                "format": "int64",
+                "minimum": 0
+              },
+              "type": {
+                "type": "string",
+                "enum": [
+                  "session.pr_opened"
+                ]
+              },
+              "url": {
+                "type": "string"
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "session_id",
+              "workspace_id",
+              "type"
+            ],
+            "properties": {
+              "session_id": {
+                "$ref": "#/components/schemas/String"
+              },
+              "type": {
+                "type": "string",
+                "enum": [
+                  "session.deleted"
+                ]
+              },
+              "workspace_id": {
+                "$ref": "#/components/schemas/String"
+              }
+            }
+          },
+          {
+            "type": "object",
+            "description": "Session metadata changed (rename / archive). Clients refetch.",
+            "required": [
+              "session_id",
+              "workspace_id",
+              "type"
+            ],
+            "properties": {
+              "session_id": {
+                "$ref": "#/components/schemas/String"
+              },
+              "type": {
+                "type": "string",
+                "enum": [
+                  "session.updated"
+                ]
+              },
+              "workspace_id": {
+                "$ref": "#/components/schemas/String"
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "thread_id",
+              "session_id",
+              "type"
+            ],
+            "properties": {
+              "session_id": {
+                "$ref": "#/components/schemas/String"
+              },
+              "thread_id": {
+                "$ref": "#/components/schemas/String"
+              },
+              "type": {
+                "type": "string",
+                "enum": [
+                  "thread.created"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "description": "Thread settings changed (mode/model). Clients refetch.",
+            "required": [
+              "thread_id",
+              "session_id",
+              "type"
+            ],
+            "properties": {
+              "session_id": {
+                "$ref": "#/components/schemas/String"
+              },
+              "thread_id": {
+                "$ref": "#/components/schemas/String"
+              },
+              "type": {
+                "type": "string",
+                "enum": [
+                  "thread.updated"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "description": "A session started or stopped actively processing prompts (one of its\nthreads began running turns, or the last active one went idle).\nDrives the activity indicator in session lists; `Session.active`\ncarries the same state for initial fetches.",
+            "required": [
+              "session_id",
+              "workspace_id",
+              "active",
+              "type"
+            ],
+            "properties": {
+              "active": {
+                "type": "boolean"
+              },
+              "session_id": {
+                "$ref": "#/components/schemas/String"
+              },
+              "type": {
+                "type": "string",
+                "enum": [
+                  "session.activity"
+                ]
+              },
+              "workspace_id": {
+                "$ref": "#/components/schemas/String"
+              }
+            }
+          },
+          {
+            "type": "object",
+            "description": "A scheduled automation ran (or failed to). Clients refetch the\nautomations list — and the sessions list when it succeeded, since a\nrun creates a session.",
+            "required": [
+              "automation_id",
+              "type"
+            ],
+            "properties": {
+              "automation_id": {
+                "type": "string"
+              },
+              "error": {
+                "type": "string",
+                "description": "Failure reason (\"\" = success)."
+              },
+              "session_id": {
+                "oneOf": [
+                  {
+                    "type": "null"
+                  },
+                  {
+                    "$ref": "#/components/schemas/String",
+                    "description": "Session the run created (absent when the run failed)."
+                  }
+                ]
+              },
+              "type": {
+                "type": "string",
+                "enum": [
+                  "automation.fired"
+                ]
+              }
+            }
+          }
+        ],
+        "description": "Every event type in the log. Serialized with a `type` tag using\ndot-namespaced names, per the event-log design doc."
+      },
+      "EventEnvelope": {
+        "allOf": [
+          {
+            "$ref": "#/components/schemas/Event"
+          },
+          {
+            "type": "object",
+            "required": [
+              "cursor",
+              "scope",
+              "ts"
+            ],
+            "properties": {
+              "cursor": {
+                "type": "integer",
+                "format": "int64",
+                "description": "Strictly increasing within a scope; used as the SSE event id for\n`Last-Event-ID` resumption. Not necessarily dense.",
+                "minimum": 0
+              },
+              "scope": {
+                "$ref": "#/components/schemas/Scope"
+              },
+              "ts": {
+                "type": "string",
+                "format": "date-time",
+                "description": "RFC 3339 timestamp assigned at append time."
+              }
+            }
+          }
+        ],
+        "description": "The envelope every event is delivered in (and persisted as)."
+      },
+      "FileContent": {
+        "type": "object",
+        "required": [
+          "path",
+          "content"
+        ],
+        "properties": {
+          "content": {
+            "type": "string"
+          },
+          "path": {
+            "type": "string"
+          }
+        }
+      },
+      "GithubHostIntegration": {
+        "type": "object",
+        "description": "Auth state of one GitHub host (github.com or a GitHub Enterprise\ninstance).",
+        "required": [
+          "host",
+          "configured",
+          "source",
+          "oauth_available",
+          "removable"
+        ],
+        "properties": {
+          "configured": {
+            "type": "boolean"
+          },
+          "host": {
+            "type": "string",
+            "description": "\"github.com\" or the enterprise hostname (\"github.example.com\")."
+          },
+          "oauth_available": {
+            "type": "boolean",
+            "description": "A device-flow OAuth app client id is configured for this host."
+          },
+          "removable": {
+            "type": "boolean",
+            "description": "Enterprise hosts can be removed; github.com cannot."
+          },
+          "source": {
+            "type": "string",
+            "description": "\"environment\", \"oauth\", \"settings\", \"gh-cli\", or \"\" when\nunconfigured."
+          }
+        }
+      },
+      "GithubIntegration": {
+        "type": "object",
+        "description": "Whether the GitHub integration can authenticate, and where the token\ncame from (\"environment\", \"oauth\", \"settings\", \"gh-cli\", or \"\" when\nunconfigured).",
+        "required": [
+          "configured",
+          "source"
+        ],
+        "properties": {
+          "configured": {
+            "type": "boolean",
+            "description": "github.com's state (mirrors `hosts[0]`; kept for older clients)."
+          },
+          "hosts": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/GithubHostIntegration"
+            },
+            "description": "Every known host: github.com first, then the configured GitHub\nEnterprise hosts in config order."
+          },
+          "oauth_available": {
+            "type": "boolean",
+            "description": "Whether \"Sign in with GitHub\" (OAuth device flow) is available —\ni.e. a GitHub OAuth app client id is configured or built in."
+          },
+          "source": {
+            "type": "string"
+          }
+        }
+      },
+      "KnownProvider": {
+        "type": "object",
+        "description": "A well-known provider preset: clients offer these for one-click setup\ninstead of hand-typed base URLs.",
+        "required": [
+          "id",
+          "display_name",
+          "kind",
+          "auth"
+        ],
+        "properties": {
+          "api_key_env": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Conventional environment variable holding the API key, when one\nexists (empty for keyless local providers like Ollama)."
+          },
+          "auth": {
+            "type": "string",
+            "description": "How the provider authenticates: \"api-key\", \"oauth\" (subscription\nlogin), \"cli\" (the vendor's own CLI holds subscription auth), or\n\"none\" (keyless local endpoints)."
+          },
+          "base_url": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "display_name": {
+            "type": "string"
+          },
+          "experimental": {
+            "type": "boolean",
+            "description": "Uses an undocumented vendor endpoint that may break or be restricted\nat any time; clients should display a warning."
+          },
+          "id": {
+            "type": "string",
+            "description": "Suggested provider id, e.g. \"openrouter\"."
+          },
+          "kind": {
+            "type": "string",
+            "description": "Wire protocol: \"openai-compat\" or \"anthropic\"."
+          }
+        }
+      },
+      "LocalGpu": {
+        "type": "object",
+        "description": "A GPU the local-models hardware probe found.",
+        "required": [
+          "name",
+          "vram_bytes"
+        ],
+        "properties": {
+          "name": {
+            "type": "string"
+          },
+          "vram_bytes": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Dedicated VRAM in bytes (system RAM for unified-memory machines).",
+            "minimum": 0
+          }
+        }
+      },
+      "LocalModelInfo": {
+        "type": "object",
+        "description": "One local model (curated catalog entry or user-added GGUF) with its\ndownload and hardware-fit state.",
+        "required": [
+          "id",
+          "display_name",
+          "repo",
+          "file",
+          "size_bytes",
+          "params",
+          "context_window",
+          "fit",
+          "downloaded",
+          "download_status",
+          "custom"
+        ],
+        "properties": {
+          "context_window": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Context window trouve serves the model with.",
+            "minimum": 0
+          },
+          "custom": {
+            "type": "boolean",
+            "description": "User-added entry (can be removed entirely)."
+          },
+          "display_name": {
+            "type": "string"
+          },
+          "download_bytes": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Downloaded bytes so far (pending only).",
+            "minimum": 0
+          },
+          "download_error": {
+            "type": "string"
+          },
+          "download_status": {
+            "type": "string",
+            "description": "\"none\" / \"pending\" / \"failed\" (success shows as downloaded)."
+          },
+          "downloaded": {
+            "type": "boolean",
+            "description": "True when the GGUF is on disk and ready to run."
+          },
+          "file": {
+            "type": "string",
+            "description": "GGUF filename inside the repo."
+          },
+          "fit": {
+            "type": "string",
+            "description": "Hardware fit: \"gpu\" (fits in VRAM), \"cpu\" (fits in RAM, slower),\nor \"too-large\"."
+          },
+          "id": {
+            "type": "string",
+            "description": "Stable id; runs as model \"local/<id>\"."
+          },
+          "notes": {
+            "type": "string",
+            "description": "One-line description shown in settings."
+          },
+          "params": {
+            "type": "string",
+            "description": "Human parameter count (\"7B\", \"30B MoE\")."
+          },
+          "repo": {
+            "type": "string",
+            "description": "HuggingFace repo the GGUF comes from (e.g. \"Qwen/…-GGUF\")."
+          },
+          "size_bytes": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          }
+        }
+      },
+      "LocalSearchFile": {
+        "type": "object",
+        "description": "One single-file GGUF inside a search result's repo\n(`GET /v1/local/search`).",
+        "required": [
+          "file",
+          "size_bytes",
+          "quant",
+          "fit",
+          "added"
+        ],
+        "properties": {
+          "added": {
+            "type": "boolean",
+            "description": "Already in the local model list (catalog or previously added)."
+          },
+          "file": {
+            "type": "string",
+            "description": "Path inside the repo, ready for [`AddLocalModelRequest::file`]."
+          },
+          "fit": {
+            "type": "string",
+            "description": "Hardware fit on this machine: \"gpu\", \"cpu\", or \"too-large\"."
+          },
+          "quant": {
+            "type": "string",
+            "description": "Quantization tag parsed from the filename (\"Q4_K_M\"; may be empty)."
+          },
+          "size_bytes": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          }
+        }
+      },
+      "LocalSearchResult": {
+        "type": "object",
+        "description": "One HuggingFace repo matching a local-model search, with its\nsingle-file GGUFs (smallest first) and a recommended pick for this\nmachine's hardware.",
+        "required": [
+          "repo",
+          "downloads",
+          "likes",
+          "files",
+          "recommended"
+        ],
+        "properties": {
+          "downloads": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "files": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/LocalSearchFile"
+            }
+          },
+          "likes": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "recommended": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Index into `files` of the best pick for this hardware.",
+            "minimum": 0
+          },
+          "repo": {
+            "type": "string",
+            "description": "Repo id (\"Qwen/Qwen2.5-Coder-7B-Instruct-GGUF\")."
+          }
+        }
+      },
+      "LocalStatus": {
+        "type": "object",
+        "description": "Local inference status: hardware, the llama.cpp runtime install, the\nrunning server, and every known model.",
+        "required": [
+          "ram_bytes",
+          "gpus",
+          "runtime_installed",
+          "models"
+        ],
+        "properties": {
+          "enabled": {
+            "type": "boolean",
+            "description": "Whether local models are enabled (the \"local\" provider is\nregistered). Toggled with `PUT /v1/local/enabled`."
+          },
+          "gpus": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/LocalGpu"
+            }
+          },
+          "models": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/LocalModelInfo"
+            }
+          },
+          "ram_bytes": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "running_model": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Model id currently loaded in (or loading into) llama-server."
+          },
+          "runtime_installed": {
+            "type": "boolean",
+            "description": "Whether the llama.cpp runtime (llama-server) is installed."
+          },
+          "runtime_latest_version": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Newest llama.cpp build the vendor serves (None when the check\nfailed, e.g. offline)."
+          },
+          "runtime_managed": {
+            "type": "boolean",
+            "description": "True when the runtime is a trouve-managed install (updatable and\nuninstallable through the API), false for PATH/system builds."
+          },
+          "runtime_update_available": {
+            "type": "boolean",
+            "description": "True when a managed install is older than `runtime_latest_version`."
+          },
+          "runtime_version": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "server_status": {
+            "type": "string",
+            "description": "Sidecar state: \"stopped\", \"starting\" (model loading), or \"running\"."
+          }
+        }
+      },
+      "LoginStarted": {
+        "type": "object",
+        "description": "Response to starting an OAuth login for a provider.",
+        "required": [
+          "verification_url"
+        ],
+        "properties": {
+          "user_code": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Code the user must enter at the verification URL (device flow only;\nPKCE flows encode everything in the URL)."
+          },
+          "verification_url": {
+            "type": "string",
+            "description": "URL the user must open in a browser to approve access."
+          }
+        }
+      },
+      "LoginStatus": {
+        "type": "object",
+        "description": "Current state of a provider's OAuth login attempt.",
+        "required": [
+          "status"
+        ],
+        "properties": {
+          "error": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "status": {
+            "type": "string",
+            "description": "\"none\" (no login running), \"pending\", \"success\", or \"failed\"."
+          }
+        }
+      },
+      "McpLogs": {
+        "type": "object",
+        "description": "Recent stderr and lifecycle lines for one MCP server.",
+        "required": [
+          "lines"
+        ],
+        "properties": {
+          "lines": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          }
+        }
+      },
+      "McpServerInfo": {
+        "type": "object",
+        "description": "One user-managed MCP server (from `mcp.json` in the trouve config dir or\n`.agents/.mcp.json` in a workspace). First-party servers trouve injects\nitself (the Claude approval bridge) never appear here.",
+        "required": [
+          "name",
+          "scope",
+          "command",
+          "health",
+          "detail"
+        ],
+        "properties": {
+          "args": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "command": {
+            "type": "string"
+          },
+          "detail": {
+            "type": "string",
+            "description": "\"5 tools\" when healthy, the failure reason when not, \"\" for unknown."
+          },
+          "env": {
+            "type": "object",
+            "description": "Values may be `${VAR}` references resolved at spawn time.",
+            "additionalProperties": {
+              "type": "string"
+            },
+            "propertyNames": {
+              "type": "string"
+            }
+          },
+          "health": {
+            "type": "string",
+            "description": "\"ok\" / \"error\" / \"unknown\" (unknown when listing skipped the probe) /\n\"untrusted\" (a repo-scoped server that is never auto-run)."
+          },
+          "name": {
+            "type": "string"
+          },
+          "scope": {
+            "type": "string",
+            "description": "\"user\" (config dir) or \"workspace\" (.agents/.mcp.json)."
+          },
+          "workspace_id": {
+            "type": "string",
+            "description": "For workspace scope: which workspace's config this entry lives in.\nEmpty for user scope."
+          },
+          "workspace_name": {
+            "type": "string"
+          }
+        }
+      },
+      "MergePrRequest": {
+        "type": "object",
+        "properties": {
+          "method": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "merge / squash / rebase (default: merge)"
+          }
+        }
+      },
+      "ModeInfo": {
+        "type": "object",
+        "description": "A mode plus where it came from, for the settings UI.",
+        "required": [
+          "mode",
+          "origin"
+        ],
+        "properties": {
+          "mode": {
+            "$ref": "#/components/schemas/AgentMode"
+          },
+          "origin": {
+            "type": "string",
+            "description": "\"builtin\" (untouched), \"customized\" (builtin with a user override\nfile), \"custom\" (user-added), or \"workspace\" (defined in the\nworkspace's .agents/modes — file-managed, read-only in settings)."
+          }
+        }
+      },
+      "ModelInfo": {
+        "type": "object",
+        "description": "A model a configured provider can run, with enough metadata for clients\nto render selection and options UIs generically.",
+        "required": [
+          "id",
+          "display_name",
+          "context_window",
+          "supports_tools",
+          "options_schema"
+        ],
+        "properties": {
+          "context_window": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "display_name": {
+            "type": "string"
+          },
+          "id": {
+            "type": "string",
+            "description": "Provider-qualified id, e.g. \"openai/gpt-4.1-mini\"."
+          },
+          "input_price_per_mtok": {
+            "type": [
+              "number",
+              "null"
+            ],
+            "format": "double",
+            "description": "USD per million input tokens (None = unknown; cost reporting skips it)."
+          },
+          "options_schema": {
+            "description": "JSON Schema for the model's options object (thinking level, etc.).\nClients render these controls from the schema, not from hardcoded\nper-model knowledge."
+          },
+          "output_price_per_mtok": {
+            "type": [
+              "number",
+              "null"
+            ],
+            "format": "double"
+          },
+          "supports_tools": {
+            "type": "boolean"
+          }
+        }
+      },
+      "OpenTerminalRequest": {
+        "type": "object",
+        "description": "Open (or re-attach to) the session's terminal.",
+        "required": [
+          "cols",
+          "rows"
+        ],
+        "properties": {
+          "cols": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Initial grid size; ignored when re-attaching to a live terminal.",
+            "minimum": 0
+          },
+          "rows": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 0
+          }
+        }
+      },
+      "PermissionMode": {
+        "type": "string",
+        "description": "How tool calls are gated in a thread. See ADR 0004.",
+        "enum": [
+          "ask",
+          "allow_list",
+          "yolo"
+        ]
+      },
+      "PrInfo": {
+        "type": "object",
+        "required": [
+          "number",
+          "url",
+          "title",
+          "state",
+          "draft",
+          "base",
+          "head",
+          "checks",
+          "reviews"
+        ],
+        "properties": {
+          "base": {
+            "type": "string"
+          },
+          "checks": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/CheckRun"
+            }
+          },
+          "draft": {
+            "type": "boolean"
+          },
+          "head": {
+            "type": "string"
+          },
+          "number": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "reviews": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/PrReview"
+            }
+          },
+          "state": {
+            "type": "string"
+          },
+          "title": {
+            "type": "string"
+          },
+          "url": {
+            "type": "string"
+          }
+        }
+      },
+      "PrReview": {
+        "type": "object",
+        "required": [
+          "reviewer",
+          "state"
+        ],
+        "properties": {
+          "reviewer": {
+            "type": "string"
+          },
+          "state": {
+            "type": "string",
+            "description": "approved / changes_requested / commented / …"
+          }
+        }
+      },
+      "ProviderInfo": {
+        "type": "object",
+        "description": "A configured provider, with secrets elided.",
+        "required": [
+          "id",
+          "kind",
+          "has_credentials",
+          "auth"
+        ],
+        "properties": {
+          "auth": {
+            "type": "string",
+            "description": "\"api-key\", \"oauth\", \"cli\" (vendor CLI holds the subscription auth),\nor \"none\" — drives which credential UI to show."
+          },
+          "base_url": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "experimental": {
+            "type": "boolean",
+            "description": "Uses an undocumented vendor endpoint that may break or be restricted\nat any time; clients should display a warning."
+          },
+          "has_credentials": {
+            "type": "boolean",
+            "description": "Whether usable credentials were resolved (key, env, OAuth, or a\nlogged-in vendor CLI)."
+          },
+          "id": {
+            "type": "string",
+            "description": "Stable identifier, e.g. \"openai\" or \"openrouter\"."
+          },
+          "kind": {
+            "type": "string",
+            "description": "\"openai-compat\" or \"anthropic\"."
+          }
+        }
+      },
+      "ProvidersResponse": {
+        "type": "object",
+        "required": [
+          "providers",
+          "default_model"
+        ],
+        "properties": {
+          "default_model": {
+            "type": "string",
+            "description": "Default model for new threads, e.g. \"openai/gpt-4.1-mini\"."
+          },
+          "providers": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ProviderInfo"
+            }
+          }
+        }
+      },
+      "Question": {
+        "type": "object",
+        "description": "A single question inside a `question.requested` event. Clients always\noffer a trailing free-form \"Other\" choice in addition to the listed\noptions; its text comes back in [`QuestionAnswer::other_text`].",
+        "required": [
+          "id",
+          "prompt",
+          "options"
+        ],
+        "properties": {
+          "allow_multiple": {
+            "type": "boolean",
+            "description": "Multiple options may be selected (checkboxes instead of radios)."
+          },
+          "id": {
+            "type": "string"
+          },
+          "options": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/QuestionOption"
+            }
+          },
+          "prompt": {
+            "type": "string"
+          }
+        }
+      },
+      "QuestionAnswer": {
+        "type": "object",
+        "description": "The user's answer to one [`Question`].",
+        "required": [
+          "question_id"
+        ],
+        "properties": {
+          "other_text": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Free-form text when the user picked \"Other\"."
+          },
+          "question_id": {
+            "type": "string"
+          },
+          "selected_option_ids": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Ids of the selected options (at most one unless `allow_multiple`)."
+          }
+        }
+      },
+      "QuestionOption": {
+        "type": "object",
+        "description": "One choice offered by a [`Question`].",
+        "required": [
+          "id",
+          "label"
+        ],
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "label": {
+            "type": "string"
+          }
+        }
+      },
+      "QueuedPrompt": {
+        "type": "object",
+        "description": "A prompt waiting its turn. Queued prompts persist on disk and run in\n`position` order once the thread is idle.",
+        "required": [
+          "id",
+          "thread_id",
+          "position",
+          "content",
+          "created_at"
+        ],
+        "properties": {
+          "attachments": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/Attachment"
+            },
+            "description": "Attachments uploaded with the prompt (already stored server-side)."
+          },
+          "content": {
+            "type": "string"
+          },
+          "created_at": {
+            "type": "string"
+          },
+          "id": {
+            "type": "string"
+          },
+          "position": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "thread_id": {
+            "$ref": "#/components/schemas/String"
+          }
+        }
+      },
+      "RegisterWorkspaceRequest": {
+        "type": "object",
+        "required": [
+          "path"
+        ],
+        "properties": {
+          "name": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "path": {
+            "type": "string",
+            "description": "Absolute path to a git repository root."
+          }
+        }
+      },
+      "ReorderQueueRequest": {
+        "type": "object",
+        "description": "Full desired order for a thread's queue (every queued prompt id, first\nto run first).",
+        "required": [
+          "ids"
+        ],
+        "properties": {
+          "ids": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          }
+        }
+      },
+      "ResolveApprovalRequest": {
+        "type": "object",
+        "required": [
+          "call_id",
+          "decision"
+        ],
+        "properties": {
+          "call_id": {
+            "$ref": "#/components/schemas/String"
+          },
+          "decision": {
+            "$ref": "#/components/schemas/ApprovalDecision"
+          }
+        }
+      },
+      "ResolveQuestionRequest": {
+        "type": "object",
+        "description": "Answers for a pending `question.requested`. `answers: null` skips the\nquestions (the agent is told the user declined to answer).",
+        "required": [
+          "request_id"
+        ],
+        "properties": {
+          "answers": {
+            "type": [
+              "array",
+              "null"
+            ],
+            "items": {
+              "$ref": "#/components/schemas/QuestionAnswer"
+            }
+          },
+          "request_id": {
+            "$ref": "#/components/schemas/String"
+          }
+        }
+      },
+      "RestoreDirection": {
+        "type": "string",
+        "enum": [
+          "undo",
+          "redo"
+        ]
+      },
+      "Scope": {
+        "oneOf": [
+          {
+            "type": "string",
+            "enum": [
+              "server"
+            ]
+          },
+          {
+            "type": "object",
+            "required": [
+              "session"
+            ],
+            "properties": {
+              "session": {
+                "$ref": "#/components/schemas/String"
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "thread"
+            ],
+            "properties": {
+              "thread": {
+                "$ref": "#/components/schemas/String"
+              }
+            }
+          }
+        ],
+        "description": "Which stream an event belongs to. Cursors are monotonic per scope."
+      },
+      "SendMessageRequest": {
+        "type": "object",
+        "required": [
+          "content"
+        ],
+        "properties": {
+          "attachments": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/AttachmentUpload"
+            },
+            "description": "Files riding along with the prompt (screenshots, logs, …); bytes are\nbase64 in the request, stored server-side, and referenced by id from\nthen on."
+          },
+          "content": {
+            "type": "string"
+          }
+        }
+      },
+      "ServerInfo": {
+        "type": "object",
+        "required": [
+          "name",
+          "version",
+          "protocol_version"
+        ],
+        "properties": {
+          "name": {
+            "type": "string"
+          },
+          "protocol_version": {
+            "type": "string"
+          },
+          "version": {
+            "type": "string"
+          }
+        }
+      },
+      "Session": {
+        "type": "object",
+        "required": [
+          "id",
+          "workspace_id",
+          "title",
+          "branch",
+          "worktree_path",
+          "base_ref",
+          "created_at"
+        ],
+        "properties": {
+          "active": {
+            "type": "boolean",
+            "description": "One of the session's threads is actively processing prompts right\nnow. Live updates ride the server-scope `session.activity` event."
+          },
+          "archived": {
+            "type": "boolean",
+            "description": "Archived sessions are hidden from default listings but keep their\nworktree and history."
+          },
+          "base_ref": {
+            "type": "string"
+          },
+          "branch": {
+            "type": "string",
+            "description": "Branch dedicated to this session (`trouve/<slug>`)."
+          },
+          "created_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "id": {
+            "$ref": "#/components/schemas/String"
+          },
+          "title": {
+            "type": "string"
+          },
+          "workspace_id": {
+            "$ref": "#/components/schemas/String"
+          },
+          "worktree_path": {
+            "type": "string",
+            "description": "Absolute path of the session worktree."
+          }
+        }
+      },
+      "SessionDiff": {
+        "type": "object",
+        "description": "The session's unified diff against its base ref.",
+        "required": [
+          "diff"
+        ],
+        "properties": {
+          "diff": {
+            "type": "string"
+          }
+        }
+      },
+      "SetDefaultModelRequest": {
+        "type": "object",
+        "required": [
+          "model"
+        ],
+        "properties": {
+          "model": {
+            "type": "string",
+            "description": "Provider-qualified id, e.g. \"openai/gpt-4.1-mini\"."
+          }
+        }
+      },
+      "SetGithubTokenRequest": {
+        "type": "object",
+        "description": "Store (or, with an empty token, remove) the GitHub personal access\ntoken in the server's secret store.",
+        "required": [
+          "token"
+        ],
+        "properties": {
+          "host": {
+            "type": "string",
+            "description": "Which host the token is for; empty/absent means github.com."
+          },
+          "token": {
+            "type": "string"
+          }
+        }
+      },
+      "SetLocalEnabledRequest": {
+        "type": "object",
+        "description": "Turn local models on or off (`PUT /v1/local/enabled`). Disabling stops\nthe llama-server sidecar and unregisters the \"local\" provider.",
+        "required": [
+          "enabled"
+        ],
+        "properties": {
+          "enabled": {
+            "type": "boolean"
+          }
+        }
+      },
+      "String": {
+        "type": "string"
+      },
+      "SubscriptionHealth": {
+        "type": "object",
+        "description": "Subscription usage for one configured agent-backend provider.",
+        "required": [
+          "provider_id",
+          "status",
+          "plan",
+          "windows",
+          "credits",
+          "note"
+        ],
+        "properties": {
+          "credits": {
+            "type": "string",
+            "description": "Credits summary (\"credits: 42.50\", \"unlimited credits\"); \"\" if n/a."
+          },
+          "note": {
+            "type": "string",
+            "description": "Human explanation for unavailable/unsupported; \"\" when ok."
+          },
+          "plan": {
+            "type": "string",
+            "description": "Plan name as reported (\"plus\", \"pro\", …); \"\" when unknown."
+          },
+          "provider_id": {
+            "type": "string"
+          },
+          "status": {
+            "type": "string",
+            "description": "\"ok\" (windows below), \"unavailable\" (vendor query failed / not\nlogged in), or \"unsupported\" (vendor doesn't share the data)."
+          },
+          "windows": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/SubscriptionWindow"
+            }
+          }
+        }
+      },
+      "SubscriptionWindow": {
+        "type": "object",
+        "description": "One metered rate-limit window of a vendor subscription (e.g. Codex's\n5-hour and weekly buckets).",
+        "required": [
+          "label",
+          "used_percent",
+          "resets"
+        ],
+        "properties": {
+          "label": {
+            "type": "string",
+            "description": "\"5h window\", \"Weekly\", …"
+          },
+          "resets": {
+            "type": "string",
+            "description": "Pre-rendered reset note (\"resets in 2h 10m\"), \"\" when unknown."
+          },
+          "used_percent": {
+            "type": "integer",
+            "format": "int64"
+          }
+        }
+      },
+      "TerminalInfo": {
+        "type": "object",
+        "required": [
+          "id",
+          "session_id",
+          "cols",
+          "rows",
+          "exited"
+        ],
+        "properties": {
+          "cols": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 0
+          },
+          "exited": {
+            "type": "boolean",
+            "description": "True once the shell process has exited (the stream is complete)."
+          },
+          "id": {
+            "type": "string"
+          },
+          "rows": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 0
+          },
+          "session_id": {
+            "type": "string"
+          }
+        }
+      },
+      "TerminalInputRequest": {
+        "type": "object",
+        "description": "Keyboard/paste bytes for the PTY, base64-encoded.",
+        "required": [
+          "data"
+        ],
+        "properties": {
+          "data": {
+            "type": "string"
+          }
+        }
+      },
+      "TerminalResizeRequest": {
+        "type": "object",
+        "required": [
+          "cols",
+          "rows"
+        ],
+        "properties": {
+          "cols": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 0
+          },
+          "rows": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 0
+          }
+        }
+      },
+      "Thread": {
+        "type": "object",
+        "required": [
+          "id",
+          "session_id",
+          "mode",
+          "model",
+          "permission_mode",
+          "created_at"
+        ],
+        "properties": {
+          "created_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "id": {
+            "$ref": "#/components/schemas/String"
+          },
+          "mode": {
+            "type": "string"
+          },
+          "model": {
+            "type": "string"
+          },
+          "model_options": {
+            "type": "object",
+            "description": "Current values for the model's options (thinking level, etc.);\nclients render controls from the model's `options_schema`.",
+            "additionalProperties": {},
+            "propertyNames": {
+              "type": "string"
+            }
+          },
+          "permission_mode": {
+            "$ref": "#/components/schemas/PermissionMode"
+          },
+          "session_id": {
+            "$ref": "#/components/schemas/String"
+          },
+          "spawned": {
+            "type": "boolean",
+            "description": "True when an agent spawned this thread (spawn_thread/spawn_session\ntools) rather than the user; clients mark such threads visually."
+          }
+        }
+      },
+      "ToolStatus": {
+        "type": "string",
+        "description": "Terminal status of a tool call.",
+        "enum": [
+          "ok",
+          "error",
+          "denied",
+          "aborted"
+        ]
+      },
+      "TurnAccepted": {
+        "type": "object",
+        "description": "Accepted-for-processing response; progress arrives on the event stream.\nWhen the thread already has a turn running the prompt is queued instead:\n`queued` is true and `turn` is 0 (the turn number is assigned when the\nprompt is dispatched).",
+        "required": [
+          "thread_id",
+          "turn"
+        ],
+        "properties": {
+          "queued": {
+            "type": "boolean"
+          },
+          "thread_id": {
+            "$ref": "#/components/schemas/String"
+          },
+          "turn": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          }
+        }
+      },
+      "UpdateQueuedPromptRequest": {
+        "type": "object",
+        "required": [
+          "content"
+        ],
+        "properties": {
+          "content": {
+            "type": "string"
+          }
+        }
+      },
+      "UpdateSessionRequest": {
+        "type": "object",
+        "description": "Partial session update (rename / archive). Omitted fields are unchanged.",
+        "properties": {
+          "archived": {
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "title": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        }
+      },
+      "UpdateThreadRequest": {
+        "type": "object",
+        "description": "Partial thread update between turns (mode/model switching). Rejected with\na conflict while a turn is running. Omitted fields are unchanged.",
+        "properties": {
+          "mode": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "model": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "model_options": {
+            "type": [
+              "object",
+              "null"
+            ],
+            "description": "Replaces the thread's model options when present.",
+            "additionalProperties": {},
+            "propertyNames": {
+              "type": "string"
+            }
+          },
+          "permission_mode": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/PermissionMode"
+              }
+            ]
+          }
+        }
+      },
+      "UpsertAutomationRequest": {
+        "type": "object",
+        "description": "Create or update an automation (`POST /v1/automations`,\n`PUT /v1/automations/{id}`).",
+        "required": [
+          "name",
+          "prompt",
+          "workspace_id",
+          "schedule",
+          "enabled"
+        ],
+        "properties": {
+          "enabled": {
+            "type": "boolean"
+          },
+          "mode": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "model": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "name": {
+            "type": "string"
+          },
+          "permission_mode": {
+            "$ref": "#/components/schemas/PermissionMode",
+            "description": "Permission policy for each fresh automation session. Omitted by older\nclients means Ask."
+          },
+          "prompt": {
+            "type": "string"
+          },
+          "schedule": {
+            "$ref": "#/components/schemas/AutomationSchedule"
+          },
+          "workspace_id": {
+            "$ref": "#/components/schemas/String"
+          }
+        }
+      },
+      "UpsertMcpServerRequest": {
+        "type": "object",
+        "required": [
+          "scope",
+          "command"
+        ],
+        "properties": {
+          "args": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "command": {
+            "type": "string"
+          },
+          "env": {
+            "type": "object",
+            "additionalProperties": {
+              "type": "string"
+            },
+            "propertyNames": {
+              "type": "string"
+            }
+          },
+          "scope": {
+            "type": "string",
+            "description": "\"user\" or \"workspace\"."
+          },
+          "workspace_id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Required for workspace scope: whose `.agents/.mcp.json` to edit."
+          }
+        }
+      },
+      "UpsertModeRequest": {
+        "type": "object",
+        "description": "Create or update a user-level mode (`<config>/modes/<id>.toml`). Saving\nunder a built-in id customizes that built-in.",
+        "required": [
+          "display_name",
+          "system_prompt"
+        ],
+        "properties": {
+          "allowed_tools": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "default_model": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "default_permission_mode": {
+            "$ref": "#/components/schemas/PermissionMode"
+          },
+          "display_name": {
+            "type": "string"
+          },
+          "read_only": {
+            "type": "boolean"
+          },
+          "system_prompt": {
+            "type": "string"
+          }
+        }
+      },
+      "UpsertProviderRequest": {
+        "type": "object",
+        "description": "Create or update a provider. The API key (when given) goes to the secret\nstore, never to the config file.",
+        "required": [
+          "kind"
+        ],
+        "properties": {
+          "api_key": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "base_url": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "kind": {
+            "type": "string",
+            "description": "\"openai-compat\" or \"anthropic\"."
+          }
+        }
+      },
+      "Usage": {
+        "type": "object",
+        "description": "Token/cost usage for a turn.",
+        "required": [
+          "input_tokens",
+          "output_tokens"
+        ],
+        "properties": {
+          "cached_input_tokens": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Cached/read tokens where the provider reports them.",
+            "minimum": 0
+          },
+          "context_window": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "The model's context window as reported live by the provider during\nthe turn. Authoritative over any static catalog value.",
+            "minimum": 0
+          },
+          "cost_usd": {
+            "type": [
+              "number",
+              "null"
+            ],
+            "format": "double",
+            "description": "Estimated cost in USD, when list pricing for the model is known."
+          },
+          "input_tokens": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "output_tokens": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          }
+        }
+      },
+      "UsageSummary": {
+        "type": "object",
+        "description": "Aggregated usage for a thread or session.",
+        "required": [
+          "turns",
+          "input_tokens",
+          "output_tokens",
+          "cached_input_tokens",
+          "cost_usd"
+        ],
+        "properties": {
+          "cached_input_tokens": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "cost_usd": {
+            "type": "number",
+            "format": "double"
+          },
+          "input_tokens": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "output_tokens": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "turns": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          }
+        }
+      },
+      "Workspace": {
+        "type": "object",
+        "required": [
+          "id",
+          "name",
+          "path"
+        ],
+        "properties": {
+          "id": {
+            "$ref": "#/components/schemas/String"
+          },
+          "name": {
+            "type": "string"
+          },
+          "path": {
+            "type": "string"
+          }
+        }
+      }
+    }
+  }
+}
