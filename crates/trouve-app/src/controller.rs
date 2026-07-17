@@ -748,7 +748,8 @@ async fn start_local_server() -> Result<(
     if let Err(e) = wait_server_ready(&client).await {
         // Dropping the task closes its listener and engine.
         handle.abort();
-        return Err(e).with_context(|| format!("embedded trouve-server did not become ready on {addr}"));
+        return Err(e)
+            .with_context(|| format!("embedded trouve-server did not become ready on {addr}"));
     }
     Ok((client, url, Some((info, handle))))
 }
