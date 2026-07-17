@@ -1,6 +1,8 @@
 # ADR 0002: Protocol-first client/server split (OpenAPI + SSE event log)
 
-Status: Accepted (2026-07)
+Status: Accepted (2026-07). Local-server mechanism amended by ADR 0008: the
+desktop app now embeds the server in-process instead of spawning a child
+binary; the protocol-only rule is unchanged.
 
 ## Context
 

@@ -17,3 +17,4 @@ sequentially.
 | [0005](0005-split-ui-slint-native-plus-web.md) | Split UI: Slint native clients + separate web client | Accepted |
 | [0006](0006-slint-royalty-free-license.md) | Slint under the Royalty-Free license | Accepted |
 | [0007](0007-shared-search-daemon.md) | Shared trouve-search MCP daemon over a unix socket | Accepted |
+| [0008](0008-embedded-server-in-desktop-app.md) | Desktop app embeds trouve-server in-process | Accepted |

@@ -1,10 +1,8 @@
 //! Standalone server binary: `trouve-server [--addr 127.0.0.1:7433]`.
+//! Hosted and self-hosted deployments run this; the desktop app embeds the
+//! same [`trouve_server::bind_local`] stack in-process (ADR 0008).
 
-use std::sync::Arc;
-
-use trouve_core::Engine;
-use trouve_core::config::{Config, data_dir};
-use trouve_core::store::Store;
+use trouve_core::config::data_dir;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -20,19 +18,7 @@ async fn main() -> anyhow::Result<()> {
         .unwrap_or_else(|| "127.0.0.1:7433".into())
         .parse()?;
 
-    let data = data_dir();
-    let store = Store::open(&data.join("trouve.db"))?;
-    let config = Config::load();
-    let security = trouve_server::ServerSecurity::resolve(&data);
-    let engine = Arc::new(
-        Engine::new(store, data, &config)
-            // This engine loaded the real config file, so provider changes
-            // write back to it.
-            .with_config_file(Some(trouve_core::config::config_path()))
-            .with_index_hooks()
-            // Real internet probing only in the standalone binary; embedded
-            // and test engines stay always-online (offline-safe tests).
-            .with_connectivity_probe(trouve_core::connectivity::system_probe()),
-    );
-    trouve_server::serve(engine, addr, security).await
+    let security = trouve_server::ServerSecurity::resolve(&data_dir());
+    let (_, server) = trouve_server::bind_local(addr, security).await?;
+    server.await
 }

@@ -25,6 +25,10 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 trouve-client-core.workspace = true
 trouve-protocol.workspace = true
+# Embedded local server (ADR 0008): the app calls one bootstrap entry point
+# and speaks HTTP/SSE to it over loopback. Engine internals stay out of
+# reach — trouve-core is deliberately NOT a dependency (invariant 1).
+trouve-server.workspace = true
 # Plain-data helpers (diff parsing, markdown blocks, highlight segments,
 # terminal screen state + key encoding).
 slint-code-view = { path = "../slint-code-view" }
@@ -42,7 +46,7 @@ shlex = "2.0.1"
 notify-rust = "4.18.0"
 # Automations: local-time rendering of schedule timestamps.
 chrono.workspace = true
-# Per-launch bearer token for the spawned local server.
+# Per-launch bearer token for the embedded local server.
 uuid.workspace = true
 
 # Prompt attachments: clipboard image paste (arboard), PNG encoding of the
@@ -51,10 +55,6 @@ arboard = "3.6.1"
 mime_guess = "2.0.5"
 png = "0.18.1"
 base64 = "0.22"
-
-[target.'cfg(target_os = "linux")'.dependencies]
-# PR_SET_PDEATHSIG so the spawned server dies with the app.
-libc = "0.2"
 
 [build-dependencies]
 slint-build = "1.17"
