@@ -746,8 +746,9 @@ async fn start_local_server() -> Result<(
     let url = format!("http://{addr}");
     let client = ProtocolClient::with_token(&url, Some(token));
     if let Err(e) = wait_server_ready(&client).await {
-        // Dropping the task closes its listener and engine.
+        // Abort and join so the listener/engine tear down before we return.
         handle.abort();
+        let _ = handle.await;
         return Err(e)
             .with_context(|| format!("embedded trouve-server did not become ready on {addr}"));
     }
@@ -1061,8 +1062,9 @@ impl Controller {
                     watch_embedded_server(self.tx.clone(), handle);
                     true
                 } else {
-                    // Dropping the task closes its listener and engine.
+                    // Abort and join so the listener/engine tear down before retry.
                     handle.abort();
+                    let _ = handle.await;
                     false
                 }
             }
