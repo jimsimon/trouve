@@ -53,6 +53,14 @@ fn at_token(text: &str, cursor: usize) -> Option<(usize, String)> {
     Some((at, query.to_string()))
 }
 
+/// Optional workspace path from the command line (`trouve .`, `trouve ~/src/foo`).
+fn workspace_arg() -> Option<std::path::PathBuf> {
+    std::env::args_os()
+        .nth(1)
+        .filter(|a| !a.is_empty())
+        .map(std::path::PathBuf::from)
+}
+
 fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -1061,7 +1069,7 @@ fn main() -> anyhow::Result<()> {
             .enable_all()
             .build()
             .expect("tokio runtime");
-        runtime.block_on(controller::run(weak, tx, rx, focused));
+        runtime.block_on(controller::run(weak, tx, rx, focused, workspace_arg()));
     });
 
     // Restore the last window geometry (position picks the monitor too);
