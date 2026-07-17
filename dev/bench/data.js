@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1784244652130,
+  "lastUpdate": 1784256878637,
   "repoUrl": "https://github.com/jimsimon/trouve",
   "entries": {
     "e2e-benchmarks": [
@@ -1439,6 +1439,54 @@ window.BENCHMARK_DATA = {
             "name": "non-git warm query",
             "value": 65.6521817,
             "range": "± 2",
+            "unit": "ms"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "jim.j.simon@gmail.com",
+            "name": "Jim Simon",
+            "username": "jimsimon"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "c79062285dc0278bc75f97c7220664ab331fea06",
+          "message": "Show the OAuth device code in Settings → Integrations (#58)\n\nThe GitHub sign-in button lives in the Integrations section, but the\n\"opening browser — enter code XXXX-XXXX at …\" status the controller\nreports only rendered in the Providers and Agents sections, so the\ndevice code GitHub asks for was never shown. Render settings-status in\nthe Integrations section too.\n\nCo-authored-by: Claude Fable 5 <noreply@anthropic.com>",
+          "timestamp": "2026-07-16T22:53:16-04:00",
+          "tree_id": "738d818da58a0e29a7943c935b19e8a3b7032cf2",
+          "url": "https://github.com/jimsimon/trouve/commit/c79062285dc0278bc75f97c7220664ab331fea06"
+        },
+        "date": 1784256877707,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "cold index + query",
+            "value": 101.61812856,
+            "range": "± 49.2",
+            "unit": "ms"
+          },
+          {
+            "name": "warm query",
+            "value": 58.208771000000006,
+            "range": "± 1.6",
+            "unit": "ms"
+          },
+          {
+            "name": "incremental (1 file modified)",
+            "value": 72.67185218000002,
+            "range": "± 12.8",
+            "unit": "ms"
+          },
+          {
+            "name": "non-git warm query",
+            "value": 56.11674832,
+            "range": "± 1.4",
             "unit": "ms"
           }
         ]
