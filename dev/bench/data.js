@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1784256878637,
+  "lastUpdate": 1784256922160,
   "repoUrl": "https://github.com/jimsimon/trouve",
   "entries": {
     "e2e-benchmarks": [
@@ -2929,6 +2929,54 @@ window.BENCHMARK_DATA = {
             "name": "dense_query_20k_rows",
             "value": 1363207.825,
             "range": "± 7188",
+            "unit": "ns"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "jim.j.simon@gmail.com",
+            "name": "Jim Simon",
+            "username": "jimsimon"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "c79062285dc0278bc75f97c7220664ab331fea06",
+          "message": "Show the OAuth device code in Settings → Integrations (#58)\n\nThe GitHub sign-in button lives in the Integrations section, but the\n\"opening browser — enter code XXXX-XXXX at …\" status the controller\nreports only rendered in the Providers and Agents sections, so the\ndevice code GitHub asks for was never shown. Render settings-status in\nthe Integrations section too.\n\nCo-authored-by: Claude Fable 5 <noreply@anthropic.com>",
+          "timestamp": "2026-07-16T22:53:16-04:00",
+          "tree_id": "738d818da58a0e29a7943c935b19e8a3b7032cf2",
+          "url": "https://github.com/jimsimon/trouve/commit/c79062285dc0278bc75f97c7220664ab331fea06"
+        },
+        "date": 1784256921791,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "bm25_build_5k_docs",
+            "value": 5084964.5,
+            "range": "± 7984",
+            "unit": "ns"
+          },
+          {
+            "name": "bm25_query_5k_docs",
+            "value": 35743.738394258806,
+            "range": "± 15",
+            "unit": "ns"
+          },
+          {
+            "name": "chunk_python_200_functions",
+            "value": 2868513.5555555555,
+            "range": "± 1393",
+            "unit": "ns"
+          },
+          {
+            "name": "dense_query_20k_rows",
+            "value": 1547696.2589285714,
+            "range": "± 12363",
             "unit": "ns"
           }
         ]
