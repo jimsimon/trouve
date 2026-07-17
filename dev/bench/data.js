@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1784256922160,
+  "lastUpdate": 1784259828562,
   "repoUrl": "https://github.com/jimsimon/trouve",
   "entries": {
     "e2e-benchmarks": [
@@ -1487,6 +1487,54 @@ window.BENCHMARK_DATA = {
             "name": "non-git warm query",
             "value": 56.11674832,
             "range": "± 1.4",
+            "unit": "ms"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "jim.j.simon@gmail.com",
+            "name": "Jim Simon",
+            "username": "jimsimon"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "32d6ff98eb790a4f765097f08cb2da83d7963436",
+          "message": "Embed trouve-server in-process in the desktop app (ADR 0008) (#61)\n\n* Embed trouve-server in-process in the desktop app (ADR 0008)\n\nThe app spawned trouve-server as a child binary, which meant `cargo run\n--bin trouve` ran against a missing or stale sibling binary, dev builds\nneeded a separate `cargo build -p trouve-server`, and the child-process\nmodel could never ship on iOS (no exec). The protocol boundary — the\nload-bearing part of ADR 0002 — never required a process boundary.\n\ntrouve-server now exposes one bootstrap entry point, bind_local(), that\nwires the full local stack and returns the bound address plus the serve\nfuture. The app spawns that future on its runtime with a per-launch\ntoken (ServerSecurity::with_token) and speaks loopback HTTP+SSE exactly\nas before; the dependency graph still enforces invariant 1 because the\napp depends only on trouve-server, never trouve-core. The standalone\nbinary remains (a thin main over bind_local) for hosted/self-hosted\nuse, and TROUVE_SERVER_URL still targets external servers.\n\nDeleted with the child process: sibling-binary lookup and\nTROUVE_SERVER_BIN, the port-reservation race, PR_SET_PDEATHSIG (and the\nlibc dep), kill-on-drop plumbing. The crash-restart logic carries over\nagainst the embedded task. Trade-off (recorded in the ADR): a hard\nserver crash now takes the UI down; panics are contained by the task\nboundary and restarted.\n\nCo-Authored-By: Claude Fable 5 <noreply@anthropic.com>\n\n* Update docs/adr/0002-protocol-first-client-server-split.md\n\nCo-authored-by: coderabbitai[bot] <136622811+coderabbitai[bot]@users.noreply.github.com>\n\n* fix: apply CodeRabbit auto-fixes\n\nFixed 1 file(s) based on 1 unresolved review comment.\n\nCo-authored-by: CodeRabbit <noreply@coderabbit.ai>\n\n* Fix rustfmt after CodeRabbit auto-fix on controller.rs.\n\nCo-authored-by: Cursor <cursoragent@cursor.com>\n\n* Await embedded server shutdown after readiness failures.\n\nAborting the serve task alone can leave the listener running; join\nbefore returning startup errors or giving up on restart.\n\nCo-authored-by: Cursor <cursoragent@cursor.com>\n\n---------\n\nCo-authored-by: Claude Fable 5 <noreply@anthropic.com>\nCo-authored-by: coderabbitai[bot] <136622811+coderabbitai[bot]@users.noreply.github.com>\nCo-authored-by: CodeRabbit <noreply@coderabbit.ai>\nCo-authored-by: Cursor <cursoragent@cursor.com>",
+          "timestamp": "2026-07-16T23:41:51-04:00",
+          "tree_id": "a89f3ca44eaa184abc0466f3737a8aa5b4c6d11f",
+          "url": "https://github.com/jimsimon/trouve/commit/32d6ff98eb790a4f765097f08cb2da83d7963436"
+        },
+        "date": 1784259827996,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "cold index + query",
+            "value": 97.43356866,
+            "range": "± 18.4",
+            "unit": "ms"
+          },
+          {
+            "name": "warm query",
+            "value": 52.83643382,
+            "range": "± 2.7",
+            "unit": "ms"
+          },
+          {
+            "name": "incremental (1 file modified)",
+            "value": 57.916981979999996,
+            "range": "± 8.1",
+            "unit": "ms"
+          },
+          {
+            "name": "non-git warm query",
+            "value": 73.71819064000002,
+            "range": "± 25.3",
             "unit": "ms"
           }
         ]
