@@ -29,7 +29,10 @@ These are load-bearing. Do not violate them without a new ADR.
 
 1. **Clients never bypass the protocol.** All agent functionality is exposed
    by `trouve-server`; the desktop app, CLI, and future clients speak
-   HTTP + SSE only. No client imports `trouve-core`.
+   HTTP + SSE only. No client imports `trouve-core`. The desktop app embeds
+   the server in-process (ADR 0008), but only through its one bootstrap
+   entry point (`trouve_server::bind_local`) — it still talks to it over
+   loopback HTTP + SSE and never touches engine internals.
 2. **One event log.** Server→client state flows through the append-only,
    persisted, cursor-addressed event log. New UI-visible state means a new
    event type, not a side channel.

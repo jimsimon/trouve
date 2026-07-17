@@ -8253,7 +8253,6 @@ dependencies = [
  "chrono",
  "dirs",
  "fuzzy-matcher",
- "libc",
  "mime_guess",
  "notify-rust",
  "open",
@@ -8274,6 +8273,7 @@ dependencies = [
  "tracing-subscriber",
  "trouve-client-core",
  "trouve-protocol",
+ "trouve-server",
  "uuid",
 ]
 

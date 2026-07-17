@@ -260,6 +260,17 @@ impl ServerSecurity {
         Self::default()
     }
 
+    /// A per-launch token supplied by a trusted embedder (the desktop app):
+    /// loopback-only, with a fresh internal bridge token. Nothing is read
+    /// from the environment or persisted.
+    pub fn with_token(token: String) -> Self {
+        Self {
+            token: Some(token),
+            require_loopback_host: true,
+            internal_token: Some(fresh_token()),
+        }
+    }
+
     /// Resolve from the environment and data dir:
     /// - token: `TROUVE_AUTH_TOKEN`, else `<data_dir>/auth-token`, else a
     ///   freshly generated token persisted there with 0600 perms.
@@ -267,11 +278,7 @@ impl ServerSecurity {
     /// - host: loopback-only unless `TROUVE_ALLOW_REMOTE` is set.
     pub fn resolve(data_dir: &std::path::Path) -> Self {
         let require_loopback_host = std::env::var_os("TROUVE_ALLOW_REMOTE").is_none();
-        let internal_token = Some(format!(
-            "{}{}",
-            uuid::Uuid::new_v4().simple(),
-            uuid::Uuid::new_v4().simple()
-        ));
+        let internal_token = Some(fresh_token());
         if std::env::var("TROUVE_NO_AUTH").is_ok_and(|v| v == "1" || v == "true") {
             tracing::warn!("TROUVE_NO_AUTH set: the API is unauthenticated");
             return Self {
@@ -299,11 +306,7 @@ impl ServerSecurity {
                 return existing;
             }
         }
-        let token = format!(
-            "{}{}",
-            uuid::Uuid::new_v4().simple(),
-            uuid::Uuid::new_v4().simple()
-        );
+        let token = fresh_token();
         let _ = std::fs::create_dir_all(data_dir);
         if write_private(&path, token.as_bytes()).is_err() {
             tracing::warn!("could not persist auth token to {}", path.display());
@@ -312,6 +315,15 @@ impl ServerSecurity {
         }
         token
     }
+}
+
+/// A 256-bit random bearer token (two v4 UUIDs, hex).
+fn fresh_token() -> String {
+    format!(
+        "{}{}",
+        uuid::Uuid::new_v4().simple(),
+        uuid::Uuid::new_v4().simple()
+    )
 }
 
 /// Write a file readable only by the owner (0600 on unix).
@@ -556,6 +568,36 @@ pub async fn serve(
 ) -> anyhow::Result<()> {
     let listener = tokio::net::TcpListener::bind(addr).await?;
     serve_listener(engine, listener, security).await
+}
+
+/// Bootstrap the full local stack — store, real config file (provider
+/// changes write back), index hooks, system connectivity probe — and bind
+/// `addr` (port 0 for ephemeral). Returns the bound address and the serve
+/// future.
+///
+/// This is the single entry point for embedders (the desktop app, ADR
+/// 0008) and the standalone binary alike: an embedder spawns the future
+/// and speaks HTTP + SSE to the returned address, keeping the protocol
+/// boundary intact without ever touching engine internals.
+pub async fn bind_local(
+    addr: std::net::SocketAddr,
+    security: ServerSecurity,
+) -> anyhow::Result<(
+    std::net::SocketAddr,
+    impl std::future::Future<Output = anyhow::Result<()>> + Send + 'static,
+)> {
+    let listener = tokio::net::TcpListener::bind(addr).await?;
+    let local = listener.local_addr()?;
+    let data = trouve_core::config::data_dir();
+    let store = trouve_core::store::Store::open(&data.join("trouve.db"))?;
+    let config = trouve_core::config::Config::load();
+    let engine = Arc::new(
+        Engine::new(store, data, &config)
+            .with_config_file(Some(trouve_core::config::config_path()))
+            .with_index_hooks()
+            .with_connectivity_probe(trouve_core::connectivity::system_probe()),
+    );
+    Ok((local, serve_listener(engine, listener, security)))
 }
 
 /// Serve on an already-bound listener (embedded mode: bind port 0, read the

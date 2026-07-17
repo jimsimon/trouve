@@ -1,6 +1,6 @@
 # ADR 0002: Protocol-first client/server split (OpenAPI + SSE event log)
 
-Status: Accepted (2026-07)
+Status: Accepted
 
 ## Context
 

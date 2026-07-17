@@ -3,8 +3,10 @@
 //! thread sends [`UiCommand`]s in, and the controller pushes rendered plain
 //! data back via `Weak::upgrade_in_event_loop`.
 //!
-//! Invariant 1 holds strictly: the app spawns `trouve-server` as a child
-//! process and speaks HTTP/SSE to it — no `trouve-core` import.
+//! Invariant 1 holds in embedded form (ADR 0008): the app runs
+//! `trouve-server` in-process through its one bootstrap entry point and
+//! speaks HTTP/SSE to it over loopback — no `trouve-core` import, no
+//! engine access.
 
 use std::collections::{HashMap, HashSet};
 
@@ -450,7 +452,7 @@ struct Controller {
     server_url: String,
     /// How to respawn the locally spawned server when its process dies
     /// (`None` when connected to an external server via TROUVE_SERVER_URL).
-    server_spawn: Option<ServerSpawnInfo>,
+    embedded_server: Option<EmbeddedServer>,
     /// Local models: true while a poller is scheduled for an in-flight
     /// download/install, plus the last seen downloaded-model count (a
     /// change means the model catalog changed → reload pickers).
@@ -596,8 +598,8 @@ pub async fn run(
             return;
         }
     };
-    let (server_spawn, server_child) = match spawned {
-        Some((info, child)) => (Some(info), Some(child)),
+    let (embedded_server, server_handle) = match spawned {
+        Some((info, handle)) => (Some(info), Some(handle)),
         None => (None, None),
     };
 
@@ -626,7 +628,7 @@ pub async fn run(
         server_failed: false,
         last_respawn: None,
         server_url,
-        server_spawn,
+        embedded_server,
         local_polling: false,
         local_downloaded: None,
         local_search: Vec::new(),
@@ -674,10 +676,10 @@ pub async fn run(
         term_view: (80, 24),
     };
 
-    // Report the spawned server's death to the command loop, which will
-    // attempt one automatic respawn before surfacing the failure.
-    if let Some(child) = server_child {
-        watch_server_child(ctl.tx.clone(), child);
+    // Report the embedded server's death to the command loop, which will
+    // attempt one automatic restart before surfacing the failure.
+    if let Some(handle) = server_handle {
+        watch_embedded_server(ctl.tx.clone(), handle);
     }
 
     if let Err(e) = ctl.bootstrap().await {
@@ -708,13 +710,13 @@ pub async fn run(
     }
 }
 
-/// Spawn `trouve-server` on an ephemeral local port and wait for it to
-/// answer. `TROUVE_SERVER_URL` skips spawning and connects to an existing
-/// (possibly remote) server instead.
+/// Start the embedded `trouve-server` on an ephemeral loopback port and
+/// wait for it to answer. `TROUVE_SERVER_URL` skips embedding and connects
+/// to an existing (possibly remote) server instead.
 async fn start_local_server() -> Result<(
     ProtocolClient,
     String,
-    Option<(ServerSpawnInfo, tokio::process::Child)>,
+    Option<(EmbeddedServer, tokio::task::JoinHandle<Result<()>>)>,
 )> {
     if let Ok(url) = std::env::var("TROUVE_SERVER_URL") {
         // Connecting to an externally-managed server: the user supplies its
@@ -728,61 +730,49 @@ async fn start_local_server() -> Result<(
         return Ok((client, url, None));
     }
 
-    let binary = server_binary()?;
-    // Reserve a port, then hand it to the server (tiny race, fine locally).
-    let port = std::net::TcpListener::bind("127.0.0.1:0")?
-        .local_addr()?
-        .port();
-    let addr = format!("127.0.0.1:{port}");
-
     // A per-launch bearer token so no other local process can drive the
-    // server we just spawned (it can run shell and edit files).
+    // server we embed (it can run shell and edit files).
     let token = format!(
         "{}{}",
         uuid::Uuid::new_v4().simple(),
         uuid::Uuid::new_v4().simple()
     );
 
-    let spawn = ServerSpawnInfo {
-        binary,
-        addr: addr.clone(),
+    let (addr, handle) = spawn_embedded_server("127.0.0.1:0".parse()?, &token).await?;
+    let info = EmbeddedServer {
+        addr,
         token: token.clone(),
     };
-    let child = spawn_server_process(&spawn)?;
     let url = format!("http://{addr}");
     let client = ProtocolClient::with_token(&url, Some(token));
-    wait_server_ready(&client)
-        .await
-        .with_context(|| format!("trouve-server did not become ready on {addr}"))?;
-    Ok((client, url, Some((spawn, child))))
+    if let Err(e) = wait_server_ready(&client).await {
+        // Abort and join so the listener/engine tear down before we return.
+        handle.abort();
+        let _ = handle.await;
+        return Err(e)
+            .with_context(|| format!("embedded trouve-server did not become ready on {addr}"));
+    }
+    Ok((client, url, Some((info, handle))))
 }
 
-/// Everything needed to relaunch the locally spawned server on the same
-/// address with the same per-launch token (the client keeps both).
+/// Everything needed to relaunch the embedded server on the same address
+/// with the same per-launch token (the client keeps both).
 #[derive(Clone)]
-struct ServerSpawnInfo {
-    binary: std::path::PathBuf,
-    addr: String,
+struct EmbeddedServer {
+    addr: std::net::SocketAddr,
     token: String,
 }
 
-fn spawn_server_process(spawn: &ServerSpawnInfo) -> Result<tokio::process::Child> {
-    let mut command = tokio::process::Command::new(&spawn.binary);
-    command
-        .args(["--addr", &spawn.addr])
-        .env("TROUVE_AUTH_TOKEN", &spawn.token)
-        .kill_on_drop(true);
-    #[cfg(target_os = "linux")]
-    unsafe {
-        // Tie the server's lifetime to ours even if we exit uncleanly.
-        command.pre_exec(|| {
-            libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM);
-            Ok(())
-        });
-    }
-    command
-        .spawn()
-        .with_context(|| format!("spawning {}", spawn.binary.display()))
+/// Bind and launch the embedded server task (full local engine behind the
+/// protocol; the app only ever sees the address). Returns the bound
+/// address and the join handle used to observe its exit.
+async fn spawn_embedded_server(
+    addr: std::net::SocketAddr,
+    token: &str,
+) -> Result<(std::net::SocketAddr, tokio::task::JoinHandle<Result<()>>)> {
+    let security = trouve_server::ServerSecurity::with_token(token.to_string());
+    let (addr, server) = trouve_server::bind_local(addr, security).await?;
+    Ok((addr, tokio::spawn(server)))
 }
 
 async fn wait_server_ready(client: &ProtocolClient) -> Result<()> {
@@ -795,35 +785,21 @@ async fn wait_server_ready(client: &ProtocolClient) -> Result<()> {
     anyhow::bail!("server did not answer /v1/info in time")
 }
 
-/// Own the spawned server child and report its death to the command loop.
-/// The task owning it preserves kill-on-drop: when the runtime shuts down
-/// the task is dropped and the child killed with it.
-fn watch_server_child(tx: mpsc::UnboundedSender<UiCommand>, mut child: tokio::process::Child) {
+/// Observe the embedded server task and report its exit to the command
+/// loop. The serve future normally runs for the app's whole lifetime, so
+/// any exit — error or panic (surfaced as a `JoinError`) — is exceptional.
+fn watch_embedded_server(
+    tx: mpsc::UnboundedSender<UiCommand>,
+    handle: tokio::task::JoinHandle<Result<()>>,
+) {
     tokio::spawn(async move {
-        let status = match child.wait().await {
-            Ok(status) => status.to_string(),
-            Err(e) => format!("wait failed: {e}"),
+        let status = match handle.await {
+            Ok(Ok(())) => "exited cleanly".to_string(),
+            Ok(Err(e)) => format!("{e:#}"),
+            Err(e) => format!("panicked: {e}"),
         };
         let _ = tx.send(UiCommand::ServerExited(status));
     });
-}
-
-/// Locate the server binary: `TROUVE_SERVER_BIN`, next to our own
-/// executable (installed layout and cargo target dir), then `$PATH`.
-fn server_binary() -> Result<std::path::PathBuf> {
-    if let Ok(path) = std::env::var("TROUVE_SERVER_BIN") {
-        return Ok(path.into());
-    }
-    let name = format!("trouve-server{}", std::env::consts::EXE_SUFFIX);
-    if let Ok(me) = std::env::current_exe()
-        && let Some(dir) = me.parent()
-    {
-        let sibling = dir.join(&name);
-        if sibling.exists() {
-            return Ok(sibling);
-        }
-    }
-    Ok(name.into()) // resolved via PATH by Command::new
 }
 
 impl Controller {
@@ -981,7 +957,7 @@ impl Controller {
                 "The trouve server stopped and could not be restarted — \
                  please restart the app."
                     .into()
-            } else if self.server_spawn.is_some() {
+            } else if self.embedded_server.is_some() {
                 "Lost the connection to the trouve server — reconnecting…".into()
             } else {
                 format!(
@@ -1056,16 +1032,16 @@ impl Controller {
         self.show_connectivity_notice(notice);
     }
 
-    /// The locally spawned server process died: attempt one automatic
-    /// respawn on the same address/token. A crash loop (dying again within
-    /// a minute of a respawn) or a failed spawn gives up and asks for an
-    /// app restart — retrying can't fix a bad binary or port conflict.
+    /// The embedded server task died: attempt one automatic restart on the
+    /// same address/token (a fresh engine over the persisted store). A
+    /// crash loop (dying again within a minute of a restart) or a failed
+    /// rebind gives up and asks for an app restart.
     async fn handle_server_exited(&mut self, status: &str) {
-        let Some(spawn) = self.server_spawn.clone() else {
+        let Some(info) = self.embedded_server.clone() else {
             // Externally-managed server: the watchdog handles messaging.
             return;
         };
-        tracing::warn!("trouve-server exited ({status})");
+        tracing::warn!("embedded trouve-server exited ({status})");
         self.server_unreachable = true;
         self.clear_connectivity_notice();
         if self
@@ -1078,22 +1054,22 @@ impl Controller {
         }
         self.last_respawn = Some(std::time::Instant::now());
         self.push_connectivity();
-        let restarted = match spawn_server_process(&spawn) {
-            Ok(mut child) => {
+        let restarted = match spawn_embedded_server(info.addr, &info.token).await {
+            Ok((_, handle)) => {
                 if wait_server_ready(&self.client).await.is_ok() {
                     // Hand ownership to the watcher only once the server
-                    // answers; an unready child must not linger unwatched.
-                    watch_server_child(self.tx.clone(), child);
+                    // answers; an unready task must not linger unwatched.
+                    watch_embedded_server(self.tx.clone(), handle);
                     true
                 } else {
-                    if let Err(e) = child.kill().await {
-                        tracing::warn!("killing unready trouve-server: {e:#}");
-                    }
+                    // Abort and join so the listener/engine tear down before retry.
+                    handle.abort();
+                    let _ = handle.await;
                     false
                 }
             }
             Err(e) => {
-                tracing::warn!("respawning trouve-server: {e:#}");
+                tracing::warn!("restarting embedded trouve-server: {e:#}");
                 false
             }
         };
