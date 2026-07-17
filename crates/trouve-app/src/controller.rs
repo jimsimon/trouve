@@ -745,9 +745,11 @@ async fn start_local_server() -> Result<(
     };
     let url = format!("http://{addr}");
     let client = ProtocolClient::with_token(&url, Some(token));
-    wait_server_ready(&client)
-        .await
-        .with_context(|| format!("embedded trouve-server did not become ready on {addr}"))?;
+    if let Err(e) = wait_server_ready(&client).await {
+        // Dropping the task closes its listener and engine.
+        handle.abort();
+        return Err(e).with_context(|| format!("embedded trouve-server did not become ready on {addr}"));
+    }
     Ok((client, url, Some((info, handle))))
 }
 
