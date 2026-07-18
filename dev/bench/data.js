@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1784404709680,
+  "lastUpdate": 1784405898795,
   "repoUrl": "https://github.com/jimsimon/trouve",
   "entries": {
     "e2e-benchmarks": [
@@ -1727,6 +1727,54 @@ window.BENCHMARK_DATA = {
             "name": "non-git warm query",
             "value": 72.404626,
             "range": "± 2.8",
+            "unit": "ms"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "jim.j.simon@gmail.com",
+            "name": "Jim Simon",
+            "username": "jimsimon"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "a3add2bd8d8ff663fd49ecb24637179af2f50c2a",
+          "message": "Fix scroll bookmarks bleeding between sessions on switch (#66)\n\n* Fix scroll bookmarks bleeding between sessions on switch\n\nThe shell's 1 Hz scroll poll sent a bare ChatScrolled(f32); the\ncontroller booked the sample against whatever thread was current when\nthe message was processed. Around a session/thread switch the two\ndiffer, so the outgoing thread's viewport offset (sampled up to a\nsecond earlier) was written into the incoming thread's resume\nbookmark.\n\nAttribute each sample where it's taken instead: the chat list now\ncarries a chat-thread-key property written in the same event as the\nrow swap, the poll reads key and offset in one event-loop turn, and\nChatScrolled carries the sampled thread id which the controller books\ndirectly. As a side effect the outgoing thread's final position is now\nsaved correctly even when its sample arrives after the switch.\n\nCo-Authored-By: Claude Fable 5 <noreply@anthropic.com>\n\n* Format ChatScrolled variant per rustfmt\n\nCo-Authored-By: Claude Fable 5 <noreply@anthropic.com>\n\n---------\n\nCo-authored-by: Claude Fable 5 <noreply@anthropic.com>",
+          "timestamp": "2026-07-18T16:16:56-04:00",
+          "tree_id": "10003ed260ef525f1eb16b99c6de81076f59caee",
+          "url": "https://github.com/jimsimon/trouve/commit/a3add2bd8d8ff663fd49ecb24637179af2f50c2a"
+        },
+        "date": 1784405898399,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "cold index + query",
+            "value": 138.42957622000003,
+            "range": "± 6.8",
+            "unit": "ms"
+          },
+          {
+            "name": "warm query",
+            "value": 83.41367188000001,
+            "range": "± 1.8",
+            "unit": "ms"
+          },
+          {
+            "name": "incremental (1 file modified)",
+            "value": 93.40664618000001,
+            "range": "± 11.7",
+            "unit": "ms"
+          },
+          {
+            "name": "non-git warm query",
+            "value": 78.7370166,
+            "range": "± 1.3",
             "unit": "ms"
           }
         ]
