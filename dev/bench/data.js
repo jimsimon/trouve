@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1784361175753,
+  "lastUpdate": 1784404653893,
   "repoUrl": "https://github.com/jimsimon/trouve",
   "entries": {
     "e2e-benchmarks": [
@@ -1679,6 +1679,54 @@ window.BENCHMARK_DATA = {
             "name": "non-git warm query",
             "value": 63.465348000000006,
             "range": "± 1.1",
+            "unit": "ms"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "jim.j.simon@gmail.com",
+            "name": "Jim Simon",
+            "username": "jimsimon"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "84a9c92c5b5b73e53a5632de1e152a27c7d1b542",
+          "message": "Fix backend approvals that arrive before the tool card (#64)\n\n* Fix backend approvals that arrive before the tool card exists.\n\nCursor and Codex can emit permission requests before the tool_call event\nthat normally creates the UI card, leaving Approve/Deny with nowhere to\nattach and wedging the turn. Synthesize a tool.requested card when needed\nand honor turn cancellation during the approval wait.\n\nCo-authored-by: Cursor <cursoragent@cursor.com>\n\n* Set requires_approval on synthetic backend tool cards.\n\nMatch bridged_approval so cards render as awaiting approval before\napproval.requested is processed, not only after the status flip.\n\nCo-authored-by: Cursor <cursoragent@cursor.com>\n\n* Harden backend approval cancellation and duplicate tool cards.\n\nSkip TurnCompleted when a backend turn is cancelled so drain_queue can\nemit turn.cancelled alone. Reuse synthetic approval cards when the\nvendor's tool_started arrives later, and keep them actionable until\napproval resolves.\n\nCo-authored-by: Cursor <cursoragent@cursor.com>\n\n* Address review feedback on backend approval edge cases.\n\nScope tool-card dedup to the active turn, persist partial assistant\ntext on cancelled backend turns, handle turn.cancelled in the viewmodel,\nand keep terminal tool cards stable when vendor events arrive late.\n\nCo-authored-by: Cursor <cursoragent@cursor.com>\n\n---------\n\nCo-authored-by: Cursor <cursoragent@cursor.com>",
+          "timestamp": "2026-07-18T15:56:14-04:00",
+          "tree_id": "74de43f89adc7a08939b8518557a49deeaa55d5b",
+          "url": "https://github.com/jimsimon/trouve/commit/84a9c92c5b5b73e53a5632de1e152a27c7d1b542"
+        },
+        "date": 1784404653563,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "cold index + query",
+            "value": 141.0283915,
+            "range": "± 8.6",
+            "unit": "ms"
+          },
+          {
+            "name": "warm query",
+            "value": 72.68493402000001,
+            "range": "± 1.7",
+            "unit": "ms"
+          },
+          {
+            "name": "incremental (1 file modified)",
+            "value": 82.58797644,
+            "range": "± 1.6",
+            "unit": "ms"
+          },
+          {
+            "name": "non-git warm query",
+            "value": 72.404626,
+            "range": "± 2.8",
             "unit": "ms"
           }
         ]
