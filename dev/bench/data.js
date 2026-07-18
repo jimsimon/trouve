@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1784357712518,
+  "lastUpdate": 1784361119689,
   "repoUrl": "https://github.com/jimsimon/trouve",
   "entries": {
     "e2e-benchmarks": [
@@ -1631,6 +1631,54 @@ window.BENCHMARK_DATA = {
             "name": "non-git warm query",
             "value": 69.86727134,
             "range": "± 1.9",
+            "unit": "ms"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "jim.j.simon@gmail.com",
+            "name": "Jim Simon",
+            "username": "jimsimon"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "60f81e243a669e08103bc23a5750f3c602468da1",
+          "message": "Fix Codex tool approvals replying with obsolete decision values (#65)\n\n* Fix Codex app-server approval replies to use accept/decline.\n\nThe Codex app-server protocol no longer recognizes approved/denied\ndecision values, so user approvals were treated as rejections.\n\nCo-authored-by: Cursor <cursoragent@cursor.com>\n\n* Add Codex adapter test for denied approval replies.\n\nCover the decline path so approval mapping stays paired with the existing accept case.\n\nCo-authored-by: Cursor <cursoragent@cursor.com>\n\n---------\n\nCo-authored-by: Cursor <cursoragent@cursor.com>",
+          "timestamp": "2026-07-18T03:50:46-04:00",
+          "tree_id": "cd43fedde527f1048effc174a53273c956ec652b",
+          "url": "https://github.com/jimsimon/trouve/commit/60f81e243a669e08103bc23a5750f3c602468da1"
+        },
+        "date": 1784361119379,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "cold index + query",
+            "value": 129.7812973,
+            "range": "± 5.6",
+            "unit": "ms"
+          },
+          {
+            "name": "warm query",
+            "value": 64.91864138,
+            "range": "± 2.2",
+            "unit": "ms"
+          },
+          {
+            "name": "incremental (1 file modified)",
+            "value": 76.99004598,
+            "range": "± 1.3",
+            "unit": "ms"
+          },
+          {
+            "name": "non-git warm query",
+            "value": 63.465348000000006,
+            "range": "± 1.1",
             "unit": "ms"
           }
         ]
