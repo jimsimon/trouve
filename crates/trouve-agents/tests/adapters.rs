@@ -603,6 +603,44 @@ cat > /dev/null
 }
 
 #[tokio::test]
+async fn codex_adapter_sends_decline_when_user_denies_approval() {
+    let tmp = tempfile::tempdir().unwrap();
+    let stub = write_stub(
+        tmp.path(),
+        "codex",
+        r#"#!/bin/bash
+read line # initialize
+echo '{"jsonrpc":"2.0","id":1,"result":{}}'
+read line # initialized notification
+read line # thread/start
+echo '{"jsonrpc":"2.0","id":2,"result":{"thread":{"id":"thr-1"}}}'
+read line # turn/start
+echo '{"jsonrpc":"2.0","id":3,"result":{"turn":{"id":"turn-1"}}}'
+echo '{"jsonrpc":"2.0","id":100,"method":"item/commandExecution/requestApproval","params":{"threadId":"thr-1","itemId":"c1","command":"ls"}}'
+read approval
+echo "$approval" > "$0.approval"
+echo '{"jsonrpc":"2.0","method":"turn/completed","params":{"threadId":"thr-1","turn":{"id":"turn-1","status":"completed"}}}'
+cat > /dev/null
+"#,
+    );
+    let backend = CodexBackend::new("codex", Some(stub.clone()));
+    let mut stream = start_turn(&backend, || {
+        turn(tmp.path().to_path_buf(), None, BackendPermission::Ask)
+    })
+    .await;
+
+    while let Some(ev) = stream.next().await {
+        if let BackendEvent::ApprovalNeeded { responder, .. } = ev.unwrap() {
+            responder.send(false).unwrap();
+        }
+    }
+
+    let reply = std::fs::read_to_string(format!("{stub}.approval")).unwrap();
+    assert!(reply.contains("\"id\":100"), "{reply}");
+    assert!(reply.contains("\"decision\":\"decline\""), "{reply}");
+}
+
+#[tokio::test]
 async fn claude_adapter_wires_mcp_tool_bridge() {
     let tmp = tempfile::tempdir().unwrap();
     let stub = write_stub(
