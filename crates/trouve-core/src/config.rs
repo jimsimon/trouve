@@ -35,6 +35,10 @@ pub struct Config {
     /// Default model for new threads, e.g. "openai/gpt-4.1-mini".
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default_model: Option<String>,
+    /// Global default permission mode for new threads, used by modes that
+    /// don't set one of their own. Unset means Ask.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_permission_mode: Option<trouve_protocol::PermissionMode>,
     /// Whether the built-in "local" provider (managed llama-server) is
     /// active. Unset means enabled.
     #[serde(default, skip_serializing_if = "Option::is_none")]

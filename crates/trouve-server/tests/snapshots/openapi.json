@@ -476,6 +476,37 @@
         }
       }
     },
+    "/v1/config/default-permission-mode": {
+      "put": {
+        "tags": [],
+        "operationId": "set_default_permission_mode",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SetDefaultPermissionModeRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "204": {
+            "description": ""
+          },
+          "400": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/v1/info": {
       "get": {
         "tags": [],
@@ -2993,7 +3024,15 @@
             "description": "Preferred model for threads started in this mode (\"provider/model\").\nNone falls back to the global default model."
           },
           "default_permission_mode": {
-            "$ref": "#/components/schemas/PermissionMode"
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/PermissionMode",
+                "description": "Permission mode for threads started in this mode. None falls back to\nthe global default permission mode."
+              }
+            ]
           },
           "display_name": {
             "type": "string"
@@ -5076,6 +5115,10 @@
             "type": "string",
             "description": "Default model for new threads, e.g. \"openai/gpt-4.1-mini\"."
           },
+          "default_permission_mode": {
+            "$ref": "#/components/schemas/PermissionMode",
+            "description": "Global default permission mode for new threads, used by modes without\na default of their own. Absent on older servers means Ask."
+          },
           "providers": {
             "type": "array",
             "items": {
@@ -5407,6 +5450,18 @@
           "model": {
             "type": "string",
             "description": "Provider-qualified id, e.g. \"openai/gpt-4.1-mini\"."
+          }
+        }
+      },
+      "SetDefaultPermissionModeRequest": {
+        "type": "object",
+        "description": "Set the global default permission mode\n(`PUT /v1/config/default-permission-mode`).",
+        "required": [
+          "permission_mode"
+        ],
+        "properties": {
+          "permission_mode": {
+            "$ref": "#/components/schemas/PermissionMode"
           }
         }
       },
@@ -5812,7 +5867,15 @@
             ]
           },
           "default_permission_mode": {
-            "$ref": "#/components/schemas/PermissionMode"
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/PermissionMode",
+                "description": "None uses the global default permission mode."
+              }
+            ]
           },
           "display_name": {
             "type": "string"

@@ -6,7 +6,7 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
-use trouve_protocol::{AgentMode, ModeInfo, PermissionMode};
+use trouve_protocol::{AgentMode, ModeInfo};
 
 pub fn builtin_modes() -> Vec<AgentMode> {
     vec![
@@ -19,7 +19,7 @@ pub fn builtin_modes() -> Vec<AgentMode> {
                 .into(),
             allowed_tools: vec![],
             read_only: false,
-            default_permission_mode: PermissionMode::Ask,
+            default_permission_mode: None,
             default_model: None,
         },
         AgentMode {
@@ -39,7 +39,7 @@ pub fn builtin_modes() -> Vec<AgentMode> {
                 "todo_write".into(),
             ],
             read_only: true,
-            default_permission_mode: PermissionMode::Ask,
+            default_permission_mode: None,
             default_model: None,
         },
         AgentMode {
@@ -62,7 +62,7 @@ pub fn builtin_modes() -> Vec<AgentMode> {
                 "todo_write".into(),
             ],
             read_only: true,
-            default_permission_mode: PermissionMode::Ask,
+            default_permission_mode: None,
             default_model: None,
         },
         AgentMode {
@@ -74,7 +74,7 @@ pub fn builtin_modes() -> Vec<AgentMode> {
                 .into(),
             allowed_tools: vec![],
             read_only: false,
-            default_permission_mode: PermissionMode::Ask,
+            default_permission_mode: None,
             default_model: None,
         },
         AgentMode {
@@ -93,7 +93,7 @@ pub fn builtin_modes() -> Vec<AgentMode> {
                 "todo_write".into(),
             ],
             read_only: true,
-            default_permission_mode: PermissionMode::Ask,
+            default_permission_mode: None,
             default_model: None,
         },
     ]
@@ -121,7 +121,7 @@ pub fn fallback_mode() -> AgentMode {
             "todo_write".into(),
         ],
         read_only: true,
-        default_permission_mode: PermissionMode::Ask,
+        default_permission_mode: None,
         default_model: None,
     }
 }
@@ -327,7 +327,7 @@ default_permission_mode = "ask"
             system_prompt: "write docs".into(),
             allowed_tools: vec![],
             read_only: false,
-            default_permission_mode: PermissionMode::Ask,
+            default_permission_mode: None,
             default_model: None,
         };
         upsert_user_mode(config, &custom).unwrap();

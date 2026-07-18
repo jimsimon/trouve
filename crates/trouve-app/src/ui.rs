@@ -802,6 +802,7 @@ pub fn set_settings_data(
     providers: Vec<(String, String, String, bool, String, bool)>,
     models: Vec<String>,
     default_model_index: i32,
+    default_permission_index: i32,
 ) {
     let _ = ui.upgrade_in_event_loop(move |ui| {
         let items: Vec<ProviderItem> = providers
@@ -820,6 +821,7 @@ pub fn set_settings_data(
         ui.set_settings_providers(ModelRc::new(VecModel::from(items)));
         ui.set_settings_models(string_model(models));
         ui.set_settings_default_model_index(default_model_index);
+        ui.set_settings_default_permission_index(default_permission_index);
     });
 }
 
@@ -831,6 +833,7 @@ pub struct ModeView {
     pub read_only: bool,
     pub system_prompt: String,
     pub allowed_tools: String,
+    /// -1 = global default, 0 ask, 1 allow-list, 2 yolo.
     pub permission_index: i32,
     pub model_index: i32,
 }

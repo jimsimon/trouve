@@ -6,6 +6,18 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- **Global default permissions**: Settings → Modes & Models gains a "Global
+  default permissions" picker (Ask / Allow list / Yolo) that applies to new
+  threads whose mode doesn't set its own permission mode. Per-mode default
+  permissions now default to "Global default" and can still be overridden
+  per mode in the mode editor. Server side: a mode's
+  `default_permission_mode` is now optional (absent = global default), the
+  global value persists in `config.toml` and is settable via
+  `PUT /v1/config/default-permission-mode`, and `GET /v1/providers` reports
+  it alongside the default model.
+
 ### Fixed
 
 - **Screen artifacts in the desktop app**: the app now prefers Slint's Skia

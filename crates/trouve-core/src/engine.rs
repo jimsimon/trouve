@@ -80,6 +80,9 @@ pub struct Engine {
     /// persistence (tests).
     config_file: Option<PathBuf>,
     default_model: RwLock<String>,
+    /// Global default permission mode for new threads, used by modes that
+    /// don't set one of their own.
+    default_permission_mode: RwLock<trouve_protocol::PermissionMode>,
     secrets: Arc<dyn trouve_providers::secrets::SecretStore>,
     /// In-flight OAuth logins, keyed by provider id.
     logins: Mutex<HashMap<String, LoginState>>,
@@ -378,6 +381,9 @@ impl Engine {
                     .clone()
                     .unwrap_or_else(|| "openai/gpt-4.1-mini".into()),
             ),
+            default_permission_mode: RwLock::new(
+                config.default_permission_mode.unwrap_or_default(),
+            ),
             secrets,
             logins: Mutex::new(HashMap::new()),
             cli_installs: Mutex::new(HashMap::new()),
@@ -661,6 +667,7 @@ impl Engine {
         ProvidersResponse {
             providers: infos,
             default_model: self.default_model.read().unwrap().clone(),
+            default_permission_mode: *self.default_permission_mode.read().unwrap(),
         }
     }
 
@@ -1983,6 +1990,21 @@ impl Engine {
         Ok(())
     }
 
+    /// Set the global default permission mode for new threads (used by
+    /// modes that don't set one of their own).
+    pub fn set_default_permission_mode(
+        &self,
+        mode: trouve_protocol::PermissionMode,
+    ) -> Result<(), EngineError> {
+        {
+            let mut config = self.config.lock().unwrap();
+            config.default_permission_mode = Some(mode);
+            self.persist_config(&config);
+        }
+        *self.default_permission_mode.write().unwrap() = mode;
+        Ok(())
+    }
+
     fn persist_config(&self, config: &Config) {
         if let Some(path) = &self.config_file
             && let Err(e) = config.save_to(path)
@@ -3105,7 +3127,12 @@ impl Engine {
             mode: mode.id.clone(),
             model,
             model_options: req.model_options.clone(),
-            permission_mode: req.permission_mode.unwrap_or(mode.default_permission_mode),
+            // Permission precedence mirrors the model's: explicit request >
+            // the mode's default > the global default.
+            permission_mode: req
+                .permission_mode
+                .or(mode.default_permission_mode)
+                .unwrap_or_else(|| *self.default_permission_mode.read().unwrap()),
             created_at: chrono::Utc::now(),
             // Spawn parentage is recorded by the spawn tools after insert;
             // reads recompute this flag from the spawned_threads table.

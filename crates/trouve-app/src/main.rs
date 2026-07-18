@@ -850,6 +850,12 @@ fn main() -> anyhow::Result<()> {
     }
     {
         let tx = tx.clone();
+        window.on_default_permission_picked(move |i| {
+            let _ = tx.send(UiCommand::SetDefaultPermission(i));
+        });
+    }
+    {
+        let tx = tx.clone();
         window.on_mode_saved(move |id, display, prompt, tools, read_only, perm, model| {
             let _ = tx.send(UiCommand::SaveMode(
                 id.to_string(),

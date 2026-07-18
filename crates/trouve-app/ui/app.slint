@@ -1139,6 +1139,7 @@ export component AppWindow inherits Window {
     in property <[string]> settings-known-provider-names;
     in property <[string]> settings-models;
     in property <int> settings-default-model-index: -1;
+    in property <int> settings-default-permission-index: 0;
     in property <[ModeItem]> settings-mode-items;
     in property <[string]> settings-mode-model-names;
     in property <string> settings-status: "";
@@ -1176,6 +1177,7 @@ export component AppWindow inherits Window {
     callback provider-deleted(string);
     callback provider-login(string);
     callback default-model-picked(int);
+    callback default-permission-picked(int);
     callback mode-saved(string, string, string, string, bool, int, int);
     callback mode-deleted(string);
     callback mode-model-picked(string, int);
@@ -4121,6 +4123,7 @@ export component AppWindow inherits Window {
         known-provider-names: root.settings-known-provider-names;
         models: root.settings-models;
         default-model-index: root.settings-default-model-index;
+        default-permission-index: root.settings-default-permission-index;
         mode-items: root.settings-mode-items;
         mode-model-names: root.settings-mode-model-names;
         settings-status: root.settings-status;
@@ -4165,6 +4168,7 @@ export component AppWindow inherits Window {
         provider-deleted(id) => { root.provider-deleted(id); }
         provider-login(id) => { root.provider-login(id); }
         default-model-picked(i) => { root.default-model-picked(i); }
+        default-permission-picked(i) => { root.default-permission-picked(i); }
         mode-saved(id, name, prompt, tools, ro, perm, model) => {
             root.mode-saved(id, name, prompt, tools, ro, perm, model);
         }
