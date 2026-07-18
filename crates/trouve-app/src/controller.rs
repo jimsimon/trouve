@@ -590,6 +590,7 @@ pub async fn run(
     tx: mpsc::UnboundedSender<UiCommand>,
     mut rx: mpsc::UnboundedReceiver<UiCommand>,
     window_focused: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    register_workspace: Option<std::path::PathBuf>,
 ) {
     let (client, server_url, spawned) = match start_local_server().await {
         Ok(parts) => parts,
@@ -682,7 +683,7 @@ pub async fn run(
         watch_embedded_server(ctl.tx.clone(), handle);
     }
 
-    if let Err(e) = ctl.bootstrap().await {
+    if let Err(e) = ctl.bootstrap(register_workspace).await {
         ctl.error(&format!("startup error: {e:#}"));
     }
 
@@ -807,14 +808,23 @@ impl Controller {
         ui::set_error(&self.ui, text);
     }
 
-    async fn bootstrap(&mut self) -> Result<()> {
-        let cwd = std::env::current_dir()?;
-        let workspace = self
-            .client
-            .register_workspace(&cwd.to_string_lossy())
-            .await
-            .context("registering current directory as workspace")?;
-        self.home_workspace_id = workspace.id.clone();
+    async fn bootstrap(&mut self, register_workspace: Option<std::path::PathBuf>) -> Result<()> {
+        if let Some(path) = register_workspace {
+            let path_str = path.to_str().context("workspace path is not valid UTF-8")?;
+            let workspace = self
+                .client
+                .register_workspace(path_str)
+                .await
+                .with_context(|| format!("registering {} as workspace", path.display()))?;
+            self.home_workspace_id = workspace.id.clone();
+        }
+
+        self.reload_sessions().await?;
+        if self.home_workspace_id.is_empty()
+            && let Some(ws) = self.workspaces.first()
+        {
+            self.home_workspace_id = ws.id.clone();
+        }
 
         // Seed connectivity before the first catalog load: when the server
         // started offline, the model list is already filtered and the
@@ -823,7 +833,6 @@ impl Controller {
             self.offline = !info.online;
         }
         self.reload_catalogs().await;
-        self.reload_sessions().await?;
 
         if let Ok(gh) = self.client.github_integration().await {
             self.apply_github_integration(gh);
@@ -904,9 +913,11 @@ impl Controller {
 
     /// Refresh modes/models (after provider changes) and push all pickers.
     async fn reload_catalogs(&mut self) {
+        let home_workspace =
+            (!self.home_workspace_id.is_empty()).then_some(self.home_workspace_id.as_str());
         let infos = self
             .client
-            .list_mode_infos(Some(&self.home_workspace_id))
+            .list_mode_infos(home_workspace)
             .await
             .unwrap_or_default();
         self.modes = infos.iter().map(|i| i.mode.clone()).collect();
