@@ -1521,6 +1521,12 @@ export component AppWindow inherits Window {
     // offset into the controller's per-thread resume bookmark, and the
     // controller writes it back when a thread is reopened.
     in-out property <length> chat-scroll <=> chat-list.viewport-y;
+    // The thread whose transcript the list is currently showing, written in
+    // the same event as the rows. The shell samples it together with
+    // chat-scroll so an offset polled around a thread switch is booked to
+    // the thread that was actually on screen, not whichever became current
+    // by the time the sample reached the controller.
+    in-out property <string> chat-thread-key;
 
     // Quit confirmation while agents run: closing the window with active
     // turns opens the modal instead of quitting.

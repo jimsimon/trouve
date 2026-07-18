@@ -272,7 +272,7 @@ pub fn invalidate_chat_cache(ui: &Ui) {
     });
 }
 
-pub fn set_chat(ui: &Ui, rows: Vec<ChatRowData>, scroll_to_end: bool) {
+pub fn set_chat(ui: &Ui, rows: Vec<ChatRowData>, thread_key: String, scroll_to_end: bool) {
     use slint::Model as _;
 
     let _ = ui.upgrade_in_event_loop(move |ui| {
@@ -281,6 +281,9 @@ pub fn set_chat(ui: &Ui, rows: Vec<ChatRowData>, scroll_to_end: bool) {
         // toggle at the tail would land the view at a visibly wrong spot
         // unless we re-pin it below.
         let was_at_bottom = ui.get_chat_at_bottom();
+        // Same event as the row swap, so the shell's scroll poll can never
+        // pair the new key with the old thread's viewport (or vice versa).
+        ui.set_chat_thread_key(thread_key.as_str().into());
         LAST_CHAT.with(|cache| {
             let mut cache = cache.borrow_mut();
             let model = ui.get_chat_rows();
