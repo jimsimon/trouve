@@ -295,10 +295,14 @@ impl ThreadViewModel {
                     |i| matches!(i, ChatItem::ToolCall { call_id: c, .. } if c == call_id),
                 );
                 if let Some(ChatItem::ToolCall { status, .. }) = self.find_tool(call_id) {
-                    // A synthetic approval-first card stays actionable until
-                    // approval.requested/resolved has run; a delayed vendor
-                    // tool_started must not paint over it as Running.
-                    if *status != ToolCallStatus::AwaitingApproval {
+                    let terminal = matches!(
+                        *status,
+                        ToolCallStatus::Ok
+                            | ToolCallStatus::Error
+                            | ToolCallStatus::Denied
+                            | ToolCallStatus::Aborted
+                    );
+                    if !terminal && *status != ToolCallStatus::AwaitingApproval {
                         *status = ToolCallStatus::Running;
                     }
                 }
@@ -403,6 +407,20 @@ impl ThreadViewModel {
                             error: error.clone(),
                         },
                     };
+                }
+                idx
+            }
+            Event::TurnCancelled { turn } => {
+                self.turn_running = false;
+                self.compacting = false;
+                self.finish_thinking();
+                self.pending_questions.clear();
+                self.record_turn_duration(*turn, envelope.ts);
+                let idx = self.items.iter().position(|i| {
+                    matches!(i, ChatItem::TurnStatus { turn: t, state: TurnState::Running } if t == turn)
+                });
+                if let Some(idx) = idx {
+                    self.items.remove(idx);
                 }
                 idx
             }
@@ -611,6 +629,56 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn delayed_tool_started_preserves_denied_cards() {
+        let mut vm = ThreadViewModel::new();
+        vm.apply(&env(Event::ToolRequested {
+            turn: 1,
+            call_id: "c1".into(),
+            tool: "Bash".into(),
+            args: serde_json::json!({"command": "rm -rf /"}),
+            requires_approval: true,
+        }));
+        vm.apply(&env(Event::ApprovalRequested {
+            turn: 1,
+            call_id: "c1".into(),
+        }));
+        vm.apply(&env(Event::ApprovalResolved {
+            call_id: "c1".into(),
+            decision: ApprovalDecision::Deny,
+        }));
+        vm.apply(&env(Event::ToolStarted {
+            call_id: "c1".into(),
+        }));
+        assert!(matches!(
+            &vm.items[0],
+            ChatItem::ToolCall {
+                status: ToolCallStatus::Denied,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn turn_cancelled_clears_running_state() {
+        let mut vm = ThreadViewModel::new();
+        vm.apply(&env(Event::TurnStarted {
+            turn: 1,
+            mode: "code".into(),
+            model: "m".into(),
+        }));
+        assert!(vm.turn_running);
+        vm.apply(&env(Event::TurnCancelled { turn: 1 }));
+        assert!(!vm.turn_running);
+        assert!(!vm.items.iter().any(|i| matches!(
+            i,
+            ChatItem::TurnStatus {
+                state: TurnState::Running,
+                ..
+            }
+        )));
     }
 
     #[test]

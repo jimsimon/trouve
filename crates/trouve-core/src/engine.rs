@@ -4407,8 +4407,9 @@ impl Engine {
             .map(|(id, _)| id.clone())
     }
 
-    /// Whether a `tool.requested` card already exists for this call id.
-    fn tool_card_exists(&self, thread_id: &str, call_id: &str) -> bool {
+    /// Whether a `tool.requested` card already exists for this call in the
+    /// current turn.
+    fn tool_card_exists(&self, thread_id: &str, turn: u64, call_id: &str) -> bool {
         self.store
             .events_after(&Scope::Thread(thread_id.to_string()), 0)
             .ok()
@@ -4417,8 +4418,10 @@ impl Engine {
                     matches!(
                         &env.event,
                         Event::ToolRequested {
-                            call_id: id, ..
-                        } if id == call_id
+                            turn: t,
+                            call_id: id,
+                            ..
+                        } if *t == turn && id == call_id
                     )
                 })
             })
@@ -4684,7 +4687,7 @@ impl Engine {
                     // still un-edited at announcement time, so resolve line
                     // hints now for the UI's diff gutter.
                     annotate_edit_lines(Path::new(&session.worktree_path), &mut args);
-                    if !self.tool_card_exists(&thread.id, &call_id) {
+                    if !self.tool_card_exists(&thread.id, turn, &call_id) {
                         self.store.append_event(
                             scope.clone(),
                             Event::ToolRequested {
@@ -4783,6 +4786,25 @@ impl Engine {
         drop(stream);
 
         if cancel.is_cancelled() {
+            if !segment.is_empty() {
+                self.store.append_event(
+                    scope.clone(),
+                    Event::AssistantMessage {
+                        turn,
+                        content: segment,
+                    },
+                )?;
+            }
+            if !text.is_empty() {
+                self.store.append_message(
+                    &thread.id,
+                    &serde_json::to_value(Message::Assistant {
+                        content: text,
+                        tool_calls: Vec::new(),
+                        reasoning: Vec::new(),
+                    })?,
+                )?;
+            }
             return Ok(());
         }
 
@@ -4875,7 +4897,7 @@ impl Engine {
                 // before the tool_call announcement that normally creates the
                 // card. Without a synthetic card the Approve/Deny UI has
                 // nowhere to attach and the turn hangs forever.
-                if !self.tool_card_exists(&thread.id, call_id) {
+                if !self.tool_card_exists(&thread.id, turn, call_id) {
                     let mut display_args = args.clone();
                     annotate_edit_lines(Path::new(&session.worktree_path), &mut display_args);
                     self.store.append_event(
