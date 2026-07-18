@@ -4011,17 +4011,18 @@ impl Controller {
                 }
             }
             UiCommand::SetDefaultPermission(i) => {
-                let mode = permission_mode_of(i).unwrap_or_default();
-                match self.client.set_default_permission_mode(mode).await {
-                    Ok(()) => {
-                        ui::set_settings_status(
-                            &self.ui,
-                            format!("default permissions: {}", permission_label(mode)),
-                        );
-                        self.refresh_settings().await;
-                    }
-                    Err(e) => {
-                        ui::set_settings_status(&self.ui, format!("{e:#}"));
+                if let Some(mode) = permission_mode_of(i) {
+                    match self.client.set_default_permission_mode(mode).await {
+                        Ok(()) => {
+                            ui::set_settings_status(
+                                &self.ui,
+                                format!("default permissions: {}", permission_label(mode)),
+                            );
+                            self.refresh_settings().await;
+                        }
+                        Err(e) => {
+                            ui::set_settings_status(&self.ui, format!("{e:#}"));
+                        }
                     }
                 }
             }

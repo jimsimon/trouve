@@ -55,7 +55,10 @@ pub use requests::*;
 // 0.19: connectivity — the server.connectivity_changed event and
 // ServerInfo.online report internet reachability; while offline
 // GET /v1/models lists only models that run without internet (additive).
-pub const PROTOCOL_VERSION: &str = "0.19";
+// 0.20: global default permission mode — AgentMode.default_permission_mode
+// is now optional (absent = global default), GET /v1/providers reports
+// default_permission_mode, and PUT /v1/config/default-permission-mode sets it.
+pub const PROTOCOL_VERSION: &str = "0.20";
 
 pub type WorkspaceId = String;
 pub type SessionId = String;

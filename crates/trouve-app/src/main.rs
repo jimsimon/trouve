@@ -851,7 +851,7 @@ fn main() -> anyhow::Result<()> {
     {
         let tx = tx.clone();
         window.on_default_permission_picked(move |i| {
-            let _ = tx.send(UiCommand::SetDefaultPermission(i));
+            let _ = tx.send(UiCommand::SetDefaultPermission(i.max(0)));
         });
     }
     {
