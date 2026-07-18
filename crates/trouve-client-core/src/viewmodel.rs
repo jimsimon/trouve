@@ -580,6 +580,31 @@ mod tests {
     }
 
     #[test]
+    fn approval_before_vendor_tool_card_surfaces_buttons() {
+        let mut vm = ThreadViewModel::new();
+        // When the engine synthesizes a card before approval.requested…
+        vm.apply(&env(Event::ToolRequested {
+            turn: 1,
+            call_id: "web_search_0".into(),
+            tool: "execute".into(),
+            args: serde_json::json!({"title": "Web Search"}),
+            requires_approval: false,
+        }));
+        vm.apply(&env(Event::ApprovalRequested {
+            turn: 1,
+            call_id: "web_search_0".into(),
+        }));
+        assert_eq!(vm.items.len(), 1);
+        assert!(matches!(
+            &vm.items[0],
+            ChatItem::ToolCall {
+                status: ToolCallStatus::AwaitingApproval,
+                ..
+            }
+        ));
+    }
+
+    #[test]
     fn bridged_approval_attaches_to_the_vendors_tool_card() {
         let mut vm = ThreadViewModel::new();
         // The vendor's stream announces the call first (plain Running)…
