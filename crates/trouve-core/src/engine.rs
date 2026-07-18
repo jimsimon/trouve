@@ -4684,16 +4684,18 @@ impl Engine {
                     // still un-edited at announcement time, so resolve line
                     // hints now for the UI's diff gutter.
                     annotate_edit_lines(Path::new(&session.worktree_path), &mut args);
-                    self.store.append_event(
-                        scope.clone(),
-                        Event::ToolRequested {
-                            turn,
-                            call_id: call_id.clone(),
-                            tool,
-                            args,
-                            requires_approval: false,
-                        },
-                    )?;
+                    if !self.tool_card_exists(&thread.id, &call_id) {
+                        self.store.append_event(
+                            scope.clone(),
+                            Event::ToolRequested {
+                                turn,
+                                call_id: call_id.clone(),
+                                tool,
+                                args,
+                                requires_approval: false,
+                            },
+                        )?;
+                    }
                     self.store
                         .append_event(scope.clone(), Event::ToolStarted { call_id })?;
                 }
@@ -4779,6 +4781,10 @@ impl Engine {
         // Drop the backend stream promptly so a cancelled turn kills the
         // vendor process now rather than at end of scope.
         drop(stream);
+
+        if cancel.is_cancelled() {
+            return Ok(());
+        }
 
         if !segment.is_empty() {
             self.store.append_event(

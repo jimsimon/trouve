@@ -295,7 +295,12 @@ impl ThreadViewModel {
                     |i| matches!(i, ChatItem::ToolCall { call_id: c, .. } if c == call_id),
                 );
                 if let Some(ChatItem::ToolCall { status, .. }) = self.find_tool(call_id) {
-                    *status = ToolCallStatus::Running;
+                    // A synthetic approval-first card stays actionable until
+                    // approval.requested/resolved has run; a delayed vendor
+                    // tool_started must not paint over it as Running.
+                    if *status != ToolCallStatus::AwaitingApproval {
+                        *status = ToolCallStatus::Running;
+                    }
                 }
                 idx
             }
@@ -589,6 +594,14 @@ mod tests {
             tool: "execute".into(),
             args: serde_json::json!({"title": "Web Search"}),
             requires_approval: true,
+        }));
+        vm.apply(&env(Event::ApprovalRequested {
+            turn: 1,
+            call_id: "web_search_0".into(),
+        }));
+        // …a delayed vendor tool_started reuses the card (no duplicate).
+        vm.apply(&env(Event::ToolStarted {
+            call_id: "web_search_0".into(),
         }));
         assert_eq!(vm.items.len(), 1);
         assert!(matches!(
