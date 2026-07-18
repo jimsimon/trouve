@@ -4879,7 +4879,7 @@ impl Engine {
                             call_id: call_id.to_string(),
                             tool: tool.to_string(),
                             args: display_args,
-                            requires_approval: false,
+                            requires_approval: true,
                         },
                     )?;
                 }

@@ -588,11 +588,7 @@ mod tests {
             call_id: "web_search_0".into(),
             tool: "execute".into(),
             args: serde_json::json!({"title": "Web Search"}),
-            requires_approval: false,
-        }));
-        vm.apply(&env(Event::ApprovalRequested {
-            turn: 1,
-            call_id: "web_search_0".into(),
+            requires_approval: true,
         }));
         assert_eq!(vm.items.len(), 1);
         assert!(matches!(
