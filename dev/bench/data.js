@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1784361119689,
+  "lastUpdate": 1784361175753,
   "repoUrl": "https://github.com/jimsimon/trouve",
   "entries": {
     "e2e-benchmarks": [
@@ -3313,6 +3313,54 @@ window.BENCHMARK_DATA = {
             "name": "dense_query_20k_rows",
             "value": 1378680.4790234445,
             "range": "± 6215",
+            "unit": "ns"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "jim.j.simon@gmail.com",
+            "name": "Jim Simon",
+            "username": "jimsimon"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "60f81e243a669e08103bc23a5750f3c602468da1",
+          "message": "Fix Codex tool approvals replying with obsolete decision values (#65)\n\n* Fix Codex app-server approval replies to use accept/decline.\n\nThe Codex app-server protocol no longer recognizes approved/denied\ndecision values, so user approvals were treated as rejections.\n\nCo-authored-by: Cursor <cursoragent@cursor.com>\n\n* Add Codex adapter test for denied approval replies.\n\nCover the decline path so approval mapping stays paired with the existing accept case.\n\nCo-authored-by: Cursor <cursoragent@cursor.com>\n\n---------\n\nCo-authored-by: Cursor <cursoragent@cursor.com>",
+          "timestamp": "2026-07-18T03:50:46-04:00",
+          "tree_id": "cd43fedde527f1048effc174a53273c956ec652b",
+          "url": "https://github.com/jimsimon/trouve/commit/60f81e243a669e08103bc23a5750f3c602468da1"
+        },
+        "date": 1784361174992,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "bm25_build_5k_docs",
+            "value": 4872325.6,
+            "range": "± 9547",
+            "unit": "ns"
+          },
+          {
+            "name": "bm25_query_5k_docs",
+            "value": 37109.397487487484,
+            "range": "± 18",
+            "unit": "ns"
+          },
+          {
+            "name": "chunk_python_200_functions",
+            "value": 3050504.3529411764,
+            "range": "± 1468",
+            "unit": "ns"
+          },
+          {
+            "name": "dense_query_20k_rows",
+            "value": 1369117.3166666667,
+            "range": "± 9604",
             "unit": "ns"
           }
         ]
