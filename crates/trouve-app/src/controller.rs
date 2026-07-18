@@ -94,7 +94,10 @@ pub enum UiCommand {
     /// Chat viewport-y sampled by the shell's poll, bookmarked per thread.
     /// Carries the thread the viewport was showing at sample time — the
     /// current thread may have changed by the time this is processed.
-    ChatScrolled { thread_id: String, y: f32 },
+    ChatScrolled {
+        thread_id: String,
+        y: f32,
+    },
     SendMessage(String),
     /// The "@" mention popup opened (or is filtering): refresh the worktree
     /// path list feeding it. Throttled per session by the controller.
