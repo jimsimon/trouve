@@ -834,9 +834,7 @@ impl Controller {
 
     async fn bootstrap(&mut self, register_workspace: Option<std::path::PathBuf>) -> Result<()> {
         if let Some(path) = register_workspace {
-            let path_str = path
-                .to_str()
-                .context("workspace path is not valid UTF-8")?;
+            let path_str = path.to_str().context("workspace path is not valid UTF-8")?;
             let workspace = self
                 .client
                 .register_workspace(path_str)
