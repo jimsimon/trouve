@@ -14,7 +14,7 @@
 //!   `turn/completed`
 //! - server-initiated approval requests:
 //!   `item/commandExecution/requestApproval`, `item/fileChange/requestApproval`
-//!   answered with `{ decision: "approved" | "denied" }`
+//!   answered with `{ decision: "accept" | "decline" }`
 
 use std::collections::HashMap;
 use std::process::Stdio;
@@ -548,7 +548,7 @@ fn turn_stream(
                                 "codex: denying unknown server request {method}: {}",
                                 serde_json::to_string(&params).unwrap_or_default()
                             );
-                            server.respond(id, json!({ "decision": "denied" })).await;
+                            server.respond(id, json!({ "decision": "decline" })).await;
                             continue;
                         }
                     };
@@ -563,9 +563,9 @@ fn turn_stream(
                         }))
                         .await;
                     let approved = ok_rx.await.unwrap_or(false);
-                    // ReviewDecision: "denied" (vs "abort") lets the agent
+                    // ReviewDecision: "decline" (vs "abort") lets the agent
                     // continue and explain instead of killing the turn.
-                    let decision = if approved { "approved" } else { "denied" };
+                    let decision = if approved { "accept" } else { "decline" };
                     server.respond(id, json!({ "decision": decision })).await;
                 }
             }
