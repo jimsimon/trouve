@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1784357665182,
+  "lastUpdate": 1784357712518,
   "repoUrl": "https://github.com/jimsimon/trouve",
   "entries": {
     "e2e-benchmarks": [
@@ -3217,6 +3217,54 @@ window.BENCHMARK_DATA = {
             "name": "dense_query_20k_rows",
             "value": 1378940.9270405837,
             "range": "± 5533",
+            "unit": "ns"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "jim.j.simon@gmail.com",
+            "name": "Jim Simon",
+            "username": "jimsimon"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "07bc80d5b9eb3912e4b51d3f9c702ed4541dafc0",
+          "message": "Add a global default permissions setting to Modes & Models (#63)\n\n* Add a global default permissions setting to Modes & Models\n\nSettings → Modes & Models gains a \"Global default permissions\" picker\n(Ask / Allow list / Yolo) applied to new threads whose mode has no\npermission default of its own. Per-mode permissions now default to\n\"Global default\" and remain overridable in the mode editor, mirroring\nthe existing global/per-mode default-model pattern.\n\nA mode's default_permission_mode is now optional (absent = global\ndefault); the global value persists in config.toml, is settable via\nPUT /v1/config/default-permission-mode, and rides on GET /v1/providers\nalongside the default model.\n\nCo-Authored-By: Claude Fable 5 <noreply@anthropic.com>\n\n* Address PR review feedback for global default permissions.\n\nBump PROTOCOL_VERSION to 0.20 for the optional default_permission_mode\nschema change, guard invalid permission picker indices like the model\npicker, and clarify changelog migration behavior for existing modes.\n\nCo-authored-by: Cursor <cursoragent@cursor.com>\n\n---------\n\nCo-authored-by: Claude Fable 5 <noreply@anthropic.com>\nCo-authored-by: Cursor <cursoragent@cursor.com>",
+          "timestamp": "2026-07-18T02:53:07-04:00",
+          "tree_id": "0c26fdec871409df950313352bdb353df36540ec",
+          "url": "https://github.com/jimsimon/trouve/commit/07bc80d5b9eb3912e4b51d3f9c702ed4541dafc0"
+        },
+        "date": 1784357712198,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "bm25_build_5k_docs",
+            "value": 4886419.300000001,
+            "range": "± 12850",
+            "unit": "ns"
+          },
+          {
+            "name": "bm25_query_5k_docs",
+            "value": 37122.93281443123,
+            "range": "± 13",
+            "unit": "ns"
+          },
+          {
+            "name": "chunk_python_200_functions",
+            "value": 3007641.3823529407,
+            "range": "± 1403",
+            "unit": "ns"
+          },
+          {
+            "name": "dense_query_20k_rows",
+            "value": 1378680.4790234445,
+            "range": "± 6215",
             "unit": "ns"
           }
         ]
