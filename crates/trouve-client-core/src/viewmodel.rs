@@ -295,7 +295,16 @@ impl ThreadViewModel {
                     |i| matches!(i, ChatItem::ToolCall { call_id: c, .. } if c == call_id),
                 );
                 if let Some(ChatItem::ToolCall { status, .. }) = self.find_tool(call_id) {
-                    *status = ToolCallStatus::Running;
+                    let terminal = matches!(
+                        *status,
+                        ToolCallStatus::Ok
+                            | ToolCallStatus::Error
+                            | ToolCallStatus::Denied
+                            | ToolCallStatus::Aborted
+                    );
+                    if !terminal && *status != ToolCallStatus::AwaitingApproval {
+                        *status = ToolCallStatus::Running;
+                    }
                 }
                 idx
             }
@@ -398,6 +407,20 @@ impl ThreadViewModel {
                             error: error.clone(),
                         },
                     };
+                }
+                idx
+            }
+            Event::TurnCancelled { turn } => {
+                self.turn_running = false;
+                self.compacting = false;
+                self.finish_thinking();
+                self.pending_questions.clear();
+                self.record_turn_duration(*turn, envelope.ts);
+                let idx = self.items.iter().position(|i| {
+                    matches!(i, ChatItem::TurnStatus { turn: t, state: TurnState::Running } if t == turn)
+                });
+                if let Some(idx) = idx {
+                    self.items.remove(idx);
                 }
                 idx
             }
@@ -577,6 +600,85 @@ mod tests {
         }));
         assert!(!vm.turn_running);
         assert_eq!(vm.last_usage, Some(usage));
+    }
+
+    #[test]
+    fn approval_before_vendor_tool_card_surfaces_buttons() {
+        let mut vm = ThreadViewModel::new();
+        // When the engine synthesizes a card before approval.requested…
+        vm.apply(&env(Event::ToolRequested {
+            turn: 1,
+            call_id: "web_search_0".into(),
+            tool: "execute".into(),
+            args: serde_json::json!({"title": "Web Search"}),
+            requires_approval: true,
+        }));
+        vm.apply(&env(Event::ApprovalRequested {
+            turn: 1,
+            call_id: "web_search_0".into(),
+        }));
+        // …a delayed vendor tool_started reuses the card (no duplicate).
+        vm.apply(&env(Event::ToolStarted {
+            call_id: "web_search_0".into(),
+        }));
+        assert_eq!(vm.items.len(), 1);
+        assert!(matches!(
+            &vm.items[0],
+            ChatItem::ToolCall {
+                status: ToolCallStatus::AwaitingApproval,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn delayed_tool_started_preserves_denied_cards() {
+        let mut vm = ThreadViewModel::new();
+        vm.apply(&env(Event::ToolRequested {
+            turn: 1,
+            call_id: "c1".into(),
+            tool: "Bash".into(),
+            args: serde_json::json!({"command": "rm -rf /"}),
+            requires_approval: true,
+        }));
+        vm.apply(&env(Event::ApprovalRequested {
+            turn: 1,
+            call_id: "c1".into(),
+        }));
+        vm.apply(&env(Event::ApprovalResolved {
+            call_id: "c1".into(),
+            decision: ApprovalDecision::Deny,
+        }));
+        vm.apply(&env(Event::ToolStarted {
+            call_id: "c1".into(),
+        }));
+        assert!(matches!(
+            &vm.items[0],
+            ChatItem::ToolCall {
+                status: ToolCallStatus::Denied,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn turn_cancelled_clears_running_state() {
+        let mut vm = ThreadViewModel::new();
+        vm.apply(&env(Event::TurnStarted {
+            turn: 1,
+            mode: "code".into(),
+            model: "m".into(),
+        }));
+        assert!(vm.turn_running);
+        vm.apply(&env(Event::TurnCancelled { turn: 1 }));
+        assert!(!vm.turn_running);
+        assert!(!vm.items.iter().any(|i| matches!(
+            i,
+            ChatItem::TurnStatus {
+                state: TurnState::Running,
+                ..
+            }
+        )));
     }
 
     #[test]

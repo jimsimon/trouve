@@ -4407,6 +4407,26 @@ impl Engine {
             .map(|(id, _)| id.clone())
     }
 
+    /// Whether a `tool.requested` card already exists for this call in the
+    /// current turn.
+    fn tool_card_exists(&self, thread_id: &str, turn: u64, call_id: &str) -> bool {
+        self.store
+            .events_after(&Scope::Thread(thread_id.to_string()), 0)
+            .ok()
+            .is_some_and(|events| {
+                events.iter().any(|env| {
+                    matches!(
+                        &env.event,
+                        Event::ToolRequested {
+                            turn: t,
+                            call_id: id,
+                            ..
+                        } if *t == turn && id == call_id
+                    )
+                })
+            })
+    }
+
     fn bridged_context(
         &self,
         thread_id: &str,
@@ -4667,16 +4687,18 @@ impl Engine {
                     // still un-edited at announcement time, so resolve line
                     // hints now for the UI's diff gutter.
                     annotate_edit_lines(Path::new(&session.worktree_path), &mut args);
-                    self.store.append_event(
-                        scope.clone(),
-                        Event::ToolRequested {
-                            turn,
-                            call_id: call_id.clone(),
-                            tool,
-                            args,
-                            requires_approval: false,
-                        },
-                    )?;
+                    if !self.tool_card_exists(&thread.id, turn, &call_id) {
+                        self.store.append_event(
+                            scope.clone(),
+                            Event::ToolRequested {
+                                turn,
+                                call_id: call_id.clone(),
+                                tool,
+                                args,
+                                requires_approval: false,
+                            },
+                        )?;
+                    }
                     self.store
                         .append_event(scope.clone(), Event::ToolStarted { call_id })?;
                 }
@@ -4763,6 +4785,29 @@ impl Engine {
         // vendor process now rather than at end of scope.
         drop(stream);
 
+        if cancel.is_cancelled() {
+            if !segment.is_empty() {
+                self.store.append_event(
+                    scope.clone(),
+                    Event::AssistantMessage {
+                        turn,
+                        content: segment,
+                    },
+                )?;
+            }
+            if !text.is_empty() {
+                self.store.append_message(
+                    &thread.id,
+                    &serde_json::to_value(Message::Assistant {
+                        content: text,
+                        tool_calls: Vec::new(),
+                        reasoning: Vec::new(),
+                    })?,
+                )?;
+            }
+            return Ok(());
+        }
+
         if !segment.is_empty() {
             self.store.append_event(
                 scope.clone(),
@@ -4848,6 +4893,31 @@ impl Engine {
             Gate::Allow => Ok(true),
             Gate::Deny => Ok(false),
             Gate::NeedsApproval => {
+                // Cursor (and occasionally Codex) can ask for permission
+                // before the tool_call announcement that normally creates the
+                // card. Without a synthetic card the Approve/Deny UI has
+                // nowhere to attach and the turn hangs forever.
+                if !self.tool_card_exists(&thread.id, turn, call_id) {
+                    let mut display_args = args.clone();
+                    annotate_edit_lines(Path::new(&session.worktree_path), &mut display_args);
+                    self.store.append_event(
+                        scope.clone(),
+                        Event::ToolRequested {
+                            turn,
+                            call_id: call_id.to_string(),
+                            tool: tool.to_string(),
+                            args: display_args,
+                            requires_approval: true,
+                        },
+                    )?;
+                }
+                let cancel = self
+                    .turn_cancels
+                    .lock()
+                    .unwrap()
+                    .get(&thread.id)
+                    .cloned()
+                    .unwrap_or_default();
                 let rx = self.approvals.request(call_id);
                 self.store.append_event(
                     scope.clone(),
@@ -4856,7 +4926,12 @@ impl Engine {
                         call_id: call_id.to_string(),
                     },
                 )?;
-                let decision = rx.await.unwrap_or(ApprovalDecision::Deny);
+                // A cancelled turn must not hang on an unanswered approval.
+                let decision = tokio::select! {
+                    biased;
+                    _ = cancel.cancelled() => ApprovalDecision::Deny,
+                    d = rx => d.unwrap_or(ApprovalDecision::Deny),
+                };
                 self.store.append_event(
                     scope,
                     Event::ApprovalResolved {
