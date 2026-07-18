@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1784356141585,
+  "lastUpdate": 1784356195168,
   "repoUrl": "https://github.com/jimsimon/trouve",
   "entries": {
     "e2e-benchmarks": [
@@ -3121,6 +3121,54 @@ window.BENCHMARK_DATA = {
             "name": "dense_query_20k_rows",
             "value": 1391737.7302591922,
             "range": "± 8827",
+            "unit": "ns"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "jim.j.simon@gmail.com",
+            "name": "Jim Simon",
+            "username": "jimsimon"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "364b49916ee19ec835672e0d8d187619ea89d30a",
+          "message": "Require a path argument to register a workspace on startup. (#62)\n\n* Require a path argument to register a workspace on startup.\n\nAuto-registering CWD caused session worktrees launched from\n~/.local/share/trouve/worktrees/ to appear as separate workspaces.\nUse `trouve .` or `trouve /path/to/repo` to opt in; plain `trouve`\nloads existing workspaces only.\n\nCo-authored-by: Cursor <cursoragent@cursor.com>\n\n* Update crates/trouve-app/src/controller.rs\n\nCo-authored-by: coderabbitai[bot] <136622811+coderabbitai[bot]@users.noreply.github.com>\n\n* Apply rustfmt to controller.rs\n\nCo-Authored-By: Claude Fable 5 <noreply@anthropic.com>\n\n---------\n\nCo-authored-by: Cursor <cursoragent@cursor.com>\nCo-authored-by: coderabbitai[bot] <136622811+coderabbitai[bot]@users.noreply.github.com>\nCo-authored-by: Claude Fable 5 <noreply@anthropic.com>",
+          "timestamp": "2026-07-18T02:27:41-04:00",
+          "tree_id": "ba1430a5314a12d115c8df78472c717d9f306b74",
+          "url": "https://github.com/jimsimon/trouve/commit/364b49916ee19ec835672e0d8d187619ea89d30a"
+        },
+        "date": 1784356194379,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "bm25_build_5k_docs",
+            "value": 4897306.15,
+            "range": "± 14038",
+            "unit": "ns"
+          },
+          {
+            "name": "bm25_query_5k_docs",
+            "value": 37379.050783295075,
+            "range": "± 12",
+            "unit": "ns"
+          },
+          {
+            "name": "chunk_python_200_functions",
+            "value": 3069423.676470588,
+            "range": "± 3826",
+            "unit": "ns"
+          },
+          {
+            "name": "dense_query_20k_rows",
+            "value": 1378940.9270405837,
+            "range": "± 5533",
             "unit": "ns"
           }
         ]
