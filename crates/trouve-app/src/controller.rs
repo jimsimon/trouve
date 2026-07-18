@@ -194,10 +194,13 @@ pub enum UiCommand {
     DeleteProvider(String),
     ProviderLogin(String),
     SetDefaultModel(usize),
+    /// Set the global default permission mode (0 ask/1 allow-list/2 yolo).
+    SetDefaultPermission(i32),
     /// Create/update a user-level mode (a built-in id customizes it).
     /// Fields: id, display name, system prompt, comma-separated allowed
-    /// tools, read-only, permission index (0 ask/1 allow-list/2 yolo),
-    /// model index into the models catalog (-1 = global default).
+    /// tools, read-only, permission index (-1 global default/0 ask/
+    /// 1 allow-list/2 yolo), model index into the models catalog
+    /// (-1 = global default).
     SaveMode(String, String, String, String, bool, i32, i32),
     /// Remove a custom mode / reset a customized built-in.
     DeleteMode(String),
@@ -2341,6 +2344,7 @@ impl Controller {
                 .collect(),
             model_ids.clone(),
             default_index,
+            permission_index_of(Some(providers.default_permission_mode)),
         );
         let mode_views = self
             .modes
@@ -2353,11 +2357,7 @@ impl Controller {
                 read_only: m.read_only,
                 system_prompt: m.system_prompt.clone(),
                 allowed_tools: m.allowed_tools.join(", "),
-                permission_index: match m.default_permission_mode {
-                    PermissionMode::Ask => 0,
-                    PermissionMode::AllowList => 1,
-                    PermissionMode::Yolo => 2,
-                },
+                permission_index: permission_index_of(m.default_permission_mode),
                 model_index: self.model_index_of(m.default_model.as_deref()),
             })
             .collect();
@@ -4021,6 +4021,22 @@ impl Controller {
                     }
                 }
             }
+            UiCommand::SetDefaultPermission(i) => {
+                if let Some(mode) = permission_mode_of(i) {
+                    match self.client.set_default_permission_mode(mode).await {
+                        Ok(()) => {
+                            ui::set_settings_status(
+                                &self.ui,
+                                format!("default permissions: {}", permission_label(mode)),
+                            );
+                            self.refresh_settings().await;
+                        }
+                        Err(e) => {
+                            ui::set_settings_status(&self.ui, format!("{e:#}"));
+                        }
+                    }
+                }
+            }
             UiCommand::SaveMode(id, display, prompt, tools, read_only, perm, model) => {
                 let req = UpsertModeRequest {
                     display_name: display,
@@ -4032,11 +4048,7 @@ impl Controller {
                         .map(String::from)
                         .collect(),
                     read_only,
-                    default_permission_mode: match perm {
-                        1 => PermissionMode::AllowList,
-                        2 => PermissionMode::Yolo,
-                        _ => PermissionMode::Ask,
-                    },
+                    default_permission_mode: permission_mode_of(perm),
                     default_model: usize::try_from(model)
                         .ok()
                         .and_then(|i| self.models.get(i))
@@ -4785,6 +4797,35 @@ fn format_checks(checks: &[trouve_protocol::CheckRun]) -> String {
 }
 
 /// One line per review: reviewer and their verdict.
+/// Settings-picker index for an optional permission mode: -1 = global
+/// default, then ask / allow-list / yolo.
+fn permission_index_of(mode: Option<PermissionMode>) -> i32 {
+    match mode {
+        None => -1,
+        Some(PermissionMode::Ask) => 0,
+        Some(PermissionMode::AllowList) => 1,
+        Some(PermissionMode::Yolo) => 2,
+    }
+}
+
+fn permission_label(mode: PermissionMode) -> &'static str {
+    match mode {
+        PermissionMode::Ask => "Ask",
+        PermissionMode::AllowList => "Allow list",
+        PermissionMode::Yolo => "Yolo",
+    }
+}
+
+/// Inverse of [`permission_index_of`]; out-of-range means global default.
+fn permission_mode_of(index: i32) -> Option<PermissionMode> {
+    match index {
+        0 => Some(PermissionMode::Ask),
+        1 => Some(PermissionMode::AllowList),
+        2 => Some(PermissionMode::Yolo),
+        _ => None,
+    }
+}
+
 fn format_reviews(reviews: &[trouve_protocol::PrReview]) -> String {
     reviews
         .iter()

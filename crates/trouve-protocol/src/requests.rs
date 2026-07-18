@@ -34,8 +34,10 @@ pub struct AgentMode {
     /// thread's permission mode (e.g. plan/question modes).
     #[serde(default)]
     pub read_only: bool,
-    #[serde(default)]
-    pub default_permission_mode: PermissionMode,
+    /// Permission mode for threads started in this mode. None falls back to
+    /// the global default permission mode.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_permission_mode: Option<PermissionMode>,
     /// Preferred model for threads started in this mode ("provider/model").
     /// None falls back to the global default model.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -62,8 +64,9 @@ pub struct UpsertModeRequest {
     pub allowed_tools: Vec<String>,
     #[serde(default)]
     pub read_only: bool,
-    #[serde(default)]
-    pub default_permission_mode: PermissionMode,
+    /// None uses the global default permission mode.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_permission_mode: Option<PermissionMode>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default_model: Option<String>,
 }
@@ -568,6 +571,10 @@ pub struct ProvidersResponse {
     pub providers: Vec<ProviderInfo>,
     /// Default model for new threads, e.g. "openai/gpt-4.1-mini".
     pub default_model: String,
+    /// Global default permission mode for new threads, used by modes without
+    /// a default of their own. Absent on older servers means Ask.
+    #[serde(default)]
+    pub default_permission_mode: PermissionMode,
 }
 
 /// Create or update a provider. The API key (when given) goes to the secret
@@ -586,6 +593,13 @@ pub struct UpsertProviderRequest {
 pub struct SetDefaultModelRequest {
     /// Provider-qualified id, e.g. "openai/gpt-4.1-mini".
     pub model: String,
+}
+
+/// Set the global default permission mode
+/// (`PUT /v1/config/default-permission-mode`).
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct SetDefaultPermissionModeRequest {
+    pub permission_mode: PermissionMode,
 }
 
 /// A well-known provider preset: clients offer these for one-click setup

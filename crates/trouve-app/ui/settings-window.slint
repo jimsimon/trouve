@@ -80,7 +80,7 @@ export struct ModeItem {
     read-only: bool,
     system-prompt: string,
     allowed-tools: string,
-    // 0 ask, 1 allow-list, 2 yolo.
+    // -1 global default, 0 ask, 1 allow-list, 2 yolo.
     permission-index: int,
     model-index: int,
 }
@@ -277,10 +277,15 @@ export component SettingsScreen inherits Rectangle {
     in property <[string]> known-provider-names;
     in property <[string]> models;
     in property <int> default-model-index: -1;
+    // Global default permission mode: 0 ask, 1 allow-list, 2 yolo.
+    in property <int> default-permission-index: 0;
     // Modes & Models section: full mode cards plus the per-mode model
     // picker options ("Global default" followed by every model id).
     in property <[ModeItem]> mode-items;
     in property <[string]> mode-model-names;
+    // Per-mode permission picker options: "Global default" then Ask /
+    // Allow list / Yolo (index i maps to permission-index i - 1).
+    property <[string]> mode-permission-names: ["Global default", "Ask", "Allow list", "Yolo"];
     in property <string> settings-status: "";
 
     // Provider form state (prefilled by "Edit" or a preset).
@@ -328,6 +333,8 @@ export component SettingsScreen inherits Rectangle {
     callback provider-deleted(string);
     callback provider-login(string);
     callback default-model-picked(int);
+    // 0 ask, 1 allow-list, 2 yolo.
+    callback default-permission-picked(int);
     // Mode CRUD. mode-deleted covers both "Remove" (custom modes) and
     // "Reset to defaults" (customized built-ins) — both drop the user file.
     callback mode-saved(/* id */ string, /* display-name */ string,
@@ -442,7 +449,8 @@ export component SettingsScreen inherits Rectangle {
     in-out property <string> mode-form-prompt: "";
     in-out property <string> mode-form-tools: "";
     in-out property <bool> mode-form-readonly: false;
-    in-out property <int> mode-form-permission: 0;
+    // -1 global default, 0 ask, 1 allow-list, 2 yolo.
+    in-out property <int> mode-form-permission: -1;
     in-out property <int> mode-form-model: -1;
 
     // Side-nav selection: 0 providers, 1 modes & models, 2 local models,
@@ -921,6 +929,22 @@ export component SettingsScreen inherits Rectangle {
                             }
 
                             Text {
+                                text: "Global default permissions — used by new threads whose mode has no default of its own.";
+                                color: Theme.c.text-soft;
+                                font-size: Theme.fs(11px);
+                                wrap: word-wrap;
+                            }
+                            HorizontalLayout {
+                                alignment: start;
+                                ComboBox {
+                                    width: 150px;
+                                    model: ["Ask", "Allow list", "Yolo"];
+                                    current-index: root.default-permission-index;
+                                    selected => { root.default-permission-picked(self.current-index); }
+                                }
+                            }
+
+                            Text {
                                 text: "Modes";
                                 color: Theme.c.text-hi;
                                 font-size: Theme.fs(14px);
@@ -1028,7 +1052,7 @@ export component SettingsScreen inherits Rectangle {
                                         root.mode-form-prompt = "";
                                         root.mode-form-tools = "";
                                         root.mode-form-readonly = false;
-                                        root.mode-form-permission = 0;
+                                        root.mode-form-permission = -1;
                                         root.mode-form-model = -1;
                                     }
                                 }
@@ -1096,8 +1120,11 @@ export component SettingsScreen inherits Rectangle {
                                             }
                                             ComboBox {
                                                 width: 150px;
-                                                model: ["Ask", "Allow list", "Yolo"];
-                                                current-index <=> root.mode-form-permission;
+                                                model: root.mode-permission-names;
+                                                current-index: root.mode-form-permission + 1;
+                                                selected => {
+                                                    root.mode-form-permission = self.current-index - 1;
+                                                }
                                             }
                                         }
                                         VerticalLayout {

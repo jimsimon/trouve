@@ -513,6 +513,16 @@ impl ProtocolClient {
         .await
     }
 
+    /// Set the global default permission mode for new threads (used by
+    /// modes without a default of their own).
+    pub async fn set_default_permission_mode(&self, permission_mode: PermissionMode) -> Result<()> {
+        self.put_empty(
+            "/config/default-permission-mode",
+            &SetDefaultPermissionModeRequest { permission_mode },
+        )
+        .await
+    }
+
     pub async fn session_diff(&self, session_id: &str) -> Result<SessionDiff> {
         self.get_json(&format!("/sessions/{session_id}/diff")).await
     }

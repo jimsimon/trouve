@@ -28,10 +28,11 @@ use trouve_protocol::{
     PROTOCOL_VERSION, PrInfo, ProviderInfo, ProvidersResponse, QueuedPrompt,
     RegisterWorkspaceRequest, ReorderQueueRequest, ResolveApprovalRequest, ResolveQuestionRequest,
     Scope, SendMessageRequest, ServerInfo, Session, SessionDiff, SetDefaultModelRequest,
-    SetGithubTokenRequest, SetLocalEnabledRequest, SubscriptionHealth, TerminalInfo,
-    TerminalInputRequest, TerminalResizeRequest, Thread, TurnAccepted, UpdateQueuedPromptRequest,
-    UpdateSessionRequest, UpdateThreadRequest, UpsertAutomationRequest, UpsertMcpServerRequest,
-    UpsertModeRequest, UpsertProviderRequest, UsageSummary, Workspace,
+    SetDefaultPermissionModeRequest, SetGithubTokenRequest, SetLocalEnabledRequest,
+    SubscriptionHealth, TerminalInfo, TerminalInputRequest, TerminalResizeRequest, Thread,
+    TurnAccepted, UpdateQueuedPromptRequest, UpdateSessionRequest, UpdateThreadRequest,
+    UpsertAutomationRequest, UpsertMcpServerRequest, UpsertModeRequest, UpsertProviderRequest,
+    UsageSummary, Workspace,
 };
 use utoipa::OpenApi;
 
@@ -117,6 +118,7 @@ impl IntoResponse for ApiError {
         stop_local_server,
         restart_local_server,
         set_default_model,
+        set_default_permission_mode,
         thread_usage,
         session_usage,
         session_mcp_servers,
@@ -187,6 +189,7 @@ impl IntoResponse for ApiError {
         SetLocalEnabledRequest,
         UpsertProviderRequest,
         SetDefaultModelRequest,
+        SetDefaultPermissionModeRequest,
         UsageSummary,
         SessionDiff,
         DirEntry,
@@ -534,6 +537,10 @@ pub fn build_router(engine: Arc<Engine>) -> Router {
         .route(
             "/v1/config/default-model",
             axum::routing::put(set_default_model),
+        )
+        .route(
+            "/v1/config/default-permission-mode",
+            axum::routing::put(set_default_permission_mode),
         )
         .route("/v1/threads", post(create_thread).get(list_threads))
         .route("/v1/threads/{id}", get(get_thread).patch(update_thread))
@@ -1179,6 +1186,17 @@ async fn set_default_model(
     Json(req): Json<SetDefaultModelRequest>,
 ) -> Result<StatusCode, ApiError> {
     engine.set_default_model(&req.model)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+#[utoipa::path(put, path = "/v1/config/default-permission-mode",
+    request_body = SetDefaultPermissionModeRequest,
+    responses((status = 204), (status = 400, body = ErrorBody)))]
+async fn set_default_permission_mode(
+    State(engine): State<Arc<Engine>>,
+    Json(req): Json<SetDefaultPermissionModeRequest>,
+) -> Result<StatusCode, ApiError> {
+    engine.set_default_permission_mode(req.permission_mode)?;
     Ok(StatusCode::NO_CONTENT)
 }
 
