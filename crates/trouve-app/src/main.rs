@@ -1107,7 +1107,7 @@ fn main() -> anyhow::Result<()> {
     {
         let weak = window.as_weak();
         let last = std::cell::RefCell::new(restored);
-        let last_scroll = std::cell::RefCell::new(f32::NAN);
+        let last_scroll = std::cell::RefCell::new((slint::SharedString::new(), f32::NAN));
         let focused = window_focused.clone();
         geometry_timer.start(
             slint::TimerMode::Repeated,
@@ -1138,11 +1138,21 @@ fn main() -> anyhow::Result<()> {
                         *last = Some(next);
                     }
                 }
+                // Key and offset are read in the same event-loop turn, so
+                // the pair is consistent: the offset belongs to the thread
+                // named by the key even if the controller has already moved
+                // on to another one.
                 let scroll = window.get_chat_scroll();
+                let key = window.get_chat_thread_key();
                 let mut last_scroll = last_scroll.borrow_mut();
-                if *last_scroll != scroll {
-                    *last_scroll = scroll;
-                    let _ = scroll_tx.send(UiCommand::ChatScrolled(scroll));
+                if *last_scroll != (key.clone(), scroll) {
+                    *last_scroll = (key.clone(), scroll);
+                    if !key.is_empty() {
+                        let _ = scroll_tx.send(UiCommand::ChatScrolled {
+                            thread_id: key.to_string(),
+                            y: scroll,
+                        });
+                    }
                 }
             },
         );

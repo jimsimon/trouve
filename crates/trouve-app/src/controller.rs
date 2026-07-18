@@ -92,7 +92,12 @@ pub enum UiCommand {
     // Chat screen.
     SelectThread(usize),
     /// Chat viewport-y sampled by the shell's poll, bookmarked per thread.
-    ChatScrolled(f32),
+    /// Carries the thread the viewport was showing at sample time — the
+    /// current thread may have changed by the time this is processed.
+    ChatScrolled {
+        thread_id: String,
+        y: f32,
+    },
     SendMessage(String),
     /// The "@" mention popup opened (or is filtering): refresh the worktree
     /// path list feeding it. Throttled per session by the controller.
@@ -1621,7 +1626,7 @@ impl Controller {
     fn render_chat(&mut self, scroll: bool) {
         let Some(thread_id) = self.current_thread_id() else {
             self.row_call_ids.clear();
-            ui::set_chat(&self.ui, Vec::new(), false);
+            ui::set_chat(&self.ui, Vec::new(), String::new(), false);
             ui::set_composer_enabled(&self.ui, false);
             ui::set_slash_commands(&self.ui, Vec::new());
             return;
@@ -1641,7 +1646,7 @@ impl Controller {
             .filter(|(t, _)| *t == thread_id)
             .map(|(_, key)| key.clone())
             .collect();
-        let vm = self.vms.entry(thread_id).or_default();
+        let vm = self.vms.entry(thread_id.clone()).or_default();
         // Wizard state tracks the thread's pending question requests: fresh
         // state when one appears, dropped once it resolves.
         for item in &vm.items {
@@ -1676,7 +1681,7 @@ impl Controller {
                 .map(|c| (c.name.clone(), c.description.clone()))
                 .collect(),
         );
-        ui::set_chat(&self.ui, rows, scroll);
+        ui::set_chat(&self.ui, rows, thread_id, scroll);
         ui::set_composer_enabled(&self.ui, true);
     }
 
@@ -3133,10 +3138,13 @@ impl Controller {
                 }
                 // i == threads.len() is the provisional tab itself: no-op.
             }
-            UiCommand::ChatScrolled(y) => {
-                if let Some(thread_id) = self.current_thread_id()
-                    && self.resume.thread_scroll.get(&thread_id) != Some(&y)
-                {
+            UiCommand::ChatScrolled { thread_id, y } => {
+                // Booked to the thread that was on screen when the shell
+                // sampled the offset, not the current one: around a
+                // session/thread switch the two differ, and using the
+                // current thread would bleed one thread's scroll position
+                // into another's bookmark.
+                if self.resume.thread_scroll.get(&thread_id) != Some(&y) {
                     self.resume.thread_scroll.insert(thread_id, y);
                     crate::winstate::save_resume(&self.resume);
                 }
