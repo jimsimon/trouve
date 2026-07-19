@@ -1616,6 +1616,9 @@ export component AppWindow inherits Window {
                     // hover-out; drop any tooltip it left behind.
                     changed viewport-y => { Tip.hide-all(); }
                     for row[idx] in root.nav-rows: Rectangle {
+                        // Match the chat pane's right-side gutter so the
+                        // scrollbar never covers trailing row controls.
+                        width: parent.width - 18px;
                         height: Theme.fs(row.kind == 1 ? 52px : row.kind == 0 ? 34px : 30px);
                         background: row.kind == 0
                             ? (row-ta.has-hover ? Theme.c.hover-bg : Theme.c.raised-bg)
