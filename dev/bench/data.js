@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1784448207289,
+  "lastUpdate": 1784448353604,
   "repoUrl": "https://github.com/jimsimon/trouve",
   "entries": {
     "e2e-benchmarks": [
@@ -2063,6 +2063,54 @@ window.BENCHMARK_DATA = {
             "name": "non-git warm query",
             "value": 66.5837597,
             "range": "± 1.7",
+            "unit": "ms"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "jim.j.simon@gmail.com",
+            "name": "Jim Simon",
+            "username": "jimsimon"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "81e68be4ee24d96c853c0e13cc662ef52a2c3da4",
+          "message": "Release Codex waiters when app-server exits (#73)",
+          "timestamp": "2026-07-19T04:04:24-04:00",
+          "tree_id": "230cbef346ca6e78c913ca4c16368e07f11ac325",
+          "url": "https://github.com/jimsimon/trouve/commit/81e68be4ee24d96c853c0e13cc662ef52a2c3da4"
+        },
+        "date": 1784448352657,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "cold index + query",
+            "value": 128.02419916000002,
+            "range": "± 8.4",
+            "unit": "ms"
+          },
+          {
+            "name": "warm query",
+            "value": 67.32035714000001,
+            "range": "± 1.6",
+            "unit": "ms"
+          },
+          {
+            "name": "incremental (1 file modified)",
+            "value": 75.98408022000001,
+            "range": "± 2",
+            "unit": "ms"
+          },
+          {
+            "name": "non-git warm query",
+            "value": 65.25860808,
+            "range": "± 1.4",
             "unit": "ms"
           }
         ]
