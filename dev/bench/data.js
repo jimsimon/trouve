@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1784405948337,
+  "lastUpdate": 1784420899810,
   "repoUrl": "https://github.com/jimsimon/trouve",
   "entries": {
     "e2e-benchmarks": [
@@ -1775,6 +1775,54 @@ window.BENCHMARK_DATA = {
             "name": "non-git warm query",
             "value": 78.7370166,
             "range": "± 1.3",
+            "unit": "ms"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "jim.j.simon@gmail.com",
+            "name": "Jim Simon",
+            "username": "jimsimon"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "1137b36f152d421ef195b9fc30b30ed432055e4e",
+          "message": "Enable network access for Codex turns (#67)\n\n* Enable network access for Codex turns\n\n* fix: apply CodeRabbit auto-fixes\n\nFixed 1 file(s) based on 1 unresolved review comment.\n\nCo-authored-by: CodeRabbit <noreply@coderabbit.ai>\n\n---------\n\nCo-authored-by: coderabbitai[bot] <136622811+coderabbitai[bot]@users.noreply.github.com>\nCo-authored-by: CodeRabbit <noreply@coderabbit.ai>",
+          "timestamp": "2026-07-18T20:27:05-04:00",
+          "tree_id": "c7c0d868d1bce42416bf4fe387a9e2f60ac74db7",
+          "url": "https://github.com/jimsimon/trouve/commit/1137b36f152d421ef195b9fc30b30ed432055e4e"
+        },
+        "date": 1784420899487,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "cold index + query",
+            "value": 131.23835008,
+            "range": "± 6.7",
+            "unit": "ms"
+          },
+          {
+            "name": "warm query",
+            "value": 70.36762212000001,
+            "range": "± 1.6",
+            "unit": "ms"
+          },
+          {
+            "name": "incremental (1 file modified)",
+            "value": 81.39790528,
+            "range": "± 1.9",
+            "unit": "ms"
+          },
+          {
+            "name": "non-git warm query",
+            "value": 67.94476397999999,
+            "range": "± 1.5",
             "unit": "ms"
           }
         ]
