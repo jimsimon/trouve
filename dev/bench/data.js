@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1784450194092,
+  "lastUpdate": 1784450232729,
   "repoUrl": "https://github.com/jimsimon/trouve",
   "entries": {
     "e2e-benchmarks": [
@@ -4465,6 +4465,54 @@ window.BENCHMARK_DATA = {
             "name": "dense_query_20k_rows",
             "value": 1353954.1770186336,
             "range": "± 6049",
+            "unit": "ns"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "jim.j.simon@gmail.com",
+            "name": "Jim Simon",
+            "username": "jimsimon"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "ba9e9b1aecd0c60e8f597257ad71deb690cb52a7",
+          "message": "Improve session list status indicators (#78)\n\n* Improve session list status indicators\n\n* Address session indicator review feedback\n\nStop obsolete event followers, cache attention totals, and bound sidebar PR requests. Preserve unread completion state across event-stream reconnects without treating startup history as new work.\n\n* Retry failed sidebar PR lookups\n\nKeep transient lookup failures out of the navigation PR cache so later session reloads can retry them.",
+          "timestamp": "2026-07-19T04:35:01-04:00",
+          "tree_id": "f7de48f1c758da2425fb2a5de775b14921132f88",
+          "url": "https://github.com/jimsimon/trouve/commit/ba9e9b1aecd0c60e8f597257ad71deb690cb52a7"
+        },
+        "date": 1784450231988,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "bm25_build_5k_docs",
+            "value": 4866505.95,
+            "range": "± 7638",
+            "unit": "ns"
+          },
+          {
+            "name": "bm25_query_5k_docs",
+            "value": 37036.045453550476,
+            "range": "± 11",
+            "unit": "ns"
+          },
+          {
+            "name": "chunk_python_200_functions",
+            "value": 3005060.147058823,
+            "range": "± 2366",
+            "unit": "ns"
+          },
+          {
+            "name": "dense_query_20k_rows",
+            "value": 1342865.0852713177,
+            "range": "± 8611",
             "unit": "ns"
           }
         ]
