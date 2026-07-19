@@ -2345,6 +2345,7 @@ impl Engine {
         None
     }
 
+    /// Append durable links for PR numbers not already recorded for a session.
     fn record_session_pr_numbers(
         &self,
         session_id: &str,
@@ -2365,6 +2366,19 @@ impl Engine {
             }
         }
         Ok(())
+    }
+
+    /// PR numbers already linked through persisted session events.
+    fn recorded_session_pr_numbers(&self, session_id: &str) -> Result<HashSet<u64>, EngineError> {
+        Ok(self
+            .store
+            .events_after(&Scope::Session(session_id.to_string()), 0)?
+            .into_iter()
+            .filter_map(|envelope| match envelope.event {
+                Event::SessionPrOpened { number, .. } => Some(number),
+                _ => None,
+            })
+            .collect())
     }
 
     /// Provider-neutral evidence tying GitHub activity to this session.
@@ -2461,7 +2475,15 @@ impl Engine {
         }
         for number in evidence.numbers {
             if seen.insert(number) {
-                prs.push(github.pr(number).await.map_err(EngineError::Internal)?);
+                match github.pr(number).await {
+                    Ok(pr) => prs.push(pr),
+                    Err(error) => tracing::warn!(
+                        session_id,
+                        pr_number = number,
+                        error = %error,
+                        "skipping unavailable linked pull request"
+                    ),
+                }
             }
         }
         prs.sort_by_key(|pr| (pr.state != "open", std::cmp::Reverse(pr.number)));
@@ -5066,7 +5088,11 @@ impl Engine {
         // endpoint. Turn repository-specific PR references in its output into
         // the same durable session event, independent of the tool name.
         let github_repository = self.github_repository_for_session(session).ok();
-        let mut recorded_prs = HashSet::new();
+        let mut recorded_prs = if github_repository.is_some() {
+            self.recorded_session_pr_numbers(&session.id)?
+        } else {
+            HashSet::new()
+        };
         loop {
             let ev = tokio::select! {
                 biased;
@@ -5730,11 +5756,12 @@ impl Engine {
         )?;
         if let Ok(repository) = self.github_repository_for_session(session) {
             let (host, owner, repo) = &repository;
+            let mut recorded_prs = self.recorded_session_pr_numbers(&session.id)?;
             self.record_session_pr_numbers(
                 &session.id,
                 &repository,
                 pr_numbers_in_value(&outcome.result, host, owner, repo),
-                &mut HashSet::new(),
+                &mut recorded_prs,
             )?;
         }
         self.store.append_event(
@@ -6410,6 +6437,7 @@ fn take_tool_images(result: &mut serde_json::Value) -> Vec<trouve_providers::Too
     images
 }
 
+/// Repository-local PR numbers found recursively in structured tool data.
 fn pr_numbers_in_value(
     value: &serde_json::Value,
     host: &str,
@@ -6436,6 +6464,7 @@ fn pr_numbers_in_value(
     numbers
 }
 
+/// Full SHA-1 or SHA-256 commit IDs present as tokens in text.
 fn git_commit_ids_in_text(text: &str) -> HashSet<String> {
     text.split(|character: char| !character.is_ascii_hexdigit())
         .filter(|token| matches!(token.len(), 40 | 64))
@@ -6443,6 +6472,7 @@ fn git_commit_ids_in_text(text: &str) -> HashSet<String> {
         .collect()
 }
 
+/// Full git commit IDs found recursively in structured tool data.
 fn git_commit_ids_in_value(value: &serde_json::Value) -> HashSet<String> {
     let mut commits = HashSet::new();
     match value {
@@ -6464,6 +6494,7 @@ fn git_commit_ids_in_value(value: &serde_json::Value) -> HashSet<String> {
     commits
 }
 
+/// Evidence that associates PRs with a session independently of the client.
 #[derive(Default)]
 struct SessionPrEvidence {
     numbers: HashSet<u64>,
@@ -6473,6 +6504,7 @@ struct SessionPrEvidence {
 }
 
 impl SessionPrEvidence {
+    /// Merge evidence collected from another thread into this session.
     fn extend(&mut self, other: Self) {
         self.numbers.extend(other.numbers);
         self.recorded_numbers.extend(other.recorded_numbers);
@@ -6481,6 +6513,7 @@ impl SessionPrEvidence {
     }
 }
 
+/// Collect PR references, successful branch activity, and commits from events.
 fn pr_evidence_from_events(
     events: impl IntoIterator<Item = Event>,
     host: &str,

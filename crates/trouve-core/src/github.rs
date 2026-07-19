@@ -23,6 +23,12 @@ const DASHBOARD_ENRICH_CONCURRENCY: usize = 4;
 /// The one GitHub host that is always known.
 pub const GITHUB_COM: &str = "github.com";
 
+/// Maximum open-PR list requests made by evidence-based discovery.
+const MAX_OPEN_PR_DISCOVERY_PAGES: usize = 3;
+
+/// Maximum PRs enriched by one evidence-based discovery request.
+const MAX_DISCOVERED_SESSION_PRS: usize = 20;
+
 /// Parse a git remote URL into (host, owner, repo). Supports
 /// `https://HOST/owner/repo(.git)`, `ssh://git@HOST/owner/repo`, and
 /// `git@HOST:owner/repo(.git)` — the host may be github.com or a GitHub
@@ -93,10 +99,12 @@ pub fn pr_numbers_in_text(text: &str, host: &str, owner: &str, repo: &str) -> Ve
     numbers
 }
 
+/// Browser URL for a repository-local pull request number.
 pub fn pr_url(host: &str, owner: &str, repo: &str, number: u64) -> String {
     format!("https://{host}/{owner}/{repo}/pull/{number}")
 }
 
+/// Whether text contains a git ref as a complete token.
 fn text_mentions_ref(text: &str, reference: &str) -> bool {
     let text = text.as_bytes();
     let reference = reference.as_bytes();
@@ -113,10 +121,12 @@ fn text_mentions_ref(text: &str, reference: &str) -> bool {
         })
 }
 
+/// Bytes that may occur inside a git ref token.
 fn is_ref_byte(byte: u8) -> bool {
     byte.is_ascii_alphanumeric() || matches!(byte, b'/' | b'-' | b'_' | b'.')
 }
 
+/// Whether a PR head matches recorded branch or commit evidence.
 fn pr_head_matches_evidence(
     branch: &str,
     label: Option<&str>,
@@ -333,7 +343,7 @@ impl GitHub {
         if branch_evidence.is_empty() && commit_ids.is_empty() {
             return Ok(Vec::new());
         }
-        let first = self
+        let mut page = self
             .client
             .pulls(&self.owner, &self.repo)
             .list()
@@ -341,18 +351,36 @@ impl GitHub {
             .send()
             .await
             .context("listing open PRs")?;
-        let candidates = self
-            .client
-            .all_pages(first)
-            .await
-            .context("listing open PR pages")?;
         let mut prs = Vec::new();
-        for pr in candidates {
-            let branch = &pr.head.ref_field;
-            let label = pr.head.label.as_deref();
-            if pr_head_matches_evidence(branch, label, &pr.head.sha, branch_evidence, commit_ids) {
-                prs.push(self.enrich(pr).await?);
+        for page_number in 0..MAX_OPEN_PR_DISCOVERY_PAGES {
+            for pr in page.take_items() {
+                let branch = &pr.head.ref_field;
+                let label = pr.head.label.as_deref();
+                if pr_head_matches_evidence(
+                    branch,
+                    label,
+                    &pr.head.sha,
+                    branch_evidence,
+                    commit_ids,
+                ) {
+                    prs.push(self.enrich(pr).await?);
+                    if prs.len() == MAX_DISCOVERED_SESSION_PRS {
+                        return Ok(prs);
+                    }
+                }
             }
+            if page_number + 1 == MAX_OPEN_PR_DISCOVERY_PAGES {
+                break;
+            }
+            let Some(next) = self
+                .client
+                .get_page(&page.next)
+                .await
+                .context("listing open PR pages")?
+            else {
+                break;
+            };
+            page = next;
         }
         Ok(prs)
     }
