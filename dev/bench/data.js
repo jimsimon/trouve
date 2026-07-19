@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1784449222607,
+  "lastUpdate": 1784449303290,
   "repoUrl": "https://github.com/jimsimon/trouve",
   "entries": {
     "e2e-benchmarks": [
@@ -4369,6 +4369,54 @@ window.BENCHMARK_DATA = {
             "name": "dense_query_20k_rows",
             "value": 1567714.0028846152,
             "range": "± 15831",
+            "unit": "ns"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "jim.j.simon@gmail.com",
+            "name": "Jim Simon",
+            "username": "jimsimon"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "7c4abc8bfa0c0ca9371e93736b9a426bf5c280e9",
+          "message": "Reduce dev build debuginfo to shrink target dirs (#94)\n\nDev builds used cargo defaults: full DWARF for every crate, which made\neach session worktree's target/ run 20-30 GB. Line tables keep\nbacktraces and panic locations useful for workspace crates; dependency\ndebuginfo is dropped entirely.\n\nCo-authored-by: Claude Fable 5 <noreply@anthropic.com>",
+          "timestamp": "2026-07-19T04:17:54-04:00",
+          "tree_id": "aa9fd595dd31457a03af1acecb90139ccd68dbe5",
+          "url": "https://github.com/jimsimon/trouve/commit/7c4abc8bfa0c0ca9371e93736b9a426bf5c280e9"
+        },
+        "date": 1784449302333,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "bm25_build_5k_docs",
+            "value": 4900890.2,
+            "range": "± 8143",
+            "unit": "ns"
+          },
+          {
+            "name": "bm25_query_5k_docs",
+            "value": 37355.885782556754,
+            "range": "± 21",
+            "unit": "ns"
+          },
+          {
+            "name": "chunk_python_200_functions",
+            "value": 3057166.9117647056,
+            "range": "± 4910",
+            "unit": "ns"
+          },
+          {
+            "name": "dense_query_20k_rows",
+            "value": 1353954.1770186336,
+            "range": "± 6049",
             "unit": "ns"
           }
         ]
