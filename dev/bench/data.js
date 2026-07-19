@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1784503104882,
+  "lastUpdate": 1784503197059,
   "repoUrl": "https://github.com/jimsimon/trouve",
   "entries": {
     "e2e-benchmarks": [
@@ -2783,6 +2783,54 @@ window.BENCHMARK_DATA = {
             "name": "non-git warm query",
             "value": 77.04245864,
             "range": "± 2.1",
+            "unit": "ms"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "29139614+renovate[bot]@users.noreply.github.com",
+            "name": "renovate[bot]",
+            "username": "renovate[bot]"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "fa586b1f126af811e10caad6410e4f71627b3a4b",
+          "message": "Update all non-major dependencies (#54)\n\n* Update all non-major dependencies\n\n* Adapt non-major dependency updates\n\n---------\n\nCo-authored-by: renovate[bot] <29139614+renovate[bot]@users.noreply.github.com>\nCo-authored-by: Codex <codex@openai.com>",
+          "timestamp": "2026-07-19T19:17:55-04:00",
+          "tree_id": "4f933552cd49a01cbcbd135173ccf7a887be7c55",
+          "url": "https://github.com/jimsimon/trouve/commit/fa586b1f126af811e10caad6410e4f71627b3a4b"
+        },
+        "date": 1784503196056,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "cold index + query",
+            "value": 130.79480414,
+            "range": "± 7.8",
+            "unit": "ms"
+          },
+          {
+            "name": "warm query",
+            "value": 72.66436658,
+            "range": "± 2.8",
+            "unit": "ms"
+          },
+          {
+            "name": "incremental (1 file modified)",
+            "value": 82.33154476,
+            "range": "± 2.1",
+            "unit": "ms"
+          },
+          {
+            "name": "non-git warm query",
+            "value": 70.81417872000002,
+            "range": "± 0.8",
             "unit": "ms"
           }
         ]
