@@ -56,3 +56,13 @@ trouve-client-core = { path = "crates/trouve-client-core", version = "0.1.0" }
 [profile.release]
 lto = "thin"
 codegen-units = 1
+
+# Keep dev target dirs small: full DWARF debuginfo dominates target/ size.
+# Line tables are enough for backtraces and panic locations; flip to
+# `debug = true` locally if you need to step through code in a debugger.
+[profile.dev]
+debug = "line-tables-only"
+
+# Dependencies get no debuginfo at all — we don't step through them.
+[profile.dev.package."*"]
+debug = false
