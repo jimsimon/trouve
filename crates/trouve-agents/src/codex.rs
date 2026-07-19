@@ -16,7 +16,7 @@
 //!   `item/commandExecution/requestApproval`, `item/fileChange/requestApproval`
 //!   answered with `{ decision: "accept" | "decline" }`
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::process::Stdio;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, Ordering};
@@ -408,6 +408,12 @@ fn turn_stream(
                 .await;
         }
         let mut usage = Usage::default();
+        // Some Codex/app-server combinations only populate the completed
+        // reasoning item instead of emitting its optional delta
+        // notifications. Remember which items did stream so `item/completed`
+        // can be a lossless fallback without displaying the same thought
+        // twice.
+        let mut streamed_reasoning = HashSet::new();
         while let Some(msg) = route.recv().await {
             match msg {
                 ServerMsg::Notification { method, params } => match method.as_str() {
@@ -420,6 +426,9 @@ fn turn_stream(
                     // reasoning (open-source models).
                     "item/reasoning/summaryTextDelta" | "item/reasoning/textDelta" => {
                         if let Some(d) = params["delta"].as_str() {
+                            if let Some(id) = params["itemId"].as_str() {
+                                streamed_reasoning.insert(id.to_string());
+                            }
                             let _ = tx.send(Ok(BackendEvent::ThinkingDelta(d.into()))).await;
                         }
                     }
@@ -460,6 +469,14 @@ fn turn_stream(
                     "item/completed" => {
                         let item = &params["item"];
                         let ty = item["type"].as_str().unwrap_or("");
+                        if ty == "reasoning"
+                            && item["id"]
+                                .as_str()
+                                .is_none_or(|id| !streamed_reasoning.contains(id))
+                            && let Some(text) = completed_reasoning_text(item)
+                        {
+                            let _ = tx.send(Ok(BackendEvent::ThinkingDelta(text))).await;
+                        }
                         if !matches!(
                             ty,
                             "" | "agentMessage" | "userMessage" | "plan" | "reasoning"
@@ -580,6 +597,24 @@ fn turn_stream(
         }
         server.unsubscribe(&codex_thread_id).await;
     })
+}
+
+/// Extract the displayable text from a completed Codex reasoning item.
+/// Summary text is preferred; raw content is used by open-source models.
+fn completed_reasoning_text(item: &Value) -> Option<String> {
+    for field in ["summary", "content"] {
+        let parts = item[field]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .filter(|part| !part.is_empty())
+            .collect::<Vec<_>>();
+        if !parts.is_empty() {
+            return Some(parts.join("\n\n"));
+        }
+    }
+    None
 }
 
 fn json_rpc_id(id: &Value) -> String {
@@ -935,6 +970,27 @@ mod tests {
     fn json_rpc_ids_make_stable_approval_ids() {
         assert_eq!(json_rpc_id(&json!(42)), "42");
         assert_eq!(json_rpc_id(&json!("request-7")), "request-7");
+    }
+
+    #[test]
+    fn extracts_completed_codex_reasoning_as_a_stream_fallback() {
+        let summarized = json!({
+            "id": "reason-1",
+            "type": "reasoning",
+            "summary": ["Checking the adapter", "Found the missing fallback"],
+            "content": ["raw text is secondary"],
+        });
+        assert_eq!(
+            completed_reasoning_text(&summarized).as_deref(),
+            Some("Checking the adapter\n\nFound the missing fallback")
+        );
+
+        let raw = json!({ "type": "reasoning", "summary": [], "content": ["thinking"] });
+        assert_eq!(completed_reasoning_text(&raw).as_deref(), Some("thinking"));
+        assert_eq!(
+            completed_reasoning_text(&json!({ "type": "reasoning" })),
+            None
+        );
     }
 
     #[test]
