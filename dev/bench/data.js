@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1784489850673,
+  "lastUpdate": 1784489937849,
   "repoUrl": "https://github.com/jimsimon/trouve",
   "entries": {
     "e2e-benchmarks": [
@@ -2351,6 +2351,54 @@ window.BENCHMARK_DATA = {
             "name": "non-git warm query",
             "value": 58.763904000000004,
             "range": "± 34.6",
+            "unit": "ms"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "29139614+renovate[bot]@users.noreply.github.com",
+            "name": "renovate[bot]",
+            "username": "renovate[bot]"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "2ff8ab89aa3a36abb2dd2a89354def09baabe373",
+          "message": "Update Rust crate toml to v1 (#60)\n\nCo-authored-by: renovate[bot] <29139614+renovate[bot]@users.noreply.github.com>",
+          "timestamp": "2026-07-19T15:37:07-04:00",
+          "tree_id": "bf6420078181c60f0fb89820cd90c30d8fb50171",
+          "url": "https://github.com/jimsimon/trouve/commit/2ff8ab89aa3a36abb2dd2a89354def09baabe373"
+        },
+        "date": 1784489936899,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "cold index + query",
+            "value": 142.89682136000002,
+            "range": "± 12.5",
+            "unit": "ms"
+          },
+          {
+            "name": "warm query",
+            "value": 78.06576682000001,
+            "range": "± 2.6",
+            "unit": "ms"
+          },
+          {
+            "name": "incremental (1 file modified)",
+            "value": 88.45577908,
+            "range": "± 2.3",
+            "unit": "ms"
+          },
+          {
+            "name": "non-git warm query",
+            "value": 75.47462132000001,
+            "range": "± 2.8",
             "unit": "ms"
           }
         ]
