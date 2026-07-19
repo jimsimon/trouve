@@ -1147,6 +1147,7 @@ fn main() -> anyhow::Result<()> {
         let weak = window.as_weak();
         let last = std::cell::RefCell::new(restored);
         let last_scroll = std::cell::RefCell::new((slint::SharedString::new(), f32::NAN));
+        let last_focus = std::cell::Cell::new(false);
         let focused = window_focused.clone();
         geometry_timer.start(
             slint::TimerMode::Repeated,
@@ -1158,6 +1159,9 @@ fn main() -> anyhow::Result<()> {
                     use slint::winit_030::WinitWindowAccessor;
                     if let Some(f) = w.with_winit_window(|w| w.has_focus()) {
                         focused.store(f, std::sync::atomic::Ordering::Relaxed);
+                        if last_focus.replace(f) != f {
+                            let _ = scroll_tx.send(UiCommand::WindowFocusChanged(f));
+                        }
                     }
                 }
                 let mut next = last.borrow().unwrap_or_default();
