@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1784503242011,
+  "lastUpdate": 1784504308266,
   "repoUrl": "https://github.com/jimsimon/trouve",
   "entries": {
     "e2e-benchmarks": [
@@ -5665,6 +5665,54 @@ window.BENCHMARK_DATA = {
             "name": "dense_query_20k_rows",
             "value": 1373853.9554848967,
             "range": "± 7965",
+            "unit": "ns"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "jim.j.simon@gmail.com",
+            "name": "Jim Simon",
+            "username": "jimsimon"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "f3ef43f1bc731fec8eb12e3a261cab7dd0e66926",
+          "message": "Add provider tabs and Kimi subscription usage (#81)\n\n* Add provider categories and Kimi usage\n\n* Harden provider usage endpoint validation\n\n* Update protocol snapshot after rebase",
+          "timestamp": "2026-07-19T19:36:22-04:00",
+          "tree_id": "01faca34b704e92d9ff0f44902c84a30200b5cfa",
+          "url": "https://github.com/jimsimon/trouve/commit/f3ef43f1bc731fec8eb12e3a261cab7dd0e66926"
+        },
+        "date": 1784504307873,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "bm25_build_5k_docs",
+            "value": 4827715.699999999,
+            "range": "± 10534",
+            "unit": "ns"
+          },
+          {
+            "name": "bm25_query_5k_docs",
+            "value": 36997.150013949926,
+            "range": "± 18",
+            "unit": "ns"
+          },
+          {
+            "name": "chunk_python_200_functions",
+            "value": 3010987.352941177,
+            "range": "± 1481",
+            "unit": "ns"
+          },
+          {
+            "name": "dense_query_20k_rows",
+            "value": 1359844.0909090908,
+            "range": "± 9981",
             "unit": "ns"
           }
         ]
