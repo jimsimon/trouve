@@ -1728,7 +1728,15 @@ export component AppWindow inherits Window {
                 nav-list := ListView {
                     // Scrolling can move/recycle a hovered button without a
                     // hover-out; drop any tooltip it left behind.
-                    changed viewport-y => { Tip.hide-all(); }
+                    changed viewport-y => {
+                        Tip.hide-all();
+                        // A virtual-list remeasurement must never strand the
+                        // viewport beyond its content. Besides rendering an
+                        // empty nav, that invalid offset leaves the scrollbar
+                        // unable to return to the rows.
+                        self.viewport-y = clamp(self.viewport-y,
+                            min(0px, self.visible-height - self.viewport-height), 0px);
+                    }
                     for row[idx] in root.nav-rows: Rectangle {
                         // Match the chat pane's right-side gutter so the
                         // scrollbar never covers trailing row controls.

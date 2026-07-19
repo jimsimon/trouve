@@ -124,6 +124,8 @@ pub fn set_model_knobs(
 }
 
 pub fn set_nav(ui: &Ui, rows: Vec<NavRowData>) {
+    use slint::Model as _;
+
     let _ = ui.upgrade_in_event_loop(move |ui| {
         let items: Vec<NavRow> = rows
             .into_iter()
@@ -147,7 +149,29 @@ pub fn set_nav(ui: &Ui, rows: Vec<NavRowData>) {
                 show_archived: r.show_archived,
             })
             .collect();
-        ui.set_nav_rows(ModelRc::new(VecModel::from(items)));
+
+        // Keep the model object stable. Replacing it for a selection-only
+        // change makes ListView discard its virtual-row measurements and can
+        // leave viewport-y beyond the rebuilt content (a click near the end
+        // then produces an empty, unscrollable list).
+        let model = ui.get_nav_rows();
+        match model.as_any().downcast_ref::<VecModel<NavRow>>() {
+            Some(vec) => {
+                let common = vec.row_count().min(items.len());
+                for (i, item) in items.iter().take(common).enumerate() {
+                    if vec.row_data(i).as_ref() != Some(item) {
+                        vec.set_row_data(i, item.clone());
+                    }
+                }
+                for item in &items[common..] {
+                    vec.push(item.clone());
+                }
+                while vec.row_count() > items.len() {
+                    vec.remove(vec.row_count() - 1);
+                }
+            }
+            None => ui.set_nav_rows(ModelRc::new(VecModel::from(items))),
+        }
     });
 }
 
