@@ -2762,8 +2762,15 @@ mod tests {
                         "type": "fileChange",
                         "changes": [
                             {"path": "a.rs", "kind": "update", "diff": "..."},
+                            {"path": "a.rs", "kind": "update", "diff": "..."},
                             {"path": "b.rs", "kind": "create", "diff": "..."}
                         ]
+                    }),
+                ),
+                tool(
+                    "fileChange",
+                    serde_json::json!({
+                        "changes": [{"kind": "update", "diff": "..."}]
                     }),
                 ),
                 tool(
@@ -2776,6 +2783,22 @@ mod tests {
                         "server": "trouve",
                         "tool": "read_file",
                         "arguments": {"path": "c.rs"}
+                    }),
+                ),
+                tool(
+                    "mcpToolCall",
+                    serde_json::json!({
+                        "server": "trouve",
+                        "tool": "edit_file",
+                        "arguments": {"path": "d.rs"}
+                    }),
+                ),
+                tool(
+                    "mcpToolCall",
+                    serde_json::json!({
+                        "server": "trouve",
+                        "tool": "edit_file",
+                        "arguments": {}
                     }),
                 ),
                 tool(
@@ -2797,7 +2820,7 @@ mod tests {
         let segments: Vec<Segment> = (0..vm.items.len()).map(Segment::Item).collect();
         assert_eq!(
             activity_summary(&vm, &segments),
-            "Edited 2 files, read 1 file, ran 1 command, called 1 tool, thought 1 time"
+            "Edited 5 files, read 1 file, ran 1 command, called 1 tool, thought 1 time"
         );
     }
 
