@@ -7,7 +7,7 @@
       "name": "MIT",
       "identifier": "MIT"
     },
-    "version": "0.21"
+    "version": "0.22"
   },
   "paths": {
     "/v1/approvals": {
@@ -2956,10 +2956,10 @@
         }
       }
     },
-    "/v1/workspaces/{id}/prs": {
-      "get": {
+    "/v1/workspaces/{id}/prs/refresh": {
+      "post": {
         "tags": [],
-        "operationId": "workspace_prs",
+        "operationId": "refresh_workspace_prs",
         "parameters": [
           {
             "name": "id",
@@ -2971,15 +2971,8 @@
           }
         ],
         "responses": {
-          "200": {
-            "description": "",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/WorkspacePrList"
-                }
-              }
-            }
+          "204": {
+            "description": ""
           },
           "400": {
             "description": "",
@@ -4218,6 +4211,29 @@
                 "type": "string",
                 "enum": [
                   "workspace.registered"
+                ]
+              },
+              "workspace_id": {
+                "$ref": "#/components/schemas/String"
+              }
+            }
+          },
+          {
+            "type": "object",
+            "description": "A workspace PR-dashboard refresh completed. This is a full snapshot\nfor that workspace; clients replace the previously folded slice.",
+            "required": [
+              "workspace_id",
+              "pull_requests",
+              "type"
+            ],
+            "properties": {
+              "pull_requests": {
+                "$ref": "#/components/schemas/WorkspacePrList"
+              },
+              "type": {
+                "type": "string",
+                "enum": [
+                  "workspace.pull_requests_updated"
                 ]
               },
               "workspace_id": {

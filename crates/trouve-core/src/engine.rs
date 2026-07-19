@@ -2867,13 +2867,10 @@ impl Engine {
         Ok(self.store.list_workspaces()?)
     }
 
-    /// PR dashboard slice for one workspace: every open PR of its origin
-    /// repo plus PRs merged in the last 24 hours, with the viewer's login
-    /// so clients can spot review requests aimed at them.
-    pub async fn workspace_prs(
-        &self,
-        id: &str,
-    ) -> Result<trouve_protocol::WorkspacePrList, EngineError> {
+    /// Refresh one workspace's PR dashboard and publish the full snapshot on
+    /// the persisted server event stream. The command response carries no UI
+    /// state; clients fold `workspace.pull_requests_updated` instead.
+    pub async fn refresh_workspace_prs(&self, id: &str) -> Result<(), EngineError> {
         let ws = self
             .store
             .workspace(id)?
@@ -2887,7 +2884,14 @@ impl Engine {
             .dashboard_prs(merged_since)
             .await
             .map_err(EngineError::Internal)?;
-        Ok(trouve_protocol::WorkspacePrList { viewer, prs })
+        self.store.append_event(
+            Scope::Server,
+            Event::WorkspacePullRequestsUpdated {
+                workspace_id: ws.id,
+                pull_requests: trouve_protocol::WorkspacePrList { viewer, prs },
+            },
+        )?;
+        Ok(())
     }
 
     /// Local branches of the workspace repo, for base-ref selection.

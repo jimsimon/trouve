@@ -281,8 +281,9 @@ pub enum UiCommand {
     ClosePullRequests,
     /// Re-fetch every workspace's PRs for the dashboard.
     RefreshPullRequests,
-    /// Internal: one workspace's dashboard fetch finished.
-    PrDashLoaded(String, Result<trouve_protocol::WorkspacePrList, String>),
+    /// Internal: one workspace's refresh command finished. Successful
+    /// dashboard data arrives separately as a persisted server event.
+    PrDashRefreshFinished(String, Result<(), String>),
     /// Dashboard project filter changed (0 = all projects).
     PrDashFilterPicked(i32),
     /// Collapse/expand a dashboard group.
@@ -2150,8 +2151,9 @@ impl Controller {
 
     // --- PR dashboard --------------------------------------------------------
 
-    /// Kick off a dashboard fetch for every workspace (results land as
-    /// `PrDashLoaded`, one per workspace) and repaint with what's known.
+    /// Kick off a dashboard refresh command for every workspace. Successful
+    /// snapshots arrive through the persisted server event stream; only
+    /// command failures use `PrDashRefreshFinished` to clear local loading.
     fn refresh_pr_dashboard(&mut self) {
         if self.github_configured {
             for ws in &self.workspaces {
@@ -2166,12 +2168,12 @@ impl Controller {
                 tokio::spawn(async move {
                     let result = match limiter.acquire_owned().await {
                         Ok(_permit) => client
-                            .workspace_prs(&workspace_id)
+                            .refresh_workspace_prs(&workspace_id)
                             .await
                             .map_err(|e| format!("{e:#}")),
                         Err(error) => Err(format!("dashboard request limiter closed: {error}")),
                     };
-                    let _ = tx.send(UiCommand::PrDashLoaded(workspace_id, result));
+                    let _ = tx.send(UiCommand::PrDashRefreshFinished(workspace_id, result));
                 });
             }
         }
@@ -3091,10 +3093,25 @@ impl Controller {
         ui::set_automation_templates(&self.ui, templates);
     }
 
-    /// React to a server-scope event. Only fresh envelopes count — on
-    /// (re)connect the stream replays history, which must not trigger a
-    /// reload storm.
+    /// Fold server-scope state events during replay; edge-triggered lifecycle
+    /// events only act when fresh so reconnects do not trigger reload storms.
     async fn handle_server_event(&mut self, envelope: trouve_protocol::EventEnvelope) {
+        use trouve_protocol::Event;
+
+        // Dashboard snapshots are folded even during replay: unlike the
+        // lifecycle events below, the persisted payload is the state itself
+        // and reconstructs the cache after launch/reconnect.
+        if let Event::WorkspacePullRequestsUpdated {
+            workspace_id,
+            pull_requests,
+        } = &envelope.event
+        {
+            self.pr_dash
+                .insert(workspace_id.clone(), pull_requests.clone());
+            self.push_pr_dashboard();
+            return;
+        }
+
         let fresh = std::time::SystemTime::from(envelope.ts)
             .elapsed()
             .map(|age| age.as_secs() < 20)
@@ -3102,7 +3119,6 @@ impl Controller {
         if !fresh {
             return;
         }
-        use trouve_protocol::Event;
         match &envelope.event {
             // An automation ran: its last/next fields changed, and a
             // successful run created a session this UI hasn't seen.
@@ -4577,17 +4593,18 @@ impl Controller {
                 );
             }
             UiCommand::RefreshPullRequests => self.refresh_pr_dashboard(),
-            UiCommand::PrDashLoaded(workspace_id, result) => {
+            UiCommand::PrDashRefreshFinished(workspace_id, result) => {
                 self.pr_dash_loading.remove(&workspace_id);
                 match result {
-                    Ok(list) => {
-                        self.pr_dash.insert(workspace_id.clone(), list);
+                    Ok(()) => {
                         self.pr_dash_errors.remove(&workspace_id);
                     }
                     Err(error) => {
-                        self.pr_dash_errors.insert(workspace_id.clone(), error);
+                        self.pr_dash_errors.insert(workspace_id, error);
                     }
                 }
+                // The command result owns progress/error state only; the PR
+                // snapshot itself is folded exclusively from the SSE event.
                 self.push_pr_dashboard();
             }
             UiCommand::PrDashFilterPicked(index) => {

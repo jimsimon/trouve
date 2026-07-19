@@ -62,7 +62,10 @@ pub use requests::*;
 // recently merged PR of the workspace's origin repo, and PrInfo gains
 // author, requested_reviewers, comment counts/timestamps, and merged_at
 // (all additive).
-pub const PROTOCOL_VERSION: &str = "0.21";
+// 0.22: workspace.pull_requests_updated persists each dashboard refresh in
+// the server event log; POST /v1/workspaces/{id}/prs/refresh triggers the
+// refresh without returning UI state directly (additive event-flow change).
+pub const PROTOCOL_VERSION: &str = "0.22";
 
 pub type WorkspaceId = String;
 pub type SessionId = String;

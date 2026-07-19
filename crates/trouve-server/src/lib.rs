@@ -71,7 +71,7 @@ impl IntoResponse for ApiError {
         register_workspace,
         list_workspaces,
         workspace_branches,
-        workspace_prs,
+        refresh_workspace_prs,
         create_session,
         list_sessions,
         get_session,
@@ -442,7 +442,10 @@ pub fn build_router(engine: Arc<Engine>) -> Router {
             post(register_workspace).get(list_workspaces),
         )
         .route("/v1/workspaces/{id}/branches", get(workspace_branches))
-        .route("/v1/workspaces/{id}/prs", get(workspace_prs))
+        .route(
+            "/v1/workspaces/{id}/prs/refresh",
+            post(refresh_workspace_prs),
+        )
         .route("/v1/sessions", post(create_session).get(list_sessions))
         .route(
             "/v1/sessions/{id}",
@@ -676,14 +679,15 @@ async fn workspace_branches(
     Ok(Json(engine.workspace_branches(&id).await?))
 }
 
-#[utoipa::path(get, path = "/v1/workspaces/{id}/prs", params(("id" = String, Path,)),
-    responses((status = 200, body = WorkspacePrList),
+#[utoipa::path(post, path = "/v1/workspaces/{id}/prs/refresh", params(("id" = String, Path,)),
+    responses((status = 204),
         (status = 400, body = ErrorBody), (status = 404, body = ErrorBody)))]
-async fn workspace_prs(
+async fn refresh_workspace_prs(
     State(engine): State<Arc<Engine>>,
     Path(id): Path<String>,
-) -> Result<Json<WorkspacePrList>, ApiError> {
-    Ok(Json(engine.workspace_prs(&id).await?))
+) -> Result<axum::http::StatusCode, ApiError> {
+    engine.refresh_workspace_prs(&id).await?;
+    Ok(axum::http::StatusCode::NO_CONTENT)
 }
 
 #[utoipa::path(post, path = "/v1/sessions", request_body = CreateSessionRequest,
