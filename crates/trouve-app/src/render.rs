@@ -999,6 +999,19 @@ fn activity_summary(vm: &ThreadViewModel, segments: &[Segment]) -> String {
         match &vm.items[*j] {
             ChatItem::Thinking { .. } => thoughts += 1,
             ChatItem::ToolCall { tool, args, .. } => {
+                // Codex app-server wraps MCP calls in an `mcpToolCall` item.
+                // Classify the underlying tool using its real arguments so
+                // trouve's search/read/edit tools summarize like native calls.
+                let (tool, args) = if tool == "mcpToolCall" {
+                    (
+                        args.get("tool")
+                            .and_then(serde_json::Value::as_str)
+                            .unwrap_or(tool),
+                        args.get("arguments").unwrap_or(args),
+                    )
+                } else {
+                    (tool.as_str(), args)
+                };
                 // MCP-mangled names classify by their base name.
                 let base = tool.rsplit("__").next().unwrap_or(tool);
                 let path = args
@@ -1020,7 +1033,25 @@ fn activity_summary(vm: &ThreadViewModel, segments: &[Segment]) -> String {
                         }
                         None => reads_unpathed += 1,
                     },
-                    "shell" | "bash" | "Bash" | "execute" => commands += 1,
+                    // Codex app-server's built-in shell item.
+                    "shell" | "bash" | "Bash" | "execute" | "commandExecution" => commands += 1,
+                    // A single Codex fileChange can contain changes to
+                    // several files, so count its distinct paths rather than
+                    // treating the whole item as one generic tool call.
+                    "fileChange" => {
+                        let mut found = false;
+                        if let Some(changes) = args.get("changes").and_then(|v| v.as_array()) {
+                            for change in changes {
+                                if let Some(path) = change.get("path").and_then(|v| v.as_str()) {
+                                    edited.insert(path);
+                                    found = true;
+                                }
+                            }
+                        }
+                        if !found {
+                            edits_unpathed += 1;
+                        }
+                    }
                     _ => tools += 1,
                 }
             }
@@ -2711,6 +2742,85 @@ mod tests {
         assert_eq!(
             activity_summary(&vm, &segments),
             "Edited 2 files, read 2 files, ran 1 command, called 1 tool, thought 1 time"
+        );
+    }
+
+    #[test]
+    fn activity_summary_classifies_codex_app_server_items() {
+        let tool = |name: &str, args: serde_json::Value| ChatItem::ToolCall {
+            call_id: name.into(),
+            tool: name.into(),
+            args,
+            status: ToolCallStatus::Ok,
+            result: None,
+        };
+        let vm = ThreadViewModel {
+            items: vec![
+                tool(
+                    "fileChange",
+                    serde_json::json!({
+                        "type": "fileChange",
+                        "changes": [
+                            {"path": "a.rs", "kind": "update", "diff": "..."},
+                            {"path": "a.rs", "kind": "update", "diff": "..."},
+                            {"path": "b.rs", "kind": "create", "diff": "..."}
+                        ]
+                    }),
+                ),
+                tool(
+                    "fileChange",
+                    serde_json::json!({
+                        "changes": [{"kind": "update", "diff": "..."}]
+                    }),
+                ),
+                tool(
+                    "commandExecution",
+                    serde_json::json!({"command": "cargo test"}),
+                ),
+                tool(
+                    "mcpToolCall",
+                    serde_json::json!({
+                        "server": "trouve",
+                        "tool": "read_file",
+                        "arguments": {"path": "c.rs"}
+                    }),
+                ),
+                tool(
+                    "mcpToolCall",
+                    serde_json::json!({
+                        "server": "trouve",
+                        "tool": "edit_file",
+                        "arguments": {"path": "d.rs"}
+                    }),
+                ),
+                tool(
+                    "mcpToolCall",
+                    serde_json::json!({
+                        "server": "trouve",
+                        "tool": "edit_file",
+                        "arguments": {}
+                    }),
+                ),
+                tool(
+                    "mcpToolCall",
+                    serde_json::json!({
+                        "server": "trouve",
+                        "tool": "search",
+                        "arguments": {"query": "activity summary"}
+                    }),
+                ),
+                ChatItem::Thinking {
+                    turn: 1,
+                    content: "hmm".into(),
+                    complete: true,
+                },
+            ],
+            ..Default::default()
+        };
+        let segments: Vec<Segment> = (0..vm.items.len()).map(Segment::Item).collect();
+        assert_eq!(
+            activity_summary(&vm, &segments),
+            "Edited 5 files, read 1 file, ran 1 command, called 1 tool, thought 1 time"
         );
     }
 
