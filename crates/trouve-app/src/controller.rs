@@ -4324,9 +4324,7 @@ impl Controller {
                 if let Some(index) = self.current_session {
                     let full = std::path::Path::new(&self.sessions[index].worktree_path)
                         .join(path.trim_start_matches('/'));
-                    if let Err(e) = open::that_detached(&full) {
-                        self.error(&format!("cannot open {}: {e:#}", full.display()));
-                    }
+                    crate::opener::open(&full);
                 }
             }
             UiCommand::OpenChatFile(path, from, to) => {
@@ -4397,10 +4395,8 @@ impl Controller {
                 }
             }
             UiCommand::OpenPrUrl(url) => {
-                if !url.is_empty()
-                    && let Err(e) = open::that_detached(&url)
-                {
-                    self.error(&format!("could not open {url}: {e}"));
+                if !url.is_empty() {
+                    crate::opener::open(&url);
                 }
             }
             UiCommand::PrsLoaded(session_id, result) => {
@@ -5682,14 +5678,7 @@ fn format_tokens(n: u64) -> String {
 }
 
 fn open_in_browser(url: &str) {
-    #[cfg(target_os = "linux")]
-    let _ = std::process::Command::new("xdg-open").arg(url).spawn();
-    #[cfg(target_os = "macos")]
-    let _ = std::process::Command::new("open").arg(url).spawn();
-    #[cfg(target_os = "windows")]
-    let _ = std::process::Command::new("cmd")
-        .args(["/C", "start", url])
-        .spawn();
+    crate::opener::open(url);
 }
 
 /// One line per check run: status glyph, name, conclusion.
