@@ -91,6 +91,56 @@ pub fn slugify(title: &str) -> String {
     }
 }
 
+/// The freshly fetched upstream commit for a local base branch.
+pub struct FetchedBase {
+    /// Short remote-tracking ref (for example `origin/main`).
+    pub upstream_ref: String,
+    /// Immutable commit to use when creating the worktree branch.
+    pub commit: String,
+}
+
+/// Fetch a local base branch's configured upstream without moving the local
+/// branch or any checkout.
+///
+/// Refs that are not local branches (for example a checkpoint commit) and
+/// branches without an upstream return `None` so callers can use the original
+/// ref as-is. The remote-tracking ref is resolved to a commit after fetching,
+/// rather than exposing the repository-global `FETCH_HEAD` to races.
+pub fn fetch_upstream_base(repo: &Path, base_ref: &str) -> Result<Option<FetchedBase>> {
+    ensure_safe_ref(base_ref)?;
+
+    let full_ref = git(
+        repo,
+        &["rev-parse", "--symbolic-full-name", "--verify", base_ref],
+    )?;
+    if !full_ref.starts_with("refs/heads/") {
+        return Ok(None);
+    }
+
+    let remote = git(
+        repo,
+        &["for-each-ref", "--format=%(upstream:remotename)", &full_ref],
+    )?;
+    let upstream = git(repo, &["for-each-ref", "--format=%(upstream)", &full_ref])?;
+    if remote.is_empty() || upstream.is_empty() {
+        return Ok(None);
+    }
+
+    git(repo, &["fetch", "--quiet", "--", &remote])?;
+    let upstream_ref = git(
+        repo,
+        &["for-each-ref", "--format=%(refname:short)", &upstream],
+    )?;
+    let commit = git(
+        repo,
+        &["rev-parse", "--verify", &format!("{upstream}^{{commit}}")],
+    )?;
+    Ok(Some(FetchedBase {
+        upstream_ref,
+        commit,
+    }))
+}
+
 /// Create the session worktree on a new branch from `base_ref`.
 pub fn create_worktree(
     repo: &Path,
@@ -185,6 +235,21 @@ pub fn remote_url(worktree: &Path, remote: &str) -> Option<String> {
         .filter(|s| !s.is_empty())
 }
 
+/// Strip a configured remote name from a short remote-tracking ref.
+pub fn remote_branch_name(worktree: &Path, remote_ref: &str) -> Option<String> {
+    let remotes = git(worktree, &["remote"]).ok()?;
+    remotes
+        .lines()
+        .filter_map(|remote| {
+            remote_ref
+                .strip_prefix(remote)
+                .and_then(|rest| rest.strip_prefix('/'))
+                .map(|branch| (remote.len(), branch.to_string()))
+        })
+        .max_by_key(|(remote_len, _)| *remote_len)
+        .map(|(_, branch)| branch)
+}
+
 /// Push the session branch to the remote (sets upstream).
 pub fn push_branch(worktree: &Path, remote: &str, branch: &str) -> Result<()> {
     git(worktree, &["push", "--set-upstream", remote, branch])?;
@@ -200,30 +265,105 @@ pub fn worktree_dir(data_dir: &Path, session_id: &str) -> PathBuf {
 mod tests {
     use super::*;
 
+    fn run(dir: &Path, args: &[&str]) -> String {
+        let out = Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "git {args:?} failed in {}: {}",
+            dir.display(),
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
     fn init_repo(dir: &Path) {
-        let run = |args: &[&str]| {
-            let ok = Command::new("git")
-                .arg("-C")
-                .arg(dir)
-                .args(args)
-                .output()
-                .unwrap()
-                .status
-                .success();
-            assert!(ok, "git {args:?} failed");
-        };
-        run(&["init", "-b", "main"]);
-        run(&["config", "user.email", "test@example.com"]);
-        run(&["config", "user.name", "Test"]);
+        run(dir, &["init", "-b", "main"]);
+        run(dir, &["config", "user.email", "test@example.com"]);
+        run(dir, &["config", "user.name", "Test"]);
         std::fs::write(dir.join("a.txt"), "one\n").unwrap();
-        run(&["add", "-A"]);
-        run(&["commit", "-m", "init"]);
+        run(dir, &["add", "-A"]);
+        run(dir, &["commit", "-m", "init"]);
     }
 
     #[test]
     fn slugify_basics() {
         assert_eq!(slugify("Fix the Login Bug!"), "fix-the-login-bug");
         assert_eq!(slugify("---"), "session");
+    }
+
+    #[test]
+    fn fetch_upstream_base_returns_remote_commit_without_moving_local_branch() {
+        let tmp = tempfile::tempdir().unwrap();
+        let remote = tmp.path().join("remote.git");
+        std::fs::create_dir(&remote).unwrap();
+        run(&remote, &["init", "--bare", "-b", "main"]);
+
+        let publisher = tmp.path().join("publisher");
+        std::fs::create_dir(&publisher).unwrap();
+        init_repo(&publisher);
+        run(
+            &publisher,
+            &["remote", "add", "origin", remote.to_str().unwrap()],
+        );
+        run(&publisher, &["push", "-u", "origin", "main"]);
+
+        let repo = tmp.path().join("repo");
+        run(
+            tmp.path(),
+            &[
+                "clone",
+                "--quiet",
+                remote.to_str().unwrap(),
+                repo.to_str().unwrap(),
+            ],
+        );
+        let old_head = run(&repo, &["rev-parse", "main"]);
+
+        std::fs::write(publisher.join("a.txt"), "two\n").unwrap();
+        run(&publisher, &["add", "a.txt"]);
+        run(&publisher, &["commit", "-m", "update"]);
+        run(&publisher, &["push", "origin", "main"]);
+
+        let fetched = fetch_upstream_base(&repo, "main").unwrap().unwrap();
+        assert_eq!(fetched.upstream_ref, "origin/main");
+        assert_eq!(run(&repo, &["rev-parse", "main"]), old_head);
+        assert_eq!(
+            std::fs::read_to_string(repo.join("a.txt")).unwrap(),
+            "one\n"
+        );
+
+        let wt = tmp.path().join("wt");
+        create_worktree(&repo, &wt, "trouve/test", &fetched.commit).unwrap();
+        assert_eq!(std::fs::read_to_string(wt.join("a.txt")).unwrap(), "two\n");
+    }
+
+    #[test]
+    fn fetch_upstream_base_without_upstream_returns_none() {
+        let tmp = tempfile::tempdir().unwrap();
+        init_repo(tmp.path());
+
+        let head = run(tmp.path(), &["rev-parse", "main"]);
+        assert!(fetch_upstream_base(tmp.path(), "main").unwrap().is_none());
+
+        assert_eq!(run(tmp.path(), &["rev-parse", "main"]), head);
+    }
+
+    #[test]
+    fn remote_branch_name_uses_the_configured_remote_prefix() {
+        let tmp = tempfile::tempdir().unwrap();
+        init_repo(tmp.path());
+        run(tmp.path(), &["remote", "add", "upstream", "."]);
+
+        assert_eq!(
+            remote_branch_name(tmp.path(), "upstream/feature/x").as_deref(),
+            Some("feature/x")
+        );
+        assert_eq!(remote_branch_name(tmp.path(), "feature/x"), None);
     }
 
     #[test]

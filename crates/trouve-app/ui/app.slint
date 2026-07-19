@@ -7,7 +7,7 @@
 // folding happens in Rust (client-core view models + the app controller).
 
 import {
-    Button, ComboBox, LineEdit, ListView, ScrollView, Spinner, TabWidget, TextEdit
+    Button, CheckBox, ComboBox, LineEdit, ListView, ScrollView, Spinner, TabWidget, TextEdit
 } from "std-widgets.slint";
 import { DiffView, DiffRow } from "diff-view.slint";
 import { CodeView, TextSegment } from "code-view.slint";
@@ -889,6 +889,7 @@ component NewChatForm inherits VerticalLayout {
     in-out property <int> workspace-index;
     in property <[string]> branches;
     in-out property <int> branch-index;
+    in-out property <bool> use-latest-remote: true;
     in property <[string]> modes;
     in-out property <int> mode-index;
     // Per-mode default model as an index into models (-1 = none); picking
@@ -904,7 +905,7 @@ component NewChatForm inherits VerticalLayout {
     in property <bool> blocked-severe;
     in property <string> offline-warning;
     in property <string> online-notice;
-    callback start(int, int, int, int, string);
+    callback start(int, int, bool, int, int, string);
     callback cancel();
     callback workspace-changed(int);
     callback register-workspace(string);
@@ -970,6 +971,11 @@ component NewChatForm inherits VerticalLayout {
             current-index <=> root.branch-index;
             enabled: !root.blocked;
         }
+        CheckBox {
+            text: "Use latest remote branch";
+            checked <=> root.use-latest-remote;
+            enabled: !root.blocked;
+        }
     }
 
     HorizontalLayout {
@@ -1019,7 +1025,7 @@ component NewChatForm inherits VerticalLayout {
             enabled: !root.blocked;
             submitted(text) => {
                 if (!root.blocked && (!root.session-form || root.workspace-index >= 0)) {
-                    root.start(root.workspace-index, root.branch-index,
+                    root.start(root.workspace-index, root.branch-index, root.use-latest-remote,
                         root.mode-index, root.model-index, text);
                     self.text = "";
                 }
@@ -1035,7 +1041,7 @@ component NewChatForm inherits VerticalLayout {
             enabled: prompt-edit.text != "" && !root.blocked
                 && (!root.session-form || root.workspace-index >= 0);
             clicked => {
-                root.start(root.workspace-index, root.branch-index,
+                root.start(root.workspace-index, root.branch-index, root.use-latest-remote,
                     root.mode-index, root.model-index, prompt-edit.text);
                 prompt-edit.text = "";
             }
@@ -1525,11 +1531,12 @@ export component AppWindow inherits Window {
     in property <[string]> nc-branches;
     in-out property <int> nc-workspace-index: -1;
     in-out property <int> nc-branch-index: -1;
+    in-out property <bool> nc-fetch-latest: true;
     in-out property <int> nc-mode-index: 0;
     in-out property <int> nc-model-index: 0;
     callback nc-workspace-changed(int);
     callback register-workspace-path(string);
-    callback start-new-chat(/* ws */ int, /* branch */ int, /* mode */ int,
+    callback start-new-chat(/* ws */ int, /* branch */ int, /* fetch */ bool, /* mode */ int,
                             /* model */ int, /* prompt */ string);
     callback cancel-new-chat();
 
@@ -2309,8 +2316,8 @@ export component AppWindow inherits Window {
                     blocked-severe: root.connectivity-severe;
                     offline-warning: root.connectivity-text;
                     online-notice: root.connectivity-notice;
-                    start(ws, br, mode, model, prompt) => {
-                        root.start-new-chat(ws, br, mode, model, prompt);
+                    start(ws, br, fetch, mode, model, prompt) => {
+                        root.start-new-chat(ws, br, fetch, mode, model, prompt);
                     }
                     cancel => { root.cancel-new-chat(); }
                     model-filter(q) => { root.model-filter-changed(q); }
@@ -3724,6 +3731,7 @@ export component AppWindow inherits Window {
                 workspace-index <=> root.nc-workspace-index;
                 branches: root.nc-branches;
                 branch-index <=> root.nc-branch-index;
+                use-latest-remote <=> root.nc-fetch-latest;
                 modes: root.modes;
                 mode-model-indices: root.mode-model-indices;
                 mode-index <=> root.nc-mode-index;
@@ -3735,8 +3743,8 @@ export component AppWindow inherits Window {
                 blocked-severe: root.connectivity-severe;
                 offline-warning: root.connectivity-text;
                 online-notice: root.connectivity-notice;
-                start(ws, br, mode, model, prompt) => {
-                    root.start-new-chat(ws, br, mode, model, prompt);
+                start(ws, br, fetch, mode, model, prompt) => {
+                    root.start-new-chat(ws, br, fetch, mode, model, prompt);
                 }
                 cancel => { root.cancel-new-chat(); }
                 workspace-changed(i) => { root.nc-workspace-changed(i); }

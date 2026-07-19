@@ -1544,6 +1544,7 @@ impl Engine {
                     chrono::Local::now().format("%b %d %H:%M")
                 )),
                 base_ref: None,
+                fetch_latest: true,
             })
             .await?;
         let thread = self.create_thread(trouve_protocol::CreateThreadRequest {
@@ -2705,17 +2706,19 @@ impl Engine {
         let github = self.github_for_session(&session)?;
         let worktree = PathBuf::from(&session.worktree_path);
         let branch = session.branch.clone();
-        tokio::task::spawn_blocking(move || git::push_branch(&worktree, "origin", &branch))
-            .await
-            .map_err(|e| EngineError::Internal(anyhow!(e)))?
-            .map_err(EngineError::Internal)?;
-        let base = req.base.clone().unwrap_or_else(|| {
-            session
-                .base_ref
-                .strip_prefix("origin/")
-                .unwrap_or(&session.base_ref)
-                .to_string()
-        });
+        let requested_base = req.base.clone();
+        let session_base = session.base_ref.clone();
+        let base = tokio::task::spawn_blocking(move || -> Result<String> {
+            let base = requested_base.unwrap_or_else(|| {
+                git::remote_branch_name(&worktree, &session_base)
+                    .unwrap_or_else(|| session_base.clone())
+            });
+            git::push_branch(&worktree, "origin", &branch)?;
+            Ok(base)
+        })
+        .await
+        .map_err(|e| EngineError::Internal(anyhow!(e)))?
+        .map_err(EngineError::Internal)?;
         let pr = github
             .create_pr(&session.branch, &base, &req.title, &req.body, req.draft)
             .await
@@ -3037,18 +3040,32 @@ impl Engine {
             }
         };
         let worktree_path = git::worktree_dir(&self.data_dir, &session_id);
-        {
+        let base_ref = {
             let repo = repo.clone();
             let worktree_path = worktree_path.clone();
             let branch = branch.clone();
-            let base_ref = base_ref.clone();
-            tokio::task::spawn_blocking(move || {
-                git::create_worktree(&repo, &worktree_path, &branch, &base_ref)
+            let selected_base = base_ref.clone();
+            let fetch_latest = req.fetch_latest;
+            tokio::task::spawn_blocking(move || -> Result<String> {
+                let mut session_base = selected_base.clone();
+                let worktree_base = if fetch_latest {
+                    match git::fetch_upstream_base(&repo, &selected_base)? {
+                        Some(fetched) => {
+                            session_base = fetched.upstream_ref;
+                            fetched.commit
+                        }
+                        None => selected_base,
+                    }
+                } else {
+                    selected_base
+                };
+                git::create_worktree(&repo, &worktree_path, &branch, &worktree_base)?;
+                Ok(session_base)
             })
             .await
             .map_err(|e| EngineError::Internal(anyhow!(e)))?
-            .map_err(EngineError::Internal)?;
-        }
+            .map_err(EngineError::Internal)?
+        };
 
         let session = Session {
             id: session_id.clone(),
@@ -5551,6 +5568,7 @@ impl Engine {
                     workspace_id: session.workspace_id.clone(),
                     title: Some(title),
                     base_ref: Some(base_ref.clone()),
+                    fetch_latest: true,
                 })
                 .await
                 .map_err(|e| anyhow!(e.to_string()))?;

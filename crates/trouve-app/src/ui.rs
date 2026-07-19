@@ -519,6 +519,7 @@ pub fn set_new_chat(
         ui.set_nc_workspace_index(workspace_index);
         ui.set_nc_branches(string_model(branches));
         ui.set_nc_branch_index(branch_index);
+        ui.set_nc_fetch_latest(true);
         ui.set_nc_mode_index(mode_index);
         ui.set_nc_model_index(model_index);
     });
