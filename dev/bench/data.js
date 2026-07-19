@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1784430218015,
+  "lastUpdate": 1784430293985,
   "repoUrl": "https://github.com/jimsimon/trouve",
   "entries": {
     "e2e-benchmarks": [
@@ -3889,6 +3889,54 @@ window.BENCHMARK_DATA = {
             "name": "dense_query_20k_rows",
             "value": 1355189.3615196077,
             "range": "± 8758",
+            "unit": "ns"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "jim.j.simon@gmail.com",
+            "name": "Jim Simon",
+            "username": "jimsimon"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "2d5ff980f06a6fdd1d876ab551762b19d5cc75d3",
+          "message": "Surface Claude subscription limit errors (#69)\n\n* Surface Claude subscription limit errors\n\n* fix: apply CodeRabbit auto-fixes\n\nFixed 1 file(s) based on 1 unresolved review comment.\n\nCo-authored-by: CodeRabbit <noreply@coderabbit.ai>\n\n* Format Claude error result tests\n\n---------\n\nCo-authored-by: coderabbitai[bot] <136622811+coderabbitai[bot]@users.noreply.github.com>\nCo-authored-by: CodeRabbit <noreply@coderabbit.ai>",
+          "timestamp": "2026-07-18T23:01:05-04:00",
+          "tree_id": "6477d66e46b2194071b5c82e608c6fb95350ed13",
+          "url": "https://github.com/jimsimon/trouve/commit/2d5ff980f06a6fdd1d876ab551762b19d5cc75d3"
+        },
+        "date": 1784430293437,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "bm25_build_5k_docs",
+            "value": 5095557.65,
+            "range": "± 23051",
+            "unit": "ns"
+          },
+          {
+            "name": "bm25_query_5k_docs",
+            "value": 36979.52400793651,
+            "range": "± 22",
+            "unit": "ns"
+          },
+          {
+            "name": "chunk_python_200_functions",
+            "value": 3016359.0588235296,
+            "range": "± 1586",
+            "unit": "ns"
+          },
+          {
+            "name": "dense_query_20k_rows",
+            "value": 1391201.3702307008,
+            "range": "± 15635",
             "unit": "ns"
           }
         ]
