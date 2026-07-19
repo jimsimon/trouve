@@ -260,7 +260,15 @@ impl AgentBackend for CodexBackend {
             "threadId": codex_thread_id,
             "model": model_or_default(model_name),
             "approvalPolicy": approval_policy,
-            "sandboxPolicy": { "type": sandbox_policy_type },
+            // Codex defaults networkAccess to false for both read-only and
+            // workspace-write sandboxes. Turns need outbound access for
+            // fetches, package managers, remote git operations, and MCP
+            // servers; filesystem mutation remains governed independently
+            // by the sandbox type and approval policy above.
+            "sandboxPolicy": {
+                "type": sandbox_policy_type,
+                "networkAccess": true,
+            },
             "input": input,
         });
         if let Some(effort) = effort {

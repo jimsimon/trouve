@@ -156,7 +156,7 @@ async fn claude_adapter_reads_subscription_usage() {
     let script = format!(
         r#"#!/bin/bash
 printf '%s\n' "$@" > "$0.args"
-read -r line
+IFS= read -r line
 printf '%s\n' "$line" > "$0.request"
 cat <<EOF
 {{"type":"control_response","response":{{"subtype":"success","request_id":"trouve-usage","response":{{"session":{{"total_cost_usd":0}},"subscription_type":"max","rate_limits_available":true,"rate_limits":{{"five_hour":{{"utilization":62.0,"resets_at":{soon}}},"seven_day":{{"utilization":31.0,"resets_at":{later}}},"extra_usage":{{"is_enabled":false}}}},"behaviors":null}}}}}}
@@ -314,35 +314,35 @@ fn cursor_acp_stub(dir: &Path) -> String {
         "cursor-agent",
         r##"#!/bin/bash
 echo "$1" > "$0.args"
-read line # initialize
+IFS= read -r line # initialize
 echo '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":1}}'
-read line # session/new
+IFS= read -r line # session/new
 echo '{"jsonrpc":"2.0","id":2,"result":{"sessionId":"sess-1"}}'
-read line # set_config_option mode
-echo "$line" > "$0.mode"
+IFS= read -r line # set_config_option mode
+printf '%s\n' "$line" > "$0.mode"
 echo '{"jsonrpc":"2.0","id":3,"result":{"configOptions":[{"id":"mode","currentValue":"agent"}]}}'
-read line # set_config_option model
-echo "$line" > "$0.model"
+IFS= read -r line # set_config_option model
+printf '%s\n' "$line" > "$0.model"
 echo '{"jsonrpc":"2.0","id":4,"result":{"configOptions":[{"id":"model","currentValue":"test-model"}]}}'
-read line # session/prompt
-echo "$line" > "$0.prompt"
+IFS= read -r line # session/prompt
+printf '%s\n' "$line" > "$0.prompt"
 echo '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"sess-1","update":{"sessionUpdate":"agent_thought_chunk","content":{"type":"text","text":"Hmm."}}}}'
 echo '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"sess-1","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"Hi "}}}}'
 echo '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"sess-1","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"there"}}}}'
 echo '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"sess-1","update":{"sessionUpdate":"tool_call","toolCallId":"c1","title":"`ls`","kind":"execute","status":"pending","rawInput":{"command":"ls"}}}}'
 echo '{"jsonrpc":"2.0","id":100,"method":"session/request_permission","params":{"sessionId":"sess-1","toolCall":{"toolCallId":"c1","title":"`ls`","kind":"execute"},"options":[{"optionId":"allow-once","name":"Allow once","kind":"allow_once"},{"optionId":"allow-always","name":"Allow always","kind":"allow_always"},{"optionId":"reject-once","name":"Reject","kind":"reject_once"}]}}'
-read approval
-echo "$approval" > "$0.approval"
+IFS= read -r approval
+printf '%s\n' "$approval" > "$0.approval"
 echo '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"sess-1","update":{"sessionUpdate":"tool_call_update","toolCallId":"c1","status":"completed","rawOutput":{"exitCode":0,"stdout":"a.txt\n"}}}}'
 echo '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"sess-1","update":{"sessionUpdate":"tool_call","toolCallId":"c2","title":"Create Plan","kind":"other","status":"pending","rawInput":{"_toolName":"createPlan"}}}}'
 echo '{"jsonrpc":"2.0","id":101,"method":"cursor/create_plan","params":{"toolCallId":"c2","name":"Plan","plan":"# The plan"}}'
-read planack
-echo "$planack" > "$0.planack"
+IFS= read -r planack
+printf '%s\n' "$planack" > "$0.planack"
 echo '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"sess-1","update":{"sessionUpdate":"tool_call_update","toolCallId":"c2","status":"completed"}}}'
 echo '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"sess-1","update":{"sessionUpdate":"tool_call","toolCallId":"c3","title":"Ask Question","kind":"think","status":"pending","rawInput":{"_toolName":"askQuestion"}}}}'
 echo '{"jsonrpc":"2.0","id":102,"method":"cursor/ask_question","params":{"toolCallId":"c3","title":"Prefs","questions":[{"id":"q1","prompt":"Color?","options":[{"id":"red","label":"Red"},{"id":"blue","label":"Blue"}],"allowMultiple":false}]}}'
-read qans
-echo "$qans" > "$0.qans"
+IFS= read -r qans
+printf '%s\n' "$qans" > "$0.qans"
 echo '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"sess-1","update":{"sessionUpdate":"tool_call_update","toolCallId":"c3","status":"completed"}}}'
 echo '{"jsonrpc":"2.0","id":5,"result":{"stopReason":"end_turn","usage":{"inputTokens":7,"outputTokens":3,"totalTokens":10}}}'
 cat > /dev/null
@@ -533,18 +533,19 @@ async fn codex_adapter_speaks_json_rpc_and_bridges_approvals() {
         tmp.path(),
         "codex",
         r#"#!/bin/bash
-read line # initialize
+IFS= read -r line # initialize
 echo '{"jsonrpc":"2.0","id":1,"result":{}}'
-read line # initialized notification
-read line # thread/start
+IFS= read -r line # initialized notification
+IFS= read -r line # thread/start
 echo '{"jsonrpc":"2.0","id":2,"result":{"thread":{"id":"thr-1"}}}'
-read line # turn/start
+IFS= read -r line # turn/start
+printf '%s\n' "$line" > "$0.turn-start"
 echo '{"jsonrpc":"2.0","id":3,"result":{"turn":{"id":"turn-1"}}}'
 echo '{"jsonrpc":"2.0","method":"item/agentMessage/delta","params":{"threadId":"thr-1","itemId":"i1","delta":"Hello"}}'
 echo '{"jsonrpc":"2.0","method":"item/started","params":{"threadId":"thr-1","item":{"id":"c1","type":"commandExecution","command":"ls"}}}'
 echo '{"jsonrpc":"2.0","id":100,"method":"item/commandExecution/requestApproval","params":{"threadId":"thr-1","itemId":"c1","command":"ls"}}'
-read approval
-echo "$approval" > "$0.approval"
+IFS= read -r approval
+printf '%s\n' "$approval" > "$0.approval"
 echo '{"jsonrpc":"2.0","method":"item/commandExecution/outputDelta","params":{"threadId":"thr-1","itemId":"c1","delta":"a.txt\n"}}'
 echo '{"jsonrpc":"2.0","method":"item/completed","params":{"threadId":"thr-1","item":{"id":"c1","type":"commandExecution","status":"completed"}}}'
 echo '{"jsonrpc":"2.0","method":"thread/tokenUsage/updated","params":{"threadId":"thr-1","tokenUsage":{"inputTokens":11,"outputTokens":4}}}'
@@ -596,6 +597,15 @@ cat > /dev/null
     assert_eq!(usage.input_tokens, 11);
     assert_eq!(usage.output_tokens, 4);
 
+    // Outbound network access is explicit because Codex otherwise defaults
+    // workspace-write turns to an offline sandbox.
+    let turn_start = std::fs::read_to_string(format!("{stub}.turn-start")).unwrap();
+    let turn_start: serde_json::Value = serde_json::from_str(&turn_start).unwrap();
+    assert_eq!(
+        turn_start["params"]["sandboxPolicy"],
+        serde_json::json!({ "type": "workspaceWrite", "networkAccess": true })
+    );
+
     // Our approval reply reached the vendor with an accept decision.
     let reply = std::fs::read_to_string(format!("{stub}.approval")).unwrap();
     assert!(reply.contains("\"id\":100"), "{reply}");
@@ -609,16 +619,16 @@ async fn codex_adapter_sends_decline_when_user_denies_approval() {
         tmp.path(),
         "codex",
         r#"#!/bin/bash
-read line # initialize
+IFS= read -r line # initialize
 echo '{"jsonrpc":"2.0","id":1,"result":{}}'
-read line # initialized notification
-read line # thread/start
+IFS= read -r line # initialized notification
+IFS= read -r line # thread/start
 echo '{"jsonrpc":"2.0","id":2,"result":{"thread":{"id":"thr-1"}}}'
-read line # turn/start
+IFS= read -r line # turn/start
 echo '{"jsonrpc":"2.0","id":3,"result":{"turn":{"id":"turn-1"}}}'
 echo '{"jsonrpc":"2.0","id":100,"method":"item/commandExecution/requestApproval","params":{"threadId":"thr-1","itemId":"c1","command":"ls"}}'
-read approval
-echo "$approval" > "$0.approval"
+IFS= read -r approval
+printf '%s\n' "$approval" > "$0.approval"
 echo '{"jsonrpc":"2.0","method":"turn/completed","params":{"threadId":"thr-1","turn":{"id":"turn-1","status":"completed"}}}'
 cat > /dev/null
 "#,
