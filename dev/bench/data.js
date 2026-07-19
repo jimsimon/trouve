@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1784494996205,
+  "lastUpdate": 1784495124607,
   "repoUrl": "https://github.com/jimsimon/trouve",
   "entries": {
     "e2e-benchmarks": [
@@ -2639,6 +2639,54 @@ window.BENCHMARK_DATA = {
             "name": "non-git warm query",
             "value": 72.67995276,
             "range": "± 2",
+            "unit": "ms"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "jim.j.simon@gmail.com",
+            "name": "Jim Simon",
+            "username": "jimsimon"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "afa788b9f6662991d0aab70c3d86ba3028b9daf3",
+          "message": "Add Pull Request dashboard (#88)\n\n* Add pull request dashboard\n\nGive users an actionable, project-filtered view of review requests, drafts, pending reviews, merge-ready PRs, attention items, and recent merges. Persist accessible group ordering and expose the required workspace PR data through the versioned protocol.\n\n* Bound pull request dashboard requests\n\nLimit cross-workspace fan-out across repeated refreshes, cap PR pagination, and lower per-repository enrichment concurrency to avoid GitHub API request bursts.\n\n* Persist pull request dashboard snapshots\n\nRoute dashboard refreshes through the server event log, replace the state-returning GET with a command-only POST, and fold replayed snapshots in the client.",
+          "timestamp": "2026-07-19T17:04:06-04:00",
+          "tree_id": "c4d82c34fa080fcbf0933db5bb892dbf0a9c9e02",
+          "url": "https://github.com/jimsimon/trouve/commit/afa788b9f6662991d0aab70c3d86ba3028b9daf3"
+        },
+        "date": 1784495124236,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "cold index + query",
+            "value": 131.34109034000002,
+            "range": "± 4.4",
+            "unit": "ms"
+          },
+          {
+            "name": "warm query",
+            "value": 70.42422608,
+            "range": "± 2.8",
+            "unit": "ms"
+          },
+          {
+            "name": "incremental (1 file modified)",
+            "value": 81.47966508000002,
+            "range": "± 2",
+            "unit": "ms"
+          },
+          {
+            "name": "non-git warm query",
+            "value": 68.52702504000003,
+            "range": "± 1.4",
             "unit": "ms"
           }
         ]
