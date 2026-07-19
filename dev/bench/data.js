@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1784504427430,
+  "lastUpdate": 1784504481769,
   "repoUrl": "https://github.com/jimsimon/trouve",
   "entries": {
     "e2e-benchmarks": [
@@ -5809,6 +5809,54 @@ window.BENCHMARK_DATA = {
             "name": "dense_query_20k_rows",
             "value": 1359844.0909090908,
             "range": "± 9981",
+            "unit": "ns"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "jim.j.simon@gmail.com",
+            "name": "Jim Simon",
+            "username": "jimsimon"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "d5fda70b286d47b58a584f3970e56ebde60ca474",
+          "message": "Improve prompt composer controls (#72)\n\n* Improve prompt composer controls\n\n* Address prompt composer review feedback\n\n* Fix new chat Clippy lint\n\n* Harden permission mode selection\n\n* Allow attachment-only new chats",
+          "timestamp": "2026-07-19T19:36:38-04:00",
+          "tree_id": "1b9e0e0ad614136809ec3c2c31b9a4f05e7ce005",
+          "url": "https://github.com/jimsimon/trouve/commit/d5fda70b286d47b58a584f3970e56ebde60ca474"
+        },
+        "date": 1784504481107,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "bm25_build_5k_docs",
+            "value": 4899766.550000001,
+            "range": "± 6339",
+            "unit": "ns"
+          },
+          {
+            "name": "bm25_query_5k_docs",
+            "value": 37369.65676804475,
+            "range": "± 15",
+            "unit": "ns"
+          },
+          {
+            "name": "chunk_python_200_functions",
+            "value": 3038486.5,
+            "range": "± 1938",
+            "unit": "ns"
+          },
+          {
+            "name": "dense_query_20k_rows",
+            "value": 1387102.0059780008,
+            "range": "± 6742",
             "unit": "ns"
           }
         ]
