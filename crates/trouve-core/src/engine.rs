@@ -4872,6 +4872,20 @@ impl Engine {
         tool: &str,
         args: &serde_json::Value,
     ) -> Result<bool> {
+        // A vendor write aimed outside the session worktree is denied
+        // without asking: the vendor executes the tool itself, so this is
+        // the only place trouve can stop an edit from escaping into some
+        // other checkout, and the approval card may render the path
+        // worktree-relative — the user could approve without noticing.
+        if let Some(path) =
+            crate::permissions::escaping_write_path(tool, args, Path::new(&session.worktree_path))
+        {
+            tracing::warn!(
+                "denied vendor tool {tool}: {path} is outside worktree {}",
+                session.worktree_path
+            );
+            return Ok(false);
+        }
         let scope = Scope::Thread(thread.id.clone());
         let key = allow_key(tool, args);
         // Bridged trouve tools are our own: trust the executor's mutability

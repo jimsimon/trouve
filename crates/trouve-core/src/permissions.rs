@@ -2,6 +2,7 @@
 //! approval bookkeeping.
 
 use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use tokio::sync::oneshot;
@@ -105,6 +106,146 @@ pub fn gate(
         PermissionMode::AllowList | PermissionMode::Ask if allow_list.contains(key) => Gate::Allow,
         _ => Gate::NeedsApproval,
     }
+}
+
+/// Vendor-side tools that write to the filesystem, by the names the
+/// backends report: ACP tool-call kinds (cursor), Claude Code built-ins
+/// (bridged approvals), and Codex approval methods. Shell tools are absent
+/// on purpose — arbitrary shell text cannot be path-validated reliably;
+/// the per-worktree process cwd still contains its relative targets.
+fn vendor_tool_writes(tool: &str) -> bool {
+    matches!(
+        tool.to_ascii_lowercase().as_str(),
+        "edit" | "write" | "create" | "delete" | "move" // ACP kinds
+            | "multiedit" | "notebookedit" // Claude Code built-ins
+            | "filechange" // Codex
+    )
+}
+
+/// A key whose value (or self, for absolute-path keys) names a filesystem
+/// target rather than file content.
+fn is_path_key(key: &str) -> bool {
+    let k = key.trim_start_matches('_').to_ascii_lowercase();
+    k == "file" || k == "source" || k == "destination" || k.ends_with("path")
+}
+
+/// Collect path-shaped arguments: values under path-like keys (including
+/// arrays of them) plus object keys that are themselves absolute paths
+/// (Codex file-change maps key on the path). Content strings are never
+/// scanned — a file mentioning `/etc` must not trip the guard.
+fn collect_path_args(v: &serde_json::Value, out: &mut Vec<String>) {
+    match v {
+        serde_json::Value::Object(map) => {
+            for (k, val) in map {
+                if Path::new(k).is_absolute() {
+                    out.push(k.clone());
+                }
+                // Codex file-change approvals use a path-keyed changes map;
+                // those keys may be relative to the turn cwd.
+                if k.eq_ignore_ascii_case("changes")
+                    && let Some(changes) = val.as_object()
+                {
+                    out.extend(changes.keys().filter(|p| !p.is_empty()).cloned());
+                }
+                if is_path_key(k) {
+                    match val {
+                        serde_json::Value::String(s) if !s.is_empty() => out.push(s.clone()),
+                        serde_json::Value::Array(items) => out.extend(
+                            items
+                                .iter()
+                                .filter_map(serde_json::Value::as_str)
+                                .filter(|s| !s.is_empty())
+                                .map(str::to_string),
+                        ),
+                        _ => {}
+                    }
+                }
+                collect_path_args(val, out);
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for item in items {
+                collect_path_args(item, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Resolve `.` and `..` lexically (the target of a write may not exist yet,
+/// so canonicalize can't be the primary check).
+fn normalize(p: &Path) -> PathBuf {
+    use std::path::Component;
+    let mut out = PathBuf::new();
+    for c in p.components() {
+        match c {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                out.pop();
+            }
+            other => out.push(other.as_os_str()),
+        }
+    }
+    out
+}
+
+/// Resolve symlinks in the deepest existing ancestor, then put any missing
+/// suffix back. Unlike `canonicalize`, this also works for a file that a
+/// write is about to create, and catches `worktree/link/new-file` when
+/// `link` points outside the checkout.
+fn canonicalize_existing_ancestor(p: &Path) -> Option<PathBuf> {
+    let mut current = p;
+    let mut missing = Vec::new();
+    loop {
+        match current.canonicalize() {
+            Ok(mut resolved) => {
+                for component in missing.iter().rev() {
+                    resolved.push(component);
+                }
+                return Some(normalize(&resolved));
+            }
+            Err(_) => {
+                missing.push(current.file_name()?.to_os_string());
+                current = current.parent()?;
+            }
+        }
+    }
+}
+
+/// The first path argument of a vendor write that lands outside the session
+/// worktree, if any. Vendors execute these tools themselves, so this is the
+/// engine's only chance to stop a write from escaping the checkout (e.g.
+/// into the main working copy trouve was launched from). Relative paths
+/// resolve against the worktree — the vendor's session cwd — and symlinked
+/// worktrees are tolerated by also comparing canonicalized forms.
+pub fn escaping_write_path(
+    tool: &str,
+    args: &serde_json::Value,
+    worktree: &Path,
+) -> Option<String> {
+    if !vendor_tool_writes(tool) || !worktree.is_absolute() {
+        return None;
+    }
+    let mut bases = vec![normalize(worktree)];
+    if let Ok(canon) = worktree.canonicalize()
+        && !bases.contains(&canon)
+    {
+        bases.push(canon);
+    }
+    let mut paths = Vec::new();
+    collect_path_args(args, &mut paths);
+    paths.into_iter().find(|raw| {
+        let p = Path::new(raw);
+        let abs = if p.is_absolute() {
+            p.to_path_buf()
+        } else {
+            worktree.join(p)
+        };
+        let norm = normalize(&abs);
+        canonicalize_existing_ancestor(&norm)
+            .map(|resolved| !bases.iter().any(|b| resolved.starts_with(b)))
+            .unwrap_or_else(|| !bases.iter().any(|b| norm.starts_with(b)))
+    })
 }
 
 /// Pending approvals: one oneshot per outstanding call, plus the per-session
@@ -305,6 +446,116 @@ mod tests {
                 &serde_json::json!({"command": "git commit -m \"msg\""})
             ),
             "shell:git"
+        );
+    }
+
+    #[test]
+    fn write_paths_outside_the_worktree_are_flagged() {
+        let wt = Path::new("/work/trees/se_1");
+
+        // Absolute path in another checkout (the launch cwd, say).
+        assert_eq!(
+            escaping_write_path(
+                "edit",
+                &serde_json::json!({ "rawInput": { "path": "/home/u/repo/src/main.rs" } }),
+                wt,
+            ),
+            Some("/home/u/repo/src/main.rs".to_string())
+        );
+        // Relative traversal escaping the worktree.
+        assert_eq!(
+            escaping_write_path(
+                "Write",
+                &serde_json::json!({ "file_path": "../../../etc/passwd" }),
+                wt,
+            ),
+            Some("../../../etc/passwd".to_string())
+        );
+        // Codex file-change maps key on the path itself.
+        assert_eq!(
+            escaping_write_path(
+                "fileChange",
+                &serde_json::json!({
+                    "changes": {
+                        "../../evil.rs": { "kind": "add" },
+                        "/tmp/also-evil.rs": { "kind": "add" },
+                    }
+                }),
+                wt,
+            ),
+            Some("../../evil.rs".to_string())
+        );
+
+        // In-worktree targets pass: absolute, relative, ACP locations, and
+        // dotted-but-contained traversal.
+        for args in [
+            serde_json::json!({ "path": "/work/trees/se_1/src/main.rs" }),
+            serde_json::json!({ "path": "src/main.rs" }),
+            serde_json::json!({ "locations": [{ "path": "/work/trees/se_1/a.rs" }] }),
+            serde_json::json!({ "path": "src/../README.md" }),
+        ] {
+            assert_eq!(escaping_write_path("edit", &args, wt), None, "{args}");
+        }
+
+        // Content strings are not scanned for paths.
+        assert_eq!(
+            escaping_write_path(
+                "edit",
+                &serde_json::json!({
+                    "path": "src/main.rs",
+                    "new_string": "include!(\"/etc/passwd\");",
+                }),
+                wt,
+            ),
+            None
+        );
+        // Reads and shell commands are out of scope.
+        assert_eq!(
+            escaping_write_path("read", &serde_json::json!({ "path": "/etc/hosts" }), wt),
+            None
+        );
+        assert_eq!(
+            escaping_write_path(
+                "execute",
+                &serde_json::json!({ "command": "cat /etc/hosts" }),
+                wt,
+            ),
+            None
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn escaping_write_tolerates_symlinked_worktrees() {
+        // Base symlinks to real: a canonical-path target inside a
+        // symlink-addressed worktree must not be denied.
+        let real = tempfile::tempdir().unwrap();
+        let link_dir = tempfile::tempdir().unwrap();
+        let link = link_dir.path().join("wt");
+        std::os::unix::fs::symlink(real.path(), &link).unwrap();
+        let target = real.path().join("f.rs");
+        std::fs::write(&target, "x").unwrap();
+        assert_eq!(
+            escaping_write_path(
+                "edit",
+                &serde_json::json!({ "path": target.to_str().unwrap() }),
+                &link,
+            ),
+            None
+        );
+
+        // A symlink *inside* the worktree that points outside must not turn
+        // into an escape hatch, even when the target file does not exist.
+        let outside = tempfile::tempdir().unwrap();
+        let escape = link.join("escape");
+        std::os::unix::fs::symlink(outside.path(), &escape).unwrap();
+        assert_eq!(
+            escaping_write_path(
+                "edit",
+                &serde_json::json!({ "path": escape.join("new.rs") }),
+                &link,
+            ),
+            Some(escape.join("new.rs").to_string_lossy().into_owned())
         );
     }
 

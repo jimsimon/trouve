@@ -8,7 +8,7 @@
 //! Claude Code rotates its session id on every resume, so we re-persist the
 //! id from each turn's `system/init` / `result` events.
 //!
-//! Permission mapping: `Yolo` → `--dangerously-skip-permissions`,
+//! Permission mapping: `Yolo` → auto-approval through trouve's gate,
 //! `ReadOnly` → disallowed mutating built-ins + trouve's approval gate,
 //! `Ask` → the trouve MCP bridge's `approval_prompt` tool via
 //! `--permission-prompt-tool`, so headless print mode routes permission
@@ -85,7 +85,7 @@ impl Pool {
         let mut procs = self.procs.lock().await;
         let mut dead = Vec::new();
         for (id, p) in procs.iter() {
-            if p.lines.try_lock().is_err() {
+            if Arc::strong_count(p) != 1 || p.lines.try_lock().is_err() {
                 continue; // turn in flight
             }
             if p.last_used.lock().unwrap().elapsed() > IDLE_TIMEOUT {
@@ -104,7 +104,7 @@ impl Pool {
         while procs.len() >= POOL_CAP {
             let lru = procs
                 .iter()
-                .filter(|(_, p)| p.lines.try_lock().is_ok())
+                .filter(|(_, p)| Arc::strong_count(p) == 1 && p.lines.try_lock().is_ok())
                 .min_by_key(|(_, p)| *p.last_used.lock().unwrap())
                 .map(|(id, _)| id.clone());
             let Some(id) = lru else { break }; // all busy: allow overflow
@@ -563,16 +563,18 @@ impl ClaudeBackend {
                     "mcp__trouve__search,mcp__trouve__find_related,mcp__trouve__ask_question",
                 ]);
             }
-            if matches!(
-                turn.permission,
-                BackendPermission::Ask | BackendPermission::ReadOnly
-            ) {
-                cmd.args(["--permission-prompt-tool", "mcp__trouve__approval_prompt"]);
-            }
+            // Even Yolo routes through the engine: it auto-approves normal
+            // calls but still enforces the session-worktree boundary.
+            cmd.args(["--permission-prompt-tool", "mcp__trouve__approval_prompt"]);
         }
         match turn.permission {
             BackendPermission::Yolo => {
-                cmd.arg("--dangerously-skip-permissions");
+                // Direct backend use may have no embedded bridge. Preserve
+                // Yolo semantics in that degraded case; normal engine turns
+                // have a bridge and auto-approve through its path guard.
+                if turn.mcp_bridge.is_none() {
+                    cmd.arg("--dangerously-skip-permissions");
+                }
             }
             // Read-only rides on trouve's approval gate (mutating requests
             // are denied inside trouve) rather than `--permission-mode plan`:

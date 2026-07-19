@@ -314,6 +314,8 @@ fn cursor_acp_stub(dir: &Path) -> String {
         "cursor-agent",
         r##"#!/bin/bash
 echo "$1" > "$0.args"
+pwd > "$0.cwd"
+echo spawned >> "$0.spawns"
 IFS= read -r line # initialize
 echo '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":1}}'
 IFS= read -r line # session/new
@@ -330,6 +332,7 @@ echo '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"sess-1",
 echo '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"sess-1","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"Hi "}}}}'
 echo '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"sess-1","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"there"}}}}'
 echo '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"sess-1","update":{"sessionUpdate":"tool_call","toolCallId":"c1","title":"`ls`","kind":"execute","status":"pending","rawInput":{"command":"ls"}}}}'
+echo '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"sess-1","update":{"sessionUpdate":"tool_call_update","toolCallId":"c1","status":"in_progress"}}}'
 echo '{"jsonrpc":"2.0","id":100,"method":"session/request_permission","params":{"sessionId":"sess-1","toolCall":{"toolCallId":"c1","title":"`ls`","kind":"execute"},"options":[{"optionId":"allow-once","name":"Allow once","kind":"allow_once"},{"optionId":"allow-always","name":"Allow always","kind":"allow_always"},{"optionId":"reject-once","name":"Reject","kind":"reject_once"}]}}'
 IFS= read -r approval
 printf '%s\n' "$approval" > "$0.approval"
@@ -367,12 +370,13 @@ async fn cursor_adapter_speaks_acp_and_bridges_approvals() {
         if let BackendEvent::ApprovalNeeded {
             call_id,
             tool,
+            args,
             responder,
-            ..
         } = ev
         {
             assert_eq!(call_id, "c1");
             assert_eq!(tool, "execute");
+            assert_eq!(args["rawInput"]["command"], "ls");
             responder.send(true).unwrap();
             continue;
         }
@@ -462,6 +466,8 @@ async fn cursor_adapter_speaks_acp_and_bridges_approvals() {
     // The child ran in ACP mode and got our config before the prompt.
     let args = std::fs::read_to_string(format!("{stub}.args")).unwrap();
     assert_eq!(args.trim(), "acp");
+    let cwd = std::fs::read_to_string(format!("{stub}.cwd")).unwrap();
+    assert_eq!(Path::new(cwd.trim()), tmp.path());
     let mode = std::fs::read_to_string(format!("{stub}.mode")).unwrap();
     assert!(mode.contains("\"configId\":\"mode\""), "{mode}");
     assert!(mode.contains("\"value\":\"agent\""), "{mode}");
@@ -480,7 +486,7 @@ async fn cursor_adapter_speaks_acp_and_bridges_approvals() {
 }
 
 #[tokio::test]
-async fn cursor_adapter_auto_approves_in_yolo_and_maps_read_only_to_plan() {
+async fn cursor_adapter_routes_yolo_through_guard_and_maps_read_only_to_plan() {
     let tmp = tempfile::tempdir().unwrap();
     let stub = cursor_acp_stub(tmp.path());
     let backend = CursorBackend::new("cursor", Some(stub.clone()), None);
@@ -489,21 +495,46 @@ async fn cursor_adapter_auto_approves_in_yolo_and_maps_read_only_to_plan() {
     })
     .await;
 
-    // Yolo: the permission request is answered inside the adapter, so no
-    // ApprovalNeeded ever surfaces.
+    // Yolo still surfaces the internal approval event so the engine can
+    // reject an out-of-worktree target. The engine auto-approves safe calls,
+    // represented here by replying true; no user prompt is created.
     let mut saw_approval = false;
     let mut completed = false;
     while let Some(ev) = stream.next().await {
         match ev.unwrap() {
-            BackendEvent::ApprovalNeeded { .. } => saw_approval = true,
+            BackendEvent::ApprovalNeeded { responder, .. } => {
+                saw_approval = true;
+                responder.send(true).unwrap();
+            }
             BackendEvent::Completed { .. } => completed = true,
             _ => {}
         }
     }
-    assert!(!saw_approval);
+    assert!(saw_approval);
     assert!(completed);
     let reply = std::fs::read_to_string(format!("{stub}.approval")).unwrap();
     assert!(reply.contains("allow-once"), "{reply}");
+
+    // A different worktree gets a different cwd-pinned child from the same
+    // backend pool; it cannot inherit or reuse the first child's cwd.
+    let other_worktree = tempfile::tempdir().unwrap();
+    let mut other = start_turn(&backend, || {
+        turn(
+            other_worktree.path().to_path_buf(),
+            None,
+            BackendPermission::Yolo,
+        )
+    })
+    .await;
+    while let Some(ev) = other.next().await {
+        if let BackendEvent::ApprovalNeeded { responder, .. } = ev.unwrap() {
+            responder.send(true).unwrap();
+        }
+    }
+    let cwd = std::fs::read_to_string(format!("{stub}.cwd")).unwrap();
+    assert_eq!(Path::new(cwd.trim()), other_worktree.path());
+    let spawns = std::fs::read_to_string(format!("{stub}.spawns")).unwrap();
+    assert_eq!(spawns.lines().count(), 2, "{spawns}");
 
     // Read-only turns run in cursor's plan mode (fresh process: the shared
     // ACP child is per-backend, so use a new backend instance).
@@ -738,7 +769,7 @@ EOF
 }
 
 #[tokio::test]
-async fn claude_adapter_wires_approval_gate_without_tool_bridge() {
+async fn claude_adapter_routes_yolo_through_gate_without_tool_bridge() {
     let tmp = tempfile::tempdir().unwrap();
     let stub = write_stub(
         tmp.path(),
@@ -752,7 +783,7 @@ EOF
     );
     let backend = ClaudeBackend::new("claude-code", Some(stub.clone()));
     let mut stream = start_turn(&backend, || {
-        let mut t = turn(tmp.path().to_path_buf(), None, BackendPermission::Ask);
+        let mut t = turn(tmp.path().to_path_buf(), None, BackendPermission::Yolo);
         t.thread_id = "th_2".into();
         t.mcp_bridge = Some(trouve_agents::McpBridgeConfig {
             url: "http://127.0.0.1:1/internal/threads/th_2/mcp?tools=0&approval=1".into(),
@@ -766,13 +797,14 @@ EOF
         ev.unwrap();
     }
 
-    // Approvals-only: Claude keeps its built-in tools but permission
-    // requests route to trouve, and trouve's read-only semantic search
-    // tools ride along pre-allowed.
+    // Approvals-only Yolo: Claude keeps its built-ins and trouve auto-allows
+    // normal permission requests, while retaining the worktree path guard.
+    // The read-only semantic search tools ride along pre-allowed.
     let args = std::fs::read_to_string(format!("{stub}.args")).unwrap();
     assert!(args.contains("--mcp-config"), "{args}");
     assert!(args.contains("--permission-prompt-tool"), "{args}");
     assert!(args.contains("mcp__trouve__approval_prompt"), "{args}");
+    assert!(!args.contains("--dangerously-skip-permissions"), "{args}");
     assert!(!args.contains("--disallowedTools"), "{args}");
     assert!(
         args.contains("mcp__trouve__search,mcp__trouve__find_related"),
