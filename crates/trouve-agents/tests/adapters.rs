@@ -539,6 +539,7 @@ read line # initialized notification
 read line # thread/start
 echo '{"jsonrpc":"2.0","id":2,"result":{"thread":{"id":"thr-1"}}}'
 read line # turn/start
+echo "$line" > "$0.turn-start"
 echo '{"jsonrpc":"2.0","id":3,"result":{"turn":{"id":"turn-1"}}}'
 echo '{"jsonrpc":"2.0","method":"item/agentMessage/delta","params":{"threadId":"thr-1","itemId":"i1","delta":"Hello"}}'
 echo '{"jsonrpc":"2.0","method":"item/started","params":{"threadId":"thr-1","item":{"id":"c1","type":"commandExecution","command":"ls"}}}'
@@ -595,6 +596,15 @@ cat > /dev/null
     let usage = usage.expect("turn completed");
     assert_eq!(usage.input_tokens, 11);
     assert_eq!(usage.output_tokens, 4);
+
+    // Outbound network access is explicit because Codex otherwise defaults
+    // workspace-write turns to an offline sandbox.
+    let turn_start = std::fs::read_to_string(format!("{stub}.turn-start")).unwrap();
+    let turn_start: serde_json::Value = serde_json::from_str(&turn_start).unwrap();
+    assert_eq!(
+        turn_start["params"]["sandboxPolicy"],
+        serde_json::json!({ "type": "workspaceWrite", "networkAccess": true })
+    );
 
     // Our approval reply reached the vendor with an accept decision.
     let reply = std::fs::read_to_string(format!("{stub}.approval")).unwrap();
