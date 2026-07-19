@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1784449303290,
+  "lastUpdate": 1784450194092,
   "repoUrl": "https://github.com/jimsimon/trouve",
   "entries": {
     "e2e-benchmarks": [
@@ -2207,6 +2207,54 @@ window.BENCHMARK_DATA = {
             "name": "non-git warm query",
             "value": 67.46985633999999,
             "range": "± 1.3",
+            "unit": "ms"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "jim.j.simon@gmail.com",
+            "name": "Jim Simon",
+            "username": "jimsimon"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "ba9e9b1aecd0c60e8f597257ad71deb690cb52a7",
+          "message": "Improve session list status indicators (#78)\n\n* Improve session list status indicators\n\n* Address session indicator review feedback\n\nStop obsolete event followers, cache attention totals, and bound sidebar PR requests. Preserve unread completion state across event-stream reconnects without treating startup history as new work.\n\n* Retry failed sidebar PR lookups\n\nKeep transient lookup failures out of the navigation PR cache so later session reloads can retry them.",
+          "timestamp": "2026-07-19T04:35:01-04:00",
+          "tree_id": "f7de48f1c758da2425fb2a5de775b14921132f88",
+          "url": "https://github.com/jimsimon/trouve/commit/ba9e9b1aecd0c60e8f597257ad71deb690cb52a7"
+        },
+        "date": 1784450193068,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "cold index + query",
+            "value": 112.6376152,
+            "range": "± 12.5",
+            "unit": "ms"
+          },
+          {
+            "name": "warm query",
+            "value": 55.30018286000001,
+            "range": "± 2.9",
+            "unit": "ms"
+          },
+          {
+            "name": "incremental (1 file modified)",
+            "value": 74.08038866000001,
+            "range": "± 88.5",
+            "unit": "ms"
+          },
+          {
+            "name": "non-git warm query",
+            "value": 55.62856920000001,
+            "range": "± 3",
             "unit": "ms"
           }
         ]
