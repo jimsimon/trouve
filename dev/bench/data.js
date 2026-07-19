@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1784448486193,
+  "lastUpdate": 1784448527630,
   "repoUrl": "https://github.com/jimsimon/trouve",
   "entries": {
     "e2e-benchmarks": [
@@ -4273,6 +4273,54 @@ window.BENCHMARK_DATA = {
             "name": "dense_query_20k_rows",
             "value": 954251.7680704899,
             "range": "± 2378",
+            "unit": "ns"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "jim.j.simon@gmail.com",
+            "name": "Jim Simon",
+            "username": "jimsimon"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "85ddf1d0968fe08dd096bc0fdf84adf3fa07ec63",
+          "message": "Allow Codex Git writes in mutable modes (#76)\n\nCodex workspace-write makes linked worktree metadata read-only, so even index locks fail. Run mutable Codex turns without its OS sandbox while preserving Ask approvals and the read-only sandbox.",
+          "timestamp": "2026-07-19T04:05:44-04:00",
+          "tree_id": "b9b9361e691bb53d84f79eb8f41558e4b650ef72",
+          "url": "https://github.com/jimsimon/trouve/commit/85ddf1d0968fe08dd096bc0fdf84adf3fa07ec63"
+        },
+        "date": 1784448527211,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "bm25_build_5k_docs",
+            "value": 5161549.050000001,
+            "range": "± 14716",
+            "unit": "ns"
+          },
+          {
+            "name": "bm25_query_5k_docs",
+            "value": 36894.469001421836,
+            "range": "± 5",
+            "unit": "ns"
+          },
+          {
+            "name": "chunk_python_200_functions",
+            "value": 2842177.972222222,
+            "range": "± 1707",
+            "unit": "ns"
+          },
+          {
+            "name": "dense_query_20k_rows",
+            "value": 1567714.0028846152,
+            "range": "± 15831",
             "unit": "ns"
           }
         ]
