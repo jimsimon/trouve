@@ -6,8 +6,8 @@
 //! in env values expands from the process environment so secrets stay out
 //! of the file). Discovered tools surface as `mcp__<server>__<tool>` through
 //! the normal `ToolExecutor` chokepoint; the permission layer requires
-//! first-use approval per server per session, even in yolo mode (invariant
-//! 3 + prompt-injection guidance in the plan).
+//! first-use approval per server per session in ask and allow-list modes
+//! (yolo skips all approval prompts).
 //!
 //! Trust boundary: only servers whose winning definition comes from the
 //! user's own config dir are ever spawned automatically. A repo's
