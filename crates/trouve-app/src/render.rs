@@ -27,6 +27,9 @@ pub struct ChatRowData {
     /// Syntax-highlighted code-fence lines, computed on the controller
     /// thread so the Slint event loop only maps plain segment data.
     pub code_lines: Vec<Vec<(String, u32)>>,
+    /// Table cells as (inline-markdown, alignment) pairs. Alignment is
+    /// 0 default, 1 left, 2 center, 3 right.
+    pub table_rows: Vec<Vec<(String, i32)>>,
     pub text: String,
     /// Markdown source for inline styling (bold/italic/code/links) of
     /// non-code markdown blocks; the UI thread parses it into a Slint
@@ -200,6 +203,7 @@ fn md_kind(kind: BlockKind) -> i32 {
         BlockKind::Bullet => 4,
         BlockKind::Code => 5,
         BlockKind::Numbered => 6,
+        BlockKind::Table => 7,
     }
 }
 
@@ -1213,7 +1217,7 @@ fn push_blocks(body: &mut Vec<(ChatRowData, Option<String>)>, content: &str) {
         // StyledText with block-level structure (heading weight, bullet
         // glyph) re-applied as markup. Code fences stay plain text.
         let styled_md = match block.kind {
-            BlockKind::Code => String::new(),
+            BlockKind::Code | BlockKind::Table => String::new(),
             BlockKind::H1 | BlockKind::H2 | BlockKind::H3 => {
                 format!("**{}**", block.text)
             }
@@ -1229,6 +1233,23 @@ fn push_blocks(body: &mut Vec<(ChatRowData, Option<String>)>, content: &str) {
             }
             BlockKind::Paragraph => block.text.clone(),
         };
+        let table_rows = block
+            .table_rows
+            .iter()
+            .enumerate()
+            .map(|(row_index, row)| {
+                row.iter()
+                    .map(|cell| {
+                        let markdown = if row_index == 0 {
+                            format!("**{}**", cell.text)
+                        } else {
+                            cell.text.clone()
+                        };
+                        (tint_code_spans(&markdown), cell.alignment.as_int())
+                    })
+                    .collect()
+            })
+            .collect();
         // Inline code spans get a distinct color; code fences are
         // excluded (empty styled_md).
         let styled_md = tint_code_spans(&styled_md);
@@ -1239,6 +1260,7 @@ fn push_blocks(body: &mut Vec<(ChatRowData, Option<String>)>, content: &str) {
                 md_indent: block.indent,
                 md_lang: block.language,
                 code_lines,
+                table_rows,
                 text: block.text,
                 styled_md,
                 ..Default::default()
@@ -1794,6 +1816,17 @@ fn plain_text(md: &str) -> String {
         .map(|b| match b.kind {
             BlockKind::Code => b.text.clone(),
             BlockKind::Bullet => format!("{}•  {}", "  ".repeat(b.indent as usize), strip(&b.text)),
+            BlockKind::Table => b
+                .table_rows
+                .iter()
+                .map(|row| {
+                    row.iter()
+                        .map(|cell| strip(&cell.text))
+                        .collect::<Vec<_>>()
+                        .join(" | ")
+                })
+                .collect::<Vec<_>>()
+                .join("\n"),
             _ => strip(&b.text),
         })
         .collect::<Vec<_>>()
@@ -1991,6 +2024,30 @@ mod tests {
                 .iter()
                 .flatten()
                 .any(|(text, _)| text.contains("fn"))
+        );
+    }
+
+    #[test]
+    fn markdown_tables_keep_cells_inline_markup_and_alignment() {
+        let rows = markdown_rows("| Name | Result |\n| :--- | ---: |\n| build | `passing` |");
+        let table = rows.iter().find(|row| row.md_kind == 7).unwrap();
+        assert_eq!(table.table_rows.len(), 2);
+        assert_eq!(table.table_rows[0][0], ("**Name**".into(), 1));
+        assert_eq!(table.table_rows[0][1], ("**Result**".into(), 3));
+        assert!(table.table_rows[1][1].0.contains("<font color="));
+        assert_eq!(
+            table.text,
+            "| Name | Result |\n| :--- | ---: |\n| build | `passing` |"
+        );
+    }
+
+    #[test]
+    fn plain_text_formats_table_cells_and_rows_as_displayed() {
+        let markdown =
+            "| **Name** | Result |\n| --- | --- |\n| `build` | **passing** |\n| test | `ok` |";
+        assert_eq!(
+            plain_text(markdown),
+            "Name | Result\nbuild | passing\ntest | ok"
         );
     }
 

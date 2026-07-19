@@ -17,7 +17,13 @@ streams from the model. The renderer only updates trailing blocks.
 
 - the paragraph above growing without flicker
 - bullets appearing one at a time
+- a table gaining rows without rebuilding earlier blocks
 - a code fence that renders while still open
+
+| Feature | Status | Alignment |
+| :--- | :---: | ---: |
+| Streaming | ready | right |
+| Tables | ready | right |
 
 ```rust
 fn main() {

@@ -1,7 +1,7 @@
 //! Streaming markdown for Slint.
 //!
 //! [`parse_blocks`] converts markdown text into flat blocks (headings,
-//! paragraphs, bullets, code fences) rendered by the `MarkdownView`
+//! paragraphs, bullets, tables, code fences) rendered by the `MarkdownView`
 //! component. [`StreamingMarkdown`] keeps a live block model in sync while
 //! text streams in token-by-token: each append only touches the trailing
 //! blocks that actually changed, so long documents never re-layout from
@@ -26,6 +26,8 @@ pub enum BlockKind {
     Code,
     /// Ordered-list item; the marker ("1.", "2)") stays in the text.
     Numbered,
+    /// A GFM-style table, including its header row.
+    Table,
 }
 
 impl BlockKind {
@@ -38,8 +40,34 @@ impl BlockKind {
             BlockKind::Bullet => 4,
             BlockKind::Code => 5,
             BlockKind::Numbered => 6,
+            BlockKind::Table => 7,
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TableAlignment {
+    Default,
+    Left,
+    Center,
+    Right,
+}
+
+impl TableAlignment {
+    pub fn as_int(self) -> i32 {
+        match self {
+            Self::Default => 0,
+            Self::Left => 1,
+            Self::Center => 2,
+            Self::Right => 3,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TableCell {
+    pub text: String,
+    pub alignment: TableAlignment,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -49,6 +77,8 @@ pub struct Block {
     pub language: String,
     /// Nesting level for list items (0 = top level), from leading spaces.
     pub indent: i32,
+    /// Header followed by body rows for [`BlockKind::Table`].
+    pub table_rows: Vec<Vec<TableCell>>,
 }
 
 impl Block {
@@ -58,6 +88,7 @@ impl Block {
             text: text.into(),
             language: String::new(),
             indent: 0,
+            table_rows: Vec::new(),
         }
     }
 }
@@ -99,11 +130,102 @@ fn split_heading(s: &str) -> Option<(BlockKind, &str)> {
     Some((kind, s[hashes..].strip_prefix(' ')?))
 }
 
+/// Split a table row on unescaped pipes. Leading and trailing pipes are
+/// structural and are not returned as empty cells.
+fn split_table_row(line: &str) -> Option<Vec<String>> {
+    let line = line.trim();
+    if line.is_empty() {
+        return None;
+    }
+
+    let mut separators = Vec::new();
+    let mut backslashes = 0;
+    for (index, ch) in line.char_indices() {
+        if ch == '\\' {
+            backslashes += 1;
+            continue;
+        }
+        if ch == '|' && backslashes % 2 == 0 {
+            separators.push(index);
+        }
+        backslashes = 0;
+    }
+    if separators.is_empty() {
+        return None;
+    }
+
+    let leading_pipe = separators.first() == Some(&0);
+    let trailing_pipe = separators
+        .last()
+        .is_some_and(|index| *index + 1 == line.len());
+    let mut cells = Vec::with_capacity(separators.len() + 1);
+    let mut start = 0;
+    for separator in separators {
+        cells.push(clean_table_cell(&line[start..separator]));
+        start = separator + 1;
+    }
+    cells.push(clean_table_cell(&line[start..]));
+    if leading_pipe {
+        cells.remove(0);
+    }
+    if trailing_pipe {
+        cells.pop();
+    }
+    (!cells.is_empty()).then_some(cells)
+}
+
+/// Once pipes have been split structurally, their backslash escapes are no
+/// longer needed and would otherwise show up in the plain-text widget.
+fn clean_table_cell(cell: &str) -> String {
+    let mut out = String::with_capacity(cell.len());
+    let mut chars = cell.trim().chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch == '\\' && chars.peek() == Some(&'|') {
+            out.push('|');
+            chars.next();
+        } else {
+            out.push(ch);
+        }
+    }
+    out
+}
+
+fn delimiter_alignments(cells: &[String]) -> Option<Vec<TableAlignment>> {
+    cells
+        .iter()
+        .map(|cell| {
+            let cell = cell.trim();
+            let left = cell.starts_with(':');
+            let right = cell.ends_with(':');
+            let dashes = cell.trim_matches(':');
+            if dashes.is_empty() || !dashes.bytes().all(|byte| byte == b'-') {
+                return None;
+            }
+            Some(match (left, right) {
+                (true, true) => TableAlignment::Center,
+                (true, false) => TableAlignment::Left,
+                (false, true) => TableAlignment::Right,
+                (false, false) => TableAlignment::Default,
+            })
+        })
+        .collect()
+}
+
+fn table_row(cells: Vec<String>, alignments: &[TableAlignment]) -> Vec<TableCell> {
+    (0..alignments.len())
+        .map(|column| TableCell {
+            text: cells.get(column).cloned().unwrap_or_default(),
+            alignment: alignments[column],
+        })
+        .collect()
+}
+
 /// Parse markdown into flat blocks. Supports headings (# through ######),
 /// bullets (-/*/+) and ordered lists (1. / 1)) with nesting from
-/// indentation, fenced code blocks (``` with optional language), and
-/// paragraphs. Indented lines directly under a list item continue that
-/// item. Inline styling is left in the text for the renderer.
+/// indentation, GFM-style tables with column alignment, fenced code blocks
+/// (``` with optional language), and paragraphs. Indented lines directly
+/// under a list item continue that item. Inline styling is left in the text
+/// for the renderer.
 pub fn parse_blocks(text: &str) -> Vec<Block> {
     let mut blocks: Vec<Block> = Vec::new();
     let mut paragraph: Vec<&str> = Vec::new();
@@ -122,7 +244,8 @@ pub fn parse_blocks(text: &str) -> Vec<Block> {
         }
     };
 
-    for line in text.lines() {
+    let mut input = text.lines().peekable();
+    while let Some(line) = input.next() {
         if let Some((ticks, lang, lines)) = code.as_mut() {
             // Only a closing fence at least as long as the opener (and
             // nothing but backticks) ends the block; shorter fences are
@@ -142,7 +265,29 @@ pub fn parse_blocks(text: &str) -> Vec<Block> {
         let trimmed = line.trim_start();
         let leading = line.len() - trimmed.len();
         let indent = ((leading as i32) / 2).min(4);
-        if let Some((ticks, lang)) = split_fence(trimmed) {
+        let table = split_table_row(trimmed).and_then(|header| {
+            let delimiters = split_table_row(input.peek().copied()?)?;
+            let alignments = delimiter_alignments(&delimiters)?;
+            (header.len() == alignments.len()).then_some((header, alignments))
+        });
+        if let Some((header, alignments)) = table {
+            flush_paragraph(&mut blocks, &mut paragraph);
+            let delimiter = input.next().expect("peeked table delimiter exists");
+            let mut source = vec![line, delimiter];
+            let mut rows = vec![table_row(header, &alignments)];
+            while let Some(next) = input.peek().copied() {
+                let Some(cells) = split_table_row(next) else {
+                    break;
+                };
+                input.next();
+                source.push(next);
+                rows.push(table_row(cells, &alignments));
+            }
+            let mut block = Block::new(BlockKind::Table, source.join("\n"));
+            block.table_rows = rows;
+            blocks.push(block);
+            list_open = false;
+        } else if let Some((ticks, lang)) = split_fence(trimmed) {
             flush_paragraph(&mut blocks, &mut paragraph);
             code = Some((ticks, lang.to_string(), Vec::new()));
             list_open = false;
@@ -190,11 +335,26 @@ pub fn parse_blocks(text: &str) -> Vec<Block> {
 }
 
 fn to_widget_block(b: &Block) -> MarkdownBlock {
+    let table_rows: Vec<ModelRc<MarkdownTableCell>> = b
+        .table_rows
+        .iter()
+        .map(|row| {
+            ModelRc::new(VecModel::from(
+                row.iter()
+                    .map(|cell| MarkdownTableCell {
+                        text: SharedString::from(cell.text.as_str()),
+                        alignment: cell.alignment.as_int(),
+                    })
+                    .collect::<Vec<_>>(),
+            ))
+        })
+        .collect();
     MarkdownBlock {
         kind: b.kind.as_int(),
         text: SharedString::from(b.text.as_str()),
         language: SharedString::from(b.language.as_str()),
         indent: b.indent,
+        table_rows: ModelRc::new(VecModel::from(table_rows)),
     }
 }
 
@@ -378,8 +538,62 @@ mod tests {
     }
 
     #[test]
+    fn parses_gfm_tables_with_alignment_and_inline_markdown() {
+        let blocks = parse_blocks(
+            "before\n\n| Name | Score | Note |\n| :--- | ---: | :---: |\n| Alice | 10 | **great** |\n| Bob | 8 | `ok` |\n\nafter",
+        );
+        assert_eq!(
+            blocks.iter().map(|block| block.kind).collect::<Vec<_>>(),
+            vec![BlockKind::Paragraph, BlockKind::Table, BlockKind::Paragraph]
+        );
+        let table = &blocks[1];
+        assert_eq!(table.table_rows.len(), 3);
+        assert_eq!(
+            table.table_rows[0]
+                .iter()
+                .map(|cell| cell.text.as_str())
+                .collect::<Vec<_>>(),
+            vec!["Name", "Score", "Note"]
+        );
+        assert_eq!(table.table_rows[1][2].text, "**great**");
+        assert_eq!(table.table_rows[0][0].alignment, TableAlignment::Left);
+        assert_eq!(table.table_rows[0][1].alignment, TableAlignment::Right);
+        assert_eq!(table.table_rows[0][2].alignment, TableAlignment::Center);
+    }
+
+    #[test]
+    fn table_rows_unescape_pipes_and_normalize_column_counts() {
+        let blocks =
+            parse_blocks("A | B\n--- | ---\nleft | escaped \\| pipe\nonly one\nnot a table row");
+        assert_eq!(blocks[0].kind, BlockKind::Table);
+        // A row without a pipe ends the table; missing cells in a pipe row
+        // would be padded and excess cells ignored.
+        assert_eq!(blocks[0].table_rows.len(), 2);
+        assert_eq!(blocks[0].table_rows[1][1].text, "escaped | pipe");
+        assert_eq!(blocks[1].kind, BlockKind::Paragraph);
+        assert_eq!(blocks[1].text, "only one not a table row");
+
+        let blocks = parse_blocks("| A | B |\n| - | - |\n| one |\n| x | y | ignored |");
+        assert_eq!(blocks[0].table_rows[1][1].text, "");
+        assert_eq!(blocks[0].table_rows[2].len(), 2);
+        assert_eq!(blocks[0].table_rows[2][1].text, "y");
+    }
+
+    #[test]
+    fn invalid_table_delimiters_stay_paragraphs() {
+        for markdown in ["A | B\nwords | here", "A | B\n--- |", "plain\n---"] {
+            let blocks = parse_blocks(markdown);
+            assert!(
+                blocks
+                    .iter()
+                    .all(|block| block.kind == BlockKind::Paragraph)
+            );
+        }
+    }
+
+    #[test]
     fn streaming_matches_batch_and_touches_only_the_tail() {
-        let full = "# Title\n\nA paragraph that grows over time.\n\n- item one\n- item two\n\n```rust\nfn main() {}\n```\n";
+        let full = "# Title\n\nA paragraph that grows over time.\n\n- item one\n- item two\n\n| Name | Value |\n| :--- | ---: |\n| alpha | 10 |\n| beta | 20 |\n\n```rust\nfn main() {}\n```\n";
         let mut streaming = StreamingMarkdown::new();
         // Feed in small chunks.
         let mut max_touched_after_warmup = 0;

@@ -6,13 +6,22 @@
 
 import { ListView } from "std-widgets.slint";
 
+export struct MarkdownTableCell {
+    text: string,
+    // 0 default, 1 left, 2 center, 3 right.
+    alignment: int,
+}
+
 export struct MarkdownBlock {
-    // 0 paragraph, 1 h1, 2 h2, 3 h3, 4 bullet, 5 code fence, 6 numbered
+    // 0 paragraph, 1 h1, 2 h2, 3 h3, 4 bullet, 5 code fence, 6 numbered,
+    // 7 table.
     kind: int,
     text: string,
     language: string,
     // Nesting level for list items (0 = top level).
     indent: int,
+    // Header followed by body rows for tables.
+    table-rows: [[MarkdownTableCell]],
 }
 
 export component MarkdownView inherits Rectangle {
@@ -20,6 +29,9 @@ export component MarkdownView inherits Rectangle {
     in property <length> body-font-size: 14px;
     in property <color> foreground: #d4d4d4;
     in property <string> code-font-family: "monospace";
+    in property <color> table-border: #484848;
+    in property <color> table-header-background: #303030;
+    in property <color> table-row-background: #242424;
 
     background: transparent;
 
@@ -44,7 +56,7 @@ export component MarkdownView inherits Rectangle {
                     : block.kind == 5 ? 10px : 0px;
                 padding-right: 4px;
 
-                Text {
+                if block.kind != 7: Text {
                     text: block.kind == 4 ? "•  " + block.text : block.text;
                     wrap: word-wrap;
                     color: root.foreground;
@@ -54,6 +66,42 @@ export component MarkdownView inherits Rectangle {
                         : root.body-font-size;
                     font-weight: block.kind >= 1 && block.kind <= 3 ? 700 : 400;
                     font-family: block.kind == 5 ? root.code-font-family : "";
+                }
+
+                if block.kind == 7: Rectangle {
+                    background: root.table-border;
+                    clip: true;
+                    border-radius: 4px;
+
+                    VerticalLayout {
+                        padding: 1px;
+                        spacing: 1px;
+
+                        for table-row[row-index] in block.table-rows: HorizontalLayout {
+                            spacing: 1px;
+
+                            for cell in table-row: Rectangle {
+                                horizontal-stretch: 1;
+                                background: row-index == 0
+                                    ? root.table-header-background
+                                    : root.table-row-background;
+
+                                VerticalLayout {
+                                    padding: 6px;
+
+                                    Text {
+                                        text: cell.text;
+                                        wrap: word-wrap;
+                                        color: root.foreground;
+                                        font-size: root.body-font-size;
+                                        font-weight: row-index == 0 ? 700 : 400;
+                                        horizontal-alignment: cell.alignment == 3 ? right
+                                            : cell.alignment == 2 ? center : left;
+                                    }
+                                }
+                            }
+                        }
+                    }
                 }
             }
         }
