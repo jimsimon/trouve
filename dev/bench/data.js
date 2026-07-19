@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1784489979440,
+  "lastUpdate": 1784490078873,
   "repoUrl": "https://github.com/jimsimon/trouve",
   "entries": {
     "e2e-benchmarks": [
@@ -2399,6 +2399,54 @@ window.BENCHMARK_DATA = {
             "name": "non-git warm query",
             "value": 75.47462132000001,
             "range": "± 2.8",
+            "unit": "ms"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "29139614+renovate[bot]@users.noreply.github.com",
+            "name": "renovate[bot]",
+            "username": "renovate[bot]"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "0e6584c2b5459fca290c9b00ca5ee7391bc9fdd3",
+          "message": "Update dependency @types/node to v24 (#36)\n\nCo-authored-by: renovate[bot] <29139614+renovate[bot]@users.noreply.github.com>",
+          "timestamp": "2026-07-19T15:38:37-04:00",
+          "tree_id": "b38fa27a56472dfa5699f0d2a1f7158024a1a1fb",
+          "url": "https://github.com/jimsimon/trouve/commit/0e6584c2b5459fca290c9b00ca5ee7391bc9fdd3"
+        },
+        "date": 1784490077440,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "cold index + query",
+            "value": 137.85435788,
+            "range": "± 14.9",
+            "unit": "ms"
+          },
+          {
+            "name": "warm query",
+            "value": 61.695322180000005,
+            "range": "± 2.2",
+            "unit": "ms"
+          },
+          {
+            "name": "incremental (1 file modified)",
+            "value": 80.90836964,
+            "range": "± 18.3",
+            "unit": "ms"
+          },
+          {
+            "name": "non-git warm query",
+            "value": 61.56436968,
+            "range": "± 1.7",
             "unit": "ms"
           }
         ]
