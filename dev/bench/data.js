@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1784434407109,
+  "lastUpdate": 1784448134298,
   "repoUrl": "https://github.com/jimsimon/trouve",
   "entries": {
     "e2e-benchmarks": [
@@ -2014,6 +2014,54 @@ window.BENCHMARK_DATA = {
           {
             "name": "non-git warm query",
             "value": 64.28154728,
+            "range": "± 1.7",
+            "unit": "ms"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "jim.j.simon@gmail.com",
+            "name": "Jim Simon",
+            "username": "jimsimon"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "4b91ef782469c7a303d0a7978eb385e6f7b74efc",
+          "message": "Add configurable thinking defaults (#75)\n\nPersist a global thinking level and optional per-mode overrides. Resolve inherited levels through each selected model schema so unsupported controls stay hidden and provider-specific keys remain correct.",
+          "timestamp": "2026-07-19T03:59:39-04:00",
+          "tree_id": "0978450ec76c9c0a7420812f2c54d8aae38c1b5a",
+          "url": "https://github.com/jimsimon/trouve/commit/4b91ef782469c7a303d0a7978eb385e6f7b74efc"
+        },
+        "date": 1784448133515,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "cold index + query",
+            "value": 127.94186326,
+            "range": "± 768.6",
+            "unit": "ms"
+          },
+          {
+            "name": "warm query",
+            "value": 69.00071248,
+            "range": "± 1.9",
+            "unit": "ms"
+          },
+          {
+            "name": "incremental (1 file modified)",
+            "value": 81.28731204,
+            "range": "± 1.5",
+            "unit": "ms"
+          },
+          {
+            "name": "non-git warm query",
+            "value": 66.5837597,
             "range": "± 1.7",
             "unit": "ms"
           }
