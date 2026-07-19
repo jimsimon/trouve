@@ -196,6 +196,20 @@ pub fn save_notifications(notifications: &Notifications) {
     write_json(config_path("notifications.json"), notifications);
 }
 
+/// The workspace sidebar order is a frontend preference: other clients may
+/// arrange the same server's workspaces differently.
+pub fn load_workspace_order() -> Vec<String> {
+    let read = || {
+        let text = std::fs::read_to_string(config_path("workspace-order.json")?).ok()?;
+        serde_json::from_str::<Vec<String>>(&text).ok()
+    };
+    read().unwrap_or_default()
+}
+
+pub fn save_workspace_order(order: &[String]) {
+    write_json(config_path("workspace-order.json"), &order);
+}
+
 pub fn load_resume() -> Resume {
     let read = || {
         let text = std::fs::read_to_string(resume_path()?).ok()?;
