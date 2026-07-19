@@ -300,6 +300,118 @@ fn tool_label(tool: &str, args: &serde_json::Value) -> String {
     }
 }
 
+/// Activity label for equivalent tool names emitted by trouve's native loop
+/// and the Claude, Cursor, and Codex vendor harnesses.
+fn tool_activity_label(tool: &str, args: &serde_json::Value) -> String {
+    if let Some((server, name)) = tool
+        .strip_prefix("mcp__")
+        .and_then(|rest| rest.split_once("__"))
+    {
+        return if server == "trouve" {
+            tool_activity_label(name, args)
+        } else {
+            format!("Using {server}…")
+        };
+    }
+
+    let normalized: String = tool
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .flat_map(char::to_lowercase)
+        .collect();
+
+    // Codex app-server wraps the underlying name in its generic tool item.
+    // Recover it when possible so trouve's bridged search, for example,
+    // still reads as code search.
+    if matches!(normalized.as_str(), "mcptoolcall" | "dynamictoolcall") {
+        let server = args
+            .get("serverName")
+            .or_else(|| args.get("server"))
+            .and_then(serde_json::Value::as_str);
+        if let Some(server) = server.filter(|s| *s != "trouve" && !s.is_empty()) {
+            return format!("Using {server}…");
+        }
+        if server.is_none_or(|s| s == "trouve")
+            && let Some(name) = ["toolName", "tool", "name"]
+                .iter()
+                .find_map(|key| args.get(*key).and_then(serde_json::Value::as_str))
+            && name != tool
+        {
+            return tool_activity_label(name, args);
+        }
+    }
+
+    // Cursor approval fallbacks can carry a broad family ("execute") but a
+    // more precise human title. Use only unambiguous title hints here.
+    let title = args
+        .get("title")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let label = if title.contains("web search") {
+        Some("Searching the web…")
+    } else if title.contains("code search") || title.contains("find related") {
+        Some("Searching through code…")
+    } else {
+        match normalized.as_str() {
+            "edit" | "multiedit" | "notebookedit" | "write" | "editfile" | "writefile"
+            | "createfile" | "applypatch" | "delete" | "deletefile" | "filechange" => {
+                Some("Editing files…")
+            }
+            "read" | "readfile" | "listdir" => Some("Reading files…"),
+            "shell" | "bash" | "execute" | "commandexecution" | "shelloutput" | "shellkill" => {
+                Some("Running commands…")
+            }
+            "search" | "findrelated" | "grep" | "glob" => Some("Searching through code…"),
+            "websearch" => Some("Searching the web…"),
+            "webfetch" => Some("Fetching web content…"),
+            "todowrite" | "createplan" | "updateplan" => Some("Updating the plan…"),
+            "task" | "agent" | "spawnagent" | "collabagenttoolcall" => Some("Delegating work…"),
+            _ => None,
+        }
+    };
+    label
+        .map(str::to_string)
+        .unwrap_or_else(|| format!("Using {}…", tool_display_name(tool)))
+}
+
+fn running_activity_label(vm: &ThreadViewModel) -> String {
+    if vm.thinking {
+        return "Thinking…".into();
+    }
+
+    // Ignore a stale unfinished card from a previous turn. Real folded
+    // state always has a running turn marker; scanning everything remains a
+    // useful fallback for lightweight render fixtures.
+    let start = vm
+        .items
+        .iter()
+        .rposition(|item| {
+            matches!(
+                item,
+                ChatItem::TurnStatus {
+                    state: TurnState::Running,
+                    ..
+                }
+            )
+        })
+        .map_or(0, |i| i + 1);
+    let active = vm.items[start..].iter().rev().find_map(|item| match item {
+        ChatItem::ToolCall {
+            tool,
+            args,
+            status: ToolCallStatus::Running,
+            ..
+        } => Some((tool.as_str(), args)),
+        _ => None,
+    });
+    let Some((tool, args)) = active else {
+        return "Processing…".into();
+    };
+
+    tool_activity_label(tool, args)
+}
+
 /// Flatten a thread's chat items into rows. Returns the rows plus a parallel
 /// map from row index to the tool call id (for approvals/expansion).
 /// Turns listed in `raw_turns` render their assistant text as one plain
@@ -571,14 +683,9 @@ pub fn chat_rows(
         }
     }
     if vm.turn_running {
-        let label = if vm.thinking {
-            "Thinking…"
-        } else {
-            "Processing…"
-        };
         let mut activity = ChatRowData {
             kind: 5,
-            text: label.into(),
+            text: running_activity_label(vm),
             ..Default::default()
         };
         // Nest the activity row at the bottom of the Agent card being
@@ -2019,6 +2126,7 @@ mod tests {
             &HashMap::new(),
         );
         assert_eq!(rows.last().unwrap().text, "Thinking…");
+        vm.thinking = false;
 
         // With the running turn's Agent card open at the tail, the activity
         // row nests as the card's last body row instead of standing alone.
@@ -2070,6 +2178,85 @@ mod tests {
             &HashMap::new(),
         );
         assert!(rows.is_empty());
+    }
+
+    #[test]
+    fn running_tools_describe_their_activity() {
+        let label = |tool: &str, args: serde_json::Value| {
+            let vm = ThreadViewModel {
+                items: vec![ChatItem::ToolCall {
+                    call_id: "c1".into(),
+                    tool: tool.into(),
+                    args,
+                    status: ToolCallStatus::Running,
+                    result: None,
+                }],
+                turn_running: true,
+                ..Default::default()
+            };
+            running_activity_label(&vm)
+        };
+
+        let cases = [
+            ("Edit", serde_json::json!({}), "Editing files…"),
+            (
+                "mcp__trouve__search",
+                serde_json::json!({}),
+                "Searching through code…",
+            ),
+            ("WebSearch", serde_json::json!({}), "Searching the web…"),
+            (
+                "execute",
+                serde_json::json!({"title": "Web Search"}),
+                "Searching the web…",
+            ),
+            (
+                "mcpToolCall",
+                serde_json::json!({"serverName": "trouve", "toolName": "find_related"}),
+                "Searching through code…",
+            ),
+            (
+                "mcpToolCall",
+                serde_json::json!({"serverName": "github", "toolName": "list_issues"}),
+                "Using github…",
+            ),
+            (
+                "commandExecution",
+                serde_json::json!({}),
+                "Running commands…",
+            ),
+            ("read_file", serde_json::json!({}), "Reading files…"),
+            ("web_fetch", serde_json::json!({}), "Fetching web content…"),
+            ("todo_write", serde_json::json!({}), "Updating the plan…"),
+            ("Task", serde_json::json!({}), "Delegating work…"),
+        ];
+        for (tool, args, expected) in cases {
+            assert_eq!(label(tool, args), expected, "tool: {tool}");
+        }
+    }
+
+    #[test]
+    fn activity_uses_only_running_tools_from_the_current_turn() {
+        let tool = |status| ChatItem::ToolCall {
+            call_id: "c1".into(),
+            tool: "WebSearch".into(),
+            args: serde_json::json!({}),
+            status,
+            result: None,
+        };
+        let vm = ThreadViewModel {
+            items: vec![
+                tool(ToolCallStatus::Running),
+                ChatItem::TurnStatus {
+                    turn: 2,
+                    state: TurnState::Running,
+                },
+                tool(ToolCallStatus::AwaitingApproval),
+            ],
+            turn_running: true,
+            ..Default::default()
+        };
+        assert_eq!(running_activity_label(&vm), "Processing…");
     }
 
     #[test]

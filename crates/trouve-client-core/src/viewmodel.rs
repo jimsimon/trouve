@@ -86,7 +86,7 @@ pub struct ThreadViewModel {
     /// True while a turn is running (between turn.started and completion).
     pub turn_running: bool,
     /// True while the model is streaming thinking and nothing has followed
-    /// it yet ("Thinking…" vs "Processing…" activity label).
+    /// it yet (the "Thinking…" activity label takes priority over tools).
     pub thinking: bool,
     /// The model that ran each turn ("cursor/claude-fable-5"), from
     /// turn.started — shown in the agent card header.
