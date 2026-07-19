@@ -452,6 +452,8 @@ global Tip {
 // keyboard activation (Tab to focus, Enter/Space to click).
 component IconButton inherits Rectangle {
     in property <string> icon;
+    in property <image> icon-image;
+    in property <bool> use-icon-image: false;
     in property <string> tip;
     in property <bool> enabled: true;
     in property <length> icon-size: Theme.fs(12px);
@@ -467,6 +469,15 @@ component IconButton inherits Rectangle {
     background: ta.has-hover && root.enabled ? root.hover-bg : root.idle-bg;
     border-width: fs.has-focus ? 1px : 0px;
     border-color: Theme.c.accent;
+
+    if root.use-icon-image: Image {
+        source: root.icon-image;
+        width: root.icon-size;
+        height: root.icon-size;
+        x: (parent.width - self.width) / 2;
+        y: (parent.height - self.height) / 2;
+        colorize: ta.has-hover ? root.hover-icon-color : root.icon-color;
+    }
 
     property <int> tip-token: -1;
     function tip-changed(on: bool) {
@@ -2303,26 +2314,64 @@ export component AppWindow inherits Window {
                         if row.kind == 1: HorizontalLayout {
                             padding-left: 8px;
                             padding-right: 4px;
-                            // Fixed-width slot in the indent left of the
-                            // name: a pulsing accent dot while any of the
-                            // session's threads runs a turn. Always present
-                            // so titles align whether busy or not.
-                            activity-slot := Rectangle {
-                                width: 16px;
-                                if row.busy: Rectangle {
-                                    width: 7px;
-                                    height: 7px;
+                            // Every session status shares this fixed slot.
+                            // Conditions are mutually exclusive and encode
+                            // the status precedence from most actionable to
+                            // informational: attention, unread, busy, PR.
+                            status-slot := Rectangle {
+                                width: 26px;
+                                if row.attention-kind != 0: IconButton {
+                                    width: 26px;
+                                    height: 30px;
+                                    icon: row.attention-kind == 2 ? "?" : "!";
+                                    icon-size: Theme.fs(16px);
+                                    icon-color: Theme.c.warn;
+                                    hover-icon-color: Theme.c.warn;
+                                    hover-bg: Theme.c.warn-bg;
+                                    tip: row.attention-tooltip;
+                                    clicked => { root.nav-row-clicked(idx); }
+                                }
+                                if row.attention-kind == 0 && row.unread: IconButton {
+                                    width: 26px;
+                                    height: 30px;
+                                    icon: "●";
+                                    icon-size: Theme.fs(11px);
+                                    icon-color: Theme.c.accent;
+                                    hover-icon-color: Theme.c.accent-hover;
+                                    hover-bg: transparent;
+                                    tip: "Unviewed work";
+                                    clicked => { root.nav-row-clicked(idx); }
+                                }
+                                if row.attention-kind == 0 && !row.unread && row.busy: Rectangle {
+                                    width: 10px;
+                                    height: 10px;
                                     // Refer to the fixed slot explicitly: an
                                     // `if` element has an implementation
                                     // wrapper, so `parent.width` is not a
                                     // reliable centering anchor here.
-                                    x: (activity-slot.width - self.width) / 2;
+                                    x: (status-slot.width - self.width) / 2;
                                     y: (parent.height - self.height) / 2;
-                                    border-radius: 3.5px;
+                                    border-radius: 5px;
                                     background: Theme.c.accent;
                                     opacity: Theme.reduce-motion
                                         ? 1.0
                                         : 0.55 + 0.45 * Math.sin(360deg * (animation-tick() / 1.6s));
+                                }
+                                if row.attention-kind == 0 && !row.unread && !row.busy && row.pr-kind != 0: IconButton {
+                                    width: 26px;
+                                    height: 30px;
+                                    use-icon-image: true;
+                                    icon-image: @image-url("assets/git-merge.svg");
+                                    icon-size: Theme.fs(18px);
+                                    icon-color: row.pr-kind == 1 ? Theme.c.ok
+                                        : row.pr-kind == 2 ? Theme.c.text-dim
+                                        : row.pr-kind == 3 ? Theme.c.accent
+                                        : row.pr-kind == 4 ? Theme.c.err
+                                        : Theme.c.text-mid;
+                                    hover-icon-color: self.icon-color;
+                                    hover-bg: Theme.c.hover-bg;
+                                    tip: row.pr-tooltip;
+                                    clicked => { root.nav-row-clicked(idx); }
                                 }
                             }
                             VerticalLayout {
@@ -2341,49 +2390,6 @@ export component AppWindow inherits Window {
                                     font-size: Theme.fs(11px);
                                     overflow: elide;
                                 }
-                            }
-                            if row.attention-kind != 0: IconButton {
-                                width: 22px;
-                                height: 28px;
-                                y: (parent.height - self.height) / 2;
-                                icon: row.attention-kind == 2 ? "?" : "!";
-                                icon-size: Theme.fs(13px);
-                                icon-color: Theme.c.warn;
-                                hover-icon-color: Theme.c.warn;
-                                hover-bg: Theme.c.warn-bg;
-                                tip: row.attention-tooltip;
-                                clicked => { root.nav-row-clicked(idx); }
-                            }
-                            if row.unread: IconButton {
-                                width: 18px;
-                                height: 28px;
-                                y: (parent.height - self.height) / 2;
-                                icon: "●";
-                                icon-size: Theme.fs(8px);
-                                icon-color: Theme.c.accent;
-                                hover-icon-color: Theme.c.accent-hover;
-                                hover-bg: transparent;
-                                tip: "Unviewed work";
-                                clicked => { root.nav-row-clicked(idx); }
-                            }
-                            if row.pr-kind != 0: IconButton {
-                                width: 22px;
-                                height: 28px;
-                                y: (parent.height - self.height) / 2;
-                                // Unicode's OCR fork is a compact,
-                                // font-portable approximation of the
-                                // familiar pull-request branch icon.
-                                icon: "⑂";
-                                icon-size: Theme.fs(15px);
-                                icon-color: row.pr-kind == 1 ? Theme.c.ok
-                                    : row.pr-kind == 2 ? Theme.c.text-dim
-                                    : row.pr-kind == 3 ? Theme.c.accent
-                                    : row.pr-kind == 4 ? Theme.c.err
-                                    : Theme.c.text-mid;
-                                hover-icon-color: self.icon-color;
-                                hover-bg: Theme.c.hover-bg;
-                                tip: row.pr-tooltip;
-                                clicked => { root.nav-row-clicked(idx); }
                             }
                             IconButton {
                                 width: 30px;
