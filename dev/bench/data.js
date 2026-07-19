@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1784505549901,
+  "lastUpdate": 1784505587069,
   "repoUrl": "https://github.com/jimsimon/trouve",
   "entries": {
     "e2e-benchmarks": [
@@ -5905,6 +5905,54 @@ window.BENCHMARK_DATA = {
             "name": "dense_query_20k_rows",
             "value": 1387102.0059780008,
             "range": "± 6742",
+            "unit": "ns"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "29139614+renovate[bot]@users.noreply.github.com",
+            "name": "renovate[bot]",
+            "username": "renovate[bot]"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "03c407e00bb38fe717d2e1c11bce72c421627726",
+          "message": "Lock file maintenance (#38)\n\n* Lock file maintenance\n\n* Pin plugin Node types for Bun declarations\n\n* Reconcile lockfiles with main\n\n---------\n\nCo-authored-by: renovate[bot] <29139614+renovate[bot]@users.noreply.github.com>\nCo-authored-by: Codex <codex@openai.com>",
+          "timestamp": "2026-07-19T19:56:44-04:00",
+          "tree_id": "abda1cd2ea648af5163367bbcfac987cf25349d2",
+          "url": "https://github.com/jimsimon/trouve/commit/03c407e00bb38fe717d2e1c11bce72c421627726"
+        },
+        "date": 1784505586218,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "bm25_build_5k_docs",
+            "value": 3804029.071428572,
+            "range": "± 4920",
+            "unit": "ns"
+          },
+          {
+            "name": "bm25_query_5k_docs",
+            "value": 27995.265154320987,
+            "range": "± 6",
+            "unit": "ns"
+          },
+          {
+            "name": "chunk_python_200_functions",
+            "value": 2196602.5434782607,
+            "range": "± 3845",
+            "unit": "ns"
+          },
+          {
+            "name": "dense_query_20k_rows",
+            "value": 1199656.2482142858,
+            "range": "± 5967",
             "unit": "ns"
           }
         ]
