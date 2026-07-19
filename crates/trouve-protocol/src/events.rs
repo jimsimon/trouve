@@ -249,6 +249,13 @@ pub enum Event {
         workspace_id: WorkspaceId,
         path: String,
     },
+    /// A workspace PR-dashboard refresh completed. This is a full snapshot
+    /// for that workspace; clients replace the previously folded slice.
+    #[serde(rename = "workspace.pull_requests_updated")]
+    WorkspacePullRequestsUpdated {
+        workspace_id: WorkspaceId,
+        pull_requests: crate::WorkspacePrList,
+    },
     #[serde(rename = "session.created")]
     SessionCreated {
         session_id: SessionId,
@@ -330,6 +337,31 @@ mod tests {
         };
         let v = serde_json::to_value(&ev).unwrap();
         assert_eq!(v["type"], "assistant.delta");
+    }
+
+    #[test]
+    fn workspace_pull_request_snapshot_roundtrips() {
+        let event = Event::WorkspacePullRequestsUpdated {
+            workspace_id: "ws_1".into(),
+            pull_requests: crate::WorkspacePrList {
+                viewer: "octocat".into(),
+                prs: Vec::new(),
+            },
+        };
+        let value = serde_json::to_value(&event).unwrap();
+        assert_eq!(value["type"], "workspace.pull_requests_updated");
+        let decoded: Event = serde_json::from_value(value).unwrap();
+        match decoded {
+            Event::WorkspacePullRequestsUpdated {
+                workspace_id,
+                pull_requests,
+            } => {
+                assert_eq!(workspace_id, "ws_1");
+                assert_eq!(pull_requests.viewer, "octocat");
+                assert!(pull_requests.prs.is_empty());
+            }
+            _ => panic!("wrong event variant"),
+        }
     }
 
     #[test]

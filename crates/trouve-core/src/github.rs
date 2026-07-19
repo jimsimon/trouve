@@ -7,8 +7,15 @@
 //! plan.
 
 use anyhow::{Context, Result};
+use chrono::{DateTime, Utc};
+use futures::{StreamExt, TryStreamExt};
 use octocrab::Octocrab;
 use trouve_protocol::{CheckRun, PrInfo, PrReview};
+
+/// A dashboard refresh should stay bounded even for repositories with an
+/// unusually deep PR history. Each page contains up to 100 PRs.
+const DASHBOARD_MAX_PR_PAGES: usize = 3;
+const DASHBOARD_ENRICH_CONCURRENCY: usize = 4;
 
 /// The one GitHub host that is always known.
 pub const GITHUB_COM: &str = "github.com";
@@ -177,6 +184,146 @@ impl GitHub {
         self.enrich(pr).await
     }
 
+    /// Login of the authenticated user (whose token this client holds).
+    pub async fn viewer(&self) -> Result<String> {
+        Ok(self.client.current().user().await?.login)
+    }
+
+    /// Dashboard listing: every open PR plus PRs merged since `merged_since`,
+    /// each enriched with checks, reviews, and comment info.
+    pub async fn dashboard_prs(&self, merged_since: DateTime<Utc>) -> Result<Vec<PrInfo>> {
+        let mut open_page = self
+            .client
+            .pulls(&self.owner, &self.repo)
+            .list()
+            .state(octocrab::params::State::Open)
+            .per_page(100)
+            .send()
+            .await
+            .context("listing open PRs")?;
+        let mut open = open_page.take_items();
+        for _ in 1..DASHBOARD_MAX_PR_PAGES {
+            let Some(mut page) = self
+                .client
+                .get_page::<octocrab::models::pulls::PullRequest>(&open_page.next)
+                .await
+                .context("listing additional open PRs")?
+            else {
+                break;
+            };
+            open.append(&mut page.items);
+            open_page = page;
+        }
+
+        // Recently merged PRs hide among the closed ones; recently *updated*
+        // closed PRs are a superset of recently merged. Walk pages sorted by
+        // update time until they cross the merge window instead of silently
+        // truncating busy repositories at one page.
+        let mut closed_page = self
+            .client
+            .pulls(&self.owner, &self.repo)
+            .list()
+            .state(octocrab::params::State::Closed)
+            .sort(octocrab::params::pulls::Sort::Updated)
+            .direction(octocrab::params::Direction::Descending)
+            .per_page(100)
+            .send()
+            .await
+            .context("listing closed PRs")?;
+        let mut recently_merged = Vec::new();
+        for page_index in 0..DASHBOARD_MAX_PR_PAGES {
+            let reached_cutoff = closed_page
+                .items
+                .iter()
+                .filter_map(|pr| pr.updated_at)
+                .next_back()
+                .is_some_and(|updated| updated < merged_since);
+            let next = closed_page.next.clone();
+            recently_merged.extend(
+                closed_page
+                    .items
+                    .into_iter()
+                    .filter(|pr| pr.merged_at.is_some_and(|at| at >= merged_since)),
+            );
+            if reached_cutoff || page_index + 1 == DASHBOARD_MAX_PR_PAGES {
+                break;
+            }
+            let Some(page) = self
+                .client
+                .get_page::<octocrab::models::pulls::PullRequest>(&next)
+                .await
+                .context("listing recently updated closed PRs")?
+            else {
+                break;
+            };
+            closed_page = page;
+        }
+
+        // A dashboard may span several active repositories and enrichment
+        // needs multiple GitHub endpoints per PR. A small concurrency cap
+        // keeps refreshes responsive without turning a busy repo into an API
+        // burst.
+        futures::stream::iter(open.into_iter().chain(recently_merged))
+            .map(|pr| async move {
+                let number = pr.number;
+                let mut info = self.enrich(pr).await?;
+                self.attach_comment_info(number, &mut info).await;
+                Ok::<_, anyhow::Error>(info)
+            })
+            .buffer_unordered(DASHBOARD_ENRICH_CONCURRENCY)
+            .try_collect()
+            .await
+    }
+
+    /// Fill `comments` and `last_comment_at` (issue + review comments).
+    /// Best-effort: comment endpoints failing must not hide the PR.
+    async fn attach_comment_info(&self, number: u64, info: &mut PrInfo) {
+        // The list endpoint omits comment counts; only the single-PR GET
+        // reports them.
+        let Ok(pr) = self.client.pulls(&self.owner, &self.repo).get(number).await else {
+            return;
+        };
+        let issue_comments = pr.comments.unwrap_or(0);
+        let review_comments = pr.review_comments.unwrap_or(0);
+        info.comments = issue_comments + review_comments;
+
+        let mut last: Option<DateTime<Utc>> = None;
+        if issue_comments > 0 {
+            // Issue comments list oldest-first with no sort option; one
+            // comment per page makes page N the Nth (so last) comment.
+            let newest = self
+                .client
+                .issues(&self.owner, &self.repo)
+                .list_comments(number)
+                .per_page(1)
+                .page(u32::try_from(issue_comments).unwrap_or(u32::MAX))
+                .send()
+                .await;
+            if let Ok(page) = newest {
+                last = page.items.first().map(|c| c.created_at);
+            }
+        }
+        if review_comments > 0 {
+            let newest = self
+                .client
+                .pulls(&self.owner, &self.repo)
+                .list_comments(Some(number))
+                .sort(octocrab::params::pulls::comments::Sort::Created)
+                .direction(octocrab::params::Direction::Descending)
+                .per_page(1)
+                .send()
+                .await;
+            if let Ok(page) = newest {
+                let newest = page.items.first().map(|c| c.created_at);
+                last = match (last, newest) {
+                    (Some(a), Some(b)) => Some(a.max(b)),
+                    (a, b) => a.or(b),
+                };
+            }
+        }
+        info.last_comment_at = last;
+    }
+
     pub async fn merge_pr(&self, number: u64, method: &str) -> Result<()> {
         let method = match method {
             "squash" => octocrab::params::pulls::MergeMethod::Squash,
@@ -269,6 +416,18 @@ impl GitHub {
             head: pr.head.ref_field,
             checks,
             reviews,
+            author: pr.user.map(|u| u.login).unwrap_or_default(),
+            requested_reviewers: pr
+                .requested_reviewers
+                .unwrap_or_default()
+                .into_iter()
+                .map(|u| u.login)
+                .collect(),
+            // Comment info comes from the dashboard path only — the extra
+            // requests aren't worth it for per-session lookups.
+            comments: 0,
+            last_comment_at: None,
+            merged_at: pr.merged_at,
         })
     }
 }

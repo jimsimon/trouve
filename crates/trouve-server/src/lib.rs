@@ -32,7 +32,7 @@ use trouve_protocol::{
     SubscriptionHealth, TerminalInfo, TerminalInputRequest, TerminalResizeRequest, Thread,
     TurnAccepted, UpdateQueuedPromptRequest, UpdateSessionRequest, UpdateThreadRequest,
     UpsertAutomationRequest, UpsertMcpServerRequest, UpsertModeRequest, UpsertProviderRequest,
-    UsageSummary, Workspace,
+    UsageSummary, Workspace, WorkspacePrList,
 };
 use utoipa::OpenApi;
 
@@ -71,6 +71,7 @@ impl IntoResponse for ApiError {
         register_workspace,
         list_workspaces,
         workspace_branches,
+        refresh_workspace_prs,
         create_session,
         list_sessions,
         get_session,
@@ -199,6 +200,7 @@ impl IntoResponse for ApiError {
         TerminalInputRequest,
         TerminalResizeRequest,
         PrInfo,
+        WorkspacePrList,
         CreatePrRequest,
         MergePrRequest,
         GithubIntegration,
@@ -440,6 +442,10 @@ pub fn build_router(engine: Arc<Engine>) -> Router {
             post(register_workspace).get(list_workspaces),
         )
         .route("/v1/workspaces/{id}/branches", get(workspace_branches))
+        .route(
+            "/v1/workspaces/{id}/prs/refresh",
+            post(refresh_workspace_prs),
+        )
         .route("/v1/sessions", post(create_session).get(list_sessions))
         .route(
             "/v1/sessions/{id}",
@@ -671,6 +677,17 @@ async fn workspace_branches(
     Path(id): Path<String>,
 ) -> Result<Json<BranchList>, ApiError> {
     Ok(Json(engine.workspace_branches(&id).await?))
+}
+
+#[utoipa::path(post, path = "/v1/workspaces/{id}/prs/refresh", params(("id" = String, Path,)),
+    responses((status = 204),
+        (status = 400, body = ErrorBody), (status = 404, body = ErrorBody)))]
+async fn refresh_workspace_prs(
+    State(engine): State<Arc<Engine>>,
+    Path(id): Path<String>,
+) -> Result<axum::http::StatusCode, ApiError> {
+    engine.refresh_workspace_prs(&id).await?;
+    Ok(axum::http::StatusCode::NO_CONTENT)
 }
 
 #[utoipa::path(post, path = "/v1/sessions", request_body = CreateSessionRequest,

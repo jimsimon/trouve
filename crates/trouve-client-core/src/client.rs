@@ -164,6 +164,13 @@ impl ProtocolClient {
         self.get_json("/workspaces").await
     }
 
+    /// Ask the server to refresh one workspace's PR dashboard. The resulting
+    /// snapshot arrives on the persisted server event stream.
+    pub async fn refresh_workspace_prs(&self, workspace_id: &str) -> Result<()> {
+        self.post_empty(&format!("/workspaces/{workspace_id}/prs/refresh"))
+            .await
+    }
+
     pub async fn workspace_branches(&self, workspace_id: &str) -> Result<BranchList> {
         self.get_json(&format!("/workspaces/{workspace_id}/branches"))
             .await

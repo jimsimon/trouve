@@ -553,6 +553,100 @@ pub fn set_prs(
     });
 }
 
+/// Plain-data mirror of the Slint PrRowItem struct (one dashboard row).
+pub struct PrRowView {
+    pub workspace_id: String,
+    pub app_name: String,
+    /// "#42"
+    pub number_label: String,
+    pub title: String,
+    pub branch: String,
+    /// 0 no checks, 1 passing, 2 running, 3 failing.
+    pub check_kind: i32,
+    pub check_label: String,
+    /// 0 no reviews, 1 approved, 2 pending, 3 changes requested.
+    pub approval_kind: i32,
+    pub approval_label: String,
+    /// "3 comments" / "0 comments".
+    pub comments_label: String,
+    /// "last comment 45 mins ago" / "no comments yet".
+    pub last_comment: String,
+    pub url: String,
+    /// A session for this branch exists (chat button jumps instead of
+    /// offering a new chat).
+    pub has_chat: bool,
+}
+
+/// Plain-data mirror of the Slint PrGroupItem struct.
+pub struct PrGroupView {
+    pub key: String,
+    pub title: String,
+    pub description: String,
+    /// Icon tint: 0 review-requested, 1 drafts, 2 pending, 3 ready,
+    /// 4 needs-attention, 5 merged.
+    pub kind: i32,
+    pub icon: String,
+    /// Zero-based position and total group count (reorder bounds).
+    pub position: i32,
+    pub group_count: i32,
+    pub collapsed: bool,
+    pub empty_text: String,
+    pub prs: Vec<PrRowView>,
+}
+
+/// The PR dashboard: groups in display order plus the project filter
+/// options ("All projects" first) and its selection.
+pub fn set_pr_dashboard(
+    ui: &Ui,
+    groups: Vec<PrGroupView>,
+    projects: Vec<String>,
+    project_index: i32,
+    status: String,
+    has_workspaces: bool,
+) {
+    let _ = ui.upgrade_in_event_loop(move |ui| {
+        let items: Vec<crate::PrGroupItem> = groups
+            .into_iter()
+            .map(|g| crate::PrGroupItem {
+                key: SharedString::from(g.key.as_str()),
+                title: SharedString::from(g.title.as_str()),
+                description: SharedString::from(g.description.as_str()),
+                kind: g.kind,
+                icon: SharedString::from(g.icon.as_str()),
+                position: g.position,
+                group_count: g.group_count,
+                collapsed: g.collapsed,
+                empty_text: SharedString::from(g.empty_text.as_str()),
+                prs: ModelRc::new(VecModel::from(
+                    g.prs
+                        .into_iter()
+                        .map(|p| crate::PrRowItem {
+                            workspace_id: SharedString::from(p.workspace_id.as_str()),
+                            app_name: SharedString::from(p.app_name.as_str()),
+                            number_label: SharedString::from(p.number_label.as_str()),
+                            title: SharedString::from(p.title.as_str()),
+                            branch: SharedString::from(p.branch.as_str()),
+                            check_kind: p.check_kind,
+                            check_label: SharedString::from(p.check_label.as_str()),
+                            approval_kind: p.approval_kind,
+                            approval_label: SharedString::from(p.approval_label.as_str()),
+                            comments_label: SharedString::from(p.comments_label.as_str()),
+                            last_comment: SharedString::from(p.last_comment.as_str()),
+                            url: SharedString::from(p.url.as_str()),
+                            has_chat: p.has_chat,
+                        })
+                        .collect::<Vec<_>>(),
+                )),
+            })
+            .collect();
+        ui.set_pr_dash_groups(ModelRc::new(VecModel::from(items)));
+        ui.set_pr_dash_projects(string_model(projects));
+        ui.set_pr_dash_project_index(project_index);
+        ui.set_pr_dash_status(SharedString::from(status.as_str()));
+        ui.set_pr_dash_has_workspaces(has_workspaces);
+    });
+}
+
 /// Plain-data mirror of the Slint SubscriptionItem struct; windows are
 /// (label, used-percent, resets) tuples. The Slint struct is flat, so only
 /// the first four windows are shown.

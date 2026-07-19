@@ -87,6 +87,8 @@ Session scope:
 Server scope:
 
 - `workspace.registered` `{workspace_id, path}`
+- `workspace.pull_requests_updated` `{workspace_id, pull_requests}` — full
+  dashboard snapshot for one workspace, emitted after a requested refresh
 - `session.created` / `session.deleted` `{session_id, workspace_id}`
 - `server.connectivity_changed` `{online}` — the server's internet
   reachability flipped; while offline `/v1/models` lists only models that

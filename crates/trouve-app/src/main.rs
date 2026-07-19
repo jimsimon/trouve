@@ -1093,6 +1093,71 @@ fn main() -> anyhow::Result<()> {
     }
     {
         let tx = tx.clone();
+        window.on_open_pull_requests(move || {
+            let _ = tx.send(UiCommand::OpenPullRequests);
+        });
+    }
+    {
+        let tx = tx.clone();
+        window.on_close_pull_requests(move || {
+            let _ = tx.send(UiCommand::ClosePullRequests);
+        });
+    }
+    {
+        let tx = tx.clone();
+        window.on_pull_requests_refresh(move || {
+            let _ = tx.send(UiCommand::RefreshPullRequests);
+        });
+    }
+    {
+        let tx = tx.clone();
+        window.on_pr_dash_filter_picked(move |index| {
+            let _ = tx.send(UiCommand::PrDashFilterPicked(index));
+        });
+    }
+    {
+        let tx = tx.clone();
+        window.on_pr_group_toggled(move |key| {
+            let _ = tx.send(UiCommand::PrGroupToggled(key.to_string()));
+        });
+    }
+    window
+        .on_pr_group_drag_data(|key| slint::SharedString::from(pr_group_drag_payload(&key)).into());
+    window.on_pr_group_drag_acceptable(|data| pr_group_drag_id(&data).is_some());
+    {
+        let tx = tx.clone();
+        window.on_pr_group_dropped(move |data, target_key, after| {
+            let Some(key) = pr_group_drag_id(&data) else {
+                return false;
+            };
+            let _ = tx.send(UiCommand::PrGroupDropped {
+                key,
+                target_key: target_key.to_string(),
+                after,
+            });
+            true
+        });
+    }
+    {
+        let tx = tx.clone();
+        window.on_pr_group_moved(move |key, offset| {
+            let _ = tx.send(UiCommand::PrGroupMoved {
+                key: key.to_string(),
+                offset,
+            });
+        });
+    }
+    {
+        let tx = tx.clone();
+        window.on_pr_chat_clicked(move |workspace_id, branch| {
+            let _ = tx.send(UiCommand::PrChatClicked {
+                workspace_id: workspace_id.to_string(),
+                branch: branch.to_string(),
+            });
+        });
+    }
+    {
+        let tx = tx.clone();
         window.on_open_automations(move || {
             let _ = tx.send(UiCommand::OpenAutomations);
         });
@@ -1273,6 +1338,7 @@ fn clipboard_image_png() -> Option<Vec<u8>> {
 }
 
 const WORKSPACE_DRAG_PREFIX: &str = "trouve-workspace:";
+const PR_GROUP_DRAG_PREFIX: &str = "trouve-pr-group:";
 
 fn workspace_drag_payload(workspace_id: &str) -> String {
     format!("{WORKSPACE_DRAG_PREFIX}{workspace_id}")
@@ -1286,9 +1352,24 @@ fn workspace_drag_id(data: &slint::DataTransfer) -> Option<String> {
         .map(str::to_owned)
 }
 
+fn pr_group_drag_payload(key: &str) -> String {
+    format!("{PR_GROUP_DRAG_PREFIX}{key}")
+}
+
+fn pr_group_drag_id(data: &slint::DataTransfer) -> Option<String> {
+    data.plain_text()
+        .ok()?
+        .strip_prefix(PR_GROUP_DRAG_PREFIX)
+        .filter(|key| !key.is_empty())
+        .map(str::to_owned)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{at_token, chat_file_link, workspace_drag_id, workspace_drag_payload};
+    use super::{
+        at_token, chat_file_link, pr_group_drag_id, pr_group_drag_payload, workspace_drag_id,
+        workspace_drag_payload,
+    };
 
     #[test]
     fn codex_file_links_open_in_the_files_panel() {
@@ -1320,6 +1401,14 @@ mod tests {
         assert_eq!(workspace_drag_id(&data).as_deref(), Some("ws_123"));
         let other: slint::DataTransfer = slint::SharedString::from("not a workspace").into();
         assert_eq!(workspace_drag_id(&other), None);
+    }
+
+    #[test]
+    fn pr_group_drag_payload_round_trips_without_accepting_workspace_drags() {
+        let data: slint::DataTransfer =
+            slint::SharedString::from(pr_group_drag_payload("ready-to-merge")).into();
+        assert_eq!(pr_group_drag_id(&data).as_deref(), Some("ready-to-merge"));
+        assert_eq!(workspace_drag_id(&data), None);
     }
 
     #[test]

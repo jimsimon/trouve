@@ -210,6 +210,20 @@ pub fn save_workspace_order(order: &[String]) {
     write_json(config_path("workspace-order.json"), &order);
 }
 
+/// Display order of the PR dashboard's groups (group keys), a frontend
+/// preference like the workspace sidebar order.
+pub fn load_pr_group_order() -> Vec<String> {
+    let read = || {
+        let text = std::fs::read_to_string(config_path("pr-group-order.json")?).ok()?;
+        serde_json::from_str::<Vec<String>>(&text).ok()
+    };
+    read().unwrap_or_default()
+}
+
+pub fn save_pr_group_order(order: &[String]) {
+    write_json(config_path("pr-group-order.json"), &order);
+}
+
 pub fn load_resume() -> Resume {
     let read = || {
         let text = std::fs::read_to_string(resume_path()?).ok()?;

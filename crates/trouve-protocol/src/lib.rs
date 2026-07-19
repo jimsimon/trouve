@@ -60,7 +60,11 @@ pub use requests::*;
 // default_permission_mode, and PUT /v1/config/default-permission-mode sets it.
 // 0.21: global and per-mode default thinking levels — additive fields on
 // AgentMode, UpsertModeRequest, ProvidersResponse, and SetDefaultModelRequest.
-pub const PROTOCOL_VERSION: &str = "0.21";
+// 0.22: PR dashboard — PrInfo gains review and comment metadata;
+// workspace.pull_requests_updated persists each workspace snapshot, and
+// POST /v1/workspaces/{id}/prs/refresh triggers a refresh without returning
+// UI state directly.
+pub const PROTOCOL_VERSION: &str = "0.22";
 
 pub type WorkspaceId = String;
 pub type SessionId = String;

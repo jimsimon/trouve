@@ -2239,8 +2239,13 @@ impl Engine {
         &self,
         session: &trouve_protocol::Session,
     ) -> Result<crate::github::GitHub, EngineError> {
-        let worktree = PathBuf::from(&session.worktree_path);
-        let url = git::remote_url(&worktree, "origin")
+        self.github_for_checkout(&PathBuf::from(&session.worktree_path))
+    }
+
+    /// GitHub client for any checkout's origin remote (a session worktree
+    /// or a workspace root).
+    fn github_for_checkout(&self, checkout: &Path) -> Result<crate::github::GitHub, EngineError> {
+        let url = git::remote_url(checkout, "origin")
             .ok_or_else(|| EngineError::BadRequest("workspace has no 'origin' remote".into()))?;
         let (host, owner, repo) = crate::github::parse_remote(&url).ok_or_else(|| {
             EngineError::BadRequest(format!("origin is not a GitHub-style remote: {url}"))
@@ -2962,6 +2967,33 @@ impl Engine {
 
     pub fn list_workspaces(&self) -> Result<Vec<Workspace>, EngineError> {
         Ok(self.store.list_workspaces()?)
+    }
+
+    /// Refresh one workspace's PR dashboard and publish the full snapshot on
+    /// the persisted server event stream. The command response carries no UI
+    /// state; clients fold `workspace.pull_requests_updated` instead.
+    pub async fn refresh_workspace_prs(&self, id: &str) -> Result<(), EngineError> {
+        let ws = self
+            .store
+            .workspace(id)?
+            .ok_or_else(|| EngineError::NotFound(format!("workspace {id}")))?;
+        let github = self.github_for_checkout(Path::new(&ws.path))?;
+        // "Who am I" failing (fine-grained token quirks, GHES) only costs
+        // the review-requested signal, not the whole dashboard.
+        let viewer = github.viewer().await.unwrap_or_default();
+        let merged_since = chrono::Utc::now() - chrono::Duration::hours(24);
+        let prs = github
+            .dashboard_prs(merged_since)
+            .await
+            .map_err(EngineError::Internal)?;
+        self.store.append_event(
+            Scope::Server,
+            Event::WorkspacePullRequestsUpdated {
+                workspace_id: ws.id,
+                pull_requests: trouve_protocol::WorkspacePrList { viewer, prs },
+            },
+        )?;
+        Ok(())
     }
 
     /// Local branches of the workspace repo, for base-ref selection.
