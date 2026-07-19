@@ -77,6 +77,9 @@ pub enum UiCommand {
     /// Notification preferences toggled (already persisted on the UI
     /// thread); the controller keeps a copy to gate event notifications.
     NotifyPrefsChanged(crate::winstate::Notifications),
+    /// Window focus sampled by the UI-thread poll. Returning to the visible
+    /// session acknowledges its unread-work badge.
+    WindowFocusChanged(bool),
     /// "Send test notification" in settings.
     NotifyTest,
     /// A desktop notification was clicked: raise the window and reveal the
@@ -191,6 +194,8 @@ pub enum UiCommand {
     /// Internal: a background PR fetch finished (session it was for, PRs or
     /// an error message).
     PrsLoaded(String, Result<Vec<trouve_protocol::PrInfo>, String>),
+    /// Internal: a sidebar-only PR summary fetch finished.
+    NavPrsLoaded(String, Result<Vec<trouve_protocol::PrInfo>, String>),
     FileActivated(usize),
     /// Open a worktree-relative file in the user's preferred editor.
     OpenFileExternally(String),
@@ -404,6 +409,9 @@ pub enum UiCommand {
     /// Initial persisted history, coalesced so opening a long thread applies
     /// and renders many envelopes in one controller command.
     Events(String, Vec<EventEnvelope>),
+    /// Internal: threads were discovered for an active background session,
+    /// so their streams can feed attention and unread-work badges.
+    SessionThreadsLoaded(String, Result<Vec<Thread>, String>),
 }
 
 /// What a left-nav row maps back to.
@@ -507,12 +515,22 @@ struct Controller {
     prs: Vec<trouve_protocol::PrInfo>,
     pr_selected: usize,
     pr_error: String,
+    /// PRs per session for the compact sidebar badge. An empty vector means
+    /// the branch was checked and has no associated PRs.
+    nav_prs: HashMap<String, Vec<trouve_protocol::PrInfo>>,
+    nav_prs_pending: HashSet<String>,
 
     vms: HashMap<String, ThreadViewModel>,
     followed: HashSet<String>,
     /// thread id → session id, for notifications about backgrounded
     /// threads (`threads` only holds the open session's).
     thread_sessions: HashMap<String, String>,
+    /// Sessions whose thread list is being/has been watched for background
+    /// attention. New threads still arrive through `thread.created`.
+    watched_sessions: HashSet<String>,
+    /// Sessions with completed/failed work the user has not brought on
+    /// screen since it landed.
+    unread_sessions: HashSet<String>,
     /// Desktop notification preferences; persisted on the UI thread, this
     /// copy gates what event notifications fire.
     notify: crate::winstate::Notifications,
@@ -678,9 +696,13 @@ pub async fn run(
         prs: Vec::new(),
         pr_selected: 0,
         pr_error: String::new(),
+        nav_prs: HashMap::new(),
+        nav_prs_pending: HashSet::new(),
         vms: HashMap::new(),
         followed: HashSet::new(),
         thread_sessions: HashMap::new(),
+        watched_sessions: HashSet::new(),
+        unread_sessions: HashSet::new(),
         notify: crate::winstate::load_notifications(),
         window_focused,
         pending_attachments: Vec::new(),
@@ -877,6 +899,7 @@ impl Controller {
         }
         self.push_github_integration();
         self.push_prs();
+        self.refresh_nav_prs(false);
 
         // Follow the server-scope event stream for the lifetime of the app:
         // sessions created in the background (scheduled automations) and
@@ -1159,6 +1182,11 @@ impl Controller {
             .collect();
         self.current_session =
             current_id.and_then(|id| self.sessions.iter().position(|s| s.id == id));
+        let session_ids: HashSet<String> = self.sessions.iter().map(|s| s.id.clone()).collect();
+        self.nav_prs.retain(|id, _| session_ids.contains(id));
+        self.nav_prs_pending.retain(|id| session_ids.contains(id));
+        self.unread_sessions.retain(|id| session_ids.contains(id));
+        self.watched_sessions.retain(|id| session_ids.contains(id));
         // If the open session vanished (deleted in another window or by an
         // automation), drop its threads and selection too — otherwise
         // current_thread_id keeps returning a thread of a session that no
@@ -1168,7 +1196,56 @@ impl Controller {
             self.current_thread = None;
         }
         self.push_nav();
+        // A session waiting on an agent can block on an approval/question in
+        // any thread. Watch all threads of active background sessions so the
+        // sidebar can surface that state without requiring the user to open
+        // the session first.
+        let active: Vec<String> = self.busy_sessions.iter().cloned().collect();
+        for session_id in active {
+            self.watch_session_threads(session_id);
+        }
+        self.refresh_nav_prs(false);
         Ok(())
+    }
+
+    /// Build the session-specific part of one nav row.
+    fn session_nav_row(&self, index: usize, archived: bool) -> NavRowData {
+        let session = &self.sessions[index];
+        let (pr_kind, pr_tooltip) = pr_badge(
+            self.nav_prs
+                .get(&session.id)
+                .map(Vec::as_slice)
+                .unwrap_or_default(),
+        );
+        let (attention_kind, attention_tooltip) = self.session_attention(&session.id);
+        NavRowData {
+            kind: 1,
+            title: session.title.clone(),
+            subtitle: session.branch.clone(),
+            session_index: index as i32,
+            selected: self.current_session == Some(index),
+            archived,
+            busy: self.busy_sessions.contains(&session.id),
+            unread: self.unread_sessions.contains(&session.id),
+            pr_kind,
+            pr_tooltip,
+            attention_kind,
+            attention_tooltip,
+            ..Default::default()
+        }
+    }
+
+    /// Aggregate pending requests across every followed thread of a session.
+    fn session_attention(&self, session_id: &str) -> (i32, String) {
+        let mut approvals = 0usize;
+        let mut questions = 0usize;
+        for (thread_id, vm) in &self.vms {
+            if self.thread_sessions.get(thread_id).map(String::as_str) == Some(session_id) {
+                approvals += vm.pending_approvals.len();
+                questions += vm.pending_questions.len();
+            }
+        }
+        attention_badge(approvals, questions)
     }
 
     /// Rebuild the grouped left-nav rows and the row → entry map.
@@ -1207,16 +1284,7 @@ impl Controller {
                     archived_count += 1;
                     continue;
                 }
-                rows.push(NavRowData {
-                    kind: 1,
-                    title: session.title.clone(),
-                    subtitle: session.branch.clone(),
-                    session_index: i as i32,
-                    selected: self.current_session == Some(i),
-                    archived: false,
-                    busy: self.busy_sessions.contains(&session.id),
-                    ..Default::default()
-                });
+                rows.push(self.session_nav_row(i, false));
                 nav.push(NavEntry::Session(i));
             }
             if archived_count > 0 && show_archived {
@@ -1233,16 +1301,7 @@ impl Controller {
                         if session.workspace_id != ws.id || !session.archived {
                             continue;
                         }
-                        rows.push(NavRowData {
-                            kind: 1,
-                            title: session.title.clone(),
-                            subtitle: session.branch.clone(),
-                            session_index: i as i32,
-                            selected: self.current_session == Some(i),
-                            archived: true,
-                            busy: self.busy_sessions.contains(&session.id),
-                            ..Default::default()
-                        });
+                        rows.push(self.session_nav_row(i, true));
                         nav.push(NavEntry::Session(i));
                     }
                 }
@@ -1407,6 +1466,7 @@ impl Controller {
             return Ok(());
         }
         self.current_session = Some(index);
+        self.unread_sessions.remove(&self.sessions[index].id);
         self.close_new_chat();
         self.push_nav();
         let session_id = self.sessions[index].id.clone();
@@ -1414,6 +1474,11 @@ impl Controller {
         for t in &self.threads {
             self.thread_sessions
                 .insert(t.id.clone(), session_id.clone());
+        }
+        self.watched_sessions.insert(session_id.clone());
+        let thread_ids: Vec<String> = self.threads.iter().map(|t| t.id.clone()).collect();
+        for thread_id in thread_ids {
+            self.follow_thread(thread_id, session_id.clone());
         }
         // Reopen the thread the user last had open in this session; first
         // thread when there's no bookmark (or it was deleted).
@@ -1601,6 +1666,32 @@ impl Controller {
         let Some(thread_id) = self.current_thread_id() else {
             return;
         };
+        let Some(session_id) = self.current_session_id() else {
+            return;
+        };
+        self.follow_thread(thread_id, session_id);
+    }
+
+    /// Discover all threads in an active background session. The request is
+    /// asynchronous so a slow server cannot stall UI command handling.
+    fn watch_session_threads(&mut self, session_id: String) {
+        if !self.watched_sessions.insert(session_id.clone()) {
+            return;
+        }
+        let client = self.client.clone();
+        let tx = self.tx.clone();
+        tokio::spawn(async move {
+            let result = client
+                .list_threads(&session_id)
+                .await
+                .map_err(|e| format!("{e:#}"));
+            let _ = tx.send(UiCommand::SessionThreadsLoaded(session_id, result));
+        });
+    }
+
+    /// Follow one thread for chat rendering and session-list state.
+    fn follow_thread(&mut self, thread_id: String, session_id: String) {
+        self.thread_sessions.insert(thread_id.clone(), session_id);
         if !self.followed.insert(thread_id.clone()) {
             return;
         }
@@ -2063,6 +2154,43 @@ impl Controller {
                 .map_err(|e| format!("{e:#}"));
             let _ = tx.send(UiCommand::PrsLoaded(session_id, result));
         });
+    }
+
+    /// Fill missing sidebar PR summaries without blocking the command loop.
+    /// `force` drops cached statuses first (used after auth changes); normal
+    /// session reloads only query newly-created sessions.
+    fn refresh_nav_prs(&mut self, force: bool) {
+        if !self.github_configured {
+            self.nav_prs_pending.clear();
+            if !self.nav_prs.is_empty() {
+                self.nav_prs.clear();
+                self.push_nav();
+            }
+            return;
+        }
+        if force {
+            self.nav_prs.clear();
+            self.nav_prs_pending.clear();
+            self.push_nav();
+        }
+        let session_ids: Vec<String> = self
+            .sessions
+            .iter()
+            .filter(|s| !self.nav_prs.contains_key(&s.id) && !self.nav_prs_pending.contains(&s.id))
+            .map(|s| s.id.clone())
+            .collect();
+        for session_id in session_ids {
+            self.nav_prs_pending.insert(session_id.clone());
+            let client = self.client.clone();
+            let tx = self.tx.clone();
+            tokio::spawn(async move {
+                let result = client
+                    .session_prs(&session_id)
+                    .await
+                    .map_err(|e| format!("{e:#}"));
+                let _ = tx.send(UiCommand::NavPrsLoaded(session_id, result));
+            });
+        }
     }
 
     /// Kick off a background fetch of the session's effective MCP config
@@ -2947,9 +3075,27 @@ impl Controller {
                 } else {
                     self.busy_sessions.remove(session_id)
                 };
+                if *active {
+                    self.watch_session_threads(session_id.clone());
+                } else if changed {
+                    let focused = self
+                        .window_focused
+                        .load(std::sync::atomic::Ordering::Relaxed);
+                    let viewed = focused
+                        && self.current_session_id().as_deref() == Some(session_id.as_str());
+                    if !viewed {
+                        self.unread_sessions.insert(session_id.clone());
+                    }
+                }
                 if changed {
                     self.push_nav();
                 }
+            }
+            Event::ThreadCreated {
+                thread_id,
+                session_id,
+            } => {
+                self.follow_thread(thread_id.clone(), session_id.clone());
             }
             // The server's internet reachability flipped: refresh the model
             // list (filtered while offline), regate prompt entry, announce
@@ -3266,6 +3412,11 @@ impl Controller {
                         self.close_new_chat();
                     }
                     self.current_thread = Some(i);
+                    if let Some(session_id) = self.current_session_id()
+                        && self.unread_sessions.remove(&session_id)
+                    {
+                        self.push_nav();
+                    }
                     self.push_threads();
                     self.push_picker_indices();
                     self.follow_current();
@@ -3859,10 +4010,10 @@ impl Controller {
                 }
             }
             UiCommand::PrsLoaded(session_id, result) => {
-                // Ignore answers for a session the user has since left.
-                if self.current_session_id().as_deref() == Some(&session_id) {
-                    match result {
-                        Ok(prs) => {
+                match result {
+                    Ok(prs) => {
+                        self.nav_prs.insert(session_id.clone(), prs.clone());
+                        if self.current_session_id().as_deref() == Some(&session_id) {
                             // Keep the selection on the same PR across
                             // refreshes when it still exists.
                             let keep = self
@@ -3872,15 +4023,28 @@ impl Controller {
                             self.prs = prs;
                             self.pr_selected = keep.unwrap_or(0);
                             self.pr_error.clear();
+                            self.push_prs();
                         }
-                        Err(e) => {
+                        self.push_nav();
+                    }
+                    Err(e) => {
+                        // The right panel owns errors for its selected
+                        // session; an old response must not replace it.
+                        if self.current_session_id().as_deref() == Some(&session_id) {
                             self.prs.clear();
                             self.pr_selected = 0;
                             self.pr_error = e;
+                            self.push_prs();
                         }
                     }
-                    self.push_prs();
                 }
+            }
+            UiCommand::NavPrsLoaded(session_id, result) => {
+                self.nav_prs_pending.remove(&session_id);
+                // Remember failures as an empty result. A later explicit
+                // auth refresh clears the cache and retries all sessions.
+                self.nav_prs.insert(session_id, result.unwrap_or_default());
+                self.push_nav();
             }
             UiCommand::OpenIntegrationsSettings => {
                 ui::set_settings_section(&self.ui, 4);
@@ -4031,6 +4195,7 @@ impl Controller {
                         self.push_github_integration();
                         // A fresh token usually means the PR tab was waiting.
                         self.refresh_prs();
+                        self.refresh_nav_prs(true);
                     }
                     Err(e) => self.error(&format!("saving GitHub token: {e:#}")),
                 }
@@ -4041,6 +4206,7 @@ impl Controller {
                         self.apply_github_integration(integration);
                         self.push_github_integration();
                         self.refresh_prs();
+                        self.refresh_nav_prs(true);
                     }
                     Err(e) => self.error(&format!("adding GitHub host: {e:#}")),
                 }
@@ -4051,6 +4217,7 @@ impl Controller {
                         self.apply_github_integration(integration);
                         self.push_github_integration();
                         self.refresh_prs();
+                        self.refresh_nav_prs(true);
                     }
                     Err(e) => self.error(&format!("removing GitHub host: {e:#}")),
                 }
@@ -4699,6 +4866,7 @@ impl Controller {
             UiCommand::Events(thread_id, envelopes) => {
                 let mut changed = false;
                 let mut completed = false;
+                let mut attention_changed = false;
                 for envelope in &envelopes {
                     changed |= self
                         .vms
@@ -4708,6 +4876,7 @@ impl Controller {
                         .is_some();
                     completed |=
                         matches!(envelope.event, trouve_protocol::Event::TurnCompleted { .. });
+                    attention_changed |= is_attention_event(&envelope.event);
                     self.maybe_notify(&thread_id, envelope);
                 }
                 if self.current_thread_id().as_deref() == Some(&thread_id) {
@@ -4722,11 +4891,20 @@ impl Controller {
                         self.refresh_usage_text().await;
                     }
                 }
+                if attention_changed {
+                    self.push_nav();
+                }
                 self.push_agents_running();
             }
             UiCommand::Event(thread_id, envelope) => {
                 let vm = self.vms.entry(thread_id.clone()).or_default();
                 let changed = vm.apply(&envelope);
+                let attention_changed = is_attention_event(&envelope.event);
+                let finished = matches!(
+                    envelope.event,
+                    trouve_protocol::Event::TurnCompleted { .. }
+                        | trouve_protocol::Event::TurnFailed { .. }
+                );
                 if self.current_thread_id().as_deref() == Some(&thread_id) {
                     // Compaction/usage state can change without a chat row
                     // changing, so the dial refreshes on every event.
@@ -4762,9 +4940,31 @@ impl Controller {
                     }
                 }
                 self.maybe_notify(&thread_id, &envelope);
+                let mut nav_changed = attention_changed;
+                if finished {
+                    let focused = self
+                        .window_focused
+                        .load(std::sync::atomic::Ordering::Relaxed);
+                    let viewed =
+                        focused && self.current_thread_id().as_deref() == Some(thread_id.as_str());
+                    if !viewed && let Some(session_id) = self.thread_sessions.get(&thread_id) {
+                        nav_changed |= self.unread_sessions.insert(session_id.clone());
+                    }
+                }
+                if nav_changed {
+                    self.push_nav();
+                }
                 self.push_agents_running();
             }
             UiCommand::NotifyPrefsChanged(prefs) => self.notify = prefs,
+            UiCommand::WindowFocusChanged(focused) => {
+                if focused
+                    && let Some(session_id) = self.current_session_id()
+                    && self.unread_sessions.remove(&session_id)
+                {
+                    self.push_nav();
+                }
+            }
             UiCommand::NotifyTest => {
                 crate::notify::show(
                     crate::notify::Toast {
@@ -4794,6 +4994,17 @@ impl Controller {
                     let _ = self.tx.send(UiCommand::SelectThread(i));
                 }
             }
+            UiCommand::SessionThreadsLoaded(session_id, result) => match result {
+                Ok(threads) => {
+                    for thread in threads {
+                        self.follow_thread(thread.id, session_id.clone());
+                    }
+                }
+                Err(e) => {
+                    self.watched_sessions.remove(&session_id);
+                    tracing::warn!("watching session {session_id} threads: {e}");
+                }
+            },
             UiCommand::QuitWhenIdle => {
                 self.quit_when_idle = true;
                 self.push_agents_running();
@@ -5047,6 +5258,84 @@ fn permission_mode_of(index: i32) -> Option<PermissionMode> {
     }
 }
 
+/// Events that can change a session's aggregated attention badge.
+fn is_attention_event(event: &trouve_protocol::Event) -> bool {
+    matches!(
+        event,
+        trouve_protocol::Event::ApprovalRequested { .. }
+            | trouve_protocol::Event::ApprovalResolved { .. }
+            | trouve_protocol::Event::QuestionRequested { .. }
+            | trouve_protocol::Event::QuestionResolved { .. }
+            | trouve_protocol::Event::ToolCompleted { .. }
+            | trouve_protocol::Event::TurnCompleted { .. }
+            | trouve_protocol::Event::TurnFailed { .. }
+    )
+}
+
+/// Compact attention kind + accessible hover/focus detail.
+fn attention_badge(approvals: usize, questions: usize) -> (i32, String) {
+    let plural = |count: usize, singular: &str, plural: &str| {
+        format!("{count} {}", if count == 1 { singular } else { plural })
+    };
+    match (approvals, questions) {
+        (0, 0) => (0, String::new()),
+        (a, 0) => (1, format!("{} pending", plural(a, "approval", "approvals"))),
+        (0, q) => (
+            2,
+            format!("{} awaiting an answer", plural(q, "question", "questions")),
+        ),
+        (a, q) => (
+            3,
+            format!(
+                "{} and {} need attention",
+                plural(a, "approval", "approvals"),
+                plural(q, "question", "questions")
+            ),
+        ),
+    }
+}
+
+/// Pull-request badge kind + detail. A single PR inherits its status color;
+/// multiple PRs intentionally collapse to the neutral kind while the tooltip
+/// preserves each individual status.
+fn pr_badge(prs: &[trouve_protocol::PrInfo]) -> (i32, String) {
+    if prs.is_empty() {
+        return (0, String::new());
+    }
+    let state = |pr: &trouve_protocol::PrInfo| {
+        if pr.draft {
+            "Draft"
+        } else {
+            match pr.state.as_str() {
+                "open" => "Open",
+                "merged" => "Merged",
+                "closed" => "Closed",
+                _ => "Pull request",
+            }
+        }
+    };
+    let lines = prs
+        .iter()
+        .map(|pr| format!("#{} · {}", pr.number, state(pr)))
+        .collect::<Vec<_>>()
+        .join("\n");
+    if prs.len() > 1 {
+        return (5, format!("{} pull requests\n{lines}", prs.len()));
+    }
+    let pr = &prs[0];
+    let kind = if pr.draft {
+        2
+    } else {
+        match pr.state.as_str() {
+            "open" => 1,
+            "merged" => 3,
+            "closed" => 4,
+            _ => 5,
+        }
+    };
+    (kind, format!("Pull request\n{lines}"))
+}
+
 fn format_reviews(reviews: &[trouve_protocol::PrReview]) -> String {
     reviews
         .iter()
@@ -5236,8 +5525,8 @@ fn reorder_workspace(
 #[cfg(test)]
 mod tests {
     use super::{
-        download_progress, human_rate, reconcile_workspace_order, reorder_workspace, session_title,
-        thinking_property,
+        attention_badge, download_progress, human_rate, pr_badge, reconcile_workspace_order,
+        reorder_workspace, session_title, thinking_property,
     };
     use trouve_protocol::Workspace;
 
@@ -5275,6 +5564,43 @@ mod tests {
         assert_eq!(order, ["d", "b", "c", "a"]);
         assert!(!reorder_workspace(&mut order, "d", "d", false));
     }
+    fn pr(number: u64, state: &str, draft: bool) -> trouve_protocol::PrInfo {
+        trouve_protocol::PrInfo {
+            number,
+            url: String::new(),
+            title: format!("PR {number}"),
+            state: state.into(),
+            draft,
+            base: "main".into(),
+            head: "feature".into(),
+            checks: Vec::new(),
+            reviews: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn pr_badges_color_single_status_and_neutralize_multiple() {
+        assert_eq!(pr_badge(&[]).0, 0);
+        assert_eq!(pr_badge(&[pr(1, "open", false)]).0, 1);
+        assert_eq!(pr_badge(&[pr(2, "open", true)]).0, 2);
+        assert_eq!(pr_badge(&[pr(3, "merged", false)]).0, 3);
+        assert_eq!(pr_badge(&[pr(4, "closed", false)]).0, 4);
+        let (kind, tip) = pr_badge(&[pr(5, "open", false), pr(4, "merged", false)]);
+        assert_eq!(kind, 5);
+        assert!(tip.contains("#5 · Open"));
+        assert!(tip.contains("#4 · Merged"));
+    }
+
+    #[test]
+    fn attention_badges_distinguish_approval_question_and_both() {
+        assert_eq!(attention_badge(0, 0).0, 0);
+        assert_eq!(attention_badge(1, 0).0, 1);
+        assert_eq!(attention_badge(0, 1).0, 2);
+        let (kind, tip) = attention_badge(2, 1);
+        assert_eq!(kind, 3);
+        assert_eq!(tip, "2 approvals and 1 question need attention");
+    }
+
     #[test]
     fn download_progress_includes_speed() {
         let (text, pct) = download_progress("downloading", 25_000_000, 100_000_000, Some(12.3e6));
