@@ -213,7 +213,7 @@ pub enum UiCommand {
     },
     DeleteProvider(String),
     ProviderLogin(String),
-    SetDefaultModel(usize),
+    SetDefaultModel(usize, Option<String>),
     /// Set the global default permission mode (0 ask/1 allow-list/2 yolo).
     SetDefaultPermission(i32),
     /// Create/update a user-level mode (a built-in id customizes it).
@@ -221,11 +221,22 @@ pub enum UiCommand {
     /// tools, read-only, permission index (-1 global default/0 ask/
     /// 1 allow-list/2 yolo), model index into the models catalog
     /// (-1 = global default).
-    SaveMode(String, String, String, String, bool, i32, i32),
+    SaveMode(
+        String,
+        String,
+        String,
+        String,
+        bool,
+        i32,
+        i32,
+        Option<String>,
+    ),
     /// Remove a custom mode / reset a customized built-in.
     DeleteMode(String),
     /// Quick per-row change of a mode's default model (-1 = global).
     SetModeModel(String, i32),
+    /// Quick per-row change of a mode's thinking level (None = global).
+    SetModeThinking(String, Option<String>),
     /// Download/update a managed vendor CLI ("cursor-agent", "claude", "codex").
     CliInstall(String),
     /// Cancel an in-flight CLI install (also used for "llama-server").
@@ -589,6 +600,9 @@ struct Controller {
     /// custom / workspace) — drives the settings Modes & Models section.
     mode_origins: Vec<String>,
     models: Vec<ModelInfo>,
+    /// Global thinking default, kept with the catalogs so switching a live
+    /// thread's mode can apply the same inheritance as thread creation.
+    default_thinking_level: Option<String>,
     /// Thinking dropdown state for the current thread's model: the schema
     /// property the values belong to and the raw value tokens (parallel to
     /// the displayed labels).
@@ -739,6 +753,7 @@ pub async fn run(
         modes: Vec::new(),
         mode_origins: Vec::new(),
         models: Vec::new(),
+        default_thinking_level: None,
         thinking_key: None,
         thinking_values: Vec::new(),
         context_values: Vec::new(),
@@ -1004,6 +1019,9 @@ impl Controller {
         self.modes = infos.iter().map(|i| i.mode.clone()).collect();
         self.mode_origins = infos.into_iter().map(|i| i.origin).collect();
         self.models = self.client.list_models().await.unwrap_or_default();
+        if let Ok(providers) = self.client.list_providers().await {
+            self.default_thinking_level = providers.default_thinking_level;
+        }
         let mode_names = self
             .modes
             .iter()
@@ -1585,6 +1603,14 @@ impl Controller {
         let current = key
             .as_deref()
             .and_then(|k| thread?.model_options.get(k)?.as_str().map(String::from))
+            .or_else(|| {
+                thread?
+                    .model_options
+                    .get("thinking_level")?
+                    .as_str()
+                    .map(String::from)
+            })
+            .filter(|current| values.iter().any(|value| value == current))
             .or(default);
         let index = current
             .and_then(|c| values.iter().position(|v| *v == c))
@@ -2636,10 +2662,41 @@ impl Controller {
             }
         };
         let model_ids: Vec<String> = self.models.iter().map(|m| m.id.clone()).collect();
+        let default_model = providers.default_model.clone();
+        let default_thinking_level = providers.default_thinking_level.clone();
+        self.default_thinking_level = default_thinking_level.clone();
         let default_index = model_ids
             .iter()
-            .position(|m| *m == providers.default_model)
+            .position(|m| *m == default_model)
             .map(|i| i as i32)
+            .unwrap_or(-1);
+        let thinking_views: Vec<ui::ModelThinkingView> = self
+            .models
+            .iter()
+            .map(|model| {
+                let (_, values, schema_default) =
+                    thinking_property(&model.options_schema).unwrap_or_default();
+                let configured_index = default_thinking_level
+                    .as_ref()
+                    .and_then(|level| values.iter().position(|value| value == level))
+                    .or_else(|| {
+                        schema_default
+                            .as_ref()
+                            .and_then(|level| values.iter().position(|value| value == level))
+                    })
+                    .map(|i| i as i32)
+                    .unwrap_or_else(|| if values.is_empty() { -1 } else { 0 });
+                ui::ModelThinkingView {
+                    names: values.iter().map(|value| level_label(value)).collect(),
+                    values,
+                    configured_index,
+                }
+            })
+            .collect();
+        let default_thinking_index = usize::try_from(default_index)
+            .ok()
+            .and_then(|i| thinking_views.get(i))
+            .map(|item| item.configured_index)
             .unwrap_or(-1);
         ui::set_settings_data(
             &self.ui,
@@ -2658,7 +2715,9 @@ impl Controller {
                 })
                 .collect(),
             model_ids.clone(),
+            thinking_views,
             default_index,
+            default_thinking_index,
             permission_index_of(Some(providers.default_permission_mode)),
         );
         let mode_views = self
@@ -2674,6 +2733,21 @@ impl Controller {
                 allowed_tools: m.allowed_tools.join(", "),
                 permission_index: permission_index_of(m.default_permission_mode),
                 model_index: self.model_index_of(m.default_model.as_deref()),
+                thinking_index: m
+                    .default_thinking_level
+                    .as_ref()
+                    .and_then(|level| {
+                        let model_id = m.default_model.as_deref().unwrap_or(&default_model);
+                        self.models
+                            .iter()
+                            .find(|model| model.id == model_id)
+                            .and_then(|model| thinking_property(&model.options_schema))
+                            .and_then(|(_, values, _)| {
+                                values.iter().position(|value| value == level)
+                            })
+                    })
+                    .map(|i| i as i32)
+                    .unwrap_or(-1),
             })
             .collect();
         ui::set_settings_modes(&self.ui, mode_views, model_ids);
@@ -3709,17 +3783,32 @@ impl Controller {
                 }
             }
             UiCommand::ComposerModeChanged(i) => {
-                let mode = self.modes.get(i).map(|m| m.id.clone());
+                let selected_mode = self.modes.get(i).cloned();
+                let mode = selected_mode.as_ref().map(|m| m.id.clone());
                 // Switching modes also applies the mode's default model,
-                // when it has one; the user can still re-pick afterwards.
-                let model = self
-                    .modes
-                    .get(i)
+                // and thinking level, when present; the user can still
+                // re-pick either afterwards.
+                let model = selected_mode
+                    .as_ref()
                     .and_then(|m| m.default_model.clone())
                     .filter(|m| self.models.iter().any(|known| known.id == *m));
+                let mut model_options = if model.is_some() {
+                    serde_json::Map::new()
+                } else {
+                    self.current_model_options()
+                };
+                for key in ["thinking_level", "reasoning_effort", "effort", "reasoning"] {
+                    model_options.remove(key);
+                }
+                if let Some(level) = selected_mode
+                    .and_then(|m| m.default_thinking_level)
+                    .or_else(|| self.default_thinking_level.clone())
+                {
+                    model_options.insert("thinking_level".into(), serde_json::Value::String(level));
+                }
                 self.update_current_thread(UpdateThreadRequest {
                     mode,
-                    model_options: model.is_some().then(serde_json::Map::new),
+                    model_options: Some(model_options),
                     model,
                     ..Default::default()
                 })
@@ -4346,13 +4435,24 @@ impl Controller {
                     ui::set_settings_status(&self.ui, format!("{e:#}"));
                 }
             },
-            UiCommand::SetDefaultModel(i) => {
+            UiCommand::SetDefaultModel(i, thinking_level) => {
                 if let Some(model) = self.models.get(i) {
-                    match self.client.set_default_model(&model.id).await {
+                    match self
+                        .client
+                        .set_default_model(&model.id, thinking_level.as_deref())
+                        .await
+                    {
                         Ok(()) => {
                             ui::set_settings_status(
                                 &self.ui,
-                                format!("default model: {}", model.id),
+                                match &thinking_level {
+                                    Some(level) => format!(
+                                        "defaults: {} · {} thinking",
+                                        model.id,
+                                        level_label(level)
+                                    ),
+                                    None => format!("default model: {}", model.id),
+                                },
                             );
                             self.refresh_settings().await;
                         }
@@ -4378,7 +4478,16 @@ impl Controller {
                     }
                 }
             }
-            UiCommand::SaveMode(id, display, prompt, tools, read_only, perm, model) => {
+            UiCommand::SaveMode(
+                id,
+                display,
+                prompt,
+                tools,
+                read_only,
+                perm,
+                model,
+                thinking_level,
+            ) => {
                 let req = UpsertModeRequest {
                     display_name: display,
                     system_prompt: prompt,
@@ -4394,6 +4503,7 @@ impl Controller {
                         .ok()
                         .and_then(|i| self.models.get(i))
                         .map(|m| m.id.clone()),
+                    default_thinking_level: thinking_level,
                 };
                 match self.client.upsert_mode(&id, &req).await {
                     Ok(()) => {
@@ -4426,6 +4536,11 @@ impl Controller {
                             .ok()
                             .and_then(|i| self.models.get(i))
                             .map(|m| m.id.clone()),
+                        // Thinking choices are model-specific; changing the
+                        // mode's model resets this override to the global
+                        // default, just like changing a thread model clears
+                        // its model options.
+                        default_thinking_level: None,
                     };
                     match self.client.upsert_mode(&id, &req).await {
                         Ok(()) => {
@@ -4434,6 +4549,39 @@ impl Controller {
                                 match &req.default_model {
                                     Some(m) => format!("{id} default model: {m}"),
                                     None => format!("{id} uses the global default model"),
+                                },
+                            );
+                            self.reload_catalogs().await;
+                            self.refresh_settings().await;
+                        }
+                        Err(e) => ui::set_settings_status(&self.ui, format!("{e:#}")),
+                    }
+                }
+            }
+            UiCommand::SetModeThinking(id, thinking_level) => {
+                // PUT replaces the whole mode file, so carry every field and
+                // only swap the thinking-level override.
+                if let Some(mode) = self.modes.iter().find(|m| m.id == id).cloned() {
+                    let req = UpsertModeRequest {
+                        display_name: mode.display_name,
+                        system_prompt: mode.system_prompt,
+                        allowed_tools: mode.allowed_tools,
+                        read_only: mode.read_only,
+                        default_permission_mode: mode.default_permission_mode,
+                        default_model: mode.default_model,
+                        default_thinking_level: thinking_level,
+                    };
+                    match self.client.upsert_mode(&id, &req).await {
+                        Ok(()) => {
+                            ui::set_settings_status(
+                                &self.ui,
+                                match &req.default_thinking_level {
+                                    Some(level) => {
+                                        format!("{id} default thinking: {}", level_label(level))
+                                    }
+                                    None => {
+                                        format!("{id} uses the global default thinking level")
+                                    }
                                 },
                             );
                             self.reload_catalogs().await;
@@ -5616,6 +5764,7 @@ mod tests {
     use super::{
         approval_pill, check_pill, classify_pr, download_progress, human_age, human_rate,
         reconcile_pr_group_order, reconcile_workspace_order, reorder_id, session_title,
+        thinking_property,
     };
     use chrono::{Duration, TimeZone, Utc};
     use trouve_protocol::{CheckRun, PrInfo, PrReview, Workspace};
@@ -5801,7 +5950,6 @@ mod tests {
         assert_eq!(human_age(now - Duration::minutes(45), now), "45 mins ago");
         assert_eq!(human_age(now - Duration::hours(24), now), "1 day ago");
     }
-
     #[test]
     fn download_progress_includes_speed() {
         let (text, pct) = download_progress("downloading", 25_000_000, 100_000_000, Some(12.3e6));
@@ -5829,5 +5977,34 @@ mod tests {
         assert!(title.len() <= 50);
         assert!(!title.contains('\n'));
         assert_eq!(session_title("first line\nsecond"), "first line");
+    }
+
+    #[test]
+    fn thinking_picker_requires_a_model_advertised_enum() {
+        let supported = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "reasoning_effort": {
+                    "type": "string",
+                    "enum": ["low", "medium", "high"],
+                    "default": "medium"
+                }
+            }
+        });
+        assert_eq!(
+            thinking_property(&supported),
+            Some((
+                "reasoning_effort".into(),
+                vec!["low".into(), "medium".into(), "high".into()],
+                Some("medium".into())
+            ))
+        );
+        assert!(
+            thinking_property(&serde_json::json!({
+                "type": "object",
+                "properties": {"temperature": {"type": "number"}}
+            }))
+            .is_none()
+        );
     }
 }

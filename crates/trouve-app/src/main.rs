@@ -879,8 +879,9 @@ fn main() -> anyhow::Result<()> {
     }
     {
         let tx = tx.clone();
-        window.on_default_model_picked(move |i| {
-            let _ = tx.send(UiCommand::SetDefaultModel(i.max(0) as usize));
+        window.on_default_model_picked(move |i, thinking| {
+            let thinking = (!thinking.is_empty()).then(|| thinking.to_string());
+            let _ = tx.send(UiCommand::SetDefaultModel(i.max(0) as usize, thinking));
         });
     }
     {
@@ -891,17 +892,21 @@ fn main() -> anyhow::Result<()> {
     }
     {
         let tx = tx.clone();
-        window.on_mode_saved(move |id, display, prompt, tools, read_only, perm, model| {
-            let _ = tx.send(UiCommand::SaveMode(
-                id.to_string(),
-                display.to_string(),
-                prompt.to_string(),
-                tools.to_string(),
-                read_only,
-                perm,
-                model,
-            ));
-        });
+        window.on_mode_saved(
+            move |id, display, prompt, tools, read_only, perm, model, thinking| {
+                let thinking = (!thinking.is_empty()).then(|| thinking.to_string());
+                let _ = tx.send(UiCommand::SaveMode(
+                    id.to_string(),
+                    display.to_string(),
+                    prompt.to_string(),
+                    tools.to_string(),
+                    read_only,
+                    perm,
+                    model,
+                    thinking,
+                ));
+            },
+        );
     }
     {
         let tx = tx.clone();
@@ -913,6 +918,13 @@ fn main() -> anyhow::Result<()> {
         let tx = tx.clone();
         window.on_mode_model_picked(move |id, model| {
             let _ = tx.send(UiCommand::SetModeModel(id.to_string(), model));
+        });
+    }
+    {
+        let tx = tx.clone();
+        window.on_mode_thinking_picked(move |id, thinking| {
+            let thinking = (!thinking.is_empty()).then(|| thinking.to_string());
+            let _ = tx.send(UiCommand::SetModeThinking(id.to_string(), thinking));
         });
     }
     {

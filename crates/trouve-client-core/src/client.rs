@@ -510,11 +510,16 @@ impl ProtocolClient {
         .await
     }
 
-    pub async fn set_default_model(&self, model: &str) -> Result<()> {
+    pub async fn set_default_model(
+        &self,
+        model: &str,
+        default_thinking_level: Option<&str>,
+    ) -> Result<()> {
         self.put_empty(
             "/config/default-model",
             &SetDefaultModelRequest {
                 model: model.into(),
+                default_thinking_level: default_thinking_level.map(String::from),
             },
         )
         .await

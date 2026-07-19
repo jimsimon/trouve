@@ -1,5 +1,5 @@
-//! Data-driven agent modes (invariant 6): a mode is a prompt, a tool
-//! policy, and a default permission mode. Built-ins ship as data; users add
+//! Data-driven agent modes (invariant 6): a mode is a prompt, a tool policy,
+//! and model/permission defaults. Built-ins ship as data; users add
 //! or override modes with TOML files in `<config>/modes/` or a workspace's
 //! `.agents/modes/`.
 
@@ -21,6 +21,7 @@ pub fn builtin_modes() -> Vec<AgentMode> {
             read_only: false,
             default_permission_mode: None,
             default_model: None,
+            default_thinking_level: None,
         },
         AgentMode {
             id: "plan".into(),
@@ -41,6 +42,7 @@ pub fn builtin_modes() -> Vec<AgentMode> {
             read_only: true,
             default_permission_mode: None,
             default_model: None,
+            default_thinking_level: None,
         },
         AgentMode {
             id: "review".into(),
@@ -64,6 +66,7 @@ pub fn builtin_modes() -> Vec<AgentMode> {
             read_only: true,
             default_permission_mode: None,
             default_model: None,
+            default_thinking_level: None,
         },
         AgentMode {
             id: "architect".into(),
@@ -76,6 +79,7 @@ pub fn builtin_modes() -> Vec<AgentMode> {
             read_only: false,
             default_permission_mode: None,
             default_model: None,
+            default_thinking_level: None,
         },
         AgentMode {
             id: "question".into(),
@@ -95,6 +99,7 @@ pub fn builtin_modes() -> Vec<AgentMode> {
             read_only: true,
             default_permission_mode: None,
             default_model: None,
+            default_thinking_level: None,
         },
     ]
 }
@@ -123,6 +128,7 @@ pub fn fallback_mode() -> AgentMode {
         read_only: true,
         default_permission_mode: None,
         default_model: None,
+        default_thinking_level: None,
     }
 }
 
@@ -320,6 +326,7 @@ default_permission_mode = "ask"
             .unwrap();
         plan.display_name = "My Plan".into();
         plan.default_model = Some("openai/gpt-4.1-mini".into());
+        plan.default_thinking_level = Some("high".into());
         upsert_user_mode(config, &plan).unwrap();
         let custom = AgentMode {
             id: "docs".into(),
@@ -329,6 +336,7 @@ default_permission_mode = "ask"
             read_only: false,
             default_permission_mode: None,
             default_model: None,
+            default_thinking_level: None,
         };
         upsert_user_mode(config, &custom).unwrap();
 
@@ -339,6 +347,10 @@ default_permission_mode = "ask"
         assert_eq!(
             by_id("plan").mode.default_model.as_deref(),
             Some("openai/gpt-4.1-mini")
+        );
+        assert_eq!(
+            by_id("plan").mode.default_thinking_level.as_deref(),
+            Some("high")
         );
         assert_eq!(by_id("docs").origin, "custom");
         assert_eq!(by_id("code").origin, "builtin");

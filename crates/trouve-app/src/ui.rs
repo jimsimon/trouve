@@ -906,7 +906,9 @@ pub fn set_settings_data(
     ui: &Ui,
     providers: Vec<(String, String, String, bool, String, bool)>,
     models: Vec<String>,
+    thinking: Vec<ModelThinkingView>,
     default_model_index: i32,
+    default_thinking_index: i32,
     default_permission_index: i32,
 ) {
     let _ = ui.upgrade_in_event_loop(move |ui| {
@@ -925,9 +927,31 @@ pub fn set_settings_data(
             .collect();
         ui.set_settings_providers(ModelRc::new(VecModel::from(items)));
         ui.set_settings_models(string_model(models));
+        let thinking_items: Vec<crate::ThinkingItem> = thinking
+            .into_iter()
+            .map(|item| {
+                let mut mode_names = vec!["Global default".into()];
+                mode_names.extend(item.names.iter().cloned());
+                crate::ThinkingItem {
+                    values: string_model(item.values),
+                    names: string_model(item.names),
+                    mode_names: string_model(mode_names),
+                    configured_index: item.configured_index,
+                }
+            })
+            .collect();
+        ui.set_settings_model_thinking_items(ModelRc::new(VecModel::from(thinking_items)));
         ui.set_settings_default_model_index(default_model_index);
+        ui.set_settings_default_thinking_index(default_thinking_index);
         ui.set_settings_default_permission_index(default_permission_index);
     });
+}
+
+/// Thinking choices for one model, aligned with the settings model list.
+pub struct ModelThinkingView {
+    pub values: Vec<String>,
+    pub names: Vec<String>,
+    pub configured_index: i32,
 }
 
 /// Plain-data mirror of the Slint ModeItem struct.
@@ -941,6 +965,9 @@ pub struct ModeView {
     /// -1 = global default, 0 ask, 1 allow-list, 2 yolo.
     pub permission_index: i32,
     pub model_index: i32,
+    /// -1 = inherit the global default; otherwise an index into the selected
+    /// model's thinking enum.
+    pub thinking_index: i32,
 }
 
 /// Mode cards for the Modes & Models section, plus the per-mode model
@@ -958,6 +985,7 @@ pub fn set_settings_modes(ui: &Ui, modes: Vec<ModeView>, mut model_names: Vec<St
                 allowed_tools: SharedString::from(m.allowed_tools.as_str()),
                 permission_index: m.permission_index,
                 model_index: m.model_index,
+                thinking_index: m.thinking_index,
             })
             .collect();
         ui.set_settings_mode_items(ModelRc::new(VecModel::from(items)));

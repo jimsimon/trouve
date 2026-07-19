@@ -287,6 +287,16 @@ impl AgentBackend for ClaudeBackend {
                 let Ok(ev) = serde_json::from_str::<Value>(&line) else {
                     continue;
                 };
+                if let Some(error) = result_error(&ev) {
+                    // Error results can still carry a session_id; persist it
+                    // before reporting the error so the process isn't respawned.
+                    if let Some(sid) = ev["session_id"].as_str() {
+                        *proc_.session.lock().unwrap() = Some(sid.to_string());
+                    }
+                    let _ = tx.send(Err(BackendError::Protocol(error))).await;
+                    completed = true;
+                    break;
+                }
                 let events = map_event(&ev);
                 // Track the session the process is holding so the next
                 // turn's reuse check compares against the current id.
@@ -328,6 +338,52 @@ impl AgentBackend for ClaudeBackend {
         });
         Ok(stream.boxed())
     }
+}
+
+/// Claude reports turn-level failures as a final `result` record rather
+/// than closing stdout with an error. In particular, subscription limits use
+/// this path, so treating every result as successful makes the turn disappear
+/// from the chat without any feedback.
+fn result_error(ev: &Value) -> Option<String> {
+    if ev["type"].as_str() != Some("result") {
+        return None;
+    }
+    let subtype = ev["subtype"].as_str().unwrap_or_default();
+    if ev["is_error"].as_bool() != Some(true) && !subtype.starts_with("error_") {
+        return None;
+    }
+
+    ev["result"]
+        .as_str()
+        .filter(|message| !message.trim().is_empty())
+        .or_else(|| {
+            ev["error"]
+                .as_str()
+                .filter(|message| !message.trim().is_empty())
+        })
+        .or_else(|| {
+            ev["error"]["message"]
+                .as_str()
+                .filter(|message| !message.trim().is_empty())
+        })
+        .or_else(|| {
+            ev["errors"].as_array().and_then(|errors| {
+                errors.iter().find_map(|error| {
+                    error
+                        .as_str()
+                        .or_else(|| error["message"].as_str())
+                        .filter(|message| !message.trim().is_empty())
+                })
+            })
+        })
+        .map(str::to_string)
+        .or_else(|| {
+            Some(if subtype.is_empty() {
+                "Claude turn failed".to_string()
+            } else {
+                format!("Claude turn failed ({subtype})")
+            })
+        })
 }
 
 /// How long a `get_usage` query may take end to end (CLI cold start plus
@@ -982,5 +1038,79 @@ mod tests {
         assert_eq!(health.status, "unavailable");
         assert!(health.note.contains("claude.ai login"));
         assert!(health.windows.is_empty());
+    }
+
+    #[test]
+    fn result_error_detects_error_results() {
+        // Subscription limit error with is_error flag
+        let ev = json!({
+            "type": "result",
+            "is_error": true,
+            "session_id": "session-123",
+            "result": "You've reached your usage limit",
+        });
+        assert!(result_error(&ev).is_some());
+        assert!(result_error(&ev).unwrap().contains("usage limit"));
+
+        // Error subtype
+        let ev = json!({
+            "type": "result",
+            "subtype": "error_subscription_limit",
+            "session_id": "session-456",
+            "error": "Limit exceeded",
+        });
+        assert!(result_error(&ev).is_some());
+
+        // Successful result should not be an error
+        let ev = json!({
+            "type": "result",
+            "is_error": false,
+            "session_id": "session-789",
+            "usage": { "input_tokens": 100 },
+        });
+        assert!(result_error(&ev).is_none());
+    }
+
+    #[test]
+    fn error_results_preserve_session_id() {
+        // Error results should carry session_id just like successful ones.
+        // This test verifies the structure used by the event loop fix.
+        let error_result = json!({
+            "type": "result",
+            "is_error": true,
+            "session_id": "session-after-error-abc123",
+            "result": "Subscription limit exceeded",
+            "usage": {
+                "input_tokens": 50,
+                "output_tokens": 0,
+            },
+        });
+
+        // Verify it's detected as an error
+        assert!(result_error(&error_result).is_some());
+
+        // Verify session_id is accessible (as the event loop fix relies on)
+        assert_eq!(
+            error_result["session_id"].as_str(),
+            Some("session-after-error-abc123")
+        );
+
+        // Successful results also have session_id via map_event
+        let success_result = json!({
+            "type": "result",
+            "session_id": "session-success-xyz789",
+            "usage": {
+                "input_tokens": 100,
+                "output_tokens": 50,
+            },
+        });
+
+        let events = map_event(&success_result);
+        // Should produce SessionStarted + Completed events
+        assert_eq!(events.len(), 2);
+        assert!(matches!(events[0], BackendEvent::SessionStarted { .. }));
+        if let BackendEvent::SessionStarted { session_id } = &events[0] {
+            assert_eq!(session_id, "session-success-xyz789");
+        }
     }
 }

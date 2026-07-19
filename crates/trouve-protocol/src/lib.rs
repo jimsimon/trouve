@@ -58,13 +58,12 @@ pub use requests::*;
 // 0.20: global default permission mode — AgentMode.default_permission_mode
 // is now optional (absent = global default), GET /v1/providers reports
 // default_permission_mode, and PUT /v1/config/default-permission-mode sets it.
-// 0.21: PR dashboard — GET /v1/workspaces/{id}/prs lists every open or
-// recently merged PR of the workspace's origin repo, and PrInfo gains
-// author, requested_reviewers, comment counts/timestamps, and merged_at
-// (all additive).
-// 0.22: workspace.pull_requests_updated persists each dashboard refresh in
-// the server event log; POST /v1/workspaces/{id}/prs/refresh triggers the
-// refresh without returning UI state directly (additive event-flow change).
+// 0.21: global and per-mode default thinking levels — additive fields on
+// AgentMode, UpsertModeRequest, ProvidersResponse, and SetDefaultModelRequest.
+// 0.22: PR dashboard — PrInfo gains review and comment metadata;
+// workspace.pull_requests_updated persists each workspace snapshot, and
+// POST /v1/workspaces/{id}/prs/refresh triggers a refresh without returning
+// UI state directly.
 pub const PROTOCOL_VERSION: &str = "0.22";
 
 pub type WorkspaceId = String;

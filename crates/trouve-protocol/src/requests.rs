@@ -18,7 +18,7 @@ pub enum PermissionMode {
     Yolo,
 }
 
-/// A data-driven agent mode: prompt + tool policy + default permissions.
+/// A data-driven agent mode: prompt + tool policy + model/permission defaults.
 /// Adding a mode is configuration, not code (AGENTS.md invariant 6).
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct AgentMode {
@@ -42,6 +42,11 @@ pub struct AgentMode {
     /// None falls back to the global default model.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default_model: Option<String>,
+    /// Preferred thinking level for threads started in this mode. The value
+    /// is a model-advertised enum token (for example "medium" or "high").
+    /// None falls back to the global default thinking level.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_thinking_level: Option<String>,
 }
 
 /// A mode plus where it came from, for the settings UI.
@@ -69,6 +74,9 @@ pub struct UpsertModeRequest {
     pub default_permission_mode: Option<PermissionMode>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default_model: Option<String>,
+    /// None uses the global default thinking level.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_thinking_level: Option<String>,
 }
 
 // --- server info ---------------------------------------------------------
@@ -596,6 +604,10 @@ pub struct ProvidersResponse {
     pub providers: Vec<ProviderInfo>,
     /// Default model for new threads, e.g. "openai/gpt-4.1-mini".
     pub default_model: String,
+    /// Global thinking level for new threads. None leaves the selected
+    /// model at its own default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_thinking_level: Option<String>,
     /// Global default permission mode for new threads, used by modes without
     /// a default of their own. Absent on older servers means Ask.
     #[serde(default)]
@@ -618,6 +630,11 @@ pub struct UpsertProviderRequest {
 pub struct SetDefaultModelRequest {
     /// Provider-qualified id, e.g. "openai/gpt-4.1-mini".
     pub model: String,
+    /// Global thinking level for the selected model. Omitted when the model
+    /// has no thinking knob, preserving the existing global setting for
+    /// models that do support it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_thinking_level: Option<String>,
 }
 
 /// Set the global default permission mode

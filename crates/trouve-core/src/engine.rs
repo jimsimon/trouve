@@ -44,6 +44,83 @@ pub enum EngineError {
     Internal(#[from] anyhow::Error),
 }
 
+const THINKING_OPTION_KEYS: [&str; 4] =
+    ["thinking_level", "reasoning_effort", "effort", "reasoning"];
+
+fn validate_thinking_level(level: Option<&str>) -> Result<(), EngineError> {
+    if level.is_some_and(|value| value.trim().is_empty()) {
+        return Err(EngineError::BadRequest(
+            "default_thinking_level must not be empty".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn has_thinking_option(options: &serde_json::Map<String, serde_json::Value>) -> bool {
+    THINKING_OPTION_KEYS
+        .iter()
+        .any(|key| options.contains_key(*key))
+}
+
+fn inherit_thinking_option(
+    options: &mut serde_json::Map<String, serde_json::Value>,
+    mode_level: Option<&str>,
+    global_level: Option<&str>,
+) {
+    if has_thinking_option(options) {
+        return;
+    }
+    if let Some(level) = mode_level.or(global_level) {
+        options.insert(
+            "thinking_level".into(),
+            serde_json::Value::String(level.into()),
+        );
+    }
+}
+
+/// Resolve the canonical inherited `thinking_level` key through a model's
+/// advertised options schema. Unknown/unsupported levels fall back to the
+/// model's schema default; models without an enum thinking knob drop the
+/// inherited option entirely.
+fn normalize_thinking_option(
+    options: &mut serde_json::Map<String, serde_json::Value>,
+    model: Option<&trouve_protocol::ModelInfo>,
+) {
+    let Some(canonical) = options.get("thinking_level").cloned() else {
+        return;
+    };
+    let property = model.and_then(|model| {
+        THINKING_OPTION_KEYS.iter().find_map(|key| {
+            let property = model
+                .options_schema
+                .pointer(&format!("/properties/{key}"))?;
+            let values = property["enum"].as_array()?;
+            (values.len() > 1).then_some((*key, property, values))
+        })
+    });
+    let Some((key, property, values)) = property else {
+        options.remove("thinking_level");
+        return;
+    };
+
+    // A thread-level selection already stored under the model's native key
+    // wins over the inherited canonical value.
+    if key != "thinking_level" && options.contains_key(key) {
+        options.remove("thinking_level");
+        return;
+    }
+
+    let selected = canonical
+        .as_str()
+        .filter(|level| values.iter().any(|value| value.as_str() == Some(*level)))
+        .map(String::from)
+        .or_else(|| property["default"].as_str().map(String::from));
+    options.remove("thinking_level");
+    if let Some(selected) = selected {
+        options.insert(key.into(), serde_json::Value::String(selected));
+    }
+}
+
 pub struct Engine {
     store: Store,
     data_dir: PathBuf,
@@ -80,6 +157,10 @@ pub struct Engine {
     /// persistence (tests).
     config_file: Option<PathBuf>,
     default_model: RwLock<String>,
+    /// Canonical thinking-level token inherited by modes without an
+    /// override. It is translated through the selected model's schema when
+    /// the turn starts.
+    default_thinking_level: RwLock<Option<String>>,
     /// Global default permission mode for new threads, used by modes that
     /// don't set one of their own.
     default_permission_mode: RwLock<trouve_protocol::PermissionMode>,
@@ -381,6 +462,7 @@ impl Engine {
                     .clone()
                     .unwrap_or_else(|| "openai/gpt-4.1-mini".into()),
             ),
+            default_thinking_level: RwLock::new(config.default_thinking_level.clone()),
             default_permission_mode: RwLock::new(
                 config.default_permission_mode.unwrap_or_default(),
             ),
@@ -534,6 +616,12 @@ impl Engine {
         self
     }
 
+    /// Override the global default thinking level for new threads.
+    pub fn with_default_thinking_level(self, level: Option<&str>) -> Self {
+        *self.default_thinking_level.write().unwrap() = level.map(String::from);
+        self
+    }
+
     /// Override the config dir used for mode/AGENTS.md discovery (tests).
     pub fn with_config_dir(mut self, dir: Option<PathBuf>) -> Self {
         self.config_dir = dir;
@@ -667,6 +755,7 @@ impl Engine {
         ProvidersResponse {
             providers: infos,
             default_model: self.default_model.read().unwrap().clone(),
+            default_thinking_level: self.default_thinking_level.read().unwrap().clone(),
             default_permission_mode: *self.default_permission_mode.read().unwrap(),
         }
     }
@@ -1975,18 +2064,29 @@ impl Engine {
     }
 
     /// Set the default model for new threads (provider-qualified).
-    pub fn set_default_model(&self, model: &str) -> Result<(), EngineError> {
+    pub fn set_default_model(
+        &self,
+        model: &str,
+        thinking_level: Option<&str>,
+    ) -> Result<(), EngineError> {
         if !model.contains('/') {
             return Err(EngineError::BadRequest(format!(
                 "model must be provider-qualified (e.g. openai/gpt-4.1-mini): {model}"
             )));
         }
+        validate_thinking_level(thinking_level)?;
         {
             let mut config = self.config.lock().unwrap();
             config.default_model = Some(model.to_string());
+            if let Some(level) = thinking_level {
+                config.default_thinking_level = Some(level.into());
+            }
             self.persist_config(&config);
         }
         *self.default_model.write().unwrap() = model.to_string();
+        if let Some(level) = thinking_level {
+            *self.default_thinking_level.write().unwrap() = Some(level.into());
+        }
         Ok(())
     }
 
@@ -2107,6 +2207,7 @@ impl Engine {
                 "default_model must be provider-qualified (\"provider/model\"), got {model}"
             )));
         }
+        validate_thinking_level(req.default_thinking_level.as_deref())?;
         let mode = AgentMode {
             id: id.to_string(),
             display_name: req.display_name,
@@ -2115,6 +2216,7 @@ impl Engine {
             read_only: req.read_only,
             default_permission_mode: req.default_permission_mode,
             default_model: req.default_model,
+            default_thinking_level: req.default_thinking_level,
         };
         modes::upsert_user_mode(config_dir, &mode)
             .map_err(|e| EngineError::BadRequest(format!("{e:#}")))
@@ -3153,12 +3255,23 @@ impl Engine {
             .model
             .or_else(|| mode.default_model.clone())
             .unwrap_or_else(|| self.default_model.read().unwrap().clone());
+        let mut model_options = req.model_options;
+        let global_thinking_level = self.default_thinking_level.read().unwrap().clone();
+        // `thinking_level` is the canonical inherited key. Before a turn it
+        // is resolved to the selected model's advertised key
+        // (reasoning_effort, effort, ...), or removed for models that do not
+        // expose thinking levels.
+        inherit_thinking_option(
+            &mut model_options,
+            mode.default_thinking_level.as_deref(),
+            global_thinking_level.as_deref(),
+        );
         let thread = Thread {
             id: new_id("th"),
             session_id: session.id.clone(),
             mode: mode.id.clone(),
             model,
-            model_options: req.model_options.clone(),
+            model_options: model_options.clone(),
             // Permission precedence mirrors the model's: explicit request >
             // the mode's default > the global default.
             permission_mode: req
@@ -3170,7 +3283,7 @@ impl Engine {
             // reads recompute this flag from the spawned_threads table.
             spawned: false,
         };
-        self.store.insert_thread(&thread, &req.model_options)?;
+        self.store.insert_thread(&thread, &model_options)?;
         self.store.append_event(
             Scope::Server,
             Event::ThreadCreated {
@@ -3844,7 +3957,12 @@ impl Engine {
         let (provider, model_name) = self
             .resolve_provider(&thread.model)
             .map_err(|e| anyhow!(e.to_string()))?;
-        let model_options = self.store.thread_model_options(&thread.id)?;
+        let mut model_options = self.store.thread_model_options(&thread.id)?;
+        let model_catalog = provider.list_models().await;
+        normalize_thinking_option(
+            &mut model_options,
+            model_catalog.iter().find(|m| m.id == thread.model),
+        );
 
         self.store.append_event(
             scope.clone(),
@@ -4634,12 +4752,18 @@ impl Engine {
             Some(digest) => format!("{digest}\n\n{content}"),
             None => content,
         };
+        let mut model_options = self.store.thread_model_options(&thread.id)?;
+        let model_catalog = backend.list_models().await;
+        normalize_thinking_option(
+            &mut model_options,
+            model_catalog.iter().find(|m| m.id == thread.model),
+        );
         let backend_turn = BackendTurn {
             thread_id: thread.id.clone(),
             worktree: PathBuf::from(&session.worktree_path),
             session: vendor_session,
             model: model_name,
-            model_options: self.store.thread_model_options(&thread.id)?,
+            model_options,
             prompt,
             attachments: turn_attachments,
             instructions: (!instructions.is_empty()).then_some(instructions),
@@ -6725,5 +6849,61 @@ mod tests {
             },
         ];
         assert_eq!(sanitize_transcript(clean).len(), 2);
+    }
+
+    #[test]
+    fn inherited_thinking_level_resolves_through_model_schema() {
+        let mut inherited = serde_json::Map::new();
+        inherit_thinking_option(&mut inherited, Some("low"), Some("high"));
+        assert_eq!(inherited["thinking_level"], "low");
+
+        let mut explicit =
+            serde_json::Map::from_iter([("reasoning_effort".into(), serde_json::json!("medium"))]);
+        inherit_thinking_option(&mut explicit, Some("low"), Some("high"));
+        assert_eq!(explicit.len(), 1, "an explicit thread option wins");
+        assert_eq!(explicit["reasoning_effort"], "medium");
+
+        let model = trouve_protocol::ModelInfo {
+            id: "codex/gpt".into(),
+            display_name: "GPT".into(),
+            context_window: 100_000,
+            supports_tools: true,
+            input_price_per_mtok: None,
+            output_price_per_mtok: None,
+            options_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "reasoning_effort": {
+                        "type": "string",
+                        "enum": ["low", "medium", "high"],
+                        "default": "medium"
+                    }
+                }
+            }),
+        };
+        let mut options =
+            serde_json::Map::from_iter([("thinking_level".into(), serde_json::json!("high"))]);
+        normalize_thinking_option(&mut options, Some(&model));
+        assert_eq!(
+            options.get("reasoning_effort"),
+            Some(&serde_json::json!("high"))
+        );
+        assert!(!options.contains_key("thinking_level"));
+
+        // A global token the selected model does not offer falls back to
+        // that model's advertised default.
+        options.remove("reasoning_effort");
+        options.insert("thinking_level".into(), serde_json::json!("xhigh"));
+        normalize_thinking_option(&mut options, Some(&model));
+        assert_eq!(
+            options.get("reasoning_effort"),
+            Some(&serde_json::json!("medium"))
+        );
+
+        // No thinking enum means the inherited option is not sent.
+        options.remove("reasoning_effort");
+        options.insert("thinking_level".into(), serde_json::json!("high"));
+        normalize_thinking_option(&mut options, None);
+        assert!(options.is_empty());
     }
 }
