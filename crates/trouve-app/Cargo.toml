@@ -61,3 +61,6 @@ base64 = "0.22"
 
 [build-dependencies]
 slint-build = "1.17"
+
+[dev-dependencies]
+i-slint-backend-testing = "1.17"

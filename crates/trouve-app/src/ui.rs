@@ -124,55 +124,66 @@ pub fn set_model_knobs(
 }
 
 pub fn set_nav(ui: &Ui, rows: Vec<NavRowData>) {
+    let _ = ui.upgrade_in_event_loop(move |ui| {
+        set_nav_now(&ui, rows);
+    });
+}
+
+fn set_nav_now(ui: &AppWindow, rows: Vec<NavRowData>) {
     use slint::Model as _;
 
-    let _ = ui.upgrade_in_event_loop(move |ui| {
-        let items: Vec<NavRow> = rows
-            .into_iter()
-            .map(|r| NavRow {
-                kind: r.kind,
-                title: r.title.into(),
-                subtitle: r.subtitle.into(),
-                workspace_id: r.workspace_id.into(),
-                workspace_position: r.workspace_position,
-                workspace_count: r.workspace_count,
-                session_index: r.session_index,
-                selected: r.selected,
-                archived: r.archived,
-                expanded: r.expanded,
-                busy: r.busy,
-                unread: r.unread,
-                pr_kind: r.pr_kind,
-                pr_tooltip: r.pr_tooltip.into(),
-                attention_kind: r.attention_kind,
-                attention_tooltip: r.attention_tooltip.into(),
-                show_archived: r.show_archived,
-            })
-            .collect();
+    let items: Vec<NavRow> = rows
+        .into_iter()
+        .map(|r| NavRow {
+            kind: r.kind,
+            title: r.title.into(),
+            subtitle: r.subtitle.into(),
+            workspace_id: r.workspace_id.into(),
+            workspace_position: r.workspace_position,
+            workspace_count: r.workspace_count,
+            session_index: r.session_index,
+            selected: r.selected,
+            archived: r.archived,
+            expanded: r.expanded,
+            busy: r.busy,
+            unread: r.unread,
+            pr_kind: r.pr_kind,
+            pr_tooltip: r.pr_tooltip.into(),
+            attention_kind: r.attention_kind,
+            attention_tooltip: r.attention_tooltip.into(),
+            show_archived: r.show_archived,
+        })
+        .collect();
 
-        // Keep the model object stable. Replacing it for a selection-only
-        // change makes ListView discard its virtual-row measurements and can
-        // leave viewport-y beyond the rebuilt content (a click near the end
-        // then produces an empty, unscrollable list).
-        let model = ui.get_nav_rows();
-        match model.as_any().downcast_ref::<VecModel<NavRow>>() {
-            Some(vec) => {
-                let common = vec.row_count().min(items.len());
-                for (i, item) in items.iter().take(common).enumerate() {
-                    if vec.row_data(i).as_ref() != Some(item) {
-                        vec.set_row_data(i, item.clone());
-                    }
-                }
-                for item in &items[common..] {
-                    vec.push(item.clone());
-                }
-                while vec.row_count() > items.len() {
-                    vec.remove(vec.row_count() - 1);
+    // Keep the model object stable. Replacing it for a selection-only
+    // change makes ListView discard its virtual-row measurements and can
+    // leave viewport-y beyond the rebuilt content (a click near the end
+    // then produces an empty, unscrollable list).
+    let model = ui.get_nav_rows();
+    match model.as_any().downcast_ref::<VecModel<NavRow>>() {
+        Some(vec) => {
+            let common = vec.row_count().min(items.len());
+            for (i, item) in items.iter().take(common).enumerate() {
+                if vec.row_data(i).as_ref() != Some(item) {
+                    vec.set_row_data(i, item.clone());
                 }
             }
-            None => ui.set_nav_rows(ModelRc::new(VecModel::from(items))),
+            for item in &items[common..] {
+                vec.push(item.clone());
+            }
+            while vec.row_count() > items.len() {
+                vec.remove(vec.row_count() - 1);
+            }
         }
-    });
+        None => ui.set_nav_rows(ModelRc::new(VecModel::from(items))),
+    }
+
+    // Keyboard reordering used to replace the model, so the moved row's
+    // init hook restored focus. In-place updates retain delegates; explicitly
+    // notify them after every row has reached its new position instead.
+    if !ui.get_workspace_reorder_focus_id().is_empty() {
+        ui.invoke_restore_workspace_reorder_focus();
+    }
 }
 
 pub fn set_threads(ui: &Ui, threads: Vec<(String, String)>, current: i32) {
@@ -1384,4 +1395,77 @@ fn string_model(values: Vec<String>) -> ModelRc<SharedString> {
             .map(SharedString::from)
             .collect::<Vec<_>>(),
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    use slint::platform::{Key, WindowEvent};
+    use slint::{ComponentHandle as _, PhysicalSize};
+
+    use super::*;
+
+    fn workspace_rows(ids: &[&str]) -> Vec<NavRowData> {
+        ids.iter()
+            .enumerate()
+            .map(|(position, id)| NavRowData {
+                kind: 0,
+                title: (*id).into(),
+                workspace_id: (*id).into(),
+                workspace_position: position as i32,
+                workspace_count: ids.len() as i32,
+                expanded: true,
+                ..Default::default()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn keyboard_workspace_reorder_restores_focus_up_and_down() {
+        i_slint_backend_testing::init_no_event_loop();
+
+        let ui = AppWindow::new().unwrap();
+        ui.window().set_size(PhysicalSize::new(1400, 900));
+        let moves = Rc::new(RefCell::new(Vec::new()));
+        let captured = moves.clone();
+        ui.on_workspace_moved(move |id, offset| {
+            captured.borrow_mut().push((id.to_string(), offset));
+        });
+
+        ui.show().unwrap();
+        ui.set_workspace_reorder_focus_id("b".into());
+        set_nav_now(&ui, workspace_rows(&["a", "b", "c"]));
+        i_slint_backend_testing::mock_elapsed_time(std::time::Duration::ZERO);
+        assert!(ui.get_workspace_reorder_focus_id().is_empty());
+
+        // Move b up, apply the controller's resulting model, then Down must
+        // still be delivered to b at its new delegate/index.
+        ui.window().dispatch_event(WindowEvent::KeyPressed {
+            text: Key::UpArrow.into(),
+        });
+        assert_eq!(&*moves.borrow(), &[("b".into(), -1)]);
+        set_nav_now(&ui, workspace_rows(&["b", "a", "c"]));
+        i_slint_backend_testing::mock_elapsed_time(std::time::Duration::ZERO);
+        assert!(ui.get_workspace_reorder_focus_id().is_empty());
+
+        // Move b down again; after applying that model, Up proves focus also
+        // followed the downward reorder rather than remaining at index 0.
+        ui.window().dispatch_event(WindowEvent::KeyPressed {
+            text: Key::DownArrow.into(),
+        });
+        assert_eq!(&*moves.borrow(), &[("b".into(), -1), ("b".into(), 1)]);
+        set_nav_now(&ui, workspace_rows(&["a", "b", "c"]));
+        i_slint_backend_testing::mock_elapsed_time(std::time::Duration::ZERO);
+        assert!(ui.get_workspace_reorder_focus_id().is_empty());
+
+        ui.window().dispatch_event(WindowEvent::KeyPressed {
+            text: Key::UpArrow.into(),
+        });
+        assert_eq!(
+            &*moves.borrow(),
+            &[("b".into(), -1), ("b".into(), 1), ("b".into(), -1)]
+        );
+    }
 }
