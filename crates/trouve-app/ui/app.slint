@@ -630,11 +630,12 @@ component TableGrid inherits Rectangle {
         padding: 1px;
         spacing: 1px;
 
-        for table-row[table-row-index] in root.rows: HorizontalLayout {
+        for table-row[table-row-index] in root.rows: row-layout := HorizontalLayout {
             spacing: 1px;
 
             for cell in table-row: Rectangle {
-                horizontal-stretch: 1;
+                min-width: (row-layout.width - 1px * (table-row.length - 1)) / table-row.length;
+                max-width: self.min-width;
                 background: table-row-index == 0
                     ? Theme.c.surface : Theme.c.inset-bg;
 
