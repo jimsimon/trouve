@@ -1,10 +1,12 @@
-//! GitHub PR integration (Phase 5 slice): create, inspect, and merge the PR
-//! for a session branch via octocrab.
+//! GitHub PR integration (Phase 5 slice): create, inspect, and merge PRs
+//! associated with a session via octocrab.
 //!
-//! Covered today: PR lookup by branch, create (incl. draft), combined
-//! status (checks + reviews), merge with method selection. Review threads,
-//! merge queues (GraphQL), and GitLab are tracked as follow-ups in the
-//! plan.
+//! Covered today: PR lookup by branch and session activity, create (incl.
+//! draft), combined status (checks + reviews), and merge with method
+//! selection. Review threads, merge queues (GraphQL), and GitLab are tracked
+//! as follow-ups in the plan.
+
+use std::collections::HashSet;
 
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
@@ -50,6 +52,83 @@ pub fn parse_remote(url: &str) -> Option<(String, String, String)> {
         return None;
     }
     Some((host, owner.to_string(), repo.to_string()))
+}
+
+/// Pull-request numbers mentioned in `text` for one repository.
+///
+/// Recognizes browser URLs plus public, enterprise, and relative REST API
+/// paths. This is deliberately independent of the client that produced the
+/// text (GitHub UI, REST, GraphQL responses, CLIs, or MCP tools).
+pub fn pr_numbers_in_text(text: &str, host: &str, owner: &str, repo: &str) -> Vec<u64> {
+    let text = text.to_ascii_lowercase();
+    let mut numbers = Vec::new();
+    let host = host.to_ascii_lowercase();
+    let owner = owner.to_ascii_lowercase();
+    let repo = repo.to_ascii_lowercase();
+    let mut prefixes = vec![
+        format!("https://{host}/{owner}/{repo}/pull/"),
+        format!("http://{host}/{owner}/{repo}/pull/"),
+        format!("repos/{owner}/{repo}/pulls/"),
+    ];
+    if host == GITHUB_COM {
+        prefixes.push(format!("api.github.com/repos/{owner}/{repo}/pulls/"));
+    } else {
+        prefixes.push(format!("{host}/api/v3/repos/{owner}/{repo}/pulls/"));
+    }
+    for prefix in prefixes {
+        let mut rest = text.as_str();
+        while let Some(index) = rest.find(&prefix) {
+            rest = &rest[index + prefix.len()..];
+            let digits = rest
+                .chars()
+                .take_while(char::is_ascii_digit)
+                .collect::<String>();
+            if let Ok(number) = digits.parse()
+                && !numbers.contains(&number)
+            {
+                numbers.push(number);
+            }
+        }
+    }
+    numbers
+}
+
+pub fn pr_url(host: &str, owner: &str, repo: &str, number: u64) -> String {
+    format!("https://{host}/{owner}/{repo}/pull/{number}")
+}
+
+fn text_mentions_ref(text: &str, reference: &str) -> bool {
+    let text = text.as_bytes();
+    let reference = reference.as_bytes();
+    if reference.is_empty() {
+        return false;
+    }
+    text.windows(reference.len())
+        .enumerate()
+        .any(|(index, part)| {
+            part == reference
+                && (index == 0 || !is_ref_byte(text[index - 1]))
+                && (index + reference.len() == text.len()
+                    || !is_ref_byte(text[index + reference.len()]))
+        })
+}
+
+fn is_ref_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || matches!(byte, b'/' | b'-' | b'_' | b'.')
+}
+
+fn pr_head_matches_evidence(
+    branch: &str,
+    label: Option<&str>,
+    sha: &str,
+    branch_evidence: &[String],
+    commit_ids: &HashSet<String>,
+) -> bool {
+    commit_ids.contains(&sha.to_ascii_lowercase())
+        || branch_evidence.iter().any(|text| {
+            text_mentions_ref(text, branch)
+                || label.is_some_and(|label| text_mentions_ref(text, label))
+        })
 }
 
 /// Token from the environment for `host`. github.com reads
@@ -230,6 +309,52 @@ impl GitHub {
             Some(pr) => Ok(Some(self.enrich(pr).await?)),
             None => Ok(None),
         }
+    }
+
+    /// A PR by repository-local number, regardless of its head branch.
+    pub async fn pr(&self, number: u64) -> Result<PrInfo> {
+        let pr = self
+            .client
+            .pulls(&self.owner, &self.repo)
+            .get(number)
+            .await
+            .context("getting PR")?;
+        self.enrich(pr).await
+    }
+
+    /// Open PRs whose head ref or commit is tied to successful activity in a
+    /// session. This discovers PRs opened later through the GitHub UI, REST,
+    /// GraphQL, or another client after the session created or pushed them.
+    pub async fn open_prs_referenced_by(
+        &self,
+        branch_evidence: &[String],
+        commit_ids: &HashSet<String>,
+    ) -> Result<Vec<PrInfo>> {
+        if branch_evidence.is_empty() && commit_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let first = self
+            .client
+            .pulls(&self.owner, &self.repo)
+            .list()
+            .per_page(100)
+            .send()
+            .await
+            .context("listing open PRs")?;
+        let candidates = self
+            .client
+            .all_pages(first)
+            .await
+            .context("listing open PR pages")?;
+        let mut prs = Vec::new();
+        for pr in candidates {
+            let branch = &pr.head.ref_field;
+            let label = pr.head.label.as_deref();
+            if pr_head_matches_evidence(branch, label, &pr.head.sha, branch_evidence, commit_ids) {
+                prs.push(self.enrich(pr).await?);
+            }
+        }
+        Ok(prs)
     }
 
     /// Every PR (open, merged, or closed) whose head is `branch`, open ones
@@ -585,5 +710,44 @@ mod tests {
         );
         assert_eq!(parse_remote("git@github.com:broken"), None);
         assert_eq!(parse_remote("/local/path/repo.git"), None);
+    }
+
+    #[test]
+    fn finds_only_pr_urls_for_the_expected_repository() {
+        let text = concat!(
+            "created https://github.com/JimSimon/Trouve/pull/73, ",
+            "then viewed https://github.com/jimsimon/trouve/pull/73#discussion; ",
+            "REST https://api.github.com/repos/jimsimon/trouve/pulls/74; ",
+            "relative repos/jimsimon/trouve/pulls/75/comments; ",
+            "ignore https://github.com/other/repo/pull/9"
+        );
+        assert_eq!(
+            pr_numbers_in_text(text, "github.com", "jimsimon", "trouve"),
+            vec![73, 74, 75]
+        );
+        assert!(pr_numbers_in_text(text, "github.com", "other", "project").is_empty());
+    }
+
+    #[test]
+    fn matches_head_refs_on_token_boundaries() {
+        assert!(text_mentions_ref(
+            "git push origin fix/cross-branch-pr",
+            "fix/cross-branch-pr"
+        ));
+        assert!(text_mentions_ref(
+            r#"{\"head\":\"alice:fix/cross-branch-pr\"}"#,
+            "alice:fix/cross-branch-pr"
+        ));
+        assert!(!text_mentions_ref(
+            "git push origin prefix-fix/cross-branch-pr-old",
+            "fix/cross-branch-pr"
+        ));
+        assert!(pr_head_matches_evidence(
+            "unmentioned-branch",
+            None,
+            "9F2C6D8B18C86D48CA2C3F58191F9F5277B9269A",
+            &[],
+            &HashSet::from(["9f2c6d8b18c86d48ca2c3f58191f9f5277b9269a".into()]),
+        ));
     }
 }

@@ -677,7 +677,7 @@ impl ProtocolClient {
         self.get_json(&format!("/sessions/{session_id}/pr")).await
     }
 
-    /// All PRs spawned from the session branch (open first, newest first).
+    /// All PRs associated with the session (open first, newest first).
     pub async fn session_prs(&self, session_id: &str) -> Result<Vec<PrInfo>> {
         self.get_json(&format!("/sessions/{session_id}/prs")).await
     }
