@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1784424813202,
+  "lastUpdate": 1784424890520,
   "repoUrl": "https://github.com/jimsimon/trouve",
   "entries": {
     "e2e-benchmarks": [
@@ -3793,6 +3793,54 @@ window.BENCHMARK_DATA = {
             "name": "dense_query_20k_rows",
             "value": 1389135.4303144447,
             "range": "± 8763",
+            "unit": "ns"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "29139614+renovate[bot]@users.noreply.github.com",
+            "name": "renovate[bot]",
+            "username": "renovate[bot]"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "3c8897ca2d828ccfcdb0d89ac08cf6f50536e241",
+          "message": "Update dependency typescript to v7 (#42)\n\nCo-authored-by: renovate[bot] <29139614+renovate[bot]@users.noreply.github.com>",
+          "timestamp": "2026-07-18T21:31:43-04:00",
+          "tree_id": "12d8bd669ab16d9a934106343ce5b38378c30020",
+          "url": "https://github.com/jimsimon/trouve/commit/3c8897ca2d828ccfcdb0d89ac08cf6f50536e241"
+        },
+        "date": 1784424889703,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "bm25_build_5k_docs",
+            "value": 4994809.611111111,
+            "range": "± 10786",
+            "unit": "ns"
+          },
+          {
+            "name": "bm25_query_5k_docs",
+            "value": 36905.82658227848,
+            "range": "± 10",
+            "unit": "ns"
+          },
+          {
+            "name": "chunk_python_200_functions",
+            "value": 3029251.823529412,
+            "range": "± 1000",
+            "unit": "ns"
+          },
+          {
+            "name": "dense_query_20k_rows",
+            "value": 1355189.3615196077,
+            "range": "± 8758",
             "unit": "ns"
           }
         ]
