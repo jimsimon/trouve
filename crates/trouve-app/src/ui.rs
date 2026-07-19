@@ -2,7 +2,7 @@
 //! Slint models. Every function here is safe to call from any thread — the
 //! conversion happens inside `upgrade_in_event_loop`.
 
-use slint::{ModelRc, SharedString, VecModel};
+use slint::{Model, ModelRc, SharedString, VecModel};
 
 use crate::render::ChatRowData;
 use crate::{
@@ -410,18 +410,28 @@ pub fn set_at_files(ui: &Ui, files: Vec<String>) {
 /// thread is idle (idle + non-empty queue surfaces the "Send now" pill).
 pub fn set_queue(ui: &Ui, prompts: Vec<String>, badges: Vec<String>, idle: bool) {
     let _ = ui.upgrade_in_event_loop(move |ui| {
-        let rows: Vec<SharedString> = prompts
-            .iter()
-            .map(|p| SharedString::from(p.as_str()))
-            .collect();
-        let badges: Vec<SharedString> = badges
-            .iter()
-            .map(|b| SharedString::from(b.as_str()))
-            .collect();
-        ui.set_queue_prompts(ModelRc::new(VecModel::from(rows)));
-        ui.set_queue_badges(ModelRc::new(VecModel::from(badges)));
+        // Replacing either model makes Slint rebuild the queue repeater. In
+        // particular, replacing `queue-prompts` fires its changed handler and
+        // closes an open inline editor. Chat events call this bridge even when
+        // the queue itself is unchanged, so retain the models (and the editor's
+        // local draft/focus) unless their contents really changed.
+        if !string_model_matches(&ui.get_queue_prompts(), &prompts) {
+            ui.set_queue_prompts(string_model(prompts));
+        }
+        if !string_model_matches(&ui.get_queue_badges(), &badges) {
+            ui.set_queue_badges(string_model(badges));
+        }
         ui.set_queue_idle(idle);
     });
+}
+
+fn string_model_matches(model: &ModelRc<SharedString>, values: &[String]) -> bool {
+    model.row_count() == values.len()
+        && values.iter().enumerate().all(|(index, value)| {
+            model
+                .row_data(index)
+                .is_some_and(|current| current.as_str() == value)
+        })
 }
 
 /// Files staged for the next prompt, shown as removable composer chips.
