@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1784420956749,
+  "lastUpdate": 1784424697782,
   "repoUrl": "https://github.com/jimsimon/trouve",
   "entries": {
     "e2e-benchmarks": [
@@ -1823,6 +1823,54 @@ window.BENCHMARK_DATA = {
             "name": "non-git warm query",
             "value": 67.94476397999999,
             "range": "± 1.5",
+            "unit": "ms"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "jim.j.simon@gmail.com",
+            "name": "Jim Simon",
+            "username": "jimsimon"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "cc782e8c7eca25a8250b892aa4b24248a9bb79f9",
+          "message": "Make workspace headers reorderable (#68)\n\n* Make workspace headers reorderable\n\n* fix: apply CodeRabbit auto-fixes\n\nFixed 1 file(s) based on 1 unresolved review comment.\n\nCo-authored-by: CodeRabbit <noreply@coderabbit.ai>\n\n---------\n\nCo-authored-by: coderabbitai[bot] <136622811+coderabbitai[bot]@users.noreply.github.com>\nCo-authored-by: CodeRabbit <noreply@coderabbit.ai>",
+          "timestamp": "2026-07-18T21:30:08-04:00",
+          "tree_id": "84cf93b2dc27fab5494433ee77786b08a7e9199d",
+          "url": "https://github.com/jimsimon/trouve/commit/cc782e8c7eca25a8250b892aa4b24248a9bb79f9"
+        },
+        "date": 1784424696701,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "cold index + query",
+            "value": 147.7229599,
+            "range": "± 6",
+            "unit": "ms"
+          },
+          {
+            "name": "warm query",
+            "value": 82.24468302000001,
+            "range": "± 2.9",
+            "unit": "ms"
+          },
+          {
+            "name": "incremental (1 file modified)",
+            "value": 93.89206278,
+            "range": "± 1.8",
+            "unit": "ms"
+          },
+          {
+            "name": "non-git warm query",
+            "value": 79.52557533999999,
+            "range": "± 2",
             "unit": "ms"
           }
         ]
