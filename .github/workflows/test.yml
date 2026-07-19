@@ -8,6 +8,10 @@ on:
 env:
   CARGO_TERM_COLOR: always
 
+# Every job only checks out, builds, tests, and caches.
+permissions:
+  contents: read
+
 # Cancel superseded PR runs: they waste runner time and race the winners
 # to save the same rust-cache key, which discards the losers' cache saves.
 concurrency:

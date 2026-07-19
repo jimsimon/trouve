@@ -8,6 +8,10 @@ on:
 env:
   CARGO_TERM_COLOR: always
 
+# The lint job only checks out and reads code.
+permissions:
+  contents: read
+
 jobs:
   lint:
     runs-on: ubuntu-latest
@@ -32,9 +36,12 @@ jobs:
       # The test-with-model job in test.yml only compiles trouve-search, so
       # an #[ignore]d test anywhere else would silently never run in CI.
       # Keep them all in trouve-search, or widen that job's scope on purpose.
+      # Matches bare #[ignore] and #[cfg_attr(..., ignore)] forms; a comment
+      # or string that happens to match fails loudly here, which is cheap to
+      # fix, unlike a silently skipped test.
       - name: ignored tests live in trouve-search
         run: |
-          if grep -rln '#\[ignore' crates --include='*.rs' | grep -v '^crates/trouve-search/'; then
+          if grep -rlnE '#\[(cfg_attr\(.*,[[:space:]]*)?ignore\b' crates --include='*.rs' | grep -v '^crates/trouve-search/'; then
             echo "Found #[ignore]d tests outside crates/trouve-search — update the test-with-model job in test.yml or move the test" >&2
             exit 1
           fi
