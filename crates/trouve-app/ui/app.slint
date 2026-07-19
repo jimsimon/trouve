@@ -14,7 +14,7 @@ import { CodeView, TextSegment } from "code-view.slint";
 import { TerminalGrid, TermSpan } from "terminal-grid.slint";
 import {
     SettingsScreen, ProviderItem, CliItem, KnownProviderItem, McpServerItem,
-    SubscriptionItem, ModeItem, LocalModelItem, LocalSearchItem, GithubHostItem
+    SubscriptionItem, ModeItem, ThinkingItem, LocalModelItem, LocalSearchItem, GithubHostItem
 } from "settings-window.slint";
 import { AutomationsScreen, AutomationItem, AutomationTemplateItem } from "automations-screen.slint";
 import { ConnectivityBanner } from "connectivity-banner.slint";
@@ -27,6 +27,7 @@ export {
     DiffRow, TextSegment, TermSpan, ProviderItem, CliItem, KnownProviderItem, McpServerItem,
     SubscriptionItem, ModeItem, LocalModelItem, LocalSearchItem, AutomationItem, GithubHostItem
 }
+export { ThinkingItem }
 export { Theme, ThemePalette }
 
 // One row of the left nav: workspace headers, sessions, archived toggles.
@@ -1152,6 +1153,8 @@ export component AppWindow inherits Window {
     in property <[string]> settings-known-provider-names;
     in property <[string]> settings-models;
     in property <int> settings-default-model-index: -1;
+    in property <[ThinkingItem]> settings-model-thinking-items;
+    in-out property <int> settings-default-thinking-index: -1;
     in property <int> settings-default-permission-index: 0;
     in property <[ModeItem]> settings-mode-items;
     in property <[string]> settings-mode-model-names;
@@ -1189,11 +1192,12 @@ export component AppWindow inherits Window {
                             /* base-url */ string, /* api-key */ string);
     callback provider-deleted(string);
     callback provider-login(string);
-    callback default-model-picked(int);
+    callback default-model-picked(int, string);
     callback default-permission-picked(int);
-    callback mode-saved(string, string, string, string, bool, int, int);
+    callback mode-saved(string, string, string, string, bool, int, int, string);
     callback mode-deleted(string);
     callback mode-model-picked(string, int);
+    callback mode-thinking-picked(string, string);
     callback refresh-settings();
     callback cli-install(/* id */ string);
     callback cli-cancel(/* id */ string);
@@ -4244,6 +4248,8 @@ export component AppWindow inherits Window {
         known-provider-names: root.settings-known-provider-names;
         models: root.settings-models;
         default-model-index: root.settings-default-model-index;
+        model-thinking-items: root.settings-model-thinking-items;
+        default-thinking-index <=> root.settings-default-thinking-index;
         default-permission-index: root.settings-default-permission-index;
         mode-items: root.settings-mode-items;
         mode-model-names: root.settings-mode-model-names;
@@ -4288,13 +4294,14 @@ export component AppWindow inherits Window {
         }
         provider-deleted(id) => { root.provider-deleted(id); }
         provider-login(id) => { root.provider-login(id); }
-        default-model-picked(i) => { root.default-model-picked(i); }
+        default-model-picked(i, thinking) => { root.default-model-picked(i, thinking); }
         default-permission-picked(i) => { root.default-permission-picked(i); }
-        mode-saved(id, name, prompt, tools, ro, perm, model) => {
-            root.mode-saved(id, name, prompt, tools, ro, perm, model);
+        mode-saved(id, name, prompt, tools, ro, perm, model, thinking) => {
+            root.mode-saved(id, name, prompt, tools, ro, perm, model, thinking);
         }
         mode-deleted(id) => { root.mode-deleted(id); }
         mode-model-picked(id, model) => { root.mode-model-picked(id, model); }
+        mode-thinking-picked(id, thinking) => { root.mode-thinking-picked(id, thinking); }
         refresh-settings => { root.refresh-settings(); }
         cli-install(id) => { root.cli-install(id); }
         cli-cancel(id) => { root.cli-cancel(id); }

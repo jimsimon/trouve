@@ -159,6 +159,28 @@ async fn full_turn_with_approval_checkpoint_and_undo() {
         .unwrap();
     assert_eq!(info["protocol_version"], trouve_protocol::PROTOCOL_VERSION);
 
+    // Global model + thinking defaults round-trip through the protocol and
+    // are inherited by newly created threads.
+    let resp = client
+        .put(format!("{base}/config/default-model"))
+        .json(&serde_json::json!({
+            "model": "scripted/test-model",
+            "default_thinking_level": "high"
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 204);
+    let providers: serde_json::Value = client
+        .get(format!("{base}/providers"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(providers["default_thinking_level"], "high");
+
     // Workspace -> session -> thread.
     let ws: serde_json::Value = client
         .post(format!("{base}/workspaces"))
@@ -197,6 +219,7 @@ async fn full_turn_with_approval_checkpoint_and_undo() {
         .await
         .unwrap();
     let thread_id = thread["id"].as_str().unwrap().to_string();
+    assert_eq!(thread["model_options"]["thinking_level"], "high");
 
     // Send a message; the scripted provider requests a write, which needs
     // approval in the default "ask" mode.

@@ -58,7 +58,9 @@ pub use requests::*;
 // 0.20: global default permission mode — AgentMode.default_permission_mode
 // is now optional (absent = global default), GET /v1/providers reports
 // default_permission_mode, and PUT /v1/config/default-permission-mode sets it.
-pub const PROTOCOL_VERSION: &str = "0.20";
+// 0.21: global and per-mode default thinking levels — additive fields on
+// AgentMode, UpsertModeRequest, ProvidersResponse, and SetDefaultModelRequest.
+pub const PROTOCOL_VERSION: &str = "0.21";
 
 pub type WorkspaceId = String;
 pub type SessionId = String;

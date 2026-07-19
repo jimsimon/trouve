@@ -7,7 +7,7 @@
       "name": "MIT",
       "identifier": "MIT"
     },
-    "version": "0.20"
+    "version": "0.21"
   },
   "paths": {
     "/v1/approvals": {
@@ -3002,7 +3002,7 @@
       },
       "AgentMode": {
         "type": "object",
-        "description": "A data-driven agent mode: prompt + tool policy + default permissions.\nAdding a mode is configuration, not code (AGENTS.md invariant 6).",
+        "description": "A data-driven agent mode: prompt + tool policy + model/permission defaults.\nAdding a mode is configuration, not code (AGENTS.md invariant 6).",
         "required": [
           "id",
           "display_name",
@@ -3033,6 +3033,13 @@
                 "description": "Permission mode for threads started in this mode. None falls back to\nthe global default permission mode."
               }
             ]
+          },
+          "default_thinking_level": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Preferred thinking level for threads started in this mode. The value\nis a model-advertised enum token (for example \"medium\" or \"high\").\nNone falls back to the global default thinking level."
           },
           "display_name": {
             "type": "string"
@@ -5119,6 +5126,13 @@
             "$ref": "#/components/schemas/PermissionMode",
             "description": "Global default permission mode for new threads, used by modes without\na default of their own. Absent on older servers means Ask."
           },
+          "default_thinking_level": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Global thinking level for new threads. None leaves the selected\nmodel at its own default."
+          },
           "providers": {
             "type": "array",
             "items": {
@@ -5447,6 +5461,13 @@
           "model"
         ],
         "properties": {
+          "default_thinking_level": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Global thinking level for the selected model. Omitted when the model\nhas no thinking knob, preserving the existing global setting for\nmodels that do support it."
+          },
           "model": {
             "type": "string",
             "description": "Provider-qualified id, e.g. \"openai/gpt-4.1-mini\"."
@@ -5876,6 +5897,13 @@
                 "description": "None uses the global default permission mode."
               }
             ]
+          },
+          "default_thinking_level": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "None uses the global default thinking level."
           },
           "display_name": {
             "type": "string"

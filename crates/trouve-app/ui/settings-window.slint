@@ -83,6 +83,20 @@ export struct ModeItem {
     // -1 global default, 0 ask, 1 allow-list, 2 yolo.
     permission-index: int,
     model-index: int,
+    // -1 inherits the global thinking level; otherwise indexes the selected
+    // model's ThinkingItem.values.
+    thinking-index: int,
+}
+
+// Thinking choices advertised by one model's options schema. Arrays are
+// aligned with the settings `models` list.
+export struct ThinkingItem {
+    values: [string],
+    names: [string],
+    mode-names: [string],
+    // Global configured level when supported, otherwise the model's schema
+    // default (or the first advertised level).
+    configured-index: int,
 }
 
 // Auth state of one GitHub host (github.com or an enterprise instance).
@@ -277,6 +291,8 @@ export component SettingsScreen inherits Rectangle {
     in property <[string]> known-provider-names;
     in property <[string]> models;
     in property <int> default-model-index: -1;
+    in property <[ThinkingItem]> model-thinking-items;
+    in-out property <int> default-thinking-index: -1;
     // Global default permission mode: 0 ask, 1 allow-list, 2 yolo.
     in property <int> default-permission-index: 0;
     // Modes & Models section: full mode cards plus the per-mode model
@@ -332,7 +348,7 @@ export component SettingsScreen inherits Rectangle {
                             /* base-url */ string, /* api-key */ string);
     callback provider-deleted(string);
     callback provider-login(string);
-    callback default-model-picked(int);
+    callback default-model-picked(/* model-index */ int, /* thinking-level */ string);
     // 0 ask, 1 allow-list, 2 yolo.
     callback default-permission-picked(int);
     // Mode CRUD. mode-deleted covers both "Remove" (custom modes) and
@@ -340,9 +356,10 @@ export component SettingsScreen inherits Rectangle {
     callback mode-saved(/* id */ string, /* display-name */ string,
                         /* system-prompt */ string, /* allowed-tools */ string,
                         /* read-only */ bool, /* permission-index */ int,
-                        /* model-index */ int);
+                        /* model-index */ int, /* thinking-level */ string);
     callback mode-deleted(string);
     callback mode-model-picked(/* id */ string, /* model-index */ int);
+    callback mode-thinking-picked(/* id */ string, /* thinking-level */ string);
     callback refresh-settings();
     callback cli-install(/* id */ string);
     callback cli-cancel(/* id */ string);
@@ -452,6 +469,11 @@ export component SettingsScreen inherits Rectangle {
     // -1 global default, 0 ask, 1 allow-list, 2 yolo.
     in-out property <int> mode-form-permission: -1;
     in-out property <int> mode-form-model: -1;
+    // -1 inherits the global thinking level; otherwise indexes the selected
+    // model's ThinkingItem.values.
+    in-out property <int> mode-form-thinking: -1;
+    property <int> mode-form-thinking-model-index: root.mode-form-model >= 0
+        ? root.mode-form-model : root.default-model-index;
 
     // Side-nav selection: 0 providers, 1 modes & models, 2 local models,
     // 3 mcp servers, 4 integrations, 5 appearance, 6 notifications,
@@ -920,11 +942,46 @@ export component SettingsScreen inherits Rectangle {
                                     model: root.models;
                                     current-index: root.default-model-index;
                                     enabled: root.models.length > 0;
+                                    selected => {
+                                        root.default-thinking-index = self.current-index >= 0
+                                            && self.current-index < root.model-thinking-items.length
+                                            ? root.model-thinking-items[self.current-index].configured-index
+                                            : -1;
+                                    }
                                 }
+                            }
+
+                            if model-box.current-index >= 0
+                                && model-box.current-index < root.model-thinking-items.length
+                                && root.model-thinking-items[model-box.current-index].values.length > 0: VerticalLayout {
+                                spacing: 4px;
+                                Text {
+                                    text: "Global default thinking level";
+                                    color: Theme.c.text-soft;
+                                    font-size: Theme.fs(11px);
+                                }
+                                default-thinking-box := ComboBox {
+                                    width: 190px;
+                                    model: root.model-thinking-items[model-box.current-index].names;
+                                    current-index: root.default-thinking-index;
+                                    selected => { root.default-thinking-index = self.current-index; }
+                                }
+                            }
+                            HorizontalLayout {
+                                alignment: start;
                                 Button {
-                                    text: "Set default";
+                                    text: "Set defaults";
                                     enabled: root.models.length > 0 && model-box.current-index >= 0;
-                                    clicked => { root.default-model-picked(model-box.current-index); }
+                                    clicked => {
+                                        root.default-model-picked(
+                                            model-box.current-index,
+                                            model-box.current-index < root.model-thinking-items.length
+                                                && root.model-thinking-items[model-box.current-index].values.length > 0
+                                                && root.default-thinking-index >= 0
+                                                && root.default-thinking-index < root.model-thinking-items[model-box.current-index].values.length
+                                                ? root.model-thinking-items[model-box.current-index].values[root.default-thinking-index]
+                                                : "");
+                                    }
                                 }
                             }
 
@@ -951,7 +1008,7 @@ export component SettingsScreen inherits Rectangle {
                                 font-weight: 700;
                             }
                             Text {
-                                text: "A mode is a prompt, a tool policy, and default permissions. Editing a built-in saves an override in ~/.config/trouve/modes/; Reset removes it. Workspace modes (.agents/modes/) are file-managed and read-only here.";
+                                text: "A mode combines a prompt, tool policy, permissions, model, and thinking defaults. Editing a built-in saves an override in ~/.config/trouve/modes/; Reset removes it. Workspace modes (.agents/modes/) are file-managed and read-only here.";
                                 color: Theme.c.text-soft;
                                 font-size: Theme.fs(11px);
                                 wrap: word-wrap;
@@ -960,10 +1017,12 @@ export component SettingsScreen inherits Rectangle {
                             Rectangle {
                                 background: Theme.c.surface;
                                 border-radius: 6px;
-                                height: 240px;
+                                height: 320px;
                                 ListView {
-                                    for mode in root.mode-items: Rectangle {
-                                        height: Theme.fs(44px);
+                                    for mode in root.mode-items: mode-row := Rectangle {
+                                        property <int> thinking-model-index: mode.model-index >= 0
+                                            ? mode.model-index : root.default-model-index;
+                                        height: Theme.fs(68px);
                                         HorizontalLayout {
                                             padding-left: 10px;
                                             padding-right: 6px;
@@ -1002,6 +1061,7 @@ export component SettingsScreen inherits Rectangle {
                                             // is "Global default".
                                             VerticalLayout {
                                                 alignment: center;
+                                                spacing: 3px;
                                                 ComboBox {
                                                     width: 190px;
                                                     model: root.mode-model-names;
@@ -1010,6 +1070,21 @@ export component SettingsScreen inherits Rectangle {
                                                         && mode.origin != "workspace";
                                                     selected => {
                                                         root.mode-model-picked(mode.id, self.current-index - 1);
+                                                    }
+                                                }
+                                                if mode-row.thinking-model-index >= 0
+                                                    && mode-row.thinking-model-index < root.model-thinking-items.length
+                                                    && root.model-thinking-items[mode-row.thinking-model-index].values.length > 0: ComboBox {
+                                                    width: 190px;
+                                                    model: root.model-thinking-items[mode-row.thinking-model-index].mode-names;
+                                                    current-index: mode.thinking-index + 1;
+                                                    enabled: mode.origin != "workspace";
+                                                    selected => {
+                                                        root.mode-thinking-picked(
+                                                            mode.id,
+                                                            self.current-index > 0
+                                                                ? root.model-thinking-items[mode-row.thinking-model-index].values[self.current-index - 1]
+                                                                : "");
                                                     }
                                                 }
                                             }
@@ -1025,6 +1100,7 @@ export component SettingsScreen inherits Rectangle {
                                                     root.mode-form-readonly = mode.read-only;
                                                     root.mode-form-permission = mode.permission-index;
                                                     root.mode-form-model = mode.model-index;
+                                                    root.mode-form-thinking = mode.thinking-index;
                                                 }
                                             }
                                             if mode.origin == "customized": Button {
@@ -1054,6 +1130,7 @@ export component SettingsScreen inherits Rectangle {
                                         root.mode-form-readonly = false;
                                         root.mode-form-permission = -1;
                                         root.mode-form-model = -1;
+                                        root.mode-form-thinking = -1;
                                     }
                                 }
                             }
@@ -1141,6 +1218,25 @@ export component SettingsScreen inherits Rectangle {
                                                 enabled: root.models.length > 0;
                                                 selected => {
                                                     root.mode-form-model = self.current-index - 1;
+                                                    root.mode-form-thinking = -1;
+                                                }
+                                            }
+                                        }
+                                        if root.mode-form-thinking-model-index >= 0
+                                            && root.mode-form-thinking-model-index < root.model-thinking-items.length
+                                            && root.model-thinking-items[root.mode-form-thinking-model-index].values.length > 0: VerticalLayout {
+                                            spacing: 2px;
+                                            Text {
+                                                text: "Default thinking level";
+                                                color: Theme.c.text-soft;
+                                                font-size: Theme.fs(10px);
+                                            }
+                                            ComboBox {
+                                                width: 190px;
+                                                model: root.model-thinking-items[root.mode-form-thinking-model-index].mode-names;
+                                                current-index: root.mode-form-thinking + 1;
+                                                selected => {
+                                                    root.mode-form-thinking = self.current-index - 1;
                                                 }
                                             }
                                         }
@@ -1160,7 +1256,13 @@ export component SettingsScreen inherits Rectangle {
                                                     root.mode-form-tools,
                                                     root.mode-form-readonly,
                                                     root.mode-form-permission,
-                                                    root.mode-form-model);
+                                                    root.mode-form-model,
+                                                    root.mode-form-thinking-model-index >= 0
+                                                        && root.mode-form-thinking-model-index < root.model-thinking-items.length
+                                                        && root.mode-form-thinking >= 0
+                                                        && root.mode-form-thinking < root.model-thinking-items[root.mode-form-thinking-model-index].values.length
+                                                        ? root.model-thinking-items[root.mode-form-thinking-model-index].values[root.mode-form-thinking]
+                                                        : "");
                                                 root.mode-form-open = false;
                                             }
                                         }
