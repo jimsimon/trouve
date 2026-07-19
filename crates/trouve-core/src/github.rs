@@ -12,6 +12,11 @@ use futures::{StreamExt, TryStreamExt};
 use octocrab::Octocrab;
 use trouve_protocol::{CheckRun, PrInfo, PrReview};
 
+/// A dashboard refresh should stay bounded even for repositories with an
+/// unusually deep PR history. Each page contains up to 100 PRs.
+const DASHBOARD_MAX_PR_PAGES: usize = 3;
+const DASHBOARD_ENRICH_CONCURRENCY: usize = 4;
+
 /// The one GitHub host that is always known.
 pub const GITHUB_COM: &str = "github.com";
 
@@ -187,7 +192,7 @@ impl GitHub {
     /// Dashboard listing: every open PR plus PRs merged since `merged_since`,
     /// each enriched with checks, reviews, and comment info.
     pub async fn dashboard_prs(&self, merged_since: DateTime<Utc>) -> Result<Vec<PrInfo>> {
-        let open_page = self
+        let mut open_page = self
             .client
             .pulls(&self.owner, &self.repo)
             .list()
@@ -196,11 +201,19 @@ impl GitHub {
             .send()
             .await
             .context("listing open PRs")?;
-        let open = self
-            .client
-            .all_pages(open_page)
-            .await
-            .context("listing all open PRs")?;
+        let mut open = open_page.take_items();
+        for _ in 1..DASHBOARD_MAX_PR_PAGES {
+            let Some(mut page) = self
+                .client
+                .get_page::<octocrab::models::pulls::PullRequest>(&open_page.next)
+                .await
+                .context("listing additional open PRs")?
+            else {
+                break;
+            };
+            open.append(&mut page.items);
+            open_page = page;
+        }
 
         // Recently merged PRs hide among the closed ones; recently *updated*
         // closed PRs are a superset of recently merged. Walk pages sorted by
@@ -218,7 +231,7 @@ impl GitHub {
             .await
             .context("listing closed PRs")?;
         let mut recently_merged = Vec::new();
-        loop {
+        for page_index in 0..DASHBOARD_MAX_PR_PAGES {
             let reached_cutoff = closed_page
                 .items
                 .iter()
@@ -232,7 +245,7 @@ impl GitHub {
                     .into_iter()
                     .filter(|pr| pr.merged_at.is_some_and(|at| at >= merged_since)),
             );
-            if reached_cutoff {
+            if reached_cutoff || page_index + 1 == DASHBOARD_MAX_PR_PAGES {
                 break;
             }
             let Some(page) = self
@@ -257,7 +270,7 @@ impl GitHub {
                 self.attach_comment_info(number, &mut info).await;
                 Ok::<_, anyhow::Error>(info)
             })
-            .buffer_unordered(8)
+            .buffer_unordered(DASHBOARD_ENRICH_CONCURRENCY)
             .try_collect()
             .await
     }

@@ -9,9 +9,10 @@
 //! engine access.
 
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
 use anyhow::{Context, Result};
-use tokio::sync::mpsc;
+use tokio::sync::{Semaphore, mpsc};
 use trouve_client_core::client::ProtocolClient;
 use trouve_client_core::viewmodel::ThreadViewModel;
 use trouve_protocol::{
@@ -30,6 +31,9 @@ const TERMINAL_TAB: i32 = 4;
 /// Terminal scrollback the client-side screen model keeps, in lines.
 const TERM_SCROLLBACK: usize = 5000;
 const TERM_FRAME_INTERVAL: std::time::Duration = std::time::Duration::from_millis(16);
+/// Limit cross-workspace dashboard fan-out; each workspace request performs
+/// its own bounded PR enrichment against GitHub.
+const PR_DASH_WORKSPACE_CONCURRENCY: usize = 2;
 
 #[derive(Debug)]
 pub enum UiCommand {
@@ -531,6 +535,9 @@ struct Controller {
     pr_dash_errors: HashMap<String, String>,
     /// Workspaces with a dashboard fetch in flight.
     pr_dash_loading: HashSet<String>,
+    /// Shared across refreshes so repeated clicks cannot create independent
+    /// batches that exceed the cross-workspace request cap.
+    pr_dash_limiter: Arc<Semaphore>,
     /// Client-local display order of the dashboard groups, persisted like
     /// the workspace sidebar order.
     pr_group_order: Vec<String>,
@@ -710,6 +717,7 @@ pub async fn run(
         pr_dash: HashMap::new(),
         pr_dash_errors: HashMap::new(),
         pr_dash_loading: HashSet::new(),
+        pr_dash_limiter: Arc::new(Semaphore::new(PR_DASH_WORKSPACE_CONCURRENCY)),
         pr_group_order: crate::winstate::load_pr_group_order(),
         pr_collapsed: HashSet::new(),
         pr_dash_filter: None,
@@ -2153,12 +2161,16 @@ impl Controller {
                 self.pr_dash_errors.remove(&ws.id);
                 let client = self.client.clone();
                 let tx = self.tx.clone();
+                let limiter = Arc::clone(&self.pr_dash_limiter);
                 let workspace_id = ws.id.clone();
                 tokio::spawn(async move {
-                    let result = client
-                        .workspace_prs(&workspace_id)
-                        .await
-                        .map_err(|e| format!("{e:#}"));
+                    let result = match limiter.acquire_owned().await {
+                        Ok(_permit) => client
+                            .workspace_prs(&workspace_id)
+                            .await
+                            .map_err(|e| format!("{e:#}")),
+                        Err(error) => Err(format!("dashboard request limiter closed: {error}")),
+                    };
                     let _ = tx.send(UiCommand::PrDashLoaded(workspace_id, result));
                 });
             }
