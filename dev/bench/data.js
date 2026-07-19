@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1784490108123,
+  "lastUpdate": 1784490197171,
   "repoUrl": "https://github.com/jimsimon/trouve",
   "entries": {
     "e2e-benchmarks": [
@@ -2447,6 +2447,54 @@ window.BENCHMARK_DATA = {
             "name": "non-git warm query",
             "value": 61.56436968,
             "range": "± 1.7",
+            "unit": "ms"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "jim.j.simon@gmail.com",
+            "name": "Jim Simon",
+            "username": "jimsimon"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "05b7f1af23673fd17ce3ebe50ab723062f8ba62e",
+          "message": "Describe active tool calls during turns (#90)",
+          "timestamp": "2026-07-19T15:40:42-04:00",
+          "tree_id": "86a7b89182e7e315628234edc3743c62000cfd42",
+          "url": "https://github.com/jimsimon/trouve/commit/05b7f1af23673fd17ce3ebe50ab723062f8ba62e"
+        },
+        "date": 1784490196332,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "cold index + query",
+            "value": 134.71862690000003,
+            "range": "± 4.5",
+            "unit": "ms"
+          },
+          {
+            "name": "warm query",
+            "value": 66.65005808000002,
+            "range": "± 1.3",
+            "unit": "ms"
+          },
+          {
+            "name": "incremental (1 file modified)",
+            "value": 78.27934784000001,
+            "range": "± 1.1",
+            "unit": "ms"
+          },
+          {
+            "name": "non-git warm query",
+            "value": 64.35381108,
+            "range": "± 1.8",
             "unit": "ms"
           }
         ]
