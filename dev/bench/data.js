@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1784501091231,
+  "lastUpdate": 1784501138939,
   "repoUrl": "https://github.com/jimsimon/trouve",
   "entries": {
     "e2e-benchmarks": [
@@ -5425,6 +5425,54 @@ window.BENCHMARK_DATA = {
             "name": "dense_query_20k_rows",
             "value": 1376250.9164133738,
             "range": "± 5695",
+            "unit": "ns"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "jim.j.simon@gmail.com",
+            "name": "Jim Simon",
+            "username": "jimsimon"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "e1aaeb8f9928fb23d3a258956e2d52450c42d22f",
+          "message": "Fix session list scrollbar jumps (#93)\n\n* Preserve session list scroll position\n\n* Restore focus after workspace reordering",
+          "timestamp": "2026-07-19T18:43:28-04:00",
+          "tree_id": "46baa9ed0b50dec1acc1f7a3ef7bca58b91fe0c9",
+          "url": "https://github.com/jimsimon/trouve/commit/e1aaeb8f9928fb23d3a258956e2d52450c42d22f"
+        },
+        "date": 1784501138247,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "bm25_build_5k_docs",
+            "value": 5052081.25,
+            "range": "± 11217",
+            "unit": "ns"
+          },
+          {
+            "name": "bm25_query_5k_docs",
+            "value": 37328.67479213908,
+            "range": "± 19",
+            "unit": "ns"
+          },
+          {
+            "name": "chunk_python_200_functions",
+            "value": 2998410.2647058824,
+            "range": "± 1693",
+            "unit": "ns"
+          },
+          {
+            "name": "dense_query_20k_rows",
+            "value": 1355638.987004104,
+            "range": "± 9500",
             "unit": "ns"
           }
         ]
