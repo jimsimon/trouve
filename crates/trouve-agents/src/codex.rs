@@ -23,7 +23,7 @@ use std::sync::atomic::{AtomicI64, Ordering};
 
 use futures::StreamExt;
 use serde_json::{Value, json};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin};
 use tokio::sync::{Mutex, mpsc, oneshot};
 use trouve_protocol::{ModelInfo, Usage};
@@ -414,6 +414,7 @@ fn turn_stream(
         // can be a lossless fallback without displaying the same thought
         // twice.
         let mut streamed_reasoning = HashSet::new();
+        let mut turn_finished = false;
         while let Some(msg) = route.recv().await {
             match msg {
                 ServerMsg::Notification { method, params } => match method.as_str() {
@@ -509,6 +510,7 @@ fn turn_stream(
                         }
                     }
                     "turn/completed" => {
+                        turn_finished = true;
                         let status = params["turn"]["status"].as_str().unwrap_or("completed");
                         if status == "failed" {
                             let msg = params["turn"]["error"]["message"]
@@ -594,6 +596,14 @@ fn turn_stream(
                     server.respond(id, json!({ "decision": decision })).await;
                 }
             }
+        }
+        if !turn_finished {
+            let reason = if server.is_closed() {
+                "app-server closed before turn completed"
+            } else {
+                "app-server event route closed before turn completed"
+            };
+            let _ = tx.send(Err(BackendError::Protocol(reason.into()))).await;
         }
         server.unsubscribe(&codex_thread_id).await;
     })
@@ -761,17 +771,132 @@ enum ServerMsg {
 }
 
 type Pending = Arc<Mutex<HashMap<i64, oneshot::Sender<Result<Value, String>>>>>;
+type Routes = Arc<Mutex<HashMap<String, mpsc::Sender<ServerMsg>>>>;
+type Buffered = Arc<Mutex<HashMap<String, Vec<ServerMsg>>>>;
+const ROUTE_CAPACITY: usize = 256;
+
+async fn close_transport(
+    pending: &Pending,
+    routes: &Routes,
+    buffered: &Buffered,
+    closed: &std::sync::atomic::AtomicBool,
+) {
+    // Publish closure before taking async locks so no caller can reuse this
+    // transport while its abandoned waiters are being drained.
+    closed.store(true, Ordering::Relaxed);
+    pending.lock().await.clear();
+    routes.lock().await.clear();
+    buffered.lock().await.clear();
+}
+
+async fn read_stdout<R: AsyncRead + Unpin>(
+    stdout: R,
+    pending: Pending,
+    routes: Routes,
+    buffered: Buffered,
+    closed: Arc<std::sync::atomic::AtomicBool>,
+) {
+    let mut lines = BufReader::new(stdout).lines();
+    let mut failed_routes = HashSet::new();
+    while let Ok(Some(line)) = lines.next_line().await {
+        let Ok(msg) = serde_json::from_str::<Value>(&line) else {
+            continue;
+        };
+        let has_id = !msg["id"].is_null();
+        let has_method = msg["method"].is_string();
+        if has_id && !has_method {
+            // Response to one of our requests.
+            if let Some(id) = msg["id"].as_i64()
+                && let Some(tx) = pending.lock().await.remove(&id)
+            {
+                let result = if msg.get("error").map(|e| !e.is_null()).unwrap_or(false) {
+                    Err(msg["error"]["message"]
+                        .as_str()
+                        .unwrap_or("unknown error")
+                        .to_string())
+                } else {
+                    Ok(msg["result"].clone())
+                };
+                let _ = tx.send(result);
+            }
+        } else if has_method {
+            let method = msg["method"].as_str().unwrap_or("").to_string();
+            let params = msg["params"].clone();
+            let thread_id = params["threadId"]
+                .as_str()
+                .or_else(|| params["thread"]["id"].as_str())
+                .unwrap_or("")
+                .to_string();
+            let m = if has_id {
+                ServerMsg::Request {
+                    id: msg["id"].clone(),
+                    method,
+                    params,
+                }
+            } else {
+                ServerMsg::Notification { method, params }
+            };
+            let routed = {
+                let routes = routes.lock().await;
+                routes.get(&thread_id).cloned()
+            };
+            match routed {
+                Some(tx) => match tx.try_send(m) {
+                    Ok(()) => {
+                        failed_routes.remove(&thread_id);
+                    }
+                    Err(error) => {
+                        // The stdout reader is shared by every Codex turn. A
+                        // stalled route must fail independently rather than
+                        // applying backpressure that wedges all turns and
+                        // prevents this task from ever observing EOF.
+                        tracing::warn!(
+                            "codex: dropping {thread_id} event route: {}",
+                            match error {
+                                mpsc::error::TrySendError::Full(_) => "route buffer is full",
+                                mpsc::error::TrySendError::Closed(_) => "route receiver is closed",
+                            }
+                        );
+                        let mut routes = routes.lock().await;
+                        if routes
+                            .get(&thread_id)
+                            .is_some_and(|active| active.same_channel(&tx))
+                        {
+                            routes.remove(&thread_id);
+                        }
+                        // Do not reinterpret later events from this failed
+                        // turn as pre-subscription events. A future route for
+                        // the same thread clears this marker on delivery.
+                        failed_routes.insert(thread_id);
+                    }
+                },
+                // No subscriber yet: buffer for a thread id we've seen named
+                // (skip the empty catch-all) so nothing emitted between
+                // thread/start and subscribe is lost.
+                None if !thread_id.is_empty() && !failed_routes.contains(&thread_id) => {
+                    buffered.lock().await.entry(thread_id).or_default().push(m);
+                }
+                None => {}
+            }
+        }
+    }
+    // Dropping stdout means the app-server can never complete any
+    // outstanding request or turn. Drop every sender it left behind so
+    // request waiters and routed turn streams wake immediately instead of
+    // remaining active forever.
+    close_transport(&pending, &routes, &buffered, &closed).await;
+}
 
 struct AppServer {
     stdin: Mutex<ChildStdin>,
     next_id: AtomicI64,
     pending: Pending,
-    routes: Arc<Mutex<HashMap<String, mpsc::Sender<ServerMsg>>>>,
+    routes: Routes,
     /// Thread-scoped messages that arrived before anyone subscribed to that
     /// thread — the id is only known after thread/start returns, so the
     /// app-server can emit notifications in the gap before `subscribe`.
     /// Delivered when the route is registered instead of being dropped.
-    buffered: Arc<Mutex<HashMap<String, Vec<ServerMsg>>>>,
+    buffered: Buffered,
     /// Held so the child (kill_on_drop) lives as long as the server handle.
     _child: Child,
     closed: Arc<std::sync::atomic::AtomicBool>,
@@ -815,66 +940,7 @@ impl AppServer {
         let closed = self.closed.clone();
         let pending = self.pending.clone();
         let buffered = self.buffered.clone();
-        tokio::spawn(async move {
-            let mut lines = BufReader::new(stdout).lines();
-            while let Ok(Some(line)) = lines.next_line().await {
-                let Ok(msg) = serde_json::from_str::<Value>(&line) else {
-                    continue;
-                };
-                let has_id = !msg["id"].is_null();
-                let has_method = msg["method"].is_string();
-                if has_id && !has_method {
-                    // Response to one of our requests.
-                    if let Some(id) = msg["id"].as_i64()
-                        && let Some(tx) = pending.lock().await.remove(&id)
-                    {
-                        let result = if msg.get("error").map(|e| !e.is_null()).unwrap_or(false) {
-                            Err(msg["error"]["message"]
-                                .as_str()
-                                .unwrap_or("unknown error")
-                                .to_string())
-                        } else {
-                            Ok(msg["result"].clone())
-                        };
-                        let _ = tx.send(result);
-                    }
-                } else if has_method {
-                    let method = msg["method"].as_str().unwrap_or("").to_string();
-                    let params = msg["params"].clone();
-                    let thread_id = params["threadId"]
-                        .as_str()
-                        .or_else(|| params["thread"]["id"].as_str())
-                        .unwrap_or("")
-                        .to_string();
-                    let m = if has_id {
-                        ServerMsg::Request {
-                            id: msg["id"].clone(),
-                            method,
-                            params,
-                        }
-                    } else {
-                        ServerMsg::Notification { method, params }
-                    };
-                    let routed = {
-                        let routes = routes.lock().await;
-                        routes.get(&thread_id).cloned()
-                    };
-                    match routed {
-                        Some(tx) => {
-                            let _ = tx.send(m).await;
-                        }
-                        // No subscriber yet: buffer for a thread id we've
-                        // seen named (skip the empty catch-all) so nothing
-                        // emitted between thread/start and subscribe is lost.
-                        None if !thread_id.is_empty() => {
-                            buffered.lock().await.entry(thread_id).or_default().push(m);
-                        }
-                        None => {}
-                    }
-                }
-            }
-            closed.store(true, Ordering::Relaxed);
-        });
+        tokio::spawn(read_stdout(stdout, pending, routes, buffered, closed));
     }
 
     async fn handshake(&self) -> Result<(), BackendError> {
@@ -925,7 +991,7 @@ impl AppServer {
     }
 
     async fn subscribe(&self, thread_id: &str) -> mpsc::Receiver<ServerMsg> {
-        let (tx, rx) = mpsc::channel(256);
+        let (tx, rx) = mpsc::channel(ROUTE_CAPACITY);
         self.routes
             .lock()
             .await
@@ -990,6 +1056,101 @@ mod tests {
         assert_eq!(
             completed_reasoning_text(&json!({ "type": "reasoning" })),
             None
+        );
+    }
+
+    #[tokio::test]
+    async fn reader_eof_releases_pending_requests_and_turn_routes() {
+        let deadline = std::time::Duration::from_secs(1);
+        let pending: Pending = Arc::new(Mutex::new(HashMap::new()));
+        let routes: Routes = Arc::new(Mutex::new(HashMap::new()));
+        let buffered: Buffered = Arc::new(Mutex::new(HashMap::new()));
+        let closed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (request_tx, request_rx) = oneshot::channel();
+        pending.lock().await.insert(1, request_tx);
+        let (route_tx, mut route_rx) = mpsc::channel(1);
+        routes.lock().await.insert("thread-1".into(), route_tx);
+
+        let (mut writer, reader) = tokio::io::duplex(16);
+        let task = tokio::spawn(read_stdout(
+            reader,
+            pending.clone(),
+            routes.clone(),
+            buffered.clone(),
+            closed.clone(),
+        ));
+        writer.shutdown().await.unwrap();
+        tokio::time::timeout(deadline, task)
+            .await
+            .expect("stdout reader should stop at EOF")
+            .unwrap();
+
+        assert!(closed.load(Ordering::Relaxed));
+        assert!(
+            tokio::time::timeout(deadline, request_rx)
+                .await
+                .expect("pending request should be released")
+                .is_err()
+        );
+        assert!(
+            tokio::time::timeout(deadline, route_rx.recv())
+                .await
+                .expect("turn route should be released")
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn full_turn_route_does_not_block_stdout_eof_cleanup() {
+        let deadline = std::time::Duration::from_secs(1);
+        let pending: Pending = Arc::new(Mutex::new(HashMap::new()));
+        let routes: Routes = Arc::new(Mutex::new(HashMap::new()));
+        let buffered: Buffered = Arc::new(Mutex::new(HashMap::new()));
+        let closed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (route_tx, mut route_rx) = mpsc::channel(1);
+        route_tx
+            .try_send(ServerMsg::Notification {
+                method: "already/queued".into(),
+                params: json!({}),
+            })
+            .unwrap();
+        routes.lock().await.insert("thread-1".into(), route_tx);
+
+        let (mut writer, reader) = tokio::io::duplex(256);
+        let task = tokio::spawn(read_stdout(
+            reader,
+            pending.clone(),
+            routes.clone(),
+            buffered.clone(),
+            closed.clone(),
+        ));
+        writer
+            .write_all(
+                br#"{"jsonrpc":"2.0","method":"item/agentMessage/delta","params":{"threadId":"thread-1","delta":"blocked"}}
+"#,
+            )
+            .await
+            .unwrap();
+        writer.shutdown().await.unwrap();
+        tokio::time::timeout(deadline, task)
+            .await
+            .expect("route backpressure must not block EOF cleanup")
+            .unwrap();
+
+        assert!(closed.load(Ordering::Relaxed));
+        assert!(routes.lock().await.is_empty());
+        assert!(buffered.lock().await.is_empty());
+        assert!(
+            tokio::time::timeout(deadline, route_rx.recv())
+                .await
+                .expect("pre-existing route event should remain available")
+                .is_some()
+        );
+        assert!(
+            tokio::time::timeout(deadline, route_rx.recv())
+                .await
+                .expect("saturated route should close")
+                .is_none()
         );
     }
 
