@@ -329,9 +329,7 @@ fn spawn_event_writer(
                         // The transaction rolled back: every waiter's event
                         // was equally not persisted.
                         for req in batch {
-                            let _ = req
-                                .reply
-                                .send(Err(anyhow::anyhow!("appending event: {e}")));
+                            let _ = req.reply.send(Err(anyhow::anyhow!("appending event: {e}")));
                         }
                     }
                 }
