@@ -8,6 +8,12 @@ on:
 env:
   CARGO_TERM_COLOR: always
 
+# Cancel superseded PR runs: they waste runner time and race the winners
+# to save the same rust-cache key, which discards the losers' cache saves.
+concurrency:
+  group: test-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   test:
     strategy:
@@ -24,16 +30,23 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Unit and integration tests (offline)
         run: cargo test --workspace
+      # The full-workspace release build takes ~10-13 minutes (thin LTO,
+      # codegen-units=1), so it runs as a smoke check on main only. Release
+      # compilation of trouve-search is still exercised on every PR by the
+      # bench and parity jobs, and release.yml covers the rest on tags.
       - name: Build release binaries
+        if: github.ref == 'refs/heads/main'
         run: cargo build --release
 
   # End-to-end tests that download the embedding model from Hugging Face.
+  # Scoped to trouve-search: it holds every #[ignore]d test in the
+  # workspace (enforced by the "ignored tests" check in lint.yml), and
+  # crate-level scoping skips compiling the Slint/GUI crates — which is
+  # also why this job needs no fontconfig/dbus apt packages.
   test-with-model:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-      - name: Install Linux native build dependencies
-        run: sudo apt-get update && sudo apt-get install -y libfontconfig1-dev libdbus-1-dev
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: Cache embedding model
@@ -42,7 +55,7 @@ jobs:
           path: ~/.cache/huggingface
           key: hf-potion-code-16m
       - name: Model-backed end-to-end tests
-        run: cargo test --workspace -- --ignored
+        run: cargo test -p trouve-search -- --ignored
         env:
           TROUVE_E2E: "1"
 
