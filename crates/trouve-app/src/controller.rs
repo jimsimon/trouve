@@ -98,6 +98,7 @@ pub enum UiCommand {
     NewThread,
     CancelNewChat,
     NewChatWorkspaceChanged(usize),
+    NewChatModelChanged(usize),
     RegisterWorkspacePath(String),
     StartNewChat {
         workspace_idx: usize,
@@ -105,6 +106,8 @@ pub enum UiCommand {
         fetch_latest: bool,
         mode_idx: usize,
         model_idx: usize,
+        thinking_idx: usize,
+        permission_idx: usize,
         prompt: String,
     },
 
@@ -120,6 +123,7 @@ pub enum UiCommand {
         at_bottom: bool,
     },
     SendMessage(String),
+    CancelTurn,
     /// The "@" mention popup opened (or is filtering): refresh the worktree
     /// path list feeding it. Throttled per session by the controller.
     RefreshAtFiles,
@@ -155,6 +159,7 @@ pub enum UiCommand {
     },
     /// Queued-prompt panel: start draining an idle thread's queue.
     QueueSendNow,
+    QueueSendNowAt(usize),
     Approval {
         row: usize,
         approved: bool,
@@ -184,6 +189,7 @@ pub enum UiCommand {
     ComposerModeChanged(usize),
     ComposerModelChanged(usize),
     ComposerThinkingChanged(usize),
+    ComposerPermissionChanged(usize),
     ComposerContextChanged(usize),
     ComposerFastToggled(bool),
 
@@ -659,6 +665,8 @@ struct Controller {
     /// Context-size dropdown values (schema property "context"), when the
     /// current model offers a choice (e.g. cursor's 300k/1M).
     context_values: Vec<String>,
+    new_chat_thinking_key: Option<String>,
+    new_chat_thinking_values: Vec<String>,
 
     new_chat: Option<NewChat>,
     branches: Vec<String>,
@@ -813,6 +821,8 @@ pub async fn run(
         thinking_key: None,
         thinking_values: Vec::new(),
         context_values: Vec::new(),
+        new_chat_thinking_key: None,
+        new_chat_thinking_values: Vec::new(),
         new_chat: None,
         branches: Vec::new(),
         diff_files: Vec::new(),
@@ -1806,7 +1816,8 @@ impl Controller {
 
     /// Composer pickers mirror the current thread's mode/model.
     fn push_picker_indices(&mut self) {
-        let (mode, model) = match self.current_thread.and_then(|i| self.threads.get(i)) {
+        let (mode, model, permission) = match self.current_thread.and_then(|i| self.threads.get(i))
+        {
             Some(thread) => (
                 self.modes
                     .iter()
@@ -1818,10 +1829,12 @@ impl Controller {
                     .position(|m| m.id == thread.model)
                     .map(|i| i as i32)
                     .unwrap_or(-1),
+                permission_index_of(Some(thread.permission_mode)),
             ),
-            None => (-1, -1),
+            None => (-1, -1, -1),
         };
         ui::set_picker_indices(&self.ui, mode, model);
+        ui::set_permission_index(&self.ui, permission);
         self.push_model_knobs();
     }
 
@@ -1887,6 +1900,29 @@ impl Controller {
             context_index,
             fast_visible,
             fast_checked,
+        );
+    }
+
+    fn push_new_chat_knobs(&mut self, model_index: usize) {
+        let thinking = self
+            .models
+            .get(model_index)
+            .and_then(|model| thinking_property(&model.options_schema));
+        let (key, values, default) = match thinking {
+            Some((key, values, default)) => (Some(key), values, default),
+            None => (None, Vec::new(), None),
+        };
+        let selected = default
+            .as_ref()
+            .and_then(|value| values.iter().position(|candidate| candidate == value))
+            .map(|index| index as i32)
+            .unwrap_or_else(|| if values.is_empty() { -1 } else { 0 });
+        self.new_chat_thinking_key = key;
+        self.new_chat_thinking_values = values.clone();
+        ui::set_new_chat_knobs(
+            &self.ui,
+            values.iter().map(|value| thinking_label(value)).collect(),
+            selected,
         );
     }
 
@@ -2047,6 +2083,7 @@ impl Controller {
             self.row_call_ids.clear();
             ui::set_chat(&self.ui, Vec::new(), String::new(), false);
             ui::set_composer_enabled(&self.ui, false);
+            ui::set_composer_turn_running(&self.ui, false);
             ui::set_slash_commands(&self.ui, Vec::new());
             return;
         };
@@ -2066,6 +2103,7 @@ impl Controller {
             .map(|(_, key)| key.clone())
             .collect();
         let vm = self.vms.entry(thread_id.clone()).or_default();
+        ui::set_composer_turn_running(&self.ui, vm.turn_running);
         // Wizard state tracks the thread's pending question requests: fresh
         // state when one appears, dropped once it resolves.
         for item in &vm.items {
@@ -2876,6 +2914,7 @@ impl Controller {
             default_mode_index(&self.modes),
             0,
         );
+        self.push_new_chat_knobs(0);
         self.push_threads();
         ui::set_center_screen(&self.ui, 2);
     }
@@ -2919,12 +2958,28 @@ impl Controller {
         fetch_latest: bool,
         mode_idx: usize,
         model_idx: usize,
+        thinking_idx: usize,
+        permission_idx: usize,
         prompt: String,
     ) -> Result<()> {
+        let mut model_options = serde_json::Map::new();
+        if let (Some(key), Some(value)) = (
+            self.new_chat_thinking_key.clone(),
+            self.new_chat_thinking_values.get(thinking_idx).cloned(),
+        ) {
+            model_options.insert(key, serde_json::Value::String(value));
+        }
+        let permission_mode = match permission_idx {
+            1 => Some(PermissionMode::Ask),
+            2 => Some(PermissionMode::AllowList),
+            3 => Some(PermissionMode::Yolo),
+            _ => None,
+        };
         match self.new_chat {
             Some(NewChat::Thread) => {
                 self.close_new_chat();
-                self.create_thread(mode_idx, model_idx).await?;
+                self.create_thread(mode_idx, model_idx, model_options.clone(), permission_mode)
+                    .await?;
                 if let Some(thread_id) = self.current_thread_id() {
                     let uploads = std::mem::take(&mut self.pending_attachments);
                     self.push_attachments();
@@ -2956,7 +3011,8 @@ impl Controller {
                     .position(|s| s.id == session.id)
                     .unwrap_or(0);
                 self.select_session(index).await?;
-                self.create_thread(mode_idx, model_idx).await?;
+                self.create_thread(mode_idx, model_idx, model_options, permission_mode)
+                    .await?;
                 if let Some(thread_id) = self.current_thread_id() {
                     let uploads = std::mem::take(&mut self.pending_attachments);
                     self.push_attachments();
@@ -3664,9 +3720,11 @@ impl Controller {
                 | UiCommand::QueueMove { .. }
                 | UiCommand::QueueReorder { .. }
                 | UiCommand::QueueSendNow
+                | UiCommand::QueueSendNowAt(_)
                 | UiCommand::ComposerModeChanged(_)
                 | UiCommand::ComposerModelChanged(_)
                 | UiCommand::ComposerThinkingChanged(_)
+                | UiCommand::ComposerPermissionChanged(_)
                 | UiCommand::ComposerContextChanged(_)
                 | UiCommand::ComposerFastToggled(_) => {
                     self.error(&format!("Can't do that right now — {reason}."));
@@ -3861,6 +3919,7 @@ impl Controller {
                         default_mode_index(&self.modes),
                         0,
                     );
+                    self.push_new_chat_knobs(0);
                     self.load_branches(index).await;
                 }
             }
@@ -3870,6 +3929,8 @@ impl Controller {
                 fetch_latest,
                 mode_idx,
                 model_idx,
+                thinking_idx,
+                permission_idx,
                 prompt,
             } => {
                 self.start_new_chat(
@@ -3878,10 +3939,13 @@ impl Controller {
                     fetch_latest,
                     mode_idx,
                     model_idx,
+                    thinking_idx,
+                    permission_idx,
                     prompt,
                 )
                 .await?
             }
+            UiCommand::NewChatModelChanged(i) => self.push_new_chat_knobs(i),
             UiCommand::SelectThread(i) => {
                 self.open_thread_index(i, false);
                 // i == threads.len() is the provisional tab itself: no-op.
@@ -3927,6 +3991,11 @@ impl Controller {
                         return Err(e);
                     }
                     self.apply_scroll_intent(true);
+                }
+            }
+            UiCommand::CancelTurn => {
+                if let Some(thread_id) = self.current_thread_id() {
+                    self.client.cancel_turn(&thread_id).await?;
                 }
             }
             UiCommand::RefreshAtFiles => self.refresh_at_files(),
@@ -4029,6 +4098,28 @@ impl Controller {
                     match self.client.dispatch_queue(&thread_id).await {
                         Ok(_) => self.apply_scroll_intent(true),
                         Err(e) => self.error(&format!("{e:#}")),
+                    }
+                }
+            }
+            UiCommand::QueueSendNowAt(index) => {
+                if let Some(thread_id) = self.current_thread_id() {
+                    let (mut ids, idle): (Vec<String>, bool) = self
+                        .vms
+                        .get(&thread_id)
+                        .map(|vm| {
+                            (
+                                vm.queue.iter().map(|p| p.id.clone()).collect(),
+                                !vm.turn_running,
+                            )
+                        })
+                        .unwrap_or_default();
+                    if index < ids.len() {
+                        let id = ids.remove(index);
+                        ids.insert(0, id);
+                        self.client.reorder_queue(&thread_id, &ids).await?;
+                        if idle {
+                            self.client.dispatch_queue(&thread_id).await?;
+                        }
                     }
                 }
             }
@@ -4190,6 +4281,15 @@ impl Controller {
                     options.insert(key, serde_json::Value::String(token));
                     self.update_current_thread(UpdateThreadRequest {
                         model_options: Some(options),
+                        ..Default::default()
+                    })
+                    .await;
+                }
+            }
+            UiCommand::ComposerPermissionChanged(i) => {
+                if let Some(permission_mode) = permission_mode_of(i as i32) {
+                    self.update_current_thread(UpdateThreadRequest {
+                        permission_mode: Some(permission_mode),
                         ..Default::default()
                     })
                     .await;
@@ -5610,7 +5710,13 @@ impl Controller {
         }
     }
 
-    async fn create_thread(&mut self, mode_idx: usize, model_idx: usize) -> Result<()> {
+    async fn create_thread(
+        &mut self,
+        mode_idx: usize,
+        model_idx: usize,
+        model_options: serde_json::Map<String, serde_json::Value>,
+        permission_mode: Option<PermissionMode>,
+    ) -> Result<()> {
         let Some(session_id) = self.current_session_id() else {
             return Ok(());
         };
@@ -5620,8 +5726,8 @@ impl Controller {
                 session_id,
                 mode: self.modes.get(mode_idx).map(|m| m.id.clone()),
                 model: self.models.get(model_idx).map(|m| m.id.clone()),
-                model_options: Default::default(),
-                permission_mode: None,
+                model_options,
+                permission_mode,
             })
             .await?;
         self.thread_sessions

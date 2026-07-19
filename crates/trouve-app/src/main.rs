@@ -506,21 +506,37 @@ fn main() -> anyhow::Result<()> {
     }
     {
         let tx = tx.clone();
-        window.on_start_new_chat(move |ws, branch, fetch_latest, mode, model, prompt| {
-            let _ = tx.send(UiCommand::StartNewChat {
-                workspace_idx: ws.max(0) as usize,
-                branch_idx: branch.max(0) as usize,
-                fetch_latest,
-                mode_idx: mode.max(0) as usize,
-                model_idx: model.max(0) as usize,
-                prompt: prompt.to_string(),
-            });
+        window.on_start_new_chat(
+            move |ws, branch, fetch_latest, mode, model, thinking, permission, prompt| {
+                let _ = tx.send(UiCommand::StartNewChat {
+                    workspace_idx: ws.max(0) as usize,
+                    branch_idx: branch.max(0) as usize,
+                    fetch_latest,
+                    mode_idx: mode.max(0) as usize,
+                    model_idx: model.max(0) as usize,
+                    thinking_idx: thinking.max(0) as usize,
+                    permission_idx: permission.max(0) as usize,
+                    prompt: prompt.to_string(),
+                });
+            },
+        );
+    }
+    {
+        let tx = tx.clone();
+        window.on_nc_model_changed(move |i| {
+            let _ = tx.send(UiCommand::NewChatModelChanged(i.max(0) as usize));
         });
     }
     {
         let tx = tx.clone();
         window.on_send_message(move |text| {
             let _ = tx.send(UiCommand::SendMessage(text.to_string()));
+        });
+    }
+    {
+        let tx = tx.clone();
+        window.on_cancel_turn(move || {
+            let _ = tx.send(UiCommand::CancelTurn);
         });
     }
     {
@@ -595,6 +611,12 @@ fn main() -> anyhow::Result<()> {
         let tx = tx.clone();
         window.on_queue_send_now(move || {
             let _ = tx.send(UiCommand::QueueSendNow);
+        });
+    }
+    {
+        let tx = tx.clone();
+        window.on_queue_send_now_at(move |index| {
+            let _ = tx.send(UiCommand::QueueSendNowAt(index.max(0) as usize));
         });
     }
     {
@@ -676,6 +698,12 @@ fn main() -> anyhow::Result<()> {
         let tx = tx.clone();
         window.on_composer_thinking_changed(move |i| {
             let _ = tx.send(UiCommand::ComposerThinkingChanged(i.max(0) as usize));
+        });
+    }
+    {
+        let tx = tx.clone();
+        window.on_composer_permission_changed(move |i| {
+            let _ = tx.send(UiCommand::ComposerPermissionChanged(i.max(0) as usize));
         });
     }
     {
