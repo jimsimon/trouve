@@ -53,6 +53,52 @@ fn at_token(text: &str, cursor: usize) -> Option<(usize, String)> {
     Some((at, query.to_string()))
 }
 
+/// Turn a Markdown link target that names a workspace file into the path and
+/// optional line range understood by [`UiCommand::OpenChatFile`]. Codex emits
+/// clickable file references as absolute paths with a trailing `:line` (for
+/// example `/worktree/src/main.rs:42`).
+fn chat_file_link(target: &str) -> Option<(String, i32, i32)> {
+    let mut target = target.strip_prefix("file://").unwrap_or(target);
+    if target.is_empty()
+        || target.starts_with('#')
+        || target.starts_with("mailto:")
+        || target.contains("://")
+    {
+        return None;
+    }
+
+    let mut from = 0;
+    let mut to = 0;
+    if let Some((path, line)) = target.rsplit_once(':')
+        && let Ok(line) = line.parse::<i32>()
+        && line > 0
+    {
+        target = path;
+        from = line;
+        to = line;
+    } else if let Some((path, fragment)) = target.rsplit_once("#L") {
+        let (first, last) = fragment.split_once("-L").unwrap_or((fragment, fragment));
+        if let (Ok(first), Ok(last)) = (first.parse::<i32>(), last.parse::<i32>())
+            && first > 0
+            && last >= first
+        {
+            target = path;
+            from = first;
+            to = last;
+        }
+    }
+
+    // Bare URL-ish strings should not be interpreted as server file paths.
+    // Repository-relative and absolute paths all have one of these shapes.
+    let looks_like_path = target.starts_with('/')
+        || target.starts_with("./")
+        || target.starts_with("../")
+        || target.contains('/')
+        || target.contains('\\')
+        || std::path::Path::new(target).extension().is_some();
+    looks_like_path.then(|| (target.to_string(), from, to))
+}
+
 /// Optional workspace path from the command line (`trouve .`, `trouve ~/src/foo`).
 fn workspace_arg() -> Option<std::path::PathBuf> {
     std::env::args_os()
@@ -284,13 +330,18 @@ fn main() -> anyhow::Result<()> {
             let _ = tx.send(UiCommand::OpenWorkspaceDialog);
         });
     }
-    window.on_open_link(|url| {
-        // http(s) only: chat markdown is model output, so no file:// or
-        // arbitrary schemes reach the system opener.
-        if url.starts_with("https://") || url.starts_with("http://") {
-            let _ = open::that_detached(url.as_str());
-        }
-    });
+    {
+        let tx = tx.clone();
+        window.on_open_link(move |url| {
+            // Web links go to the system opener. File-looking links stay inside
+            // the session and use the same Files-panel path as tool-card links.
+            if url.starts_with("https://") || url.starts_with("http://") {
+                let _ = open::that_detached(url.as_str());
+            } else if let Some((path, from, to)) = chat_file_link(&url) {
+                let _ = tx.send(UiCommand::OpenChatFile(path, from, to));
+            }
+        });
+    }
     {
         // Model search picker: fuzzy-filter the model list. Pure UI-thread
         // work, so it never round-trips through the controller.
@@ -1237,7 +1288,30 @@ fn workspace_drag_id(data: &slint::DataTransfer) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{at_token, workspace_drag_id, workspace_drag_payload};
+    use super::{at_token, chat_file_link, workspace_drag_id, workspace_drag_payload};
+
+    #[test]
+    fn codex_file_links_open_in_the_files_panel() {
+        assert_eq!(
+            chat_file_link("/tmp/worktree/crates/app/src/main.rs:42"),
+            Some(("/tmp/worktree/crates/app/src/main.rs".into(), 42, 42))
+        );
+        assert_eq!(
+            chat_file_link("crates/app/src/main.rs#L10-L14"),
+            Some(("crates/app/src/main.rs".into(), 10, 14))
+        );
+        assert_eq!(
+            chat_file_link("file:///tmp/worktree/README.md"),
+            Some(("/tmp/worktree/README.md".into(), 0, 0))
+        );
+    }
+
+    #[test]
+    fn non_file_links_are_not_routed_to_the_files_panel() {
+        assert_eq!(chat_file_link("https://example.com/file.rs:42"), None);
+        assert_eq!(chat_file_link("mailto:user@example.com"), None);
+        assert_eq!(chat_file_link("#section"), None);
+    }
 
     #[test]
     fn workspace_drag_payload_round_trips() {
