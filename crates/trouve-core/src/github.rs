@@ -10,6 +10,7 @@ use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use futures::{StreamExt, TryStreamExt};
 use octocrab::Octocrab;
+use serde::Deserialize;
 use trouve_protocol::{CheckRun, PrInfo, PrReview};
 
 /// A dashboard refresh should stay bounded even for repositories with an
@@ -55,32 +56,6 @@ pub fn parse_remote(url: &str) -> Option<(String, String, String)> {
 /// `GITHUB_TOKEN` / `GH_TOKEN`; enterprise hosts read
 /// `GH_ENTERPRISE_TOKEN` / `GITHUB_ENTERPRISE_TOKEN` (the gh CLI's own
 /// convention).
-pub fn token_from_env(host: &str) -> Option<String> {
-    let vars: [&str; 2] = if host == GITHUB_COM {
-        ["GITHUB_TOKEN", "GH_TOKEN"]
-    } else {
-        ["GH_ENTERPRISE_TOKEN", "GITHUB_ENTERPRISE_TOKEN"]
-    };
-    vars.iter()
-        .find_map(|v| std::env::var(v).ok())
-        .filter(|t| !t.is_empty())
-}
-
-/// GitHub token from the gh CLI's keyring (`gh auth token --hostname …`),
-/// when the user is logged in there. Zero-config reuse of an auth most
-/// developers already have.
-pub fn token_from_gh_cli(host: &str) -> Option<String> {
-    let out = std::process::Command::new("gh")
-        .args(["auth", "token", "--hostname", host])
-        .output()
-        .ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    let token = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    (!token.is_empty()).then_some(token)
-}
-
 /// Client id of the shared "Trouve" OAuth app on github.com, baked in so
 /// sign-in works out of the box. OAuth client ids are public identifiers
 /// (the device flow needs no secret); `github_client_id` in config.toml
@@ -107,6 +82,109 @@ pub struct GitHub {
     client: Octocrab,
     owner: String,
     repo: String,
+}
+
+/// A GitHub client scoped to an authenticated account rather than a repo.
+pub struct GitHubAccount {
+    client: Octocrab,
+    host: String,
+}
+
+#[derive(Deserialize)]
+struct SearchIssues {
+    items: Vec<SearchIssue>,
+}
+
+#[derive(Deserialize)]
+struct SearchIssue {
+    number: u64,
+    repository_url: String,
+}
+
+impl GitHubAccount {
+    pub fn new(token: &str, host: &str) -> Result<Self> {
+        let mut builder = Octocrab::builder().personal_token(token.to_string());
+        if host != GITHUB_COM {
+            builder = builder
+                .base_uri(format!("https://{host}/api/v3"))
+                .context("enterprise API base URI")?;
+        }
+        Ok(Self {
+            client: builder.build().context("building GitHub client")?,
+            host: host.into(),
+        })
+    }
+
+    pub async fn dashboard_prs(
+        &self,
+        merged_since: DateTime<Utc>,
+    ) -> Result<(String, Vec<PrInfo>)> {
+        let viewer = self
+            .client
+            .current()
+            .user()
+            .await
+            .context("looking up GitHub viewer")?
+            .login;
+        let day = merged_since.format("%Y-%m-%d");
+        let queries = [
+            format!("is:pr is:open involves:{viewer}"),
+            format!("is:pr is:open review-requested:{viewer}"),
+            format!("is:pr is:merged merged:>={day} involves:{viewer}"),
+        ];
+        let mut refs = std::collections::BTreeSet::new();
+        for query in queries {
+            for page_number in 1..=DASHBOARD_MAX_PR_PAGES {
+                let page: SearchIssues = self
+                    .client
+                    .get(
+                        "/search/issues",
+                        Some(&serde_json::json!({
+                            "q": query, "per_page": 100, "page": page_number
+                        })),
+                    )
+                    .await
+                    .context("searching account pull requests")?;
+                let count = page.items.len();
+                for issue in page.items {
+                    let Some(repo) = issue.repository_url.rsplit_once("/repos/").map(|(_, r)| r)
+                    else {
+                        continue;
+                    };
+                    if let Some((owner, name)) = repo.split_once('/') {
+                        refs.insert((owner.to_string(), name.to_string(), issue.number));
+                    }
+                }
+                if count < 100 {
+                    break;
+                }
+            }
+        }
+        let host = self.host.clone();
+        let token_client = self.client.clone();
+        let mut prs: Vec<PrInfo> = futures::stream::iter(refs)
+            .map(|(owner, repo, number)| {
+                let client = token_client.clone();
+                let host = host.clone();
+                async move {
+                    let raw = client.pulls(&owner, &repo).get(number).await?;
+                    let github = GitHub {
+                        client,
+                        owner,
+                        repo,
+                    };
+                    let mut info = github.enrich(raw).await?;
+                    github.attach_comment_info(number, &mut info).await;
+                    info.host = host;
+                    Ok::<_, anyhow::Error>(info)
+                }
+            })
+            .buffer_unordered(DASHBOARD_ENRICH_CONCURRENCY)
+            .try_collect()
+            .await?;
+        prs.sort_by_key(|pr| std::cmp::Reverse(pr.number));
+        Ok((viewer, prs))
+    }
 }
 
 impl GitHub {
@@ -275,14 +353,16 @@ impl GitHub {
             .await
     }
 
-    /// Fill `comments` and `last_comment_at` (issue + review comments).
-    /// Best-effort: comment endpoints failing must not hide the PR.
+    /// Fill `comments`, `last_comment_at` (issue + review comments), and
+    /// `mergeable`. Best-effort: these endpoints failing must not hide
+    /// the PR.
     async fn attach_comment_info(&self, number: u64, info: &mut PrInfo) {
-        // The list endpoint omits comment counts; only the single-PR GET
-        // reports them.
+        // The list endpoint omits comment counts and mergeability; only
+        // the single-PR GET reports them.
         let Ok(pr) = self.client.pulls(&self.owner, &self.repo).get(number).await else {
             return;
         };
+        info.mergeable = pr.mergeable;
         let issue_comments = pr.comments.unwrap_or(0);
         let review_comments = pr.review_comments.unwrap_or(0);
         info.comments = issue_comments + review_comments;
@@ -400,6 +480,9 @@ impl GitHub {
             .unwrap_or_default();
 
         Ok(PrInfo {
+            host: String::new(),
+            repository: format!("{}/{}", self.owner, self.repo),
+            workspace_id: String::new(),
             number,
             url: pr.html_url.map(|u| u.to_string()).unwrap_or_default(),
             title: pr.title.unwrap_or_default(),
@@ -427,6 +510,9 @@ impl GitHub {
             // requests aren't worth it for per-session lookups.
             comments: 0,
             last_comment_at: None,
+            // Populated on list responses only via the dashboard's
+            // single-PR GET; present here when `pr` came from one.
+            mergeable: pr.mergeable,
             merged_at: pr.merged_at,
         })
     }

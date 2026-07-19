@@ -2759,14 +2759,14 @@ async fn github_enterprise_host_crud() {
         assert_eq!(resp.status(), status, "{body}");
     }
 
-    // Tokens for unknown hosts are refused.
+    // Pasted-token authentication is not an integration point.
     let resp = client
         .put(format!("{base}/integrations/github"))
         .json(&serde_json::json!({"token": "x", "host": "unknown.example.com"}))
         .send()
         .await
         .unwrap();
-    assert_eq!(resp.status(), 404);
+    assert_eq!(resp.status(), 405);
 
     // Remove the host; github.com can't be removed.
     let gh: serde_json::Value = client

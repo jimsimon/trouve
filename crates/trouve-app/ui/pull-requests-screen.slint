@@ -1,6 +1,7 @@
 // Pull Requests: a dashboard of every open (or recently merged) PR across
 // the registered workspaces, grouped by what the user should do next.
-// Full-window screen (like settings/automations). Groups collapse, and
+// Full-window screen (like settings/automations). Groups use a responsive
+// two-column grid, collapse, and
 // reorder by pointer drag or, for keyboard/assistive tech, an Up/Down
 // position control — the same pattern as workspace headers. All state
 // folding (grouping, pills, timestamps) happens in the Rust controller;
@@ -27,6 +28,10 @@ export struct PrRowItem {
     // Approval pill: 0 no reviews, 1 approved, 2 pending, 3 changes requested.
     approval-kind: int,
     approval-label: string,
+    // Merge pill: 0 unknown, 1 clean, 3 conflicts. An empty label hides
+    // the pill (merged/closed PRs).
+    merge-kind: int,
+    merge-label: string,
     // "3 comments" / "0 comments".
     comments-label: string,
     // "last comment 45 mins ago" / "no comments yet".
@@ -45,7 +50,7 @@ export struct PrGroupItem {
     // Subheading explaining what the group includes.
     description: string,
     // Colors the header icon: 0 review-requested, 1 drafts, 2 pending,
-    // 3 ready, 4 needs-attention, 5 merged.
+    // 2 needs-reviewers/pending, 3 ready, 4 needs-attention, 5 merged.
     kind: int,
     icon: string,
     // Zero-based position and total group count (reorder bounds).
@@ -249,12 +254,12 @@ export component PullRequestsScreen inherits Rectangle {
             }
         }
 
-        // ---------------- body (centered column) ----------------
+        // ---------------- body (centered responsive grid) ----------------
         HorizontalLayout {
             vertical-stretch: 1;
             Rectangle { horizontal-stretch: 1; }
             Rectangle {
-                width: 760px;
+                width: min(root.width - 32px, 1400px);
                 ScrollKeys {
                     target-y <=> body.viewport-y;
                     page: body.visible-height;
@@ -339,9 +344,12 @@ export component PullRequestsScreen inherits Rectangle {
 
                         // ---------------- groups ----------------
                         if root.configured && root.has-workspaces:
-                        VerticalLayout {
+                        groups-grid := GridLayout {
+                            property <bool> two-columns: root.width >= 1032px;
                             spacing: 10px;
-                            for group in root.groups: Rectangle {
+                            for group[group-index] in root.groups: Rectangle {
+                                row: groups-grid.two-columns ? group-index / 2 : group-index;
+                                col: groups-grid.two-columns ? Math.mod(group-index, 2) : 0;
                                 background: Theme.c.surface;
                                 border-radius: 8px;
                                 border-width: group-drop.has-drag ? 2px : 1px;
@@ -617,6 +625,11 @@ export component PullRequestsScreen inherits Rectangle {
                                                             tone: pr.approval-kind == 1 ? 1
                                                                 : pr.approval-kind == 2 ? 2
                                                                 : pr.approval-kind == 3 ? 3 : 0;
+                                                        }
+                                                        if pr.merge-label != "": StatusPill {
+                                                            label: pr.merge-label;
+                                                            tone: pr.merge-kind == 1 ? 1
+                                                                : pr.merge-kind == 3 ? 3 : 0;
                                                         }
                                                     }
                                                     HorizontalLayout {

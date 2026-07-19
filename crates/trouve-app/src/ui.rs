@@ -659,6 +659,10 @@ pub struct PrRowView {
     /// 0 no reviews, 1 approved, 2 pending, 3 changes requested.
     pub approval_kind: i32,
     pub approval_label: String,
+    /// 0 unknown, 1 clean, 3 conflicts.
+    pub merge_kind: i32,
+    /// "" hides the pill (merged/closed PRs).
+    pub merge_label: String,
     /// "3 comments" / "0 comments".
     pub comments_label: String,
     /// "last comment 45 mins ago" / "no comments yet".
@@ -674,7 +678,7 @@ pub struct PrGroupView {
     pub key: String,
     pub title: String,
     pub description: String,
-    /// Icon tint: 0 review-requested, 1 drafts, 2 pending, 3 ready,
+    /// Icon tint: 0 review-requested, 1 drafts, 2 review-needed/pending, 3 ready,
     /// 4 needs-attention, 5 merged.
     pub kind: i32,
     pub icon: String,
@@ -722,6 +726,8 @@ pub fn set_pr_dashboard(
                             check_label: SharedString::from(p.check_label.as_str()),
                             approval_kind: p.approval_kind,
                             approval_label: SharedString::from(p.approval_label.as_str()),
+                            merge_kind: p.merge_kind,
+                            merge_label: SharedString::from(p.merge_label.as_str()),
                             comments_label: SharedString::from(p.comments_label.as_str()),
                             last_comment: SharedString::from(p.last_comment.as_str()),
                             url: SharedString::from(p.url.as_str()),

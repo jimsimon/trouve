@@ -46,7 +46,7 @@ pub use requests::*;
 // 0.15: automation templates — GET /v1/automations/templates returns
 // pre-canned automations for common development tasks (additive).
 // 0.16: GitHub Enterprise — GithubIntegration.hosts (per-host auth state),
-// SetGithubTokenRequest.host, POST/DELETE /v1/integrations/github/hosts for
+// per-host auth state, POST/DELETE /v1/integrations/github/hosts for
 // self-hosted instances, and provider-login ids "github:<host>" (additive).
 // 0.17: turn cancellation — POST /v1/threads/{id}/cancel interrupts the
 // running turn, and the turn.cancelled event reports it (additive).
@@ -72,7 +72,11 @@ pub use requests::*;
 // (additive).
 // 0.25: thread-owned todo snapshots — Thread.todos provides initial state
 // and thread.todos_updated replaces it on the event stream (additive).
-pub const PROTOCOL_VERSION: &str = "0.25";
+// 0.26: PrInfo gains an optional `mergeable` flag — additive; drives the
+// dashboard's merge-conflict pill and its needs-attention grouping.
+// 1.0: GitHub becomes OAuth-only and the PR dashboard becomes an
+// account-centric, multi-instance feed (breaking route/event replacement).
+pub const PROTOCOL_VERSION: &str = "1.0";
 
 pub type WorkspaceId = String;
 pub type SessionId = String;

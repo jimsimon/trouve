@@ -9,10 +9,9 @@
 //! engine access.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
 
 use anyhow::{Context, Result};
-use tokio::sync::{Semaphore, mpsc};
+use tokio::sync::mpsc;
 use trouve_client_core::client::ProtocolClient;
 use trouve_client_core::viewmodel::ThreadViewModel;
 use trouve_protocol::{
@@ -30,14 +29,13 @@ const TERMINAL_TAB: i32 = 4;
 /// Conditional Todos panel. It sits above the stable inspection TabWidget,
 /// so showing or hiding it never changes the indices above.
 const TODOS_TAB: i32 = 5;
+/// GitHub data is fresh enough for a dashboard without creating sustained
+/// API pressure from the per-PR enrichment requests.
+const PR_DASH_REFRESH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// Terminal scrollback the client-side screen model keeps, in lines.
 const TERM_SCROLLBACK: usize = 5000;
 const TERM_FRAME_INTERVAL: std::time::Duration = std::time::Duration::from_millis(16);
-/// Limit cross-workspace dashboard fan-out; each workspace request performs
-/// its own bounded PR enrichment against GitHub.
-const PR_DASH_WORKSPACE_CONCURRENCY: usize = 2;
-
 #[derive(Debug)]
 pub enum UiCommand {
     // Left nav.
@@ -211,7 +209,6 @@ pub enum UiCommand {
     /// an error message).
     PrsLoaded(String, Result<Vec<trouve_protocol::PrInfo>, String>),
     /// Internal: a sidebar-only PR summary fetch finished.
-    NavPrsLoaded(String, Result<Vec<trouve_protocol::PrInfo>, String>),
     FileActivated(usize),
     /// Open a worktree-relative file in the user's preferred editor.
     OpenFileExternally(String),
@@ -307,9 +304,11 @@ pub enum UiCommand {
     OpenPullRequests,
     /// Leave the pull-requests dashboard (back to chat / new-chat).
     ClosePullRequests,
-    /// Re-fetch every workspace's PRs for the dashboard.
+    /// Re-fetch account PRs from every authenticated GitHub instance.
     RefreshPullRequests,
-    /// Internal: one workspace's refresh command finished. Successful
+    /// Internal periodic refresh of the shared GitHub account snapshots.
+    GithubRefreshTick,
+    /// Internal: the multi-instance refresh command finished. Successful
     /// dashboard data arrives separately as a persisted server event.
     PrDashRefreshFinished(String, Result<(), String>),
     /// Dashboard project filter changed (0 = all projects).
@@ -382,8 +381,6 @@ pub enum UiCommand {
     ServerExited(String),
     /// Open settings straight to the Integrations section.
     OpenIntegrationsSettings,
-    /// Store/remove the GitHub token (empty = remove).
-    SaveGithubToken(/* host */ String, /* token */ String),
     AddGithubHost(/* host */ String, /* client id */ String),
     RemoveGithubHost(String),
     /// Re-list MCP servers (quick list, then health probes).
@@ -587,30 +584,23 @@ struct Controller {
     prs: Vec<trouve_protocol::PrInfo>,
     pr_selected: usize,
     pr_error: String,
-    /// PR dashboard: per-workspace fetch results (viewer + PRs).
-    pr_dash: HashMap<String, trouve_protocol::WorkspacePrList>,
-    /// Per-workspace fetch failures ("workspace name: error").
+    /// PR dashboard: per-GitHub-instance account results.
+    pr_dash: HashMap<String, trouve_protocol::GithubPrList>,
+    /// Multi-instance account refresh failures.
     pr_dash_errors: HashMap<String, String>,
-    /// Workspaces with a dashboard fetch in flight.
+    /// Shared GitHub refreshes in flight (the `github` key is the guard).
     pr_dash_loading: HashSet<String>,
-    /// Shared across refreshes so repeated clicks cannot create independent
-    /// batches that exceed the cross-workspace request cap.
-    pr_dash_limiter: Arc<Semaphore>,
     /// Client-local display order of the dashboard groups, persisted like
     /// the workspace sidebar order.
     pr_group_order: Vec<String>,
     /// Dashboard groups the user collapsed (session-local, like the
     /// workspace tree's collapse state).
     pr_collapsed: HashSet<String>,
-    /// Project filter: the selected workspace id (None = all projects).
+    /// Project filter: `host/owner/repo` (None = all projects).
     pr_dash_filter: Option<String>,
     /// PRs per session for the compact sidebar badge. An empty vector means
     /// the branch was checked and has no associated PRs.
     nav_prs: HashMap<String, Vec<trouve_protocol::PrInfo>>,
-    nav_prs_pending: HashSet<String>,
-    /// Shared across refresh generations so GitHub is never hit by more
-    /// than four sidebar-summary requests at once.
-    nav_pr_limiter: std::sync::Arc<tokio::sync::Semaphore>,
 
     vms: HashMap<String, ThreadViewModel>,
     followed: HashSet<String>,
@@ -802,13 +792,10 @@ pub async fn run(
         pr_dash: HashMap::new(),
         pr_dash_errors: HashMap::new(),
         pr_dash_loading: HashSet::new(),
-        pr_dash_limiter: Arc::new(Semaphore::new(PR_DASH_WORKSPACE_CONCURRENCY)),
         pr_group_order: crate::winstate::load_pr_group_order(),
         pr_collapsed: HashSet::new(),
         pr_dash_filter: None,
         nav_prs: HashMap::new(),
-        nav_prs_pending: HashSet::new(),
-        nav_pr_limiter: std::sync::Arc::new(tokio::sync::Semaphore::new(4)),
         vms: HashMap::new(),
         followed: HashSet::new(),
         follower_tasks: HashMap::new(),
@@ -873,6 +860,26 @@ pub async fn run(
             loop {
                 tick.tick().await;
                 if tx.send(UiCommand::RefreshDiff).is_err() {
+                    break;
+                }
+            }
+        }
+    });
+
+    // One shared account refresh keeps the dashboard, sidebar PR indicators,
+    // and right-panel PR data current. The existing in-flight key prevents
+    // this timer from overlapping a slow manual refresh.
+    tokio::spawn({
+        let tx = ctl.tx.clone();
+        async move {
+            let mut tick = tokio::time::interval(PR_DASH_REFRESH_INTERVAL);
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            // `interval`'s first tick is immediate; opening the dashboard
+            // performs the initial fetch, so wait for the first real period.
+            tick.tick().await;
+            loop {
+                tick.tick().await;
+                if tx.send(UiCommand::GithubRefreshTick).is_err() {
                     break;
                 }
             }
@@ -1015,6 +1022,7 @@ impl Controller {
         }
         self.push_github_integration();
         self.push_prs();
+        self.refresh_pr_dashboard();
         self.refresh_nav_prs(false);
 
         // Follow the server-scope event stream for the lifetime of the app:
@@ -1300,7 +1308,6 @@ impl Controller {
             current_id.and_then(|id| self.sessions.iter().position(|s| s.id == id));
         let session_ids: HashSet<String> = self.sessions.iter().map(|s| s.id.clone()).collect();
         self.nav_prs.retain(|id, _| session_ids.contains(id));
-        self.nav_prs_pending.retain(|id| session_ids.contains(id));
         self.unread_sessions.retain(|id| session_ids.contains(id));
         self.watched_sessions.retain(|id| session_ids.contains(id));
         let stale_threads: Vec<String> = self
@@ -2500,8 +2507,50 @@ impl Controller {
         );
     }
 
-    /// Kick off a background fetch of the session's PRs (GitHub round-trips
-    /// are too slow for the command loop); lands back as `PrsLoaded`.
+    fn shared_prs_for_session(&self, session: &Session) -> Vec<trouve_protocol::PrInfo> {
+        let mut prs: Vec<_> = self
+            .pr_dash
+            .values()
+            .flat_map(|list| list.prs.iter())
+            .filter(|pr| pr.workspace_id == session.workspace_id && pr.head == session.branch)
+            .cloned()
+            .collect();
+        prs.sort_by_key(|pr| (pr.state != "open", std::cmp::Reverse(pr.number)));
+        prs
+    }
+
+    /// Fold the shared account snapshots into sidebar icons and the current
+    /// session's right panel. `clear_missing` is used after a full refresh so
+    /// PRs that left the account feed do not remain as stale indicators.
+    fn sync_shared_prs(&mut self, clear_missing: bool) {
+        let updates: Vec<_> = self
+            .sessions
+            .iter()
+            .map(|session| (session.id.clone(), self.shared_prs_for_session(session)))
+            .collect();
+        for (session_id, prs) in updates {
+            if clear_missing || !prs.is_empty() {
+                self.nav_prs.insert(session_id, prs);
+            }
+        }
+        if let Some(session_id) = self.current_session_id()
+            && let Some(shared) = self.nav_prs.get(&session_id).cloned()
+            && (clear_missing || !shared.is_empty())
+        {
+            let keep = self
+                .prs
+                .get(self.pr_selected)
+                .and_then(|cur| shared.iter().position(|pr| pr.number == cur.number));
+            self.prs = shared;
+            self.pr_selected = keep.unwrap_or(0);
+            self.pr_error.clear();
+            self.push_prs();
+        }
+        self.push_nav();
+    }
+
+    /// Populate the right panel from the shared account feed when possible;
+    /// use a targeted branch lookup only when that feed has no matching PR.
     fn refresh_prs(&mut self) {
         let Some(session_id) = self.current_session_id() else {
             self.prs.clear();
@@ -2512,6 +2561,21 @@ impl Controller {
         };
         if !self.github_configured {
             self.push_prs();
+            return;
+        }
+        let shared = self
+            .sessions
+            .iter()
+            .find(|session| session.id == session_id)
+            .map(|session| self.shared_prs_for_session(session))
+            .unwrap_or_default();
+        if !shared.is_empty() {
+            self.prs = shared.clone();
+            self.nav_prs.insert(session_id, shared);
+            self.pr_selected = self.pr_selected.min(self.prs.len().saturating_sub(1));
+            self.pr_error.clear();
+            self.push_prs();
+            self.push_nav();
             return;
         }
         if self.prs.is_empty() {
@@ -2529,12 +2593,10 @@ impl Controller {
         });
     }
 
-    /// Fill missing sidebar PR summaries without blocking the command loop.
-    /// `force` drops cached statuses first (used after auth changes); normal
-    /// session reloads only query newly-created sessions.
+    /// Sidebar PR summaries are projections of the shared account feed; they
+    /// never issue per-session GitHub requests.
     fn refresh_nav_prs(&mut self, force: bool) {
         if !self.github_configured {
-            self.nav_prs_pending.clear();
             if !self.nav_prs.is_empty() {
                 self.nav_prs.clear();
                 self.push_nav();
@@ -2543,31 +2605,8 @@ impl Controller {
         }
         if force {
             self.nav_prs.clear();
-            self.nav_prs_pending.clear();
-            self.push_nav();
         }
-        let session_ids: Vec<String> = self
-            .sessions
-            .iter()
-            .filter(|s| !self.nav_prs.contains_key(&s.id) && !self.nav_prs_pending.contains(&s.id))
-            .map(|s| s.id.clone())
-            .collect();
-        for session_id in session_ids {
-            self.nav_prs_pending.insert(session_id.clone());
-            let client = self.client.clone();
-            let tx = self.tx.clone();
-            let limiter = self.nav_pr_limiter.clone();
-            tokio::spawn(async move {
-                let result = match limiter.acquire_owned().await {
-                    Ok(_permit) => client
-                        .session_prs(&session_id)
-                        .await
-                        .map_err(|e| format!("{e:#}")),
-                    Err(e) => Err(format!("sidebar PR request limiter closed: {e}")),
-                };
-                let _ = tx.send(UiCommand::NavPrsLoaded(session_id, result));
-            });
-        }
+        self.sync_shared_prs(false);
     }
 
     /// Kick off a background fetch of the session's effective MCP config
@@ -2624,31 +2663,19 @@ impl Controller {
 
     // --- PR dashboard --------------------------------------------------------
 
-    /// Kick off a dashboard refresh command for every workspace. Successful
-    /// snapshots arrive through the persisted server event stream; only
-    /// command failures use `PrDashRefreshFinished` to clear local loading.
+    /// Kick off one account-level refresh across all configured instances.
     fn refresh_pr_dashboard(&mut self) {
-        if self.github_configured {
-            for ws in &self.workspaces {
-                if !self.pr_dash_loading.insert(ws.id.clone()) {
-                    continue; // Already in flight.
-                }
-                self.pr_dash_errors.remove(&ws.id);
-                let client = self.client.clone();
-                let tx = self.tx.clone();
-                let limiter = Arc::clone(&self.pr_dash_limiter);
-                let workspace_id = ws.id.clone();
-                tokio::spawn(async move {
-                    let result = match limiter.acquire_owned().await {
-                        Ok(_permit) => client
-                            .refresh_workspace_prs(&workspace_id)
-                            .await
-                            .map_err(|e| format!("{e:#}")),
-                        Err(error) => Err(format!("dashboard request limiter closed: {error}")),
-                    };
-                    let _ = tx.send(UiCommand::PrDashRefreshFinished(workspace_id, result));
-                });
-            }
+        if self.github_configured && self.pr_dash_loading.insert("github".into()) {
+            self.pr_dash_errors.clear();
+            let client = self.client.clone();
+            let tx = self.tx.clone();
+            tokio::spawn(async move {
+                let result = client
+                    .refresh_github_prs()
+                    .await
+                    .map_err(|e| format!("{e:#}"));
+                let _ = tx.send(UiCommand::PrDashRefreshFinished("github".into(), result));
+            });
         }
         self.push_pr_dashboard();
     }
@@ -2659,20 +2686,28 @@ impl Controller {
         if reconcile_pr_group_order(&mut self.pr_group_order) {
             crate::winstate::save_pr_group_order(&self.pr_group_order);
         }
+        let mut repository_keys: Vec<String> = self
+            .pr_dash
+            .values()
+            .flat_map(|list| list.prs.iter())
+            .map(|pr| format!("{}/{}", pr.host, pr.repository))
+            .collect();
+        repository_keys.sort();
+        repository_keys.dedup();
         if self
             .pr_dash_filter
             .as_ref()
-            .is_some_and(|selected| !self.workspaces.iter().any(|ws| ws.id == *selected))
+            .is_some_and(|selected| !repository_keys.contains(selected))
         {
             self.pr_dash_filter = None;
         }
 
         let mut projects = vec!["All projects".to_string()];
-        projects.extend(self.workspaces.iter().map(|w| w.name.clone()));
+        projects.extend(repository_keys.iter().cloned());
         let filter_index = self
             .pr_dash_filter
             .as_ref()
-            .and_then(|id| self.workspaces.iter().position(|w| w.id == *id))
+            .and_then(|id| repository_keys.iter().position(|key| key == id))
             .map(|i| i as i32 + 1)
             .unwrap_or(0);
 
@@ -2680,23 +2715,26 @@ impl Controller {
         // Rows carry a sort key: merge recency for the merged group, PR
         // number (a proxy for recency) elsewhere — newest first either way.
         let mut rows: HashMap<&'static str, Vec<(i64, ui::PrRowView)>> = HashMap::new();
-        for ws in &self.workspaces {
-            if self.pr_dash_filter.as_ref().is_some_and(|id| *id != ws.id) {
-                continue;
-            }
-            let Some(list) = self.pr_dash.get(&ws.id) else {
-                continue;
-            };
+        for list in self.pr_dash.values() {
             for pr in &list.prs {
+                let repo_key = format!("{}/{}", pr.host, pr.repository);
+                if self
+                    .pr_dash_filter
+                    .as_ref()
+                    .is_some_and(|id| *id != repo_key)
+                {
+                    continue;
+                }
                 let Some(group) = classify_pr(pr, &list.viewer, now) else {
                     continue;
                 };
                 let (check_kind, check_label) = check_pill(&pr.checks);
                 let (approval_kind, approval_label) = approval_pill(pr);
+                let (merge_kind, merge_label) = merge_pill(pr);
                 let has_chat = self
                     .sessions
                     .iter()
-                    .any(|s| s.workspace_id == ws.id && s.branch == pr.head);
+                    .any(|s| s.workspace_id == pr.workspace_id && s.branch == pr.head);
                 let sort_key = match pr.merged_at {
                     Some(at) if group == "recently-merged" => -at.timestamp(),
                     _ => -(pr.number as i64),
@@ -2704,8 +2742,8 @@ impl Controller {
                 rows.entry(group).or_default().push((
                     sort_key,
                     ui::PrRowView {
-                        workspace_id: ws.id.clone(),
-                        app_name: ws.name.clone(),
+                        workspace_id: pr.workspace_id.clone(),
+                        app_name: pr.repository.clone(),
                         number_label: format!("#{}", pr.number),
                         title: pr.title.clone(),
                         branch: pr.head.clone(),
@@ -2713,6 +2751,8 @@ impl Controller {
                         check_label: check_label.into(),
                         approval_kind,
                         approval_label: approval_label.into(),
+                        merge_kind,
+                        merge_label: merge_label.into(),
                         comments_label: match pr.comments {
                             1 => "1 comment".into(),
                             n => format!("{n} comments"),
@@ -2759,10 +2799,8 @@ impl Controller {
         if !self.pr_dash_loading.is_empty() {
             status_parts.push("looking for pull requests…".to_string());
         }
-        for ws in &self.workspaces {
-            if let Some(e) = self.pr_dash_errors.get(&ws.id) {
-                status_parts.push(format!("{}: {e}", ws.name));
-            }
+        for e in self.pr_dash_errors.values() {
+            status_parts.push(e.clone());
         }
 
         ui::set_pr_dashboard(
@@ -3646,13 +3684,10 @@ impl Controller {
         // Dashboard snapshots are folded even during replay: unlike the
         // lifecycle events below, the persisted payload is the state itself
         // and reconstructs the cache after launch/reconnect.
-        if let Event::WorkspacePullRequestsUpdated {
-            workspace_id,
-            pull_requests,
-        } = &envelope.event
-        {
+        if let Event::GithubPullRequestsUpdated { pull_requests } = &envelope.event {
             self.pr_dash
-                .insert(workspace_id.clone(), pull_requests.clone());
+                .insert(pull_requests.host.clone(), pull_requests.clone());
+            self.sync_shared_prs(false);
             self.push_pr_dashboard();
             return;
         }
@@ -4672,10 +4707,14 @@ impl Controller {
                             },
                         )
                         .await?;
+                    self.refresh_pr_dashboard();
                     self.refresh_prs();
                 }
             }
-            UiCommand::RefreshPrs => self.refresh_prs(),
+            UiCommand::RefreshPrs => {
+                self.refresh_pr_dashboard();
+                self.refresh_prs();
+            }
             UiCommand::SelectPr(i) => {
                 if i < self.prs.len() {
                     self.pr_selected = i;
@@ -4718,13 +4757,6 @@ impl Controller {
                         }
                     }
                 }
-            }
-            UiCommand::NavPrsLoaded(session_id, result) => {
-                self.nav_prs_pending.remove(&session_id);
-                if let Ok(prs) = result {
-                    self.nav_prs.insert(session_id, prs);
-                }
-                self.push_nav();
             }
             UiCommand::OpenIntegrationsSettings => {
                 ui::set_settings_section(&self.ui, 3);
@@ -4868,23 +4900,12 @@ impl Controller {
                     .collect();
                 ui::set_subscriptions(&self.ui, items, String::new());
             }
-            UiCommand::SaveGithubToken(host, token) => {
-                match self.client.set_github_token(&token, &host).await {
-                    Ok(integration) => {
-                        self.apply_github_integration(integration);
-                        self.push_github_integration();
-                        // A fresh token usually means the PR tab was waiting.
-                        self.refresh_prs();
-                        self.refresh_nav_prs(true);
-                    }
-                    Err(e) => self.error(&format!("saving GitHub token: {e:#}")),
-                }
-            }
             UiCommand::AddGithubHost(host, client_id) => {
                 match self.client.add_github_host(&host, &client_id).await {
                     Ok(integration) => {
                         self.apply_github_integration(integration);
                         self.push_github_integration();
+                        self.refresh_pr_dashboard();
                         self.refresh_prs();
                         self.refresh_nav_prs(true);
                     }
@@ -4896,6 +4917,7 @@ impl Controller {
                     Ok(integration) => {
                         self.apply_github_integration(integration);
                         self.push_github_integration();
+                        self.refresh_pr_dashboard();
                         self.refresh_prs();
                         self.refresh_nav_prs(true);
                     }
@@ -5320,8 +5342,10 @@ impl Controller {
                 );
             }
             UiCommand::RefreshPullRequests => self.refresh_pr_dashboard(),
+            UiCommand::GithubRefreshTick => self.refresh_pr_dashboard(),
             UiCommand::PrDashRefreshFinished(workspace_id, result) => {
                 self.pr_dash_loading.remove(&workspace_id);
+                let succeeded = result.is_ok();
                 match result {
                     Ok(()) => {
                         self.pr_dash_errors.remove(&workspace_id);
@@ -5332,13 +5356,23 @@ impl Controller {
                 }
                 // The command result owns progress/error state only; the PR
                 // snapshot itself is folded exclusively from the SSE event.
+                if succeeded {
+                    self.sync_shared_prs(true);
+                }
                 self.push_pr_dashboard();
             }
             UiCommand::PrDashFilterPicked(index) => {
+                let mut repositories: Vec<String> = self
+                    .pr_dash
+                    .values()
+                    .flat_map(|list| list.prs.iter())
+                    .map(|pr| format!("{}/{}", pr.host, pr.repository))
+                    .collect();
+                repositories.sort();
+                repositories.dedup();
                 self.pr_dash_filter = usize::try_from(index - 1)
                     .ok()
-                    .and_then(|index| self.workspaces.get(index))
-                    .map(|workspace| workspace.id.clone());
+                    .and_then(|index| repositories.get(index).cloned());
                 self.push_pr_dashboard();
             }
             UiCommand::PrGroupToggled(key) => {
@@ -5356,7 +5390,9 @@ impl Controller {
             UiCommand::PrChatClicked {
                 workspace_id,
                 branch,
-            } => self.open_pr_chat(&workspace_id, &branch).await?,
+            } => {
+                self.open_pr_chat(&workspace_id, &branch).await?;
+            }
             UiCommand::OpenAutomations => {
                 ui::set_automations_status(&self.ui, String::new());
                 self.push_automations(); // last known list while the fetch runs
@@ -6294,7 +6330,7 @@ struct PrGroupDef {
 
 /// The dashboard's groups in default order. `key` is the stable id the
 /// persisted order, collapse state, and reorder callbacks use.
-const PR_GROUPS: [PrGroupDef; 6] = [
+const PR_GROUPS: [PrGroupDef; 7] = [
     PrGroupDef {
         key: "review-requested",
         title: "Review Requested",
@@ -6312,9 +6348,17 @@ const PR_GROUPS: [PrGroupDef; 6] = [
         empty: "No draft pull requests right now.",
     },
     PrGroupDef {
+        key: "needs-reviewers",
+        title: "Needs Reviewers",
+        description: "Open pull requests that do not have any reviewers yet.",
+        icon: "＋",
+        kind: 2,
+        empty: "Every open pull request has a reviewer.",
+    },
+    PrGroupDef {
         key: "pending-review",
         title: "Pending Review",
-        description: "Open pull requests with reviewers assigned, waiting on their review.",
+        description: "Open pull requests waiting for review or approval.",
         icon: "◐",
         kind: 2,
         empty: "Nothing is waiting on review.",
@@ -6330,7 +6374,7 @@ const PR_GROUPS: [PrGroupDef; 6] = [
     PrGroupDef {
         key: "needs-attention",
         title: "Needs Attention",
-        description: "Pull requests with failing checks or changes requested.",
+        description: "Pull requests with merge conflicts, failing checks, or changes requested.",
         icon: "⚠",
         kind: 4,
         empty: "Nothing needs attention — all clear.",
@@ -6425,6 +6469,20 @@ fn check_pill(checks: &[trouve_protocol::CheckRun]) -> (i32, &'static str) {
     (1, "checks passing")
 }
 
+/// Merge pill: (kind, label) with kind 0 unknown / 1 clean / 3 conflicts.
+/// Merged and closed PRs get an empty label (the row hides the pill) —
+/// mergeability only means something while the PR is open.
+fn merge_pill(pr: &trouve_protocol::PrInfo) -> (i32, &'static str) {
+    if pr.state != "open" {
+        return (0, "");
+    }
+    match pr.mergeable {
+        Some(true) => (1, "no conflicts"),
+        Some(false) => (3, "merge conflicts"),
+        None => (0, "merge unknown"),
+    }
+}
+
 /// Approval pill: (kind, label) with kind 0 no reviews / 1 approved /
 /// 2 pending / 3 changes requested. "Approved" means at least one
 /// approval, no changes requested, and no outstanding review requests.
@@ -6443,8 +6501,9 @@ fn approval_pill(pr: &trouve_protocol::PrInfo) -> (i32, &'static str) {
 }
 
 /// Which dashboard group a PR lands in (None = not shown). Merged PRs
-/// first, then the viewer's own review inbox, then drafts, then problem
-/// states — each PR appears in exactly one group.
+/// first, then merge conflicts (except on drafts), then the viewer's
+/// own review inbox, then drafts, then the remaining problem states —
+/// each PR appears in exactly one group.
 fn classify_pr(
     pr: &trouve_protocol::PrInfo,
     viewer: &str,
@@ -6458,6 +6517,14 @@ fn classify_pr(
     }
     if pr.state != "open" {
         return None;
+    }
+    // Conflicts must be resolved before anything else can happen to the
+    // PR, so an unmergeable one needs attention — even one sitting in
+    // the viewer's review inbox. Drafts are exempt: they aren't going
+    // anywhere yet, so they stay in the drafts group (their merge pill
+    // still shows the conflict).
+    if pr.mergeable == Some(false) && !pr.draft {
+        return Some("needs-attention");
     }
     if !viewer.is_empty() && pr.requested_reviewers.iter().any(|r| r == viewer) {
         return Some("review-requested");
@@ -6473,7 +6540,13 @@ fn classify_pr(
     if approval_kind == 1 && check_kind == 1 {
         return Some("ready-to-merge");
     }
-    (!pr.requested_reviewers.is_empty() || !pr.reviews.is_empty()).then_some("pending-review")
+    if pr.requested_reviewers.is_empty() && pr.reviews.is_empty() {
+        return Some("needs-reviewers");
+    }
+    // The account feed already limits the dashboard to PRs relevant to the
+    // viewer. Any remaining open PR is waiting for an assigned review or
+    // approval.
+    Some("pending-review")
 }
 
 /// Coarse relative age for the dashboard's comment timestamps
@@ -6502,8 +6575,8 @@ fn should_open_chat_at_tail(force_tail: bool, turn_running: bool, has_queue: boo
 mod tests {
     use super::{
         approval_pill, attention_badge, check_pill, classify_pr, download_progress, human_age,
-        human_rate, pr_badge, reconcile_pr_group_order, reconcile_workspace_order, reorder_id,
-        should_open_chat_at_tail, thinking_property,
+        human_rate, merge_pill, pr_badge, reconcile_pr_group_order, reconcile_workspace_order,
+        reorder_id, should_open_chat_at_tail, thinking_property,
     };
     use chrono::{Duration, TimeZone, Utc};
     use trouve_protocol::{CheckRun, PrInfo, PrReview, Workspace};
@@ -6558,6 +6631,7 @@ mod tests {
                 "ready-to-merge",
                 "drafts",
                 "review-requested",
+                "needs-reviewers",
                 "pending-review",
                 "needs-attention",
                 "recently-merged",
@@ -6568,6 +6642,9 @@ mod tests {
 
     fn pr() -> PrInfo {
         PrInfo {
+            host: "github.com".into(),
+            repository: "acme/app".into(),
+            workspace_id: "ws_1".into(),
             number: 42,
             url: "https://github.com/acme/app/pull/42".into(),
             title: "Make it better".into(),
@@ -6581,6 +6658,7 @@ mod tests {
             requested_reviewers: Vec::new(),
             comments: 0,
             last_comment_at: None,
+            mergeable: None,
             merged_at: None,
         }
     }
@@ -6638,8 +6716,15 @@ mod tests {
         merged.merged_at = Some(now - Duration::hours(25));
         assert_eq!(classify_pr(&merged, "viewer", now), None);
 
-        // Open PRs with no assigned reviewer don't fit the requested groups.
-        assert_eq!(classify_pr(&pr(), "viewer", now), None);
+        // A clean, passing PR with nobody assigned yet needs reviewers
+        // (PR #101).
+        let mut unassigned = pr();
+        unassigned.mergeable = Some(true);
+        unassigned.checks.push(passing_check());
+        assert_eq!(
+            classify_pr(&unassigned, "viewer", now),
+            Some("needs-reviewers")
+        );
     }
 
     #[test]
@@ -6684,6 +6769,56 @@ mod tests {
     }
 
     #[test]
+    fn merge_pill_reflects_mergeability_and_hides_after_merge() {
+        let mut conflicted = pr();
+        assert_eq!(merge_pill(&conflicted), (0, "merge unknown"));
+        conflicted.mergeable = Some(true);
+        assert_eq!(merge_pill(&conflicted), (1, "no conflicts"));
+        conflicted.mergeable = Some(false);
+        assert_eq!(merge_pill(&conflicted), (3, "merge conflicts"));
+
+        let mut merged = pr();
+        merged.state = "merged".into();
+        assert_eq!(merge_pill(&merged), (0, ""));
+    }
+
+    #[test]
+    fn unmergeable_prs_need_attention_unless_drafted() {
+        let now = Utc.with_ymd_and_hms(2026, 7, 18, 12, 0, 0).unwrap();
+
+        // Even a PR that would otherwise be ready to merge or one in the
+        // viewer's review inbox lands in needs-attention.
+        let mut ready = pr();
+        ready.checks.push(passing_check());
+        ready.reviews.push(PrReview {
+            reviewer: "reviewer".into(),
+            state: "approved".into(),
+        });
+        ready.mergeable = Some(false);
+        assert_eq!(classify_pr(&ready, "viewer", now), Some("needs-attention"));
+
+        // Drafts stay drafts — the merge pill carries the conflict.
+        let mut draft = pr();
+        draft.draft = true;
+        draft.mergeable = Some(false);
+        assert_eq!(classify_pr(&draft, "viewer", now), Some("drafts"));
+
+        let mut review_requested = pr();
+        review_requested.requested_reviewers.push("viewer".into());
+        review_requested.mergeable = Some(false);
+        assert_eq!(
+            classify_pr(&review_requested, "viewer", now),
+            Some("needs-attention")
+        );
+
+        // A cleanly mergeable PR keeps its usual group.
+        let mut clean = pr();
+        clean.mergeable = Some(true);
+        clean.requested_reviewers.push("reviewer".into());
+        assert_eq!(classify_pr(&clean, "viewer", now), Some("pending-review"));
+    }
+
+    #[test]
     fn relative_comment_age_uses_approachable_units() {
         let now = Utc.with_ymd_and_hms(2026, 7, 18, 12, 0, 0).unwrap();
         assert_eq!(human_age(now - Duration::minutes(45), now), "45 mins ago");
@@ -6691,6 +6826,9 @@ mod tests {
     }
     fn nav_pr(number: u64, state: &str, draft: bool) -> trouve_protocol::PrInfo {
         trouve_protocol::PrInfo {
+            host: "github.com".into(),
+            repository: "acme/app".into(),
+            workspace_id: String::new(),
             number,
             url: String::new(),
             title: format!("PR {number}"),
@@ -6704,6 +6842,7 @@ mod tests {
             requested_reviewers: Vec::new(),
             comments: 0,
             last_comment_at: None,
+            mergeable: None,
             merged_at: None,
         }
     }

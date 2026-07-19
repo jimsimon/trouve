@@ -7,7 +7,7 @@
       "name": "MIT",
       "identifier": "MIT"
     },
-    "version": "0.25"
+    "version": "1.0"
   },
   "paths": {
     "/v1/approvals": {
@@ -507,6 +507,27 @@
         }
       }
     },
+    "/v1/github/prs/refresh": {
+      "post": {
+        "tags": [],
+        "operationId": "refresh_github_prs",
+        "responses": {
+          "204": {
+            "description": ""
+          },
+          "400": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/v1/info": {
       "get": {
         "tags": [],
@@ -536,42 +557,6 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/GithubIntegration"
-                }
-              }
-            }
-          }
-        }
-      },
-      "put": {
-        "tags": [],
-        "operationId": "set_github_integration",
-        "requestBody": {
-          "content": {
-            "application/json": {
-              "schema": {
-                "$ref": "#/components/schemas/SetGithubTokenRequest"
-              }
-            }
-          },
-          "required": true
-        },
-        "responses": {
-          "200": {
-            "description": "",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/GithubIntegration"
-                }
-              }
-            }
-          },
-          "400": {
-            "description": "",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorBody"
                 }
               }
             }
@@ -2955,47 +2940,6 @@
           }
         }
       }
-    },
-    "/v1/workspaces/{id}/prs/refresh": {
-      "post": {
-        "tags": [],
-        "operationId": "refresh_workspace_prs",
-        "parameters": [
-          {
-            "name": "id",
-            "in": "path",
-            "required": true,
-            "schema": {
-              "type": "string"
-            }
-          }
-        ],
-        "responses": {
-          "204": {
-            "description": ""
-          },
-          "400": {
-            "description": "",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorBody"
-                }
-              }
-            }
-          },
-          "404": {
-            "description": "",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorBody"
-                }
-              }
-            }
-          }
-        }
-      }
     }
   },
   "components": {
@@ -3009,7 +2953,7 @@
         "properties": {
           "client_id": {
             "type": "string",
-            "description": "Client id of an OAuth app on that instance (device flow enabled);\nenables \"Sign in\" for the host. A PAT works without one."
+            "description": "Client id of an OAuth app on that instance (device flow enabled)."
           },
           "host": {
             "type": "string",
@@ -4253,24 +4197,20 @@
           },
           {
             "type": "object",
-            "description": "A workspace PR-dashboard refresh completed. This is a full snapshot\nfor that workspace; clients replace the previously folded slice.",
+            "description": "An account-centric PR-dashboard refresh completed for one GitHub\ninstance. Clients replace the previously folded host slice.",
             "required": [
-              "workspace_id",
               "pull_requests",
               "type"
             ],
             "properties": {
               "pull_requests": {
-                "$ref": "#/components/schemas/WorkspacePrList"
+                "$ref": "#/components/schemas/GithubPrList"
               },
               "type": {
                 "type": "string",
                 "enum": [
-                  "workspace.pull_requests_updated"
+                  "github.pull_requests_updated"
                 ]
-              },
-              "workspace_id": {
-                "$ref": "#/components/schemas/String"
               }
             }
           },
@@ -4568,13 +4508,13 @@
           },
           "source": {
             "type": "string",
-            "description": "\"environment\", \"oauth\", \"settings\", \"gh-cli\", or \"\" when\nunconfigured."
+            "description": "\"oauth\", or \"\" when unconfigured."
           }
         }
       },
       "GithubIntegration": {
         "type": "object",
-        "description": "Whether the GitHub integration can authenticate, and where the token\ncame from (\"environment\", \"oauth\", \"settings\", \"gh-cli\", or \"\" when\nunconfigured).",
+        "description": "Whether the GitHub OAuth integration is authenticated.",
         "required": [
           "configured",
           "source"
@@ -4597,6 +4537,30 @@
           },
           "source": {
             "type": "string"
+          }
+        }
+      },
+      "GithubPrList": {
+        "type": "object",
+        "description": "Every dashboard-relevant PR of a workspace's origin repo: all open PRs\nplus those merged in the last day.",
+        "required": [
+          "host",
+          "prs"
+        ],
+        "properties": {
+          "host": {
+            "type": "string",
+            "description": "GitHub instance this slice came from."
+          },
+          "prs": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/PrInfo"
+            }
+          },
+          "viewer": {
+            "type": "string",
+            "description": "Login of the authenticated GitHub user (\"\" when unknown) — clients\nuse it to spot PRs where that user's review was requested."
           }
         }
       },
@@ -5139,6 +5103,10 @@
           "head": {
             "type": "string"
           },
+          "host": {
+            "type": "string",
+            "description": "GitHub instance that owns this PR."
+          },
           "last_comment_at": {
             "type": [
               "string",
@@ -5146,6 +5114,13 @@
             ],
             "format": "date-time",
             "description": "When the newest comment (of either kind) was posted."
+          },
+          "mergeable": {
+            "type": [
+              "boolean",
+              "null"
+            ],
+            "description": "Whether GitHub can merge this PR cleanly (false = merge/rebase\nconflicts). None while unknown: list endpoints omit it and GitHub\ncomputes it lazily even on single-PR reads."
           },
           "merged_at": {
             "type": [
@@ -5158,6 +5133,10 @@
             "type": "integer",
             "format": "int64",
             "minimum": 0
+          },
+          "repository": {
+            "type": "string",
+            "description": "Repository in `owner/name` form."
           },
           "requested_reviewers": {
             "type": "array",
@@ -5180,6 +5159,10 @@
           },
           "url": {
             "type": "string"
+          },
+          "workspace_id": {
+            "type": "string",
+            "description": "Matching local workspace, when one is registered."
           }
         }
       },
@@ -5613,22 +5596,6 @@
         "properties": {
           "permission_mode": {
             "$ref": "#/components/schemas/PermissionMode"
-          }
-        }
-      },
-      "SetGithubTokenRequest": {
-        "type": "object",
-        "description": "Store (or, with an empty token, remove) the GitHub personal access\ntoken in the server's secret store.",
-        "required": [
-          "token"
-        ],
-        "properties": {
-          "host": {
-            "type": "string",
-            "description": "Which host the token is for; empty/absent means github.com."
-          },
-          "token": {
-            "type": "string"
           }
         }
       },
@@ -6204,25 +6171,6 @@
           },
           "path": {
             "type": "string"
-          }
-        }
-      },
-      "WorkspacePrList": {
-        "type": "object",
-        "description": "Every dashboard-relevant PR of a workspace's origin repo: all open PRs\nplus those merged in the last day.",
-        "required": [
-          "prs"
-        ],
-        "properties": {
-          "prs": {
-            "type": "array",
-            "items": {
-              "$ref": "#/components/schemas/PrInfo"
-            }
-          },
-          "viewer": {
-            "type": "string",
-            "description": "Login of the authenticated GitHub user (\"\" when unknown) — clients\nuse it to spot PRs where that user's review was requested."
           }
         }
       }

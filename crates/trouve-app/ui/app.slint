@@ -1348,7 +1348,6 @@ export component AppWindow inherits Window {
     // 3 integrations); the controller sets it before flipping center-screen.
     in-out property <int> settings-section: 0;
     in property <[GithubHostItem]> settings-github-hosts;
-    callback github-token-saved(/* host */ string, /* token */ string);
     callback github-host-added(/* host */ string, /* client-id */ string);
     callback github-host-removed(/* host */ string);
     in property <[SubscriptionItem]> settings-subscriptions;
@@ -5022,7 +5021,6 @@ export component AppWindow inherits Window {
         preset-index <=> root.settings-preset-index;
         section <=> root.settings-section;
         github-hosts: root.settings-github-hosts;
-        github-token-saved(host, token) => { root.github-token-saved(host, token); }
         github-host-added(host, client-id) => { root.github-host-added(host, client-id); }
         github-host-removed(host) => { root.github-host-removed(host); }
         subscriptions: root.settings-subscriptions;
