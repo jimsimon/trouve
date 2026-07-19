@@ -2974,6 +2974,15 @@ impl Engine {
         }
         let path_str = canonical.to_string_lossy().to_string();
         if let Some(existing) = self.store.workspace_by_path(&path_str)? {
+            if self.store.set_workspace_closed(&existing.id, false)? {
+                self.store.append_event(
+                    Scope::Server,
+                    Event::WorkspaceRegistered {
+                        workspace_id: existing.id.clone(),
+                        path: path_str,
+                    },
+                )?;
+            }
             return Ok(existing);
         }
         let ws = Workspace {
@@ -3049,6 +3058,23 @@ impl Engine {
         }
         if !failures.is_empty() {
             return Err(EngineError::BadRequest(failures.join("; ")));
+        }
+        Ok(())
+    }
+
+    /// Hide a workspace from clients while retaining its sessions and
+    /// worktrees. Registering the same path later reopens it.
+    pub fn close_workspace(&self, id: &str) -> Result<(), EngineError> {
+        if self.store.workspace(id)?.is_none() {
+            return Err(EngineError::NotFound(format!("workspace {id}")));
+        }
+        if self.store.set_workspace_closed(id, true)? {
+            self.store.append_event(
+                Scope::Server,
+                Event::WorkspaceClosed {
+                    workspace_id: id.to_string(),
+                },
+            )?;
         }
         Ok(())
     }

@@ -169,6 +169,10 @@ impl ProtocolClient {
         self.post_empty("/github/prs/refresh").await
     }
 
+    pub async fn close_workspace(&self, workspace_id: &str) -> Result<()> {
+        self.delete(&format!("/workspaces/{workspace_id}")).await
+    }
+
     pub async fn workspace_branches(&self, workspace_id: &str) -> Result<BranchList> {
         self.get_json(&format!("/workspaces/{workspace_id}/branches"))
             .await

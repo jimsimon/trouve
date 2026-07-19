@@ -75,7 +75,9 @@ pub use requests::*;
 // 0.26: PrInfo gains an optional `mergeable` flag — additive; drives the
 // dashboard's merge-conflict pill and its needs-attention grouping.
 // 1.0: GitHub becomes OAuth-only and the PR dashboard becomes an
-// account-centric, multi-instance feed (breaking route/event replacement).
+// account-centric, multi-instance feed (breaking route/event replacement),
+// and DELETE /v1/workspaces/{id} closes a workspace without deleting its
+// sessions while workspace.closed records the state change.
 pub const PROTOCOL_VERSION: &str = "1.0";
 
 pub type WorkspaceId = String;

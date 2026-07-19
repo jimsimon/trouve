@@ -56,6 +56,10 @@ pub enum UiCommand {
     ToggleArchivedFilter {
         row: usize,
     },
+    /// Remove a workspace from the sidebar without deleting its sessions.
+    CloseWorkspace {
+        row: usize,
+    },
     /// Quit once all running agent turns complete.
     QuitWhenIdle,
     /// Native folder picker → register the chosen directory as a workspace.
@@ -3952,6 +3956,39 @@ impl Controller {
                         self.show_archived.insert(id);
                     }
                     self.push_nav();
+                }
+            }
+            UiCommand::CloseWorkspace { row } => {
+                if let Some(NavEntry::Workspace(wi)) = self.nav.get(row)
+                    && let Some(ws) = self.workspaces.get(*wi)
+                {
+                    let id = ws.id.clone();
+                    let closes_current = self
+                        .current_session
+                        .and_then(|i| self.sessions.get(i))
+                        .is_some_and(|s| s.workspace_id == id);
+                    self.client.close_workspace(&id).await?;
+                    self.collapsed_workspaces.remove(&id);
+                    self.show_archived.remove(&id);
+                    self.archived_expanded.remove(&id);
+                    if self.home_workspace_id == id {
+                        self.home_workspace_id.clear();
+                    }
+                    if closes_current {
+                        self.current_session = None;
+                        self.threads.clear();
+                        self.current_thread = None;
+                        self.resume.session_id.clear();
+                        crate::winstate::save_resume(&self.resume);
+                        self.push_threads();
+                        self.render_chat(true);
+                    }
+                    self.reload_sessions().await?;
+                    if self.home_workspace_id.is_empty()
+                        && let Some(ws) = self.workspaces.first()
+                    {
+                        self.home_workspace_id = ws.id.clone();
+                    }
                 }
             }
             UiCommand::SessionDelete { row } => {

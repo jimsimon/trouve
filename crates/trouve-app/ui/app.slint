@@ -1285,6 +1285,8 @@ export component AppWindow inherits Window {
     public function restore-workspace-reorder-focus() {
         root.workspace-reorder-focus-generation += 1;
     }
+    /// Hide a workspace from the sidebar; opening its folder restores it.
+    callback workspace-closed(int);
     callback open-settings();
     callback session-renamed(/* nav row */ int, /* new title */ string);
     callback session-archived(/* nav row */ int, /* archived */ bool);
@@ -2138,13 +2140,12 @@ export component AppWindow inherits Window {
                             clicked => { root.nav-row-clicked(idx); }
                         }
 
-                        // Session-list filter menu (opened from the funnel
-                        // button in the workspace header).
+                        // Workspace actions menu.
                         filter-menu := PopupWindow {
                             x: parent.width - 190px;
                             y: 32px;
                             width: 180px;
-                            height: Theme.fs(24px) + Theme.fs(30px) + 16px;
+                            height: Theme.fs(24px) + Theme.fs(60px) + 16px;
                             Rectangle {
                                 background: Theme.c.popup-bg;
                                 border-radius: 6px;
@@ -2156,7 +2157,7 @@ export component AppWindow inherits Window {
                                         height: 24px;
                                         Text {
                                             x: 8px;
-                                            text: "Filters";
+                                            text: "Workspace";
                                             color: Theme.c.text-soft;
                                             font-size: Theme.fs(11px);
                                             vertical-alignment: center;
@@ -2190,11 +2191,27 @@ export component AppWindow inherits Window {
                                             }
                                         }
                                     }
+                                    Rectangle {
+                                        height: Theme.fs(30px);
+                                        background: close-workspace-ta.has-hover
+                                            ? Theme.c.accent-bg : transparent;
+                                        border-radius: 4px;
+                                        close-workspace-ta := TouchArea {
+                                            clicked => { root.workspace-closed(idx); }
+                                        }
+                                        Text {
+                                            x: 8px;
+                                            text: "Close workspace";
+                                            color: Theme.c.text;
+                                            font-size: Theme.fs(12px);
+                                            vertical-alignment: center;
+                                        }
+                                    }
                                 }
                             }
                         }
 
-                        // Workspace header: chevron + name, filter menu, and
+                        // Workspace header: chevron + name, actions menu, and
                         // "+" starts a session in this workspace. Clicking
                         // elsewhere collapses/expands the group.
                         if row.kind == 0: HorizontalLayout {
@@ -2308,9 +2325,9 @@ export component AppWindow inherits Window {
                                 height: 26px;
                                 y: (parent.height - self.height) / 2;
                                 border-radius: 5px;
-                                icon: "▽";
-                                icon-size: Theme.fs(13px);
-                                tip: "Filter sessions";
+                                icon: "⋯";
+                                icon-size: Theme.fs(16px);
+                                tip: "Workspace actions";
                                 clicked => { filter-menu.show(); }
                             }
                             IconButton {
