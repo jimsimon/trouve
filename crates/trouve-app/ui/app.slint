@@ -35,6 +35,10 @@ export struct NavRow {
     kind: int,
     title: string,
     subtitle: string,
+    // Stable workspace identity and position (kind 0 only).
+    workspace-id: string,
+    workspace-position: int,
+    workspace-count: int,
     // For kind 1: stable index the controller maps back to a session.
     session-index: int,
     selected: bool,
@@ -1091,6 +1095,15 @@ export component AppWindow inherits Window {
     callback open-link(string);
     /// Start a new session in the workspace at this nav row.
     callback workspace-new-session(int);
+    // Workspace header ordering. Drag payloads stay opaque in Slint and are
+    // created/validated by the Rust host.
+    pure callback workspace-drag-data(string) -> data-transfer;
+    pure callback workspace-drag-acceptable(data-transfer) -> bool;
+    callback workspace-dropped(data-transfer, /* target id */ string, /* after */ bool) -> bool;
+    callback workspace-moved(/* workspace id */ string, /* signed offset */ int);
+    // Set immediately before a keyboard move so the rebuilt repeater returns
+    // focus to the moved handle.
+    in-out property <string> workspace-reorder-focus-id: "";
     callback open-settings();
     callback session-renamed(/* nav row */ int, /* new title */ string);
     callback session-archived(/* nav row */ int, /* archived */ bool);
@@ -1602,6 +1615,28 @@ export component AppWindow inherits Window {
                             ? (row-ta.has-hover ? Theme.c.hover-bg : Theme.c.raised-bg)
                             : row.kind == 1 && row.selected ? Theme.c.accent-bg : transparent;
                         border-radius: 6px;
+                        border-width: row.kind == 0 && workspace-drop.has-drag ? 2px : 0px;
+                        border-color: Theme.c.accent;
+
+                        // A header accepts the dragged workspace before or
+                        // after itself, depending on which half is released.
+                        workspace-drop := DropArea {
+                            enabled: row.kind == 0 && row.workspace-count > 1;
+                            can-drop(event) => {
+                                root.workspace-drag-acceptable(event.data)
+                                    ? DragAction.move : DragAction.none
+                            }
+                            dropped(event) => {
+                                if (root.workspace-dropped(
+                                    event.data,
+                                    row.workspace-id,
+                                    event.position.y >= self.height / 2
+                                )) {
+                                    return DragAction.move;
+                                }
+                                return DragAction.none;
+                            }
+                        }
 
                         row-menu := PopupWindow {
                             x: parent.width - 150px;
@@ -1753,6 +1788,86 @@ export component AppWindow inherits Window {
                                 vertical-alignment: center;
                                 overflow: elide;
                                 horizontal-stretch: 1;
+                            }
+                            // Pointer drag handle and keyboard/assistive-
+                            // technology position control. Up/Down performs
+                            // the same adjacent moves as a pointer drop.
+                            reorder-grip := Rectangle {
+                                width: 22px;
+                                height: 26px;
+                                y: (parent.height - self.height) / 2;
+                                border-radius: 5px;
+                                background: reorder-ta.has-hover || reorder-focus.has-focus
+                                    ? Theme.c.border : transparent;
+                                border-width: reorder-focus.has-focus ? 1px : 0px;
+                                border-color: Theme.c.accent;
+
+                                reorder-focus := FocusScope {
+                                    enabled: row.workspace-count > 1;
+                                    accessible-role: slider;
+                                    accessible-label: "Position of " + row.title;
+                                    accessible-description: "Drag or use Up and Down arrow keys to reorder";
+                                    accessible-enabled: self.enabled;
+                                    accessible-value: "" + (row.workspace-position + 1);
+                                    accessible-value-minimum: 1;
+                                    accessible-value-maximum: row.workspace-count;
+                                    accessible-value-step: 1;
+                                    accessible-action-decrement => {
+                                        if (row.workspace-position > 0) {
+                                            root.workspace-reorder-focus-id = row.workspace-id;
+                                            root.workspace-moved(row.workspace-id, -1);
+                                        }
+                                    }
+                                    accessible-action-increment => {
+                                        if (row.workspace-position + 1 < row.workspace-count) {
+                                            root.workspace-reorder-focus-id = row.workspace-id;
+                                            root.workspace-moved(row.workspace-id, 1);
+                                        }
+                                    }
+                                    key-pressed(event) => {
+                                        if (event.text == Key.UpArrow) {
+                                            if (row.workspace-position > 0) {
+                                                root.workspace-reorder-focus-id = row.workspace-id;
+                                                root.workspace-moved(row.workspace-id, -1);
+                                            }
+                                            return accept;
+                                        }
+                                        if (event.text == Key.DownArrow) {
+                                            if (row.workspace-position + 1 < row.workspace-count) {
+                                                root.workspace-reorder-focus-id = row.workspace-id;
+                                                root.workspace-moved(row.workspace-id, 1);
+                                            }
+                                            return accept;
+                                        }
+                                        return reject;
+                                    }
+                                    init => {
+                                        if (root.workspace-reorder-focus-id == row.workspace-id) {
+                                            root.workspace-reorder-focus-id = "";
+                                            self.focus();
+                                        }
+                                    }
+
+                                    drag-source := DragArea {
+                                        data: root.workspace-drag-data(row.workspace-id);
+                                        allow-move: true;
+                                        reorder-ta := TouchArea {
+                                            enabled: row.workspace-count > 1;
+                                            mouse-cursor: drag-source.dragging ? grabbing : grab;
+                                            clicked => { reorder-focus.focus(); }
+                                        }
+                                    }
+                                }
+                                Text {
+                                    width: 100%;
+                                    height: 100%;
+                                    text: "⠿";
+                                    color: row.workspace-count > 1
+                                        ? Theme.c.text-soft : Theme.c.text-ghost;
+                                    font-size: Theme.fs(13px);
+                                    horizontal-alignment: center;
+                                    vertical-alignment: center;
+                                }
                             }
                             IconButton {
                                 width: 26px;

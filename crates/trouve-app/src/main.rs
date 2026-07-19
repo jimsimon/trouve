@@ -245,6 +245,33 @@ fn main() -> anyhow::Result<()> {
             let _ = tx.send(UiCommand::NavRowClicked(row as usize));
         });
     }
+    window.on_workspace_drag_data(|workspace_id| {
+        slint::SharedString::from(workspace_drag_payload(&workspace_id)).into()
+    });
+    window.on_workspace_drag_acceptable(|data| workspace_drag_id(&data).is_some());
+    {
+        let tx = tx.clone();
+        window.on_workspace_dropped(move |data, target_id, after| {
+            let Some(workspace_id) = workspace_drag_id(&data) else {
+                return false;
+            };
+            let _ = tx.send(UiCommand::WorkspaceDropped {
+                workspace_id,
+                target_id: target_id.to_string(),
+                after,
+            });
+            true
+        });
+    }
+    {
+        let tx = tx.clone();
+        window.on_workspace_moved(move |workspace_id, offset| {
+            let _ = tx.send(UiCommand::WorkspaceMoved {
+                workspace_id: workspace_id.to_string(),
+                offset,
+            });
+        });
+    }
     {
         let tx = tx.clone();
         window.on_new_session(move || {
@@ -1168,9 +1195,32 @@ fn clipboard_image_png() -> Option<Vec<u8>> {
     Some(out)
 }
 
+const WORKSPACE_DRAG_PREFIX: &str = "trouve-workspace:";
+
+fn workspace_drag_payload(workspace_id: &str) -> String {
+    format!("{WORKSPACE_DRAG_PREFIX}{workspace_id}")
+}
+
+fn workspace_drag_id(data: &slint::DataTransfer) -> Option<String> {
+    data.plain_text()
+        .ok()?
+        .strip_prefix(WORKSPACE_DRAG_PREFIX)
+        .filter(|id| !id.is_empty())
+        .map(str::to_owned)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::at_token;
+    use super::{at_token, workspace_drag_id, workspace_drag_payload};
+
+    #[test]
+    fn workspace_drag_payload_round_trips() {
+        let data: slint::DataTransfer =
+            slint::SharedString::from(workspace_drag_payload("ws_123")).into();
+        assert_eq!(workspace_drag_id(&data).as_deref(), Some("ws_123"));
+        let other: slint::DataTransfer = slint::SharedString::from("not a workspace").into();
+        assert_eq!(workspace_drag_id(&other), None);
+    }
 
     #[test]
     fn at_token_finds_the_token_under_the_cursor() {

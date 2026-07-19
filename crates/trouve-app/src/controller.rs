@@ -57,6 +57,17 @@ pub enum UiCommand {
     OpenWorkspaceDialog,
     /// The "+" on a workspace header row: new session there.
     WorkspaceNewSession(usize),
+    /// Move a workspace relative to another workspace (pointer drop).
+    WorkspaceDropped {
+        workspace_id: String,
+        target_id: String,
+        after: bool,
+    },
+    /// Move a workspace by a signed number of positions (keyboard / AT).
+    WorkspaceMoved {
+        workspace_id: String,
+        offset: i32,
+    },
     OpenSettings,
     CloseSettings,
     /// Theme / font changed: re-render everything with baked colors
@@ -403,6 +414,9 @@ struct Controller {
     tx: mpsc::UnboundedSender<UiCommand>,
 
     workspaces: Vec<Workspace>,
+    /// Client-local workspace order, persisted independently of protocol
+    /// registration order.
+    workspace_order: Vec<String>,
     /// The workspace the app was started in (default for new sessions).
     home_workspace_id: String,
     sessions: Vec<Session>,
@@ -612,6 +626,7 @@ pub async fn run(
         client,
         tx,
         workspaces: Vec::new(),
+        workspace_order: crate::winstate::load_workspace_order(),
         home_workspace_id: String::new(),
         sessions: Vec::new(),
         nav: Vec::new(),
@@ -1109,6 +1124,7 @@ impl Controller {
     async fn reload_sessions(&mut self) -> Result<()> {
         let current_id = self.current_session_id();
         self.workspaces = self.client.list_workspaces().await?;
+        reconcile_workspace_order(&mut self.workspace_order, &self.workspaces);
         self.sessions = self.client.list_sessions().await?;
         self.busy_sessions = self
             .sessions
@@ -1134,12 +1150,20 @@ impl Controller {
     fn push_nav(&mut self) {
         let mut rows = Vec::new();
         let mut nav = Vec::new();
-        for (wi, ws) in self.workspaces.iter().enumerate() {
+        let workspace_count = self.workspace_order.len() as i32;
+        for (workspace_position, workspace_id) in self.workspace_order.iter().enumerate() {
+            let Some(wi) = self.workspaces.iter().position(|ws| ws.id == *workspace_id) else {
+                continue;
+            };
+            let ws = &self.workspaces[wi];
             let expanded = !self.collapsed_workspaces.contains(&ws.id);
             let show_archived = self.show_archived.contains(&ws.id);
             rows.push(NavRowData {
                 kind: 0,
                 title: ws.name.clone(),
+                workspace_id: ws.id.clone(),
+                workspace_position: workspace_position as i32,
+                workspace_count,
                 expanded,
                 show_archived,
                 ..Default::default()
@@ -1201,6 +1225,36 @@ impl Controller {
         }
         self.nav = nav;
         ui::set_nav(&self.ui, rows);
+    }
+
+    fn save_workspace_order(&mut self) {
+        crate::winstate::save_workspace_order(&self.workspace_order);
+    }
+
+    fn drop_workspace(&mut self, workspace_id: &str, target_id: &str, after: bool) {
+        if reorder_workspace(&mut self.workspace_order, workspace_id, target_id, after) {
+            self.save_workspace_order();
+            self.push_nav();
+        }
+    }
+
+    fn move_workspace(&mut self, workspace_id: &str, offset: i32) {
+        let Some(source) = self
+            .workspace_order
+            .iter()
+            .position(|id| id == workspace_id)
+        else {
+            return;
+        };
+        let Some(last) = self.workspace_order.len().checked_sub(1) else {
+            return;
+        };
+        let target = (source as i64 + i64::from(offset)).clamp(0, last as i64) as usize;
+        if target == source {
+            return;
+        }
+        let target_id = self.workspace_order[target].clone();
+        self.drop_workspace(workspace_id, &target_id, target > source);
     }
 
     /// Push the number of threads with an active turn to the UI (feeds the
@@ -2953,6 +3007,15 @@ impl Controller {
                 }
                 _ => {}
             },
+            UiCommand::WorkspaceDropped {
+                workspace_id,
+                target_id,
+                after,
+            } => self.drop_workspace(&workspace_id, &target_id, after),
+            UiCommand::WorkspaceMoved {
+                workspace_id,
+                offset,
+            } => self.move_workspace(&workspace_id, offset),
             UiCommand::SessionRename { row, title } => {
                 if let Some(i) = self.nav_session(row) {
                     let id = self.sessions[i].id.clone();
@@ -4966,9 +5029,80 @@ fn parse_mcp_form(
     Ok((command, parts, env))
 }
 
+/// Drop stale/duplicate ids from a saved order and append newly registered
+/// workspaces in the order returned by the server.
+fn reconcile_workspace_order(order: &mut Vec<String>, workspaces: &[Workspace]) {
+    let live: HashSet<&str> = workspaces.iter().map(|ws| ws.id.as_str()).collect();
+    let mut seen = HashSet::new();
+    order.retain(|id| live.contains(id.as_str()) && seen.insert(id.clone()));
+    for workspace in workspaces {
+        if seen.insert(workspace.id.clone()) {
+            order.push(workspace.id.clone());
+        }
+    }
+}
+
+/// Move `workspace_id` immediately before/after `target_id`.
+fn reorder_workspace(
+    order: &mut Vec<String>,
+    workspace_id: &str,
+    target_id: &str,
+    after: bool,
+) -> bool {
+    if workspace_id == target_id {
+        return false;
+    }
+    let Some(source) = order.iter().position(|id| id == workspace_id) else {
+        return false;
+    };
+    if !order.iter().any(|id| id == target_id) {
+        return false;
+    }
+
+    let workspace = order.remove(source);
+    let target = order
+        .iter()
+        .position(|id| id == target_id)
+        .expect("target was validated before removing a different workspace");
+    let destination = target + usize::from(after);
+    order.insert(destination, workspace);
+    source != destination
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{download_progress, human_rate, session_title};
+    use super::{
+        download_progress, human_rate, reconcile_workspace_order, reorder_workspace, session_title,
+    };
+    use trouve_protocol::Workspace;
+
+    fn workspaces(ids: &[&str]) -> Vec<Workspace> {
+        ids.iter()
+            .map(|id| Workspace {
+                id: (*id).into(),
+                name: (*id).into(),
+                path: format!("/{id}"),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn saved_workspace_order_keeps_new_workspaces_at_the_end() {
+        let list = workspaces(&["a", "b", "c", "d"]);
+        let mut order = vec!["c".into(), "a".into(), "missing".into(), "c".into()];
+        reconcile_workspace_order(&mut order, &list);
+        assert_eq!(order, ["c", "a", "b", "d"]);
+    }
+
+    #[test]
+    fn workspace_reorder_supports_before_and_after_drops() {
+        let mut order = vec!["a".into(), "b".into(), "c".into(), "d".into()];
+        assert!(reorder_workspace(&mut order, "a", "c", true));
+        assert_eq!(order, ["b", "c", "a", "d"]);
+        assert!(reorder_workspace(&mut order, "d", "b", false));
+        assert_eq!(order, ["d", "b", "c", "a"]);
+        assert!(!reorder_workspace(&mut order, "d", "d", false));
+    }
 
     #[test]
     fn download_progress_includes_speed() {

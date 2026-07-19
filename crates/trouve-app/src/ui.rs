@@ -18,6 +18,11 @@ pub struct NavRowData {
     pub kind: i32,
     pub title: String,
     pub subtitle: String,
+    /// Workspace headers: stable id used by reorder callbacks.
+    pub workspace_id: String,
+    /// Workspace headers: zero-based position and total count.
+    pub workspace_position: i32,
+    pub workspace_count: i32,
     pub session_index: i32,
     pub selected: bool,
     pub archived: bool,
@@ -115,6 +120,9 @@ pub fn set_nav(ui: &Ui, rows: Vec<NavRowData>) {
                 kind: r.kind,
                 title: r.title.into(),
                 subtitle: r.subtitle.into(),
+                workspace_id: r.workspace_id.into(),
+                workspace_position: r.workspace_position,
+                workspace_count: r.workspace_count,
                 session_index: r.session_index,
                 selected: r.selected,
                 archived: r.archived,
