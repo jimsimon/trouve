@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1784424890520,
+  "lastUpdate": 1784430218015,
   "repoUrl": "https://github.com/jimsimon/trouve",
   "entries": {
     "e2e-benchmarks": [
@@ -1919,6 +1919,54 @@ window.BENCHMARK_DATA = {
             "name": "non-git warm query",
             "value": 63.774653459999996,
             "range": "± 1.6",
+            "unit": "ms"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "jim.j.simon@gmail.com",
+            "name": "Jim Simon",
+            "username": "jimsimon"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "2d5ff980f06a6fdd1d876ab551762b19d5cc75d3",
+          "message": "Surface Claude subscription limit errors (#69)\n\n* Surface Claude subscription limit errors\n\n* fix: apply CodeRabbit auto-fixes\n\nFixed 1 file(s) based on 1 unresolved review comment.\n\nCo-authored-by: CodeRabbit <noreply@coderabbit.ai>\n\n* Format Claude error result tests\n\n---------\n\nCo-authored-by: coderabbitai[bot] <136622811+coderabbitai[bot]@users.noreply.github.com>\nCo-authored-by: CodeRabbit <noreply@coderabbit.ai>",
+          "timestamp": "2026-07-18T23:01:05-04:00",
+          "tree_id": "6477d66e46b2194071b5c82e608c6fb95350ed13",
+          "url": "https://github.com/jimsimon/trouve/commit/2d5ff980f06a6fdd1d876ab551762b19d5cc75d3"
+        },
+        "date": 1784430217215,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "cold index + query",
+            "value": 131.26542382,
+            "range": "± 2.1",
+            "unit": "ms"
+          },
+          {
+            "name": "warm query",
+            "value": 69.59957,
+            "range": "± 3.1",
+            "unit": "ms"
+          },
+          {
+            "name": "incremental (1 file modified)",
+            "value": 80.19295462000001,
+            "range": "± 1.1",
+            "unit": "ms"
+          },
+          {
+            "name": "non-git warm query",
+            "value": 68.32415425999999,
+            "range": "± 2",
             "unit": "ms"
           }
         ]
