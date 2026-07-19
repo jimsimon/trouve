@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1784504308266,
+  "lastUpdate": 1784504339140,
   "repoUrl": "https://github.com/jimsimon/trouve",
   "entries": {
     "e2e-benchmarks": [
@@ -2831,6 +2831,54 @@ window.BENCHMARK_DATA = {
             "name": "non-git warm query",
             "value": 70.81417872000002,
             "range": "± 0.8",
+            "unit": "ms"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "jim.j.simon@gmail.com",
+            "name": "Jim Simon",
+            "username": "jimsimon"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "f3ef43f1bc731fec8eb12e3a261cab7dd0e66926",
+          "message": "Add provider tabs and Kimi subscription usage (#81)\n\n* Add provider categories and Kimi usage\n\n* Harden provider usage endpoint validation\n\n* Update protocol snapshot after rebase",
+          "timestamp": "2026-07-19T19:36:22-04:00",
+          "tree_id": "01faca34b704e92d9ff0f44902c84a30200b5cfa",
+          "url": "https://github.com/jimsimon/trouve/commit/f3ef43f1bc731fec8eb12e3a261cab7dd0e66926"
+        },
+        "date": 1784504338471,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "cold index + query",
+            "value": 136.329516,
+            "range": "± 9.1",
+            "unit": "ms"
+          },
+          {
+            "name": "warm query",
+            "value": 75.82840918,
+            "range": "± 2.3",
+            "unit": "ms"
+          },
+          {
+            "name": "incremental (1 file modified)",
+            "value": 86.38274194,
+            "range": "± 1.4",
+            "unit": "ms"
+          },
+          {
+            "name": "non-git warm query",
+            "value": 75.2499976,
+            "range": "± 2.8",
             "unit": "ms"
           }
         ]
