@@ -899,6 +899,10 @@ component NewChatForm inherits VerticalLayout {
     in property <[string]> models;
     in property <[int]> model-matches;
     in-out property <int> model-index;
+    in property <[string]> thinking-options;
+    in-out property <int> thinking-index;
+    in property <[string]> permission-options;
+    in-out property <int> permission-index;
     in property <string> error-text;
     // Offline/disconnected with nothing usable: every input is disabled
     // and the banner explains why (see AppWindow.connectivity-*).
@@ -906,11 +910,18 @@ component NewChatForm inherits VerticalLayout {
     in property <bool> blocked-severe;
     in property <string> offline-warning;
     in property <string> online-notice;
-    callback start(int, int, bool, int, int, string);
+    callback start(int, int, bool, int, int, int, int, string);
     callback cancel();
     callback workspace-changed(int);
     callback register-workspace(string);
     callback model-filter(string);
+    in property <[AttachmentChip]> attachments;
+    callback attach-file();
+    callback attachment-removed(int);
+    callback paste-image-attempted() -> bool;
+    property <bool> yolo-selected: root.permission-index >= 0
+        && root.permission-index < root.permission-options.length
+        && root.permission-options[root.permission-index] == "Yolo";
 
     padding: 40px;
     spacing: 14px;
@@ -1013,11 +1024,52 @@ component NewChatForm inherits VerticalLayout {
             }
         }
     }
+    HorizontalLayout {
+        spacing: 12px;
+        if root.thinking-options.length > 0: VerticalLayout {
+            spacing: 6px; horizontal-stretch: 1;
+            Text { text: "Thinking level"; color: Theme.c.text-mid; font-size: Theme.fs(12px); font-weight: 700; }
+            ComboBox { model: root.thinking-options; current-index <=> root.thinking-index; enabled: !root.blocked; }
+        }
+        VerticalLayout {
+            spacing: 6px; horizontal-stretch: 1;
+            Text {
+                text: root.yolo-selected ? "⚠ Permission mode" : "Permission mode";
+                color: root.yolo-selected ? Theme.c.err : Theme.c.text-mid;
+                font-size: Theme.fs(12px); font-weight: 700;
+            }
+            ComboBox { model: root.permission-options; current-index <=> root.permission-index; enabled: !root.blocked; }
+        }
+    }
+    if root.yolo-selected: Rectangle {
+        background: Theme.c.err-bg;
+        border-width: 1px;
+        border-color: Theme.c.err;
+        border-radius: 6px;
+        height: setup-yolo-warning.preferred-height + 20px;
+        setup-yolo-warning := VerticalLayout {
+            padding: 10px;
+            spacing: 4px;
+            Text {
+                text: "⚠ Unattended execution (YOLO) is dangerous";
+                color: Theme.c.err;
+                font-size: Theme.fs(12px);
+                font-weight: 700;
+            }
+            Text {
+                text: "The agent can run commands and change or delete files without asking for approval.";
+                color: Theme.c.err-soft;
+                font-size: Theme.fs(11px);
+                wrap: word-wrap;
+            }
+        }
+    }
 
     VerticalLayout {
         spacing: 6px;
         Text { text: "First message"; color: Theme.c.text-mid; font-size: Theme.fs(12px); font-weight: 700; }
         prompt-edit := PromptBox {
+            paste-image-attempted => { root.paste-image-attempted() }
             placeholder: root.blocked && root.blocked-severe
                 ? "Server unavailable — prompts are disabled"
                 : root.blocked
@@ -1026,24 +1078,47 @@ component NewChatForm inherits VerticalLayout {
             enabled: !root.blocked;
             submitted(text) => {
                 if (!root.blocked && (!root.session-form || root.workspace-index >= 0)) {
-                    root.start(root.workspace-index, root.branch-index, root.use-latest-remote,
-                        root.mode-index, root.model-index, text);
+                    root.start(root.workspace-index, root.branch-index,
+                        root.use-latest-remote, root.mode-index, root.model-index, root.thinking-index,
+                        root.permission-index, text);
                     self.text = "";
                 }
             }
         }
     }
 
+    if root.attachments.length > 0: HorizontalLayout {
+        spacing: 6px;
+        for chip[i] in root.attachments: Rectangle {
+            height: Theme.fs(24px);
+            background: Theme.c.accent-bg;
+            border-radius: 6px;
+            HorizontalLayout {
+                padding-left: 8px; padding-right: 4px; spacing: 6px;
+                Text { text: chip.name; color: Theme.c.text-hi; font-size: Theme.fs(11px); vertical-alignment: center; }
+                Text { text: chip.meta; color: Theme.c.text-soft; font-size: Theme.fs(10px); vertical-alignment: center; }
+                IconButton { icon: "✕"; tip: "Remove attachment"; clicked => { root.attachment-removed(i); } }
+            }
+        }
+    }
+
     HorizontalLayout {
         spacing: 8px;
+        IconButton {
+            icon: "📎";
+            tip: "Attach files (or paste an image with Ctrl+V)";
+            enabled: !root.blocked;
+            clicked => { root.attach-file(); }
+        }
         Button {
             text: root.session-form ? "Start session" : "Start thread";
             primary: true;
-            enabled: prompt-edit.text != "" && !root.blocked
+            enabled: (prompt-edit.text != "" || root.attachments.length > 0) && !root.blocked
                 && (!root.session-form || root.workspace-index >= 0);
             clicked => {
-                root.start(root.workspace-index, root.branch-index, root.use-latest-remote,
-                    root.mode-index, root.model-index, prompt-edit.text);
+                root.start(root.workspace-index, root.branch-index,
+                    root.use-latest-remote, root.mode-index, root.model-index, root.thinking-index,
+                    root.permission-index, prompt-edit.text);
                 prompt-edit.text = "";
             }
         }
@@ -1391,7 +1466,9 @@ export component AppWindow inherits Window {
     callback right-tab-changed(int);
     changed right-tab => { root.right-tab-changed(root.right-tab); }
     callback send-message(string);
+    callback cancel-turn();
     in property <bool> composer-enabled: false;
+    in property <bool> composer-turn-running: false;
     // Draft survives the composer being swapped out for the new-thread form.
     // in-out: Rust splices "@path " mentions into it when one is picked.
     in-out property <string> composer-draft;
@@ -1461,6 +1538,7 @@ export component AppWindow inherits Window {
     callback queue-moved(/* index */ int, /* delta, -1 up / +1 down */ int);
     callback queue-reordered(/* from */ int, /* to */ int);
     callback queue-send-now();
+    callback queue-send-now-at(int);
     // Row currently showing its inline editor (-1 = none). Any queue change
     // replaces the list model, which resets this — indices may have shifted.
     property <int> queue-editing: -1;
@@ -1527,6 +1605,12 @@ export component AppWindow inherits Window {
     in property <bool> fast-visible: false;
     in-out property <bool> fast-checked: false;
     callback composer-thinking-changed(int);
+    in property <[string]> permission-options: ["Ask", "Allow list", "Yolo"];
+    in-out property <int> permission-index: 0;
+    property <bool> composer-yolo-selected: root.permission-index >= 0
+        && root.permission-index < root.permission-options.length
+        && root.permission-options[root.permission-index] == "Yolo";
+    callback composer-permission-changed(int);
     callback composer-context-changed(int);
     callback composer-fast-toggled(bool);
 
@@ -1544,10 +1628,17 @@ export component AppWindow inherits Window {
     in-out property <bool> nc-fetch-latest: true;
     in-out property <int> nc-mode-index: 0;
     in-out property <int> nc-model-index: 0;
+    in property <[string]> nc-thinking-options;
+    in-out property <int> nc-thinking-index: -1;
+    in-out property <int> nc-permission-index: 0;
+    in property <[string]> nc-permission-options: ["Mode default", "Ask", "Allow list", "Yolo"];
+    callback nc-model-changed(int);
+    changed nc-model-index => { root.nc-model-changed(root.nc-model-index); }
     callback nc-workspace-changed(int);
     callback register-workspace-path(string);
     callback start-new-chat(/* ws */ int, /* branch */ int, /* fetch */ bool, /* mode */ int,
-                            /* model */ int, /* prompt */ string);
+                            /* model */ int, /* thinking */ int,
+                            /* permission */ int, /* prompt */ string);
     callback cancel-new-chat();
 
     // --- right column -------------------------------------------------------
@@ -2465,12 +2556,20 @@ export component AppWindow inherits Window {
                     models: root.models;
                     model-matches: root.model-filter-matches;
                     model-index <=> root.nc-model-index;
+                    thinking-options: root.nc-thinking-options;
+                    thinking-index <=> root.nc-thinking-index;
+                    permission-options: root.nc-permission-options;
+                    permission-index <=> root.nc-permission-index;
                     blocked: root.connectivity-blocked;
                     blocked-severe: root.connectivity-severe;
                     offline-warning: root.connectivity-text;
                     online-notice: root.connectivity-notice;
-                    start(ws, br, fetch, mode, model, prompt) => {
-                        root.start-new-chat(ws, br, fetch, mode, model, prompt);
+                    attachments: root.composer-attachments;
+                    attach-file => { root.attach-file(); }
+                    attachment-removed(i) => { root.attachment-removed(i); }
+                    paste-image-attempted => { root.paste-image-attempted() }
+                    start(ws, br, fetch, mode, model, thinking, permission, prompt) => {
+                        root.start-new-chat(ws, br, fetch, mode, model, thinking, permission, prompt);
                     }
                     cancel => { root.cancel-new-chat(); }
                     model-filter(q) => { root.model-filter-changed(q); }
@@ -3504,6 +3603,12 @@ export component AppWindow inherits Window {
                                         vertical-alignment: center;
                                     }
                                     IconButton {
+                                        icon: "▶";
+                                        tip: root.queue-idle ? "Send this prompt now" : "Run this prompt next";
+                                        enabled: !root.connectivity-blocked;
+                                        clicked => { root.queue-send-now-at(qi); }
+                                    }
+                                    IconButton {
                                         icon: "↑";
                                         tip: "Run earlier";
                                         enabled: qi > 0 && !root.connectivity-blocked;
@@ -3701,7 +3806,10 @@ export component AppWindow inherits Window {
                         }
                     }
 
+                    HorizontalLayout {
+                    spacing: 8px;
                     composer := PromptBox {
+                        horizontal-stretch: 1;
                         text <=> root.composer-draft;
                         placeholder: !root.composer-enabled
                             ? "Select or create a thread first"
@@ -3735,6 +3843,25 @@ export component AppWindow inherits Window {
                             root.send-message(text);
                             self.text = "";
                         }
+                    }
+                    Button {
+                        width: Theme.fs(76px);
+                        text: root.composer-turn-running
+                            ? (composer.text != "" || root.composer-attachments.length > 0 ? "Queue" : "Cancel")
+                            : "Send";
+                        primary: !root.composer-turn-running || composer.text != "" || root.composer-attachments.length > 0;
+                        enabled: root.composer-enabled && !root.connectivity-blocked
+                            && (root.composer-turn-running || composer.text != "" || root.composer-attachments.length > 0);
+                        clicked => {
+                            if (root.composer-turn-running && composer.text == ""
+                                && root.composer-attachments.length == 0) {
+                                root.cancel-turn();
+                            } else {
+                                root.send-message(composer.text);
+                                composer.text = "";
+                            }
+                        }
+                    }
                     }
 
                     HorizontalLayout {
@@ -3776,6 +3903,44 @@ export component AppWindow inherits Window {
                             enabled: root.composer-enabled && !root.connectivity-blocked;
                             placeholder: "thinking";
                             changed(i) => { root.composer-thinking-changed(i); }
+                        }
+                    }
+                    VerticalLayout {
+                        spacing: 2px;
+                        Text {
+                            text: root.composer-yolo-selected ? "⚠ Permissions" : "Permissions";
+                            color: root.composer-yolo-selected ? Theme.c.err : Theme.c.text-faint;
+                            font-size: Theme.fs(10px);
+                            font-weight: root.composer-yolo-selected ? 700 : 400;
+                        }
+                        DropUpPicker {
+                            width: 105px;
+                            options: root.permission-options;
+                            current-index <=> root.permission-index;
+                            enabled: root.composer-enabled && !root.composer-turn-running && !root.connectivity-blocked;
+                            placeholder: "permissions";
+                            changed(i) => { root.composer-permission-changed(i); }
+                        }
+                    }
+                    if root.composer-yolo-selected: Rectangle {
+                        width: 250px;
+                        height: Theme.fs(30px);
+                        background: Theme.c.err-bg;
+                        border-width: 1px;
+                        border-color: Theme.c.err;
+                        border-radius: 6px;
+                        HorizontalLayout {
+                            padding-left: 8px;
+                            padding-right: 8px;
+                            spacing: 6px;
+                            Text { text: "⚠"; color: Theme.c.err; font-size: Theme.fs(13px); vertical-alignment: center; }
+                            Text {
+                                text: "YOLO: changes run without approval";
+                                color: Theme.c.err-soft;
+                                font-size: Theme.fs(10px);
+                                font-weight: 700;
+                                vertical-alignment: center;
+                            }
                         }
                     }
                     if root.context-options.length > 0: VerticalLayout {
@@ -3828,20 +3993,6 @@ export component AppWindow inherits Window {
                             height: Theme.fs(30px);
                             enabled: root.composer-enabled && !root.connectivity-blocked;
                             clicked => { root.attach-file(); }
-                        }
-                    }
-                    VerticalLayout {
-                        spacing: 2px;
-                        Text { text: " "; font-size: Theme.fs(10px); }
-                        Button {
-                            text: "Send";
-                            primary: true;
-                            enabled: root.composer-enabled && !root.connectivity-blocked
-                                && (composer.text != "" || root.composer-attachments.length > 0);
-                            clicked => {
-                                root.send-message(composer.text);
-                                composer.text = "";
-                            }
                         }
                     }
                     // Context usage dial; indeterminate while compacting.
@@ -3914,13 +4065,21 @@ export component AppWindow inherits Window {
                 models: root.models;
                 model-matches: root.model-filter-matches;
                 model-index <=> root.nc-model-index;
+                thinking-options: root.nc-thinking-options;
+                thinking-index <=> root.nc-thinking-index;
+                permission-options: root.nc-permission-options;
+                permission-index <=> root.nc-permission-index;
                 error-text: root.error-text;
                 blocked: root.connectivity-blocked;
                 blocked-severe: root.connectivity-severe;
                 offline-warning: root.connectivity-text;
                 online-notice: root.connectivity-notice;
-                start(ws, br, fetch, mode, model, prompt) => {
-                    root.start-new-chat(ws, br, fetch, mode, model, prompt);
+                attachments: root.composer-attachments;
+                attach-file => { root.attach-file(); }
+                attachment-removed(i) => { root.attachment-removed(i); }
+                paste-image-attempted => { root.paste-image-attempted() }
+                start(ws, br, fetch, mode, model, thinking, permission, prompt) => {
+                    root.start-new-chat(ws, br, fetch, mode, model, thinking, permission, prompt);
                 }
                 cancel => { root.cancel-new-chat(); }
                 workspace-changed(i) => { root.nc-workspace-changed(i); }

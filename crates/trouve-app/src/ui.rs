@@ -83,6 +83,10 @@ pub fn set_picker_indices(ui: &Ui, mode: i32, model: i32) {
     });
 }
 
+pub fn set_permission_index(ui: &Ui, index: i32) {
+    let _ = ui.upgrade_in_event_loop(move |ui| ui.set_permission_index(index));
+}
+
 /// Connectivity state: `blocked` disables all prompt entry (composer,
 /// new-chat form, automation form); `warning` explains why ("" hides the
 /// banner). `severe` renders the banner red — the connection to the server
@@ -120,6 +124,13 @@ pub fn set_model_knobs(
         ui.set_context_index(context_index);
         ui.set_fast_visible(fast_visible);
         ui.set_fast_checked(fast_checked);
+    });
+}
+
+pub fn set_new_chat_knobs(ui: &Ui, thinking_options: Vec<String>, thinking_index: i32) {
+    let _ = ui.upgrade_in_event_loop(move |ui| {
+        ui.set_nc_thinking_options(string_model(thinking_options));
+        ui.set_nc_thinking_index(thinking_index);
     });
 }
 
@@ -419,6 +430,10 @@ pub fn set_composer_enabled(ui: &Ui, enabled: bool) {
     let _ = ui.upgrade_in_event_loop(move |ui| ui.set_composer_enabled(enabled));
 }
 
+pub fn set_composer_turn_running(ui: &Ui, running: bool) {
+    let _ = ui.upgrade_in_event_loop(move |ui| ui.set_composer_turn_running(running));
+}
+
 /// Slash commands the current thread's harness accepts, as (name,
 /// description) pairs — the prompt box's "/" completion popup.
 pub fn set_slash_commands(ui: &Ui, commands: Vec<(String, String)>) {
@@ -534,6 +549,9 @@ pub fn set_new_chat(
         ui.set_nc_fetch_latest(true);
         ui.set_nc_mode_index(mode_index);
         ui.set_nc_model_index(model_index);
+        // A permission choice belongs to one setup form only. In particular,
+        // never let a previous form's YOLO selection carry into a new one.
+        ui.set_nc_permission_index(0);
     });
 }
 
