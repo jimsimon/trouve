@@ -702,6 +702,10 @@ struct Controller {
     /// Global thinking default, kept with the catalogs so switching a live
     /// thread's mode can apply the same inheritance as thread creation.
     default_thinking_level: Option<String>,
+    /// Last provider subscription snapshot. Picker rows are derived from
+    /// this cache and the current model catalog, so catalog refreshes cannot
+    /// leave the two lists misaligned.
+    subscription_health: Vec<trouve_protocol::SubscriptionHealth>,
     /// Thinking dropdown state for the current thread's model: the schema
     /// property the values belong to and the raw value tokens (parallel to
     /// the displayed labels).
@@ -862,6 +866,7 @@ pub async fn run(
         mode_origins: Vec::new(),
         models: Vec::new(),
         default_thinking_level: None,
+        subscription_health: Vec::new(),
         thinking_key: None,
         thinking_values: Vec::new(),
         context_values: Vec::new(),
@@ -1055,6 +1060,7 @@ impl Controller {
             self.offline = !info.online;
         }
         self.reload_catalogs().await;
+        self.refresh_subscriptions();
 
         if let Ok(gh) = self.client.github_integration().await {
             self.apply_github_integration(gh);
@@ -1160,6 +1166,7 @@ impl Controller {
             mode_names,
             self.models.iter().map(|m| m.id.clone()).collect(),
         );
+        self.push_model_health();
         // Each mode's default model, so mode pickers can jump the model
         // picker to it.
         ui::set_mode_model_indices(
@@ -1173,6 +1180,30 @@ impl Controller {
         // The offline banner depends on the (server-filtered) model list:
         // local models keep prompts usable, an empty list blocks them.
         self.push_connectivity();
+    }
+
+    /// Align the cached provider-level subscription state with every model
+    /// row. Providers without an applicable health record get empty entries,
+    /// which hides both the row annotation and the selected-model pill.
+    fn push_model_health(&self) {
+        let by_provider: HashMap<&str, &trouve_protocol::SubscriptionHealth> = self
+            .subscription_health
+            .iter()
+            .map(|health| (health.provider_id.as_str(), health))
+            .collect();
+        let health = self
+            .models
+            .iter()
+            .map(|model| {
+                model
+                    .id
+                    .split_once('/')
+                    .and_then(|(provider, _)| by_provider.get(provider).copied())
+                    .map(model_health_view)
+                    .unwrap_or_default()
+            })
+            .collect();
+        ui::set_model_health(&self.ui, health);
     }
 
     /// Whether prompt entry and prompt-adjacent mutations are blocked: the
@@ -1266,6 +1297,7 @@ impl Controller {
             self.offline = !info.online;
         }
         self.reload_catalogs().await; // re-pushes the connectivity banner
+        self.refresh_subscriptions();
         let _ = self.reload_sessions().await;
         self.show_connectivity_notice(notice);
     }
@@ -5005,13 +5037,13 @@ impl Controller {
             },
             UiCommand::SubscriptionsLoaded(subs) => {
                 let items = subs
-                    .into_iter()
+                    .iter()
                     .map(|s| ui::SubscriptionView {
-                        provider: s.provider_id,
-                        status: s.status,
-                        plan: s.plan,
-                        credits: s.credits,
-                        note: s.note,
+                        provider: s.provider_id.clone(),
+                        status: s.status.clone(),
+                        plan: s.plan.clone(),
+                        credits: s.credits.clone(),
+                        note: s.note.clone(),
                         windows: s
                             .windows
                             .iter()
@@ -5019,7 +5051,9 @@ impl Controller {
                             .collect(),
                     })
                     .collect();
+                self.subscription_health = subs;
                 ui::set_subscriptions(&self.ui, items, String::new());
+                self.push_model_health();
             }
             UiCommand::AddGithubHost(host, client_id) => {
                 match self.client.add_github_host(&host, &client_id).await {
@@ -5823,6 +5857,8 @@ impl Controller {
                 if !self.followed.contains(&thread_id) {
                     return Ok(());
                 }
+                let completed =
+                    matches!(envelope.event, trouve_protocol::Event::TurnCompleted { .. });
                 let before = self
                     .vms
                     .get(&thread_id)
@@ -5879,13 +5915,19 @@ impl Controller {
                         }
                     }
                     self.follow_tail_for_open_attention(&thread_id);
-                    if matches!(envelope.event, trouve_protocol::Event::TurnCompleted { .. }) {
+                    if completed {
                         let _ = self.refresh_diff().await;
                         self.refresh_usage_text().await;
                     }
                 }
                 if todos_changed {
                     self.push_threads();
+                }
+                // Subscription windows are provider-side state, so the
+                // completed-turn event is the best point to replace the
+                // startup snapshot without polling continuously.
+                if completed {
+                    self.refresh_subscriptions();
                 }
                 self.maybe_notify(&thread_id, &envelope);
                 let mut nav_changed = attention_changed;
@@ -6324,6 +6366,109 @@ fn human_count(n: u64) -> String {
     }
 }
 
+/// Compact and expanded presentations of one provider's subscription state.
+/// The compact row deliberately uses only the highest reported percentage:
+/// it is the window closest to its cap, not a promise that requests below
+/// 100% will succeed.
+fn model_health_view(health: &trouve_protocol::SubscriptionHealth) -> ui::ModelHealthView {
+    let plan = display_plan(&health.plan);
+    let constrained = health
+        .windows
+        .iter()
+        .max_by_key(|window| window.used_percent);
+    let note_lower = health.note.to_ascii_lowercase();
+
+    let (summary, tone) = match health.status.as_str() {
+        "ok" => {
+            if let Some(window) = constrained {
+                let pct = window.used_percent.clamp(0, 100);
+                let summary = if plan.is_empty() {
+                    format!("{pct}% used")
+                } else {
+                    format!("{plan} · {pct}% used")
+                };
+                let tone = if pct >= 90 {
+                    3
+                } else if pct >= 70 {
+                    2
+                } else {
+                    1
+                };
+                (summary, tone)
+            } else if !plan.is_empty() {
+                (plan.clone(), 1)
+            } else if !health.credits.is_empty() {
+                (health.credits.clone(), 1)
+            } else {
+                ("usage available".into(), 1)
+            }
+        }
+        "unavailable" => {
+            let label = if note_lower.contains("login") || note_lower.contains("logged in") {
+                "login required"
+            } else {
+                "usage unavailable"
+            };
+            (label.into(), 3)
+        }
+        "unsupported" => {
+            let label = if note_lower.contains("api key") || note_lower.contains("usage-billed") {
+                "API billed"
+            } else {
+                "usage unavailable"
+            };
+            (label.into(), 0)
+        }
+        _ => ("usage unavailable".into(), 0),
+    };
+
+    let title = if plan.is_empty() {
+        health.provider_id.clone()
+    } else {
+        format!("{} · {plan}", health.provider_id)
+    };
+    let mut lines = vec![title];
+    if !health.windows.is_empty() {
+        lines.push(String::new());
+        lines.extend(health.windows.iter().map(|window| {
+            let pct = window.used_percent.clamp(0, 100);
+            if window.resets.is_empty() {
+                format!("{}: {pct}% used", window.label)
+            } else {
+                format!("{}: {pct}% used · {}", window.label, window.resets)
+            }
+        }));
+    }
+    if !health.credits.is_empty() {
+        lines.push(health.credits.clone());
+    }
+    if !health.note.is_empty() {
+        lines.push(String::new());
+        lines.push(health.note.clone());
+    }
+    if health.status == "ok" {
+        lines.push(String::new());
+        lines.push(
+            "Highest reported usage is shown in the picker. Provider limits may change before the next refresh."
+                .into(),
+        );
+    }
+
+    ui::ModelHealthView {
+        summary,
+        detail: lines.join("\n"),
+        tone,
+    }
+}
+
+fn display_plan(plan: &str) -> String {
+    let mut chars = plan.chars();
+    let Some(first) = chars.next() else {
+        return String::new();
+    };
+    first.to_uppercase().chain(chars).collect()
+}
+
 /// Download status line + bar percent: "label… 45 MB / 120 MB (37%)", or
 /// just the received count with -1 (no bar) when the total is unknown.
 fn download_progress(label: &str, received: u64, total: u64, rate: Option<f64>) -> (String, i32) {
@@ -6701,11 +6846,14 @@ fn should_open_chat_at_tail(force_tail: bool, turn_running: bool, has_queue: boo
 mod tests {
     use super::{
         approval_pill, attention_badge, check_pill, classify_pr, download_progress, human_age,
-        human_rate, merge_pill, pr_badge, project_session_prs, reconcile_pr_group_order,
-        reconcile_workspace_order, reorder_id, should_open_chat_at_tail, thinking_property,
+        human_rate, merge_pill, model_health_view, pr_badge, project_session_prs,
+        reconcile_pr_group_order, reconcile_workspace_order, reorder_id,
+        should_open_chat_at_tail, thinking_property,
     };
     use chrono::{Duration, TimeZone, Utc};
-    use trouve_protocol::{CheckRun, PrInfo, PrReview, Session, Workspace};
+    use trouve_protocol::{
+        CheckRun, PrInfo, PrReview, Session, SubscriptionHealth, SubscriptionWindow, Workspace,
+    };
 
     fn workspaces(ids: &[&str]) -> Vec<Workspace> {
         ids.iter()
@@ -7094,5 +7242,59 @@ mod tests {
         assert!(should_open_chat_at_tail(false, false, true));
         assert!(should_open_chat_at_tail(true, false, false));
         assert!(!should_open_chat_at_tail(false, false, false));
+    }
+
+    #[test]
+    fn model_health_uses_the_window_closest_to_its_cap() {
+        let health = SubscriptionHealth {
+            provider_id: "codex".into(),
+            status: "ok".into(),
+            plan: "pro".into(),
+            windows: vec![
+                SubscriptionWindow {
+                    label: "5-hour window".into(),
+                    used_percent: 42,
+                    resets: "resets in 1h".into(),
+                },
+                SubscriptionWindow {
+                    label: "Weekly".into(),
+                    used_percent: 76,
+                    resets: "resets Monday".into(),
+                },
+            ],
+            credits: String::new(),
+            note: String::new(),
+        };
+
+        let view = model_health_view(&health);
+        assert_eq!(view.summary, "Pro · 76% used");
+        assert_eq!(view.tone, 2);
+        assert!(view.detail.contains("5-hour window: 42% used"));
+        assert!(view.detail.contains("Weekly: 76% used"));
+    }
+
+    #[test]
+    fn model_health_distinguishes_api_billing_from_login_failure() {
+        let api = SubscriptionHealth {
+            provider_id: "cursor".into(),
+            status: "unsupported".into(),
+            plan: String::new(),
+            windows: Vec::new(),
+            credits: String::new(),
+            note: "usage-billed via API key".into(),
+        };
+        assert_eq!(model_health_view(&api).summary, "API billed");
+        assert_eq!(model_health_view(&api).tone, 0);
+
+        let login = SubscriptionHealth {
+            provider_id: "claude-code".into(),
+            status: "unavailable".into(),
+            plan: String::new(),
+            windows: Vec::new(),
+            credits: String::new(),
+            note: "subscription usage needs a claude.ai login".into(),
+        };
+        assert_eq!(model_health_view(&login).summary, "login required");
+        assert_eq!(model_health_view(&login).tone, 3);
     }
 }

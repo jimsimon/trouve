@@ -6,8 +6,8 @@ use slint::{Model, ModelRc, SharedString, VecModel};
 
 use crate::render::ChatRowData;
 use crate::{
-    AppWindow, ChatRow, ChatTableCell, CliItem, DiffRow, FileItem, KnownProviderItem, NavRow,
-    ProviderItem, QOption, QPair, TextSegment, ThreadTabItem, TodoUiItem,
+    AppWindow, ChatRow, ChatTableCell, CliItem, DiffRow, FileItem, KnownProviderItem,
+    ModelHealthItem, NavRow, ProviderItem, QOption, QPair, TextSegment, ThreadTabItem, TodoUiItem,
 };
 
 type Ui = slint::Weak<AppWindow>;
@@ -74,6 +74,30 @@ pub fn set_pickers(ui: &Ui, modes: Vec<String>, models: Vec<String>) {
             (0..models.len() as i32).collect::<Vec<i32>>(),
         )));
         ui.set_models(string_model(models));
+    });
+}
+
+/// Subscription state aligned with the model catalog. Multiple models from
+/// one provider intentionally receive the same entry so filtered picker rows
+/// can each explain the provider they would use.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ModelHealthView {
+    pub summary: String,
+    pub detail: String,
+    pub tone: i32,
+}
+
+pub fn set_model_health(ui: &Ui, health: Vec<ModelHealthView>) {
+    let _ = ui.upgrade_in_event_loop(move |ui| {
+        let items = health
+            .into_iter()
+            .map(|h| ModelHealthItem {
+                summary: h.summary.into(),
+                detail: h.detail.into(),
+                tone: h.tone,
+            })
+            .collect::<Vec<_>>();
+        ui.set_model_health(ModelRc::new(VecModel::from(items)));
     });
 }
 
