@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1784420899810,
+  "lastUpdate": 1784420956749,
   "repoUrl": "https://github.com/jimsimon/trouve",
   "entries": {
     "e2e-benchmarks": [
@@ -3601,6 +3601,54 @@ window.BENCHMARK_DATA = {
             "name": "dense_query_20k_rows",
             "value": 1491201.100931677,
             "range": "± 7726",
+            "unit": "ns"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "jim.j.simon@gmail.com",
+            "name": "Jim Simon",
+            "username": "jimsimon"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "1137b36f152d421ef195b9fc30b30ed432055e4e",
+          "message": "Enable network access for Codex turns (#67)\n\n* Enable network access for Codex turns\n\n* fix: apply CodeRabbit auto-fixes\n\nFixed 1 file(s) based on 1 unresolved review comment.\n\nCo-authored-by: CodeRabbit <noreply@coderabbit.ai>\n\n---------\n\nCo-authored-by: coderabbitai[bot] <136622811+coderabbitai[bot]@users.noreply.github.com>\nCo-authored-by: CodeRabbit <noreply@coderabbit.ai>",
+          "timestamp": "2026-07-18T20:27:05-04:00",
+          "tree_id": "c7c0d868d1bce42416bf4fe387a9e2f60ac74db7",
+          "url": "https://github.com/jimsimon/trouve/commit/1137b36f152d421ef195b9fc30b30ed432055e4e"
+        },
+        "date": 1784420955777,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "bm25_build_5k_docs",
+            "value": 5099036.833333334,
+            "range": "± 9600",
+            "unit": "ns"
+          },
+          {
+            "name": "bm25_query_5k_docs",
+            "value": 36845.82039411206,
+            "range": "± 13",
+            "unit": "ns"
+          },
+          {
+            "name": "chunk_python_200_functions",
+            "value": 3031748.470588235,
+            "range": "± 1559",
+            "unit": "ns"
+          },
+          {
+            "name": "dense_query_20k_rows",
+            "value": 1355729.6705882354,
+            "range": "± 5119",
             "unit": "ns"
           }
         ]
