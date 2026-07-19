@@ -35,6 +35,11 @@ pub struct Config {
     /// Default model for new threads, e.g. "openai/gpt-4.1-mini".
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default_model: Option<String>,
+    /// Global thinking level for new threads. The selected model's options
+    /// schema decides whether the token is supported and which wire key it
+    /// maps to.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_thinking_level: Option<String>,
     /// Global default permission mode for new threads, used by modes that
     /// don't set one of their own. Unset means Ask.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -207,10 +212,15 @@ mod tests {
         );
 
         // A well-formed config loads and persists normally.
-        std::fs::write(&path, "default_model = \"openai/gpt\"\n").unwrap();
+        std::fs::write(
+            &path,
+            "default_model = \"openai/gpt\"\ndefault_thinking_level = \"high\"\n",
+        )
+        .unwrap();
         let cfg = Config::load_from(&path);
         assert!(!cfg.load_failed);
         assert_eq!(cfg.default_model.as_deref(), Some("openai/gpt"));
+        assert_eq!(cfg.default_thinking_level.as_deref(), Some("high"));
         cfg.save_to(&path).unwrap();
     }
 }

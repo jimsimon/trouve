@@ -1185,7 +1185,7 @@ async fn set_default_model(
     State(engine): State<Arc<Engine>>,
     Json(req): Json<SetDefaultModelRequest>,
 ) -> Result<StatusCode, ApiError> {
-    engine.set_default_model(&req.model)?;
+    engine.set_default_model(&req.model, req.default_thinking_level.as_deref())?;
     Ok(StatusCode::NO_CONTENT)
 }
 
