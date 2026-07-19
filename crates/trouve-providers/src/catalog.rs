@@ -243,6 +243,13 @@ fn is_loopback_url(url: &str) -> bool {
     let Ok(url) = reqwest::Url::parse(url) else {
         return false;
     };
+    if !url.username().is_empty()
+        || url.password().is_some()
+        || url.query().is_some()
+        || url.fragment().is_some()
+    {
+        return false;
+    }
     url.host_str().is_some_and(|host| {
         host.eq_ignore_ascii_case("localhost")
             || host
@@ -461,5 +468,16 @@ mod tests {
             provider_category("custom", "api-key", Some("https://localhost.example/v1")),
             "api"
         );
+        for url in [
+            "http://user:password@localhost:11434/v1",
+            "http://localhost:11434/v1?model=local",
+            "http://localhost:11434/v1#models",
+        ] {
+            assert_eq!(
+                provider_category("custom", "api-key", Some(url)),
+                "api",
+                "non-canonical loopback URL should not be local: {url}"
+            );
+        }
     }
 }

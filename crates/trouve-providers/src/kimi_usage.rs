@@ -27,6 +27,10 @@ pub fn is_kimi_code_base_url(base_url: Option<&str>) -> bool {
         && candidate.host_str() == canonical.host_str()
         && candidate.port_or_known_default() == canonical.port_or_known_default()
         && candidate.path().trim_end_matches('/') == canonical.path()
+        && candidate.username().is_empty()
+        && candidate.password().is_none()
+        && candidate.query().is_none()
+        && candidate.fragment().is_none()
 }
 
 pub async fn subscription_health(
@@ -42,8 +46,11 @@ pub async fn subscription_health(
         credits: String::new(),
         note,
     };
+    if !is_kimi_code_base_url(Some(base_url)) {
+        return unavailable("Kimi Code usage requires the canonical coding API endpoint".into());
+    }
     let request = reqwest::Client::new()
-        .get(format!("{}/usages", base_url.trim_end_matches('/')))
+        .get(format!("{KIMI_CODE_BASE_URL}/usages"))
         .bearer_auth(api_key)
         .header("Accept", "application/json")
         .timeout(Duration::from_secs(8));
@@ -254,6 +261,31 @@ mod tests {
         assert!(!is_kimi_code_base_url(Some(
             "https://api.kimi.com/coding/v2"
         )));
+        for url in [
+            "https://user:password@api.kimi.com/coding/v1",
+            "https://api.kimi.com/coding/v1?tenant=other",
+            "https://api.kimi.com/coding/v1#usages",
+        ] {
+            assert!(
+                !is_kimi_code_base_url(Some(url)),
+                "non-canonical URL should be rejected: {url}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn usage_request_rejects_non_canonical_endpoint() {
+        let health = subscription_health(
+            "kimi-code",
+            "http://127.0.0.1:1/coding/v1",
+            "must-not-be-sent",
+        )
+        .await;
+        assert_eq!(health.status, "unavailable");
+        assert_eq!(
+            health.note,
+            "Kimi Code usage requires the canonical coding API endpoint"
+        );
     }
 
     #[test]
