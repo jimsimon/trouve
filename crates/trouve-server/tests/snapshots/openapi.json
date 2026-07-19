@@ -4605,6 +4605,10 @@
               "null"
             ]
           },
+          "category": {
+            "type": "string",
+            "description": "Presentation/billing category: \"subscription\", \"api\", or \"local\"."
+          },
           "display_name": {
             "type": "string"
           },
@@ -5193,6 +5197,10 @@
               "null"
             ]
           },
+          "category": {
+            "type": "string",
+            "description": "Presentation/billing category: \"subscription\", \"api\", or \"local\".\nThis is independent of `auth`: a subscription such as Kimi Code can\nstill authenticate with an API key."
+          },
           "experimental": {
             "type": "boolean",
             "description": "Uses an undocumented vendor endpoint that may break or be restricted\nat any time; clients should display a warning."
@@ -5619,7 +5627,7 @@
       },
       "SubscriptionHealth": {
         "type": "object",
-        "description": "Subscription usage for one configured agent-backend provider.",
+        "description": "Subscription usage for one configured provider.",
         "required": [
           "provider_id",
           "status",

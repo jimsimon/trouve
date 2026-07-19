@@ -27,6 +27,13 @@ pub fn known_providers() -> Vec<KnownProvider> {
         api_key_env: Option<&str>,
         auth: &str,
     ) -> KnownProvider {
+        let category = if id == "kimi-code" || auth == "cli" || auth == "oauth" {
+            "subscription"
+        } else if base_url.is_some_and(is_loopback_url) {
+            "local"
+        } else {
+            "api"
+        };
         KnownProvider {
             id: id.into(),
             display_name: display_name.into(),
@@ -34,6 +41,7 @@ pub fn known_providers() -> Vec<KnownProvider> {
             base_url: base_url.map(Into::into),
             api_key_env: api_key_env.map(Into::into),
             auth: auth.into(),
+            category: category.into(),
             experimental: false,
         }
     }
@@ -136,10 +144,18 @@ pub fn known_providers() -> Vec<KnownProvider> {
         ),
         p(
             "moonshot",
-            "Moonshot (Kimi)",
+            "Moonshot Platform (Kimi API)",
             "openai-compat",
             Some("https://api.moonshot.ai/v1"),
             Some("MOONSHOT_API_KEY"),
+            "api-key",
+        ),
+        p(
+            "kimi-code",
+            "Kimi Code (Subscription)",
+            "openai-compat",
+            Some(crate::kimi_usage::KIMI_CODE_BASE_URL),
+            Some("KIMI_CODE_API_KEY"),
             "api-key",
         ),
         p(
@@ -196,9 +212,43 @@ pub fn known_providers() -> Vec<KnownProvider> {
             base_url: None,
             api_key_env: None,
             auth: "cli".into(),
+            category: "subscription".into(),
             experimental: true,
         },
     ]
+}
+
+/// Classify a configured provider for settings presentation. Known preset
+/// identity wins so API-key subscriptions and API-key CLI variants remain
+/// distinct; custom loopback endpoints are local, and other custom providers
+/// default to usage-billed API access.
+pub fn provider_category(id: &str, auth: &str, base_url: Option<&str>) -> String {
+    if let Some(category) = known_providers()
+        .into_iter()
+        .find(|provider| provider.id == id)
+        .map(|provider| provider.category)
+    {
+        return category;
+    }
+    if auth == "cli" || auth == "oauth" {
+        "subscription".into()
+    } else if base_url.is_some_and(is_loopback_url) {
+        "local".into()
+    } else {
+        "api".into()
+    }
+}
+
+fn is_loopback_url(url: &str) -> bool {
+    let Ok(url) = reqwest::Url::parse(url) else {
+        return false;
+    };
+    url.host_str().is_some_and(|host| {
+        host.eq_ignore_ascii_case("localhost")
+            || host
+                .parse::<std::net::IpAddr>()
+                .is_ok_and(|address| address.is_loopback())
+    })
 }
 
 /// Static catalog for the experimental direct-Codex provider.
@@ -386,5 +436,30 @@ mod tests {
         let m = &openai_models("openai")[0]; // gpt-4.1: $2 in, $8 out
         let cost = cost_usd(m, 1_000_000, 500_000).unwrap();
         assert!((cost - 6.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn provider_categories_are_independent_from_auth_and_wire_kind() {
+        assert_eq!(
+            provider_category("claude-code", "cli", None),
+            "subscription"
+        );
+        assert_eq!(provider_category("cursor-api", "api-key", None), "api");
+        assert_eq!(
+            provider_category("ollama", "none", Some("http://localhost:11434/v1")),
+            "local"
+        );
+        assert_eq!(
+            provider_category("custom", "api-key", Some("http://127.0.0.1:8000/v1")),
+            "local"
+        );
+        assert_eq!(
+            provider_category("custom", "api-key", Some("https://models.example.com/v1")),
+            "api"
+        );
+        assert_eq!(
+            provider_category("custom", "api-key", Some("https://localhost.example/v1")),
+            "api"
+        );
     }
 }

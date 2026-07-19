@@ -447,7 +447,7 @@ pub struct SubscriptionWindow {
     pub resets: String,
 }
 
-/// Subscription usage for one configured agent-backend provider.
+/// Subscription usage for one configured provider.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct SubscriptionHealth {
     pub provider_id: String,
@@ -597,6 +597,11 @@ pub struct ProviderInfo {
     /// "api-key", "oauth", "cli" (vendor CLI holds the subscription auth),
     /// or "none" — drives which credential UI to show.
     pub auth: String,
+    /// Presentation/billing category: "subscription", "api", or "local".
+    /// This is independent of `auth`: a subscription such as Kimi Code can
+    /// still authenticate with an API key.
+    #[serde(default = "default_provider_category")]
+    pub category: String,
     /// Uses an undocumented vendor endpoint that may break or be restricted
     /// at any time; clients should display a warning.
     #[serde(default)]
@@ -667,10 +672,17 @@ pub struct KnownProvider {
     /// login), "cli" (the vendor's own CLI holds subscription auth), or
     /// "none" (keyless local endpoints).
     pub auth: String,
+    /// Presentation/billing category: "subscription", "api", or "local".
+    #[serde(default = "default_provider_category")]
+    pub category: String,
     /// Uses an undocumented vendor endpoint that may break or be restricted
     /// at any time; clients should display a warning.
     #[serde(default)]
     pub experimental: bool,
+}
+
+fn default_provider_category() -> String {
+    "api".into()
 }
 
 /// Response to starting an OAuth login for a provider.

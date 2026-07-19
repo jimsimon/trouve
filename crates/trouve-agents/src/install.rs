@@ -31,8 +31,8 @@ pub enum CliId {
     Codex,
     /// llama.cpp's `llama-server` — the local-inference runtime behind the
     /// built-in "local" provider, not an agent CLI. Kept out of `ALL_CLIS`
-    /// so the CLI settings list doesn't show it; the Local Models settings
-    /// section drives its install through the same `/v1/clis` machinery.
+    /// so the CLI settings list doesn't show it; the Providers → Local tab
+    /// drives its install through the same `/v1/clis` machinery.
     LlamaServer,
 }
 

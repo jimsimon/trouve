@@ -951,13 +951,13 @@ impl Provider for LocalProvider {
         let gguf = gguf_path(&self.data_dir, &entry);
         if !gguf.exists() {
             return Err(ProviderError::Request(format!(
-                "model {model} is not downloaded — download it in Settings → Local Models"
+                "model {model} is not downloaded — download it in Settings → Providers → Local"
             )));
         }
         let bin = self.runtime_bin().ok_or_else(|| {
             ProviderError::Request(
                 "the llama.cpp runtime is not installed — install it in \
-                 Settings → Local Models"
+                 Settings → Providers → Local"
                     .into(),
             )
         })?;

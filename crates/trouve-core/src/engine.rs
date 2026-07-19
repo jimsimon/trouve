@@ -729,6 +729,11 @@ impl Engine {
                     kind: pc.kind.clone(),
                     base_url: pc.base_url.clone(),
                     has_credentials,
+                    category: trouve_providers::catalog::provider_category(
+                        id,
+                        &auth,
+                        pc.base_url.as_deref(),
+                    ),
                     auth,
                     experimental: pc.kind == "codex-responses",
                 }
@@ -737,6 +742,7 @@ impl Engine {
         // Zero-config providers (env keys) that aren't in the config file.
         for id in registry.keys() {
             if !config.providers.contains_key(id) {
+                let local = id == "local";
                 infos.push(ProviderInfo {
                     id: id.clone(),
                     kind: if id == "anthropic" {
@@ -746,7 +752,8 @@ impl Engine {
                     },
                     base_url: None,
                     has_credentials: true,
-                    auth: "api-key".into(),
+                    auth: if local { "none" } else { "api-key" }.into(),
+                    category: if local { "local" } else { "api" }.into(),
                     experimental: false,
                 });
             }
@@ -869,6 +876,11 @@ impl Engine {
             kind: req.kind.clone(),
             base_url: req.base_url.clone().filter(|u| !u.is_empty()),
             has_credentials,
+            category: trouve_providers::catalog::provider_category(
+                id,
+                &auth,
+                req.base_url.as_deref(),
+            ),
             auth,
             experimental: req.kind == "codex-responses",
         })
@@ -2555,10 +2567,12 @@ impl Engine {
         }
     }
 
-    /// Subscription usage for every configured agent-backend provider.
+    /// Subscription usage for every configured subscription provider.
     /// Codex answers via its app-server, Claude Code via its CLI's
     /// stream-json usage query, and Cursor via the dashboard's undocumented
-    /// usage RPC (read with the CLI's stored login).
+    /// usage RPC (read with the CLI's stored login). Kimi Code uses the key
+    /// stored for its provider preset against the same `/usages` endpoint as
+    /// Kimi's open-source CLI.
     pub async fn subscription_health(&self) -> Vec<trouve_protocol::SubscriptionHealth> {
         let backends: Vec<(String, Arc<dyn AgentBackend>)> = {
             let map = self.backends.read().unwrap();
@@ -2581,6 +2595,42 @@ impl Engine {
                 }),
             }
         }
+        let kimi_configs: Vec<(String, ProviderConfig)> = {
+            let config = self.config.lock().unwrap();
+            config
+                .providers
+                .iter()
+                .filter(|(id, provider)| {
+                    id.as_str() == "kimi-code"
+                        && trouve_providers::kimi_usage::is_kimi_code_base_url(
+                            provider.base_url.as_deref(),
+                        )
+                })
+                .map(|(id, provider)| (id.clone(), provider.clone()))
+                .collect()
+        };
+        for (id, provider) in kimi_configs {
+            let Some(api_key) = resolved_api_key(&id, &provider, &self.secrets) else {
+                out.push(trouve_protocol::SubscriptionHealth {
+                    provider_id: id,
+                    status: "unavailable".into(),
+                    plan: String::new(),
+                    windows: Vec::new(),
+                    credits: String::new(),
+                    note: "Kimi Code usage needs the subscription API key saved in Providers."
+                        .into(),
+                });
+                continue;
+            };
+            let base_url = provider
+                .base_url
+                .as_deref()
+                .unwrap_or(trouve_providers::kimi_usage::KIMI_CODE_BASE_URL);
+            out.push(
+                trouve_providers::kimi_usage::subscription_health(&id, base_url, &api_key).await,
+            );
+        }
+        out.sort_by(|a, b| a.provider_id.cmp(&b.provider_id));
         out
     }
 
@@ -6600,7 +6650,7 @@ fn build_provider(
     secrets: &Arc<dyn trouve_providers::secrets::SecretStore>,
 ) -> Result<Arc<dyn Provider>> {
     use trouve_providers::auth::{StaticToken, StoredOAuthToken, TokenSource};
-    use trouve_providers::secrets::{api_key_secret, oauth_secret};
+    use trouve_providers::secrets::oauth_secret;
 
     // EXPERIMENTAL direct-Codex client: credentials come from the Codex
     // CLI's auth file, not from our credential resolution below.
@@ -6610,11 +6660,7 @@ fn build_provider(
         ));
     }
 
-    let api_key = pc
-        .api_key
-        .clone()
-        .or_else(|| pc.api_key_env.as_ref().and_then(|v| std::env::var(v).ok()))
-        .or_else(|| secrets.get(&api_key_secret(id)).ok().flatten());
+    let api_key = resolved_api_key(id, pc, secrets);
     // Local endpoints (e.g. Ollama) don't need a key; send an empty token.
     let local = pc.base_url.as_deref().is_some_and(is_loopback_base_url);
     let mut oauth_bearer = false;
@@ -6657,6 +6703,28 @@ fn build_provider(
         }
         other => anyhow::bail!("unknown provider kind {other:?}"),
     }
+}
+
+fn resolved_api_key(
+    id: &str,
+    provider: &ProviderConfig,
+    secrets: &Arc<dyn trouve_providers::secrets::SecretStore>,
+) -> Option<String> {
+    provider
+        .api_key
+        .clone()
+        .or_else(|| {
+            provider
+                .api_key_env
+                .as_ref()
+                .and_then(|variable| std::env::var(variable).ok())
+        })
+        .or_else(|| {
+            secrets
+                .get(&trouve_providers::secrets::api_key_secret(id))
+                .ok()
+                .flatten()
+        })
 }
 
 #[cfg(test)]
