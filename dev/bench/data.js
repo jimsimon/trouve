@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1784448527630,
+  "lastUpdate": 1784449222607,
   "repoUrl": "https://github.com/jimsimon/trouve",
   "entries": {
     "e2e-benchmarks": [
@@ -2159,6 +2159,54 @@ window.BENCHMARK_DATA = {
             "name": "non-git warm query",
             "value": 80.3482639,
             "range": "± 24.2",
+            "unit": "ms"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "jim.j.simon@gmail.com",
+            "name": "Jim Simon",
+            "username": "jimsimon"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "7c4abc8bfa0c0ca9371e93736b9a426bf5c280e9",
+          "message": "Reduce dev build debuginfo to shrink target dirs (#94)\n\nDev builds used cargo defaults: full DWARF for every crate, which made\neach session worktree's target/ run 20-30 GB. Line tables keep\nbacktraces and panic locations useful for workspace crates; dependency\ndebuginfo is dropped entirely.\n\nCo-authored-by: Claude Fable 5 <noreply@anthropic.com>",
+          "timestamp": "2026-07-19T04:17:54-04:00",
+          "tree_id": "aa9fd595dd31457a03af1acecb90139ccd68dbe5",
+          "url": "https://github.com/jimsimon/trouve/commit/7c4abc8bfa0c0ca9371e93736b9a426bf5c280e9"
+        },
+        "date": 1784449222265,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "cold index + query",
+            "value": 125.24615654000002,
+            "range": "± 281.7",
+            "unit": "ms"
+          },
+          {
+            "name": "warm query",
+            "value": 68.52833302,
+            "range": "± 1",
+            "unit": "ms"
+          },
+          {
+            "name": "incremental (1 file modified)",
+            "value": 82.24865212,
+            "range": "± 2.5",
+            "unit": "ms"
+          },
+          {
+            "name": "non-git warm query",
+            "value": 67.46985633999999,
+            "range": "± 1.3",
             "unit": "ms"
           }
         ]
