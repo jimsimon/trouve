@@ -1221,8 +1221,23 @@ fn main() -> anyhow::Result<()> {
         });
     }
 
+    {
+        // Slint emits only explicit user scrolls, after its virtualized list
+        // has resolved the first visible rendered row. Programmatic layout
+        // settling and restore convergence never overwrite the bookmark.
+        let tx = tx.clone();
+        window.on_chat_position_changed(move |thread_id, row, offset, at_bottom| {
+            let _ = tx.send(UiCommand::ChatPositionChanged {
+                thread_id: thread_id.to_string(),
+                row: row.max(0) as usize,
+                offset,
+                at_bottom,
+            });
+        });
+    }
+
     // Controller (and spawned server) live on a background tokio runtime.
-    let scroll_tx = tx.clone();
+    let geometry_tx = tx.clone();
     let weak = window.as_weak();
     let focused = window_focused.clone();
     std::thread::spawn(move || {
@@ -1255,14 +1270,11 @@ fn main() -> anyhow::Result<()> {
 
     // Slint has no move/resize callbacks, so poll for geometry changes and
     // persist them as they happen. While maximized, keep the last floating
-    // rect so unmaximizing on a later launch lands where it used to. The
-    // same poll samples the chat scroll offset for the controller's
-    // per-thread resume bookmark (scrolling has no callback either).
+    // rect so unmaximizing on a later launch lands where it used to.
     let geometry_timer = slint::Timer::default();
     {
         let weak = window.as_weak();
         let last = std::cell::RefCell::new(restored);
-        let last_scroll = std::cell::RefCell::new((slint::SharedString::new(), f32::NAN));
         let last_focus = std::cell::Cell::new(false);
         let focused = window_focused.clone();
         geometry_timer.start(
@@ -1276,7 +1288,7 @@ fn main() -> anyhow::Result<()> {
                     if let Some(f) = w.with_winit_window(|w| w.has_focus()) {
                         focused.store(f, std::sync::atomic::Ordering::Relaxed);
                         if last_focus.replace(f) != f {
-                            let _ = scroll_tx.send(UiCommand::WindowFocusChanged(f));
+                            let _ = geometry_tx.send(UiCommand::WindowFocusChanged(f));
                         }
                     }
                 }
@@ -1295,22 +1307,6 @@ fn main() -> anyhow::Result<()> {
                     if *last != Some(next) {
                         winstate::save(&next);
                         *last = Some(next);
-                    }
-                }
-                // Key and offset are read in the same event-loop turn, so
-                // the pair is consistent: the offset belongs to the thread
-                // named by the key even if the controller has already moved
-                // on to another one.
-                let scroll = window.get_chat_scroll();
-                let key = window.get_chat_thread_key();
-                let mut last_scroll = last_scroll.borrow_mut();
-                if *last_scroll != (key.clone(), scroll) {
-                    *last_scroll = (key.clone(), scroll);
-                    if !key.is_empty() {
-                        let _ = scroll_tx.send(UiCommand::ChatScrolled {
-                            thread_id: key.to_string(),
-                            y: scroll,
-                        });
                     }
                 }
             },

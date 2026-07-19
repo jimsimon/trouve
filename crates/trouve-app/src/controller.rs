@@ -109,12 +109,14 @@ pub enum UiCommand {
 
     // Chat screen.
     SelectThread(usize),
-    /// Chat viewport-y sampled by the shell's poll, bookmarked per thread.
-    /// Carries the thread the viewport was showing at sample time — the
-    /// current thread may have changed by the time this is processed.
-    ChatScrolled {
+    /// A user-driven chat scroll, captured as the first visible rendered
+    /// row plus the offset within it. Carries the thread the viewport was
+    /// showing at capture time so a concurrent switch cannot bleed state.
+    ChatPositionChanged {
         thread_id: String,
-        y: f32,
+        row: usize,
+        offset: f32,
+        at_bottom: bool,
     },
     SendMessage(String),
     /// The "@" mention popup opened (or is filtering): refresh the worktree
@@ -635,6 +637,10 @@ struct Controller {
     /// Where-you-left-off bookmark (last session, per-session last thread,
     /// per-thread scroll), persisted to resume.json as it changes.
     resume: crate::winstate::Resume,
+    /// The thread whose mid-history row anchor is currently converging.
+    /// Kept controller-side so replay can override it when it reveals a
+    /// running turn or queued prompts after the thread was opened.
+    restoring_thread: Option<String>,
 
     modes: Vec<AgentMode>,
     /// Provenance per mode, aligned with `modes` (builtin / customized /
@@ -798,6 +804,7 @@ pub async fn run(
         row_call_ids: Vec::new(),
         wizards: HashMap::new(),
         resume: crate::winstate::load_resume(),
+        restoring_thread: None,
         modes: Vec::new(),
         mode_origins: Vec::new(),
         models: Vec::new(),
@@ -1616,8 +1623,45 @@ impl Controller {
         })
     }
 
+    fn open_thread_index(&mut self, index: usize, force_tail: bool) {
+        if index >= self.threads.len() {
+            return;
+        }
+        if let Some(session_id) = self.current_session_id()
+            && self.unread_sessions.remove(&session_id)
+        {
+            self.push_nav();
+        }
+        if self.current_thread == Some(index) && self.new_chat.is_none() {
+            if force_tail {
+                self.apply_scroll_intent(true);
+            }
+            return;
+        }
+        // Clicking a real tab while the provisional "New Thread" tab is up
+        // dismisses the form (its tab disappears).
+        if self.new_chat.is_some() {
+            self.close_new_chat();
+        }
+        self.current_thread = Some(index);
+        self.push_threads();
+        self.push_picker_indices();
+        self.follow_current();
+        self.render_chat(false);
+        self.push_context();
+        self.push_queue();
+        self.remember_position();
+        self.apply_scroll_intent(force_tail);
+    }
+
     async fn select_session(&mut self, index: usize) -> Result<()> {
         if index >= self.sessions.len() {
+            return Ok(());
+        }
+        if self.current_session_id().as_deref() == Some(self.sessions[index].id.as_str()) {
+            if self.unread_sessions.remove(&self.sessions[index].id) {
+                self.push_nav();
+            }
             return Ok(());
         }
         self.current_session = Some(index);
@@ -1650,11 +1694,11 @@ impl Controller {
         self.push_threads();
         self.push_picker_indices();
         self.follow_current();
-        self.render_chat(true);
+        self.render_chat(false);
         self.push_context();
         self.push_queue();
         self.remember_position();
-        self.restore_scroll();
+        self.apply_scroll_intent(false);
         self.refresh_usage_text().await;
         let _ = self.load_files().await;
         let _ = self.refresh_diff().await;
@@ -1684,17 +1728,46 @@ impl Controller {
         crate::winstate::save_resume(&self.resume);
     }
 
-    /// Land the just-opened thread at its saved scroll offset. The render is
-    /// queued ahead of this, so it applies after; best effort, as
-    /// virtualized row heights settle while they come on screen.
-    fn restore_scroll(&self) {
+    /// Apply the navigation policy for the open thread. Attention at the
+    /// tail wins over a parked history bookmark: explicit notification
+    /// navigation, a running turn, or visible queued prompts all open at
+    /// the bottom. Idle threads restore a rendered-row anchor when present.
+    fn apply_scroll_intent(&mut self, force_tail: bool) {
         let Some(thread_id) = self.current_thread_id() else {
+            self.restoring_thread = None;
             return;
         };
-        if let Some(&y) = self.resume.thread_scroll.get(&thread_id)
-            && y < 0.0
+        let vm = self.vms.get(&thread_id);
+        let attention_at_tail = should_open_chat_at_tail(
+            force_tail,
+            vm.is_some_and(|vm| vm.turn_running),
+            vm.is_some_and(|vm| !vm.queue.is_empty()),
+        );
+        let bookmark = self.resume.thread_scroll.get(&thread_id).copied();
+        if attention_at_tail || bookmark.is_none() {
+            self.restoring_thread = None;
+            // The tail is now the last position the user saw; do not revive
+            // an older parked-history anchor after the turn later goes idle.
+            if self.resume.thread_scroll.remove(&thread_id).is_some() {
+                crate::winstate::save_resume(&self.resume);
+            }
+            ui::scroll_chat_to_end(&self.ui);
+        } else if let Some(bookmark) = bookmark {
+            self.restoring_thread = Some(thread_id);
+            ui::restore_chat_position(&self.ui, bookmark.row, bookmark.offset);
+        }
+    }
+
+    /// A first-time follower starts with an empty view model and then folds
+    /// persisted history. If that replay reveals tail attention while a
+    /// row bookmark is still converging, switch to the tail exactly once.
+    fn follow_tail_for_open_attention(&mut self, thread_id: &str) {
+        if self.restoring_thread.as_deref() == Some(thread_id)
+            && self.vms.get(thread_id).is_some_and(|vm| {
+                should_open_chat_at_tail(false, vm.turn_running, !vm.queue.is_empty())
+            })
         {
-            ui::set_chat_scroll(&self.ui, y);
+            self.apply_scroll_intent(false);
         }
     }
 
@@ -3762,7 +3835,7 @@ impl Controller {
             UiCommand::NewThread => self.open_new_thread_screen(),
             UiCommand::CancelNewChat => {
                 self.close_new_chat();
-                self.render_chat(true);
+                self.render_chat(false);
             }
             UiCommand::NewChatWorkspaceChanged(i) => self.load_branches(i).await,
             UiCommand::RegisterWorkspacePath(path) => {
@@ -3799,37 +3872,32 @@ impl Controller {
                     .await?
             }
             UiCommand::SelectThread(i) => {
-                if i < self.threads.len() {
-                    // Clicking a real tab while the provisional "New Thread"
-                    // tab is up dismisses the form (its tab disappears).
-                    if self.new_chat.is_some() {
-                        self.close_new_chat();
-                    }
-                    self.current_thread = Some(i);
-                    if let Some(session_id) = self.current_session_id()
-                        && self.unread_sessions.remove(&session_id)
-                    {
-                        self.push_nav();
-                    }
-                    self.push_threads();
-                    self.push_picker_indices();
-                    self.follow_current();
-                    self.render_chat(true);
-                    self.push_context();
-                    self.push_queue();
-                    self.remember_position();
-                    self.restore_scroll();
-                }
+                self.open_thread_index(i, false);
                 // i == threads.len() is the provisional tab itself: no-op.
             }
-            UiCommand::ChatScrolled { thread_id, y } => {
-                // Booked to the thread that was on screen when the shell
-                // sampled the offset, not the current one: around a
-                // session/thread switch the two differ, and using the
-                // current thread would bleed one thread's scroll position
-                // into another's bookmark.
-                if self.resume.thread_scroll.get(&thread_id) != Some(&y) {
-                    self.resume.thread_scroll.insert(thread_id, y);
+            UiCommand::ChatPositionChanged {
+                thread_id,
+                row,
+                offset,
+                at_bottom,
+            } => {
+                if self.restoring_thread.as_deref() == Some(&thread_id) {
+                    self.restoring_thread = None;
+                }
+                let changed = if at_bottom {
+                    self.resume.thread_scroll.remove(&thread_id).is_some()
+                } else if offset.is_finite() && offset >= 0.0 {
+                    let bookmark = crate::winstate::ChatScrollBookmark { row, offset };
+                    if self.resume.thread_scroll.get(&thread_id) == Some(&bookmark) {
+                        false
+                    } else {
+                        self.resume.thread_scroll.insert(thread_id, bookmark);
+                        true
+                    }
+                } else {
+                    false
+                };
+                if changed {
                     crate::winstate::save_resume(&self.resume);
                 }
             }
@@ -3847,6 +3915,7 @@ impl Controller {
                         self.push_attachments();
                         return Err(e);
                     }
+                    self.apply_scroll_intent(true);
                 }
             }
             UiCommand::RefreshAtFiles => self.refresh_at_files(),
@@ -3945,10 +4014,11 @@ impl Controller {
                 }
             }
             UiCommand::QueueSendNow => {
-                if let Some(thread_id) = self.current_thread_id()
-                    && let Err(e) = self.client.dispatch_queue(&thread_id).await
-                {
-                    self.error(&format!("{e:#}"));
+                if let Some(thread_id) = self.current_thread_id() {
+                    match self.client.dispatch_queue(&thread_id).await {
+                        Ok(_) => self.apply_scroll_intent(true),
+                        Err(e) => self.error(&format!("{e:#}")),
+                    }
                 }
             }
             UiCommand::Approval { row, approved } => {
@@ -5349,9 +5419,10 @@ impl Controller {
                     self.push_context();
                     self.push_queue();
                     if changed {
-                        self.render_chat(true);
+                        self.render_chat(false);
                         self.last_delta_render = None;
                     }
+                    self.follow_tail_for_open_attention(&thread_id);
                     if completed {
                         let _ = self.refresh_diff().await;
                         self.refresh_usage_text().await;
@@ -5414,10 +5485,11 @@ impl Controller {
                                 .last_delta_render
                                 .is_some_and(|t| now.duration_since(t).as_millis() < 50);
                         if !throttled {
-                            self.render_chat(true);
+                            self.render_chat(false);
                             self.last_delta_render = if is_delta { Some(now) } else { None };
                         }
                     }
+                    self.follow_tail_for_open_attention(&thread_id);
                     if matches!(envelope.event, trouve_protocol::Event::TurnCompleted { .. }) {
                         let _ = self.refresh_diff().await;
                         self.refresh_usage_text().await;
@@ -5465,10 +5537,11 @@ impl Controller {
                 {
                     self.select_session(i).await?;
                 }
-                if let Some(i) = self.threads.iter().position(|t| t.id == thread_id)
-                    && self.current_thread != Some(i)
-                {
-                    let _ = self.tx.send(UiCommand::SelectThread(i));
+                if let Some(i) = self.threads.iter().position(|t| t.id == thread_id) {
+                    // Notifications point at newest actionable state
+                    // (approval/question/completion), so they always reveal
+                    // the tail even when this is already the open thread.
+                    self.open_thread_index(i, true);
                 }
             }
             UiCommand::SessionThreadsLoaded(session_id, result) => match result {
@@ -5547,10 +5620,11 @@ impl Controller {
         self.push_threads();
         self.push_picker_indices();
         self.follow_current();
-        self.render_chat(true);
+        self.render_chat(false);
         self.push_context();
         self.push_queue();
         self.remember_position();
+        self.apply_scroll_intent(true);
         Ok(())
     }
 }
@@ -6194,12 +6268,19 @@ fn human_age(from: chrono::DateTime<chrono::Utc>, now: chrono::DateTime<chrono::
     }
 }
 
+/// Navigation policy independent of whether an idle bookmark exists.
+/// Queued prompts count as tail attention even when the thread is not
+/// currently running (for example, after a restart or a failed turn).
+fn should_open_chat_at_tail(force_tail: bool, turn_running: bool, has_queue: bool) -> bool {
+    force_tail || turn_running || has_queue
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
         approval_pill, attention_badge, check_pill, classify_pr, download_progress, human_age,
         human_rate, pr_badge, reconcile_pr_group_order, reconcile_workspace_order, reorder_id,
-        session_title, thinking_property,
+        session_title, should_open_chat_at_tail, thinking_property,
     };
     use chrono::{Duration, TimeZone, Utc};
     use trouve_protocol::{CheckRun, PrInfo, PrReview, Workspace};
@@ -6483,5 +6564,13 @@ mod tests {
             }))
             .is_none()
         );
+    }
+
+    #[test]
+    fn chat_navigation_reveals_running_and_queued_tail_attention() {
+        assert!(should_open_chat_at_tail(false, true, false));
+        assert!(should_open_chat_at_tail(false, false, true));
+        assert!(should_open_chat_at_tail(true, false, false));
+        assert!(!should_open_chat_at_tail(false, false, false));
     }
 }

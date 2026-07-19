@@ -1590,6 +1590,11 @@ export component AppWindow inherits Window {
     // Open the file in the user's preferred (system default) editor.
     callback file-opened-externally(/* worktree-relative path */ string);
 
+    // Emitted for explicit user scrolling (and an invalid-anchor fallback).
+    // Ordinary programmatic layout settling never reaches persistence.
+    callback chat-position-changed(/* thread */ string, /* row */ int,
+        /* offset within row */ length, /* at tail */ bool);
+
     // While true, the chat stays pinned to its tail as content grows.
     // scroll-chat-to-end alone isn't enough: it runs before the ListView
     // re-measures freshly grown rows, so the bottom (activity spinner)
@@ -1607,10 +1612,149 @@ export component AppWindow inherits Window {
     property <length> chat-pin-y: 0px;
     property <length> chat-pin-h: 0px;
     public function scroll-chat-to-end() {
+        root.chat-restoring = false;
         root.chat-follow = true;
         chat-list.viewport-y = min(0px, chat-list.visible-height - chat-list.viewport-height);
         root.chat-pin-y = chat-list.viewport-y;
         root.chat-pin-h = chat-list.viewport-height;
+    }
+    // Intentional navigation (send/notification/running/queued) supersedes
+    // any debounced user bookmark still waiting to be persisted.
+    public function force-chat-to-end() {
+        root.chat-scroll-dirty = false;
+        root.chat-scroll-pending = false;
+        chat-scroll-save-timer.stop();
+        root.scroll-chat-to-end();
+    }
+
+    // Mid-history positions use a rendered-row anchor, not a raw pixel
+    // offset. ListView virtualizes and estimates row heights, so restoring
+    // is a convergence mode: whenever the top visible row is laid out, move
+    // toward the saved row and keep the saved within-row offset stable.
+    in-out property <bool> chat-restoring: false;
+    property <int> chat-restore-row: 0;
+    property <length> chat-restore-offset: 0px;
+    property <bool> chat-live-anchor-valid: false;
+    property <int> chat-live-anchor-row: 0;
+    property <length> chat-live-anchor-offset: 0px;
+    property <bool> chat-scroll-dirty: false;
+    property <string> chat-scroll-dirty-key;
+    property <bool> chat-scroll-pending: false;
+    property <string> chat-scroll-pending-key;
+    property <int> chat-scroll-pending-row: 0;
+    property <length> chat-scroll-pending-offset: 0px;
+    property <bool> chat-scroll-pending-at-bottom: false;
+
+    chat-scroll-save-timer := Timer {
+        interval: 150ms;
+        running: false;
+        triggered => {
+            self.stop();
+            if (root.chat-scroll-pending
+                    && root.chat-scroll-pending-key != "") {
+                root.chat-position-changed(root.chat-scroll-pending-key,
+                    root.chat-scroll-pending-row,
+                    root.chat-scroll-pending-offset,
+                    root.chat-scroll-pending-at-bottom);
+            }
+            root.chat-scroll-pending = false;
+        }
+    }
+
+    function converge-chat-anchor() {
+        if (!root.chat-restoring || !root.chat-live-anchor-valid
+                || root.chat-rows.length == 0) {
+            return;
+        }
+        if (root.chat-restore-row >= root.chat-rows.length) {
+            // The rendered transcript changed enough that the row no longer
+            // exists. Persist the tail fallback so later opens do not retry
+            // the same invalid anchor.
+            root.chat-position-changed(root.chat-thread-key, 0, 0px, true);
+            root.scroll-chat-to-end();
+            return;
+        }
+        chat-list.viewport-y = clamp(
+            chat-list.viewport-y
+                + root.chat-live-anchor-offset - root.chat-restore-offset
+                - (root.chat-restore-row - root.chat-live-anchor-row)
+                    * (chat-list.viewport-height / root.chat-rows.length),
+            min(0px, chat-list.visible-height - chat-list.viewport-height),
+            0px);
+    }
+
+    function observe-chat-row(index: int, row-y: length, row-height: length) {
+        if (row-height > 0px && row-y <= 0px && row-y + row-height > 0px) {
+            root.chat-live-anchor-valid = true;
+            root.chat-live-anchor-row = index;
+            root.chat-live-anchor-offset = -row-y;
+            if (root.chat-scroll-dirty) {
+                root.chat-scroll-dirty = false;
+                root.chat-scroll-pending = true;
+                root.chat-scroll-pending-key = root.chat-scroll-dirty-key;
+                root.chat-scroll-pending-row = index;
+                root.chat-scroll-pending-offset = -row-y;
+                root.chat-scroll-pending-at-bottom = root.chat-at-bottom;
+                chat-scroll-save-timer.stop();
+                chat-scroll-save-timer.start();
+            }
+            root.converge-chat-anchor();
+        }
+    }
+
+    function begin-user-chat-scroll() {
+        root.chat-follow = false;
+        root.chat-restoring = false;
+        if (!root.chat-scroll-dirty) {
+            root.chat-scroll-dirty-key = root.chat-thread-key;
+        }
+        root.chat-scroll-dirty = true;
+    }
+
+    // Called before swapping transcripts. If a switch races the final
+    // layout frame of a user scroll, flush the last known anchor under the
+    // old thread key instead of ever booking it to the new thread.
+    public function reset-chat-positioning() {
+        if (root.chat-scroll-dirty && root.chat-scroll-dirty-key != ""
+                && root.chat-live-anchor-valid) {
+            root.chat-position-changed(root.chat-scroll-dirty-key,
+                root.chat-live-anchor-row, root.chat-live-anchor-offset,
+                root.chat-at-bottom);
+        } else if (root.chat-scroll-pending
+                && root.chat-scroll-pending-key != "") {
+            root.chat-position-changed(root.chat-scroll-pending-key,
+                root.chat-scroll-pending-row,
+                root.chat-scroll-pending-offset,
+                root.chat-scroll-pending-at-bottom);
+        }
+        chat-scroll-save-timer.stop();
+        root.chat-scroll-dirty = false;
+        root.chat-scroll-pending = false;
+        root.chat-follow = false;
+        root.chat-restoring = false;
+        root.chat-live-anchor-valid = false;
+    }
+
+    public function restore-chat-position(row: int, offset: length) {
+        root.chat-follow = false;
+        root.chat-scroll-dirty = false;
+        root.chat-scroll-pending = false;
+        chat-scroll-save-timer.stop();
+        root.chat-restoring = true;
+        root.chat-restore-row = max(0, row);
+        root.chat-restore-offset = max(0px, offset);
+        root.chat-live-anchor-valid = false;
+        // The first measured visible row drives the accurate seek. This
+        // estimate gets it close enough for ListView to instantiate useful
+        // delegates immediately on long transcripts.
+        if (root.chat-rows.length > 0) {
+            chat-list.viewport-y = clamp(
+                -root.chat-restore-row
+                    * (chat-list.viewport-height / root.chat-rows.length)
+                    - root.chat-restore-offset,
+                min(0px, chat-list.visible-height - chat-list.viewport-height),
+                0px);
+        }
     }
     // True while the view rests at the tail. In-place re-renders read it to
     // keep the bottom anchored: the ListView re-derives viewport-y from
@@ -1619,9 +1763,8 @@ export component AppWindow inherits Window {
     out property <bool> chat-at-bottom: chat-list.viewport-y
         <= chat-list.visible-height - chat-list.viewport-height + 12px;
 
-    // Where-you-left-off bookkeeping: the shell polls the live scroll
-    // offset into the controller's per-thread resume bookmark, and the
-    // controller writes it back when a thread is reopened.
+    // Live pixel position is still exposed for diagnostics; persisted
+    // where-you-left-off state uses the row anchor above.
     in-out property <length> chat-scroll <=> chat-list.viewport-y;
     // The thread whose transcript the list is currently showing, written in
     // the same event as the rows. The shell samples it together with
@@ -2349,6 +2492,7 @@ export component AppWindow inherits Window {
                             }
                         }
                     }
+                    scrolled => { root.begin-user-chat-scroll(); }
                     // Keep the tail (activity spinner) on screen as rows
                     // grow during streaming; see chat-follow.
                     changed viewport-height => {
@@ -2357,10 +2501,31 @@ export component AppWindow inherits Window {
                                 self.visible-height - self.viewport-height);
                             root.chat-pin-y = self.viewport-y;
                             root.chat-pin-h = self.viewport-height;
+                        } else {
+                            root.converge-chat-anchor();
+                        }
+                    }
+                    // The queued-prompt panel changes the composer's height,
+                    // hence the list's visible page rather than its content
+                    // height. Both tail and row anchors must survive that.
+                    changed visible-height => {
+                        if (root.chat-follow) {
+                            self.viewport-y = min(0px,
+                                self.visible-height - self.viewport-height);
+                            root.chat-pin-y = self.viewport-y;
+                            root.chat-pin-h = self.viewport-height;
+                        } else {
+                            root.converge-chat-anchor();
                         }
                     }
 
                     for row[idx] in root.chat-rows: Rectangle {
+                        changed y => {
+                            root.observe-chat-row(idx, self.y, self.height);
+                        }
+                        changed height => {
+                            root.observe-chat-row(idx, self.y, self.height);
+                        }
                         // Markdown rows manage their own vertical rhythm via
                         // padding (lists tight, paragraphs spaced, headings
                         // set off); boxed rows keep a fixed gap. Headers get
@@ -3147,7 +3312,7 @@ export component AppWindow inherits Window {
                         // viewport-y watcher's height heuristic could
                         // mistake a drag for layout noise while rows are
                         // still re-measuring).
-                        root.chat-follow = false;
+                        root.begin-user-chat-scroll();
                         chat-list.viewport-y = -clamp(
                             ((y - self.margin - grab)
                                 / max(1px, self.track - self.thumb-h))
@@ -3190,6 +3355,7 @@ export component AppWindow inherits Window {
                         }
                         scroll-event(ev) => {
                             if (ev.delta-y != 0) {
+                                root.begin-user-chat-scroll();
                                 chat-list.viewport-y = clamp(
                                     chat-list.viewport-y + ev.delta-y,
                                     -(parent.total - parent.page), 0px);

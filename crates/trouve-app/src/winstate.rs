@@ -51,10 +51,48 @@ impl WindowState {
     }
 }
 
+/// A stable chat scroll bookmark. `row` is the first visible rendered chat
+/// row and `offset` is how far its top sits above the viewport. Unlike a raw
+/// ListView viewport-y this survives row re-measurement and window/font-size
+/// changes.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct ChatScrollBookmark {
+    pub row: usize,
+    pub offset: f32,
+}
+
+/// Read the row-anchor format introduced after the original raw-pixel
+/// bookmarks. Numeric values from older versions are deliberately ignored:
+/// they cannot be translated to a row without the old rendered layout, and
+/// falling back to the tail is safer than restoring an arbitrary position.
+fn deserialize_thread_scroll<'de, D>(
+    deserializer: D,
+) -> Result<HashMap<String, ChatScrollBookmark>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum StoredBookmark {
+        Anchor(ChatScrollBookmark),
+        LegacyPixels(f32),
+    }
+
+    let stored = HashMap::<String, StoredBookmark>::deserialize(deserializer)?;
+    Ok(stored
+        .into_iter()
+        .filter_map(|(thread, bookmark)| match bookmark {
+            StoredBookmark::Anchor(bookmark) => Some((thread, bookmark)),
+            StoredBookmark::LegacyPixels(_pixels) => None,
+        })
+        .collect())
+}
+
 /// Where the user left off, per session and thread: the last open session
 /// (restored on launch), each session's last open thread (restored when the
-/// session is clicked), and each thread's chat scroll offset — a Slint
-/// viewport-y, so 0 or negative — restored when the thread is opened.
+/// session is clicked), and row-anchored positions for threads where the
+/// user deliberately parked above the tail. Threads absent from
+/// `thread_scroll` reopen at the bottom.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 pub struct Resume {
     #[serde(default)]
@@ -62,9 +100,9 @@ pub struct Resume {
     /// session id → last open thread id.
     #[serde(default)]
     pub session_threads: HashMap<String, String>,
-    /// thread id → chat scroll offset.
-    #[serde(default)]
-    pub thread_scroll: HashMap<String, f32>,
+    /// thread id → first visible rendered row and offset within that row.
+    #[serde(default, deserialize_with = "deserialize_thread_scroll")]
+    pub thread_scroll: HashMap<String, ChatScrollBookmark>,
 }
 
 /// Appearance preferences: theme id, base font size/family, reduce motion.
@@ -259,6 +297,28 @@ mod tests {
         // start empty and refill as the user navigates.
         assert!(resume.session_threads.is_empty());
         assert!(resume.thread_scroll.is_empty());
+    }
+
+    #[test]
+    fn raw_pixel_thread_bookmarks_are_discarded() {
+        let old = r#"{"thread_scroll":{"t1":-420.5}}"#;
+        let resume: Resume = serde_json::from_str(old).unwrap();
+        assert!(resume.thread_scroll.is_empty());
+    }
+
+    #[test]
+    fn row_anchor_thread_bookmarks_roundtrip() {
+        let mut resume = Resume::default();
+        resume.thread_scroll.insert(
+            "t1".into(),
+            ChatScrollBookmark {
+                row: 17,
+                offset: 23.5,
+            },
+        );
+        let json = serde_json::to_string(&resume).unwrap();
+        let restored: Resume = serde_json::from_str(&json).unwrap();
+        assert_eq!(restored, resume);
     }
 
     #[test]

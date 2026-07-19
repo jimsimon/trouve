@@ -358,13 +358,19 @@ pub fn set_chat(ui: &Ui, rows: Vec<ChatRowData>, thread_key: String, scroll_to_e
     use slint::Model as _;
 
     let _ = ui.upgrade_in_event_loop(move |ui| {
+        let thread_changed = ui.get_chat_thread_key().as_str() != thread_key;
         // Sampled before the model changes: row add/removes make the
         // ListView re-derive viewport-y from estimated row heights, so a
         // toggle at the tail would land the view at a visibly wrong spot
         // unless we re-pin it below.
-        let was_at_bottom = ui.get_chat_at_bottom();
-        // Same event as the row swap, so the shell's scroll poll can never
-        // pair the new key with the old thread's viewport (or vice versa).
+        let was_at_bottom = !thread_changed && ui.get_chat_at_bottom();
+        if thread_changed {
+            // Flush any user-scroll sample under the old key and cancel its
+            // tail/anchor convergence before the new transcript is installed.
+            ui.invoke_reset_chat_positioning();
+        }
+        // Same event as the row swap, so a user-scroll callback can never
+        // pair the new key with the old thread's anchor (or vice versa).
         ui.set_chat_thread_key(thread_key.as_str().into());
         LAST_CHAT.with(|cache| {
             let mut cache = cache.borrow_mut();
@@ -396,7 +402,7 @@ pub fn set_chat(ui: &Ui, rows: Vec<ChatRowData>, thread_key: String, scroll_to_e
             }
             *cache = rows;
         });
-        if scroll_to_end || was_at_bottom {
+        if scroll_to_end || (was_at_bottom && !ui.get_chat_restoring()) {
             // At the tail, the bottom edge is the user's anchor: keep it
             // glued there through the re-layout (collapsing a card at the
             // bottom must not leave the viewport mid-drift).
@@ -483,13 +489,19 @@ pub fn set_right_tab(ui: &Ui, tab: i32) {
     let _ = ui.upgrade_in_event_loop(move |ui| ui.set_right_tab(tab));
 }
 
-/// Restore the chat scroll offset (viewport-y; 0 or negative).
-pub fn set_chat_scroll(ui: &Ui, y: f32) {
+/// Restore a mid-history chat position by rendered row and within-row
+/// offset. Slint keeps converging on the anchor while virtualized row
+/// heights settle.
+pub fn restore_chat_position(ui: &Ui, row: usize, offset: f32) {
     let _ = ui.upgrade_in_event_loop(move |ui| {
-        // A restored bookmark is an explicit position; stop tail-following.
-        ui.set_chat_follow(false);
-        ui.set_chat_scroll(y);
+        ui.invoke_restore_chat_position(row.min(i32::MAX as usize) as i32, offset);
     });
+}
+
+/// Put the chat at its live tail and keep it there as content or the
+/// queued-prompt composer panel changes height.
+pub fn scroll_chat_to_end(ui: &Ui) {
+    let _ = ui.upgrade_in_event_loop(move |ui| ui.invoke_force_chat_to_end());
 }
 
 /// How many threads have an agent turn in flight (quit-confirm dialog).
