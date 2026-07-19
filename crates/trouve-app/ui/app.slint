@@ -919,6 +919,9 @@ component NewChatForm inherits VerticalLayout {
     callback attach-file();
     callback attachment-removed(int);
     callback paste-image-attempted() -> bool;
+    property <bool> yolo-selected: root.permission-index >= 0
+        && root.permission-index < root.permission-options.length
+        && root.permission-options[root.permission-index] == "Yolo";
 
     padding: 40px;
     spacing: 14px;
@@ -1031,14 +1034,14 @@ component NewChatForm inherits VerticalLayout {
         VerticalLayout {
             spacing: 6px; horizontal-stretch: 1;
             Text {
-                text: root.permission-index == 3 ? "⚠ Permission mode" : "Permission mode";
-                color: root.permission-index == 3 ? Theme.c.err : Theme.c.text-mid;
+                text: root.yolo-selected ? "⚠ Permission mode" : "Permission mode";
+                color: root.yolo-selected ? Theme.c.err : Theme.c.text-mid;
                 font-size: Theme.fs(12px); font-weight: 700;
             }
             ComboBox { model: root.permission-options; current-index <=> root.permission-index; enabled: !root.blocked; }
         }
     }
-    if root.permission-index == 3: Rectangle {
+    if root.yolo-selected: Rectangle {
         background: Theme.c.err-bg;
         border-width: 1px;
         border-color: Theme.c.err;
@@ -1595,6 +1598,9 @@ export component AppWindow inherits Window {
     callback composer-thinking-changed(int);
     in property <[string]> permission-options: ["Ask", "Allow list", "Yolo"];
     in-out property <int> permission-index: 0;
+    property <bool> composer-yolo-selected: root.permission-index >= 0
+        && root.permission-index < root.permission-options.length
+        && root.permission-options[root.permission-index] == "Yolo";
     callback composer-permission-changed(int);
     callback composer-context-changed(int);
     callback composer-fast-toggled(bool);
@@ -3893,10 +3899,10 @@ export component AppWindow inherits Window {
                     VerticalLayout {
                         spacing: 2px;
                         Text {
-                            text: root.permission-index == 2 ? "⚠ Permissions" : "Permissions";
-                            color: root.permission-index == 2 ? Theme.c.err : Theme.c.text-faint;
+                            text: root.composer-yolo-selected ? "⚠ Permissions" : "Permissions";
+                            color: root.composer-yolo-selected ? Theme.c.err : Theme.c.text-faint;
                             font-size: Theme.fs(10px);
-                            font-weight: root.permission-index == 2 ? 700 : 400;
+                            font-weight: root.composer-yolo-selected ? 700 : 400;
                         }
                         DropUpPicker {
                             width: 105px;
@@ -3907,7 +3913,7 @@ export component AppWindow inherits Window {
                             changed(i) => { root.composer-permission-changed(i); }
                         }
                     }
-                    if root.permission-index == 2: Rectangle {
+                    if root.composer-yolo-selected: Rectangle {
                         width: 250px;
                         height: Theme.fs(30px);
                         background: Theme.c.err-bg;

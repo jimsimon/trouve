@@ -549,6 +549,9 @@ pub fn set_new_chat(
         ui.set_nc_fetch_latest(true);
         ui.set_nc_mode_index(mode_index);
         ui.set_nc_model_index(model_index);
+        // A permission choice belongs to one setup form only. In particular,
+        // never let a previous form's YOLO selection carry into a new one.
+        ui.set_nc_permission_index(0);
     });
 }
 
