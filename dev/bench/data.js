@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1784493691269,
+  "lastUpdate": 1784493743878,
   "repoUrl": "https://github.com/jimsimon/trouve",
   "entries": {
     "e2e-benchmarks": [
@@ -5137,6 +5137,54 @@ window.BENCHMARK_DATA = {
             "name": "dense_query_20k_rows",
             "value": 1454532.5219506407,
             "range": "± 17134",
+            "unit": "ns"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "jim.j.simon@gmail.com",
+            "name": "Jim Simon",
+            "username": "jimsimon"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "380175279b2960afb5f39481cd7dce4b881ecaf0",
+          "message": "Speed up CI test runs (#95)\n\n* Speed up CI test runs\n\nThe test workflow took ~20 minutes per PR. Per-job timings showed most\nof it was avoidable:\n\n- Gate the full-workspace release build (10-13 min, thin LTO +\n  codegen-units=1) to pushes to main. PRs keep release-compile coverage\n  of trouve-search via the bench and parity jobs; release.yml covers\n  the rest on tags.\n- Scope test-with-model to trouve-search, the only crate with\n  #[ignore]d tests, instead of compiling all 12 crates (including the\n  Slint GUI code — which is also why the job needed fontconfig/dbus;\n  that apt step is gone too).\n- Add a concurrency group so superseded PR runs are cancelled instead\n  of racing the winners to save the same rust-cache key (runs showed\n  \"Failed to save: Unable to reserve cache\" on every job).\n- Add a lint check that fails if an #[ignore]d test lands outside\n  trouve-search, so the scoped model job can't silently skip one.\n\nCo-Authored-By: Claude Fable 5 <noreply@anthropic.com>\n\n* Address review: attribute-aware tripwire, least-privilege permissions\n\n- Extend the ignored-test check to also match #[cfg_attr(..., ignore)]\n  forms, with a word boundary so identifiers like `ignored` don't match.\n  Comment/string false positives remain possible but fail loudly, which\n  is the cheap direction to be wrong in.\n- Add `permissions: contents: read` to the test and lint workflows;\n  every job only checks out, builds, tests, and caches.\n\nCo-Authored-By: Claude Fable 5 <noreply@anthropic.com>\n\n---------\n\nCo-authored-by: Claude Fable 5 <noreply@anthropic.com>",
+          "timestamp": "2026-07-19T16:40:10-04:00",
+          "tree_id": "84b0d900ee5e7d90455813ad13be2db5b677a36a",
+          "url": "https://github.com/jimsimon/trouve/commit/380175279b2960afb5f39481cd7dce4b881ecaf0"
+        },
+        "date": 1784493743223,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "bm25_build_5k_docs",
+            "value": 5172859,
+            "range": "± 11457",
+            "unit": "ns"
+          },
+          {
+            "name": "bm25_query_5k_docs",
+            "value": 36142.673136645964,
+            "range": "± 8",
+            "unit": "ns"
+          },
+          {
+            "name": "chunk_python_200_functions",
+            "value": 2889313.75,
+            "range": "± 3132",
+            "unit": "ns"
+          },
+          {
+            "name": "dense_query_20k_rows",
+            "value": 1543744.9090909092,
+            "range": "± 11735",
             "unit": "ns"
           }
         ]
