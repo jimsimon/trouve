@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1784424734859,
+  "lastUpdate": 1784424813202,
   "repoUrl": "https://github.com/jimsimon/trouve",
   "entries": {
     "e2e-benchmarks": [
@@ -1871,6 +1871,54 @@ window.BENCHMARK_DATA = {
             "name": "non-git warm query",
             "value": 79.52557533999999,
             "range": "± 2",
+            "unit": "ms"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "29139614+renovate[bot]@users.noreply.github.com",
+            "name": "renovate[bot]",
+            "username": "renovate[bot]"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "3c8897ca2d828ccfcdb0d89ac08cf6f50536e241",
+          "message": "Update dependency typescript to v7 (#42)\n\nCo-authored-by: renovate[bot] <29139614+renovate[bot]@users.noreply.github.com>",
+          "timestamp": "2026-07-18T21:31:43-04:00",
+          "tree_id": "12d8bd669ab16d9a934106343ce5b38378c30020",
+          "url": "https://github.com/jimsimon/trouve/commit/3c8897ca2d828ccfcdb0d89ac08cf6f50536e241"
+        },
+        "date": 1784424812876,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "cold index + query",
+            "value": 124.49118006000002,
+            "range": "± 4.8",
+            "unit": "ms"
+          },
+          {
+            "name": "warm query",
+            "value": 65.06141454,
+            "range": "± 1.9",
+            "unit": "ms"
+          },
+          {
+            "name": "incremental (1 file modified)",
+            "value": 75.2235455,
+            "range": "± 0.6",
+            "unit": "ms"
+          },
+          {
+            "name": "non-git warm query",
+            "value": 63.774653459999996,
+            "range": "± 1.6",
             "unit": "ms"
           }
         ]
