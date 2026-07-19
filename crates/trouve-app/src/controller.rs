@@ -406,9 +406,11 @@ pub enum UiCommand {
 
     /// Internal: an event arrived on some thread's stream.
     Event(String, Box<EventEnvelope>),
-    /// Initial persisted history, coalesced so opening a long thread applies
-    /// and renders many envelopes in one controller command.
-    Events(String, Vec<EventEnvelope>),
+    /// Persisted history, coalesced so opening/reconnecting a long thread
+    /// applies and renders many envelopes in one controller command. The
+    /// flag distinguishes reconnect backlog (may be unread) from startup
+    /// history (already viewed in an earlier app run).
+    Events(String, Vec<EventEnvelope>, bool),
     /// Internal: threads were discovered for an active background session,
     /// so their streams can feed attention and unread-work badges.
     SessionThreadsLoaded(String, Result<Vec<Thread>, String>),
@@ -430,6 +432,19 @@ enum NavEntry {
 enum NewChat {
     Session,
     Thread,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct AttentionCounts {
+    approvals: usize,
+    questions: usize,
+}
+
+fn thread_attention(vm: &ThreadViewModel) -> AttentionCounts {
+    AttentionCounts {
+        approvals: vm.pending_approvals.len(),
+        questions: vm.pending_questions.len(),
+    }
 }
 
 struct Controller {
@@ -519,15 +534,23 @@ struct Controller {
     /// the branch was checked and has no associated PRs.
     nav_prs: HashMap<String, Vec<trouve_protocol::PrInfo>>,
     nav_prs_pending: HashSet<String>,
+    /// Shared across refresh generations so GitHub is never hit by more
+    /// than four sidebar-summary requests at once.
+    nav_pr_limiter: std::sync::Arc<tokio::sync::Semaphore>,
 
     vms: HashMap<String, ThreadViewModel>,
     followed: HashSet<String>,
+    /// Long-lived SSE followers, aborted when their owning session vanishes.
+    follower_tasks: HashMap<String, tokio::task::JoinHandle<()>>,
     /// thread id → session id, for notifications about backgrounded
     /// threads (`threads` only holds the open session's).
     thread_sessions: HashMap<String, String>,
     /// Sessions whose thread list is being/has been watched for background
     /// attention. New threads still arrive through `thread.created`.
     watched_sessions: HashSet<String>,
+    /// Aggregate pending requests by session; kept incrementally from each
+    /// thread VM so rendering a nav row is O(1).
+    attention_by_session: HashMap<String, AttentionCounts>,
     /// Sessions with completed/failed work the user has not brought on
     /// screen since it landed.
     unread_sessions: HashSet<String>,
@@ -698,10 +721,13 @@ pub async fn run(
         pr_error: String::new(),
         nav_prs: HashMap::new(),
         nav_prs_pending: HashSet::new(),
+        nav_pr_limiter: std::sync::Arc::new(tokio::sync::Semaphore::new(4)),
         vms: HashMap::new(),
         followed: HashSet::new(),
+        follower_tasks: HashMap::new(),
         thread_sessions: HashMap::new(),
         watched_sessions: HashSet::new(),
+        attention_by_session: HashMap::new(),
         unread_sessions: HashSet::new(),
         notify: crate::winstate::load_notifications(),
         window_focused,
@@ -1187,6 +1213,17 @@ impl Controller {
         self.nav_prs_pending.retain(|id| session_ids.contains(id));
         self.unread_sessions.retain(|id| session_ids.contains(id));
         self.watched_sessions.retain(|id| session_ids.contains(id));
+        let stale_threads: Vec<String> = self
+            .thread_sessions
+            .iter()
+            .filter(|(_, session_id)| !session_ids.contains(*session_id))
+            .map(|(thread_id, _)| thread_id.clone())
+            .collect();
+        for thread_id in stale_threads {
+            self.stop_following_thread(&thread_id);
+        }
+        self.attention_by_session
+            .retain(|session_id, _| session_ids.contains(session_id));
         // If the open session vanished (deleted in another window or by an
         // automation), drop its threads and selection too — otherwise
         // current_thread_id keeps returning a thread of a session that no
@@ -1235,17 +1272,77 @@ impl Controller {
         }
     }
 
-    /// Aggregate pending requests across every followed thread of a session.
+    /// Read the incrementally-maintained pending request totals for a session.
     fn session_attention(&self, session_id: &str) -> (i32, String) {
-        let mut approvals = 0usize;
-        let mut questions = 0usize;
-        for (thread_id, vm) in &self.vms {
-            if self.thread_sessions.get(thread_id).map(String::as_str) == Some(session_id) {
-                approvals += vm.pending_approvals.len();
-                questions += vm.pending_questions.len();
-            }
+        let counts = self
+            .attention_by_session
+            .get(session_id)
+            .copied()
+            .unwrap_or_default();
+        attention_badge(counts.approvals, counts.questions)
+    }
+
+    /// Apply a thread's attention delta to its owning session. Returns true
+    /// only when the aggregate changed and the sidebar needs rebuilding.
+    fn update_session_attention(
+        &mut self,
+        thread_id: &str,
+        before: AttentionCounts,
+        after: AttentionCounts,
+    ) -> bool {
+        if before == after {
+            return false;
         }
-        attention_badge(approvals, questions)
+        let Some(session_id) = self.thread_sessions.get(thread_id).cloned() else {
+            return false;
+        };
+        let empty = {
+            let total = self
+                .attention_by_session
+                .entry(session_id.clone())
+                .or_default();
+            total.approvals = total.approvals.saturating_sub(before.approvals) + after.approvals;
+            total.questions = total.questions.saturating_sub(before.questions) + after.questions;
+            *total == AttentionCounts::default()
+        };
+        if empty {
+            self.attention_by_session.remove(&session_id);
+        }
+        true
+    }
+
+    /// Stop and forget a thread follower whose session no longer exists.
+    fn stop_following_thread(&mut self, thread_id: &str) -> bool {
+        if let Some(task) = self.follower_tasks.remove(thread_id) {
+            task.abort();
+        }
+        self.followed.remove(thread_id);
+        let before = self
+            .vms
+            .get(thread_id)
+            .map(thread_attention)
+            .unwrap_or_default();
+        let attention_changed =
+            self.update_session_attention(thread_id, before, AttentionCounts::default());
+        self.vms.remove(thread_id);
+        self.thread_sessions.remove(thread_id);
+        attention_changed
+    }
+
+    /// Mark completed work unread unless this thread is currently visible in
+    /// the focused window. Returns whether the session badge changed.
+    fn mark_thread_unread_if_hidden(&mut self, thread_id: &str) -> bool {
+        let focused = self
+            .window_focused
+            .load(std::sync::atomic::Ordering::Relaxed);
+        let viewed = focused && self.current_thread_id().as_deref() == Some(thread_id);
+        if viewed {
+            return false;
+        }
+        let Some(session_id) = self.thread_sessions.get(thread_id).cloned() else {
+            return false;
+        };
+        self.unread_sessions.insert(session_id)
     }
 
     /// Rebuild the grouped left-nav rows and the row → entry map.
@@ -1704,17 +1801,22 @@ impl Controller {
         // until relaunch. Resume from the last cursor delivered — tracked in
         // the closure so an error path (which loses the return value) still
         // knows where to continue — so no event is replayed or dropped.
-        tokio::spawn(async move {
-            use std::sync::atomic::{AtomicU64, Ordering};
+        let follower_id = thread_id.clone();
+        let task = tokio::spawn(async move {
+            use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
             let cursor = std::sync::Arc::new(AtomicU64::new(0));
             let replay = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-            let replay_flush_scheduled =
-                std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let replay_flush_scheduled = std::sync::Arc::new(AtomicBool::new(false));
+            // Startup history predates this app run and is already viewed;
+            // persisted envelopes after the stream has gone live are a
+            // reconnect backlog and can represent unseen background work.
+            let live_seen = std::sync::Arc::new(AtomicBool::new(false));
             loop {
                 let id = thread_id.clone();
                 let seen = cursor.clone();
                 let replay = replay.clone();
                 let flush_scheduled = replay_flush_scheduled.clone();
+                let live_seen = live_seen.clone();
                 let event_tx = tx.clone();
                 let after = cursor.load(Ordering::Relaxed);
                 let result = client
@@ -1730,6 +1832,7 @@ impl Controller {
                                 let flush_scheduled = flush_scheduled.clone();
                                 let event_tx = event_tx.clone();
                                 let id = id.clone();
+                                let mark_unread = live_seen.load(Ordering::Relaxed);
                                 tokio::spawn(async move {
                                     // Let the local replay producer fill the
                                     // batch before handing it to the
@@ -1738,15 +1841,25 @@ impl Controller {
                                     flush_scheduled.store(false, Ordering::Release);
                                     let batch = std::mem::take(&mut *replay.lock().unwrap());
                                     if !batch.is_empty() {
-                                        let _ = event_tx.send(UiCommand::Events(id, batch));
+                                        let _ = event_tx.send(UiCommand::Events(
+                                            id,
+                                            batch,
+                                            mark_unread,
+                                        ));
                                     }
                                 });
                             }
                         } else {
+                            let mark_unread = live_seen.load(Ordering::Relaxed);
                             let batch = std::mem::take(&mut *replay.lock().unwrap());
                             if !batch.is_empty() {
-                                let _ = event_tx.send(UiCommand::Events(id.clone(), batch));
+                                let _ = event_tx.send(UiCommand::Events(
+                                    id.clone(),
+                                    batch,
+                                    mark_unread,
+                                ));
                             }
+                            live_seen.store(true, Ordering::Relaxed);
                             let _ = event_tx.send(UiCommand::Event(id.clone(), Box::new(envelope)));
                         }
                         std::ops::ControlFlow::Continue(())
@@ -1763,6 +1876,7 @@ impl Controller {
                 tokio::time::sleep(std::time::Duration::from_secs(2)).await;
             }
         });
+        self.follower_tasks.insert(follower_id, task);
     }
 
     /// Refresh the composer's "@"-mention path list for the open session, at
@@ -2183,11 +2297,15 @@ impl Controller {
             self.nav_prs_pending.insert(session_id.clone());
             let client = self.client.clone();
             let tx = self.tx.clone();
+            let limiter = self.nav_pr_limiter.clone();
             tokio::spawn(async move {
-                let result = client
-                    .session_prs(&session_id)
-                    .await
-                    .map_err(|e| format!("{e:#}"));
+                let result = match limiter.acquire_owned().await {
+                    Ok(_permit) => client
+                        .session_prs(&session_id)
+                        .await
+                        .map_err(|e| format!("{e:#}")),
+                    Err(e) => Err(format!("sidebar PR request limiter closed: {e}")),
+                };
                 let _ = tx.send(UiCommand::NavPrsLoaded(session_id, result));
             });
         }
@@ -3094,8 +3212,16 @@ impl Controller {
             Event::ThreadCreated {
                 thread_id,
                 session_id,
-            } => {
+            } if self.watched_sessions.contains(session_id) => {
                 self.follow_thread(thread_id.clone(), session_id.clone());
+            }
+            Event::ThreadCreated {
+                thread_id: _,
+                session_id: _,
+            } => {
+                // Only selected or active sessions are watched. Their thread
+                // lists are discovered explicitly, so unrelated global
+                // thread events must not create permanent SSE followers.
             }
             // The server's internet reachability flipped: refresh the model
             // list (filtered while offline), regate prompt entry, announce
@@ -4863,20 +4989,40 @@ impl Controller {
             UiCommand::RefreshClis => {
                 self.refresh_clis().await;
             }
-            UiCommand::Events(thread_id, envelopes) => {
+            UiCommand::Events(thread_id, envelopes, mark_unread) => {
+                // A follower can be aborted while its already-queued
+                // commands are still waiting in this channel.
+                if !self.followed.contains(&thread_id) {
+                    return Ok(());
+                }
+                let before = self
+                    .vms
+                    .get(&thread_id)
+                    .map(thread_attention)
+                    .unwrap_or_default();
                 let mut changed = false;
                 let mut completed = false;
-                let mut attention_changed = false;
+                let mut finished = false;
+                {
+                    let vm = self.vms.entry(thread_id.clone()).or_default();
+                    for envelope in &envelopes {
+                        changed |= vm.apply(envelope).is_some();
+                        completed |=
+                            matches!(envelope.event, trouve_protocol::Event::TurnCompleted { .. });
+                        finished |= matches!(
+                            envelope.event,
+                            trouve_protocol::Event::TurnCompleted { .. }
+                                | trouve_protocol::Event::TurnFailed { .. }
+                        );
+                    }
+                }
+                let after = self
+                    .vms
+                    .get(&thread_id)
+                    .map(thread_attention)
+                    .unwrap_or_default();
+                let attention_changed = self.update_session_attention(&thread_id, before, after);
                 for envelope in &envelopes {
-                    changed |= self
-                        .vms
-                        .entry(thread_id.clone())
-                        .or_default()
-                        .apply(envelope)
-                        .is_some();
-                    completed |=
-                        matches!(envelope.event, trouve_protocol::Event::TurnCompleted { .. });
-                    attention_changed |= is_attention_event(&envelope.event);
                     self.maybe_notify(&thread_id, envelope);
                 }
                 if self.current_thread_id().as_deref() == Some(&thread_id) {
@@ -4891,15 +5037,33 @@ impl Controller {
                         self.refresh_usage_text().await;
                     }
                 }
-                if attention_changed {
+                let unread_changed =
+                    mark_unread && finished && self.mark_thread_unread_if_hidden(&thread_id);
+                if attention_changed || unread_changed {
                     self.push_nav();
                 }
                 self.push_agents_running();
             }
             UiCommand::Event(thread_id, envelope) => {
-                let vm = self.vms.entry(thread_id.clone()).or_default();
-                let changed = vm.apply(&envelope);
-                let attention_changed = is_attention_event(&envelope.event);
+                if !self.followed.contains(&thread_id) {
+                    return Ok(());
+                }
+                let before = self
+                    .vms
+                    .get(&thread_id)
+                    .map(thread_attention)
+                    .unwrap_or_default();
+                let changed = self
+                    .vms
+                    .entry(thread_id.clone())
+                    .or_default()
+                    .apply(&envelope);
+                let after = self
+                    .vms
+                    .get(&thread_id)
+                    .map(thread_attention)
+                    .unwrap_or_default();
+                let attention_changed = self.update_session_attention(&thread_id, before, after);
                 let finished = matches!(
                     envelope.event,
                     trouve_protocol::Event::TurnCompleted { .. }
@@ -4942,14 +5106,7 @@ impl Controller {
                 self.maybe_notify(&thread_id, &envelope);
                 let mut nav_changed = attention_changed;
                 if finished {
-                    let focused = self
-                        .window_focused
-                        .load(std::sync::atomic::Ordering::Relaxed);
-                    let viewed =
-                        focused && self.current_thread_id().as_deref() == Some(thread_id.as_str());
-                    if !viewed && let Some(session_id) = self.thread_sessions.get(&thread_id) {
-                        nav_changed |= self.unread_sessions.insert(session_id.clone());
-                    }
+                    nav_changed |= self.mark_thread_unread_if_hidden(&thread_id);
                 }
                 if nav_changed {
                     self.push_nav();
@@ -4996,6 +5153,9 @@ impl Controller {
             }
             UiCommand::SessionThreadsLoaded(session_id, result) => match result {
                 Ok(threads) => {
+                    if !self.watched_sessions.contains(&session_id) {
+                        return Ok(());
+                    }
                     for thread in threads {
                         self.follow_thread(thread.id, session_id.clone());
                     }
@@ -5256,20 +5416,6 @@ fn permission_mode_of(index: i32) -> Option<PermissionMode> {
         2 => Some(PermissionMode::Yolo),
         _ => None,
     }
-}
-
-/// Events that can change a session's aggregated attention badge.
-fn is_attention_event(event: &trouve_protocol::Event) -> bool {
-    matches!(
-        event,
-        trouve_protocol::Event::ApprovalRequested { .. }
-            | trouve_protocol::Event::ApprovalResolved { .. }
-            | trouve_protocol::Event::QuestionRequested { .. }
-            | trouve_protocol::Event::QuestionResolved { .. }
-            | trouve_protocol::Event::ToolCompleted { .. }
-            | trouve_protocol::Event::TurnCompleted { .. }
-            | trouve_protocol::Event::TurnFailed { .. }
-    )
 }
 
 /// Compact attention kind + accessible hover/focus detail.
