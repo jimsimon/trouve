@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1784448398324,
+  "lastUpdate": 1784448486193,
   "repoUrl": "https://github.com/jimsimon/trouve",
   "entries": {
     "e2e-benchmarks": [
@@ -2111,6 +2111,54 @@ window.BENCHMARK_DATA = {
             "name": "non-git warm query",
             "value": 65.25860808,
             "range": "± 1.4",
+            "unit": "ms"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "jim.j.simon@gmail.com",
+            "name": "Jim Simon",
+            "username": "jimsimon"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "85ddf1d0968fe08dd096bc0fdf84adf3fa07ec63",
+          "message": "Allow Codex Git writes in mutable modes (#76)\n\nCodex workspace-write makes linked worktree metadata read-only, so even index locks fail. Run mutable Codex turns without its OS sandbox while preserving Ask approvals and the read-only sandbox.",
+          "timestamp": "2026-07-19T04:05:44-04:00",
+          "tree_id": "b9b9361e691bb53d84f79eb8f41558e4b650ef72",
+          "url": "https://github.com/jimsimon/trouve/commit/85ddf1d0968fe08dd096bc0fdf84adf3fa07ec63"
+        },
+        "date": 1784448485754,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "cold index + query",
+            "value": 139.21793606,
+            "range": "± 2",
+            "unit": "ms"
+          },
+          {
+            "name": "warm query",
+            "value": 77.80127118,
+            "range": "± 1.9",
+            "unit": "ms"
+          },
+          {
+            "name": "incremental (1 file modified)",
+            "value": 88.46287844,
+            "range": "± 0.6",
+            "unit": "ms"
+          },
+          {
+            "name": "non-git warm query",
+            "value": 80.3482639,
+            "range": "± 24.2",
             "unit": "ms"
           }
         ]
