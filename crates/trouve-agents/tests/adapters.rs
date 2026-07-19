@@ -467,7 +467,10 @@ async fn cursor_adapter_speaks_acp_and_bridges_approvals() {
     let args = std::fs::read_to_string(format!("{stub}.args")).unwrap();
     assert_eq!(args.trim(), "acp");
     let cwd = std::fs::read_to_string(format!("{stub}.cwd")).unwrap();
-    assert_eq!(Path::new(cwd.trim()), tmp.path());
+    assert_eq!(
+        Path::new(cwd.trim()).canonicalize().unwrap(),
+        tmp.path().canonicalize().unwrap()
+    );
     let mode = std::fs::read_to_string(format!("{stub}.mode")).unwrap();
     assert!(mode.contains("\"configId\":\"mode\""), "{mode}");
     assert!(mode.contains("\"value\":\"agent\""), "{mode}");
@@ -532,7 +535,10 @@ async fn cursor_adapter_routes_yolo_through_guard_and_maps_read_only_to_plan() {
         }
     }
     let cwd = std::fs::read_to_string(format!("{stub}.cwd")).unwrap();
-    assert_eq!(Path::new(cwd.trim()), other_worktree.path());
+    assert_eq!(
+        Path::new(cwd.trim()).canonicalize().unwrap(),
+        other_worktree.path().canonicalize().unwrap()
+    );
     let spawns = std::fs::read_to_string(format!("{stub}.spawns")).unwrap();
     assert_eq!(spawns.lines().count(), 2, "{spawns}");
 
