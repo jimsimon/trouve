@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1784489646123,
+  "lastUpdate": 1784489683000,
   "repoUrl": "https://github.com/jimsimon/trouve",
   "entries": {
     "e2e-benchmarks": [
@@ -4561,6 +4561,54 @@ window.BENCHMARK_DATA = {
             "name": "dense_query_20k_rows",
             "value": 1342865.0852713177,
             "range": "± 8611",
+            "unit": "ns"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "jim.j.simon@gmail.com",
+            "name": "Jim Simon",
+            "username": "jimsimon"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "ef1f2a00ac3aaac7e551969ff621af41fe0e9529",
+          "message": "Keep sidebar controls clear of scrollbar (#91)",
+          "timestamp": "2026-07-19T15:32:41-04:00",
+          "tree_id": "da3a12c9ea478e6bc465193ef051baa4e9a1bd80",
+          "url": "https://github.com/jimsimon/trouve/commit/ef1f2a00ac3aaac7e551969ff621af41fe0e9529"
+        },
+        "date": 1784489682045,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "bm25_build_5k_docs",
+            "value": 4311927.416666667,
+            "range": "± 6081",
+            "unit": "ns"
+          },
+          {
+            "name": "bm25_query_5k_docs",
+            "value": 28123.258067226892,
+            "range": "± 9",
+            "unit": "ns"
+          },
+          {
+            "name": "chunk_python_200_functions",
+            "value": 2235034,
+            "range": "± 1429",
+            "unit": "ns"
+          },
+          {
+            "name": "dense_query_20k_rows",
+            "value": 1210919.6979166665,
+            "range": "± 16655",
             "unit": "ns"
           }
         ]
