@@ -7,7 +7,7 @@
       "name": "MIT",
       "identifier": "MIT"
     },
-    "version": "0.20"
+    "version": "0.21"
   },
   "paths": {
     "/v1/approvals": {
@@ -2955,6 +2955,54 @@
           }
         }
       }
+    },
+    "/v1/workspaces/{id}/prs": {
+      "get": {
+        "tags": [],
+        "operationId": "workspace_prs",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WorkspacePrList"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
     }
   },
   "components": {
@@ -5013,6 +5061,10 @@
           "reviews"
         ],
         "properties": {
+          "author": {
+            "type": "string",
+            "description": "PR author's login."
+          },
           "base": {
             "type": "string"
           },
@@ -5022,16 +5074,44 @@
               "$ref": "#/components/schemas/CheckRun"
             }
           },
+          "comments": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Issue + review comments combined.",
+            "minimum": 0
+          },
           "draft": {
             "type": "boolean"
           },
           "head": {
             "type": "string"
           },
+          "last_comment_at": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time",
+            "description": "When the newest comment (of either kind) was posted."
+          },
+          "merged_at": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time"
+          },
           "number": {
             "type": "integer",
             "format": "int64",
             "minimum": 0
+          },
+          "requested_reviewers": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Logins with an outstanding review request."
           },
           "reviews": {
             "type": "array",
@@ -6009,6 +6089,25 @@
           },
           "path": {
             "type": "string"
+          }
+        }
+      },
+      "WorkspacePrList": {
+        "type": "object",
+        "description": "Every dashboard-relevant PR of a workspace's origin repo: all open PRs\nplus those merged in the last day.",
+        "required": [
+          "prs"
+        ],
+        "properties": {
+          "prs": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/PrInfo"
+            }
+          },
+          "viewer": {
+            "type": "string",
+            "description": "Login of the authenticated GitHub user (\"\" when unknown) — clients\nuse it to spot PRs where that user's review was requested."
           }
         }
       }

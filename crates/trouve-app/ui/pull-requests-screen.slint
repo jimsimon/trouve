@@ -1,0 +1,701 @@
+// Pull Requests: a dashboard of every open (or recently merged) PR across
+// the registered workspaces, grouped by what the user should do next.
+// Full-window screen (like settings/automations). Groups collapse, and
+// reorder by pointer drag or, for keyboard/assistive tech, an Up/Down
+// position control — the same pattern as workspace headers. All state
+// folding (grouping, pills, timestamps) happens in the Rust controller;
+// this file only renders.
+
+import { Button, ComboBox, ScrollView } from "std-widgets.slint";
+import { ConnectivityBanner } from "connectivity-banner.slint";
+import { ScrollKeys } from "scroll-keys.slint";
+import { Theme } from "theme.slint";
+
+// One pull request row, pre-rendered by the controller.
+export struct PrRowItem {
+    workspace-id: string,
+    // Which app/repo the PR belongs to ("trouve").
+    app-name: string,
+    // "#42"
+    number-label: string,
+    title: string,
+    // Head branch ("trouve/fix-login").
+    branch: string,
+    // Check pill: 0 no checks, 1 passing, 2 running, 3 failing.
+    check-kind: int,
+    check-label: string,
+    // Approval pill: 0 no reviews, 1 approved, 2 pending, 3 changes requested.
+    approval-kind: int,
+    approval-label: string,
+    // "3 comments" / "0 comments".
+    comments-label: string,
+    // "last comment 45 mins ago" / "no comments yet".
+    last-comment: string,
+    url: string,
+    // A session for this PR's branch exists: the chat button jumps to it
+    // instead of offering to start a new chat.
+    has-chat: bool,
+}
+
+// One dashboard group ("Ready to Merge", …) in display order.
+export struct PrGroupItem {
+    // Stable id used by reorder/collapse callbacks ("ready-to-merge").
+    key: string,
+    title: string,
+    // Subheading explaining what the group includes.
+    description: string,
+    // Colors the header icon: 0 review-requested, 1 drafts, 2 pending,
+    // 3 ready, 4 needs-attention, 5 merged.
+    kind: int,
+    icon: string,
+    // Zero-based position and total group count (reorder bounds).
+    position: int,
+    group-count: int,
+    collapsed: bool,
+    // Shown instead of rows while the group is empty.
+    empty-text: string,
+    prs: [PrRowItem],
+}
+
+// Glyph button with keyboard activation; `active` renders it in the
+// accent color (the enabled/primary variant of a two-state action).
+component PrIconButton inherits Rectangle {
+    in property <string> icon;
+    in property <string> label;
+    in property <bool> active: false;
+    callback clicked;
+
+    width: Theme.fs(26px);
+    height: Theme.fs(22px);
+    border-radius: 4px;
+    background: ta.has-hover ? Theme.c.hover-strong : transparent;
+    border-width: fs.has-focus ? 1px : 0px;
+    border-color: Theme.c.accent;
+
+    fs := FocusScope {
+        accessible-role: button;
+        accessible-label: root.label;
+        accessible-action-default => { root.clicked(); }
+        key-pressed(event) => {
+            if (event.text == Key.Return || event.text == " ") {
+                root.clicked();
+                return accept;
+            }
+            return reject;
+        }
+    }
+    ta := TouchArea {
+        mouse-cursor: pointer;
+        clicked => { root.clicked(); }
+    }
+    Text {
+        width: 100%;
+        height: 100%;
+        text: root.icon;
+        color: root.active ? Theme.c.accent
+            : ta.has-hover ? Theme.c.text-hi : Theme.c.text-soft;
+        font-size: Theme.fs(13px);
+        horizontal-alignment: center;
+        vertical-alignment: center;
+    }
+}
+
+// Clipboard button (same trick as the chat's CopyButton): the hidden
+// TextInput reaches the system clipboard through its built-in
+// select-all/copy, so no native plumbing is needed.
+component PrCopyButton inherits Rectangle {
+    in property <string> payload;
+    property <bool> copied: false;
+
+    width: Theme.fs(26px);
+    height: Theme.fs(22px);
+    border-radius: 4px;
+    background: ta.has-hover ? Theme.c.hover-strong : transparent;
+    border-width: fs.has-focus ? 1px : 0px;
+    border-color: Theme.c.accent;
+
+    function do-copy() {
+        clip-src.text = root.payload;
+        clip-src.select-all();
+        clip-src.copy();
+        clip-src.text = "";
+        root.copied = true;
+    }
+    clip-src := TextInput {
+        visible: false;
+        width: 0;
+        height: 0;
+        single-line: false;
+    }
+    Timer {
+        interval: 1.2s;
+        running: root.copied;
+        triggered => { root.copied = false; }
+    }
+    fs := FocusScope {
+        accessible-role: button;
+        accessible-label: "Copy pull request URL";
+        accessible-action-default => { root.do-copy(); }
+        key-pressed(event) => {
+            if (event.text == Key.Return || event.text == " ") {
+                root.do-copy();
+                return accept;
+            }
+            return reject;
+        }
+    }
+    ta := TouchArea {
+        mouse-cursor: pointer;
+        clicked => { root.do-copy(); }
+    }
+    Text {
+        width: 100%;
+        height: 100%;
+        text: root.copied ? "✓" : "⧉";
+        color: root.copied ? Theme.c.ok
+            : ta.has-hover ? Theme.c.text-hi : Theme.c.text-soft;
+        font-size: Theme.fs(12px);
+        horizontal-alignment: center;
+        vertical-alignment: center;
+    }
+}
+
+// Small status pill ("checks passing", "approved", …). `tone` picks the
+// color pair: 0 neutral, 1 ok, 2 in-progress/warn, 3 error.
+component StatusPill inherits Rectangle {
+    in property <string> label;
+    in property <int> tone;
+    width: pill-text.preferred-width + Theme.fs(16px);
+    height: Theme.fs(20px);
+    border-radius: self.height / 2;
+    background: root.tone == 1 ? Theme.c.diff-add-bg
+        : root.tone == 2 ? Theme.c.warn-bg
+        : root.tone == 3 ? Theme.c.err-bg
+        : Theme.c.pill-bg;
+    border-width: root.tone == 2 ? 1px : 0px;
+    border-color: Theme.c.warn-border;
+    pill-text := Text {
+        width: 100%;
+        height: 100%;
+        text: root.label;
+        color: root.tone == 1 ? Theme.c.ok
+            : root.tone == 2 ? Theme.c.warn
+            : root.tone == 3 ? Theme.c.err-soft
+            : Theme.c.text-dim;
+        font-size: Theme.fs(10px);
+        font-weight: 700;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+    }
+}
+
+export component PullRequestsScreen inherits Rectangle {
+    background: Theme.c.win-bg;
+
+    in property <[PrGroupItem]> groups;
+    // "All projects" + one entry per workspace.
+    in property <[string]> project-names;
+    in-out property <int> project-index: 0;
+    // Error/progress line ("" = nothing to say).
+    in property <string> status: "";
+    // The GitHub integration has auth (mirrors the session PR tab's gate).
+    in property <bool> configured: true;
+    in property <bool> has-workspaces: true;
+    in property <string> offline-warning;
+    in property <string> online-notice;
+    in property <bool> blocked-severe;
+    // Set immediately before a keyboard move so the rebuilt repeater
+    // returns focus to the moved group's handle.
+    in-out property <string> reorder-focus-key: "";
+
+    callback close();
+    callback refresh();
+    callback filter-picked(/* project index; 0 = all */ int);
+    callback group-toggled(/* group key */ string);
+    // Group ordering. Drag payloads stay opaque in Slint and are
+    // created/validated by the Rust host.
+    pure callback group-drag-data(string) -> data-transfer;
+    pure callback group-drag-acceptable(data-transfer) -> bool;
+    callback group-dropped(data-transfer, /* target key */ string, /* after */ bool) -> bool;
+    callback group-moved(/* group key */ string, /* signed offset */ int);
+    // Jump to the PR's existing chat, or start a new one for it.
+    callback chat-clicked(/* workspace id */ string, /* head branch */ string);
+    callback open-url(string);
+    callback open-integrations();
+
+    VerticalLayout {
+        // ---------------- header ----------------
+        Rectangle {
+            height: 52px;
+            background: Theme.c.sidebar-bg;
+            HorizontalLayout {
+                padding-left: 16px;
+                padding-right: 16px;
+                Text {
+                    text: "Pull Requests";
+                    color: Theme.c.text-hi;
+                    font-size: Theme.fs(18px);
+                    font-weight: 700;
+                    vertical-alignment: center;
+                    horizontal-stretch: 1;
+                }
+                VerticalLayout {
+                    alignment: center;
+                    Button {
+                        text: "✕ Close";
+                        clicked => { root.close(); }
+                    }
+                }
+            }
+        }
+
+        // ---------------- body (centered column) ----------------
+        HorizontalLayout {
+            vertical-stretch: 1;
+            Rectangle { horizontal-stretch: 1; }
+            Rectangle {
+                width: 760px;
+                ScrollKeys {
+                    target-y <=> body.viewport-y;
+                    page: body.visible-height;
+                    total: body.viewport-height;
+                body := ScrollView {
+                    width: 100%;
+                    height: 100%;
+                    VerticalLayout {
+                        padding: 16px;
+                        spacing: 12px;
+                        alignment: start;
+
+                        // Setup prompt: the GitHub integration is unconfigured.
+                        if !root.configured: VerticalLayout {
+                            spacing: 12px;
+                            padding-top: 24px;
+                            Text {
+                                text: "Connect GitHub to see your pull requests";
+                                color: Theme.c.text-hi;
+                                font-size: Theme.fs(14px);
+                                font-weight: 700;
+                                horizontal-alignment: center;
+                                wrap: word-wrap;
+                            }
+                            Text {
+                                text: "trouve looks up each workspace's pull requests and sorts them by what needs your attention. It needs a GitHub sign-in or personal access token to do that.";
+                                color: Theme.c.text-mid;
+                                font-size: Theme.fs(12px);
+                                horizontal-alignment: center;
+                                wrap: word-wrap;
+                            }
+                            HorizontalLayout {
+                                alignment: center;
+                                Button {
+                                    text: "Set up GitHub integration";
+                                    primary: true;
+                                    clicked => { root.open-integrations(); }
+                                }
+                            }
+                        }
+
+                        if root.configured && !root.has-workspaces: Text {
+                            text: "Open a workspace first — the dashboard shows the pull requests of each workspace's repository.";
+                            color: Theme.c.warn;
+                            font-size: Theme.fs(12px);
+                            wrap: word-wrap;
+                        }
+
+                        if root.configured && root.has-workspaces: HorizontalLayout {
+                            spacing: 8px;
+                            Text {
+                                text: "Project";
+                                color: Theme.c.text-mid;
+                                font-size: Theme.fs(12px);
+                                vertical-alignment: center;
+                            }
+                            ComboBox {
+                                model: root.project-names;
+                                current-index <=> root.project-index;
+                                selected => { root.filter-picked(self.current-index); }
+                                width: Theme.fs(220px);
+                            }
+                            Rectangle { horizontal-stretch: 1; }
+                            Button {
+                                text: "⟳ Refresh";
+                                clicked => { root.refresh(); }
+                            }
+                        }
+
+                        if root.status != "": Text {
+                            text: root.status;
+                            color: Theme.c.text-soft;
+                            font-size: Theme.fs(12px);
+                            wrap: word-wrap;
+                        }
+
+                        if root.offline-warning != "" || root.online-notice != "": ConnectivityBanner {
+                            warning: root.offline-warning;
+                            notice: root.online-notice;
+                            severe: root.blocked-severe;
+                        }
+
+                        // ---------------- groups ----------------
+                        if root.configured && root.has-workspaces:
+                        VerticalLayout {
+                            spacing: 10px;
+                            for group in root.groups: Rectangle {
+                                background: Theme.c.surface;
+                                border-radius: 8px;
+                                border-width: group-drop.has-drag ? 2px : 1px;
+                                border-color: group-drop.has-drag
+                                    ? Theme.c.accent : Theme.c.border;
+                                height: group-col.preferred-height;
+
+                                // A group accepts the dragged group before or
+                                // after itself, depending on the drop half.
+                                group-drop := DropArea {
+                                    can-drop(event) => {
+                                        root.group-drag-acceptable(event.data)
+                                            ? DragAction.move : DragAction.none
+                                    }
+                                    dropped(event) => {
+                                        if (root.group-dropped(
+                                            event.data,
+                                            group.key,
+                                            event.position.y >= self.height / 2
+                                        )) {
+                                            return DragAction.move;
+                                        }
+                                        return DragAction.none;
+                                    }
+                                }
+
+                                group-col := VerticalLayout {
+                                    padding: 12px;
+                                    spacing: 8px;
+
+                                    // -------- header row --------
+                                    HorizontalLayout {
+                                        spacing: 8px;
+
+                                        // Collapse/expand chevron + title.
+                                        Rectangle {
+                                            horizontal-stretch: 1;
+                                            height: Theme.fs(40px);
+                                            border-radius: 6px;
+                                            background: header-ta.has-hover
+                                                ? Theme.c.hover-bg : transparent;
+                                            header-ta := TouchArea {
+                                                clicked => { root.group-toggled(group.key); }
+                                            }
+                                            header-focus := FocusScope {
+                                                accessible-role: button;
+                                                accessible-label: (group.collapsed ? "Expand " : "Collapse ") + group.title;
+                                                accessible-expanded: !group.collapsed;
+                                                accessible-action-default => { root.group-toggled(group.key); }
+                                                key-pressed(event) => {
+                                                    if (event.text == Key.Return || event.text == " ") {
+                                                        root.group-toggled(group.key);
+                                                        return accept;
+                                                    }
+                                                    return reject;
+                                                }
+                                            }
+                                            HorizontalLayout {
+                                                padding-left: 4px;
+                                                padding-right: 4px;
+                                                spacing: 8px;
+                                                Text {
+                                                    text: group.collapsed ? "▸" : "▾";
+                                                    color: Theme.c.text-soft;
+                                                    font-size: Theme.fs(11px);
+                                                    width: Theme.fs(12px);
+                                                    vertical-alignment: center;
+                                                }
+                                                Text {
+                                                    text: group.icon;
+                                                    color: group.kind == 0 ? Theme.c.accent
+                                                        : group.kind == 1 ? Theme.c.text-soft
+                                                        : group.kind == 2 ? Theme.c.warn
+                                                        : group.kind == 3 ? Theme.c.ok
+                                                        : group.kind == 4 ? Theme.c.err
+                                                        : Theme.c.accent-tint;
+                                                    font-size: Theme.fs(14px);
+                                                    vertical-alignment: center;
+                                                }
+                                                VerticalLayout {
+                                                    alignment: center;
+                                                    spacing: 2px;
+                                                    horizontal-stretch: 1;
+                                                    HorizontalLayout {
+                                                        spacing: 8px;
+                                                        alignment: start;
+                                                        Text {
+                                                            text: group.title;
+                                                            color: Theme.c.text-hi;
+                                                            font-size: Theme.fs(14px);
+                                                            font-weight: 700;
+                                                            vertical-alignment: center;
+                                                            overflow: elide;
+                                                        }
+                                                        // Count badge.
+                                                        Rectangle {
+                                                            width: count-text.preferred-width + Theme.fs(12px);
+                                                            height: Theme.fs(18px);
+                                                            border-radius: self.height / 2;
+                                                            background: Theme.c.pill-bg;
+                                                            count-text := Text {
+                                                                width: 100%;
+                                                                height: 100%;
+                                                                text: group.prs.length;
+                                                                color: Theme.c.text-dim;
+                                                                font-size: Theme.fs(10px);
+                                                                font-weight: 700;
+                                                                horizontal-alignment: center;
+                                                                vertical-alignment: center;
+                                                            }
+                                                        }
+                                                    }
+                                                    Text {
+                                                        text: group.description;
+                                                        color: Theme.c.text-soft;
+                                                        font-size: Theme.fs(11px);
+                                                        overflow: elide;
+                                                    }
+                                                }
+                                            }
+                                        }
+
+                                        // Pointer drag handle and keyboard/
+                                        // assistive-technology position
+                                        // control. Up/Down performs the same
+                                        // adjacent moves as a pointer drop.
+                                        reorder-grip := Rectangle {
+                                            width: 22px;
+                                            height: 26px;
+                                            y: (parent.height - self.height) / 2;
+                                            border-radius: 5px;
+                                            background: reorder-ta.has-hover || reorder-focus.has-focus
+                                                ? Theme.c.border : transparent;
+                                            border-width: reorder-focus.has-focus ? 1px : 0px;
+                                            border-color: Theme.c.accent;
+
+                                            reorder-focus := FocusScope {
+                                                accessible-role: slider;
+                                                accessible-label: "Position of " + group.title;
+                                                accessible-description: "Drag or use Up and Down arrow keys to reorder";
+                                                accessible-value: "" + (group.position + 1);
+                                                accessible-value-minimum: 1;
+                                                accessible-value-maximum: group.group-count;
+                                                accessible-value-step: 1;
+                                                accessible-action-decrement => {
+                                                    if (group.position > 0) {
+                                                        root.reorder-focus-key = group.key;
+                                                        root.group-moved(group.key, -1);
+                                                    }
+                                                }
+                                                accessible-action-increment => {
+                                                    if (group.position + 1 < group.group-count) {
+                                                        root.reorder-focus-key = group.key;
+                                                        root.group-moved(group.key, 1);
+                                                    }
+                                                }
+                                                key-pressed(event) => {
+                                                    if (event.text == Key.UpArrow) {
+                                                        if (group.position > 0) {
+                                                            root.reorder-focus-key = group.key;
+                                                            root.group-moved(group.key, -1);
+                                                        }
+                                                        return accept;
+                                                    }
+                                                    if (event.text == Key.DownArrow) {
+                                                        if (group.position + 1 < group.group-count) {
+                                                            root.reorder-focus-key = group.key;
+                                                            root.group-moved(group.key, 1);
+                                                        }
+                                                        return accept;
+                                                    }
+                                                    return reject;
+                                                }
+                                                init => {
+                                                    if (root.reorder-focus-key == group.key) {
+                                                        root.reorder-focus-key = "";
+                                                        self.focus();
+                                                    }
+                                                }
+
+                                                drag-source := DragArea {
+                                                    data: root.group-drag-data(group.key);
+                                                    allow-move: true;
+                                                    reorder-ta := TouchArea {
+                                                        mouse-cursor: drag-source.dragging ? grabbing : grab;
+                                                        clicked => { reorder-focus.focus(); }
+                                                    }
+                                                }
+                                            }
+                                            Text {
+                                                width: 100%;
+                                                height: 100%;
+                                                text: "⠿";
+                                                color: Theme.c.text-soft;
+                                                font-size: Theme.fs(13px);
+                                                horizontal-alignment: center;
+                                                vertical-alignment: center;
+                                            }
+                                        }
+                                    }
+
+                                    // -------- empty state --------
+                                    if !group.collapsed && group.prs.length == 0: Rectangle {
+                                        background: Theme.c.inset-bg;
+                                        border-radius: 6px;
+                                        height: Theme.fs(44px);
+                                        Text {
+                                            width: 100%;
+                                            height: 100%;
+                                            text: group.empty-text;
+                                            color: Theme.c.text-dim;
+                                            font-size: Theme.fs(12px);
+                                            horizontal-alignment: center;
+                                            vertical-alignment: center;
+                                        }
+                                    }
+
+                                    // -------- PR rows --------
+                                    if !group.collapsed && group.prs.length > 0: VerticalLayout {
+                                        spacing: 6px;
+                                        for pr in group.prs: Rectangle {
+                                            background: Theme.c.inset-bg;
+                                            border-radius: 6px;
+                                            height: pr-row.preferred-height + 16px;
+                                            pr-row := HorizontalLayout {
+                                                padding: 8px;
+                                                spacing: 10px;
+                                                VerticalLayout {
+                                                    spacing: 5px;
+                                                    horizontal-stretch: 1;
+                                                    HorizontalLayout {
+                                                        spacing: 8px;
+                                                        // App/repo pill.
+                                                        Rectangle {
+                                                            width: app-text.preferred-width + Theme.fs(14px);
+                                                            height: Theme.fs(20px);
+                                                            border-radius: 4px;
+                                                            background: Theme.c.accent-bg;
+                                                            app-text := Text {
+                                                                width: 100%;
+                                                                height: 100%;
+                                                                text: pr.app-name;
+                                                                color: Theme.c.accent-tint;
+                                                                font-size: Theme.fs(10px);
+                                                                font-weight: 700;
+                                                                horizontal-alignment: center;
+                                                                vertical-alignment: center;
+                                                            }
+                                                        }
+                                                        Text {
+                                                            text: pr.number-label;
+                                                            color: Theme.c.text-dim;
+                                                            font-size: Theme.fs(12px);
+                                                            vertical-alignment: center;
+                                                        }
+                                                        Text {
+                                                            text: pr.title;
+                                                            color: Theme.c.text-hi;
+                                                            font-size: Theme.fs(13px);
+                                                            font-weight: 700;
+                                                            vertical-alignment: center;
+                                                            overflow: elide;
+                                                            horizontal-stretch: 1;
+                                                        }
+                                                        StatusPill {
+                                                            label: pr.check-label;
+                                                            tone: pr.check-kind == 1 ? 1
+                                                                : pr.check-kind == 2 ? 2
+                                                                : pr.check-kind == 3 ? 3 : 0;
+                                                        }
+                                                        StatusPill {
+                                                            label: pr.approval-label;
+                                                            tone: pr.approval-kind == 1 ? 1
+                                                                : pr.approval-kind == 2 ? 2
+                                                                : pr.approval-kind == 3 ? 3 : 0;
+                                                        }
+                                                    }
+                                                    HorizontalLayout {
+                                                        spacing: 8px;
+                                                        alignment: start;
+                                                        // Branch name is a
+                                                        // neutral pill beside
+                                                        // the row metadata.
+                                                        Rectangle {
+                                                            width: min(
+                                                                branch-text.preferred-width + Theme.fs(16px),
+                                                                Theme.fs(220px)
+                                                            );
+                                                            height: Theme.fs(20px);
+                                                            border-radius: self.height / 2;
+                                                            background: Theme.c.pill-bg;
+                                                            branch-text := Text {
+                                                                width: 100%;
+                                                                height: 100%;
+                                                                text: pr.branch;
+                                                                color: Theme.c.text-dim;
+                                                                font-size: Theme.fs(10px);
+                                                                horizontal-alignment: center;
+                                                                vertical-alignment: center;
+                                                                overflow: elide;
+                                                            }
+                                                        }
+                                                        Text {
+                                                            text: "💬 " + pr.comments-label;
+                                                            color: Theme.c.text-soft;
+                                                            font-size: Theme.fs(11px);
+                                                            vertical-alignment: center;
+                                                        }
+                                                        Text {
+                                                            text: "· " + pr.last-comment;
+                                                            color: Theme.c.text-soft;
+                                                            font-size: Theme.fs(11px);
+                                                            vertical-alignment: center;
+                                                        }
+                                                    }
+                                                }
+                                                VerticalLayout {
+                                                    alignment: center;
+                                                    HorizontalLayout {
+                                                        spacing: 4px;
+                                                        // Existing chat: solid accent bubble.
+                                                        // No chat yet: "+" variant in the
+                                                        // muted color offers a fresh one.
+                                                        PrIconButton {
+                                                            icon: pr.has-chat ? "💬" : "＋💬";
+                                                            active: pr.has-chat;
+                                                            label: pr.has-chat
+                                                                ? "Open the chat this pull request came from"
+                                                                : "Start a new chat for this pull request";
+                                                            clicked => {
+                                                                root.chat-clicked(pr.workspace-id, pr.branch);
+                                                            }
+                                                        }
+                                                        PrCopyButton {
+                                                            payload: pr.url;
+                                                        }
+                                                        PrIconButton {
+                                                            icon: "↗";
+                                                            label: "Open the pull request in your browser";
+                                                            clicked => { root.open-url(pr.url); }
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                }
+            }
+            Rectangle { horizontal-stretch: 1; }
+        }
+    }
+}

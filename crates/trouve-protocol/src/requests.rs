@@ -376,6 +376,31 @@ pub struct PrInfo {
     pub head: String,
     pub checks: Vec<CheckRun>,
     pub reviews: Vec<PrReview>,
+    /// PR author's login.
+    #[serde(default)]
+    pub author: String,
+    /// Logins with an outstanding review request.
+    #[serde(default)]
+    pub requested_reviewers: Vec<String>,
+    /// Issue + review comments combined.
+    #[serde(default)]
+    pub comments: u64,
+    /// When the newest comment (of either kind) was posted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_comment_at: Option<chrono::DateTime<chrono::Utc>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub merged_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+/// Every dashboard-relevant PR of a workspace's origin repo: all open PRs
+/// plus those merged in the last day.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct WorkspacePrList {
+    /// Login of the authenticated GitHub user ("" when unknown) — clients
+    /// use it to spot PRs where that user's review was requested.
+    #[serde(default)]
+    pub viewer: String,
+    pub prs: Vec<PrInfo>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]

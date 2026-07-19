@@ -271,6 +271,35 @@ pub enum UiCommand {
     },
     /// Internal: a local-model search finished.
     LocalSearchLoaded(Result<Vec<trouve_protocol::LocalSearchResult>, String>),
+    /// Open the full-window pull-requests dashboard.
+    OpenPullRequests,
+    /// Leave the pull-requests dashboard (back to chat / new-chat).
+    ClosePullRequests,
+    /// Re-fetch every workspace's PRs for the dashboard.
+    RefreshPullRequests,
+    /// Internal: one workspace's dashboard fetch finished.
+    PrDashLoaded(String, Result<trouve_protocol::WorkspacePrList, String>),
+    /// Dashboard project filter changed (0 = all projects).
+    PrDashFilterPicked(i32),
+    /// Collapse/expand a dashboard group.
+    PrGroupToggled(String),
+    /// Move a dashboard group relative to another group (pointer drop).
+    PrGroupDropped {
+        key: String,
+        target_key: String,
+        after: bool,
+    },
+    /// Move a dashboard group by a signed number of positions (keyboard/AT).
+    PrGroupMoved {
+        key: String,
+        offset: i32,
+    },
+    /// Jump to the chat whose session owns this PR's branch, or start a
+    /// new chat for it when none exists.
+    PrChatClicked {
+        workspace_id: String,
+        branch: String,
+    },
     /// Open the full-window automations screen.
     OpenAutomations,
     /// Leave the automations screen (back to chat / new-chat).
@@ -496,6 +525,20 @@ struct Controller {
     prs: Vec<trouve_protocol::PrInfo>,
     pr_selected: usize,
     pr_error: String,
+    /// PR dashboard: per-workspace fetch results (viewer + PRs).
+    pr_dash: HashMap<String, trouve_protocol::WorkspacePrList>,
+    /// Per-workspace fetch failures ("workspace name: error").
+    pr_dash_errors: HashMap<String, String>,
+    /// Workspaces with a dashboard fetch in flight.
+    pr_dash_loading: HashSet<String>,
+    /// Client-local display order of the dashboard groups, persisted like
+    /// the workspace sidebar order.
+    pr_group_order: Vec<String>,
+    /// Dashboard groups the user collapsed (session-local, like the
+    /// workspace tree's collapse state).
+    pr_collapsed: HashSet<String>,
+    /// Project filter: the selected workspace id (None = all projects).
+    pr_dash_filter: Option<String>,
 
     vms: HashMap<String, ThreadViewModel>,
     followed: HashSet<String>,
@@ -664,6 +707,12 @@ pub async fn run(
         prs: Vec::new(),
         pr_selected: 0,
         pr_error: String::new(),
+        pr_dash: HashMap::new(),
+        pr_dash_errors: HashMap::new(),
+        pr_dash_loading: HashSet::new(),
+        pr_group_order: crate::winstate::load_pr_group_order(),
+        pr_collapsed: HashSet::new(),
+        pr_dash_filter: None,
         vms: HashMap::new(),
         followed: HashSet::new(),
         thread_sessions: HashMap::new(),
@@ -1239,7 +1288,7 @@ impl Controller {
     }
 
     fn drop_workspace(&mut self, workspace_id: &str, target_id: &str, after: bool) {
-        if reorder_workspace(&mut self.workspace_order, workspace_id, target_id, after) {
+        if reorder_id(&mut self.workspace_order, workspace_id, target_id, after) {
             self.save_workspace_order();
             self.push_nav();
         }
@@ -2089,6 +2138,197 @@ impl Controller {
             items,
             self.pr_selected,
         );
+    }
+
+    // --- PR dashboard --------------------------------------------------------
+
+    /// Kick off a dashboard fetch for every workspace (results land as
+    /// `PrDashLoaded`, one per workspace) and repaint with what's known.
+    fn refresh_pr_dashboard(&mut self) {
+        if self.github_configured {
+            for ws in &self.workspaces {
+                if !self.pr_dash_loading.insert(ws.id.clone()) {
+                    continue; // Already in flight.
+                }
+                self.pr_dash_errors.remove(&ws.id);
+                let client = self.client.clone();
+                let tx = self.tx.clone();
+                let workspace_id = ws.id.clone();
+                tokio::spawn(async move {
+                    let result = client
+                        .workspace_prs(&workspace_id)
+                        .await
+                        .map_err(|e| format!("{e:#}"));
+                    let _ = tx.send(UiCommand::PrDashLoaded(workspace_id, result));
+                });
+            }
+        }
+        self.push_pr_dashboard();
+    }
+
+    /// Rebuild the dashboard view: reconcile the persisted group order,
+    /// classify every fetched PR into exactly one group, and push.
+    fn push_pr_dashboard(&mut self) {
+        if reconcile_pr_group_order(&mut self.pr_group_order) {
+            crate::winstate::save_pr_group_order(&self.pr_group_order);
+        }
+        if self
+            .pr_dash_filter
+            .as_ref()
+            .is_some_and(|selected| !self.workspaces.iter().any(|ws| ws.id == *selected))
+        {
+            self.pr_dash_filter = None;
+        }
+
+        let mut projects = vec!["All projects".to_string()];
+        projects.extend(self.workspaces.iter().map(|w| w.name.clone()));
+        let filter_index = self
+            .pr_dash_filter
+            .as_ref()
+            .and_then(|id| self.workspaces.iter().position(|w| w.id == *id))
+            .map(|i| i as i32 + 1)
+            .unwrap_or(0);
+
+        let now = chrono::Utc::now();
+        // Rows carry a sort key: merge recency for the merged group, PR
+        // number (a proxy for recency) elsewhere — newest first either way.
+        let mut rows: HashMap<&'static str, Vec<(i64, ui::PrRowView)>> = HashMap::new();
+        for ws in &self.workspaces {
+            if self.pr_dash_filter.as_ref().is_some_and(|id| *id != ws.id) {
+                continue;
+            }
+            let Some(list) = self.pr_dash.get(&ws.id) else {
+                continue;
+            };
+            for pr in &list.prs {
+                let Some(group) = classify_pr(pr, &list.viewer, now) else {
+                    continue;
+                };
+                let (check_kind, check_label) = check_pill(&pr.checks);
+                let (approval_kind, approval_label) = approval_pill(pr);
+                let has_chat = self
+                    .sessions
+                    .iter()
+                    .any(|s| s.workspace_id == ws.id && s.branch == pr.head);
+                let sort_key = match pr.merged_at {
+                    Some(at) if group == "recently-merged" => -at.timestamp(),
+                    _ => -(pr.number as i64),
+                };
+                rows.entry(group).or_default().push((
+                    sort_key,
+                    ui::PrRowView {
+                        workspace_id: ws.id.clone(),
+                        app_name: ws.name.clone(),
+                        number_label: format!("#{}", pr.number),
+                        title: pr.title.clone(),
+                        branch: pr.head.clone(),
+                        check_kind,
+                        check_label: check_label.into(),
+                        approval_kind,
+                        approval_label: approval_label.into(),
+                        comments_label: match pr.comments {
+                            1 => "1 comment".into(),
+                            n => format!("{n} comments"),
+                        },
+                        last_comment: match (pr.comments, pr.last_comment_at) {
+                            (_, Some(at)) => format!("last comment {}", human_age(at, now)),
+                            (0, None) => "no comments yet".into(),
+                            (_, None) => "last comment time unavailable".into(),
+                        },
+                        url: pr.url.clone(),
+                        has_chat,
+                    },
+                ));
+            }
+        }
+
+        let group_count = self.pr_group_order.len() as i32;
+        let groups = self
+            .pr_group_order
+            .iter()
+            .enumerate()
+            .filter_map(|(position, key)| {
+                let def = PR_GROUPS.iter().find(|d| d.key == key)?;
+                Some(ui::PrGroupView {
+                    key: def.key.into(),
+                    title: def.title.into(),
+                    description: def.description.into(),
+                    kind: def.kind,
+                    icon: def.icon.into(),
+                    position: position as i32,
+                    group_count,
+                    collapsed: self.pr_collapsed.contains(def.key),
+                    empty_text: def.empty.into(),
+                    prs: {
+                        let mut prs = rows.remove(def.key).unwrap_or_default();
+                        prs.sort_by_key(|(key, _)| *key);
+                        prs.into_iter().map(|(_, row)| row).collect()
+                    },
+                })
+            })
+            .collect();
+
+        let mut status_parts = Vec::new();
+        if !self.pr_dash_loading.is_empty() {
+            status_parts.push("looking for pull requests…".to_string());
+        }
+        for ws in &self.workspaces {
+            if let Some(e) = self.pr_dash_errors.get(&ws.id) {
+                status_parts.push(format!("{}: {e}", ws.name));
+            }
+        }
+
+        ui::set_pr_dashboard(
+            &self.ui,
+            groups,
+            projects,
+            filter_index,
+            status_parts.join("\n"),
+            !self.workspaces.is_empty(),
+        );
+    }
+
+    fn drop_pr_group(&mut self, key: &str, target_key: &str, after: bool) {
+        if reorder_id(&mut self.pr_group_order, key, target_key, after) {
+            crate::winstate::save_pr_group_order(&self.pr_group_order);
+            self.push_pr_dashboard();
+        }
+    }
+
+    fn move_pr_group(&mut self, key: &str, offset: i32) {
+        let Some(source) = self.pr_group_order.iter().position(|k| k == key) else {
+            return;
+        };
+        let Some(last) = self.pr_group_order.len().checked_sub(1) else {
+            return;
+        };
+        let target = (source as i64 + i64::from(offset)).clamp(0, last as i64) as usize;
+        if target == source {
+            return;
+        }
+        let target_key = self.pr_group_order[target].clone();
+        self.drop_pr_group(key, &target_key, target > source);
+    }
+
+    /// The dashboard's chat button: jump to the session that owns the PR's
+    /// branch, or offer a new chat for it (workspace preselected, the PR
+    /// branch as base ref) when none exists.
+    async fn open_pr_chat(&mut self, workspace_id: &str, branch: &str) -> Result<()> {
+        if let Some(index) = self
+            .sessions
+            .iter()
+            .position(|s| s.workspace_id == workspace_id && s.branch == branch)
+        {
+            return self.select_session(index).await;
+        }
+        let workspace = self.workspaces.iter().position(|w| w.id == workspace_id);
+        self.open_new_session_screen(workspace).await?;
+        // Start the new chat from the PR's code: preselect its head branch
+        // when the local checkout knows it (falls back to HEAD otherwise).
+        if let Some(i) = self.branches.iter().position(|b| b == branch) {
+            ui::set_branches(&self.ui, self.branches.clone(), i as i32);
+        }
+        Ok(())
     }
 
     /// Record a fresh integration snapshot: per-host state plus the "any
@@ -4310,6 +4550,57 @@ impl Controller {
                     self.push_local_search(format!("search failed: {e}"));
                 }
             },
+            UiCommand::OpenPullRequests => {
+                self.refresh_pr_dashboard();
+                ui::set_center_screen(&self.ui, 5);
+            }
+            UiCommand::ClosePullRequests => {
+                ui::set_center_screen(
+                    &self.ui,
+                    match self.new_chat {
+                        None => 0,
+                        Some(NewChat::Session) => 1,
+                        Some(NewChat::Thread) => 2,
+                    },
+                );
+            }
+            UiCommand::RefreshPullRequests => self.refresh_pr_dashboard(),
+            UiCommand::PrDashLoaded(workspace_id, result) => {
+                self.pr_dash_loading.remove(&workspace_id);
+                match result {
+                    Ok(list) => {
+                        self.pr_dash.insert(workspace_id.clone(), list);
+                        self.pr_dash_errors.remove(&workspace_id);
+                    }
+                    Err(error) => {
+                        self.pr_dash_errors.insert(workspace_id.clone(), error);
+                    }
+                }
+                self.push_pr_dashboard();
+            }
+            UiCommand::PrDashFilterPicked(index) => {
+                self.pr_dash_filter = usize::try_from(index - 1)
+                    .ok()
+                    .and_then(|index| self.workspaces.get(index))
+                    .map(|workspace| workspace.id.clone());
+                self.push_pr_dashboard();
+            }
+            UiCommand::PrGroupToggled(key) => {
+                if !self.pr_collapsed.remove(&key) {
+                    self.pr_collapsed.insert(key);
+                }
+                self.push_pr_dashboard();
+            }
+            UiCommand::PrGroupDropped {
+                key,
+                target_key,
+                after,
+            } => self.drop_pr_group(&key, &target_key, after),
+            UiCommand::PrGroupMoved { key, offset } => self.move_pr_group(&key, offset),
+            UiCommand::PrChatClicked {
+                workspace_id,
+                branch,
+            } => self.open_pr_chat(&workspace_id, &branch).await?,
             UiCommand::OpenAutomations => {
                 ui::set_automations_status(&self.ui, String::new());
                 self.push_automations(); // last known list while the fetch runs
@@ -5058,39 +5349,247 @@ fn reconcile_workspace_order(order: &mut Vec<String>, workspaces: &[Workspace]) 
     removed_or_deduped || added
 }
 
-/// Move `workspace_id` immediately before/after `target_id`.
-fn reorder_workspace(
-    order: &mut Vec<String>,
-    workspace_id: &str,
-    target_id: &str,
-    after: bool,
-) -> bool {
-    if workspace_id == target_id {
+/// Move `id` immediately before/after `target_id` in an ordered id list
+/// (workspace sidebar order, PR dashboard group order).
+fn reorder_id(order: &mut Vec<String>, id: &str, target_id: &str, after: bool) -> bool {
+    if id == target_id {
         return false;
     }
-    let Some(source) = order.iter().position(|id| id == workspace_id) else {
+    let Some(source) = order.iter().position(|entry| entry == id) else {
         return false;
     };
-    if !order.iter().any(|id| id == target_id) {
+    if !order.iter().any(|entry| entry == target_id) {
         return false;
     }
 
-    let workspace = order.remove(source);
+    let moved = order.remove(source);
     let target = order
         .iter()
-        .position(|id| id == target_id)
-        .expect("target was validated before removing a different workspace");
+        .position(|entry| entry == target_id)
+        .expect("target was validated before removing a different id");
     let destination = target + usize::from(after);
-    order.insert(destination, workspace);
+    order.insert(destination, moved);
     source != destination
+}
+
+/// Static definition of one PR dashboard group.
+struct PrGroupDef {
+    key: &'static str,
+    title: &'static str,
+    description: &'static str,
+    icon: &'static str,
+    /// Icon tint (see PrGroupItem.kind in the Slint screen).
+    kind: i32,
+    empty: &'static str,
+}
+
+/// The dashboard's groups in default order. `key` is the stable id the
+/// persisted order, collapse state, and reorder callbacks use.
+const PR_GROUPS: [PrGroupDef; 6] = [
+    PrGroupDef {
+        key: "review-requested",
+        title: "Review Requested",
+        description: "Pull requests where your review has been requested.",
+        icon: "◉",
+        kind: 0,
+        empty: "No reviews waiting on you.",
+    },
+    PrGroupDef {
+        key: "drafts",
+        title: "Drafts",
+        description: "Open pull requests still marked as drafts.",
+        icon: "✎",
+        kind: 1,
+        empty: "No draft pull requests right now.",
+    },
+    PrGroupDef {
+        key: "pending-review",
+        title: "Pending Review",
+        description: "Open pull requests with reviewers assigned, waiting on their review.",
+        icon: "◐",
+        kind: 2,
+        empty: "Nothing is waiting on review.",
+    },
+    PrGroupDef {
+        key: "ready-to-merge",
+        title: "Ready to Merge",
+        description: "Fully approved pull requests with every check passing.",
+        icon: "✓",
+        kind: 3,
+        empty: "Nothing is ready to merge yet.",
+    },
+    PrGroupDef {
+        key: "needs-attention",
+        title: "Needs Attention",
+        description: "Pull requests with failing checks or changes requested.",
+        icon: "⚠",
+        kind: 4,
+        empty: "Nothing needs attention — all clear.",
+    },
+    PrGroupDef {
+        key: "recently-merged",
+        title: "Recently Merged",
+        description: "Pull requests merged in the last 24 hours.",
+        icon: "⇥",
+        kind: 5,
+        empty: "Nothing merged in the last 24 hours.",
+    },
+];
+
+/// Drop unknown keys from a saved dashboard group order and append any
+/// missing groups in canonical order. Returns true if the order changed.
+fn reconcile_pr_group_order(order: &mut Vec<String>) -> bool {
+    let mut seen = HashSet::new();
+    let original_len = order.len();
+    order.retain(|key| PR_GROUPS.iter().any(|d| d.key == key) && seen.insert(key.clone()));
+    let removed = order.len() != original_len;
+    let mut added = false;
+    for def in &PR_GROUPS {
+        if seen.insert(def.key.to_string()) {
+            order.push(def.key.to_string());
+            added = true;
+        }
+    }
+    removed || added
+}
+
+/// Review states arrive as octocrab's lowercased Debug names, so
+/// ChangesRequested shows up as "changesrequested".
+fn normalized_review_state(state: &str) -> &'static str {
+    match state {
+        "approved" => "approved",
+        "changesrequested" | "changes_requested" => "changes_requested",
+        "dismissed" => "dismissed",
+        _ => "other",
+    }
+}
+
+/// Latest verdict per reviewer: true = approved, false = changes
+/// requested. Comments don't change a verdict; a dismissal clears it.
+fn review_verdicts(reviews: &[trouve_protocol::PrReview]) -> HashMap<&str, bool> {
+    let mut latest: HashMap<&str, bool> = HashMap::new();
+    for review in reviews {
+        match normalized_review_state(&review.state) {
+            "approved" => {
+                latest.insert(&review.reviewer, true);
+            }
+            "changes_requested" => {
+                latest.insert(&review.reviewer, false);
+            }
+            "dismissed" => {
+                latest.remove(review.reviewer.as_str());
+            }
+            _ => {}
+        }
+    }
+    latest
+}
+
+/// Check pill: (kind, label) with kind 0 no checks / 1 passing /
+/// 2 running / 3 failing.
+fn check_pill(checks: &[trouve_protocol::CheckRun]) -> (i32, &'static str) {
+    if checks.is_empty() {
+        return (0, "no checks");
+    }
+    let failing = checks.iter().any(|c| {
+        matches!(
+            c.conclusion.as_deref(),
+            Some(
+                "failure"
+                    | "timed_out"
+                    | "cancelled"
+                    | "action_required"
+                    | "startup_failure"
+                    | "stale"
+            )
+        )
+    });
+    if failing {
+        return (3, "checks failing");
+    }
+    if checks
+        .iter()
+        .any(|c| c.status != "completed" || c.conclusion.is_none())
+    {
+        return (2, "checks running");
+    }
+    (1, "checks passing")
+}
+
+/// Approval pill: (kind, label) with kind 0 no reviews / 1 approved /
+/// 2 pending / 3 changes requested. "Approved" means at least one
+/// approval, no changes requested, and no outstanding review requests.
+fn approval_pill(pr: &trouve_protocol::PrInfo) -> (i32, &'static str) {
+    let verdicts = review_verdicts(&pr.reviews);
+    let approvals = verdicts.values().filter(|approved| **approved).count();
+    if verdicts.values().any(|approved| !approved) {
+        (3, "changes requested")
+    } else if approvals > 0 && pr.requested_reviewers.is_empty() {
+        (1, "approved")
+    } else if approvals > 0 || !pr.requested_reviewers.is_empty() {
+        (2, "review pending")
+    } else {
+        (0, "no reviews")
+    }
+}
+
+/// Which dashboard group a PR lands in (None = not shown). Merged PRs
+/// first, then the viewer's own review inbox, then drafts, then problem
+/// states — each PR appears in exactly one group.
+fn classify_pr(
+    pr: &trouve_protocol::PrInfo,
+    viewer: &str,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Option<&'static str> {
+    if pr.state == "merged" {
+        let recent = pr
+            .merged_at
+            .is_some_and(|at| now.signed_duration_since(at) <= chrono::Duration::hours(24));
+        return recent.then_some("recently-merged");
+    }
+    if pr.state != "open" {
+        return None;
+    }
+    if !viewer.is_empty() && pr.requested_reviewers.iter().any(|r| r == viewer) {
+        return Some("review-requested");
+    }
+    if pr.draft {
+        return Some("drafts");
+    }
+    let (check_kind, _) = check_pill(&pr.checks);
+    let (approval_kind, _) = approval_pill(pr);
+    if check_kind == 3 || approval_kind == 3 {
+        return Some("needs-attention");
+    }
+    if approval_kind == 1 && check_kind == 1 {
+        return Some("ready-to-merge");
+    }
+    (!pr.requested_reviewers.is_empty() || !pr.reviews.is_empty()).then_some("pending-review")
+}
+
+/// Coarse relative age for the dashboard's comment timestamps
+/// ("just now", "45 mins ago", "1 day ago").
+fn human_age(from: chrono::DateTime<chrono::Utc>, now: chrono::DateTime<chrono::Utc>) -> String {
+    let mins = now.signed_duration_since(from).num_minutes().max(0);
+    match mins {
+        0 => "just now".into(),
+        1 => "1 min ago".into(),
+        m if m < 60 => format!("{m} mins ago"),
+        m if m < 120 => "1 hour ago".into(),
+        m if m < 60 * 24 => format!("{} hours ago", m / 60),
+        m if m < 60 * 48 => "1 day ago".into(),
+        m => format!("{} days ago", m / (60 * 24)),
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        download_progress, human_rate, reconcile_workspace_order, reorder_workspace, session_title,
+        approval_pill, check_pill, classify_pr, download_progress, human_age, human_rate,
+        reconcile_pr_group_order, reconcile_workspace_order, reorder_id, session_title,
     };
-    use trouve_protocol::Workspace;
+    use chrono::{Duration, TimeZone, Utc};
+    use trouve_protocol::{CheckRun, PrInfo, PrReview, Workspace};
 
     fn workspaces(ids: &[&str]) -> Vec<Workspace> {
         ids.iter()
@@ -5120,11 +5619,158 @@ mod tests {
     #[test]
     fn workspace_reorder_supports_before_and_after_drops() {
         let mut order = vec!["a".into(), "b".into(), "c".into(), "d".into()];
-        assert!(reorder_workspace(&mut order, "a", "c", true));
+        assert!(reorder_id(&mut order, "a", "c", true));
         assert_eq!(order, ["b", "c", "a", "d"]);
-        assert!(reorder_workspace(&mut order, "d", "b", false));
+        assert!(reorder_id(&mut order, "d", "b", false));
         assert_eq!(order, ["d", "b", "c", "a"]);
-        assert!(!reorder_workspace(&mut order, "d", "d", false));
+        assert!(!reorder_id(&mut order, "d", "d", false));
+    }
+
+    #[test]
+    fn pr_group_order_reconciles_saved_keys() {
+        let mut order = vec![
+            "ready-to-merge".into(),
+            "missing".into(),
+            "drafts".into(),
+            "ready-to-merge".into(),
+        ];
+        assert!(reconcile_pr_group_order(&mut order));
+        assert_eq!(
+            order,
+            [
+                "ready-to-merge",
+                "drafts",
+                "review-requested",
+                "pending-review",
+                "needs-attention",
+                "recently-merged",
+            ]
+        );
+        assert!(!reconcile_pr_group_order(&mut order));
+    }
+
+    fn pr() -> PrInfo {
+        PrInfo {
+            number: 42,
+            url: "https://github.com/acme/app/pull/42".into(),
+            title: "Make it better".into(),
+            state: "open".into(),
+            draft: false,
+            base: "main".into(),
+            head: "feature".into(),
+            checks: Vec::new(),
+            reviews: Vec::new(),
+            author: "author".into(),
+            requested_reviewers: Vec::new(),
+            comments: 0,
+            last_comment_at: None,
+            merged_at: None,
+        }
+    }
+
+    fn passing_check() -> CheckRun {
+        CheckRun {
+            name: "test".into(),
+            status: "completed".into(),
+            conclusion: Some("success".into()),
+        }
+    }
+
+    #[test]
+    fn pr_dashboard_classifies_each_actionable_state() {
+        let now = Utc.with_ymd_and_hms(2026, 7, 18, 12, 0, 0).unwrap();
+
+        let mut review_requested = pr();
+        review_requested.requested_reviewers.push("viewer".into());
+        assert_eq!(
+            classify_pr(&review_requested, "viewer", now),
+            Some("review-requested")
+        );
+
+        let mut draft = pr();
+        draft.draft = true;
+        assert_eq!(classify_pr(&draft, "viewer", now), Some("drafts"));
+
+        let mut pending = pr();
+        pending.requested_reviewers.push("reviewer".into());
+        assert_eq!(classify_pr(&pending, "viewer", now), Some("pending-review"));
+
+        let mut ready = pr();
+        ready.checks.push(passing_check());
+        ready.reviews.push(PrReview {
+            reviewer: "reviewer".into(),
+            state: "approved".into(),
+        });
+        assert_eq!(classify_pr(&ready, "viewer", now), Some("ready-to-merge"));
+
+        let mut failing = pr();
+        failing.checks.push(CheckRun {
+            name: "test".into(),
+            status: "completed".into(),
+            conclusion: Some("failure".into()),
+        });
+        assert_eq!(
+            classify_pr(&failing, "viewer", now),
+            Some("needs-attention")
+        );
+
+        let mut merged = pr();
+        merged.state = "merged".into();
+        merged.merged_at = Some(now - Duration::hours(23));
+        assert_eq!(classify_pr(&merged, "viewer", now), Some("recently-merged"));
+        merged.merged_at = Some(now - Duration::hours(25));
+        assert_eq!(classify_pr(&merged, "viewer", now), None);
+
+        // Open PRs with no assigned reviewer don't fit the requested groups.
+        assert_eq!(classify_pr(&pr(), "viewer", now), None);
+    }
+
+    #[test]
+    fn ready_to_merge_requires_approval_and_passing_checks() {
+        let mut approved = pr();
+        approved.reviews.push(PrReview {
+            reviewer: "reviewer".into(),
+            state: "approved".into(),
+        });
+        assert_eq!(approval_pill(&approved), (1, "approved"));
+        assert_eq!(check_pill(&approved.checks), (0, "no checks"));
+
+        let now = Utc.with_ymd_and_hms(2026, 7, 18, 12, 0, 0).unwrap();
+        assert_eq!(
+            classify_pr(&approved, "viewer", now),
+            Some("pending-review")
+        );
+        approved.checks.push(passing_check());
+        assert_eq!(
+            classify_pr(&approved, "viewer", now),
+            Some("ready-to-merge")
+        );
+
+        approved.checks[0].conclusion = Some("stale".into());
+        assert_eq!(check_pill(&approved.checks), (3, "checks failing"));
+    }
+
+    #[test]
+    fn changes_requested_wins_over_an_earlier_approval() {
+        let mut reviewed = pr();
+        reviewed.reviews.extend([
+            PrReview {
+                reviewer: "reviewer".into(),
+                state: "approved".into(),
+            },
+            PrReview {
+                reviewer: "reviewer".into(),
+                state: "changesrequested".into(),
+            },
+        ]);
+        assert_eq!(approval_pill(&reviewed), (3, "changes requested"));
+    }
+
+    #[test]
+    fn relative_comment_age_uses_approachable_units() {
+        let now = Utc.with_ymd_and_hms(2026, 7, 18, 12, 0, 0).unwrap();
+        assert_eq!(human_age(now - Duration::minutes(45), now), "45 mins ago");
+        assert_eq!(human_age(now - Duration::hours(24), now), "1 day ago");
     }
 
     #[test]

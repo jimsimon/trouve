@@ -17,6 +17,7 @@ import {
     SubscriptionItem, ModeItem, LocalModelItem, LocalSearchItem, GithubHostItem
 } from "settings-window.slint";
 import { AutomationsScreen, AutomationItem, AutomationTemplateItem } from "automations-screen.slint";
+import { PullRequestsScreen, PrGroupItem, PrRowItem } from "pull-requests-screen.slint";
 import { ConnectivityBanner } from "connectivity-banner.slint";
 import { ScrollKeys } from "scroll-keys.slint";
 import { Theme, ThemePalette } from "theme.slint";
@@ -25,7 +26,8 @@ import { Palette } from "std-widgets.slint";
 // Theme re-exported so Rust can push the selected palette.
 export {
     DiffRow, TextSegment, TermSpan, ProviderItem, CliItem, KnownProviderItem, McpServerItem,
-    SubscriptionItem, ModeItem, LocalModelItem, LocalSearchItem, AutomationItem, GithubHostItem
+    SubscriptionItem, ModeItem, LocalModelItem, LocalSearchItem, AutomationItem, GithubHostItem,
+    PrGroupItem, PrRowItem
 }
 export { Theme, ThemePalette }
 
@@ -1119,8 +1121,30 @@ export component AppWindow inherits Window {
 
     // --- center column ---------------------------------------------------------
     // 0 chat, 1 new-session screen, 2 new-thread screen, 3 settings,
-    // 4 automations
+    // 4 automations, 5 pull requests
     in property <int> center-screen: 0;
+
+    // --- pull requests screen --------------------------------------------------
+    in property <[PrGroupItem]> pr-dash-groups;
+    in property <[string]> pr-dash-projects;
+    in-out property <int> pr-dash-project-index: 0;
+    in property <string> pr-dash-status: "";
+    in property <bool> pr-dash-has-workspaces: true;
+    // Set immediately before a keyboard move so the rebuilt repeater returns
+    // focus to the moved group's handle.
+    in-out property <string> pr-group-reorder-focus-key: "";
+    callback open-pull-requests();
+    callback close-pull-requests();
+    callback pull-requests-refresh();
+    callback pr-dash-filter-picked(/* project index; 0 = all */ int);
+    callback pr-group-toggled(/* group key */ string);
+    // Group ordering. Drag payloads stay opaque in Slint and are
+    // created/validated by the Rust host.
+    pure callback pr-group-drag-data(string) -> data-transfer;
+    pure callback pr-group-drag-acceptable(data-transfer) -> bool;
+    callback pr-group-dropped(data-transfer, /* target key */ string, /* after */ bool) -> bool;
+    callback pr-group-moved(/* group key */ string, /* signed offset */ int);
+    callback pr-chat-clicked(/* workspace id */ string, /* head branch */ string);
 
     // --- automations screen ----------------------------------------------------
     in property <[AutomationItem]> automations;
@@ -1550,8 +1574,9 @@ export component AppWindow inherits Window {
 
     HorizontalLayout {
         // Hidden (not removed — the chat list keeps its scroll state) while
-        // a full-window screen (settings, automations) is up.
-        visible: root.center-screen != 3 && root.center-screen != 4;
+        // a full-window screen (settings, automations, pull requests) is up.
+        visible: root.center-screen != 3 && root.center-screen != 4
+            && root.center-screen != 5;
 
         // ---------------- left: sessions ----------------
         Rectangle {
@@ -1563,6 +1588,34 @@ export component AppWindow inherits Window {
                 spacing: 8px;
 
                 // App-level nav (above the workspace/session tree).
+                Rectangle {
+                    height: Theme.fs(34px);
+                    border-radius: 6px;
+                    background: pull-requests-ta.has-hover ? Theme.c.hover-bg : Theme.c.raised-bg;
+                    pull-requests-ta := TouchArea {
+                        clicked => { root.open-pull-requests(); }
+                    }
+                    HorizontalLayout {
+                        padding-left: 10px;
+                        padding-right: 10px;
+                        spacing: 8px;
+                        Text {
+                            text: "⎇";
+                            color: Theme.c.text-mid;
+                            font-size: Theme.fs(14px);
+                            vertical-alignment: center;
+                        }
+                        Text {
+                            text: "Pull Requests";
+                            color: Theme.c.text-hi;
+                            font-size: Theme.fs(13px);
+                            font-weight: 700;
+                            vertical-alignment: center;
+                            horizontal-stretch: 1;
+                        }
+                    }
+                }
+
                 Rectangle {
                     height: Theme.fs(34px);
                     border-radius: 6px;
@@ -4206,6 +4259,33 @@ export component AppWindow inherits Window {
                 }
             }
         }
+    }
+
+    // ---------------- pull requests screen (full-window) ----------------
+    if root.center-screen == 5: PullRequestsScreen {
+        width: 100%;
+        height: 100%;
+        groups: root.pr-dash-groups;
+        project-names: root.pr-dash-projects;
+        project-index <=> root.pr-dash-project-index;
+        status: root.pr-dash-status;
+        configured: root.pr-configured;
+        has-workspaces: root.pr-dash-has-workspaces;
+        blocked-severe: root.connectivity-severe;
+        offline-warning: root.connectivity-text;
+        online-notice: root.connectivity-notice;
+        reorder-focus-key <=> root.pr-group-reorder-focus-key;
+        close => { root.close-pull-requests(); }
+        refresh => { root.pull-requests-refresh(); }
+        filter-picked(index) => { root.pr-dash-filter-picked(index); }
+        group-toggled(key) => { root.pr-group-toggled(key); }
+        group-drag-data(key) => { root.pr-group-drag-data(key) }
+        group-drag-acceptable(data) => { root.pr-group-drag-acceptable(data) }
+        group-dropped(data, target, after) => { root.pr-group-dropped(data, target, after) }
+        group-moved(key, offset) => { root.pr-group-moved(key, offset); }
+        chat-clicked(workspace-id, branch) => { root.pr-chat-clicked(workspace-id, branch); }
+        open-url(url) => { root.open-link(url); }
+        open-integrations => { root.open-integrations-settings(); }
     }
 
     // ---------------- automations screen (full-window) ----------------

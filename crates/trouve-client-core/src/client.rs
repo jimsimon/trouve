@@ -164,6 +164,14 @@ impl ProtocolClient {
         self.get_json("/workspaces").await
     }
 
+    /// PR dashboard slice for a workspace: open PRs plus recently merged
+    /// ones, with the viewer's login. Expect several GitHub round-trips
+    /// server-side, so calls can take a few seconds.
+    pub async fn workspace_prs(&self, workspace_id: &str) -> Result<WorkspacePrList> {
+        self.get_json(&format!("/workspaces/{workspace_id}/prs"))
+            .await
+    }
+
     pub async fn workspace_branches(&self, workspace_id: &str) -> Result<BranchList> {
         self.get_json(&format!("/workspaces/{workspace_id}/branches"))
             .await

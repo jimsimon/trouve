@@ -2137,8 +2137,13 @@ impl Engine {
         &self,
         session: &trouve_protocol::Session,
     ) -> Result<crate::github::GitHub, EngineError> {
-        let worktree = PathBuf::from(&session.worktree_path);
-        let url = git::remote_url(&worktree, "origin")
+        self.github_for_checkout(&PathBuf::from(&session.worktree_path))
+    }
+
+    /// GitHub client for any checkout's origin remote (a session worktree
+    /// or a workspace root).
+    fn github_for_checkout(&self, checkout: &Path) -> Result<crate::github::GitHub, EngineError> {
+        let url = git::remote_url(checkout, "origin")
             .ok_or_else(|| EngineError::BadRequest("workspace has no 'origin' remote".into()))?;
         let (host, owner, repo) = crate::github::parse_remote(&url).ok_or_else(|| {
             EngineError::BadRequest(format!("origin is not a GitHub-style remote: {url}"))
@@ -2860,6 +2865,29 @@ impl Engine {
 
     pub fn list_workspaces(&self) -> Result<Vec<Workspace>, EngineError> {
         Ok(self.store.list_workspaces()?)
+    }
+
+    /// PR dashboard slice for one workspace: every open PR of its origin
+    /// repo plus PRs merged in the last 24 hours, with the viewer's login
+    /// so clients can spot review requests aimed at them.
+    pub async fn workspace_prs(
+        &self,
+        id: &str,
+    ) -> Result<trouve_protocol::WorkspacePrList, EngineError> {
+        let ws = self
+            .store
+            .workspace(id)?
+            .ok_or_else(|| EngineError::NotFound(format!("workspace {id}")))?;
+        let github = self.github_for_checkout(Path::new(&ws.path))?;
+        // "Who am I" failing (fine-grained token quirks, GHES) only costs
+        // the review-requested signal, not the whole dashboard.
+        let viewer = github.viewer().await.unwrap_or_default();
+        let merged_since = chrono::Utc::now() - chrono::Duration::hours(24);
+        let prs = github
+            .dashboard_prs(merged_since)
+            .await
+            .map_err(EngineError::Internal)?;
+        Ok(trouve_protocol::WorkspacePrList { viewer, prs })
     }
 
     /// Local branches of the workspace repo, for base-ref selection.
