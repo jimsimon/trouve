@@ -122,6 +122,74 @@ async fn wait_for_event(
 }
 
 #[tokio::test]
+async fn workspace_close_hides_and_reregister_reopens() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path().join("repo");
+    std::fs::create_dir(&repo).unwrap();
+    init_repo(&repo);
+
+    let store = Store::open(&tmp.path().join("db/trouve.db")).unwrap();
+    let engine = Arc::new(
+        Engine::new(store, tmp.path().join("data"), &Config::default()).with_config_dir(None),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let router = trouve_server::build_router(engine);
+    tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+    let base = format!("http://{addr}/v1");
+    let client = reqwest::Client::new();
+    let request = serde_json::json!({"path": repo.to_str().unwrap()});
+
+    let workspace: serde_json::Value = client
+        .post(format!("{base}/workspaces"))
+        .json(&request)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let workspace_id = workspace["id"].as_str().unwrap();
+
+    let response = client
+        .delete(format!("{base}/workspaces/{workspace_id}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), reqwest::StatusCode::NO_CONTENT);
+    let listed: Vec<serde_json::Value> = client
+        .get(format!("{base}/workspaces"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(listed.is_empty());
+
+    let reopened: serde_json::Value = client
+        .post(format!("{base}/workspaces"))
+        .json(&request)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(reopened["id"], workspace_id);
+    let listed: Vec<serde_json::Value> = client
+        .get(format!("{base}/workspaces"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0]["id"], workspace_id);
+}
+
+#[tokio::test]
 async fn full_turn_with_approval_checkpoint_and_undo() {
     let tmp = tempfile::tempdir().unwrap();
     let repo = tmp.path().join("repo");

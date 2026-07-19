@@ -3729,6 +3729,11 @@ impl Controller {
             Event::SessionCreated { .. } | Event::SessionDeleted { .. } => {
                 let _ = self.reload_sessions().await;
             }
+            // Workspace lifecycle is server-scoped so another app instance
+            // can keep its sidebar in sync with opens and closes here.
+            Event::WorkspaceRegistered { .. } | Event::WorkspaceClosed { .. } => {
+                let _ = self.reload_sessions().await;
+            }
             // A session started or finished processing prompts: light up or
             // dim its sidebar indicator.
             Event::SessionActivity {
