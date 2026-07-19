@@ -17,8 +17,8 @@ use trouve_client_core::client::ProtocolClient;
 use trouve_client_core::viewmodel::ThreadViewModel;
 use trouve_protocol::{
     AddLocalModelRequest, AgentMode, ApprovalDecision, CreateSessionRequest, CreateThreadRequest,
-    DirEntry, EventEnvelope, ModelInfo, PermissionMode, Session, Thread, UpdateSessionRequest,
-    UpdateThreadRequest, UpsertModeRequest, UpsertProviderRequest, Workspace,
+    DirEntry, EventEnvelope, ModelInfo, PermissionMode, Session, Thread, TodoStatus,
+    UpdateSessionRequest, UpdateThreadRequest, UpsertModeRequest, UpsertProviderRequest, Workspace,
 };
 
 use crate::render;
@@ -27,6 +27,9 @@ use crate::ui::{self, NavRowData};
 /// Right-panel tab index of the integrated terminal (see app.slint's
 /// TabWidget order: Diff, Files, Pull Requests, MCP, Terminal).
 const TERMINAL_TAB: i32 = 4;
+/// Conditional Todos panel. It sits above the stable inspection TabWidget,
+/// so showing or hiding it never changes the indices above.
+const TODOS_TAB: i32 = 5;
 
 /// Terminal scrollback the client-side screen model keeps, in lines.
 const TERM_SCROLLBACK: usize = 5000;
@@ -1672,6 +1675,7 @@ impl Controller {
         self.render_chat(false);
         self.push_context();
         self.push_queue();
+        self.push_todos();
         self.remember_position();
         self.apply_scroll_intent(force_tail);
     }
@@ -1719,6 +1723,7 @@ impl Controller {
         self.render_chat(false);
         self.push_context();
         self.push_queue();
+        self.push_todos();
         self.remember_position();
         self.apply_scroll_intent(false);
         self.refresh_usage_text().await;
@@ -1794,7 +1799,7 @@ impl Controller {
     }
 
     fn push_threads(&self) {
-        let mut tabs: Vec<(String, String)> = self
+        let mut tabs: Vec<(String, String, String)> = self
             .threads
             .iter()
             .map(|t| {
@@ -1807,9 +1812,20 @@ impl Controller {
                 // Agent-spawned children carry a fork marker so users can
                 // tell delegated work from their own tabs at a glance.
                 let marker = if t.spawned { "⑂ " } else { "" };
+                let completed = t
+                    .todos
+                    .iter()
+                    .filter(|todo| todo.status == TodoStatus::Completed)
+                    .count();
+                let progress = if t.todos.is_empty() {
+                    String::new()
+                } else {
+                    format!("{completed}/{}", t.todos.len())
+                };
                 (
                     t.id.clone(),
                     format!("{marker}{} · {}", mode, short_model(&t.model)),
+                    progress,
                 )
             })
             .collect();
@@ -1817,12 +1833,70 @@ impl Controller {
         // tab stays one click away; `current_thread` is untouched
         // underneath, making cancel a pure UI dismissal.
         let selected = if matches!(self.new_chat, Some(NewChat::Thread)) {
-            tabs.push((String::new(), "New Thread".into()));
+            tabs.push((String::new(), "New Thread".into(), String::new()));
             (tabs.len() - 1) as i32
         } else {
             self.current_thread.map(|i| i as i32).unwrap_or(-1)
         };
         ui::set_threads(&self.ui, tabs, selected);
+    }
+
+    /// Push the active thread's current todo snapshot to both persistent UI
+    /// surfaces. Selecting a thread with no todos removes the conditional
+    /// right-side tab; if it was selected, fall back to Diff first.
+    fn push_todos(&mut self) {
+        let todos = self
+            .current_thread
+            .and_then(|i| self.threads.get(i))
+            .map(|thread| thread.todos.clone())
+            .unwrap_or_default();
+        if todos.is_empty() && self.right_tab == TODOS_TAB {
+            self.right_tab = 0;
+            ui::set_right_tab(&self.ui, 0);
+        }
+        let completed = todos
+            .iter()
+            .filter(|todo| todo.status == TodoStatus::Completed)
+            .count();
+        let progress = if todos.is_empty() {
+            String::new()
+        } else {
+            format!("{completed}/{} complete", todos.len())
+        };
+        let current = todos
+            .iter()
+            .find(|todo| todo.status == TodoStatus::InProgress)
+            .map(|todo| todo.content.clone())
+            .unwrap_or_default();
+        let rows = todos
+            .into_iter()
+            .map(|todo| {
+                let status = match todo.status {
+                    TodoStatus::Pending => 0,
+                    TodoStatus::InProgress => 1,
+                    TodoStatus::Completed => 2,
+                    TodoStatus::Cancelled => 3,
+                };
+                (todo.content, status)
+            })
+            .collect();
+        ui::set_todos(&self.ui, rows, progress, current);
+    }
+
+    /// Apply a todo snapshot event to the protocol Thread copy used for tab
+    /// badges and initial state. The per-thread view model folds it too.
+    fn capture_todos(&mut self, thread_id: &str, envelope: &EventEnvelope) -> bool {
+        let trouve_protocol::Event::TodosUpdated { todos } = &envelope.event else {
+            return false;
+        };
+        if let Some(thread) = self
+            .threads
+            .iter_mut()
+            .find(|thread| thread.id == thread_id)
+        {
+            thread.todos = todos.clone();
+        }
+        true
     }
 
     /// Composer pickers mirror the current thread's mode/model.
@@ -1971,7 +2045,11 @@ impl Controller {
         if !self.followed.insert(thread_id.clone()) {
             return;
         }
-        self.vms.insert(thread_id.clone(), ThreadViewModel::new());
+        let mut vm = ThreadViewModel::new();
+        if let Some(thread) = self.threads.iter().find(|thread| thread.id == thread_id) {
+            vm.todos = thread.todos.clone();
+        }
+        self.vms.insert(thread_id.clone(), vm);
         let client = self.client.clone();
         let tx = self.tx.clone();
         // Reconnect for the lifetime of the app. The server ends the stream
@@ -4333,8 +4411,18 @@ impl Controller {
                 .await;
             }
             UiCommand::RightTabChanged(tab) => {
-                self.right_tab = tab;
-                if tab == TERMINAL_TAB {
+                self.right_tab = if tab == TODOS_TAB
+                    && self
+                        .current_thread
+                        .and_then(|i| self.threads.get(i))
+                        .is_none_or(|thread| thread.todos.is_empty())
+                {
+                    ui::set_right_tab(&self.ui, 0);
+                    0
+                } else {
+                    tab
+                };
+                if self.right_tab == TERMINAL_TAB {
                     self.ensure_terminal().await;
                 }
             }
@@ -5521,18 +5609,23 @@ impl Controller {
                 let mut changed = false;
                 let mut completed = false;
                 let mut finished = false;
-                {
-                    let vm = self.vms.entry(thread_id.clone()).or_default();
-                    for envelope in &envelopes {
-                        changed |= vm.apply(envelope).is_some();
-                        completed |=
-                            matches!(envelope.event, trouve_protocol::Event::TurnCompleted { .. });
-                        finished |= matches!(
-                            envelope.event,
-                            trouve_protocol::Event::TurnCompleted { .. }
-                                | trouve_protocol::Event::TurnFailed { .. }
-                        );
-                    }
+                let mut todos_changed = false;
+                for envelope in &envelopes {
+                    todos_changed |= self.capture_todos(&thread_id, envelope);
+                    changed |= self
+                        .vms
+                        .entry(thread_id.clone())
+                        .or_default()
+                        .apply(envelope)
+                        .is_some();
+                    completed |=
+                        matches!(envelope.event, trouve_protocol::Event::TurnCompleted { .. });
+                    finished |= matches!(
+                        envelope.event,
+                        trouve_protocol::Event::TurnCompleted { .. }
+                            | trouve_protocol::Event::TurnFailed { .. }
+                    );
+                    self.maybe_notify(&thread_id, envelope);
                 }
                 let after = self
                     .vms
@@ -5540,12 +5633,12 @@ impl Controller {
                     .map(thread_attention)
                     .unwrap_or_default();
                 let attention_changed = self.update_session_attention(&thread_id, before, after);
-                for envelope in &envelopes {
-                    self.maybe_notify(&thread_id, envelope);
-                }
                 if self.current_thread_id().as_deref() == Some(&thread_id) {
                     self.push_context();
                     self.push_queue();
+                    if todos_changed {
+                        self.push_todos();
+                    }
                     if changed {
                         self.render_chat(false);
                         self.last_delta_render = None;
@@ -5561,6 +5654,9 @@ impl Controller {
                 if attention_changed || unread_changed {
                     self.push_nav();
                 }
+                if todos_changed {
+                    self.push_threads();
+                }
                 self.push_agents_running();
             }
             UiCommand::Event(thread_id, envelope) => {
@@ -5572,6 +5668,7 @@ impl Controller {
                     .get(&thread_id)
                     .map(thread_attention)
                     .unwrap_or_default();
+                let todos_changed = self.capture_todos(&thread_id, &envelope);
                 let changed = self
                     .vms
                     .entry(thread_id.clone())
@@ -5595,6 +5692,9 @@ impl Controller {
                     // Queue contents and the idle flag both ride the event
                     // stream (queue_updated / turn.started / turn ends).
                     self.push_queue();
+                    if todos_changed {
+                        self.push_todos();
+                    }
                     if changed.is_some() {
                         // Coalesce streaming deltas: re-folding the whole
                         // transcript per token is O(n^2) over a turn. Render
@@ -5622,6 +5722,9 @@ impl Controller {
                         let _ = self.refresh_diff().await;
                         self.refresh_usage_text().await;
                     }
+                }
+                if todos_changed {
+                    self.push_threads();
                 }
                 self.maybe_notify(&thread_id, &envelope);
                 let mut nav_changed = attention_changed;
@@ -5757,6 +5860,7 @@ impl Controller {
         self.render_chat(false);
         self.push_context();
         self.push_queue();
+        self.push_todos();
         self.remember_position();
         self.apply_scroll_intent(true);
         Ok(())

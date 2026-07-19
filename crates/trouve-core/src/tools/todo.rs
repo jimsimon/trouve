@@ -1,30 +1,16 @@
 //! The agent's task list: a progress artifact the chat UI renders as a
-//! checklist. State lives per worktree for the engine's lifetime; each
-//! update's tool result carries the full list, so the transcript (and any
-//! model resuming from it) always sees the current plan.
+//! checklist. State is seeded from and persisted back to its owning thread;
+//! each update's tool result carries the full list, so the transcript (and
+//! any model resuming from it) always sees the current plan.
 
-use std::collections::HashMap;
-use std::path::PathBuf;
-use std::sync::Mutex;
-
-use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use trouve_protocol::{TodoItem, TodoStatus};
 
 use super::{Tool, ToolCtx, ToolResult};
 
 const STATUSES: [&str; 4] = ["pending", "in_progress", "completed", "cancelled"];
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct TodoItem {
-    id: String,
-    content: String,
-    status: String,
-}
-
-#[derive(Default)]
-pub struct TodoWrite {
-    lists: Mutex<HashMap<PathBuf, Vec<TodoItem>>>,
-}
+pub struct TodoWrite;
 
 #[async_trait::async_trait]
 impl Tool for TodoWrite {
@@ -32,7 +18,7 @@ impl Tool for TodoWrite {
         "todo_write"
     }
     fn description(&self) -> &'static str {
-        "Create or update your task list for this session. Use it to plan multi-step work and \
+        "Create or update your task list for this thread. Use it to plan multi-step work and \
          mark progress (statuses: pending, in_progress, completed, cancelled). With merge=true, \
          listed items update or extend the existing list by id; otherwise the list is replaced. \
          Keep at most one item in_progress."
@@ -74,19 +60,11 @@ impl Tool for TodoWrite {
                 Ok(t) => t,
                 Err(e) => return ToolResult::error(format!("bad todo item: {e}")),
             };
-            if !STATUSES.contains(&todo.status.as_str()) {
-                return ToolResult::error(format!(
-                    "bad status \"{}\" (expected one of: {})",
-                    todo.status,
-                    STATUSES.join(", ")
-                ));
-            }
             incoming.push(todo);
         }
         let merge = args.get("merge").and_then(Value::as_bool).unwrap_or(false);
 
-        let mut lists = self.lists.lock().unwrap();
-        let list = lists.entry(ctx.worktree.clone()).or_default();
+        let mut list = ctx.todos.lock().unwrap();
         if merge {
             for todo in incoming {
                 match list.iter_mut().find(|t| t.id == todo.id) {
@@ -103,14 +81,10 @@ impl Tool for TodoWrite {
 
         let done = list
             .iter()
-            .filter(|t| t.status == "completed" || t.status == "cancelled")
+            .filter(|t| matches!(t.status, TodoStatus::Completed | TodoStatus::Cancelled))
             .count();
         ToolResult::ok(json!({
-            "todos": list.iter().map(|t| json!({
-                "id": t.id,
-                "content": t.content,
-                "status": t.status,
-            })).collect::<Vec<_>>(),
+            "todos": list.clone(),
             "done": done,
             "total": list.len(),
         }))
@@ -121,9 +95,10 @@ impl Tool for TodoWrite {
 mod tests {
     use super::*;
 
-    fn ctx(tmp: &tempfile::TempDir) -> ToolCtx {
+    fn ctx(tmp: &tempfile::TempDir, thread_id: &str) -> ToolCtx {
         ToolCtx {
             worktree: tmp.path().to_path_buf(),
+            thread_id: thread_id.into(),
             ..Default::default()
         }
     }
@@ -131,11 +106,12 @@ mod tests {
     #[tokio::test]
     async fn replace_then_merge_updates_by_id() {
         let tmp = tempfile::tempdir().unwrap();
-        let tool = TodoWrite::default();
+        let tool = TodoWrite;
+        let ctx = ctx(&tmp, "th_1");
 
         let res = tool
             .run(
-                &ctx(&tmp),
+                &ctx,
                 &json!({"todos": [
                     {"id": "a", "content": "first", "status": "in_progress"},
                     {"id": "b", "content": "second", "status": "pending"},
@@ -149,7 +125,7 @@ mod tests {
         // Merge: complete "a", add "c"; "b" survives untouched.
         let res = tool
             .run(
-                &ctx(&tmp),
+                &ctx,
                 &json!({"merge": true, "todos": [
                     {"id": "a", "content": "first", "status": "completed"},
                     {"id": "c", "content": "third", "status": "pending"},
@@ -163,7 +139,7 @@ mod tests {
         // Replace resets the list.
         let res = tool
             .run(
-                &ctx(&tmp),
+                &ctx,
                 &json!({"todos": [{"id": "x", "content": "only", "status": "pending"}]}),
             )
             .await;
@@ -173,17 +149,17 @@ mod tests {
     #[tokio::test]
     async fn rejects_bad_input() {
         let tmp = tempfile::tempdir().unwrap();
-        let tool = TodoWrite::default();
+        let tool = TodoWrite;
 
-        let res = tool.run(&ctx(&tmp), &json!({})).await;
+        let res = tool.run(&ctx(&tmp, "th_1"), &json!({})).await;
         assert_eq!(res.status, trouve_protocol::ToolStatus::Error);
 
-        let res = tool.run(&ctx(&tmp), &json!({"todos": []})).await;
+        let res = tool.run(&ctx(&tmp, "th_1"), &json!({"todos": []})).await;
         assert_eq!(res.status, trouve_protocol::ToolStatus::Error);
 
         let res = tool
             .run(
-                &ctx(&tmp),
+                &ctx(&tmp, "th_1"),
                 &json!({"todos": [{"id": "a", "content": "x", "status": "doing"}]}),
             )
             .await;
@@ -192,23 +168,25 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn lists_are_scoped_per_worktree() {
-        let tmp1 = tempfile::tempdir().unwrap();
-        let tmp2 = tempfile::tempdir().unwrap();
-        let tool = TodoWrite::default();
+    async fn lists_are_scoped_per_thread_context() {
+        let tmp = tempfile::tempdir().unwrap();
+        let tool = TodoWrite;
+        let first = ctx(&tmp, "th_1");
+        let second = ctx(&tmp, "th_2");
 
         tool.run(
-            &ctx(&tmp1),
+            &first,
             &json!({"todos": [{"id": "a", "content": "one", "status": "pending"}]}),
         )
         .await;
         let res = tool
             .run(
-                &ctx(&tmp2),
+                &second,
                 &json!({"merge": true, "todos": [{"id": "b", "content": "two", "status": "pending"}]}),
             )
             .await;
-        // tmp2's merge starts from an empty list, not tmp1's.
+        // The second thread starts from an empty list despite sharing a
+        // session worktree with the first.
         assert_eq!(res.result["total"], 1);
         assert_eq!(res.result["todos"][0]["id"], "b");
     }

@@ -175,6 +175,24 @@ pub struct CreateThreadRequest {
     pub permission_mode: Option<PermissionMode>,
 }
 
+/// Progress state for one item in a thread's current todo list.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum TodoStatus {
+    Pending,
+    InProgress,
+    Completed,
+    Cancelled,
+}
+
+/// One stable item in a thread's current todo list.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct TodoItem {
+    pub id: String,
+    pub content: String,
+    pub status: TodoStatus,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct Thread {
     pub id: ThreadId,
@@ -191,6 +209,10 @@ pub struct Thread {
     /// tools) rather than the user; clients mark such threads visually.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub spawned: bool,
+    /// Current todo snapshot for this thread. Tool-call events retain the
+    /// history of how the list changed; this field is the initial-load view.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub todos: Vec<TodoItem>,
 }
 
 /// Partial thread update between turns (mode/model switching). Rejected with

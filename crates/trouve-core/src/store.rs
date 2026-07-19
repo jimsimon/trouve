@@ -39,6 +39,7 @@ CREATE TABLE IF NOT EXISTS threads (
   model TEXT NOT NULL,
   permission_mode TEXT NOT NULL,
   model_options TEXT NOT NULL DEFAULT '{}',
+  todos TEXT NOT NULL DEFAULT '[]',
   last_turn INTEGER NOT NULL DEFAULT 0,
   created_at TEXT NOT NULL
 );
@@ -136,6 +137,7 @@ const MIGRATIONS: &[&str] = &[
     "ALTER TABLE queued_prompts ADD COLUMN attachments TEXT NOT NULL DEFAULT '[]'",
     "ALTER TABLE queued_prompts ADD COLUMN claimed INTEGER NOT NULL DEFAULT 0",
     "ALTER TABLE automations ADD COLUMN permission_mode TEXT NOT NULL DEFAULT 'ask'",
+    "ALTER TABLE threads ADD COLUMN todos TEXT NOT NULL DEFAULT '[]'",
     // Context-size proxy for compaction/UI: the input tokens of the turn's
     // *last* request, not the sum over its iterations (see record_usage).
     "ALTER TABLE usage ADD COLUMN context_input_tokens INTEGER NOT NULL DEFAULT 0",
@@ -568,8 +570,9 @@ impl Store {
         model_options: &serde_json::Map<String, serde_json::Value>,
     ) -> Result<()> {
         self.conn.lock().unwrap().execute(
-            "INSERT INTO threads (id, session_id, mode, model, permission_mode, model_options, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            "INSERT INTO threads
+                (id, session_id, mode, model, permission_mode, model_options, todos, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
             params![
                 t.id,
                 t.session_id,
@@ -577,6 +580,7 @@ impl Store {
                 t.model,
                 permission_mode_str(t.permission_mode),
                 serde_json::to_string(model_options)?,
+                serde_json::to_string(&t.todos)?,
                 t.created_at.to_rfc3339()
             ],
         )?;
@@ -650,6 +654,15 @@ impl Store {
                 params![id, permission_mode_str(pm)],
             )?;
         }
+        Ok(())
+    }
+
+    /// Replace the current todo snapshot for exactly one thread.
+    pub fn update_thread_todos(&self, id: &str, todos: &[trouve_protocol::TodoItem]) -> Result<()> {
+        self.conn.lock().unwrap().execute(
+            "UPDATE threads SET todos = ?2 WHERE id = ?1",
+            params![id, serde_json::to_string(todos)?],
+        )?;
         Ok(())
     }
 
@@ -1376,7 +1389,8 @@ fn row_to_session(r: &rusqlite::Row<'_>) -> rusqlite::Result<Session> {
 
 /// Columns matching `row_to_thread`, including the agent-spawned flag.
 const THREAD_COLUMNS: &str = "id, session_id, mode, model, permission_mode, model_options, \
-     created_at, EXISTS(SELECT 1 FROM spawned_threads st WHERE st.child_thread_id = threads.id)";
+     created_at, EXISTS(SELECT 1 FROM spawned_threads st WHERE st.child_thread_id = threads.id), \
+     todos";
 
 fn row_to_thread(r: &rusqlite::Row<'_>) -> rusqlite::Result<Thread> {
     Ok(Thread {
@@ -1391,6 +1405,7 @@ fn row_to_thread(r: &rusqlite::Row<'_>) -> rusqlite::Result<Thread> {
             .parse()
             .unwrap_or_else(|_| chrono::Utc::now()),
         spawned: r.get(7)?,
+        todos: serde_json::from_str(&r.get::<_, String>(8)?).unwrap_or_default(),
     })
 }
 
@@ -1527,6 +1542,7 @@ mod tests {
             permission_mode: PermissionMode::Ask,
             created_at: chrono::Utc::now(),
             spawned: false,
+            todos: Vec::new(),
         };
         store
             .insert_thread(&thread, &serde_json::Map::new())
@@ -1559,6 +1575,7 @@ mod tests {
             permission_mode: PermissionMode::Ask,
             created_at: chrono::Utc::now(),
             spawned: true,
+            todos: Vec::new(),
         };
         store
             .insert_thread(&child, &serde_json::Map::new())
@@ -1689,10 +1706,28 @@ mod tests {
                     permission_mode: PermissionMode::Ask,
                     created_at: chrono::Utc::now(),
                     spawned: false,
+                    todos: Vec::new(),
                 },
                 &serde_json::Map::new(),
             )
             .unwrap();
+    }
+
+    #[test]
+    fn thread_todos_round_trip_without_leaking_to_siblings() {
+        let store = Store::open_in_memory().unwrap();
+        seed_thread(&store, "th_todo_1");
+        seed_thread(&store, "th_todo_2");
+        let todos = vec![trouve_protocol::TodoItem {
+            id: "build".into(),
+            content: "Build the feature".into(),
+            status: trouve_protocol::TodoStatus::InProgress,
+        }];
+
+        store.update_thread_todos("th_todo_1", &todos).unwrap();
+
+        assert_eq!(store.thread("th_todo_1").unwrap().unwrap().todos, todos);
+        assert!(store.thread("th_todo_2").unwrap().unwrap().todos.is_empty());
     }
 
     #[test]
@@ -1901,6 +1936,7 @@ mod tests {
             permission_mode: PermissionMode::Ask,
             created_at: chrono::Utc::now(),
             spawned: false,
+            todos: Vec::new(),
         };
         store
             .insert_thread(&thread, &serde_json::Map::new())

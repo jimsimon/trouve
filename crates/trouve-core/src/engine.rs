@@ -3349,6 +3349,7 @@ impl Engine {
             // Spawn parentage is recorded by the spawn tools after insert;
             // reads recompute this flag from the spawned_threads table.
             spawned: false,
+            todos: Vec::new(),
         };
         self.store.insert_thread(&thread, &model_options)?;
         self.store.append_event(
@@ -3979,6 +3980,8 @@ impl Engine {
         let worktree = PathBuf::from(&session.worktree_path);
         let ctx = ToolCtx {
             worktree: worktree.clone(),
+            thread_id: thread.id.clone(),
+            todos: Arc::new(Mutex::new(thread.todos.clone())),
             config_dir: self.config_dir.clone(),
             workspace_root: Some(PathBuf::from(&ws.path)),
         };
@@ -4644,6 +4647,92 @@ impl Engine {
             })
     }
 
+    /// Normalize a todo list from trouve's canonical shape or a supported
+    /// vendor-native tool shape.
+    fn parse_todo_snapshot(value: &serde_json::Value) -> Option<Vec<trouve_protocol::TodoItem>> {
+        if let Ok(todos) = serde_json::from_value::<Vec<trouve_protocol::TodoItem>>(value.clone()) {
+            return Some(todos);
+        }
+
+        // Claude's built-in TodoWrite omits ids and adds `activeForm`.
+        // Normalize that vendor shape at the core boundary while keeping the
+        // protocol's canonical TodoItem strict.
+        value
+            .as_array()?
+            .iter()
+            .map(|item| {
+                let content = item.get("content")?.as_str()?.to_string();
+                let status = serde_json::from_value(item.get("status")?.clone()).ok()?;
+                let id = item
+                    .get("id")
+                    .and_then(serde_json::Value::as_str)
+                    .filter(|id| !id.is_empty())
+                    .map(str::to_string)
+                    .unwrap_or_else(|| format!("vendor:{content}"));
+                Some(trouve_protocol::TodoItem {
+                    id,
+                    content,
+                    status,
+                })
+            })
+            .collect()
+    }
+
+    /// Persist a successful todo tool's authoritative result snapshot, or
+    /// its paired start arguments when a vendor only returns an acknowledgement.
+    fn persist_todos_from_result(
+        &self,
+        thread_id: &str,
+        tool: &str,
+        status: ToolStatus,
+        result: &serde_json::Value,
+        args: Option<&serde_json::Value>,
+    ) -> Result<Option<Vec<trouve_protocol::TodoItem>>> {
+        let base = tool.rsplit("__").next().unwrap_or(tool);
+        if status != ToolStatus::Ok || !matches!(base, "todo_write" | "TodoWrite") {
+            return Ok(None);
+        }
+        let result_todos = result.get("todos").and_then(Self::parse_todo_snapshot);
+        let (mut todos, merge) = match result_todos {
+            // Native trouve tools return the authoritative full snapshot,
+            // including after a merge update.
+            Some(todos) => (todos, false),
+            // Vendor-native TodoWrite tools commonly return only an
+            // acknowledgement. Their started event still carries the
+            // requested list, so use that as the snapshot fallback.
+            None => {
+                let Some(args) = args else {
+                    return Ok(None);
+                };
+                let Some(todos) = args.get("todos").and_then(Self::parse_todo_snapshot) else {
+                    return Ok(None);
+                };
+                (
+                    todos,
+                    args.get("merge")
+                        .and_then(serde_json::Value::as_bool)
+                        .unwrap_or(false),
+                )
+            }
+        };
+        if merge {
+            let mut merged = self
+                .store
+                .thread(thread_id)?
+                .map(|thread| thread.todos)
+                .unwrap_or_default();
+            for todo in todos {
+                match merged.iter_mut().find(|existing| existing.id == todo.id) {
+                    Some(existing) => *existing = todo,
+                    None => merged.push(todo),
+                }
+            }
+            todos = merged;
+        }
+        self.store.update_thread_todos(thread_id, &todos)?;
+        Ok(Some(todos))
+    }
+
     fn bridged_context(
         &self,
         thread_id: &str,
@@ -4661,6 +4750,8 @@ impl Engine {
             .unwrap_or_else(modes::fallback_mode);
         let ctx = ToolCtx {
             worktree: PathBuf::from(&session.worktree_path),
+            thread_id: thread.id.clone(),
+            todos: Arc::new(Mutex::new(thread.todos.clone())),
             config_dir: self.config_dir.clone(),
             workspace_root: Some(PathBuf::from(&ws.path)),
         };
@@ -4851,6 +4942,10 @@ impl Engine {
         let mut text = String::new();
         let mut segment = String::new();
         let mut usage_total = Usage::default();
+        // Vendor-native todo tools are reported as ordinary tool events.
+        // Remember their names until completion so their result can update
+        // the same persisted snapshot as trouve's bridged/native tool.
+        let mut tool_calls = HashMap::<String, (String, serde_json::Value)>::new();
         loop {
             let ev = tokio::select! {
                 biased;
@@ -4897,6 +4992,7 @@ impl Engine {
                     tool,
                     mut args,
                 } => {
+                    tool_calls.insert(call_id.clone(), (tool.clone(), args.clone()));
                     if !segment.is_empty() {
                         self.store.append_event(
                             scope.clone(),
@@ -4938,18 +5034,33 @@ impl Engine {
                     ok,
                     result,
                 } => {
+                    let status = if ok {
+                        ToolStatus::Ok
+                    } else {
+                        ToolStatus::Error
+                    };
+                    let todos = match tool_calls.get(&call_id) {
+                        Some((tool, args)) => self.persist_todos_from_result(
+                            &thread.id,
+                            tool,
+                            status,
+                            &result,
+                            Some(args),
+                        )?,
+                        None => None,
+                    };
                     self.store.append_event(
                         scope.clone(),
                         Event::ToolCompleted {
                             call_id,
-                            status: if ok {
-                                ToolStatus::Ok
-                            } else {
-                                ToolStatus::Error
-                            },
+                            status,
                             result,
                         },
                     )?;
+                    if let Some(todos) = todos {
+                        self.store
+                            .append_event(scope.clone(), Event::TodosUpdated { todos })?;
+                    }
                 }
                 BackendEvent::ApprovalNeeded {
                     call_id,
@@ -5473,14 +5584,25 @@ impl Engine {
         // base64 must not land in the event log or the text transcript —
         // it becomes native image input on the tool-result message instead.
         let images = take_tool_images(&mut outcome.result);
+        let todos = self.persist_todos_from_result(
+            &thread.id,
+            &call.name,
+            outcome.status,
+            &outcome.result,
+            Some(&call.arguments),
+        )?;
         self.store.append_event(
-            scope,
+            scope.clone(),
             Event::ToolCompleted {
                 call_id,
                 status: outcome.status,
                 result: outcome.result.clone(),
             },
         )?;
+        if let Some(todos) = todos {
+            self.store
+                .append_event(scope, Event::TodosUpdated { todos })?;
+        }
         Ok((outcome.result.to_string(), images))
     }
 
@@ -6757,6 +6879,115 @@ mod tests {
         ] {
             assert!(!is_loopback_base_url(url), "should not be loopback: {url}");
         }
+    }
+
+    #[tokio::test]
+    async fn todo_tool_persists_and_emits_thread_snapshot() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Store::open_in_memory().unwrap();
+        let workspace = Workspace {
+            id: "ws_todo".into(),
+            name: "todo".into(),
+            path: tmp.path().to_string_lossy().into_owned(),
+        };
+        store.insert_workspace(&workspace).unwrap();
+        let session = Session {
+            id: "se_todo".into(),
+            workspace_id: workspace.id.clone(),
+            title: "todo".into(),
+            branch: "main".into(),
+            worktree_path: tmp.path().to_string_lossy().into_owned(),
+            base_ref: "main".into(),
+            archived: false,
+            active: false,
+            created_at: chrono::Utc::now(),
+        };
+        store.insert_session(&session).unwrap();
+        let thread = Thread {
+            id: "th_todo".into(),
+            session_id: session.id.clone(),
+            mode: "code".into(),
+            model: "test/model".into(),
+            model_options: Default::default(),
+            permission_mode: trouve_protocol::PermissionMode::Ask,
+            created_at: chrono::Utc::now(),
+            spawned: false,
+            todos: Vec::new(),
+        };
+        store.insert_thread(&thread, &Default::default()).unwrap();
+        let config = Config {
+            local_enabled: Some(false),
+            ..Default::default()
+        };
+        let engine = Arc::new(Engine::new(store.clone(), tmp.path().into(), &config));
+        let ctx = ToolCtx {
+            worktree: tmp.path().into(),
+            thread_id: thread.id.clone(),
+            ..Default::default()
+        };
+        let call = trouve_providers::ToolCallRequest {
+            id: "call_todo".into(),
+            name: "todo_write".into(),
+            arguments: serde_json::json!({"todos": [
+                {"id": "one", "content": "First", "status": "in_progress"}
+            ]}),
+        };
+
+        engine
+            .handle_tool_call(
+                &session,
+                &thread,
+                1,
+                &modes::fallback_mode(),
+                &ctx,
+                &call,
+                &tokio_util::sync::CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+
+        let stored = store.thread(&thread.id).unwrap().unwrap();
+        assert_eq!(stored.todos.len(), 1);
+        assert_eq!(
+            stored.todos[0].status,
+            trouve_protocol::TodoStatus::InProgress
+        );
+        let events = store
+            .events_after(&Scope::Thread(thread.id.clone()), 0)
+            .unwrap();
+        assert!(events.iter().any(|env| matches!(
+            &env.event,
+            Event::TodosUpdated { todos }
+                if todos.len() == 1 && todos[0].id == "one"
+        )));
+
+        // Vendor-native TodoWrite completions can be an acknowledgement
+        // rather than the updated list. Fall back to the paired start args,
+        // preserving existing items when the vendor requests a merge.
+        let vendor_result = serde_json::json!("Todos updated");
+        let vendor_args = serde_json::json!({"merge": true, "todos": [
+            {"content": "Second", "activeForm": "Working on second", "status": "pending"}
+        ]});
+        let vendor_todos = engine
+            .persist_todos_from_result(
+                &thread.id,
+                "TodoWrite",
+                ToolStatus::Ok,
+                &vendor_result,
+                Some(&vendor_args),
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(vendor_todos.len(), 2);
+        assert_eq!(
+            vendor_todos[0].status,
+            trouve_protocol::TodoStatus::InProgress
+        );
+        assert_eq!(vendor_todos[1].id, "vendor:Second");
+        assert_eq!(
+            store.thread(&thread.id).unwrap().unwrap().todos,
+            vendor_todos
+        );
     }
 
     #[test]

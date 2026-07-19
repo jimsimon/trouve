@@ -70,7 +70,9 @@ pub use requests::*;
 // 0.24: ProviderInfo.category and KnownProvider.category classify model
 // sources as subscription, API, or local independently from authentication
 // (additive).
-pub const PROTOCOL_VERSION: &str = "0.24";
+// 0.25: thread-owned todo snapshots — Thread.todos provides initial state
+// and thread.todos_updated replaces it on the event stream (additive).
+pub const PROTOCOL_VERSION: &str = "0.25";
 
 pub type WorkspaceId = String;
 pub type SessionId = String;
