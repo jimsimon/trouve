@@ -1,9 +1,18 @@
 //! Cursor backend, driving `cursor-agent acp` (Agent Client Protocol).
 //!
-//! One `cursor-agent acp` child is spawned lazily and shared across threads
-//! (JSON-RPC over stdio, like Codex's app-server). Each trouve thread maps
-//! to an ACP session; turns run `session/prompt` and stream
-//! `session/update` notifications.
+//! One `cursor-agent acp` child is spawned lazily **per worktree** (JSON-RPC
+//! over stdio, like Codex's app-server) and shared by that worktree's
+//! threads. Each trouve thread maps to an ACP session; turns run
+//! `session/prompt` and stream `session/update` notifications.
+//!
+//! The child's process cwd is pinned to the worktree (`current_dir`), not
+//! just passed as the ACP session `cwd`: cursor-agent has resolved relative
+//! paths and run shell commands against its process cwd (ignoring the
+//! session cwd), which silently edited whatever checkout trouve happened to
+//! be launched from. With cwd pinned per worktree, even those fallback
+//! paths land inside the session's checkout. The pool is bounded like the
+//! Claude backend's (LRU cap + idle reaping); killing an idle child loses
+//! nothing because sessions resume via `session/load`.
 //!
 //! ACP fixes the two long-standing gaps of the old `-p --output-format
 //! stream-json` integration:
@@ -33,9 +42,11 @@
 //! refreshes `auth.json` through the sanctioned path.
 
 use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
+use std::time::{Duration, Instant};
 
 use futures::StreamExt;
 use serde_json::{Value, json};
@@ -53,7 +64,7 @@ pub struct CursorBackend {
     id: String,
     command: String,
     api_key: Option<String>,
-    server: Mutex<Option<Arc<AcpServer>>>,
+    pool: Arc<ServerPool>,
     /// `cursor/list_available_models` result, cached for [`MODELS_TTL`].
     models_cache: Mutex<Option<(std::time::Instant, Vec<ModelInfo>)>>,
     /// The CLI's credential file, read (never written) for the usage query.
@@ -64,6 +75,21 @@ pub struct CursorBackend {
 
 /// How long a fetched vendor model list stays fresh.
 const MODELS_TTL: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// Most live `cursor-agent` children kept at once (one per worktree); the
+/// least recently used idle one is evicted first.
+const SERVER_CAP: usize = 3;
+/// Idle time after which a pooled child is reaped.
+const IDLE_TIMEOUT: Duration = Duration::from_secs(300);
+/// How often the reaper scans the pool.
+const REAP_INTERVAL: Duration = Duration::from_secs(60);
+
+/// Live `cursor-agent acp` children keyed by worktree path.
+#[derive(Default)]
+struct ServerPool {
+    servers: Mutex<HashMap<PathBuf, Arc<AcpServer>>>,
+    reaper_started: AtomicBool,
+}
 
 /// Where the dashboard Connect-RPC services live (same origin the CLI and
 /// IDE talk to).
@@ -78,7 +104,7 @@ impl CursorBackend {
             id: id.into(),
             command: command.unwrap_or_else(|| "cursor-agent".into()),
             api_key,
-            server: Mutex::new(None),
+            pool: Arc::new(ServerPool::default()),
             models_cache: Mutex::new(None),
             auth_file: cli_auth_file(),
             dashboard_base: DASHBOARD_BASE.into(),
@@ -97,17 +123,71 @@ impl CursorBackend {
         self
     }
 
-    async fn server(&self) -> Result<Arc<AcpServer>, BackendError> {
-        let mut guard = self.server.lock().await;
-        if let Some(s) = guard.as_ref()
-            && !s.is_closed()
-        {
+    /// The pooled child for this worktree, spawned (cwd-pinned) on first
+    /// use. Dead children are dropped, and the least recently used idle one
+    /// is evicted while over [`SERVER_CAP`]; busy children may overflow the
+    /// cap rather than being killed mid-turn.
+    async fn server_for(&self, worktree: &Path) -> Result<Arc<AcpServer>, BackendError> {
+        self.start_reaper();
+        let mut servers = self.pool.servers.lock().await;
+        servers.retain(|_, s| !s.is_closed());
+        if let Some(s) = servers.get(worktree) {
+            s.touch();
             return Ok(s.clone());
         }
-        let s = Arc::new(AcpServer::spawn(&self.command, self.api_key.as_deref()).await?);
+        while servers.len() >= SERVER_CAP {
+            let mut lru: Option<(PathBuf, Instant)> = None;
+            for (path, s) in servers.iter() {
+                // The pool's Arc must be the only owner. This also covers
+                // the short setup window before a turn subscribes its route.
+                if Arc::strong_count(s) != 1 || !s.is_idle() {
+                    continue;
+                }
+                let used = *s.last_used.lock().unwrap();
+                if lru.as_ref().is_none_or(|(_, t)| used < *t) {
+                    lru = Some((path.clone(), used));
+                }
+            }
+            let Some((path, _)) = lru else { break }; // all busy: allow overflow
+            servers.remove(&path); // last Arc drop kills the child
+        }
+        let s = Arc::new(AcpServer::spawn(&self.command, self.api_key.as_deref(), worktree).await?);
         s.handshake().await?;
-        *guard = Some(s.clone());
+        servers.insert(worktree.to_path_buf(), s.clone());
         Ok(s)
+    }
+
+    /// Any live child, for worktree-independent requests (model listing);
+    /// spawns one in a neutral directory when the pool is empty.
+    async fn any_server(&self) -> Result<Arc<AcpServer>, BackendError> {
+        {
+            let servers = self.pool.servers.lock().await;
+            if let Some(s) = servers.values().find(|s| !s.is_closed()) {
+                s.touch();
+                return Ok(s.clone());
+            }
+        }
+        self.server_for(&std::env::temp_dir()).await
+    }
+
+    fn start_reaper(&self) {
+        if self.pool.reaper_started.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        let pool = Arc::downgrade(&self.pool);
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(REAP_INTERVAL).await;
+                let Some(pool) = pool.upgrade() else { break };
+                let mut servers = pool.servers.lock().await;
+                servers.retain(|_, s| {
+                    !(s.is_closed()
+                        || Arc::strong_count(s) == 1
+                            && s.is_idle()
+                            && s.last_used.lock().unwrap().elapsed() > IDLE_TIMEOUT)
+                });
+            }
+        });
     }
 }
 
@@ -133,7 +213,7 @@ impl AgentBackend for CursorBackend {
             }
         }
         let fetched = async {
-            let server = self.server().await?;
+            let server = self.any_server().await?;
             server
                 .request("cursor/list_available_models", json!({}))
                 .await
@@ -202,7 +282,7 @@ impl AgentBackend for CursorBackend {
     }
 
     async fn run_turn(&self, turn: BackendTurn) -> Result<BackendEventStream, BackendError> {
-        let server = self.server().await?;
+        let server = self.server_for(&turn.worktree).await?;
 
         // Resume the ACP session for this thread, or start a fresh one. A
         // failed load (e.g. server restarted and lost it) degrades to fresh.
@@ -292,7 +372,6 @@ impl AgentBackend for CursorBackend {
             route,
             prompt_rx,
             fresh_session,
-            turn.permission,
         );
         Ok(stream.boxed())
     }
@@ -579,7 +658,6 @@ fn turn_stream(
     mut route: mpsc::Receiver<ServerMsg>,
     mut prompt_rx: oneshot::Receiver<Result<Value, String>>,
     fresh_session: bool,
-    permission: BackendPermission,
 ) -> impl futures::Stream<Item = Result<BackendEvent, BackendError>> {
     async_stream(move |tx| async move {
         if fresh_session {
@@ -594,7 +672,7 @@ fn turn_stream(
             tokio::select! {
                 msg = route.recv() => {
                     let Some(msg) = msg else { break };
-                    if handle_msg(&server, msg, &tx, permission).await.is_err() {
+                    if handle_msg(&server, msg, &tx).await.is_err() {
                         // Receiver dropped (turn cancelled): stop cursor's
                         // generation instead of letting it run headless.
                         client_gone = true;
@@ -606,7 +684,7 @@ fn turn_stream(
                     // Reader delivers in wire order, so any updates sent
                     // before the response are already queued; drain them.
                     while let Ok(msg) = route.try_recv() {
-                        if handle_msg(&server, msg, &tx, permission).await.is_err() {
+                        if handle_msg(&server, msg, &tx).await.is_err() {
                             client_gone = true;
                             break;
                         }
@@ -644,7 +722,6 @@ async fn handle_msg(
     server: &AcpServer,
     msg: ServerMsg,
     tx: &mpsc::Sender<Result<BackendEvent, BackendError>>,
-    permission: BackendPermission,
 ) -> Result<(), ()> {
     match msg {
         ServerMsg::Notification { method, params } => {
@@ -680,13 +757,23 @@ async fn handle_msg(
             }
             let allow_option = permission_option(&params, true);
             let reject_option = permission_option(&params, false);
-            if matches!(permission, BackendPermission::Yolo) {
-                server.respond(id, permission_outcome(allow_option)).await;
-                return Ok(());
-            }
-            let tool_call = &params["toolCall"];
+            let mut tool_call = params["toolCall"].clone();
             let (ok_tx, ok_rx) = oneshot::channel();
             let call_id = tool_call["toolCallId"].as_str().unwrap_or("").to_string();
+            // ACP permission requests are allowed to omit rawInput. Recover
+            // it from the preceding tool_call update so the engine can
+            // validate file targets (and show the actual arguments).
+            if let Some((_, update)) = server.calls.lock().await.get(&call_id)
+                && let (Some(dst), Some(src)) = (tool_call.as_object_mut(), update.as_object())
+            {
+                for key in ["rawInput", "locations"] {
+                    if !dst.contains_key(key)
+                        && let Some(value) = src.get(key)
+                    {
+                        dst.insert(key.to_string(), value.clone());
+                    }
+                }
+            }
             tx.send(Ok(BackendEvent::ApprovalNeeded {
                 call_id,
                 tool: tool_call["kind"]
@@ -694,7 +781,7 @@ async fn handle_msg(
                     .or_else(|| tool_call["title"].as_str())
                     .unwrap_or("tool")
                     .to_string(),
-                args: tool_call.clone(),
+                args: tool_call,
                 responder: ok_tx,
             }))
             .await
@@ -1040,19 +1127,27 @@ struct AcpServer {
     /// session-less request (answered by the reader); the stashed content
     /// becomes the plan tool's result when its completion update lands.
     plans: Arc<Mutex<HashMap<String, Value>>>,
-    /// Tool call id → session id, recorded from `session/update`
-    /// notifications: session-less requests like `cursor/ask_question` only
-    /// carry a toolCallId, so this is how they find their session's route.
-    calls: Arc<Mutex<HashMap<String, String>>>,
+    /// Tool call id → (session id, full update), recorded from
+    /// `session/update` notifications: session-less requests like
+    /// `cursor/ask_question` find their route here, and permission requests
+    /// recover rawInput when cursor omits it.
+    calls: Arc<Mutex<HashMap<String, (String, Value)>>>,
     /// Held so the child (kill_on_drop) lives as long as the server handle.
     _child: Child,
-    closed: Arc<std::sync::atomic::AtomicBool>,
+    closed: Arc<AtomicBool>,
+    /// When the pool last handed this child to a turn; feeds idle reaping.
+    last_used: std::sync::Mutex<Instant>,
 }
 
 impl AcpServer {
-    async fn spawn(command: &str, api_key: Option<&str>) -> Result<Self, BackendError> {
+    async fn spawn(command: &str, api_key: Option<&str>, cwd: &Path) -> Result<Self, BackendError> {
         let mut cmd = tokio::process::Command::new(command);
         cmd.arg("acp");
+        // The ACP session `cwd` should govern, but cursor-agent falls back
+        // to the process cwd for some path resolution — pin it so those
+        // fallbacks stay inside the worktree instead of wherever trouve was
+        // launched from.
+        cmd.current_dir(cwd);
         if let Some(key) = api_key {
             cmd.env("CURSOR_API_KEY", key);
         }
@@ -1079,7 +1174,8 @@ impl AcpServer {
             plans: Arc::new(Mutex::new(HashMap::new())),
             calls: Arc::new(Mutex::new(HashMap::new())),
             _child: child,
-            closed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            closed: Arc::new(AtomicBool::new(false)),
+            last_used: std::sync::Mutex::new(Instant::now()),
         };
         server.start_reader(stdout);
         Ok(server)
@@ -1087,6 +1183,20 @@ impl AcpServer {
 
     fn is_closed(&self) -> bool {
         self.closed.load(Ordering::Relaxed)
+    }
+
+    fn touch(&self) {
+        *self.last_used.lock().unwrap() = Instant::now();
+    }
+
+    /// No turn is streaming from this child (turns hold a route for their
+    /// whole duration). `try_lock` failing means someone is mid-(un)subscribe,
+    /// which counts as busy.
+    fn is_idle(&self) -> bool {
+        self.routes
+            .try_lock()
+            .map(|r| r.is_empty())
+            .unwrap_or(false)
     }
 
     fn start_reader(&self, stdout: tokio::process::ChildStdout) {
@@ -1152,15 +1262,30 @@ impl AcpServer {
                         && !session_id.is_empty()
                         && let Some(call_id) = params["update"]["toolCallId"].as_str()
                     {
+                        let update = params["update"].clone();
                         let mut calls = calls.lock().await;
-                        calls.insert(call_id.to_string(), session_id.clone());
-                        if calls.len() > 4096 {
-                            calls.clear(); // crude bound; live calls re-register
+                        if calls.len() >= 4096 && !calls.contains_key(call_id) {
+                            calls.clear(); // bound old calls; keep this live one below
+                        }
+                        let entry = calls
+                            .entry(call_id.to_string())
+                            .or_insert_with(|| (session_id.clone(), json!({})));
+                        entry.0.clone_from(&session_id);
+                        // Preserve rawInput from the initial tool_call when
+                        // later in-progress updates omit it.
+                        if let (Some(stored), Some(incoming)) =
+                            (entry.1.as_object_mut(), update.as_object())
+                        {
+                            for (key, value) in incoming {
+                                stored.insert(key.clone(), value.clone());
+                            }
+                        } else {
+                            entry.1 = update;
                         }
                     }
                     if session_id.is_empty()
                         && let Some(call_id) = params["toolCallId"].as_str()
-                        && let Some(owner) = calls.lock().await.get(call_id)
+                        && let Some((owner, _)) = calls.lock().await.get(call_id)
                     {
                         session_id = owner.clone();
                     }
@@ -1339,6 +1464,8 @@ impl AcpServer {
 
     async fn unsubscribe(&self, session_id: &str) {
         self.routes.lock().await.remove(session_id);
+        // Idle time counts from the end of the last turn.
+        self.touch();
     }
 }
 

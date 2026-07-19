@@ -1750,6 +1750,31 @@ async fn backend_turns_bridge_approvals_resume_sessions_and_checkpoint() {
     let text = verdict["result"]["content"][0]["text"].as_str().unwrap();
     assert!(text.contains("\"behavior\":\"allow\""), "{verdict}");
 
+    // Worktree confinement still applies in yolo mode. Vendor file tools
+    // auto-approve inside the session checkout but an absolute target in
+    // the main repo (or anywhere else) is denied before execution.
+    let verdict = mcp(serde_json::json!({
+        "jsonrpc": "2.0", "id": 5, "method": "tools/call",
+        "params": {"name": "approval_prompt",
+                   "arguments": {"tool_name": "Write", "input": {
+                       "file_path": Path::new(&worktree).join("safe.txt")
+                   }}}
+    }))
+    .await;
+    let text = verdict["result"]["content"][0]["text"].as_str().unwrap();
+    assert!(text.contains("\"behavior\":\"allow\""), "{verdict}");
+
+    let verdict = mcp(serde_json::json!({
+        "jsonrpc": "2.0", "id": 6, "method": "tools/call",
+        "params": {"name": "approval_prompt",
+                   "arguments": {"tool_name": "Write", "input": {
+                       "file_path": repo.join("escaped.txt")
+                   }}}
+    }))
+    .await;
+    let text = verdict["result"]["content"][0]["text"].as_str().unwrap();
+    assert!(text.contains("\"behavior\":\"deny\""), "{verdict}");
+
     // CLI-kind provider CRUD: upsert reports auth "cli"; login relays the
     // vendor flow (here: a bogus binary, so it fails with 400).
     let provider: serde_json::Value = client

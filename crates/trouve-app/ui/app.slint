@@ -49,6 +49,14 @@ export struct NavRow {
     expanded: bool,
     // Session is processing a prompt right now (pulsing indicator).
     busy: bool,
+    // Completed/failed work landed while the session was not being viewed.
+    unread: bool,
+    // 0 none, 1 open, 2 draft, 3 merged, 4 closed, 5 multiple.
+    pr-kind: int,
+    pr-tooltip: string,
+    // 0 none, 1 approval, 2 question, 3 both.
+    attention-kind: int,
+    attention-tooltip: string,
     // Workspace headers: this workspace shows its archived sessions.
     show-archived: bool,
 }
@@ -1673,6 +1681,9 @@ export component AppWindow inherits Window {
                     // hover-out; drop any tooltip it left behind.
                     changed viewport-y => { Tip.hide-all(); }
                     for row[idx] in root.nav-rows: Rectangle {
+                        // Match the chat pane's right-side gutter so the
+                        // scrollbar never covers trailing row controls.
+                        width: parent.width - 18px;
                         height: Theme.fs(row.kind == 1 ? 52px : row.kind == 0 ? 34px : 30px);
                         background: row.kind == 0
                             ? (row-ta.has-hover ? Theme.c.hover-bg : Theme.c.raised-bg)
@@ -1962,12 +1973,16 @@ export component AppWindow inherits Window {
                             // name: a pulsing accent dot while any of the
                             // session's threads runs a turn. Always present
                             // so titles align whether busy or not.
-                            Rectangle {
-                                width: 14px;
+                            activity-slot := Rectangle {
+                                width: 16px;
                                 if row.busy: Rectangle {
                                     width: 7px;
                                     height: 7px;
-                                    x: (parent.width - self.width) / 2;
+                                    // Refer to the fixed slot explicitly: an
+                                    // `if` element has an implementation
+                                    // wrapper, so `parent.width` is not a
+                                    // reliable centering anchor here.
+                                    x: (activity-slot.width - self.width) / 2;
                                     y: (parent.height - self.height) / 2;
                                     border-radius: 3.5px;
                                     background: Theme.c.accent;
@@ -1993,14 +2008,58 @@ export component AppWindow inherits Window {
                                     overflow: elide;
                                 }
                             }
-                            IconButton {
-                                width: 26px;
-                                height: 100%;
-                                icon: "⋯";
+                            if row.attention-kind != 0: IconButton {
+                                width: 22px;
+                                height: 28px;
+                                y: (parent.height - self.height) / 2;
+                                icon: row.attention-kind == 2 ? "?" : "!";
+                                icon-size: Theme.fs(13px);
+                                icon-color: Theme.c.warn;
+                                hover-icon-color: Theme.c.warn;
+                                hover-bg: Theme.c.warn-bg;
+                                tip: row.attention-tooltip;
+                                clicked => { root.nav-row-clicked(idx); }
+                            }
+                            if row.unread: IconButton {
+                                width: 18px;
+                                height: 28px;
+                                y: (parent.height - self.height) / 2;
+                                icon: "●";
+                                icon-size: Theme.fs(8px);
+                                icon-color: Theme.c.accent;
+                                hover-icon-color: Theme.c.accent-hover;
+                                hover-bg: transparent;
+                                tip: "Unviewed work";
+                                clicked => { root.nav-row-clicked(idx); }
+                            }
+                            if row.pr-kind != 0: IconButton {
+                                width: 22px;
+                                height: 28px;
+                                y: (parent.height - self.height) / 2;
+                                // Unicode's OCR fork is a compact,
+                                // font-portable approximation of the
+                                // familiar pull-request branch icon.
+                                icon: "⑂";
                                 icon-size: Theme.fs(15px);
+                                icon-color: row.pr-kind == 1 ? Theme.c.ok
+                                    : row.pr-kind == 2 ? Theme.c.text-dim
+                                    : row.pr-kind == 3 ? Theme.c.accent
+                                    : row.pr-kind == 4 ? Theme.c.err
+                                    : Theme.c.text-mid;
+                                hover-icon-color: self.icon-color;
+                                hover-bg: Theme.c.hover-bg;
+                                tip: row.pr-tooltip;
+                                clicked => { root.nav-row-clicked(idx); }
+                            }
+                            IconButton {
+                                width: 30px;
+                                height: 30px;
+                                y: (parent.height - self.height) / 2;
+                                icon: "•••";
+                                icon-size: Theme.fs(9px);
                                 icon-color: Theme.c.text-disabled;
                                 hover-icon-color: Theme.c.text-hi;
-                                hover-bg: transparent;
+                                hover-bg: Theme.c.hover-bg;
                                 tip: "Session actions";
                                 clicked => { row-menu.show(); }
                             }

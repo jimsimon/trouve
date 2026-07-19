@@ -29,6 +29,17 @@ pub struct NavRowData {
     pub expanded: bool,
     /// Session is processing a prompt right now (activity indicator).
     pub busy: bool,
+    /// Session has completed/failed work that has not been viewed yet.
+    pub unread: bool,
+    /// Pull-request badge: 0 none, 1 open, 2 draft, 3 merged, 4 closed,
+    /// 5 multiple (neutral).
+    pub pr_kind: i32,
+    /// Hover/focus detail for the pull-request badge.
+    pub pr_tooltip: String,
+    /// Attention badge: 0 none, 1 approval, 2 question, 3 both.
+    pub attention_kind: i32,
+    /// Hover/focus detail for the attention badge.
+    pub attention_tooltip: String,
     /// Workspace headers: this workspace shows its archived sessions.
     pub show_archived: bool,
 }
@@ -128,6 +139,11 @@ pub fn set_nav(ui: &Ui, rows: Vec<NavRowData>) {
                 archived: r.archived,
                 expanded: r.expanded,
                 busy: r.busy,
+                unread: r.unread,
+                pr_kind: r.pr_kind,
+                pr_tooltip: r.pr_tooltip.into(),
+                attention_kind: r.attention_kind,
+                attention_tooltip: r.attention_tooltip.into(),
                 show_archived: r.show_archived,
             })
             .collect();
