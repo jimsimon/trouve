@@ -1921,7 +1921,7 @@ impl Controller {
         self.new_chat_thinking_values = values.clone();
         ui::set_new_chat_knobs(
             &self.ui,
-            values.iter().map(|value| thinking_label(value)).collect(),
+            values.iter().map(|value| level_label(value)).collect(),
             selected,
         );
     }
@@ -2891,6 +2891,7 @@ impl Controller {
             default_mode_index(&self.modes),
             0,
         );
+        self.push_new_chat_knobs(0);
         ui::set_center_screen(&self.ui, 1);
         self.load_branches(ws_index).await;
         Ok(())
