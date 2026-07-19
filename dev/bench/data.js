@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1784490197171,
+  "lastUpdate": 1784490241187,
   "repoUrl": "https://github.com/jimsimon/trouve",
   "entries": {
     "e2e-benchmarks": [
@@ -4945,6 +4945,54 @@ window.BENCHMARK_DATA = {
             "name": "dense_query_20k_rows",
             "value": 1386983.972457627,
             "range": "± 10107",
+            "unit": "ns"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "jim.j.simon@gmail.com",
+            "name": "Jim Simon",
+            "username": "jimsimon"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "05b7f1af23673fd17ce3ebe50ab723062f8ba62e",
+          "message": "Describe active tool calls during turns (#90)",
+          "timestamp": "2026-07-19T15:40:42-04:00",
+          "tree_id": "86a7b89182e7e315628234edc3743c62000cfd42",
+          "url": "https://github.com/jimsimon/trouve/commit/05b7f1af23673fd17ce3ebe50ab723062f8ba62e"
+        },
+        "date": 1784490240138,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "bm25_build_5k_docs",
+            "value": 4359232.583333334,
+            "range": "± 7394",
+            "unit": "ns"
+          },
+          {
+            "name": "bm25_query_5k_docs",
+            "value": 26140.409621159622,
+            "range": "± 42",
+            "unit": "ns"
+          },
+          {
+            "name": "chunk_python_200_functions",
+            "value": 2252215.9130434785,
+            "range": "± 2240",
+            "unit": "ns"
+          },
+          {
+            "name": "dense_query_20k_rows",
+            "value": 813076.1328545026,
+            "range": "± 2711",
             "unit": "ns"
           }
         ]
