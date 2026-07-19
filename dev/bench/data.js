@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1784489937849,
+  "lastUpdate": 1784489979440,
   "repoUrl": "https://github.com/jimsimon/trouve",
   "entries": {
     "e2e-benchmarks": [
@@ -4753,6 +4753,54 @@ window.BENCHMARK_DATA = {
             "name": "dense_query_20k_rows",
             "value": 1351904.4375461028,
             "range": "± 12947",
+            "unit": "ns"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "29139614+renovate[bot]@users.noreply.github.com",
+            "name": "renovate[bot]",
+            "username": "renovate[bot]"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "2ff8ab89aa3a36abb2dd2a89354def09baabe373",
+          "message": "Update Rust crate toml to v1 (#60)\n\nCo-authored-by: renovate[bot] <29139614+renovate[bot]@users.noreply.github.com>",
+          "timestamp": "2026-07-19T15:37:07-04:00",
+          "tree_id": "bf6420078181c60f0fb89820cd90c30d8fb50171",
+          "url": "https://github.com/jimsimon/trouve/commit/2ff8ab89aa3a36abb2dd2a89354def09baabe373"
+        },
+        "date": 1784489979026,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "bm25_build_5k_docs",
+            "value": 5090259.25,
+            "range": "± 14627",
+            "unit": "ns"
+          },
+          {
+            "name": "bm25_query_5k_docs",
+            "value": 36072.796604643074,
+            "range": "± 7",
+            "unit": "ns"
+          },
+          {
+            "name": "chunk_python_200_functions",
+            "value": 2866111.944444444,
+            "range": "± 1386",
+            "unit": "ns"
+          },
+          {
+            "name": "dense_query_20k_rows",
+            "value": 1525871.6400226757,
+            "range": "± 6616",
             "unit": "ns"
           }
         ]
