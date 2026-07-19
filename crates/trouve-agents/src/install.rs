@@ -17,6 +17,7 @@
 //!   with sha256 checksums; single static binary)
 //! - codex: GitHub `openai/codex` latest release tarball (musl build on Linux)
 
+use std::fmt::Write as _;
 use std::path::{Component, Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -432,7 +433,13 @@ async fn install_into(
                 .ok_or_else(|| InstallError::Unsupported(platform.clone()))?
                 .to_string();
             let bytes = get_bytes(&format!("{base}/{version}/{platform}/claude"), progress).await?;
-            let actual = format!("{:x}", sha2::Sha256::digest(&bytes));
+            let actual = sha2::Sha256::digest(&bytes).iter().fold(
+                String::with_capacity(64),
+                |mut output, byte| {
+                    write!(output, "{byte:02x}").expect("writing to String cannot fail");
+                    output
+                },
+            );
             if actual != expected {
                 return Err(InstallError::Checksum("claude".into()));
             }
