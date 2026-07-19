@@ -1108,10 +1108,7 @@ mod tests {
         let events = map_event(&success_result);
         // Should produce SessionStarted + Completed events
         assert_eq!(events.len(), 2);
-        assert!(matches!(
-            events[0],
-            BackendEvent::SessionStarted { .. }
-        ));
+        assert!(matches!(events[0], BackendEvent::SessionStarted { .. }));
         if let BackendEvent::SessionStarted { session_id } = &events[0] {
             assert_eq!(session_id, "session-success-xyz789");
         }
