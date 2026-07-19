@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1784490241187,
+  "lastUpdate": 1784493207592,
   "repoUrl": "https://github.com/jimsimon/trouve",
   "entries": {
     "e2e-benchmarks": [
@@ -2495,6 +2495,54 @@ window.BENCHMARK_DATA = {
             "name": "non-git warm query",
             "value": 64.35381108,
             "range": "± 1.8",
+            "unit": "ms"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "jim.j.simon@gmail.com",
+            "name": "Jim Simon",
+            "username": "jimsimon"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "ddc34003264b60311d61c986d950a6f71184597c",
+          "message": "Confine vendor agents to session worktrees (#79)\n\n* Confine vendor agents to session worktrees\n\nRun Cursor ACP processes per worktree so process cwd fallbacks cannot mutate the main checkout. Deny structured vendor writes that escape the worktree and bound idle Cursor and Claude process retention.\n\n* Canonicalize Cursor cwd assertions on macOS",
+          "timestamp": "2026-07-19T16:32:05-04:00",
+          "tree_id": "a3cf55903bde8c98feb5295df949e654258fae85",
+          "url": "https://github.com/jimsimon/trouve/commit/ddc34003264b60311d61c986d950a6f71184597c"
+        },
+        "date": 1784493207214,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "cold index + query",
+            "value": 128.5924565,
+            "range": "± 7.3",
+            "unit": "ms"
+          },
+          {
+            "name": "warm query",
+            "value": 66.1135601,
+            "range": "± 1.4",
+            "unit": "ms"
+          },
+          {
+            "name": "incremental (1 file modified)",
+            "value": 75.60439394,
+            "range": "± 1.5",
+            "unit": "ms"
+          },
+          {
+            "name": "non-git warm query",
+            "value": 63.76475882000002,
+            "range": "± 1.3",
             "unit": "ms"
           }
         ]
