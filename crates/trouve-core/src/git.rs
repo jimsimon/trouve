@@ -3,10 +3,16 @@
 //! Everything shells out to `git`; all functions are synchronous and are
 //! called via `spawn_blocking` from async code.
 
+use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Child, Command, ExitStatus, Stdio};
+use std::thread;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
+
+const FETCH_TIMEOUT: Duration = Duration::from_secs(30);
+const COMMAND_POLL_INTERVAL: Duration = Duration::from_millis(25);
 
 fn git(dir: &Path, args: &[&str]) -> Result<String> {
     let out = Command::new("git")
@@ -15,15 +21,96 @@ fn git(dir: &Path, args: &[&str]) -> Result<String> {
         .args(args)
         .output()
         .with_context(|| format!("running git {args:?} in {}", dir.display()))?;
-    if !out.status.success() {
+    git_result(dir, args, out.status, out.stdout, out.stderr)
+}
+
+fn git_with_timeout(dir: &Path, args: &[&str], timeout: Duration) -> Result<String> {
+    let mut command = Command::new("git");
+    command
+        .arg("-C")
+        .arg(dir)
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
+    }
+
+    let mut child = command
+        .spawn()
+        .with_context(|| format!("running git {args:?} in {}", dir.display()))?;
+    let stdout = child.stdout.take().context("capturing git stdout")?;
+    let stderr = child.stderr.take().context("capturing git stderr")?;
+    let stdout_reader = thread::spawn(move || read_all(stdout));
+    let stderr_reader = thread::spawn(move || read_all(stderr));
+
+    let deadline = Instant::now() + timeout;
+    let status = loop {
+        if let Some(status) = child
+            .try_wait()
+            .with_context(|| format!("waiting for git {args:?} in {}", dir.display()))?
+        {
+            break status;
+        }
+        let now = Instant::now();
+        if now >= deadline {
+            kill_process_tree(&mut child);
+            let _ = child.wait();
+            bail!(
+                "git {} timed out after {}s in {}",
+                args.join(" "),
+                timeout.as_secs_f32(),
+                dir.display()
+            );
+        }
+        thread::sleep(COMMAND_POLL_INTERVAL.min(deadline - now));
+    };
+
+    let stdout = stdout_reader
+        .join()
+        .map_err(|_| anyhow::anyhow!("git stdout reader panicked"))??;
+    let stderr = stderr_reader
+        .join()
+        .map_err(|_| anyhow::anyhow!("git stderr reader panicked"))??;
+    git_result(dir, args, status, stdout, stderr)
+}
+
+fn read_all(mut pipe: impl Read) -> std::io::Result<Vec<u8>> {
+    let mut bytes = Vec::new();
+    pipe.read_to_end(&mut bytes)?;
+    Ok(bytes)
+}
+
+fn kill_process_tree(child: &mut Child) {
+    #[cfg(unix)]
+    {
+        // SAFETY: this child was placed in a new process group whose id is
+        // its pid, so the negative id targets only that group.
+        let _ = unsafe { libc::kill(-(child.id() as i32), libc::SIGKILL) };
+    }
+    #[cfg(not(unix))]
+    let _ = child.kill();
+}
+
+fn git_result(
+    dir: &Path,
+    args: &[&str],
+    status: ExitStatus,
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+) -> Result<String> {
+    if !status.success() {
         bail!(
             "git {} failed in {}: {}",
             args.join(" "),
             dir.display(),
-            String::from_utf8_lossy(&out.stderr).trim()
+            String::from_utf8_lossy(&stderr).trim()
         );
     }
-    Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+    Ok(String::from_utf8_lossy(&stdout).trim().to_string())
 }
 
 /// Reject a ref/commit-ish that could be misread by git as an option (the
@@ -89,6 +176,64 @@ pub fn slugify(title: &str) -> String {
     } else {
         slug
     }
+}
+
+/// The freshly fetched upstream commit for a local base branch.
+pub struct FetchedBase {
+    /// Short remote-tracking ref (for example `origin/main`).
+    pub upstream_ref: String,
+    /// Immutable commit to use when creating the worktree branch.
+    pub commit: String,
+}
+
+/// Fetch a local base branch's configured upstream without moving the local
+/// branch or any checkout.
+///
+/// Refs that are not local branches (for example a checkpoint commit) and
+/// branches without an upstream return `None` so callers can use the original
+/// ref as-is. The remote-tracking ref is resolved to a commit after fetching,
+/// rather than exposing the repository-global `FETCH_HEAD` to races.
+pub fn fetch_upstream_base(repo: &Path, base_ref: &str) -> Result<Option<FetchedBase>> {
+    fetch_upstream_base_with_timeout(repo, base_ref, FETCH_TIMEOUT)
+}
+
+fn fetch_upstream_base_with_timeout(
+    repo: &Path,
+    base_ref: &str,
+    timeout: Duration,
+) -> Result<Option<FetchedBase>> {
+    ensure_safe_ref(base_ref)?;
+
+    let full_ref = git(
+        repo,
+        &["rev-parse", "--symbolic-full-name", "--verify", base_ref],
+    )?;
+    if !full_ref.starts_with("refs/heads/") {
+        return Ok(None);
+    }
+
+    let remote = git(
+        repo,
+        &["for-each-ref", "--format=%(upstream:remotename)", &full_ref],
+    )?;
+    let upstream = git(repo, &["for-each-ref", "--format=%(upstream)", &full_ref])?;
+    if remote.is_empty() || upstream.is_empty() {
+        return Ok(None);
+    }
+
+    git_with_timeout(repo, &["fetch", "--quiet", "--", &remote], timeout)?;
+    let upstream_ref = git(
+        repo,
+        &["for-each-ref", "--format=%(refname:short)", &upstream],
+    )?;
+    let commit = git(
+        repo,
+        &["rev-parse", "--verify", &format!("{upstream}^{{commit}}")],
+    )?;
+    Ok(Some(FetchedBase {
+        upstream_ref,
+        commit,
+    }))
 }
 
 /// Create the session worktree on a new branch from `base_ref`.
@@ -185,6 +330,21 @@ pub fn remote_url(worktree: &Path, remote: &str) -> Option<String> {
         .filter(|s| !s.is_empty())
 }
 
+/// Strip a configured remote name from a short remote-tracking ref.
+pub fn remote_branch_name(worktree: &Path, remote_ref: &str) -> Option<String> {
+    let remotes = git(worktree, &["remote"]).ok()?;
+    remotes
+        .lines()
+        .filter_map(|remote| {
+            remote_ref
+                .strip_prefix(remote)
+                .and_then(|rest| rest.strip_prefix('/'))
+                .map(|branch| (remote.len(), branch.to_string()))
+        })
+        .max_by_key(|(remote_len, _)| *remote_len)
+        .map(|(_, branch)| branch)
+}
+
 /// Push the session branch to the remote (sets upstream).
 pub fn push_branch(worktree: &Path, remote: &str, branch: &str) -> Result<()> {
     git(worktree, &["push", "--set-upstream", remote, branch])?;
@@ -200,30 +360,135 @@ pub fn worktree_dir(data_dir: &Path, session_id: &str) -> PathBuf {
 mod tests {
     use super::*;
 
+    fn run(dir: &Path, args: &[&str]) -> String {
+        let out = Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "git {args:?} failed in {}: {}",
+            dir.display(),
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
     fn init_repo(dir: &Path) {
-        let run = |args: &[&str]| {
-            let ok = Command::new("git")
-                .arg("-C")
-                .arg(dir)
-                .args(args)
-                .output()
-                .unwrap()
-                .status
-                .success();
-            assert!(ok, "git {args:?} failed");
-        };
-        run(&["init", "-b", "main"]);
-        run(&["config", "user.email", "test@example.com"]);
-        run(&["config", "user.name", "Test"]);
+        run(dir, &["init", "-b", "main"]);
+        run(dir, &["config", "user.email", "test@example.com"]);
+        run(dir, &["config", "user.name", "Test"]);
         std::fs::write(dir.join("a.txt"), "one\n").unwrap();
-        run(&["add", "-A"]);
-        run(&["commit", "-m", "init"]);
+        run(dir, &["add", "-A"]);
+        run(dir, &["commit", "-m", "init"]);
     }
 
     #[test]
     fn slugify_basics() {
         assert_eq!(slugify("Fix the Login Bug!"), "fix-the-login-bug");
         assert_eq!(slugify("---"), "session");
+    }
+
+    #[test]
+    fn fetch_upstream_base_returns_remote_commit_without_moving_local_branch() {
+        let tmp = tempfile::tempdir().unwrap();
+        let remote = tmp.path().join("remote.git");
+        std::fs::create_dir(&remote).unwrap();
+        run(&remote, &["init", "--bare", "-b", "main"]);
+
+        let publisher = tmp.path().join("publisher");
+        std::fs::create_dir(&publisher).unwrap();
+        init_repo(&publisher);
+        run(
+            &publisher,
+            &["remote", "add", "origin", remote.to_str().unwrap()],
+        );
+        run(&publisher, &["push", "-u", "origin", "main"]);
+
+        let repo = tmp.path().join("repo");
+        run(
+            tmp.path(),
+            &[
+                "clone",
+                "--quiet",
+                remote.to_str().unwrap(),
+                repo.to_str().unwrap(),
+            ],
+        );
+        let old_head = run(&repo, &["rev-parse", "main"]);
+
+        std::fs::write(publisher.join("a.txt"), "two\n").unwrap();
+        run(&publisher, &["add", "a.txt"]);
+        run(&publisher, &["commit", "-m", "update"]);
+        run(&publisher, &["push", "origin", "main"]);
+
+        let fetched = fetch_upstream_base(&repo, "main").unwrap().unwrap();
+        assert_eq!(fetched.upstream_ref, "origin/main");
+        assert_eq!(run(&repo, &["rev-parse", "main"]), old_head);
+        assert_eq!(
+            std::fs::read_to_string(repo.join("a.txt")).unwrap(),
+            "one\n"
+        );
+
+        let wt = tmp.path().join("wt");
+        create_worktree(&repo, &wt, "trouve/test", &fetched.commit).unwrap();
+        assert_eq!(std::fs::read_to_string(wt.join("a.txt")).unwrap(), "two\n");
+    }
+
+    #[test]
+    fn fetch_upstream_base_without_upstream_returns_none() {
+        let tmp = tempfile::tempdir().unwrap();
+        init_repo(tmp.path());
+
+        let head = run(tmp.path(), &["rev-parse", "main"]);
+        assert!(fetch_upstream_base(tmp.path(), "main").unwrap().is_none());
+
+        assert_eq!(run(tmp.path(), &["rev-parse", "main"]), head);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fetch_upstream_base_times_out_a_stalled_transport() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        init_repo(&repo);
+
+        let ssh = tmp.path().join("sleeping-ssh");
+        std::fs::write(&ssh, "#!/bin/sh\nsleep 10\n").unwrap();
+        let mut permissions = std::fs::metadata(&ssh).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&ssh, permissions).unwrap();
+
+        run(&repo, &["remote", "add", "origin", "ssh://example/repo"]);
+        run(&repo, &["update-ref", "refs/remotes/origin/main", "main"]);
+        run(&repo, &["branch", "--set-upstream-to=origin/main", "main"]);
+        run(&repo, &["config", "core.sshCommand", ssh.to_str().unwrap()]);
+
+        let started = Instant::now();
+        let error = fetch_upstream_base_with_timeout(&repo, "main", Duration::from_millis(100))
+            .err()
+            .unwrap();
+
+        assert!(error.to_string().contains("timed out after 0.1s"));
+        assert!(started.elapsed() < Duration::from_secs(2));
+    }
+
+    #[test]
+    fn remote_branch_name_uses_the_configured_remote_prefix() {
+        let tmp = tempfile::tempdir().unwrap();
+        init_repo(tmp.path());
+        run(tmp.path(), &["remote", "add", "upstream", "."]);
+
+        assert_eq!(
+            remote_branch_name(tmp.path(), "upstream/feature/x").as_deref(),
+            Some("feature/x")
+        );
+        assert_eq!(remote_branch_name(tmp.path(), "feature/x"), None);
     }
 
     #[test]

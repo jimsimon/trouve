@@ -121,6 +121,10 @@ pub struct CreateSessionRequest {
     /// Base ref the session branch is created from (default: workspace HEAD).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub base_ref: Option<String>,
+    /// Fetch the base branch's configured upstream and start from its latest
+    /// remote commit. Refs without an upstream are used as-is.
+    #[serde(default = "default_true")]
+    pub fetch_latest: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -993,4 +997,17 @@ pub struct UsageSummary {
 pub struct ErrorBody {
     pub code: String,
     pub message: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn create_session_fetch_latest_defaults_to_true() {
+        let request: CreateSessionRequest =
+            serde_json::from_value(serde_json::json!({ "workspace_id": "ws_test" })).unwrap();
+
+        assert!(request.fetch_latest);
+    }
 }

@@ -7,7 +7,7 @@
       "name": "MIT",
       "identifier": "MIT"
     },
-    "version": "0.22"
+    "version": "0.23"
   },
   "paths": {
     "/v1/approvals": {
@@ -3500,6 +3500,10 @@
               "null"
             ],
             "description": "Base ref the session branch is created from (default: workspace HEAD)."
+          },
+          "fetch_latest": {
+            "type": "boolean",
+            "description": "Fetch the base branch's configured upstream and start from its latest\nremote commit. Refs without an upstream are used as-is."
           },
           "title": {
             "type": [

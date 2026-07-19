@@ -506,10 +506,11 @@ fn main() -> anyhow::Result<()> {
     }
     {
         let tx = tx.clone();
-        window.on_start_new_chat(move |ws, branch, mode, model, prompt| {
+        window.on_start_new_chat(move |ws, branch, fetch_latest, mode, model, prompt| {
             let _ = tx.send(UiCommand::StartNewChat {
                 workspace_idx: ws.max(0) as usize,
                 branch_idx: branch.max(0) as usize,
+                fetch_latest,
                 mode_idx: mode.max(0) as usize,
                 model_idx: model.max(0) as usize,
                 prompt: prompt.to_string(),

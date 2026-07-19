@@ -102,6 +102,7 @@ pub enum UiCommand {
     StartNewChat {
         workspace_idx: usize,
         branch_idx: usize,
+        fetch_latest: bool,
         mode_idx: usize,
         model_idx: usize,
         prompt: String,
@@ -2842,6 +2843,7 @@ impl Controller {
         &mut self,
         workspace_idx: usize,
         branch_idx: usize,
+        fetch_latest: bool,
         mode_idx: usize,
         model_idx: usize,
         prompt: String,
@@ -2870,6 +2872,7 @@ impl Controller {
                         workspace_id: workspace.id,
                         title: Some(session_title(&prompt)),
                         base_ref: self.branches.get(branch_idx).cloned(),
+                        fetch_latest,
                     })
                     .await?;
                 self.close_new_chat();
@@ -3791,12 +3794,20 @@ impl Controller {
             UiCommand::StartNewChat {
                 workspace_idx,
                 branch_idx,
+                fetch_latest,
                 mode_idx,
                 model_idx,
                 prompt,
             } => {
-                self.start_new_chat(workspace_idx, branch_idx, mode_idx, model_idx, prompt)
-                    .await?
+                self.start_new_chat(
+                    workspace_idx,
+                    branch_idx,
+                    fetch_latest,
+                    mode_idx,
+                    model_idx,
+                    prompt,
+                )
+                .await?
             }
             UiCommand::SelectThread(i) => {
                 if i < self.threads.len() {

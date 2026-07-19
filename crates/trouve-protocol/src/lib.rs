@@ -64,7 +64,10 @@ pub use requests::*;
 // workspace.pull_requests_updated persists each workspace snapshot, and
 // POST /v1/workspaces/{id}/prs/refresh triggers a refresh without returning
 // UI state directly.
-pub const PROTOCOL_VERSION: &str = "0.22";
+// 0.23: CreateSessionRequest.fetch_latest chooses whether a session starts
+// from the selected local ref or its freshly fetched upstream (additive;
+// omitted requests default to fetching).
+pub const PROTOCOL_VERSION: &str = "0.23";
 
 pub type WorkspaceId = String;
 pub type SessionId = String;
