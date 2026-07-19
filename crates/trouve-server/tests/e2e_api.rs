@@ -760,7 +760,20 @@ async fn session_and_thread_updates_and_provider_config() {
     assert_eq!(openrouter["base_url"], "https://openrouter.ai/api/v1");
     assert_eq!(openrouter["api_key_env"], "OPENROUTER_API_KEY");
     assert_eq!(openrouter["auth"], "api-key");
+    assert_eq!(openrouter["category"], "api");
     assert!(known.iter().any(|k| k["id"] == "anthropic"));
+    let ollama = known
+        .iter()
+        .find(|k| k["id"] == "ollama")
+        .expect("ollama preset");
+    assert_eq!(ollama["category"], "local");
+    let kimi_code = known
+        .iter()
+        .find(|k| k["id"] == "kimi-code")
+        .expect("kimi-code preset");
+    assert_eq!(kimi_code["category"], "subscription");
+    assert_eq!(kimi_code["auth"], "api-key");
+    assert_eq!(kimi_code["base_url"], "https://api.kimi.com/coding/v1");
     // Policy invariant: we never ship OAuth presets that piggyback on
     // vendors' own CLI client registrations (account-ban risk). OAuth is
     // manual-config only; subscriptions go through vendor CLIs instead.
@@ -780,6 +793,7 @@ async fn session_and_thread_updates_and_provider_config() {
             .unwrap_or_else(|| panic!("{id} preset"));
         assert_eq!(preset["kind"], kind);
         assert_eq!(preset["auth"], "cli");
+        assert_eq!(preset["category"], "subscription");
         assert!(!preset["experimental"].as_bool().unwrap_or(false));
     }
     // Cursor also ships a key-authenticated preset (usage-based billing)
@@ -790,6 +804,7 @@ async fn session_and_thread_updates_and_provider_config() {
         .expect("cursor-api preset");
     assert_eq!(cursor_api["kind"], "cursor-cli");
     assert_eq!(cursor_api["auth"], "api-key");
+    assert_eq!(cursor_api["category"], "api");
     assert_eq!(cursor_api["api_key_env"], "CURSOR_API_KEY");
     // The direct-Codex client is flagged experimental (undocumented endpoint).
     let codex_api = known
@@ -832,6 +847,7 @@ async fn session_and_thread_updates_and_provider_config() {
         .await
         .unwrap();
     assert_eq!(provider["id"], "openrouter");
+    assert_eq!(provider["category"], "api");
     assert!(config_file.exists());
     let config_text = std::fs::read_to_string(&config_file).unwrap();
     assert!(config_text.contains("openrouter"));

@@ -67,7 +67,10 @@ pub use requests::*;
 // 0.23: CreateSessionRequest.fetch_latest chooses whether a session starts
 // from the selected local ref or its freshly fetched upstream (additive;
 // omitted requests default to fetching).
-pub const PROTOCOL_VERSION: &str = "0.23";
+// 0.24: ProviderInfo.category and KnownProvider.category classify model
+// sources as subscription, API, or local independently from authentication
+// (additive).
+pub const PROTOCOL_VERSION: &str = "0.24";
 
 pub type WorkspaceId = String;
 pub type SessionId = String;

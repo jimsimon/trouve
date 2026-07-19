@@ -3032,6 +3032,7 @@ impl Controller {
                         p.base_url.unwrap_or_default(),
                         p.has_credentials,
                         p.auth,
+                        p.category,
                         p.experimental,
                     )
                 })
@@ -4522,7 +4523,7 @@ impl Controller {
                 self.push_nav();
             }
             UiCommand::OpenIntegrationsSettings => {
-                ui::set_settings_section(&self.ui, 4);
+                ui::set_settings_section(&self.ui, 3);
                 self.refresh_settings().await;
                 self.refresh_mcp();
                 self.refresh_subscriptions();

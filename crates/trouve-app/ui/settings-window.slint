@@ -19,6 +19,8 @@ export struct ProviderItem {
     base-url: string,
     has-credentials: bool,
     auth: string,
+    // "subscription" / "api" / "local".
+    category: string,
     experimental: bool,
 }
 
@@ -39,7 +41,7 @@ export struct CliItem {
     managed: bool,
 }
 
-// Subscription usage for one agent-backend provider (flat: up to four
+// Subscription usage for one provider (flat: up to four
 // metered windows — Codex reports two, Claude Code up to four with
 // model-scoped weekly buckets).
 export struct SubscriptionItem {
@@ -187,6 +189,8 @@ export struct KnownProviderItem {
     // "api-key", "oauth" (subscription login), "cli" (vendor CLI holds the
     // subscription auth), or "none" (keyless local).
     auth: string,
+    // "subscription" / "api" / "local".
+    category: string,
     // Undocumented vendor endpoint; may break or be restricted at any time.
     experimental: bool,
 }
@@ -284,11 +288,20 @@ export component SettingsScreen inherits Rectangle {
     background: Theme.c.win-bg;
 
     in property <[ProviderItem]> providers;
+    in property <[ProviderItem]> subscription-providers;
+    in property <[ProviderItem]> api-providers;
+    in property <[ProviderItem]> local-providers;
     in property <[CliItem]> clis;
     in property <[KnownProviderItem]> known-providers;
     // Preset display names (alphabetical; index i maps to
     // known-providers[i]) followed by "Custom" as the last entry.
     in property <[string]> known-provider-names;
+    in property <[KnownProviderItem]> subscription-known-providers;
+    in property <[string]> subscription-known-provider-names;
+    in property <[KnownProviderItem]> api-known-providers;
+    in property <[string]> api-known-provider-names;
+    in property <[KnownProviderItem]> local-known-providers;
+    in property <[string]> local-known-provider-names;
     in property <[string]> models;
     in property <int> default-model-index: -1;
     in property <[ThinkingItem]> model-thinking-items;
@@ -317,10 +330,26 @@ export component SettingsScreen inherits Rectangle {
     // from known-providers[index]) or the trailing "Custom" entry (id/kind/
     // url fields shown). The controller points it at Custom on load.
     in-out property <int> preset-index: 0;
-    property <bool> preset-is-custom: root.preset-index >= root.known-providers.length;
+    in-out property <int> provider-tab: 0;
+    property <[KnownProviderItem]> active-known-providers:
+        root.provider-tab == 0 ? root.subscription-known-providers
+        : root.provider-tab == 1 ? root.api-known-providers
+        : root.local-known-providers;
+    property <[string]> active-known-provider-names:
+        root.provider-tab == 0 ? root.subscription-known-provider-names
+        : root.provider-tab == 1 ? root.api-known-provider-names
+        : root.local-known-provider-names;
+    property <string> active-provider-category:
+        root.provider-tab == 0 ? "subscription"
+        : root.provider-tab == 1 ? "api" : "local";
+    property <[ProviderItem]> active-providers:
+        root.provider-tab == 0 ? root.subscription-providers
+        : root.provider-tab == 1 ? root.api-providers
+        : root.local-providers;
+    property <bool> preset-is-custom: root.preset-index >= root.active-known-providers.length;
     property <string> preset-auth:
         !root.preset-is-custom && root.preset-index >= 0
-            ? root.known-providers[root.preset-index].auth
+            ? root.active-known-providers[root.preset-index].auth
             : "api-key";
 
     // Appearance: built-in theme names, font sizes, and font families come
@@ -475,12 +504,12 @@ export component SettingsScreen inherits Rectangle {
     property <int> mode-form-thinking-model-index: root.mode-form-model >= 0
         ? root.mode-form-model : root.default-model-index;
 
-    // Side-nav selection: 0 providers, 1 modes & models, 2 local models,
-    // 3 mcp servers, 4 integrations, 5 appearance, 6 notifications,
-    // 7 about. in-out so the app can open straight to a section (e.g. the
+    // Side-nav selection: 0 providers, 1 modes & models, 2 mcp servers,
+    // 3 integrations, 4 appearance, 5 notifications, 6 about. in-out so
+    // the app can open straight to a section (e.g. the
     // PR tab's "set up GitHub" button).
     in-out property <int> section: 0;
-    property <[string]> section-names: ["Providers", "Modes & Models", "Local Models", "MCP Servers", "Integrations", "Appearance", "Notifications", "About"];
+    property <[string]> section-names: ["Providers", "Modes & Models", "MCP Servers", "Integrations", "Appearance", "Notifications", "About"];
 
     VerticalLayout {
         // Header: title + a way back to wherever the user came from.
@@ -579,12 +608,103 @@ export component SettingsScreen inherits Rectangle {
                                 }
                             }
 
+                            // Billing/source category is intentionally
+                            // independent from authentication: a subscription
+                            // may use an API key, while a local endpoint may
+                            // speak the OpenAI wire protocol.
+                            HorizontalLayout {
+                                spacing: 4px;
+                                Rectangle {
+                                    height: Theme.fs(32px);
+                                    horizontal-stretch: 1;
+                                    border-radius: 6px;
+                                    background: root.provider-tab == 0 ? Theme.c.accent-bg
+                                        : subscription-tab.has-hover ? Theme.c.raised-bg : Theme.c.control-bg;
+                                    subscription-tab := TouchArea {
+                                        clicked => {
+                                            root.provider-tab = 0;
+                                            root.preset-index = root.subscription-known-providers.length;
+                                            root.form-id = "";
+                                            root.form-hint = "";
+                                            root.form-warning = false;
+                                        }
+                                    }
+                                    Text {
+                                        text: "Subscriptions";
+                                        color: root.provider-tab == 0 ? Theme.c.text-hi : Theme.c.text-mid;
+                                        font-size: Theme.fs(12px);
+                                        font-weight: root.provider-tab == 0 ? 700 : 400;
+                                        horizontal-alignment: center;
+                                        vertical-alignment: center;
+                                    }
+                                }
+                                Rectangle {
+                                    height: Theme.fs(32px);
+                                    horizontal-stretch: 1;
+                                    border-radius: 6px;
+                                    background: root.provider-tab == 1 ? Theme.c.accent-bg
+                                        : api-tab.has-hover ? Theme.c.raised-bg : Theme.c.control-bg;
+                                    api-tab := TouchArea {
+                                        clicked => {
+                                            root.provider-tab = 1;
+                                            root.preset-index = root.api-known-providers.length;
+                                            root.form-id = "";
+                                            root.form-hint = "";
+                                            root.form-warning = false;
+                                        }
+                                    }
+                                    Text {
+                                        text: "API";
+                                        color: root.provider-tab == 1 ? Theme.c.text-hi : Theme.c.text-mid;
+                                        font-size: Theme.fs(12px);
+                                        font-weight: root.provider-tab == 1 ? 700 : 400;
+                                        horizontal-alignment: center;
+                                        vertical-alignment: center;
+                                    }
+                                }
+                                Rectangle {
+                                    height: Theme.fs(32px);
+                                    horizontal-stretch: 1;
+                                    border-radius: 6px;
+                                    background: root.provider-tab == 2 ? Theme.c.accent-bg
+                                        : local-tab.has-hover ? Theme.c.raised-bg : Theme.c.control-bg;
+                                    local-tab := TouchArea {
+                                        clicked => {
+                                            root.provider-tab = 2;
+                                            root.preset-index = root.local-known-providers.length;
+                                            root.form-id = "";
+                                            root.form-hint = "";
+                                            root.form-warning = false;
+                                        }
+                                    }
+                                    Text {
+                                        text: "Local";
+                                        color: root.provider-tab == 2 ? Theme.c.text-hi : Theme.c.text-mid;
+                                        font-size: Theme.fs(12px);
+                                        font-weight: root.provider-tab == 2 ? 700 : 400;
+                                        horizontal-alignment: center;
+                                        vertical-alignment: center;
+                                    }
+                                }
+                            }
+
+                            Text {
+                                text: root.provider-tab == 0
+                                    ? "Membership-backed providers with plan status, allowance windows, and vendor login or keys."
+                                    : root.provider-tab == 1
+                                        ? "Usage-billed hosted APIs and custom remote endpoints."
+                                        : "Managed offline models and external model servers running on this machine.";
+                                color: Theme.c.text-soft;
+                                font-size: Theme.fs(11px);
+                                wrap: word-wrap;
+                            }
+
                             Rectangle {
                                 background: Theme.c.surface;
                                 border-radius: 6px;
                                 height: 150px;
                                 ListView {
-                                    for provider in root.providers: Rectangle {
+                                    for provider in root.active-providers: Rectangle {
                                         height: Theme.fs(34px);
                                         HorizontalLayout {
                                             padding-left: 10px;
@@ -631,7 +751,7 @@ export component SettingsScreen inherits Rectangle {
                                             Button {
                                                 text: "Edit";
                                                 clicked => {
-                                                    root.preset-index = root.known-providers.length;
+                                                    root.preset-index = root.active-known-providers.length;
                                                     root.form-id = provider.id;
                                                     root.form-base-url = provider.base-url;
                                                     root.form-kind-index = provider.kind == "anthropic" ? 1 : 0;
@@ -660,26 +780,26 @@ export component SettingsScreen inherits Rectangle {
                             // hides) the id / protocol / URL details;
                             // "Custom" shows them for hand entry.
                             preset-box := ComboBox {
-                                model: root.known-provider-names;
+                                model: root.active-known-provider-names;
                                 current-index <=> root.preset-index;
                                 selected => {
                                     if (!root.preset-is-custom) {
-                                        root.form-id = root.known-providers[root.preset-index].id;
-                                        root.form-base-url = root.known-providers[root.preset-index].base-url;
-                                        root.form-kind = root.known-providers[root.preset-index].kind;
+                                        root.form-id = root.active-known-providers[root.preset-index].id;
+                                        root.form-base-url = root.active-known-providers[root.preset-index].base-url;
+                                        root.form-kind = root.active-known-providers[root.preset-index].kind;
                                         root.form-kind-index =
-                                            root.known-providers[root.preset-index].kind == "anthropic" ? 1 : 0;
-                                        root.form-warning = root.known-providers[root.preset-index].experimental;
+                                            root.active-known-providers[root.preset-index].kind == "anthropic" ? 1 : 0;
+                                        root.form-warning = root.active-known-providers[root.preset-index].experimental;
                                         root.form-hint =
-                                            root.known-providers[root.preset-index].experimental
+                                            root.active-known-providers[root.preset-index].experimental
                                             ? "Experimental: talks to an undocumented vendor endpoint using your `codex login` token. OpenAI may break or restrict it at any time — use at your own risk. Save, then log in via the Codex CLI."
-                                            : (root.known-providers[root.preset-index].auth == "cli"
+                                            : (root.active-known-providers[root.preset-index].auth == "cli"
                                                 ? "Subscription via the vendor's CLI: install it, save, then click \"Log in\" in the list above (or log in from a terminal)."
-                                                : (root.known-providers[root.preset-index].auth == "oauth"
+                                                : (root.active-known-providers[root.preset-index].auth == "oauth"
                                                     ? "Subscription login: save, then click \"Log in\" in the list above."
-                                                    : (root.known-providers[root.preset-index].auth == "api-key"
+                                                    : (root.active-known-providers[root.preset-index].auth == "api-key"
                                                         ? "Paste your API key below and save. Also honors the "
-                                                            + root.known-providers[root.preset-index].api-key-env
+                                                            + root.active-known-providers[root.preset-index].api-key-env
                                                             + " environment variable."
                                                         : "No API key needed — just save.")));
                                     } else {
@@ -746,6 +866,9 @@ export component SettingsScreen inherits Rectangle {
                                 font-size: Theme.fs(12px);
                                 wrap: word-wrap;
                             }
+
+                            if root.provider-tab == 0: VerticalLayout {
+                                spacing: 12px;
 
                             // ---------------- vendor CLIs ----------------
                             Text {
@@ -819,7 +942,7 @@ export component SettingsScreen inherits Rectangle {
                                 font-weight: 700;
                             }
                             Text {
-                                text: "How much of each subscription's metered allowance is used. Codex and Claude Code report usage through their CLIs; Cursor's is read from an undocumented dashboard endpoint using the CLI's login, so it may break or be restricted at any time.";
+                                text: "How much of each subscription's metered allowance is used. Codex and Claude Code report through their CLIs; Kimi Code uses the subscription key saved above. Cursor's usage comes from an undocumented dashboard endpoint, so it may break or be restricted at any time.";
                                 color: Theme.c.text-soft;
                                 font-size: Theme.fs(11px);
                                 wrap: word-wrap;
@@ -830,7 +953,7 @@ export component SettingsScreen inherits Rectangle {
                                 font-size: Theme.fs(12px);
                             }
                             if root.subscriptions.length == 0 && root.subscriptions-status == "": Text {
-                                text: "No agent-backend providers configured.";
+                                text: "No subscription providers configured.";
                                 color: Theme.c.text-soft;
                                 font-size: Theme.fs(12px);
                             }
@@ -890,6 +1013,7 @@ export component SettingsScreen inherits Rectangle {
                                         resets: sub.w4-resets;
                                     }
                                 }
+                            }
                             }
                         }
 
@@ -1282,14 +1406,14 @@ export component SettingsScreen inherits Rectangle {
                             }
                         }
 
-                        // ---------------- local models ----------------
-                        if root.section == 2: VerticalLayout {
+                        // ---------------- local models (Providers → Local) ----------------
+                        if root.section == 0 && root.provider-tab == 2: VerticalLayout {
                             spacing: 12px;
 
                             HorizontalLayout {
                                 spacing: 12px;
                                 Text {
-                                    text: "Local Models";
+                                    text: "Managed Local Models";
                                     color: Theme.c.text-hi;
                                     font-size: Theme.fs(18px);
                                     font-weight: 700;
@@ -1654,7 +1778,7 @@ export component SettingsScreen inherits Rectangle {
                         }
 
                         // ---------------- mcp servers ----------------
-                        if root.section == 3: VerticalLayout {
+                        if root.section == 2: VerticalLayout {
                             spacing: 12px;
 
                             HorizontalLayout {
@@ -1951,7 +2075,7 @@ export component SettingsScreen inherits Rectangle {
                         }
 
                         // ---------------- integrations ----------------
-                        if root.section == 4: VerticalLayout {
+                        if root.section == 3: VerticalLayout {
                             spacing: 12px;
 
                             Text {
@@ -2118,7 +2242,7 @@ export component SettingsScreen inherits Rectangle {
                         }
 
                         // ---------------- appearance ----------------
-                        if root.section == 5: VerticalLayout {
+                        if root.section == 4: VerticalLayout {
                             spacing: 12px;
 
                             Text {
@@ -2198,7 +2322,7 @@ export component SettingsScreen inherits Rectangle {
                         }
 
                         // ---------------- notifications ----------------
-                        if root.section == 6: VerticalLayout {
+                        if root.section == 5: VerticalLayout {
                             spacing: 12px;
 
                             Text {
@@ -2256,7 +2380,7 @@ export component SettingsScreen inherits Rectangle {
                         }
 
                         // ---------------- about ----------------
-                        if root.section == 7: VerticalLayout {
+                        if root.section == 6: VerticalLayout {
                             spacing: 12px;
 
                             Text {

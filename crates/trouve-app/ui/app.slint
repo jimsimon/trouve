@@ -1240,9 +1240,18 @@ export component AppWindow inherits Window {
 
     // --- settings screen -------------------------------------------------------
     in property <[ProviderItem]> settings-providers;
+    in property <[ProviderItem]> settings-subscription-providers;
+    in property <[ProviderItem]> settings-api-providers;
+    in property <[ProviderItem]> settings-local-providers;
     in property <[CliItem]> settings-clis;
     in property <[KnownProviderItem]> settings-known-providers;
     in property <[string]> settings-known-provider-names;
+    in property <[KnownProviderItem]> settings-subscription-known-providers;
+    in property <[string]> settings-subscription-known-provider-names;
+    in property <[KnownProviderItem]> settings-api-known-providers;
+    in property <[string]> settings-api-known-provider-names;
+    in property <[KnownProviderItem]> settings-local-known-providers;
+    in property <[string]> settings-local-known-provider-names;
     in property <[string]> settings-models;
     in property <int> settings-default-model-index: -1;
     in property <[ThinkingItem]> settings-model-thinking-items;
@@ -4636,9 +4645,18 @@ export component AppWindow inherits Window {
         width: 100%;
         height: 100%;
         providers: root.settings-providers;
+        subscription-providers: root.settings-subscription-providers;
+        api-providers: root.settings-api-providers;
+        local-providers: root.settings-local-providers;
         clis: root.settings-clis;
         known-providers: root.settings-known-providers;
         known-provider-names: root.settings-known-provider-names;
+        subscription-known-providers: root.settings-subscription-known-providers;
+        subscription-known-provider-names: root.settings-subscription-known-provider-names;
+        api-known-providers: root.settings-api-known-providers;
+        api-known-provider-names: root.settings-api-known-provider-names;
+        local-known-providers: root.settings-local-known-providers;
+        local-known-provider-names: root.settings-local-known-provider-names;
         models: root.settings-models;
         default-model-index: root.settings-default-model-index;
         model-thinking-items: root.settings-model-thinking-items;

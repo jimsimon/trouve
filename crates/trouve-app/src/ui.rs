@@ -988,10 +988,10 @@ pub fn set_file_view(ui: &Ui, name: String, content: String, lines: Vec<Vec<(Str
 
 // --- settings screen ---------------------------------------------------------
 
-/// (id, kind, base_url, has_credentials, auth, experimental) per provider.
+/// (id, kind, base_url, has_credentials, auth, category, experimental) per provider.
 pub fn set_settings_data(
     ui: &Ui,
-    providers: Vec<(String, String, String, bool, String, bool)>,
+    providers: Vec<(String, String, String, bool, String, String, bool)>,
     models: Vec<String>,
     thinking: Vec<ModelThinkingView>,
     default_model_index: i32,
@@ -1002,17 +1002,40 @@ pub fn set_settings_data(
         let items: Vec<ProviderItem> = providers
             .into_iter()
             .map(
-                |(id, kind, base_url, has_credentials, auth, experimental)| ProviderItem {
-                    id: id.into(),
-                    kind: kind.into(),
-                    base_url: base_url.into(),
-                    has_credentials,
-                    auth: auth.into(),
-                    experimental,
+                |(id, kind, base_url, has_credentials, auth, category, experimental)| {
+                    ProviderItem {
+                        id: id.into(),
+                        kind: kind.into(),
+                        base_url: base_url.into(),
+                        has_credentials,
+                        auth: auth.into(),
+                        category: category.into(),
+                        experimental,
+                    }
                 },
             )
             .collect();
+        let subscription: Vec<ProviderItem> = items
+            .iter()
+            .filter(|item| item.category == "subscription")
+            .cloned()
+            .collect();
+        let api: Vec<ProviderItem> = items
+            .iter()
+            .filter(|item| item.category == "api")
+            .cloned()
+            .collect();
+        let local: Vec<ProviderItem> = items
+            .iter()
+            // The built-in `local` provider is managed by the dedicated
+            // runtime/model controls below, not the generic edit/remove row.
+            .filter(|item| item.category == "local" && item.id != "local")
+            .cloned()
+            .collect();
         ui.set_settings_providers(ModelRc::new(VecModel::from(items)));
+        ui.set_settings_subscription_providers(ModelRc::new(VecModel::from(subscription)));
+        ui.set_settings_api_providers(ModelRc::new(VecModel::from(api)));
+        ui.set_settings_local_providers(ModelRc::new(VecModel::from(local)));
         ui.set_settings_models(string_model(models));
         let thinking_items: Vec<crate::ThinkingItem> = thinking
             .into_iter()
@@ -1372,9 +1395,15 @@ pub fn set_known_providers(ui: &Ui, mut known: Vec<trouve_protocol::KnownProvide
         });
         let mut names: Vec<String> = known.iter().map(|k| k.display_name.clone()).collect();
         names.push("Custom".into());
-        let custom_index = known.len() as i32;
+        // The Providers screen opens on Subscriptions, so its initial
+        // "Custom" index belongs to that tab's filtered preset list.
+        let custom_index = known
+            .iter()
+            .filter(|provider| provider.category == "subscription")
+            .count() as i32;
         let items: Vec<KnownProviderItem> = known
-            .into_iter()
+            .iter()
+            .cloned()
             .map(|k| KnownProviderItem {
                 id: k.id.into(),
                 display_name: k.display_name.into(),
@@ -1382,13 +1411,44 @@ pub fn set_known_providers(ui: &Ui, mut known: Vec<trouve_protocol::KnownProvide
                 base_url: k.base_url.unwrap_or_default().into(),
                 api_key_env: k.api_key_env.unwrap_or_default().into(),
                 auth: k.auth.into(),
+                category: k.category.into(),
                 experimental: k.experimental,
             })
             .collect();
+        let category_items = |category: &str| {
+            items
+                .iter()
+                .filter(|item| item.category == category)
+                .cloned()
+                .collect::<Vec<_>>()
+        };
+        let category_names = |category: &str| {
+            let mut category_names = known
+                .iter()
+                .filter(|provider| provider.category == category)
+                .map(|provider| provider.display_name.clone())
+                .collect::<Vec<_>>();
+            category_names.push("Custom".into());
+            category_names
+        };
+        let subscription_items = category_items("subscription");
+        let api_items = category_items("api");
+        let local_items = category_items("local");
+        let subscription_names = category_names("subscription");
+        let api_names = category_names("api");
+        let local_names = category_names("local");
         use slint::Model as _;
         let first_load = ui.get_settings_known_provider_names().row_count() == 0;
         ui.set_settings_known_providers(ModelRc::new(VecModel::from(items)));
         ui.set_settings_known_provider_names(string_model(names));
+        ui.set_settings_subscription_known_providers(ModelRc::new(VecModel::from(
+            subscription_items,
+        )));
+        ui.set_settings_subscription_known_provider_names(string_model(subscription_names));
+        ui.set_settings_api_known_providers(ModelRc::new(VecModel::from(api_items)));
+        ui.set_settings_api_known_provider_names(string_model(api_names));
+        ui.set_settings_local_known_providers(ModelRc::new(VecModel::from(local_items)));
+        ui.set_settings_local_known_provider_names(string_model(local_names));
         // Start on "Custom"; later refreshes keep the user's selection.
         if first_load {
             ui.set_settings_preset_index(custom_index);
