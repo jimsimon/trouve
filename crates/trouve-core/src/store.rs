@@ -1129,15 +1129,20 @@ impl Store {
     /// key.
     pub fn backend_session(&self, thread_id: &str, backend: &str) -> Result<Option<(String, u64)>> {
         let conn = self.conn.lock().unwrap();
-        Ok(conn
+        let row = conn
             .query_row(
                 "SELECT backend_session_id, seen_messages FROM backend_sessions
                  WHERE thread_id = ?1 AND backend IN (?2, '')
                  ORDER BY backend DESC LIMIT 1",
                 params![thread_id, backend],
-                |r| Ok((r.get(0)?, r.get(1)?)),
+                |r| Ok((r.get(0)?, r.get::<_, i64>(1)?)),
             )
-            .optional()?)
+            .optional()?;
+        row.map(|(id, seen)| {
+            let seen = u64::try_from(seen).context("backend seen_messages was negative")?;
+            Ok((id, seen))
+        })
+        .transpose()
     }
 
     pub fn set_backend_session(
@@ -1168,6 +1173,7 @@ impl Store {
     /// off the whole history again anyway.
     pub fn mark_backend_seen(&self, thread_id: &str, backend: &str, seen: u64) -> Result<()> {
         let conn = self.conn.lock().unwrap();
+        let seen = i64::try_from(seen).context("backend seen_messages exceeds SQLite range")?;
         conn.execute(
             "UPDATE backend_sessions SET seen_messages = ?3
              WHERE thread_id = ?1 AND backend = ?2",
