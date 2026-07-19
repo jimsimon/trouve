@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1784493743878,
+  "lastUpdate": 1784494951832,
   "repoUrl": "https://github.com/jimsimon/trouve",
   "entries": {
     "e2e-benchmarks": [
@@ -2591,6 +2591,54 @@ window.BENCHMARK_DATA = {
             "name": "non-git warm query",
             "value": 71.39015518000001,
             "range": "± 1.3",
+            "unit": "ms"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "jim.j.simon@gmail.com",
+            "name": "Jim Simon",
+            "username": "jimsimon"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "f3e73087b9fe724bce548d9f431b73fa4d80e00f",
+          "message": "Render Markdown tables (#87)",
+          "timestamp": "2026-07-19T17:01:07-04:00",
+          "tree_id": "b0c22119d31d18d3f8aff12772254f2e85b57b54",
+          "url": "https://github.com/jimsimon/trouve/commit/f3e73087b9fe724bce548d9f431b73fa4d80e00f"
+        },
+        "date": 1784494950799,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "cold index + query",
+            "value": 137.32109754,
+            "range": "± 4.7",
+            "unit": "ms"
+          },
+          {
+            "name": "warm query",
+            "value": 73.45185104000002,
+            "range": "± 3.1",
+            "unit": "ms"
+          },
+          {
+            "name": "incremental (1 file modified)",
+            "value": 83.23637428,
+            "range": "± 1.8",
+            "unit": "ms"
+          },
+          {
+            "name": "non-git warm query",
+            "value": 72.67995276,
+            "range": "± 2",
             "unit": "ms"
           }
         ]
