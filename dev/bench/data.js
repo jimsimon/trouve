@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1784493207592,
+  "lastUpdate": 1784493255191,
   "repoUrl": "https://github.com/jimsimon/trouve",
   "entries": {
     "e2e-benchmarks": [
@@ -5041,6 +5041,54 @@ window.BENCHMARK_DATA = {
             "name": "dense_query_20k_rows",
             "value": 813076.1328545026,
             "range": "± 2711",
+            "unit": "ns"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "jim.j.simon@gmail.com",
+            "name": "Jim Simon",
+            "username": "jimsimon"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "ddc34003264b60311d61c986d950a6f71184597c",
+          "message": "Confine vendor agents to session worktrees (#79)\n\n* Confine vendor agents to session worktrees\n\nRun Cursor ACP processes per worktree so process cwd fallbacks cannot mutate the main checkout. Deny structured vendor writes that escape the worktree and bound idle Cursor and Claude process retention.\n\n* Canonicalize Cursor cwd assertions on macOS",
+          "timestamp": "2026-07-19T16:32:05-04:00",
+          "tree_id": "a3cf55903bde8c98feb5295df949e654258fae85",
+          "url": "https://github.com/jimsimon/trouve/commit/ddc34003264b60311d61c986d950a6f71184597c"
+        },
+        "date": 1784493254764,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "bm25_build_5k_docs",
+            "value": 5098013.7,
+            "range": "± 7372",
+            "unit": "ns"
+          },
+          {
+            "name": "bm25_query_5k_docs",
+            "value": 35752.264424860856,
+            "range": "± 11",
+            "unit": "ns"
+          },
+          {
+            "name": "chunk_python_200_functions",
+            "value": 2869495.861111111,
+            "range": "± 4093",
+            "unit": "ns"
+          },
+          {
+            "name": "dense_query_20k_rows",
+            "value": 1454532.5219506407,
+            "range": "± 17134",
             "unit": "ns"
           }
         ]
