@@ -1713,18 +1713,35 @@ export component AppWindow inherits Window {
     // The viewport-y/viewport-height the tail pin last wrote. The
     // viewport-y watcher compares against them to tell user scrolls
     // (which end following) from pin writes and the ListView's own
-    // layout adjustments (which don't). A jump from far away converges
-    // over several frames: each one instantiates rows near the new
-    // offset, re-measures them, and may re-derive viewport-y — only a
-    // move with the content height unchanged is a real user scroll.
+    // layout adjustments (which don't). Corrections are deferred through
+    // chat-pin-timer: writing viewport-y from a viewport change handler
+    // makes ListView remeasure synchronously and can exceed Slint's
+    // callback/instantiation stabilization limit.
     property <length> chat-pin-y: 0px;
     property <length> chat-pin-h: 0px;
+    property <bool> chat-pin-pending: false;
+    chat-pin-timer := Timer {
+        interval: 1ms;
+        running: root.chat-pin-pending;
+        triggered => {
+            root.chat-pin-pending = false;
+            if (root.chat-follow) {
+                chat-list.viewport-y = min(0px,
+                    chat-list.visible-height - chat-list.viewport-height);
+                root.chat-pin-y = chat-list.viewport-y;
+                root.chat-pin-h = chat-list.viewport-height;
+            }
+        }
+    }
     public function scroll-chat-to-end() {
         root.chat-restoring = false;
         root.chat-follow = true;
         chat-list.viewport-y = min(0px, chat-list.visible-height - chat-list.viewport-height);
         root.chat-pin-y = chat-list.viewport-y;
         root.chat-pin-h = chat-list.viewport-height;
+        // ListView may remeasure rows after this callback returns. Coalesce
+        // the final correction onto the next event-loop tick.
+        root.chat-pin-pending = true;
     }
     // Intentional navigation (send/notification/running/queued) supersedes
     // any debounced user bookmark still waiting to be persisted.
@@ -2593,18 +2610,16 @@ export component AppWindow inherits Window {
                         // ListView's layout adjustments (it re-derives
                         // viewport-y while re-measuring freshly
                         // instantiated rows) coincide with a
-                        // viewport-height change, and must re-pin
-                        // instead so a jump from far away converges on
-                        // the bottom over a few frames.
+                        // viewport-height change, and must schedule another
+                        // pin instead so a jump from far away converges on
+                        // the bottom over a few event-loop ticks.
                         if (root.chat-follow && !root.chat-at-bottom
                                 && self.viewport-y != root.chat-pin-y) {
                             if (self.viewport-height == root.chat-pin-h) {
                                 root.chat-follow = false;
+                                root.chat-pin-pending = false;
                             } else {
-                                self.viewport-y = min(0px,
-                                    self.visible-height - self.viewport-height);
-                                root.chat-pin-y = self.viewport-y;
-                                root.chat-pin-h = self.viewport-height;
+                                root.chat-pin-pending = true;
                             }
                         }
                     }
@@ -2613,10 +2628,7 @@ export component AppWindow inherits Window {
                     // grow during streaming; see chat-follow.
                     changed viewport-height => {
                         if (root.chat-follow) {
-                            self.viewport-y = min(0px,
-                                self.visible-height - self.viewport-height);
-                            root.chat-pin-y = self.viewport-y;
-                            root.chat-pin-h = self.viewport-height;
+                            root.chat-pin-pending = true;
                         } else {
                             root.converge-chat-anchor();
                         }
@@ -2626,10 +2638,7 @@ export component AppWindow inherits Window {
                     // height. Both tail and row anchors must survive that.
                     changed visible-height => {
                         if (root.chat-follow) {
-                            self.viewport-y = min(0px,
-                                self.visible-height - self.viewport-height);
-                            root.chat-pin-y = self.viewport-y;
-                            root.chat-pin-h = self.viewport-height;
+                            root.chat-pin-pending = true;
                         } else {
                             root.converge-chat-anchor();
                         }
