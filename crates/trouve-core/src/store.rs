@@ -540,6 +540,14 @@ impl Store {
         )?;
         tx.execute("DELETE FROM usage WHERE session_id = ?1", params![id])?;
         tx.execute("DELETE FROM checkpoints WHERE session_id = ?1", params![id])?;
+        // Automation history is intentionally best-effort metadata, not
+        // ownership. Clear it before removing the session so databases from
+        // versions that enforced this relationship with a foreign key can
+        // still delete old automation-created sessions.
+        tx.execute(
+            "UPDATE automations SET last_session_id = NULL WHERE last_session_id = ?1",
+            params![id],
+        )?;
         // attachments and spawned_threads both FK to threads(id); with
         // foreign_keys=ON, deleting threads while these rows exist fails the
         // whole transaction. Any session that ever took an attachment or used
@@ -1512,6 +1520,17 @@ mod tests {
             created_at: chrono::Utc::now(),
         };
         store.insert_session(&session).unwrap();
+        store
+            .conn
+            .lock()
+            .unwrap()
+            .execute(
+                "INSERT INTO automations
+                    (id, name, prompt, workspace_id, schedule, last_session_id, created_at)
+                 VALUES ('au_1', 'cleanup', 'prompt', 'ws_1', '{}', 'se_1', 'now')",
+                [],
+            )
+            .unwrap();
         let thread = Thread {
             id: "th_1".into(),
             session_id: "se_1".into(),
@@ -1564,6 +1583,17 @@ mod tests {
         assert!(store.backend_session("th_1", "cursor").unwrap().is_none());
         assert!(store.queued_prompts("th_1").unwrap().is_empty());
         assert!(store.attachment("at_1").unwrap().is_none());
+        let automation_session: Option<String> = store
+            .conn
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT last_session_id FROM automations WHERE id = 'au_1'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(automation_session.is_none());
     }
 
     /// Vendor sessions are keyed per backend: swapping cursor → claude →
