@@ -565,6 +565,7 @@ IFS= read -r line # initialize
 echo '{"jsonrpc":"2.0","id":1,"result":{}}'
 IFS= read -r line # initialized notification
 IFS= read -r line # thread/start
+printf '%s\n' "$line" > "$0.thread-start"
 echo '{"jsonrpc":"2.0","id":2,"result":{"thread":{"id":"thr-1"}}}'
 IFS= read -r line # turn/start
 printf '%s\n' "$line" > "$0.turn-start"
@@ -625,19 +626,25 @@ cat > /dev/null
     assert_eq!(usage.input_tokens, 11);
     assert_eq!(usage.output_tokens, 4);
 
-    // Outbound network access is explicit because Codex otherwise defaults
-    // workspace-write turns to an offline sandbox.
-    let turn_start = std::fs::read_to_string(format!("{stub}.turn-start")).unwrap();
-    let turn_start: serde_json::Value = serde_json::from_str(&turn_start).unwrap();
-    assert_eq!(
-        turn_start["params"]["sandboxPolicy"],
-        serde_json::json!({ "type": "workspaceWrite", "networkAccess": true })
-    );
-
     // Our approval reply reached the vendor with an accept decision.
     let reply = std::fs::read_to_string(format!("{stub}.approval")).unwrap();
     assert!(reply.contains("\"id\":100"), "{reply}");
     assert!(reply.contains("\"decision\":\"accept\""), "{reply}");
+
+    // Ask mode keeps Codex's command approval gate, but runs approved work
+    // without its workspace sandbox so linked-worktree Git metadata remains
+    // writable (ADR 0004 leaves local isolation to trouve's permissions).
+    let thread_start = std::fs::read_to_string(format!("{stub}.thread-start")).unwrap();
+    let thread_start: serde_json::Value = serde_json::from_str(&thread_start).unwrap();
+    assert_eq!(thread_start["params"]["approvalPolicy"], "untrusted");
+    assert_eq!(thread_start["params"]["sandbox"], "danger-full-access");
+    let turn_start = std::fs::read_to_string(format!("{stub}.turn-start")).unwrap();
+    let turn_start: serde_json::Value = serde_json::from_str(&turn_start).unwrap();
+    assert_eq!(turn_start["params"]["approvalPolicy"], "untrusted");
+    assert_eq!(
+        turn_start["params"]["sandboxPolicy"],
+        serde_json::json!({ "type": "dangerFullAccess" })
+    );
 }
 
 #[tokio::test]

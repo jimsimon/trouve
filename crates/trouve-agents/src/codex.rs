@@ -47,6 +47,25 @@ pub struct CodexBackend {
 /// How long a fetched vendor model list stays fresh.
 const MODELS_TTL: std::time::Duration = std::time::Duration::from_secs(300);
 
+/// Codex's two sandbox spellings: `thread/start` uses the kebab-case mode,
+/// while `turn/start` uses the camel-case policy discriminator.
+///
+/// Mutable local turns deliberately rely on trouve's permission posture
+/// instead of Codex's OS sandbox (ADR 0004): Ask keeps command approvals and
+/// Yolo is explicitly unrestricted. This is also required for linked
+/// worktrees because Codex's workspace-write mode protects both `.git` and
+/// the resolved external gitdir, so Git cannot even create its per-worktree
+/// `index.lock`. Read-only modes retain that sandbox.
+fn permission_settings(
+    permission: BackendPermission,
+) -> (&'static str, &'static str, &'static str) {
+    match permission {
+        BackendPermission::ReadOnly => ("never", "read-only", "readOnly"),
+        BackendPermission::Ask => ("untrusted", "danger-full-access", "dangerFullAccess"),
+        BackendPermission::Yolo => ("never", "danger-full-access", "dangerFullAccess"),
+    }
+}
+
 impl CodexBackend {
     pub fn new(id: impl Into<String>, command: Option<String>) -> Self {
         Self {
@@ -181,15 +200,15 @@ impl AgentBackend for CodexBackend {
             .get("reasoning_effort")
             .and_then(Value::as_str)
             .or(id_effort);
-        let (approval_policy, sandbox, sandbox_policy_type) = match turn.permission {
-            // Approval policy: untrusted | on-request | granular | never;
-            // "untrusted" = ask before anything not on the trusted list.
-            // The two sandbox strings are the same mode in the protocol's
-            // two casings: thread/start's `sandbox` enum is kebab-case
-            // while turn/start's `sandboxPolicy` type tag is camelCase.
-            BackendPermission::ReadOnly => ("never", "read-only", "readOnly"),
-            BackendPermission::Ask => ("untrusted", "workspace-write", "workspaceWrite"),
-            BackendPermission::Yolo => ("never", "workspace-write", "workspaceWrite"),
+        let (approval_policy, sandbox, sandbox_policy_type) = permission_settings(turn.permission);
+        let sandbox_policy = if matches!(turn.permission, BackendPermission::ReadOnly) {
+            // Sandboxed read-only turns still need outbound access for
+            // fetches, remote inspection, and MCP servers.
+            json!({ "type": sandbox_policy_type, "networkAccess": true })
+        } else {
+            // dangerFullAccess has no networkAccess field: with no OS
+            // sandbox, network access is already unrestricted.
+            json!({ "type": sandbox_policy_type })
         };
 
         // Per-thread config overrides: the trouve MCP bridge rides along so
@@ -260,15 +279,7 @@ impl AgentBackend for CodexBackend {
             "threadId": codex_thread_id,
             "model": model_or_default(model_name),
             "approvalPolicy": approval_policy,
-            // Codex defaults networkAccess to false for both read-only and
-            // workspace-write sandboxes. Turns need outbound access for
-            // fetches, package managers, remote git operations, and MCP
-            // servers; filesystem mutation remains governed independently
-            // by the sandbox type and approval policy above.
-            "sandboxPolicy": {
-                "type": sandbox_policy_type,
-                "networkAccess": true,
-            },
+            "sandboxPolicy": sandbox_policy,
             "input": input,
         });
         if let Some(effort) = effort {
@@ -1151,6 +1162,22 @@ mod tests {
                 .await
                 .expect("saturated route should close")
                 .is_none()
+        );
+    }
+
+    #[test]
+    fn mutable_permissions_leave_git_metadata_writable() {
+        assert_eq!(
+            permission_settings(crate::BackendPermission::ReadOnly),
+            ("never", "read-only", "readOnly")
+        );
+        assert_eq!(
+            permission_settings(crate::BackendPermission::Ask),
+            ("untrusted", "danger-full-access", "dangerFullAccess")
+        );
+        assert_eq!(
+            permission_settings(crate::BackendPermission::Yolo),
+            ("never", "danger-full-access", "dangerFullAccess")
         );
     }
 
