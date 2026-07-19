@@ -6,8 +6,8 @@ use slint::{ModelRc, SharedString, VecModel};
 
 use crate::render::ChatRowData;
 use crate::{
-    AppWindow, ChatRow, CliItem, DiffRow, FileItem, KnownProviderItem, NavRow, ProviderItem,
-    QOption, QPair, TextSegment, ThreadTabItem,
+    AppWindow, ChatRow, ChatTableCell, CliItem, DiffRow, FileItem, KnownProviderItem, NavRow,
+    ProviderItem, QOption, QPair, TextSegment, ThreadTabItem,
 };
 
 type Ui = slint::Weak<AppWindow>;
@@ -187,6 +187,28 @@ fn to_chat_row(r: &ChatRowData) -> ChatRow {
     } else {
         ModelRc::default()
     };
+    let table_rows: ModelRc<ModelRc<ChatTableCell>> = if r.kind == 1 && r.md_kind == 7 {
+        ModelRc::new(VecModel::from(
+            r.table_rows
+                .iter()
+                .map(|table_row| {
+                    ModelRc::new(VecModel::from(
+                        table_row
+                            .iter()
+                            .map(|(markdown, alignment)| ChatTableCell {
+                                text: slint::StyledText::from_markdown(markdown).unwrap_or_else(
+                                    |_| slint::StyledText::from_plain_text(markdown),
+                                ),
+                                alignment: *alignment,
+                            })
+                            .collect::<Vec<_>>(),
+                    ))
+                })
+                .collect::<Vec<_>>(),
+        ))
+    } else {
+        ModelRc::default()
+    };
     ChatRow {
         kind: r.kind,
         md_kind: r.md_kind,
@@ -194,6 +216,7 @@ fn to_chat_row(r: &ChatRowData) -> ChatRow {
         md_lang: SharedString::from(r.md_lang.as_str()),
         text: SharedString::from(r.text.as_str()),
         code_lines,
+        table_rows,
         // Malformed markup falls back to the raw text rather than
         // dropping the row.
         styled: slint::StyledText::from_markdown(&r.styled_md)

@@ -89,13 +89,19 @@ export struct QPair {
     answer: string,
 }
 
+export struct ChatTableCell {
+    text: styled-text,
+    // 0 default, 1 left, 2 center, 3 right.
+    alignment: int,
+}
+
 export struct ChatRow {
     // 0 user, 1 markdown block, 2 tool card, 3 turn status,
     // 4 thinking, 5 activity (spinner + label),
     // 6 raw response text (selectable markdown source)
     kind: int,
     // For kind 1: 0 paragraph, 1 h1, 2 h2, 3 h3, 4 bullet, 5 code fence,
-    // 6 numbered list item.
+    // 6 numbered list item, 7 table.
     md-kind: int,
     // List nesting level for md-kind 4/6 (0 = top level).
     md-indent: int,
@@ -107,6 +113,8 @@ export struct ChatRow {
     styled: styled-text,
     // For kind 1 code fences: syntax-highlight segments, one entry per line.
     code-lines: [[TextSegment]],
+    // For kind 1 tables: header followed by body rows.
+    table-rows: [[ChatTableCell]],
     // Text tint for markdown rows: 0 agent (default), 1 user prompt,
     // 2 thinking.
     tone: int,
@@ -602,6 +610,47 @@ component CopyButton inherits Rectangle {
     ta := TouchArea {
         clicked => { root.do-copy(); }
         changed has-hover => { root.tip-changed(self.has-hover); }
+    }
+}
+
+// Shared table grid for chat markdown and rendered file previews. Callers
+// supply the text tint; grid structure and surface colors stay identical.
+component TableGrid inherits Rectangle {
+    in property <[[ChatTableCell]]> rows;
+    in property <color> default-color: Theme.c.text;
+    callback link-clicked(string);
+
+    background: Theme.c.card-border;
+    border-radius: 4px;
+    clip: true;
+
+    VerticalLayout {
+        padding: 1px;
+        spacing: 1px;
+
+        for table-row[table-row-index] in root.rows: HorizontalLayout {
+            spacing: 1px;
+
+            for cell in table-row: Rectangle {
+                horizontal-stretch: 1;
+                background: table-row-index == 0
+                    ? Theme.c.surface : Theme.c.inset-bg;
+
+                VerticalLayout {
+                    padding: 6px;
+
+                    StyledText {
+                        text: cell.text;
+                        default-color: root.default-color;
+                        link-color: Theme.c.accent;
+                        default-font-size: Theme.fs(13px);
+                        horizontal-alignment: cell.alignment == 3 ? right
+                            : cell.alignment == 2 ? center : left;
+                        link-clicked(url) => { root.link-clicked(url); }
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -2495,7 +2544,13 @@ export component AppWindow inherits Window {
                                     }
                                 }
                             }
-                            if row.kind == 1 && row.md-kind != 5: StyledText {
+                            if row.kind == 1 && row.md-kind == 7: TableGrid {
+                                rows: row.table-rows;
+                                default-color: row.tone == 1 ? Theme.c.text-accent-soft
+                                    : row.tone == 2 ? Theme.c.text-dim : Theme.c.text;
+                                link-clicked(url) => { root.open-link(url); }
+                            }
+                            if row.kind == 1 && row.md-kind != 5 && row.md-kind != 7: StyledText {
                                 text: row.styled;
                                 default-color: row.tone == 1 ? Theme.c.text-accent-soft
                                     : row.tone == 2 ? Theme.c.text-dim
@@ -3863,7 +3918,12 @@ export component AppWindow inherits Window {
                                         }
                                     }
                                 }
-                                if row.md-kind != 5: StyledText {
+                                if row.md-kind == 7: TableGrid {
+                                    rows: row.table-rows;
+                                    default-color: Theme.c.text;
+                                    link-clicked(url) => { root.open-link(url); }
+                                }
+                                if row.md-kind != 5 && row.md-kind != 7: StyledText {
                                     text: row.styled;
                                     default-color: Theme.c.text;
                                     link-color: Theme.c.accent;
