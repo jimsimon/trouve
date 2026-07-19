@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1784430293985,
+  "lastUpdate": 1784434336631,
   "repoUrl": "https://github.com/jimsimon/trouve",
   "entries": {
     "e2e-benchmarks": [
@@ -1967,6 +1967,54 @@ window.BENCHMARK_DATA = {
             "name": "non-git warm query",
             "value": 68.32415425999999,
             "range": "± 2",
+            "unit": "ms"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "jim.j.simon@gmail.com",
+            "name": "Jim Simon",
+            "username": "jimsimon"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "5b51fc315936c809889f3a97baf37ca4bf081eb6",
+          "message": "Show completed Codex reasoning messages (#71)",
+          "timestamp": "2026-07-19T00:09:45-04:00",
+          "tree_id": "dc06865bce5082879a064a74a46b3d3ee10d2db8",
+          "url": "https://github.com/jimsimon/trouve/commit/5b51fc315936c809889f3a97baf37ca4bf081eb6"
+        },
+        "date": 1784434335783,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "cold index + query",
+            "value": 133.28205904,
+            "range": "± 20",
+            "unit": "ms"
+          },
+          {
+            "name": "warm query",
+            "value": 67.237134,
+            "range": "± 1.8",
+            "unit": "ms"
+          },
+          {
+            "name": "incremental (1 file modified)",
+            "value": 76.34722794,
+            "range": "± 1.2",
+            "unit": "ms"
+          },
+          {
+            "name": "non-git warm query",
+            "value": 64.28154728,
+            "range": "± 1.7",
             "unit": "ms"
           }
         ]
