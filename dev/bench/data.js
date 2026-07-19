@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1784450232729,
+  "lastUpdate": 1784489646123,
   "repoUrl": "https://github.com/jimsimon/trouve",
   "entries": {
     "e2e-benchmarks": [
@@ -2255,6 +2255,54 @@ window.BENCHMARK_DATA = {
             "name": "non-git warm query",
             "value": 55.62856920000001,
             "range": "± 3",
+            "unit": "ms"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "jim.j.simon@gmail.com",
+            "name": "Jim Simon",
+            "username": "jimsimon"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "ef1f2a00ac3aaac7e551969ff621af41fe0e9529",
+          "message": "Keep sidebar controls clear of scrollbar (#91)",
+          "timestamp": "2026-07-19T15:32:41-04:00",
+          "tree_id": "da3a12c9ea478e6bc465193ef051baa4e9a1bd80",
+          "url": "https://github.com/jimsimon/trouve/commit/ef1f2a00ac3aaac7e551969ff621af41fe0e9529"
+        },
+        "date": 1784489645716,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "cold index + query",
+            "value": 138.89516016,
+            "range": "± 5.7",
+            "unit": "ms"
+          },
+          {
+            "name": "warm query",
+            "value": 78.1045238,
+            "range": "± 3",
+            "unit": "ms"
+          },
+          {
+            "name": "incremental (1 file modified)",
+            "value": 88.18060354,
+            "range": "± 1",
+            "unit": "ms"
+          },
+          {
+            "name": "non-git warm query",
+            "value": 79.33142356,
+            "range": "± 2.1",
             "unit": "ms"
           }
         ]
