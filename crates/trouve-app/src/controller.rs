@@ -477,6 +477,17 @@ enum NewChat {
     Thread,
 }
 
+/// Picker values submitted by either new-session or new-thread setup.
+struct NewChatSelection {
+    workspace_idx: usize,
+    branch_idx: usize,
+    fetch_latest: bool,
+    mode_idx: usize,
+    model_idx: usize,
+    thinking_idx: usize,
+    permission_idx: usize,
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 struct AttentionCounts {
     approvals: usize,
@@ -2952,25 +2963,17 @@ impl Controller {
         }
     }
 
-    async fn start_new_chat(
-        &mut self,
-        workspace_idx: usize,
-        branch_idx: usize,
-        fetch_latest: bool,
-        mode_idx: usize,
-        model_idx: usize,
-        thinking_idx: usize,
-        permission_idx: usize,
-        prompt: String,
-    ) -> Result<()> {
+    async fn start_new_chat(&mut self, selection: NewChatSelection, prompt: String) -> Result<()> {
         let mut model_options = serde_json::Map::new();
         if let (Some(key), Some(value)) = (
             self.new_chat_thinking_key.clone(),
-            self.new_chat_thinking_values.get(thinking_idx).cloned(),
+            self.new_chat_thinking_values
+                .get(selection.thinking_idx)
+                .cloned(),
         ) {
             model_options.insert(key, serde_json::Value::String(value));
         }
-        let permission_mode = match permission_idx {
+        let permission_mode = match selection.permission_idx {
             1 => Some(PermissionMode::Ask),
             2 => Some(PermissionMode::AllowList),
             3 => Some(PermissionMode::Yolo),
@@ -2979,8 +2982,13 @@ impl Controller {
         match self.new_chat {
             Some(NewChat::Thread) => {
                 self.close_new_chat();
-                self.create_thread(mode_idx, model_idx, model_options.clone(), permission_mode)
-                    .await?;
+                self.create_thread(
+                    selection.mode_idx,
+                    selection.model_idx,
+                    model_options.clone(),
+                    permission_mode,
+                )
+                .await?;
                 if let Some(thread_id) = self.current_thread_id() {
                     let uploads = std::mem::take(&mut self.pending_attachments);
                     self.push_attachments();
@@ -2992,7 +3000,7 @@ impl Controller {
             _ => {
                 let workspace = self
                     .workspaces
-                    .get(workspace_idx)
+                    .get(selection.workspace_idx)
                     .context("no workspace selected")?
                     .clone();
                 let session = self
@@ -3000,8 +3008,8 @@ impl Controller {
                     .create_session(&CreateSessionRequest {
                         workspace_id: workspace.id,
                         title: Some(session_title(&prompt)),
-                        base_ref: self.branches.get(branch_idx).cloned(),
-                        fetch_latest,
+                        base_ref: self.branches.get(selection.branch_idx).cloned(),
+                        fetch_latest: selection.fetch_latest,
                     })
                     .await?;
                 self.close_new_chat();
@@ -3012,8 +3020,13 @@ impl Controller {
                     .position(|s| s.id == session.id)
                     .unwrap_or(0);
                 self.select_session(index).await?;
-                self.create_thread(mode_idx, model_idx, model_options, permission_mode)
-                    .await?;
+                self.create_thread(
+                    selection.mode_idx,
+                    selection.model_idx,
+                    model_options,
+                    permission_mode,
+                )
+                .await?;
                 if let Some(thread_id) = self.current_thread_id() {
                     let uploads = std::mem::take(&mut self.pending_attachments);
                     self.push_attachments();
@@ -3935,13 +3948,15 @@ impl Controller {
                 prompt,
             } => {
                 self.start_new_chat(
-                    workspace_idx,
-                    branch_idx,
-                    fetch_latest,
-                    mode_idx,
-                    model_idx,
-                    thinking_idx,
-                    permission_idx,
+                    NewChatSelection {
+                        workspace_idx,
+                        branch_idx,
+                        fetch_latest,
+                        mode_idx,
+                        model_idx,
+                        thinking_idx,
+                        permission_idx,
+                    },
                     prompt,
                 )
                 .await?
