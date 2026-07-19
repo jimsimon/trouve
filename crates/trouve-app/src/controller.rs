@@ -1124,7 +1124,9 @@ impl Controller {
     async fn reload_sessions(&mut self) -> Result<()> {
         let current_id = self.current_session_id();
         self.workspaces = self.client.list_workspaces().await?;
-        reconcile_workspace_order(&mut self.workspace_order, &self.workspaces);
+        if reconcile_workspace_order(&mut self.workspace_order, &self.workspaces) {
+            self.save_workspace_order();
+        }
         self.sessions = self.client.list_sessions().await?;
         self.busy_sessions = self
             .sessions
@@ -5030,16 +5032,22 @@ fn parse_mcp_form(
 }
 
 /// Drop stale/duplicate ids from a saved order and append newly registered
-/// workspaces in the order returned by the server.
-fn reconcile_workspace_order(order: &mut Vec<String>, workspaces: &[Workspace]) {
+/// workspaces in the order returned by the server. Returns true if the order
+/// was modified.
+fn reconcile_workspace_order(order: &mut Vec<String>, workspaces: &[Workspace]) -> bool {
     let live: HashSet<&str> = workspaces.iter().map(|ws| ws.id.as_str()).collect();
     let mut seen = HashSet::new();
+    let original_len = order.len();
     order.retain(|id| live.contains(id.as_str()) && seen.insert(id.clone()));
+    let removed_or_deduped = order.len() != original_len;
+    let mut added = false;
     for workspace in workspaces {
         if seen.insert(workspace.id.clone()) {
             order.push(workspace.id.clone());
+            added = true;
         }
     }
+    removed_or_deduped || added
 }
 
 /// Move `workspace_id` immediately before/after `target_id`.
@@ -5090,8 +5098,15 @@ mod tests {
     fn saved_workspace_order_keeps_new_workspaces_at_the_end() {
         let list = workspaces(&["a", "b", "c", "d"]);
         let mut order = vec!["c".into(), "a".into(), "missing".into(), "c".into()];
-        reconcile_workspace_order(&mut order, &list);
+        let changed = reconcile_workspace_order(&mut order, &list);
         assert_eq!(order, ["c", "a", "b", "d"]);
+        assert!(changed); // Removed stale "missing" and duplicate "c", added "b" and "d"
+
+        // Reconciling again with the same list should not change anything
+        let mut order2 = vec!["c".into(), "a".into(), "b".into(), "d".into()];
+        let changed2 = reconcile_workspace_order(&mut order2, &list);
+        assert_eq!(order2, ["c", "a", "b", "d"]);
+        assert!(!changed2); // No changes when order already matches
     }
 
     #[test]
