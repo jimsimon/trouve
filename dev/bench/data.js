@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1784504339140,
+  "lastUpdate": 1784504427430,
   "repoUrl": "https://github.com/jimsimon/trouve",
   "entries": {
     "e2e-benchmarks": [
@@ -2879,6 +2879,54 @@ window.BENCHMARK_DATA = {
             "name": "non-git warm query",
             "value": 75.2499976,
             "range": "± 2.8",
+            "unit": "ms"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "jim.j.simon@gmail.com",
+            "name": "Jim Simon",
+            "username": "jimsimon"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "d5fda70b286d47b58a584f3970e56ebde60ca474",
+          "message": "Improve prompt composer controls (#72)\n\n* Improve prompt composer controls\n\n* Address prompt composer review feedback\n\n* Fix new chat Clippy lint\n\n* Harden permission mode selection\n\n* Allow attachment-only new chats",
+          "timestamp": "2026-07-19T19:36:38-04:00",
+          "tree_id": "1b9e0e0ad614136809ec3c2c31b9a4f05e7ce005",
+          "url": "https://github.com/jimsimon/trouve/commit/d5fda70b286d47b58a584f3970e56ebde60ca474"
+        },
+        "date": 1784504427037,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "cold index + query",
+            "value": 139.72453758,
+            "range": "± 6.5",
+            "unit": "ms"
+          },
+          {
+            "name": "warm query",
+            "value": 73.21617552000001,
+            "range": "± 2.3",
+            "unit": "ms"
+          },
+          {
+            "name": "incremental (1 file modified)",
+            "value": 86.59520292,
+            "range": "± 2.2",
+            "unit": "ms"
+          },
+          {
+            "name": "non-git warm query",
+            "value": 71.50054778,
+            "range": "± 2",
             "unit": "ms"
           }
         ]
