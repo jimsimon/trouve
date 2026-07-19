@@ -1113,7 +1113,7 @@ component NewChatForm inherits VerticalLayout {
         Button {
             text: root.session-form ? "Start session" : "Start thread";
             primary: true;
-            enabled: prompt-edit.text != "" && !root.blocked
+            enabled: (prompt-edit.text != "" || root.attachments.length > 0) && !root.blocked
                 && (!root.session-form || root.workspace-index >= 0);
             clicked => {
                 root.start(root.workspace-index, root.branch-index,
