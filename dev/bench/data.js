@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1784448134298,
+  "lastUpdate": 1784448207289,
   "repoUrl": "https://github.com/jimsimon/trouve",
   "entries": {
     "e2e-benchmarks": [
@@ -4081,6 +4081,54 @@ window.BENCHMARK_DATA = {
             "name": "dense_query_20k_rows",
             "value": 1553028.576867816,
             "range": "± 16265",
+            "unit": "ns"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "jim.j.simon@gmail.com",
+            "name": "Jim Simon",
+            "username": "jimsimon"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "4b91ef782469c7a303d0a7978eb385e6f7b74efc",
+          "message": "Add configurable thinking defaults (#75)\n\nPersist a global thinking level and optional per-mode overrides. Resolve inherited levels through each selected model schema so unsupported controls stay hidden and provider-specific keys remain correct.",
+          "timestamp": "2026-07-19T03:59:39-04:00",
+          "tree_id": "0978450ec76c9c0a7420812f2c54d8aae38c1b5a",
+          "url": "https://github.com/jimsimon/trouve/commit/4b91ef782469c7a303d0a7978eb385e6f7b74efc"
+        },
+        "date": 1784448206621,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "bm25_build_5k_docs",
+            "value": 5578230,
+            "range": "± 9357",
+            "unit": "ns"
+          },
+          {
+            "name": "bm25_query_5k_docs",
+            "value": 36067.438515643946,
+            "range": "± 202",
+            "unit": "ns"
+          },
+          {
+            "name": "chunk_python_200_functions",
+            "value": 2941145.194444444,
+            "range": "± 16332",
+            "unit": "ns"
+          },
+          {
+            "name": "dense_query_20k_rows",
+            "value": 1573245.3262108262,
+            "range": "± 13220",
             "unit": "ns"
           }
         ]
