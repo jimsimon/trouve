@@ -249,7 +249,23 @@ pub struct CheckpointRow {
 pub struct Store {
     conn: Arc<Mutex<Connection>>,
     events_tx: broadcast::Sender<EventEnvelope>,
+    append_tx: std::sync::mpsc::Sender<AppendRequest>,
 }
+
+/// One caller's event, in flight to the writer thread.
+struct AppendRequest {
+    scope: Scope,
+    ts: chrono::DateTime<chrono::Utc>,
+    /// Serialized on the caller's thread so an unserializable event fails
+    /// there instead of poisoning a whole batch.
+    payload: String,
+    event: Event,
+    reply: std::sync::mpsc::SyncSender<Result<EventEnvelope>>,
+}
+
+/// Upper bound on events committed per writer transaction. Bounds how long
+/// the earliest waiter in a batch can be held behind later arrivals.
+const APPEND_BATCH_MAX: usize = 256;
 
 fn scope_cols(scope: &Scope) -> (&'static str, String) {
     match scope {
@@ -265,6 +281,83 @@ fn scope_from_cols(kind: &str, id: String) -> Scope {
         "thread" => Scope::Thread(id),
         _ => Scope::Server,
     }
+}
+
+/// The sole author of `events` rows and `events_tx` broadcasts. A single
+/// writer assigning cursors and publishing in queue order upholds the
+/// ordering invariant by construction: live SSE subscribers drop anything
+/// with cursor <= the last they saw, so an out-of-order broadcast (6 before
+/// 5) would lose event 5 permanently until reconnect.
+///
+/// The thread exits when every `Store` clone (each holding a request sender)
+/// has been dropped.
+fn spawn_event_writer(
+    conn: Arc<Mutex<Connection>>,
+    events_tx: broadcast::Sender<EventEnvelope>,
+) -> std::sync::mpsc::Sender<AppendRequest> {
+    let (tx, rx) = std::sync::mpsc::channel::<AppendRequest>();
+    std::thread::Builder::new()
+        .name("trouve-event-writer".into())
+        .spawn(move || {
+            while let Ok(first) = rx.recv() {
+                let mut batch = vec![first];
+                while batch.len() < APPEND_BATCH_MAX
+                    && let Ok(req) = rx.try_recv()
+                {
+                    batch.push(req);
+                }
+                let inserted = {
+                    let mut conn = conn.lock().unwrap();
+                    insert_event_batch(&mut conn, &batch)
+                };
+                match inserted {
+                    Ok(cursors) => {
+                        for (req, cursor) in batch.into_iter().zip(cursors) {
+                            let envelope = EventEnvelope {
+                                cursor,
+                                scope: req.scope,
+                                ts: req.ts,
+                                event: req.event,
+                            };
+                            // Nobody listening is fine; a caller that gave up
+                            // waiting is too.
+                            let _ = events_tx.send(envelope.clone());
+                            let _ = req.reply.send(Ok(envelope));
+                        }
+                    }
+                    Err(e) => {
+                        // The transaction rolled back: every waiter's event
+                        // was equally not persisted.
+                        for req in batch {
+                            let _ = req
+                                .reply
+                                .send(Err(anyhow::anyhow!("appending event: {e}")));
+                        }
+                    }
+                }
+            }
+        })
+        .expect("spawning event writer thread");
+    tx
+}
+
+/// Insert a batch in queue order under one transaction, returning the
+/// assigned cursors. All-or-nothing: on error the transaction rolls back.
+fn insert_event_batch(conn: &mut Connection, batch: &[AppendRequest]) -> Result<Vec<u64>> {
+    let tx = conn.transaction()?;
+    let mut cursors = Vec::with_capacity(batch.len());
+    {
+        let mut stmt = tx.prepare_cached(
+            "INSERT INTO events (scope_kind, scope_id, ts, payload) VALUES (?1, ?2, ?3, ?4)",
+        )?;
+        for req in batch {
+            let (kind, id) = scope_cols(&req.scope);
+            stmt.execute(params![kind, id, req.ts.to_rfc3339(), req.payload])?;
+            cursors.push(tx.last_insert_rowid() as u64);
+        }
+    }
+    tx.commit()?;
+    Ok(cursors)
 }
 
 impl Store {
@@ -285,11 +378,7 @@ impl Store {
             "UPDATE queued_prompts SET claimed = 0 WHERE claimed != 0",
             [],
         )?;
-        let (events_tx, _) = broadcast::channel(4096);
-        Ok(Self {
-            conn: Arc::new(Mutex::new(conn)),
-            events_tx,
-        })
+        Ok(Self::from_conn(conn))
     }
 
     pub fn open_in_memory() -> Result<Self> {
@@ -302,41 +391,45 @@ impl Store {
             "UPDATE queued_prompts SET claimed = 0 WHERE claimed != 0",
             [],
         )?;
+        Ok(Self::from_conn(conn))
+    }
+
+    fn from_conn(conn: Connection) -> Self {
+        let conn = Arc::new(Mutex::new(conn));
         let (events_tx, _) = broadcast::channel(4096);
-        Ok(Self {
-            conn: Arc::new(Mutex::new(conn)),
+        let append_tx = spawn_event_writer(Arc::clone(&conn), events_tx.clone());
+        Self {
+            conn,
             events_tx,
-        })
+            append_tx,
+        }
     }
 
     // --- event log --------------------------------------------------------
 
     /// The single append chokepoint: persist first, then publish, so a
     /// subscriber can never observe an event that wouldn't survive a crash.
+    ///
+    /// Appends are executed by a dedicated writer thread that commits every
+    /// request queued at that moment in one transaction, so concurrent turns
+    /// pay one fsync per batch instead of one each, and never block each
+    /// other on the connection mutex. This call still waits for durability:
+    /// it returns once the batch containing this event has committed.
     pub fn append_event(&self, scope: Scope, event: Event) -> Result<EventEnvelope> {
-        let ts = chrono::Utc::now();
         let payload = serde_json::to_string(&event)?;
-        let (kind, id) = scope_cols(&scope);
-        // Assign the cursor and broadcast under the same lock, so two
-        // concurrent appends to one scope can never publish out of cursor
-        // order. Live SSE subscribers drop anything with cursor <= the last
-        // they saw, so an out-of-order broadcast (6 before 5) would lose
-        // event 5 permanently until reconnect.
-        let conn = self.conn.lock().unwrap();
-        conn.execute(
-            "INSERT INTO events (scope_kind, scope_id, ts, payload) VALUES (?1, ?2, ?3, ?4)",
-            params![kind, id, ts.to_rfc3339(), payload],
-        )?;
-        let cursor = conn.last_insert_rowid() as u64;
-        let envelope = EventEnvelope {
-            cursor,
-            scope,
-            ts,
-            event,
-        };
-        // Nobody listening is fine.
-        let _ = self.events_tx.send(envelope.clone());
-        Ok(envelope)
+        let (reply, reply_rx) = std::sync::mpsc::sync_channel(1);
+        self.append_tx
+            .send(AppendRequest {
+                scope,
+                ts: chrono::Utc::now(),
+                payload,
+                event,
+                reply,
+            })
+            .map_err(|_| anyhow::anyhow!("event writer thread has exited"))?;
+        reply_rx
+            .recv()
+            .map_err(|_| anyhow::anyhow!("event writer thread has exited"))?
     }
 
     /// Persisted events for a scope after `after` (exclusive), oldest first.
@@ -1436,6 +1529,48 @@ mod tests {
 
         let tail = store.events_after(&scope, all[0].cursor).unwrap();
         assert_eq!(tail.len(), 2);
+    }
+
+    #[test]
+    fn concurrent_appends_persist_and_broadcast_in_cursor_order() {
+        let store = Store::open_in_memory().unwrap();
+        let mut rx = store.subscribe();
+        let writers: Vec<_> = (0..4)
+            .map(|t| {
+                let store = store.clone();
+                std::thread::spawn(move || {
+                    for i in 0..50 {
+                        let env = store
+                            .append_event(
+                                Scope::Thread(format!("th_{t}")),
+                                Event::AssistantDelta {
+                                    turn: 1,
+                                    text: format!("d{i}"),
+                                },
+                            )
+                            .unwrap();
+                        assert!(env.cursor > 0);
+                    }
+                })
+            })
+            .collect();
+        for w in writers {
+            w.join().unwrap();
+        }
+        // Broadcast order must match cursor order even when appends from
+        // different threads were committed in shared batches.
+        let mut last = 0;
+        for _ in 0..200 {
+            let env = rx.try_recv().unwrap();
+            assert!(env.cursor > last, "broadcast out of cursor order");
+            last = env.cursor;
+        }
+        for t in 0..4 {
+            let events = store
+                .events_after(&Scope::Thread(format!("th_{t}")), 0)
+                .unwrap();
+            assert_eq!(events.len(), 50);
+        }
     }
 
     #[test]
