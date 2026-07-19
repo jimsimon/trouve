@@ -4167,9 +4167,9 @@ impl Controller {
             }
             UiCommand::NavPrsLoaded(session_id, result) => {
                 self.nav_prs_pending.remove(&session_id);
-                // Remember failures as an empty result. A later explicit
-                // auth refresh clears the cache and retries all sessions.
-                self.nav_prs.insert(session_id, result.unwrap_or_default());
+                if let Ok(prs) = result {
+                    self.nav_prs.insert(session_id, prs);
+                }
                 self.push_nav();
             }
             UiCommand::OpenIntegrationsSettings => {
