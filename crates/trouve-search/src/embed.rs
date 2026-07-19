@@ -612,9 +612,10 @@ fn resolve_model_files(id: &str) -> Result<ModelFiles> {
             .ok_or_else(|| anyhow!("no valid model layout found in {base:?}"));
     }
 
-    let api = hf_hub::api::sync::Api::new().context("hf-hub API init failed")?;
-    let repo = api.model(id.to_string());
-    let fetch = |name: &str| repo.get(name);
+    let api = hf_hub::HFClientSync::new().context("hf-hub API init failed")?;
+    let (owner, name) = hf_hub::split_id(id);
+    let repo = api.model(owner, name);
+    let fetch = |name: &str| repo.download_file().filename(name).send();
     let config = fetch("config.json")
         .or_else(|_| fetch("config_sentence_transformers.json"))
         .with_context(|| format!("could not load '{id}' from HuggingFace Hub"))?;
