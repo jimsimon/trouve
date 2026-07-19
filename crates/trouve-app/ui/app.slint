@@ -1161,9 +1161,13 @@ export component AppWindow inherits Window {
     pure callback workspace-drag-acceptable(data-transfer) -> bool;
     callback workspace-dropped(data-transfer, /* target id */ string, /* after */ bool) -> bool;
     callback workspace-moved(/* workspace id */ string, /* signed offset */ int);
-    // Set immediately before a keyboard move so the rebuilt repeater returns
-    // focus to the moved handle.
+    // Set immediately before a keyboard move so the nav update returns focus
+    // to the moved handle at its new model position.
     in-out property <string> workspace-reorder-focus-id: "";
+    property <int> workspace-reorder-focus-generation: 0;
+    public function restore-workspace-reorder-focus() {
+        root.workspace-reorder-focus-generation += 1;
+    }
     callback open-settings();
     callback session-renamed(/* nav row */ int, /* new title */ string);
     callback session-archived(/* nav row */ int, /* archived */ bool);
@@ -1728,7 +1732,15 @@ export component AppWindow inherits Window {
                 nav-list := ListView {
                     // Scrolling can move/recycle a hovered button without a
                     // hover-out; drop any tooltip it left behind.
-                    changed viewport-y => { Tip.hide-all(); }
+                    changed viewport-y => {
+                        Tip.hide-all();
+                        // A virtual-list remeasurement must never strand the
+                        // viewport beyond its content. Besides rendering an
+                        // empty nav, that invalid offset leaves the scrollbar
+                        // unable to return to the rows.
+                        self.viewport-y = clamp(self.viewport-y,
+                            min(0px, self.visible-height - self.viewport-height), 0px);
+                    }
                     for row[idx] in root.nav-rows: Rectangle {
                         // Match the chat pane's right-side gutter so the
                         // scrollbar never covers trailing row controls.
@@ -1926,6 +1938,13 @@ export component AppWindow inherits Window {
                                 border-color: Theme.c.accent;
 
                                 reorder-focus := FocusScope {
+                                    property <int> focus-generation: root.workspace-reorder-focus-generation;
+                                    function apply-pending-focus() {
+                                        if (root.workspace-reorder-focus-id == row.workspace-id) {
+                                            self.focus();
+                                            root.workspace-reorder-focus-id = "";
+                                        }
+                                    }
                                     enabled: row.workspace-count > 1;
                                     accessible-role: slider;
                                     accessible-label: "Position of " + row.title;
@@ -1965,10 +1984,10 @@ export component AppWindow inherits Window {
                                         return reject;
                                     }
                                     init => {
-                                        if (root.workspace-reorder-focus-id == row.workspace-id) {
-                                            root.workspace-reorder-focus-id = "";
-                                            self.focus();
-                                        }
+                                        self.apply-pending-focus();
+                                    }
+                                    changed focus-generation => {
+                                        self.apply-pending-focus();
                                     }
 
                                     drag-source := DragArea {
