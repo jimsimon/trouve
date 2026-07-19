@@ -150,6 +150,34 @@ EOF
 }
 
 #[tokio::test]
+async fn claude_adapter_surfaces_subscription_limit_as_error() {
+    let tmp = tempfile::tempdir().unwrap();
+    let stub = write_stub(
+        tmp.path(),
+        "claude-limit",
+        r#"#!/bin/bash
+cat <<'EOF'
+{"type":"system","subtype":"init","session_id":"sess-limit"}
+{"type":"result","subtype":"error_during_execution","is_error":true,"result":"You've hit your usage limit · resets at 3pm"}
+EOF
+"#,
+    );
+    let backend = ClaudeBackend::new("claude-code", Some(stub));
+    let mut stream = start_turn(&backend, || {
+        turn(tmp.path().to_path_buf(), None, BackendPermission::ReadOnly)
+    })
+    .await;
+
+    assert!(matches!(
+        stream.next().await,
+        Some(Ok(BackendEvent::SessionStarted { .. }))
+    ));
+    let error = stream.next().await.unwrap().unwrap_err().to_string();
+    assert!(error.contains("You've hit your usage limit"), "{error}");
+    assert!(stream.next().await.is_none());
+}
+
+#[tokio::test]
 async fn claude_adapter_reads_subscription_usage() {
     let tmp = tempfile::tempdir().unwrap();
     let soon = chrono::Utc::now().timestamp() + 2 * 3600 + 600;

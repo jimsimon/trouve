@@ -287,6 +287,11 @@ impl AgentBackend for ClaudeBackend {
                 let Ok(ev) = serde_json::from_str::<Value>(&line) else {
                     continue;
                 };
+                if let Some(error) = result_error(&ev) {
+                    let _ = tx.send(Err(BackendError::Protocol(error))).await;
+                    completed = true;
+                    break;
+                }
                 let events = map_event(&ev);
                 // Track the session the process is holding so the next
                 // turn's reuse check compares against the current id.
@@ -328,6 +333,52 @@ impl AgentBackend for ClaudeBackend {
         });
         Ok(stream.boxed())
     }
+}
+
+/// Claude reports turn-level failures as a final `result` record rather
+/// than closing stdout with an error. In particular, subscription limits use
+/// this path, so treating every result as successful makes the turn disappear
+/// from the chat without any feedback.
+fn result_error(ev: &Value) -> Option<String> {
+    if ev["type"].as_str() != Some("result") {
+        return None;
+    }
+    let subtype = ev["subtype"].as_str().unwrap_or_default();
+    if ev["is_error"].as_bool() != Some(true) && !subtype.starts_with("error_") {
+        return None;
+    }
+
+    ev["result"]
+        .as_str()
+        .filter(|message| !message.trim().is_empty())
+        .or_else(|| {
+            ev["error"]
+                .as_str()
+                .filter(|message| !message.trim().is_empty())
+        })
+        .or_else(|| {
+            ev["error"]["message"]
+                .as_str()
+                .filter(|message| !message.trim().is_empty())
+        })
+        .or_else(|| {
+            ev["errors"].as_array().and_then(|errors| {
+                errors.iter().find_map(|error| {
+                    error
+                        .as_str()
+                        .or_else(|| error["message"].as_str())
+                        .filter(|message| !message.trim().is_empty())
+                })
+            })
+        })
+        .map(str::to_string)
+        .or_else(|| {
+            Some(if subtype.is_empty() {
+                "Claude turn failed".to_string()
+            } else {
+                format!("Claude turn failed ({subtype})")
+            })
+        })
 }
 
 /// How long a `get_usage` query may take end to end (CLI cold start plus
