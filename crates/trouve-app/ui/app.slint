@@ -581,6 +581,7 @@ component IconButton inherits Rectangle {
     in property <image> icon-image;
     in property <bool> use-icon-image: false;
     in property <string> tip;
+    in property <string> accessibility-label;
     in property <bool> enabled: true;
     in property <length> icon-size: Theme.fs(12px);
     in property <color> icon-color: Theme.c.text-soft;
@@ -616,6 +617,8 @@ component IconButton inherits Rectangle {
     }
     fs := FocusScope {
         enabled: root.enabled;
+        accessible-role: button;
+        accessible-label: root.accessibility-label;
         key-pressed(event) => {
             if (event.text == Key.Return || event.text == " ") {
                 root.clicked();
@@ -4266,38 +4269,31 @@ export component AppWindow inherits Window {
                     VerticalLayout {
                         spacing: 2px;
                         Text {
-                            text: root.composer-yolo-selected ? "⚠ Permissions" : "Permissions";
+                            text: "Permissions";
                             color: root.composer-yolo-selected ? Theme.c.err : Theme.c.text-faint;
                             font-size: Theme.fs(10px);
                             font-weight: root.composer-yolo-selected ? 700 : 400;
                         }
-                        DropUpPicker {
-                            width: 105px;
-                            options: root.permission-options;
-                            current-index <=> root.permission-index;
-                            enabled: root.composer-enabled && !root.composer-turn-running && !root.connectivity-blocked;
-                            placeholder: "permissions";
-                            changed(i) => { root.composer-permission-changed(i); }
-                        }
-                    }
-                    if root.composer-yolo-selected: Rectangle {
-                        width: 250px;
-                        height: Theme.fs(30px);
-                        background: Theme.c.err-bg;
-                        border-width: 1px;
-                        border-color: Theme.c.err;
-                        border-radius: 6px;
                         HorizontalLayout {
-                            padding-left: 8px;
-                            padding-right: 8px;
-                            spacing: 6px;
-                            Text { text: "⚠"; color: Theme.c.err; font-size: Theme.fs(13px); vertical-alignment: center; }
-                            Text {
-                                text: "YOLO: changes run without approval";
-                                color: Theme.c.err-soft;
-                                font-size: Theme.fs(10px);
-                                font-weight: 700;
-                                vertical-alignment: center;
+                            spacing: 4px;
+                            DropUpPicker {
+                                width: 105px;
+                                options: root.permission-options;
+                                current-index <=> root.permission-index;
+                                enabled: root.composer-enabled && !root.composer-turn-running && !root.connectivity-blocked;
+                                placeholder: "permissions";
+                                changed(i) => { root.composer-permission-changed(i); }
+                            }
+                            if root.composer-yolo-selected: IconButton {
+                                width: Theme.fs(22px);
+                                height: Theme.fs(30px);
+                                icon: "⚠";
+                                icon-size: Theme.fs(13px);
+                                icon-color: Theme.c.err;
+                                hover-icon-color: Theme.c.err-soft;
+                                hover-bg: Theme.c.err-bg;
+                                tip: "YOLO: changes run without approval";
+                                accessibility-label: "Warning: YOLO changes run without approval";
                             }
                         }
                     }
