@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1784528262436,
+  "lastUpdate": 1784528304405,
   "repoUrl": "https://github.com/jimsimon/trouve",
   "entries": {
     "e2e-benchmarks": [
@@ -6673,6 +6673,54 @@ window.BENCHMARK_DATA = {
             "name": "dense_query_20k_rows",
             "value": 1532388.7729468597,
             "range": "± 17284",
+            "unit": "ns"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "jim.j.simon@gmail.com",
+            "name": "Jim Simon",
+            "username": "jimsimon"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "3fb0ac15fb655ba225c7c9c984776bca626e1a26",
+          "message": "Promote settings to sidebar navigation (#104)",
+          "timestamp": "2026-07-20T02:14:38-04:00",
+          "tree_id": "6b545ecd061c92ab5ffc83f1374dba40885f3913",
+          "url": "https://github.com/jimsimon/trouve/commit/3fb0ac15fb655ba225c7c9c984776bca626e1a26"
+        },
+        "date": 1784528303329,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "bm25_build_5k_docs",
+            "value": 4901906.611111111,
+            "range": "± 11885",
+            "unit": "ns"
+          },
+          {
+            "name": "bm25_query_5k_docs",
+            "value": 36694.263548606636,
+            "range": "± 8",
+            "unit": "ns"
+          },
+          {
+            "name": "chunk_python_200_functions",
+            "value": 3026057.647058823,
+            "range": "± 3901",
+            "unit": "ns"
+          },
+          {
+            "name": "dense_query_20k_rows",
+            "value": 1404022.5754385965,
+            "range": "± 7248",
             "unit": "ns"
           }
         ]
