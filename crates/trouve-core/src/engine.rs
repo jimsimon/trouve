@@ -2269,10 +2269,9 @@ impl Engine {
                  GitHub Enterprise host — add it in Settings → Integrations"
             )));
         }
-        let (token, _) = self.github_token(&host).ok_or_else(|| {
+        let token = self.github_token(&host).ok_or_else(|| {
             EngineError::BadRequest(format!(
-                "no GitHub auth for {host}: sign in or paste a token \
-                 (Settings → Integrations), set the token env var, or log in with the gh CLI"
+                "no GitHub OAuth session for {host}; sign in under Settings → Integrations"
             ))
         })?;
         crate::github::GitHub::new(&token, &host, &owner, &repo).map_err(EngineError::Internal)
@@ -2313,12 +2312,9 @@ impl Engine {
         }
     }
 
-    /// The GitHub token for a host and where it came from. Precedence:
-    /// environment > OAuth sign-in > pasted token > gh CLI keyring.
-    fn github_token(&self, host: &str) -> Option<(String, &'static str)> {
-        if let Some(t) = crate::github::token_from_env(host) {
-            return Some((t, "environment"));
-        }
+    /// The OAuth access token for a host. GitHub authentication deliberately
+    /// has one integration point: the device-flow secret.
+    fn github_token(&self, host: &str) -> Option<String> {
         let id = Self::github_secret_id(host);
         if let Ok(Some(raw)) = self
             .secrets
@@ -2327,16 +2323,10 @@ impl Engine {
             // Device-flow tokens from classic OAuth apps don't expire; apps
             // configured with expiring tokens just need a fresh sign-in.
             if let Ok(tokens) = serde_json::from_str::<trouve_providers::auth::OAuthTokens>(&raw) {
-                return Some((tokens.access_token, "oauth"));
+                return Some(tokens.access_token);
             }
         }
-        if let Ok(Some(t)) = self
-            .secrets
-            .get(&trouve_providers::secrets::api_key_secret(&id))
-        {
-            return Some((t, "settings"));
-        }
-        crate::github::token_from_gh_cli(host).map(|t| (t, "gh-cli"))
+        None
     }
 
     /// The open PR for the session branch, if one exists.
@@ -2641,15 +2631,16 @@ impl Engine {
             .github_hosts()
             .into_iter()
             .map(|(host, client_id)| {
-                let (configured, source) = match self.github_token(&host) {
-                    Some((_, source)) => (true, source),
-                    None => (false, ""),
-                };
+                let configured = self.github_token(&host).is_some();
                 trouve_protocol::GithubHostIntegration {
                     removable: host != crate::github::GITHUB_COM,
                     host,
                     configured,
-                    source: source.to_string(),
+                    source: if configured {
+                        "oauth".into()
+                    } else {
+                        String::new()
+                    },
                     oauth_available: client_id.is_some(),
                 }
             })
@@ -2660,33 +2651,6 @@ impl Engine {
             oauth_available: hosts[0].oauth_available,
             hosts,
         }
-    }
-
-    /// Store a GitHub token in the secret store (empty host = github.com);
-    /// an empty token disconnects the host (both the pasted token and any
-    /// OAuth sign-in).
-    pub fn set_github_token(&self, token: &str, host: &str) -> Result<(), EngineError> {
-        let host = if host.trim().is_empty() {
-            crate::github::GITHUB_COM.to_string()
-        } else {
-            host.trim().to_ascii_lowercase()
-        };
-        if !self.github_hosts().iter().any(|(h, _)| *h == host) {
-            return Err(EngineError::NotFound(format!("GitHub host {host}")));
-        }
-        let id = Self::github_secret_id(&host);
-        let key = trouve_providers::secrets::api_key_secret(&id);
-        if token.trim().is_empty() {
-            self.secrets.delete(&key).map_err(EngineError::Internal)?;
-            self.secrets
-                .delete(&trouve_providers::secrets::oauth_secret(&id))
-                .map_err(EngineError::Internal)?;
-        } else {
-            self.secrets
-                .set(&key, token.trim())
-                .map_err(EngineError::Internal)?;
-        }
-        Ok(())
     }
 
     /// Register a self-hosted GitHub Enterprise instance so remotes on it
@@ -2712,11 +2676,16 @@ impl Engine {
         if config.github_enterprise.iter().any(|e| e.host == host) {
             return Err(EngineError::Conflict(format!("{host} is already added")));
         }
+        if client_id.trim().is_empty() {
+            return Err(EngineError::BadRequest(
+                "an OAuth app client id is required for a GitHub Enterprise host".into(),
+            ));
+        }
         config
             .github_enterprise
             .push(crate::config::GithubEnterpriseConfig {
                 host,
-                client_id: Some(client_id.trim().to_string()).filter(|c| !c.is_empty()),
+                client_id: Some(client_id.trim().to_string()),
             });
         let snapshot = config.clone();
         drop(config);
@@ -2743,6 +2712,16 @@ impl Engine {
         let _ = self
             .secrets
             .delete(&trouve_providers::secrets::oauth_secret(&id));
+        self.store.append_event(
+            Scope::Server,
+            Event::GithubPullRequestsUpdated {
+                pull_requests: trouve_protocol::GithubPrList {
+                    viewer: String::new(),
+                    host,
+                    prs: Vec::new(),
+                },
+            },
+        )?;
         Ok(())
     }
 
@@ -3022,30 +3001,55 @@ impl Engine {
         Ok(self.store.list_workspaces()?)
     }
 
-    /// Refresh one workspace's PR dashboard and publish the full snapshot on
-    /// the persisted server event stream. The command response carries no UI
-    /// state; clients fold `workspace.pull_requests_updated` instead.
-    pub async fn refresh_workspace_prs(&self, id: &str) -> Result<(), EngineError> {
-        let ws = self
-            .store
-            .workspace(id)?
-            .ok_or_else(|| EngineError::NotFound(format!("workspace {id}")))?;
-        let github = self.github_for_checkout(Path::new(&ws.path))?;
-        // "Who am I" failing (fine-grained token quirks, GHES) only costs
-        // the review-requested signal, not the whole dashboard.
-        let viewer = github.viewer().await.unwrap_or_default();
+    /// Refresh the account-centric PR feed on every signed-in GitHub instance.
+    pub async fn refresh_github_prs(&self) -> Result<(), EngineError> {
         let merged_since = chrono::Utc::now() - chrono::Duration::hours(24);
-        let prs = github
-            .dashboard_prs(merged_since)
-            .await
-            .map_err(EngineError::Internal)?;
-        self.store.append_event(
-            Scope::Server,
-            Event::WorkspacePullRequestsUpdated {
-                workspace_id: ws.id,
-                pull_requests: trouve_protocol::WorkspacePrList { viewer, prs },
-            },
-        )?;
+        let workspaces = self.store.list_workspaces()?;
+        let workspace_repositories = tokio::task::spawn_blocking(move || {
+            workspaces
+                .into_iter()
+                .filter_map(|workspace| {
+                    let remote = git::remote_url(Path::new(&workspace.path), "origin")?;
+                    let (host, owner, repo) = crate::github::parse_remote(&remote)?;
+                    Some((host, format!("{owner}/{repo}"), workspace.id))
+                })
+                .collect::<Vec<_>>()
+        })
+        .await
+        .map_err(|error| EngineError::Internal(anyhow!(error)))?;
+        let mut failures = Vec::new();
+        for (host, _) in self.github_hosts() {
+            let Some(token) = self.github_token(&host) else {
+                continue;
+            };
+            let account =
+                crate::github::GitHubAccount::new(&token, &host).map_err(EngineError::Internal)?;
+            let (viewer, mut prs) = match account.dashboard_prs(merged_since).await {
+                Ok(result) => result,
+                Err(error) => {
+                    failures.push(format!("{host}: {error:#}"));
+                    continue;
+                }
+            };
+            for pr in &mut prs {
+                pr.workspace_id = workspace_repositories
+                    .iter()
+                    .find_map(|(host, repository, workspace_id)| {
+                        (host == &pr.host && repository == &pr.repository)
+                            .then(|| workspace_id.clone())
+                    })
+                    .unwrap_or_default();
+            }
+            self.store.append_event(
+                Scope::Server,
+                Event::GithubPullRequestsUpdated {
+                    pull_requests: trouve_protocol::GithubPrList { viewer, host, prs },
+                },
+            )?;
+        }
+        if !failures.is_empty() {
+            return Err(EngineError::BadRequest(failures.join("; ")));
+        }
         Ok(())
     }
 

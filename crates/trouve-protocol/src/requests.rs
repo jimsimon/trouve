@@ -401,6 +401,15 @@ pub struct PrReview {
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct PrInfo {
+    /// GitHub instance that owns this PR.
+    #[serde(default)]
+    pub host: String,
+    /// Repository in `owner/name` form.
+    #[serde(default)]
+    pub repository: String,
+    /// Matching local workspace, when one is registered.
+    #[serde(default)]
+    pub workspace_id: String,
     pub number: u64,
     pub url: String,
     pub title: String,
@@ -422,18 +431,27 @@ pub struct PrInfo {
     /// When the newest comment (of either kind) was posted.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_comment_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// Whether GitHub can merge this PR cleanly (false = merge/rebase
+    /// conflicts). None while unknown: list endpoints omit it and GitHub
+    /// computes it lazily even on single-PR reads.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mergeable: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub merged_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
-/// Every dashboard-relevant PR of a workspace's origin repo: all open PRs
-/// plus those merged in the last day.
+/// Pull requests relevant to the authenticated account on one GitHub host,
+/// spanning every repository visible to that account. Includes open PRs the
+/// account authored, was asked to review, or participated in, plus recently
+/// merged relevant PRs.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-pub struct WorkspacePrList {
+pub struct GithubPrList {
     /// Login of the authenticated GitHub user ("" when unknown) — clients
     /// use it to spot PRs where that user's review was requested.
     #[serde(default)]
     pub viewer: String,
+    /// GitHub instance this slice came from.
+    pub host: String,
     pub prs: Vec<PrInfo>,
 }
 
@@ -536,9 +554,7 @@ pub struct McpLogs {
 
 // --- integrations ----------------------------------------------------------
 
-/// Whether the GitHub integration can authenticate, and where the token
-/// came from ("environment", "oauth", "settings", "gh-cli", or "" when
-/// unconfigured).
+/// Whether the GitHub OAuth integration is authenticated.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct GithubIntegration {
     /// github.com's state (mirrors `hosts[0]`; kept for older clients).
@@ -561,23 +577,12 @@ pub struct GithubHostIntegration {
     /// "github.com" or the enterprise hostname ("github.example.com").
     pub host: String,
     pub configured: bool,
-    /// "environment", "oauth", "settings", "gh-cli", or "" when
-    /// unconfigured.
+    /// "oauth", or "" when unconfigured.
     pub source: String,
     /// A device-flow OAuth app client id is configured for this host.
     pub oauth_available: bool,
     /// Enterprise hosts can be removed; github.com cannot.
     pub removable: bool,
-}
-
-/// Store (or, with an empty token, remove) the GitHub personal access
-/// token in the server's secret store.
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-pub struct SetGithubTokenRequest {
-    pub token: String,
-    /// Which host the token is for; empty/absent means github.com.
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    pub host: String,
 }
 
 /// Register a self-hosted GitHub Enterprise instance
@@ -586,8 +591,7 @@ pub struct SetGithubTokenRequest {
 pub struct AddGithubHostRequest {
     /// Hostname only, e.g. "github.example.com".
     pub host: String,
-    /// Client id of an OAuth app on that instance (device flow enabled);
-    /// enables "Sign in" for the host. A PAT works without one.
+    /// Client id of an OAuth app on that instance (device flow enabled).
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub client_id: String,
 }

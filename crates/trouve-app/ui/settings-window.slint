@@ -105,7 +105,7 @@ export struct ThinkingItem {
 export struct GithubHostItem {
     host: string,
     configured: bool,
-    // "environment" / "oauth" / "settings" / "gh-cli" / "".
+    // "oauth" / "".
     source: string,
     // The host has a device-flow OAuth app client id configured.
     oauth-available: bool,
@@ -399,11 +399,10 @@ export component SettingsScreen inherits Rectangle {
     callback reduce-motion-toggled(bool);
     callback close();
 
-    // Integrations: per-host GitHub auth state comes from the server —
-    // github.com first, then configured enterprise hosts. Saving an empty
-    // token disconnects a host.
+    // OAuth-only GitHub integrations: github.com first, then configured
+    // enterprise hosts. Hosts are added with an OAuth client id and removed
+    // through the callbacks below.
     in property <[GithubHostItem]> github-hosts;
-    callback github-token-saved(/* host */ string, /* token */ string);
     callback github-host-added(/* host */ string, /* client-id */ string);
     callback github-host-removed(/* host */ string);
 
@@ -2086,7 +2085,7 @@ export component SettingsScreen inherits Rectangle {
                             }
 
                             Text {
-                                text: "Powers the Pull Requests tab and PR creation. Sign in below, or paste a personal access token; token environment variables and gh CLI logins are picked up automatically. Each host authenticates on its own.";
+                                text: "Powers the Pull Requests tab and PR creation. Sign in to each GitHub host separately with OAuth. GitHub Enterprise hosts require a device-flow-enabled OAuth app client ID.";
                                 color: Theme.c.text-soft;
                                 font-size: Theme.fs(11px);
                                 wrap: word-wrap;
@@ -2138,14 +2137,6 @@ export component SettingsScreen inherits Rectangle {
                                             clicked => { root.github-host-removed(gh.host); }
                                         }
                                     }
-                                    if gh.source == "environment": Text {
-                                        text: gh.host == "github.com"
-                                            ? "The token currently comes from the GITHUB_TOKEN / GH_TOKEN environment variable, which takes precedence over a sign-in or saved token."
-                                            : "The token currently comes from the GH_ENTERPRISE_TOKEN / GITHUB_ENTERPRISE_TOKEN environment variable, which takes precedence over a sign-in or saved token.";
-                                        color: Theme.c.warn;
-                                        font-size: Theme.fs(11px);
-                                        wrap: word-wrap;
-                                    }
                                     if gh.oauth-available: HorizontalLayout {
                                         spacing: 8px;
                                         alignment: start;
@@ -2157,10 +2148,6 @@ export component SettingsScreen inherits Rectangle {
                                                     ? "github" : "github:" + gh.host);
                                             }
                                         }
-                                        if gh.source == "oauth": Button {
-                                            text: "Disconnect";
-                                            clicked => { root.github-token-saved(gh.host, ""); }
-                                        }
                                     }
                                     // Only enterprise hosts can lack an OAuth path:
                                     // github.com always has the built-in shared app.
@@ -2169,29 +2156,6 @@ export component SettingsScreen inherits Rectangle {
                                         color: Theme.c.text-soft;
                                         font-size: Theme.fs(11px);
                                         wrap: word-wrap;
-                                    }
-                                    HorizontalLayout {
-                                        spacing: 8px;
-                                        gh-token := LineEdit {
-                                            placeholder-text: gh.configured && gh.source == "settings"
-                                                ? "••••••••  (saved — enter a new token to replace)"
-                                                : "ghp_… or github_pat_…";
-                                            input-type: password;
-                                            horizontal-stretch: 1;
-                                        }
-                                        Button {
-                                            text: "Save";
-                                            primary: gh-token.text != "" && !gh.oauth-available;
-                                            enabled: gh-token.text != "";
-                                            clicked => {
-                                                root.github-token-saved(gh.host, gh-token.text);
-                                                gh-token.text = "";
-                                            }
-                                        }
-                                        if gh.configured && gh.source == "settings": Button {
-                                            text: "Remove";
-                                            clicked => { root.github-token-saved(gh.host, ""); }
-                                        }
                                     }
                                 }
                             }
@@ -2211,7 +2175,7 @@ export component SettingsScreen inherits Rectangle {
                                         font-weight: 700;
                                     }
                                     Text {
-                                        text: "Self-hosted GitHub Enterprise Server instances work like github.com: sessions whose origin remote lives on the host use its auth. The OAuth client id is optional — a token or gh CLI login works without one.";
+                                        text: "Each self-hosted GitHub Enterprise Server instance uses its own OAuth app. Enable device flow on that app, then enter its public client id here.";
                                         color: Theme.c.text-soft;
                                         font-size: Theme.fs(11px);
                                         wrap: word-wrap;
@@ -2223,13 +2187,13 @@ export component SettingsScreen inherits Rectangle {
                                             horizontal-stretch: 1;
                                         }
                                         ghe-client-id := LineEdit {
-                                            placeholder-text: "OAuth app client id (optional)";
+                                            placeholder-text: "OAuth app client id";
                                             horizontal-stretch: 1;
                                         }
                                         Button {
                                             text: "Add";
-                                            primary: ghe-host.text != "";
-                                            enabled: ghe-host.text != "";
+                                            primary: ghe-host.text != "" && ghe-client-id.text != "";
+                                            enabled: ghe-host.text != "" && ghe-client-id.text != "";
                                             clicked => {
                                                 root.github-host-added(ghe-host.text, ghe-client-id.text);
                                                 ghe-host.text = "";

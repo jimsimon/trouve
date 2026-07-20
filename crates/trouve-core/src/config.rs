@@ -72,7 +72,7 @@ pub struct GithubEnterpriseConfig {
     /// Hostname only, e.g. "github.example.com".
     pub host: String,
     /// Client id of an OAuth app on that instance (device flow enabled)
-    /// for one-click sign-in. A PAT or the gh CLI work without one.
+    /// for sign-in. Required because OAuth is the only credential source.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub client_id: Option<String>,
 }

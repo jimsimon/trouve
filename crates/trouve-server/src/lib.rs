@@ -23,16 +23,15 @@ use trouve_core::engine::EngineError;
 use trouve_protocol::{
     AddLocalModelRequest, AgentMode, Automation, BranchList, CliInfo, CliInstallStatus, CliList,
     CreatePrRequest, CreateSessionRequest, CreateThreadRequest, DirEntry, ErrorBody, FileContent,
-    GithubIntegration, KnownProvider, LocalSearchResult, LocalStatus, LoginStarted, LoginStatus,
-    McpLogs, McpServerInfo, MergePrRequest, ModeInfo, ModelInfo, OpenTerminalRequest,
+    GithubIntegration, GithubPrList, KnownProvider, LocalSearchResult, LocalStatus, LoginStarted,
+    LoginStatus, McpLogs, McpServerInfo, MergePrRequest, ModeInfo, ModelInfo, OpenTerminalRequest,
     PROTOCOL_VERSION, PrInfo, ProviderInfo, ProvidersResponse, QueuedPrompt,
     RegisterWorkspaceRequest, ReorderQueueRequest, ResolveApprovalRequest, ResolveQuestionRequest,
     Scope, SendMessageRequest, ServerInfo, Session, SessionDiff, SetDefaultModelRequest,
-    SetDefaultPermissionModeRequest, SetGithubTokenRequest, SetLocalEnabledRequest,
-    SubscriptionHealth, TerminalInfo, TerminalInputRequest, TerminalResizeRequest, Thread,
-    TurnAccepted, UpdateQueuedPromptRequest, UpdateSessionRequest, UpdateThreadRequest,
-    UpsertAutomationRequest, UpsertMcpServerRequest, UpsertModeRequest, UpsertProviderRequest,
-    UsageSummary, Workspace, WorkspacePrList,
+    SetDefaultPermissionModeRequest, SetLocalEnabledRequest, SubscriptionHealth, TerminalInfo,
+    TerminalInputRequest, TerminalResizeRequest, Thread, TurnAccepted, UpdateQueuedPromptRequest,
+    UpdateSessionRequest, UpdateThreadRequest, UpsertAutomationRequest, UpsertMcpServerRequest,
+    UpsertModeRequest, UpsertProviderRequest, UsageSummary, Workspace,
 };
 use utoipa::OpenApi;
 
@@ -71,7 +70,7 @@ impl IntoResponse for ApiError {
         register_workspace,
         list_workspaces,
         workspace_branches,
-        refresh_workspace_prs,
+        refresh_github_prs,
         create_session,
         list_sessions,
         get_session,
@@ -137,7 +136,6 @@ impl IntoResponse for ApiError {
         merge_session_pr,
         list_session_prs,
         get_github_integration,
-        set_github_integration,
         add_github_host,
         remove_github_host,
         list_mcp_servers,
@@ -200,11 +198,10 @@ impl IntoResponse for ApiError {
         TerminalInputRequest,
         TerminalResizeRequest,
         PrInfo,
-        WorkspacePrList,
+        GithubPrList,
         CreatePrRequest,
         MergePrRequest,
         GithubIntegration,
-        SetGithubTokenRequest,
         trouve_protocol::GithubHostIntegration,
         trouve_protocol::AddGithubHostRequest,
         McpServerInfo,
@@ -442,10 +439,7 @@ pub fn build_router(engine: Arc<Engine>) -> Router {
             post(register_workspace).get(list_workspaces),
         )
         .route("/v1/workspaces/{id}/branches", get(workspace_branches))
-        .route(
-            "/v1/workspaces/{id}/prs/refresh",
-            post(refresh_workspace_prs),
-        )
+        .route("/v1/github/prs/refresh", post(refresh_github_prs))
         .route("/v1/sessions", post(create_session).get(list_sessions))
         .route(
             "/v1/sessions/{id}",
@@ -473,10 +467,7 @@ pub fn build_router(engine: Arc<Engine>) -> Router {
         )
         .route("/v1/sessions/{id}/pr/merge", post(merge_session_pr))
         .route("/v1/sessions/{id}/prs", get(list_session_prs))
-        .route(
-            "/v1/integrations/github",
-            get(get_github_integration).put(set_github_integration),
-        )
+        .route("/v1/integrations/github", get(get_github_integration))
         .route("/v1/integrations/github/hosts", post(add_github_host))
         .route(
             "/v1/integrations/github/hosts/{host}",
@@ -679,14 +670,12 @@ async fn workspace_branches(
     Ok(Json(engine.workspace_branches(&id).await?))
 }
 
-#[utoipa::path(post, path = "/v1/workspaces/{id}/prs/refresh", params(("id" = String, Path,)),
-    responses((status = 204),
-        (status = 400, body = ErrorBody), (status = 404, body = ErrorBody)))]
-async fn refresh_workspace_prs(
+#[utoipa::path(post, path = "/v1/github/prs/refresh",
+    responses((status = 204), (status = 400, body = ErrorBody)))]
+async fn refresh_github_prs(
     State(engine): State<Arc<Engine>>,
-    Path(id): Path<String>,
 ) -> Result<axum::http::StatusCode, ApiError> {
-    engine.refresh_workspace_prs(&id).await?;
+    engine.refresh_github_prs().await?;
     Ok(axum::http::StatusCode::NO_CONTENT)
 }
 
@@ -1580,17 +1569,6 @@ async fn subscription_health(State(engine): State<Arc<Engine>>) -> Json<Vec<Subs
     responses((status = 200, body = GithubIntegration)))]
 async fn get_github_integration(State(engine): State<Arc<Engine>>) -> Json<GithubIntegration> {
     Json(engine.github_integration())
-}
-
-#[utoipa::path(put, path = "/v1/integrations/github",
-    request_body = SetGithubTokenRequest,
-    responses((status = 200, body = GithubIntegration), (status = 400, body = ErrorBody)))]
-async fn set_github_integration(
-    State(engine): State<Arc<Engine>>,
-    Json(req): Json<SetGithubTokenRequest>,
-) -> Result<Json<GithubIntegration>, ApiError> {
-    engine.set_github_token(&req.token, &req.host)?;
-    Ok(Json(engine.github_integration()))
 }
 
 /// Register a self-hosted GitHub Enterprise instance.
