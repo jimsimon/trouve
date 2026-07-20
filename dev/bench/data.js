@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1784532411694,
+  "lastUpdate": 1784532620013,
   "repoUrl": "https://github.com/jimsimon/trouve",
   "entries": {
     "e2e-benchmarks": [
@@ -3599,6 +3599,54 @@ window.BENCHMARK_DATA = {
             "name": "non-git warm query",
             "value": 55.63845296,
             "range": "± 2.3",
+            "unit": "ms"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "jim.j.simon@gmail.com",
+            "name": "Jim Simon",
+            "username": "jimsimon"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "1b500c7f01034524913794dd76f78cc072ea5c89",
+          "message": "Fix Spectacle image paste on Wayland (#113)\n\nEnable arboard's native Wayland data-control backend so KDE Spectacle screenshots are visible to every shared prompt input. Keep the existing X11 fallback for other Linux sessions.",
+          "timestamp": "2026-07-20T03:29:01-04:00",
+          "tree_id": "afca046f6107496a23323f594147ea841e922b6f",
+          "url": "https://github.com/jimsimon/trouve/commit/1b500c7f01034524913794dd76f78cc072ea5c89"
+        },
+        "date": 1784532619573,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "cold index + query",
+            "value": 136.54599320000003,
+            "range": "± 5.6",
+            "unit": "ms"
+          },
+          {
+            "name": "warm query",
+            "value": 72.13872512,
+            "range": "± 3.2",
+            "unit": "ms"
+          },
+          {
+            "name": "incremental (1 file modified)",
+            "value": 84.45920242000001,
+            "range": "± 1.5",
+            "unit": "ms"
+          },
+          {
+            "name": "non-git warm query",
+            "value": 70.08329656,
+            "range": "± 3",
             "unit": "ms"
           }
         ]
