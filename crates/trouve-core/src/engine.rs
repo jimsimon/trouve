@@ -7483,7 +7483,10 @@ mod tests {
             Some("toolu_1".into())
         );
         // Wrong turn or different args: no attach, fall back to a fresh id.
-        assert_eq!(open_bridged_card_in(claude.iter(), 2, "search", &args), None);
+        assert_eq!(
+            open_bridged_card_in(claude.iter(), 2, "search", &args),
+            None
+        );
         assert_eq!(
             open_bridged_card_in(
                 claude.iter(),
@@ -7500,7 +7503,10 @@ mod tests {
             status: ToolStatus::Ok,
             result: serde_json::Value::Null,
         });
-        assert_eq!(open_bridged_card_in(closed.iter(), 3, "search", &args), None);
+        assert_eq!(
+            open_bridged_card_in(closed.iter(), 3, "search", &args),
+            None
+        );
         // Codex wraps MCP calls in an `mcpToolCall` item carrying the real
         // tool and arguments.
         let codex = vec![Event::ToolRequested {
