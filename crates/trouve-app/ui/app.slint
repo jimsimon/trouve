@@ -973,6 +973,8 @@ component NewChatForm inherits VerticalLayout {
         spacing: 6px;
         Text { text: "Workspace"; color: Theme.c.text-mid; font-size: Theme.fs(12px); font-weight: 700; }
         ComboBox {
+            height: Theme.fs(30px);
+            vertical-stretch: 0;
             model: root.workspaces;
             current-index <=> root.workspace-index;
             enabled: !root.blocked;
@@ -1000,6 +1002,8 @@ component NewChatForm inherits VerticalLayout {
         spacing: 6px;
         Text { text: "Base branch"; color: Theme.c.text-mid; font-size: Theme.fs(12px); font-weight: 700; }
         ComboBox {
+            height: Theme.fs(30px);
+            vertical-stretch: 0;
             model: root.branches;
             current-index <=> root.branch-index;
             enabled: !root.blocked;
@@ -1018,6 +1022,8 @@ component NewChatForm inherits VerticalLayout {
             horizontal-stretch: 1;
             Text { text: "Agent mode"; color: Theme.c.text-mid; font-size: Theme.fs(12px); font-weight: 700; }
             ComboBox {
+                height: Theme.fs(30px);
+                vertical-stretch: 0;
                 model: root.modes;
                 current-index <=> root.mode-index;
                 enabled: !root.blocked;
@@ -1035,6 +1041,8 @@ component NewChatForm inherits VerticalLayout {
             horizontal-stretch: 1;
             Text { text: "Model"; color: Theme.c.text-mid; font-size: Theme.fs(12px); font-weight: 700; }
             SearchPicker {
+                height: Theme.fs(30px);
+                vertical-stretch: 0;
                 up: false;
                 options: root.models;
                 matches: root.model-matches;
@@ -1050,7 +1058,10 @@ component NewChatForm inherits VerticalLayout {
         if root.thinking-options.length > 0: VerticalLayout {
             spacing: 6px; horizontal-stretch: 1;
             Text { text: "Thinking level"; color: Theme.c.text-mid; font-size: Theme.fs(12px); font-weight: 700; }
-            ComboBox { model: root.thinking-options; current-index <=> root.thinking-index; enabled: !root.blocked; }
+            ComboBox {
+                height: Theme.fs(30px); vertical-stretch: 0;
+                model: root.thinking-options; current-index <=> root.thinking-index; enabled: !root.blocked;
+            }
         }
         VerticalLayout {
             spacing: 6px; horizontal-stretch: 1;
@@ -1059,7 +1070,10 @@ component NewChatForm inherits VerticalLayout {
                 color: root.yolo-selected ? Theme.c.err : Theme.c.text-mid;
                 font-size: Theme.fs(12px); font-weight: 700;
             }
-            ComboBox { model: root.permission-options; current-index <=> root.permission-index; enabled: !root.blocked; }
+            ComboBox {
+                height: Theme.fs(30px); vertical-stretch: 0;
+                model: root.permission-options; current-index <=> root.permission-index; enabled: !root.blocked;
+            }
         }
     }
     if root.yolo-selected: Rectangle {

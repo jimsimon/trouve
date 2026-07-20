@@ -68,7 +68,6 @@ impl ProtocolClient {
         let resp = self
             .http
             .post(format!("{}{path}", self.base))
-            .json(&serde_json::json!({}))
             .send()
             .await
             .with_context(|| format!("POST {path}"))?;
@@ -948,12 +947,47 @@ async fn decode<T: serde::de::DeserializeOwned>(resp: reqwest::Response, path: &
 
 #[cfg(test)]
 mod tests {
-    use super::urlencode;
+    use super::{ProtocolClient, urlencode};
 
     #[test]
     fn urlencode_percent_encodes_utf8_bytes() {
         assert_eq!(urlencode("src/café.rs"), "src/caf%C3%A9.rs");
         assert_eq!(urlencode("🙂 notes"), "%F0%9F%99%82%20notes");
         assert_eq!(urlencode("a/b~c"), "a/b~c");
+    }
+
+    #[tokio::test]
+    async fn empty_post_has_no_json_body() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            loop {
+                let mut chunk = [0_u8; 1024];
+                let read = stream.read(&mut chunk).await.unwrap();
+                assert_ne!(read, 0, "request ended before its headers");
+                request.extend_from_slice(&chunk[..read]);
+                if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            let request = String::from_utf8(request).unwrap();
+            assert!(request.starts_with("POST /v1/empty HTTP/1.1\r\n"));
+            assert!(!request.to_ascii_lowercase().contains("content-type:"));
+            assert!(!request.ends_with("\r\n\r\n{}"));
+            stream
+                .write_all(b"HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n")
+                .await
+                .unwrap();
+        });
+
+        ProtocolClient::new(&format!("http://{addr}"))
+            .post_empty("/empty")
+            .await
+            .unwrap();
+        server.await.unwrap();
     }
 }

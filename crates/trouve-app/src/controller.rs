@@ -2675,7 +2675,11 @@ impl Controller {
 
     /// Kick off one account-level refresh across all configured instances.
     fn refresh_pr_dashboard(&mut self) {
-        if self.github_configured && self.pr_dash_loading.insert("github".into()) {
+        if self.github_configured
+            && !self.offline
+            && !self.server_unreachable
+            && self.pr_dash_loading.insert("github".into())
+        {
             self.pr_dash_errors.clear();
             let client = self.client.clone();
             let tx = self.tx.clone();
