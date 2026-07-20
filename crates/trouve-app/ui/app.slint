@@ -3988,23 +3988,26 @@ export component AppWindow inherits Window {
                             self.text = "";
                         }
                     }
-                    Button {
+                    VerticalLayout {
                         width: Theme.fs(76px);
-                        height: Theme.fs(34px);
-                        vertical-stretch: 0;
-                        text: root.composer-turn-running
-                            ? (composer.text != "" || root.composer-attachments.length > 0 ? "Queue" : "Cancel")
-                            : "Send";
-                        primary: !root.composer-turn-running || composer.text != "" || root.composer-attachments.length > 0;
-                        enabled: root.composer-enabled && !root.connectivity-blocked
-                            && (root.composer-turn-running || composer.text != "" || root.composer-attachments.length > 0);
-                        clicked => {
-                            if (root.composer-turn-running && composer.text == ""
-                                && root.composer-attachments.length == 0) {
-                                root.cancel-turn();
-                            } else {
-                                root.send-message(composer.text);
-                                composer.text = "";
+                        Rectangle { vertical-stretch: 1; }
+                        Button {
+                            height: Theme.fs(34px);
+                            vertical-stretch: 0;
+                            text: root.composer-turn-running
+                                ? (composer.text != "" || root.composer-attachments.length > 0 ? "Queue" : "Cancel")
+                                : "Send";
+                            primary: !root.composer-turn-running || composer.text != "" || root.composer-attachments.length > 0;
+                            enabled: root.composer-enabled && !root.connectivity-blocked
+                                && (root.composer-turn-running || composer.text != "" || root.composer-attachments.length > 0);
+                            clicked => {
+                                if (root.composer-turn-running && composer.text == ""
+                                    && root.composer-attachments.length == 0) {
+                                    root.cancel-turn();
+                                } else {
+                                    root.send-message(composer.text);
+                                    composer.text = "";
+                                }
                             }
                         }
                     }
