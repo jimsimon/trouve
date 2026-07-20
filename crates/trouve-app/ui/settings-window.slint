@@ -779,6 +779,7 @@ export component SettingsScreen inherits Rectangle {
                             // hides) the id / protocol / URL details;
                             // "Custom" shows them for hand entry.
                             preset-box := ComboBox {
+                                width: 280px;
                                 model: root.active-known-provider-names;
                                 current-index <=> root.preset-index;
                                 selected => {
@@ -810,6 +811,7 @@ export component SettingsScreen inherits Rectangle {
                             }
                             if root.preset-is-custom: HorizontalLayout {
                                 spacing: 8px;
+                                alignment: start;
                                 LineEdit {
                                     width: 150px;
                                     placeholder-text: "id (e.g. openai)";
@@ -824,15 +826,16 @@ export component SettingsScreen inherits Rectangle {
                                     }
                                 }
                                 LineEdit {
-                                    horizontal-stretch: 1;
+                                    width: 250px;
                                     placeholder-text: "base URL (optional)";
                                     text <=> root.form-base-url;
                                 }
                             }
                             HorizontalLayout {
                                 spacing: 8px;
+                                alignment: start;
                                 key-edit := LineEdit {
-                                    horizontal-stretch: 1;
+                                    width: 400px;
                                     visible: root.preset-auth == "api-key";
                                     placeholder-text: "API key (stored in the OS keychain; leave empty to keep)";
                                     input-type: password;
