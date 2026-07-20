@@ -1696,11 +1696,11 @@ export component AppWindow inherits Window {
 
     // --- queued prompts ---------------------------------------------------
     // Prompts waiting their turn on the current thread, in run order. Rows
-    // support inline editing, reordering (drag the ⠿ handle, or the ↑/↓
-    // buttons for single steps), and deletion. The "Send now" pill shows
-    // when the thread is idle: prompts left queued by a restart/crash or
-    // paused by a failed turn never auto-run — a crash may have cut the
-    // previous turn short, so resuming is the user's call.
+    // support sending one now, inline editing, reordering (drag the ⠿ handle,
+    // or the ↑/↓ buttons for single steps), and deletion. The header-level
+    // "Send now" pill shows when the thread is idle: prompts left queued by a
+    // restart/crash or paused by a failed turn never auto-run — a crash may
+    // have cut the previous turn short, so resuming is the user's call.
     in property <[string]> queue-prompts;
     // Per-row attachment badge ("📎2"; empty hides it). Parallel to
     // queue-prompts so the editable row text stays pristine.
@@ -3937,7 +3937,7 @@ export component AppWindow inherits Window {
                                         font-size: Theme.fs(11px);
                                         vertical-alignment: center;
                                     }
-                                    if root.queue-idle: IconButton {
+                                    IconButton {
                                         icon: "▶";
                                         tip: "Send now";
                                         enabled: !root.connectivity-blocked;

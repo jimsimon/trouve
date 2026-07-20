@@ -1116,6 +1116,36 @@ impl Store {
         Ok(n > 0)
     }
 
+    /// Move one visible prompt to the front without requiring a client to
+    /// race a full queue snapshot against the dispatcher.
+    pub fn promote_queued_prompt(&self, thread_id: &str, id: &str) -> Result<bool> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        let position = tx
+            .query_row(
+                "SELECT position FROM queued_prompts
+                 WHERE id = ?1 AND thread_id = ?2 AND claimed = 0",
+                params![id, thread_id],
+                |r| r.get::<_, i64>(0),
+            )
+            .optional()?;
+        let Some(position) = position else {
+            return Ok(false);
+        };
+        tx.execute(
+            "UPDATE queued_prompts SET position = position + 1
+             WHERE thread_id = ?1 AND claimed = 0 AND position < ?2",
+            params![thread_id, position],
+        )?;
+        tx.execute(
+            "UPDATE queued_prompts SET position = 1
+             WHERE id = ?1 AND thread_id = ?2 AND claimed = 0",
+            params![id, thread_id],
+        )?;
+        tx.commit()?;
+        Ok(true)
+    }
+
     /// Apply a full new order. `ids` must be exactly the thread's current
     /// queue; returns false (changing nothing) when it isn't, so a reorder
     /// racing a dispatch fails cleanly instead of corrupting positions.
@@ -2636,18 +2666,21 @@ mod tests {
                 .reorder_queued_prompts("th_1", &[c.id.clone(), b.id.clone()])
                 .unwrap()
         );
+        assert!(store.promote_queued_prompt("th_1", &b.id).unwrap());
+        assert!(!store.promote_queued_prompt("th_2", &b.id).unwrap());
 
         // Claim hides the prompt while a dispatcher prepares the turn;
         // releasing makes it visible again, finishing consumes it.
         let p1 = store.claim_queued_prompt("th_1").unwrap().unwrap();
-        assert_eq!(p1.content, "third");
+        assert_eq!(p1.content, "second v2");
+        assert!(!store.promote_queued_prompt("th_1", &p1.id).unwrap());
         assert_eq!(store.queued_prompts("th_1").unwrap().len(), 1);
         assert!(store.release_queued_prompt(&p1.id).unwrap());
         assert_eq!(store.queued_prompts("th_1").unwrap().len(), 2);
         let p1 = store.claim_queued_prompt("th_1").unwrap().unwrap();
         assert!(store.finish_queued_prompt(&p1.id).unwrap());
         let p2 = store.claim_queued_prompt("th_1").unwrap().unwrap();
-        assert_eq!(p2.content, "second v2");
+        assert_eq!(p2.content, "third");
         assert!(store.finish_queued_prompt(&p2.id).unwrap());
         assert!(store.claim_queued_prompt("th_1").unwrap().is_none());
 

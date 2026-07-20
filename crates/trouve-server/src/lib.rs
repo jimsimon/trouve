@@ -102,6 +102,7 @@ impl IntoResponse for ApiError {
         list_queue,
         reorder_queue,
         dispatch_queue,
+        dispatch_queued_prompt,
         update_queued_prompt,
         delete_queued_prompt,
         cancel_turn,
@@ -603,6 +604,7 @@ pub fn build_router(engine: Arc<Engine>) -> Router {
         .route("/v1/attachments/{id}", get(get_attachment))
         .route("/v1/threads/{id}/queue", get(list_queue).put(reorder_queue))
         .route("/v1/threads/{id}/queue/dispatch", post(dispatch_queue))
+        .route("/v1/queue/{id}/dispatch", post(dispatch_queued_prompt))
         .route("/v1/threads/{id}/cancel", post(cancel_turn))
         .route(
             "/v1/queue/{id}",
@@ -1017,6 +1019,27 @@ async fn dispatch_queue(
         StatusCode::ACCEPTED,
         Json(TurnAccepted {
             thread_id: id,
+            turn: turn.unwrap_or(0),
+            queued: turn.is_none(),
+        }),
+    ))
+}
+
+/// Promote a specific queued prompt and run it now. If its thread is active,
+/// the current turn is cancelled and the dispatcher continues immediately
+/// with this prompt; an idle thread starts it directly.
+#[utoipa::path(post, path = "/v1/queue/{id}/dispatch", params(("id" = String, Path,)),
+    responses((status = 202, body = TurnAccepted), (status = 404, body = ErrorBody),
+              (status = 409, body = ErrorBody)))]
+async fn dispatch_queued_prompt(
+    State(engine): State<Arc<Engine>>,
+    Path(id): Path<String>,
+) -> Result<(StatusCode, Json<TurnAccepted>), ApiError> {
+    let (thread_id, turn) = engine.dispatch_queued_prompt(&id)?;
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(TurnAccepted {
+            thread_id,
             turn: turn.unwrap_or(0),
             queued: turn.is_none(),
         }),

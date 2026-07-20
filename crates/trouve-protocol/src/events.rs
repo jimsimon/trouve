@@ -132,8 +132,9 @@ pub enum Event {
     },
     #[serde(rename = "turn.failed")]
     TurnFailed { turn: u64, error: String },
-    /// The turn was interrupted by the user (via the cancel endpoint). Like
-    /// `turn.failed` it pauses the queue, but it isn't an error condition.
+    /// The turn was interrupted by the user. Cancellation normally pauses
+    /// the queue; dispatching a specific queued prompt preempts this turn and
+    /// immediately continues with that promoted prompt instead.
     #[serde(rename = "turn.cancelled")]
     TurnCancelled { turn: u64 },
 

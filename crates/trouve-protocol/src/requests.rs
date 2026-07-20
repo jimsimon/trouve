@@ -271,9 +271,9 @@ pub struct Attachment {
 }
 
 /// Accepted-for-processing response; progress arrives on the event stream.
-/// When the thread already has a turn running the prompt is queued instead:
-/// `queued` is true and `turn` is 0 (the turn number is assigned when the
-/// prompt is dispatched).
+/// When work cannot begin synchronously, `queued` is true and `turn` is 0:
+/// ordinary sends wait behind the active turn, while per-prompt dispatch may
+/// still be cancelling that turn before assigning the replacement turn.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct TurnAccepted {
     pub thread_id: ThreadId,
