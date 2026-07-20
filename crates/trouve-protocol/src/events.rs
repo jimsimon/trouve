@@ -248,6 +248,22 @@ pub enum Event {
     #[serde(rename = "worktree.removed")]
     WorktreeRemoved { path: String, branch: String },
 
+    /// A role-based team was initialized for this session.
+    #[serde(rename = "team.created")]
+    TeamCreated { team: crate::Team },
+    /// A canonical message was appended to the shared team timeline.
+    #[serde(rename = "team.message_posted")]
+    TeamMessagePosted { message: crate::TeamMessage },
+    /// A team member's scheduling state or aggregate usage changed.
+    #[serde(rename = "team.member_updated")]
+    TeamMemberUpdated { member: crate::TeamMember },
+    /// The team's lifecycle state or automatic-turn budget changed.
+    #[serde(rename = "team.status_changed")]
+    TeamStatusChanged {
+        status: crate::TeamStatus,
+        turns_used: u64,
+    },
+
     // --- server scope -----------------------------------------------------
     #[serde(rename = "workspace.registered")]
     WorkspaceRegistered {

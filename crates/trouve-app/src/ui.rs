@@ -7,7 +7,8 @@ use slint::{Model, ModelRc, SharedString, VecModel};
 use crate::render::ChatRowData;
 use crate::{
     AppWindow, ChatRow, ChatTableCell, CliItem, DiffRow, FileItem, KnownProviderItem,
-    ModelHealthItem, NavRow, ProviderItem, QOption, QPair, TextSegment, ThreadTabItem, TodoUiItem,
+    ModelHealthItem, NavRow, ProviderItem, QOption, QPair, TeamAgentItem, TextSegment,
+    ThreadTabItem, TodoUiItem,
 };
 
 type Ui = slint::Weak<AppWindow>;
@@ -18,6 +19,9 @@ pub struct NavRowData {
     pub kind: i32,
     pub title: String,
     pub subtitle: String,
+    /// 0 solo, 1 team; team_count backs the neutral `Team · N` pill.
+    pub session_kind: i32,
+    pub team_count: i32,
     /// Workspace headers: stable id used by reorder callbacks.
     pub workspace_id: String,
     /// Workspace headers: zero-based position and total count.
@@ -44,6 +48,8 @@ pub struct NavRowData {
     pub attention_tooltip: String,
     /// Workspace headers: this workspace shows its archived sessions.
     pub show_archived: bool,
+    /// Workspace headers: 0 all, 1 solo, 2 teams.
+    pub session_filter: i32,
 }
 
 /// Bring the window to the front (notification clicks). Wayland
@@ -175,6 +181,8 @@ fn set_nav_now(ui: &AppWindow, rows: Vec<NavRowData>) {
             kind: r.kind,
             title: r.title.into(),
             subtitle: r.subtitle.into(),
+            session_kind: r.session_kind,
+            team_count: r.team_count,
             workspace_id: r.workspace_id.into(),
             workspace_position: r.workspace_position,
             workspace_count: r.workspace_count,
@@ -190,6 +198,7 @@ fn set_nav_now(ui: &AppWindow, rows: Vec<NavRowData>) {
             attention_kind: r.attention_kind,
             attention_tooltip: r.attention_tooltip.into(),
             show_archived: r.show_archived,
+            session_filter: r.session_filter,
         })
         .collect();
 
@@ -222,6 +231,67 @@ fn set_nav_now(ui: &AppWindow, rows: Vec<NavRowData>) {
     if !ui.get_workspace_reorder_focus_id().is_empty() {
         ui.invoke_restore_workspace_reorder_focus();
     }
+}
+
+pub fn set_team(ui: &Ui, team: Option<trouve_protocol::Team>) {
+    let _ = ui.upgrade_in_event_loop(move |ui| match team {
+        Some(team) => {
+            let status = match team.status {
+                trouve_protocol::TeamStatus::Active => 0,
+                trouve_protocol::TeamStatus::Paused => 1,
+                trouve_protocol::TeamStatus::Completed => 2,
+                trouve_protocol::TeamStatus::Cancelled => 3,
+            };
+            let agents: Vec<TeamAgentItem> = team
+                .members
+                .into_iter()
+                .map(|member| TeamAgentItem {
+                    thread_id: member.thread_id.into(),
+                    handle: format!("@{}", member.handle).into(),
+                    name: member.display_name.into(),
+                    role: member.role.into(),
+                    model: member.model.into(),
+                    status: match member.state {
+                        trouve_protocol::TeamMemberState::Idle => "Idle",
+                        trouve_protocol::TeamMemberState::Queued => "Queued",
+                        trouve_protocol::TeamMemberState::Running => "Running",
+                        trouve_protocol::TeamMemberState::Failed => "Failed",
+                    }
+                    .into(),
+                    usage: format!(
+                        "{} in · {} out{}",
+                        member.usage.input_tokens,
+                        member.usage.output_tokens,
+                        member
+                            .usage
+                            .cost_usd
+                            .map(|cost| format!(" · ${cost:.4}"))
+                            .unwrap_or_default()
+                    )
+                    .into(),
+                })
+                .collect();
+            ui.set_team_session(true);
+            ui.set_team_goal(team.goal.into());
+            ui.set_team_status(status);
+            ui.set_team_turns(team.turns_used as i32);
+            ui.set_team_max_turns(team.max_turns as i32);
+            ui.set_team_agents(ModelRc::new(VecModel::from(agents)));
+        }
+        None => {
+            ui.set_team_session(false);
+            ui.set_team_viewing(false);
+            ui.set_team_goal(SharedString::default());
+            ui.set_team_status(0);
+            ui.set_team_turns(0);
+            ui.set_team_max_turns(0);
+            ui.set_team_agents(ModelRc::new(VecModel::<TeamAgentItem>::default()));
+        }
+    });
+}
+
+pub fn set_team_viewing(ui: &Ui, viewing: bool) {
+    let _ = ui.upgrade_in_event_loop(move |ui| ui.set_team_viewing(viewing));
 }
 
 pub fn set_threads(ui: &Ui, threads: Vec<(String, String, String)>, current: i32) {
@@ -552,7 +622,8 @@ pub fn set_center_screen(ui: &Ui, screen: i32) {
     let _ = ui.upgrade_in_event_loop(move |ui| ui.set_center_screen(screen));
 }
 
-/// Select a right-panel tab by its stable index.
+/// Right-panel tab: 0 = Diff, 1 = Files, 2 = PRs, 3 = MCP,
+/// 4 = Terminal, 5 = Agents (team sessions only), 6 = Todos.
 pub fn set_right_tab(ui: &Ui, tab: i32) {
     let _ = ui.upgrade_in_event_loop(move |ui| ui.set_right_tab(tab));
 }
@@ -619,6 +690,7 @@ pub fn set_new_chat(
         // A permission choice belongs to one setup form only. In particular,
         // never let a previous form's YOLO selection carry into a new one.
         ui.set_nc_permission_index(0);
+        ui.set_nc_team(false);
     });
 }
 

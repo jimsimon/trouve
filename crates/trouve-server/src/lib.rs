@@ -23,18 +23,18 @@ use trouve_core::engine::EngineError;
 use trouve_protocol::{
     AddLocalModelRequest, AgentMode, Automation, BranchList, CliInfo, CliInstallStatus, CliList,
     CodeReviewDashboard, CodeReviewRepository, ConfigureGithubAppRequest, CreatePrRequest,
-    CreateSessionRequest, CreateThreadRequest, DirEntry, ErrorBody, FileContent, GithubAppStatus,
-    GithubIntegration, GithubPrList, KnownProvider, LocalSearchResult, LocalStatus, LoginStarted,
-    LoginStatus, McpLogs, McpServerInfo, MergePrRequest, ModeInfo, ModelInfo, OpenTerminalRequest,
-    PROTOCOL_VERSION, PrInfo, ProviderInfo, ProvidersResponse, QueuedPrompt,
-    RegisterWorkspaceRequest, ReorderQueueRequest, ResolveApprovalRequest, ResolveQuestionRequest,
-    ReviewerProfile, Scope, SendMessageRequest, ServerInfo, Session, SessionDiff,
-    SetDefaultModelRequest, SetDefaultPermissionModeRequest, SetLocalEnabledRequest,
-    SubscriptionHealth, TerminalInfo, TerminalInputRequest, TerminalResizeRequest, Thread,
-    TurnAccepted, UpdateCodeReviewRepositoryRequest, UpdateQueuedPromptRequest,
-    UpdateSessionRequest, UpdateThreadRequest, UpsertAutomationRequest, UpsertMcpServerRequest,
-    UpsertModeRequest, UpsertProviderRequest, UpsertReviewerProfileRequest, UsageSummary,
-    Workspace,
+    CreateSessionRequest, CreateTeamRequest, CreateThreadRequest, DirEntry, ErrorBody, FileContent,
+    GithubAppStatus, GithubIntegration, GithubPrList, KnownProvider, LocalSearchResult,
+    LocalStatus, LoginStarted, LoginStatus, McpLogs, McpServerInfo, MergePrRequest, ModeInfo,
+    ModelInfo, OpenTerminalRequest, PROTOCOL_VERSION, PostTeamMessageRequest, PrInfo, ProviderInfo,
+    ProvidersResponse, QueuedPrompt, RegisterWorkspaceRequest, ReorderQueueRequest,
+    ResolveApprovalRequest, ResolveQuestionRequest, ReviewerProfile, Scope, SendMessageRequest,
+    ServerInfo, Session, SessionDiff, SetDefaultModelRequest, SetDefaultPermissionModeRequest,
+    SetLocalEnabledRequest, SubscriptionHealth, Team, TeamMessage, TeamStatus, TeamTemplate,
+    TerminalInfo, TerminalInputRequest, TerminalResizeRequest, Thread, TurnAccepted,
+    UpdateCodeReviewRepositoryRequest, UpdateQueuedPromptRequest, UpdateSessionRequest,
+    UpdateThreadRequest, UpsertAutomationRequest, UpsertMcpServerRequest, UpsertModeRequest,
+    UpsertProviderRequest, UpsertReviewerProfileRequest, UsageSummary, Workspace,
 };
 use utoipa::OpenApi;
 
@@ -93,6 +93,14 @@ impl IntoResponse for ApiError {
         delete_session,
         undo_session,
         redo_session,
+        team_templates,
+        create_team,
+        get_team,
+        post_team_message,
+        pause_team,
+        resume_team,
+        complete_team,
+        cancel_team,
         create_thread,
         list_threads,
         get_thread,
@@ -179,6 +187,18 @@ impl IntoResponse for ApiError {
         CreateSessionRequest,
         Session,
         UpdateSessionRequest,
+        trouve_protocol::SessionKind,
+        CreateTeamRequest,
+        PostTeamMessageRequest,
+        Team,
+        TeamTemplate,
+        trouve_protocol::TeamTemplateMember,
+        trouve_protocol::TeamMember,
+        trouve_protocol::TeamMemberState,
+        TeamMessage,
+        trouve_protocol::TeamMention,
+        trouve_protocol::TeamAuthorKind,
+        TeamStatus,
         CreateThreadRequest,
         Thread,
         UpdateThreadRequest,
@@ -486,6 +506,14 @@ pub fn build_router(engine: Arc<Engine>) -> Router {
         )
         .route("/v1/sessions/{id}/undo", post(undo_session))
         .route("/v1/sessions/{id}/redo", post(redo_session))
+        .route("/v1/team-templates", get(team_templates))
+        .route("/v1/teams", post(create_team))
+        .route("/v1/sessions/{id}/team", get(get_team))
+        .route("/v1/sessions/{id}/team/messages", post(post_team_message))
+        .route("/v1/sessions/{id}/team/pause", post(pause_team))
+        .route("/v1/sessions/{id}/team/resume", post(resume_team))
+        .route("/v1/sessions/{id}/team/complete", post(complete_team))
+        .route("/v1/sessions/{id}/team/cancel", post(cancel_team))
         .route("/v1/sessions/{id}/events", get(session_events))
         .route("/v1/sessions/{id}/usage", get(session_usage))
         .route("/v1/sessions/{id}/mcp-servers", get(session_mcp_servers))
@@ -897,6 +925,86 @@ async fn redo_session(
 ) -> Result<StatusCode, ApiError> {
     engine.redo(&id).await?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+#[utoipa::path(get, path = "/v1/team-templates",
+    responses((status = 200, body = [TeamTemplate])))]
+async fn team_templates(
+    State(engine): State<Arc<Engine>>,
+) -> Result<Json<Vec<TeamTemplate>>, ApiError> {
+    Ok(Json(engine.team_templates()))
+}
+
+#[utoipa::path(post, path = "/v1/teams", request_body = CreateTeamRequest,
+    responses((status = 200, body = Team), (status = 400, body = ErrorBody),
+              (status = 404, body = ErrorBody), (status = 409, body = ErrorBody)))]
+async fn create_team(
+    State(engine): State<Arc<Engine>>,
+    Json(req): Json<CreateTeamRequest>,
+) -> Result<Json<Team>, ApiError> {
+    Ok(Json(engine.create_team(req).await?))
+}
+
+#[utoipa::path(get, path = "/v1/sessions/{id}/team", params(("id" = String, Path,)),
+    responses((status = 200, body = Team), (status = 400, body = ErrorBody),
+              (status = 404, body = ErrorBody)))]
+async fn get_team(
+    State(engine): State<Arc<Engine>>,
+    Path(id): Path<String>,
+) -> Result<Json<Team>, ApiError> {
+    Ok(Json(engine.get_team(&id)?))
+}
+
+#[utoipa::path(post, path = "/v1/sessions/{id}/team/messages",
+    params(("id" = String, Path,)), request_body = PostTeamMessageRequest,
+    responses((status = 200, body = TeamMessage), (status = 400, body = ErrorBody),
+              (status = 404, body = ErrorBody), (status = 409, body = ErrorBody)))]
+async fn post_team_message(
+    State(engine): State<Arc<Engine>>,
+    Path(id): Path<String>,
+    Json(req): Json<PostTeamMessageRequest>,
+) -> Result<Json<TeamMessage>, ApiError> {
+    Ok(Json(engine.post_team_message(&id, req)?))
+}
+
+#[utoipa::path(post, path = "/v1/sessions/{id}/team/pause", params(("id" = String, Path,)),
+    responses((status = 200, body = Team), (status = 400, body = ErrorBody),
+              (status = 404, body = ErrorBody), (status = 409, body = ErrorBody)))]
+async fn pause_team(
+    State(engine): State<Arc<Engine>>,
+    Path(id): Path<String>,
+) -> Result<Json<Team>, ApiError> {
+    Ok(Json(engine.set_team_status(&id, TeamStatus::Paused)?))
+}
+
+#[utoipa::path(post, path = "/v1/sessions/{id}/team/resume", params(("id" = String, Path,)),
+    responses((status = 200, body = Team), (status = 400, body = ErrorBody),
+              (status = 404, body = ErrorBody), (status = 409, body = ErrorBody)))]
+async fn resume_team(
+    State(engine): State<Arc<Engine>>,
+    Path(id): Path<String>,
+) -> Result<Json<Team>, ApiError> {
+    Ok(Json(engine.set_team_status(&id, TeamStatus::Active)?))
+}
+
+#[utoipa::path(post, path = "/v1/sessions/{id}/team/complete", params(("id" = String, Path,)),
+    responses((status = 200, body = Team), (status = 400, body = ErrorBody),
+              (status = 404, body = ErrorBody), (status = 409, body = ErrorBody)))]
+async fn complete_team(
+    State(engine): State<Arc<Engine>>,
+    Path(id): Path<String>,
+) -> Result<Json<Team>, ApiError> {
+    Ok(Json(engine.set_team_status(&id, TeamStatus::Completed)?))
+}
+
+#[utoipa::path(post, path = "/v1/sessions/{id}/team/cancel", params(("id" = String, Path,)),
+    responses((status = 200, body = Team), (status = 400, body = ErrorBody),
+              (status = 404, body = ErrorBody), (status = 409, body = ErrorBody)))]
+async fn cancel_team(
+    State(engine): State<Arc<Engine>>,
+    Path(id): Path<String>,
+) -> Result<Json<Team>, ApiError> {
+    Ok(Json(engine.set_team_status(&id, TeamStatus::Cancelled)?))
 }
 
 #[utoipa::path(post, path = "/v1/threads", request_body = CreateThreadRequest,

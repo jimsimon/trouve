@@ -520,7 +520,7 @@ fn main() -> anyhow::Result<()> {
     {
         let tx = tx.clone();
         window.on_start_new_chat(
-            move |ws, branch, fetch_latest, mode, model, thinking, permission, prompt| {
+            move |ws, branch, fetch_latest, mode, model, thinking, permission, team, prompt| {
                 let _ = tx.send(UiCommand::StartNewChat {
                     workspace_idx: ws.max(0) as usize,
                     branch_idx: branch.max(0) as usize,
@@ -529,6 +529,7 @@ fn main() -> anyhow::Result<()> {
                     model_idx: model.max(0) as usize,
                     thinking_idx: thinking.max(0) as usize,
                     permission_idx: permission.max(0) as usize,
+                    team,
                     prompt: prompt.to_string(),
                 });
             },
@@ -804,6 +805,27 @@ fn main() -> anyhow::Result<()> {
         let tx = tx.clone();
         window.on_archived_filter_toggled(move |row| {
             let _ = tx.send(UiCommand::ToggleArchivedFilter { row: row as usize });
+        });
+    }
+    {
+        let tx = tx.clone();
+        window.on_session_kind_filter_picked(move |row, filter| {
+            let _ = tx.send(UiCommand::SetSessionKindFilter {
+                row: row as usize,
+                filter,
+            });
+        });
+    }
+    {
+        let tx = tx.clone();
+        window.on_team_status_action(move |action| {
+            let _ = tx.send(UiCommand::TeamStatusAction(action));
+        });
+    }
+    {
+        let tx = tx.clone();
+        window.on_team_agent_opened(move |thread_id| {
+            let _ = tx.send(UiCommand::OpenTeamAgent(thread_id.to_string()));
         });
     }
 

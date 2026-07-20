@@ -85,7 +85,10 @@ pub use requests::*;
 // selection, and profile snapshots on durable review jobs (all additive).
 // 1.3: per-repository reviewer model overrides and inherit/append/replace
 // prompt policies (additive).
-pub const PROTOCOL_VERSION: &str = "1.3";
+// 1.4: role-based team sessions — session kind/member count, durable team
+// snapshots and messages, team lifecycle events, templates, and team control
+// endpoints (all additive).
+pub const PROTOCOL_VERSION: &str = "1.4";
 
 pub type WorkspaceId = String;
 pub type SessionId = String;

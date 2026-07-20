@@ -173,6 +173,42 @@ impl ProtocolClient {
         self.post_json("/sessions", req).await
     }
 
+    pub async fn team_templates(&self) -> Result<Vec<TeamTemplate>> {
+        self.get_json("/team-templates").await
+    }
+
+    pub async fn create_team(&self, req: &CreateTeamRequest) -> Result<Team> {
+        self.post_json("/teams", req).await
+    }
+
+    pub async fn get_team(&self, session_id: &str) -> Result<Team> {
+        self.get_json(&format!("/sessions/{session_id}/team")).await
+    }
+
+    pub async fn post_team_message(&self, session_id: &str, content: &str) -> Result<TeamMessage> {
+        self.post_json(
+            &format!("/sessions/{session_id}/team/messages"),
+            &PostTeamMessageRequest {
+                content: content.into(),
+            },
+        )
+        .await
+    }
+
+    pub async fn set_team_status(&self, session_id: &str, status: TeamStatus) -> Result<Team> {
+        let action = match status {
+            TeamStatus::Active => "resume",
+            TeamStatus::Paused => "pause",
+            TeamStatus::Completed => "complete",
+            TeamStatus::Cancelled => "cancel",
+        };
+        self.post_json(
+            &format!("/sessions/{session_id}/team/{action}"),
+            &serde_json::json!({}),
+        )
+        .await
+    }
+
     pub async fn list_sessions(&self) -> Result<Vec<Session>> {
         self.get_json("/sessions").await
     }
@@ -856,6 +892,21 @@ impl ProtocolClient {
     ) -> Result<u64> {
         self.follow_sse(
             format!("{}/threads/{thread_id}/events?after={after}", self.base),
+            after,
+            on_event,
+        )
+        .await
+    }
+
+    /// Follow durable team/checkpoint/worktree events for one session.
+    pub async fn follow_session_events(
+        &self,
+        session_id: &str,
+        after: u64,
+        on_event: impl FnMut(EventEnvelope) -> std::ops::ControlFlow<()>,
+    ) -> Result<u64> {
+        self.follow_sse(
+            format!("{}/sessions/{session_id}/events?after={after}", self.base),
             after,
             on_event,
         )

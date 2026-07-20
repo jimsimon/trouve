@@ -12,8 +12,10 @@ use anyhow::{Context, Result, anyhow, bail};
 use futures::{FutureExt, StreamExt};
 use trouve_agents::{AgentBackend, BackendEvent, BackendPermission, BackendTurn};
 use trouve_protocol::{
-    AgentMode, ApprovalDecision, BranchList, CreateSessionRequest, CreateThreadRequest, Event,
-    ProviderInfo, ProvidersResponse, RestoreDirection, Scope, Session, Thread, ToolStatus,
+    AgentMode, ApprovalDecision, BranchList, CreateSessionRequest, CreateTeamRequest,
+    CreateThreadRequest, Event, PostTeamMessageRequest, ProviderInfo, ProvidersResponse,
+    RestoreDirection, Scope, Session, Team, TeamAuthorKind, TeamMember, TeamMemberState,
+    TeamMention, TeamMessage, TeamStatus, TeamTemplate, TeamTemplateMember, Thread, ToolStatus,
     TurnAccepted, UpdateSessionRequest, UpdateThreadRequest, UpsertProviderRequest, Usage,
     Workspace,
 };
@@ -35,6 +37,148 @@ const COMPACTION_THRESHOLD: f64 = 0.8;
 /// End-to-end budget for refreshing one GitHub host. This bounds how long a
 /// stalled GraphQL request can retain the shared dashboard-cache lock.
 const GITHUB_DASHBOARD_REFRESH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Initial team shape. Roles remain ordinary mode-backed data; this template
+/// only supplies the stable handles and collaboration expectations.
+fn software_delivery_team_template() -> TeamTemplate {
+    TeamTemplate {
+        id: "software_delivery".into(),
+        name: "Software delivery".into(),
+        description: "An orchestrator coordinates planning, implementation, and review.".into(),
+        members: vec![
+            TeamTemplateMember {
+                handle: "orchestrator".into(),
+                display_name: "Orchestrator".into(),
+                role: "Own the goal, delegate scoped work, integrate results, and decide when the team is done.".into(),
+                mode: "plan".into(),
+            },
+            TeamTemplateMember {
+                handle: "planner".into(),
+                display_name: "Planner".into(),
+                role: "Investigate the codebase and turn the goal into a concrete implementation plan.".into(),
+                mode: "plan".into(),
+            },
+            TeamTemplateMember {
+                handle: "coder".into(),
+                display_name: "Coder".into(),
+                role: "Implement the assigned change and verify it in the shared worktree.".into(),
+                mode: "code".into(),
+            },
+            TeamTemplateMember {
+                handle: "reviewer".into(),
+                display_name: "Reviewer".into(),
+                role: "Review correctness, regressions, tests, and maintainability; report actionable findings.".into(),
+                mode: "review".into(),
+            },
+        ],
+    }
+}
+
+/// Extract valid teammate handles while ignoring fenced and inline code.
+/// The returned order follows first mention order and is stable for routing.
+fn mentioned_team_members(
+    content: &str,
+    members: &[TeamMember],
+    exclude_member_id: Option<&str>,
+) -> Vec<TeamMember> {
+    let by_handle: HashMap<String, &TeamMember> = members
+        .iter()
+        .map(|member| (member.handle.to_ascii_lowercase(), member))
+        .collect();
+    let mut fenced = false;
+    let mut seen = HashSet::new();
+    let mut out = Vec::new();
+    for line in content.lines() {
+        if line.trim_start().starts_with("```") {
+            fenced = !fenced;
+            continue;
+        }
+        if fenced {
+            continue;
+        }
+        let chars: Vec<char> = line.chars().collect();
+        let mut index = 0;
+        let mut inline_ticks = 0;
+        while index < chars.len() {
+            if chars[index] == '`' {
+                let mut end = index + 1;
+                while end < chars.len() && chars[end] == '`' {
+                    end += 1;
+                }
+                let ticks = end - index;
+                if inline_ticks == 0 {
+                    inline_ticks = ticks;
+                } else if ticks == inline_ticks {
+                    inline_ticks = 0;
+                }
+                index = end;
+                continue;
+            }
+            let starts_mention = index == 0
+                || !(chars[index - 1].is_ascii_alphanumeric()
+                    || matches!(chars[index - 1], '_' | '-'));
+            if inline_ticks == 0 && chars[index] == '@' && starts_mention {
+                let start = index + 1;
+                let mut end = start;
+                while end < chars.len()
+                    && (chars[end].is_ascii_alphanumeric() || matches!(chars[end], '_' | '-'))
+                {
+                    end += 1;
+                }
+                if end > start {
+                    let handle: String = chars[start..end].iter().collect();
+                    if let Some(member) = by_handle.get(&handle.to_ascii_lowercase())
+                        && exclude_member_id != Some(member.id.as_str())
+                        && seen.insert(member.id.clone())
+                    {
+                        out.push((*member).clone());
+                    }
+                    index = end;
+                    continue;
+                }
+            }
+            index += 1;
+        }
+    }
+    out
+}
+
+fn render_team_delivery(team: &Team, recipient: &TeamMember, message: &TeamMessage) -> String {
+    let roster = team
+        .members
+        .iter()
+        .map(|member| {
+            format!(
+                "- @{} — {}: {}",
+                member.handle, member.display_name, member.role
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    let handoff = if recipient.id == team.orchestrator_member_id {
+        "Delegate concrete tasks with exact @handles. Integrate the team's results. When the goal is fully achieved, say so clearly; otherwise tag the teammate who needs the next turn."
+    } else {
+        "Do the scoped work for your role. Report concrete results, then tag @orchestrator when your work is ready to integrate, or another teammate only when they need a turn."
+    };
+    format!(
+        "[trouve team delivery]\n\
+         Shared goal:\n{}\n\n\
+         Your identity: @{} ({})\n\
+         Your role: {}\n\n\
+         Team roster:\n{}\n\n\
+         Message from @{}:\n{}\n\n\
+         {}\n\
+         Your final response is posted to the shared team timeline. A teammate only receives a new turn when you explicitly use their exact @handle. Do not include handles inside code when you intend a handoff.",
+        team.goal,
+        recipient.handle,
+        recipient.display_name,
+        recipient.role,
+        roster,
+        message.author_handle,
+        message.content,
+        handoff,
+    )
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum EngineError {
@@ -3343,6 +3487,8 @@ impl Engine {
             branch: branch.clone(),
             worktree_path: worktree_path.to_string_lossy().to_string(),
             base_ref,
+            kind: trouve_protocol::SessionKind::Solo,
+            team_member_count: 0,
             archived: false,
             active: false,
             created_at: chrono::Utc::now(),
@@ -3418,6 +3564,338 @@ impl Engine {
             active.values().any(|s| *s == session.id)
         };
         Ok(session)
+    }
+
+    // --- agent teams -------------------------------------------------------
+
+    pub fn team_templates(&self) -> Vec<TeamTemplate> {
+        vec![software_delivery_team_template()]
+    }
+
+    /// Create the session and its role-backed threads, then deliver the goal
+    /// to the orchestrator through the same persistent queue as every later
+    /// mention. The server, not a provider backend or client, owns routing.
+    pub async fn create_team(
+        self: &Arc<Self>,
+        req: CreateTeamRequest,
+    ) -> Result<Team, EngineError> {
+        let goal = req.goal.trim().to_string();
+        if goal.is_empty() {
+            return Err(EngineError::BadRequest("team goal cannot be empty".into()));
+        }
+        let template_id = req.template_id.as_deref().unwrap_or("software_delivery");
+        let template = self
+            .team_templates()
+            .into_iter()
+            .find(|template| template.id == template_id)
+            .ok_or_else(|| {
+                EngineError::BadRequest(format!("unknown team template: {template_id}"))
+            })?;
+        let session = self
+            .create_session(CreateSessionRequest {
+                workspace_id: req.workspace_id,
+                title: req.title,
+                base_ref: req.base_ref,
+                checkout_ref: None,
+                fetch_latest: req.fetch_latest,
+            })
+            .await?;
+
+        let members_result: Result<Vec<TeamMember>, EngineError> = template
+            .members
+            .iter()
+            .map(|spec| {
+                let thread = self.create_thread(CreateThreadRequest {
+                    session_id: session.id.clone(),
+                    mode: Some(spec.mode.clone()),
+                    model: req.model.clone(),
+                    model_options: req.model_options.clone(),
+                    permission_mode: req.permission_mode,
+                })?;
+                Ok(TeamMember {
+                    id: new_id("tm"),
+                    session_id: session.id.clone(),
+                    handle: spec.handle.clone(),
+                    display_name: spec.display_name.clone(),
+                    role: spec.role.clone(),
+                    thread_id: thread.id,
+                    mode: thread.mode,
+                    model: thread.model,
+                    state: TeamMemberState::Idle,
+                    usage: Usage::default(),
+                })
+            })
+            .collect();
+        let members = match members_result {
+            Ok(members) => members,
+            Err(error) => {
+                let _ = self.delete_session(&session.id).await;
+                return Err(error);
+            }
+        };
+        let orchestrator_member_id = members
+            .iter()
+            .find(|member| member.handle == "orchestrator")
+            .map(|member| member.id.clone())
+            .ok_or_else(|| EngineError::Internal(anyhow!("template has no orchestrator")))?;
+        let team = Team {
+            session_id: session.id.clone(),
+            snapshot_cursor: 0,
+            goal,
+            status: TeamStatus::Active,
+            orchestrator_member_id,
+            members,
+            messages: Vec::new(),
+            max_turns: req.max_turns.unwrap_or(64).clamp(1, 1_000),
+            turns_used: 0,
+            created_at: chrono::Utc::now(),
+        };
+        if let Err(error) = self.store.insert_team(&team) {
+            let _ = self.delete_session(&session.id).await;
+            return Err(error.into());
+        }
+        let initialized = (|| -> Result<(), EngineError> {
+            self.store.append_event(
+                Scope::Session(session.id.clone()),
+                Event::TeamCreated { team: team.clone() },
+            )?;
+            self.store.append_event(
+                Scope::Server,
+                Event::SessionUpdated {
+                    session_id: session.id.clone(),
+                    workspace_id: session.workspace_id.clone(),
+                },
+            )?;
+            self.post_team_message(
+                &session.id,
+                PostTeamMessageRequest {
+                    content: team.goal.clone(),
+                },
+            )?;
+            Ok(())
+        })();
+        if let Err(error) = initialized {
+            let _ = self.delete_session(&session.id).await;
+            return Err(error);
+        }
+        self.get_team(&session.id)
+    }
+
+    pub fn get_team(&self, session_id: &str) -> Result<Team, EngineError> {
+        let session = self.get_session(session_id)?;
+        if session.kind != trouve_protocol::SessionKind::Team {
+            return Err(EngineError::BadRequest(format!(
+                "session {session_id} is not a team"
+            )));
+        }
+        self.store
+            .team(session_id)?
+            .ok_or_else(|| EngineError::NotFound(format!("team for session {session_id}")))
+    }
+
+    pub fn post_team_message(
+        self: &Arc<Self>,
+        session_id: &str,
+        req: PostTeamMessageRequest,
+    ) -> Result<TeamMessage, EngineError> {
+        let content = req.content.trim().to_string();
+        if content.is_empty() {
+            return Err(EngineError::BadRequest(
+                "team message cannot be empty".into(),
+            ));
+        }
+        self.append_team_message(session_id, None, "you", TeamAuthorKind::Human, content)
+    }
+
+    fn append_team_message(
+        self: &Arc<Self>,
+        session_id: &str,
+        author: Option<&TeamMember>,
+        author_handle: &str,
+        author_kind: TeamAuthorKind,
+        content: String,
+    ) -> Result<TeamMessage, EngineError> {
+        let team = self.get_team(session_id)?;
+        if author_kind == TeamAuthorKind::Human
+            && matches!(team.status, TeamStatus::Completed | TeamStatus::Cancelled)
+        {
+            return Err(EngineError::Conflict(format!(
+                "team is {}",
+                match team.status {
+                    TeamStatus::Completed => "completed",
+                    TeamStatus::Cancelled => "cancelled",
+                    _ => unreachable!(),
+                }
+            )));
+        }
+        let recipients = mentioned_team_members(
+            &content,
+            &team.members,
+            author.map(|member| member.id.as_str()),
+        );
+        let mentions = recipients
+            .iter()
+            .map(|member| TeamMention {
+                member_id: member.id.clone(),
+                handle: member.handle.clone(),
+            })
+            .collect();
+        let message = TeamMessage {
+            id: new_id("msg"),
+            session_id: session_id.to_string(),
+            author_member_id: author.map(|member| member.id.clone()),
+            author_handle: author_handle.to_string(),
+            author_kind,
+            content,
+            mentions,
+            created_at: chrono::Utc::now(),
+        };
+        self.store.insert_team_message(&message)?;
+        self.store.append_event(
+            Scope::Session(session_id.to_string()),
+            Event::TeamMessagePosted {
+                message: message.clone(),
+            },
+        )?;
+
+        // Untagged human messages address the orchestrator. Untagged agent
+        // output is still visible in the timeline but deliberately creates
+        // no hidden turn.
+        let recipients = if recipients.is_empty() && author_kind == TeamAuthorKind::Human {
+            team.members
+                .iter()
+                .find(|member| member.id == team.orchestrator_member_id)
+                .cloned()
+                .into_iter()
+                .collect()
+        } else {
+            recipients
+        };
+        if !matches!(team.status, TeamStatus::Completed | TeamStatus::Cancelled) {
+            self.route_team_message(&team, &message, &recipients)?;
+        }
+        Ok(message)
+    }
+
+    fn route_team_message(
+        self: &Arc<Self>,
+        team: &Team,
+        message: &TeamMessage,
+        recipients: &[TeamMember],
+    ) -> Result<(), EngineError> {
+        for member in recipients {
+            let prompt = render_team_delivery(team, member, message);
+            let queued = self.store.enqueue_prompt(&member.thread_id, &prompt, &[])?;
+            self.store.insert_team_delivery(
+                &team.session_id,
+                &message.id,
+                &member.id,
+                &queued.id,
+            )?;
+            self.emit_queue(&member.thread_id)?;
+            self.set_team_member_state_and_emit(member, TeamMemberState::Queued)?;
+            if team.status == TeamStatus::Active
+                && let Err(error) = self.dispatch_queue(&member.thread_id)
+            {
+                tracing::warn!(
+                    "team delivery {} to @{} remains queued: {error}",
+                    message.id,
+                    member.handle
+                );
+            }
+        }
+        Ok(())
+    }
+
+    fn set_team_member_state_and_emit(
+        &self,
+        member: &TeamMember,
+        state: TeamMemberState,
+    ) -> Result<(), EngineError> {
+        self.store.set_team_member_state(&member.id, state)?;
+        let mut updated = self
+            .store
+            .team_member_by_thread(&member.thread_id)?
+            .unwrap_or_else(|| member.clone());
+        updated.state = state;
+        self.store.append_event(
+            Scope::Session(member.session_id.clone()),
+            Event::TeamMemberUpdated { member: updated },
+        )?;
+        Ok(())
+    }
+
+    /// Apply a lifecycle action. Resuming kicks every durable member queue;
+    /// cancelling also interrupts currently running turns.
+    pub fn set_team_status(
+        self: &Arc<Self>,
+        session_id: &str,
+        status: TeamStatus,
+    ) -> Result<Team, EngineError> {
+        let team = self.get_team(session_id)?;
+        if status == TeamStatus::Active
+            && team.status == TeamStatus::Paused
+            && team.turns_used >= team.max_turns
+        {
+            return Err(EngineError::Conflict(format!(
+                "team turn budget exhausted ({}/{})",
+                team.turns_used, team.max_turns
+            )));
+        }
+        let valid = match status {
+            TeamStatus::Active => team.status == TeamStatus::Paused,
+            TeamStatus::Paused => team.status == TeamStatus::Active,
+            TeamStatus::Completed | TeamStatus::Cancelled => {
+                !matches!(team.status, TeamStatus::Completed | TeamStatus::Cancelled)
+            }
+        };
+        if !valid {
+            return Err(EngineError::Conflict(format!(
+                "cannot change team from {:?} to {status:?}",
+                team.status
+            )));
+        }
+        self.store.set_team_status(session_id, status)?;
+        self.store.append_event(
+            Scope::Session(session_id.to_string()),
+            Event::TeamStatusChanged {
+                status,
+                turns_used: team.turns_used,
+            },
+        )?;
+        match status {
+            TeamStatus::Active => {
+                for member in &team.members {
+                    if !self.store.queued_prompts(&member.thread_id)?.is_empty() {
+                        self.set_team_member_state_and_emit(member, TeamMemberState::Queued)?;
+                        let _ = self.dispatch_queue(&member.thread_id);
+                    }
+                }
+            }
+            TeamStatus::Completed | TeamStatus::Cancelled => {
+                if status == TeamStatus::Cancelled {
+                    for member in &team.members {
+                        let _ = self.cancel_turn(&member.thread_id);
+                    }
+                }
+                self.store.cancel_pending_team_deliveries(session_id)?;
+                let running: HashSet<String> = self
+                    .active_threads
+                    .lock()
+                    .unwrap()
+                    .keys()
+                    .cloned()
+                    .collect();
+                for member in &team.members {
+                    self.emit_queue(&member.thread_id)?;
+                    if !running.contains(&member.thread_id) {
+                        self.set_team_member_state_and_emit(member, TeamMemberState::Idle)?;
+                    }
+                }
+            }
+            TeamStatus::Paused => {}
+        }
+        self.get_team(session_id)
     }
 
     /// Rename and/or (un)archive a session.
@@ -3599,6 +4077,11 @@ impl Engine {
         req: &UpdateThreadRequest,
     ) -> Result<Thread, EngineError> {
         let thread = self.get_thread(id)?;
+        if self.store.team_member_by_thread(id)?.is_some() {
+            return Err(EngineError::Conflict(
+                "team member settings are managed by the team session".into(),
+            ));
+        }
         let session = self.get_session(&thread.session_id)?;
 
         // The session lock is held for the duration of a turn; a locked
@@ -3800,6 +4283,11 @@ impl Engine {
         uploads: Vec<trouve_protocol::AttachmentUpload>,
     ) -> Result<TurnAccepted, EngineError> {
         self.get_thread(thread_id)?; // 404 for unknown threads
+        if self.store.team_member_by_thread(thread_id)?.is_some() {
+            return Err(EngineError::Conflict(
+                "team members are addressed through the shared team timeline".into(),
+            ));
+        }
         let attachments = self.save_attachments(thread_id, uploads)?;
         self.store
             .enqueue_prompt(thread_id, &content, &attachments)?;
@@ -3924,6 +4412,11 @@ impl Engine {
     }
 
     pub fn update_queued_prompt(&self, prompt_id: &str, content: &str) -> Result<(), EngineError> {
+        if self.store.team_delivery_for_prompt(prompt_id)?.is_some() {
+            return Err(EngineError::Conflict(
+                "team delivery queues are managed by the team session".into(),
+            ));
+        }
         let thread_id = self
             .store
             .queued_prompt_thread(prompt_id)?
@@ -3935,6 +4428,11 @@ impl Engine {
     }
 
     pub fn delete_queued_prompt(&self, prompt_id: &str) -> Result<(), EngineError> {
+        if self.store.team_delivery_for_prompt(prompt_id)?.is_some() {
+            return Err(EngineError::Conflict(
+                "team delivery queues are managed by the team session".into(),
+            ));
+        }
         let thread_id = self
             .store
             .queued_prompt_thread(prompt_id)?
@@ -3949,6 +4447,11 @@ impl Engine {
     /// currently queued prompt exactly once.
     pub fn reorder_queue(&self, thread_id: &str, ids: &[String]) -> Result<(), EngineError> {
         self.get_thread(thread_id)?;
+        if self.store.team_member_by_thread(thread_id)?.is_some() {
+            return Err(EngineError::Conflict(
+                "team delivery queues are managed by the team session".into(),
+            ));
+        }
         if !self.store.reorder_queued_prompts(thread_id, ids)? {
             return Err(EngineError::Conflict(
                 "queue changed while reordering; refresh and retry".into(),
@@ -4057,6 +4560,70 @@ impl Engine {
         let mut prompt = prompt;
         let mut first_cancel = Some(first_cancel);
         loop {
+            let scheduling: Result<_> = (|| {
+                Ok((
+                    self.store.team_member_by_thread(&thread.id)?,
+                    self.store.team_delivery_for_prompt(&prompt.id)?,
+                ))
+            })();
+            let (team_member, delivery) = match scheduling {
+                Ok(state) => state,
+                Err(error) => {
+                    tracing::error!(
+                        "could not load scheduler state for turn {turn} of {}: {error}",
+                        thread.id
+                    );
+                    let _ = self.store.release_queued_prompt(&prompt.id);
+                    let _ = self.emit_queue(&thread.id);
+                    let _ = self.store.append_event(
+                        Scope::Thread(thread.id.clone()),
+                        Event::TurnFailed {
+                            turn,
+                            error: error.to_string(),
+                        },
+                    );
+                    self.release_thread(&thread.id);
+                    return;
+                }
+            };
+            if delivery.is_some() {
+                let budget = match self.store.consume_team_turn(&thread.session_id) {
+                    Ok(budget) => budget,
+                    Err(error) => {
+                        tracing::warn!(
+                            "team turn for {} remains queued: {error}",
+                            thread.session_id
+                        );
+                        None
+                    }
+                };
+                let Some((turns_used, status)) = budget else {
+                    let _ = self.store.release_queued_prompt(&prompt.id);
+                    let _ = self.emit_queue(&thread.id);
+                    if let Some(member) = &team_member {
+                        let state = if self
+                            .store
+                            .queued_prompts(&thread.id)
+                            .is_ok_and(|prompts| !prompts.is_empty())
+                        {
+                            TeamMemberState::Queued
+                        } else {
+                            TeamMemberState::Idle
+                        };
+                        let _ = self.set_team_member_state_and_emit(member, state);
+                    }
+                    self.release_thread(&thread.id);
+                    return;
+                };
+                let _ = self.store.append_event(
+                    Scope::Session(thread.session_id.clone()),
+                    Event::TeamStatusChanged { status, turns_used },
+                );
+                let _ = self.store.set_team_delivery_status(&prompt.id, "running");
+                if let Some(member) = &team_member {
+                    let _ = self.set_team_member_state_and_emit(member, TeamMemberState::Running);
+                }
+            }
             let cancel = first_cancel
                 .take()
                 .unwrap_or_else(|| self.register_cancel(&thread.id));
@@ -4065,6 +4632,13 @@ impl Engine {
             self.clear_cancel(&thread.id);
             if let Err(e) = result {
                 tracing::error!("turn {turn} of {} failed: {e}", thread.id);
+                if delivery.is_some() {
+                    let _ = self.store.set_team_delivery_status(&prompt.id, "failed");
+                    if let Some(member) = &team_member {
+                        let _ =
+                            self.set_team_member_state_and_emit(member, TeamMemberState::Failed);
+                    }
+                }
                 let _ = self.store.release_queued_prompt(&prompt.id);
                 let _ = self.emit_queue(&thread.id);
                 let _ = self.store.append_event(
@@ -4084,8 +4658,50 @@ impl Engine {
                     Scope::Thread(thread.id.clone()),
                     Event::TurnCancelled { turn },
                 );
+                if delivery.is_some() {
+                    let _ = self.store.set_team_delivery_status(&prompt.id, "cancelled");
+                }
+                if let Some(member) = &team_member {
+                    let _ = self.set_team_member_state_and_emit(member, TeamMemberState::Idle);
+                }
                 self.release_thread(&thread.id);
                 return;
+            }
+            if delivery.is_some() {
+                let _ = self.store.set_team_delivery_status(&prompt.id, "completed");
+            }
+            if let Some(member) = &team_member {
+                match self.store.assistant_message(&thread.id, turn) {
+                    Ok(Some(content)) if !content.trim().is_empty() => {
+                        if let Err(error) = self.append_team_message(
+                            &thread.session_id,
+                            Some(member),
+                            &member.handle,
+                            TeamAuthorKind::Agent,
+                            content,
+                        ) {
+                            tracing::warn!(
+                                "failed to route output from team member @{}: {error}",
+                                member.handle
+                            );
+                        }
+                    }
+                    Ok(_) => {}
+                    Err(error) => tracing::warn!(
+                        "failed to fold output from team member @{}: {error}",
+                        member.handle
+                    ),
+                }
+                let next_state = if self
+                    .store
+                    .queued_prompts(&thread.id)
+                    .is_ok_and(|prompts| !prompts.is_empty())
+                {
+                    TeamMemberState::Queued
+                } else {
+                    TeamMemberState::Idle
+                };
+                let _ = self.set_team_member_state_and_emit(member, next_state);
             }
             // Pop the next prompt; releasing the claim and inspecting the
             // queue must be atomic against concurrent send_message calls.
@@ -4218,13 +4834,14 @@ impl Engine {
             .cloned()
             .unwrap_or_else(modes::fallback_mode);
 
-        // Serialize worktree mutations across the session's threads — except
-        // agent-spawned children in read-only modes: they can't write, and
-        // running them concurrently with the parent's turn (which holds this
-        // lock) is the whole point of spawn_thread exploration fan-out.
-        let concurrent_child = mode.read_only && self.store.spawn_parent(&thread.id)?.is_some();
+        // Serialize worktree mutations across the session's threads. Read-only
+        // spawned children and team members may inspect concurrently because
+        // neither can write through the executor or vendor permission bridge.
+        let team_member = self.store.team_member_by_thread(&thread.id)?.is_some();
+        let concurrent_reader =
+            mode.read_only && (self.store.spawn_parent(&thread.id)?.is_some() || team_member);
         let lock = self.session_lock(&session.id);
-        let _guard = if concurrent_child {
+        let _guard = if concurrent_reader {
             None
         } else {
             Some(lock.lock().await)
@@ -4244,7 +4861,7 @@ impl Engine {
                     model_name,
                     content,
                     attachments,
-                    concurrent_child,
+                    concurrent_reader,
                     cancel,
                     &prompt.id,
                 )
@@ -4325,7 +4942,7 @@ impl Engine {
         let spawn_allowed = |name: &str| {
             mode.allowed_tools.is_empty() || mode.allowed_tools.iter().any(|t| t == name)
         };
-        if self.store.spawn_parent(&thread.id)?.is_none() {
+        if self.store.spawn_parent(&thread.id)?.is_none() && !team_member {
             if spawn_allowed("spawn_thread") {
                 specs.push(spawn_thread_spec());
             }
@@ -4581,7 +5198,7 @@ impl Engine {
         // Snapshot the worktree when the turn changed it. Lock-free child
         // turns never snapshot: they can't write, so any dirt is the
         // parent's in-flight work — not theirs to checkpoint.
-        let checkpoint_id = if concurrent_child {
+        let checkpoint_id = if concurrent_reader {
             None
         } else {
             self.maybe_checkpoint(&session, thread, turn).await?
@@ -4691,7 +5308,9 @@ impl Engine {
         specs.push(ask_question_spec());
         specs.push(search_transcript_spec());
         // Spawn tools: top-level agents only, same as native turns.
-        if self.store.spawn_parent(thread_id)?.is_none() {
+        if self.store.spawn_parent(thread_id)?.is_none()
+            && self.store.team_member_by_thread(thread_id)?.is_none()
+        {
             specs.push(spawn_thread_spec());
             specs.push(spawn_session_spec());
             specs.push(spawn_output_spec());
@@ -5040,7 +5659,7 @@ impl Engine {
         model_name: String,
         content: String,
         attachments: Vec<trouve_protocol::Attachment>,
-        concurrent_child: bool,
+        concurrent_reader: bool,
         cancel: tokio_util::sync::CancellationToken,
         queued_prompt_id: &str,
     ) -> Result<()> {
@@ -5447,7 +6066,7 @@ impl Engine {
         // they hold no session lock, so `git add`/write-tree here would race
         // the parent's concurrent turn and snapshot its half-finished work as
         // the child's checkpoint. Matches the native path (invariant 4).
-        let checkpoint_id = if concurrent_child {
+        let checkpoint_id = if concurrent_reader {
             None
         } else {
             self.maybe_checkpoint(session, thread, turn).await?
@@ -7438,6 +8057,43 @@ fn resolved_api_key(
 mod tests {
     use super::*;
 
+    fn team_member(id: &str, handle: &str) -> TeamMember {
+        TeamMember {
+            id: id.into(),
+            session_id: "se_test".into(),
+            handle: handle.into(),
+            display_name: handle.into(),
+            role: format!("Act as {handle}"),
+            thread_id: format!("th_{id}"),
+            mode: "plan".into(),
+            model: "test/model".into(),
+            state: TeamMemberState::Idle,
+            usage: Default::default(),
+        }
+    }
+
+    #[test]
+    fn team_mentions_are_exact_ordered_deduplicated_and_skip_code() {
+        let planner = team_member("planner", "planner");
+        let coder = team_member("coder", "coder");
+        let reviewer = team_member("reviewer", "reviewer");
+        let members = vec![planner.clone(), coder.clone(), reviewer.clone()];
+
+        let content = "@Coder take this; @planner outline it. `@reviewer inline` \
+                       and ``@reviewer double-inline`` plus mail@reviewer.example\n\
+                       ```text\n@reviewer fenced\n```\n\
+                       @coder again, @reviewer now, and @coders is not exact.";
+        let routed = mentioned_team_members(content, &members, Some(&planner.id));
+
+        assert_eq!(
+            routed
+                .iter()
+                .map(|member| member.handle.as_str())
+                .collect::<Vec<_>>(),
+            vec!["coder", "reviewer"]
+        );
+    }
+
     #[test]
     fn collects_provider_neutral_pr_evidence() {
         let remote_commit = "9f2c6d8b18c86d48ca2c3f58191f9f5277b9269a";
@@ -7662,6 +8318,8 @@ mod tests {
             branch: "main".into(),
             worktree_path: tmp.path().to_string_lossy().into_owned(),
             base_ref: "main".into(),
+            kind: trouve_protocol::SessionKind::Solo,
+            team_member_count: 0,
             archived: false,
             active: false,
             created_at: chrono::Utc::now(),

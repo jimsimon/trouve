@@ -7,7 +7,7 @@
       "name": "MIT",
       "identifier": "MIT"
     },
-    "version": "1.3"
+    "version": "1.4"
   },
   "paths": {
     "/v1/approvals": {
@@ -2340,6 +2340,354 @@
         }
       }
     },
+    "/v1/sessions/{id}/team": {
+      "get": {
+        "tags": [],
+        "operationId": "get_team",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Team"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/sessions/{id}/team/cancel": {
+      "post": {
+        "tags": [],
+        "operationId": "cancel_team",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Team"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/sessions/{id}/team/complete": {
+      "post": {
+        "tags": [],
+        "operationId": "complete_team",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Team"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/sessions/{id}/team/messages": {
+      "post": {
+        "tags": [],
+        "operationId": "post_team_message",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PostTeamMessageRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TeamMessage"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/sessions/{id}/team/pause": {
+      "post": {
+        "tags": [],
+        "operationId": "pause_team",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Team"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/sessions/{id}/team/resume": {
+      "post": {
+        "tags": [],
+        "operationId": "resume_team",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Team"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/v1/sessions/{id}/terminal": {
       "post": {
         "tags": [],
@@ -2471,6 +2819,85 @@
                   "items": {
                     "$ref": "#/components/schemas/SubscriptionHealth"
                   }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/team-templates": {
+      "get": {
+        "tags": [],
+        "operationId": "team_templates",
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/TeamTemplate"
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/teams": {
+      "post": {
+        "tags": [],
+        "operationId": "create_team",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateTeamRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Team"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
                 }
               }
             }
@@ -3925,6 +4352,79 @@
           }
         }
       },
+      "CreateTeamRequest": {
+        "type": "object",
+        "description": "Create a role-based team and enqueue its goal for the orchestrator.",
+        "required": [
+          "workspace_id",
+          "goal"
+        ],
+        "properties": {
+          "base_ref": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "fetch_latest": {
+            "type": "boolean",
+            "description": "Fetch the base branch's configured upstream before creating the team\nsession. Refs without an upstream are used as-is."
+          },
+          "goal": {
+            "type": "string"
+          },
+          "max_turns": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "Safety budget across automatically delivered team turns.",
+            "minimum": 0
+          },
+          "model": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Optional model override applied to every initial member."
+          },
+          "model_options": {
+            "type": "object",
+            "description": "Model-specific options applied to every initial member.",
+            "additionalProperties": {},
+            "propertyNames": {
+              "type": "string"
+            }
+          },
+          "permission_mode": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/PermissionMode"
+              }
+            ]
+          },
+          "template_id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Server-provided template id; defaults to `software_delivery`."
+          },
+          "title": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "workspace_id": {
+            "$ref": "#/components/schemas/String"
+          }
+        }
+      },
       "CreateThreadRequest": {
         "type": "object",
         "required": [
@@ -4633,6 +5133,88 @@
                 "type": "string",
                 "enum": [
                   "worktree.removed"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "description": "A role-based team was initialized for this session.",
+            "required": [
+              "team",
+              "type"
+            ],
+            "properties": {
+              "team": {
+                "$ref": "#/components/schemas/Team"
+              },
+              "type": {
+                "type": "string",
+                "enum": [
+                  "team.created"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "description": "A canonical message was appended to the shared team timeline.",
+            "required": [
+              "message",
+              "type"
+            ],
+            "properties": {
+              "message": {
+                "$ref": "#/components/schemas/TeamMessage"
+              },
+              "type": {
+                "type": "string",
+                "enum": [
+                  "team.message_posted"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "description": "A team member's scheduling state or aggregate usage changed.",
+            "required": [
+              "member",
+              "type"
+            ],
+            "properties": {
+              "member": {
+                "$ref": "#/components/schemas/TeamMember"
+              },
+              "type": {
+                "type": "string",
+                "enum": [
+                  "team.member_updated"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "description": "The team's lifecycle state or automatic-turn budget changed.",
+            "required": [
+              "status",
+              "turns_used",
+              "type"
+            ],
+            "properties": {
+              "status": {
+                "$ref": "#/components/schemas/TeamStatus"
+              },
+              "turns_used": {
+                "type": "integer",
+                "format": "int64",
+                "minimum": 0
+              },
+              "type": {
+                "type": "string",
+                "enum": [
+                  "team.status_changed"
                 ]
               }
             }
@@ -5626,6 +6208,18 @@
           "yolo"
         ]
       },
+      "PostTeamMessageRequest": {
+        "type": "object",
+        "description": "Post a human-authored message to a team timeline.",
+        "required": [
+          "content"
+        ],
+        "properties": {
+          "content": {
+            "type": "string"
+          }
+        }
+      },
       "PrInfo": {
         "type": "object",
         "required": [
@@ -6175,6 +6769,16 @@
           "id": {
             "$ref": "#/components/schemas/String"
           },
+          "kind": {
+            "$ref": "#/components/schemas/SessionKind",
+            "description": "Solo chat or role-based agent team."
+          },
+          "team_member_count": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Number of agents in a team session; zero for solo sessions.",
+            "minimum": 0
+          },
           "title": {
             "type": "string"
           },
@@ -6198,6 +6802,14 @@
             "type": "string"
           }
         }
+      },
+      "SessionKind": {
+        "type": "string",
+        "description": "The collaboration shape hosted by a session.",
+        "enum": [
+          "solo",
+          "team"
+        ]
       },
       "SetDefaultModelRequest": {
         "type": "object",
@@ -6304,6 +6916,257 @@
           "used_percent": {
             "type": "integer",
             "format": "int64"
+          }
+        }
+      },
+      "Team": {
+        "type": "object",
+        "description": "Current durable snapshot of a team session.",
+        "required": [
+          "session_id",
+          "goal",
+          "status",
+          "orchestrator_member_id",
+          "members",
+          "messages",
+          "max_turns",
+          "turns_used",
+          "created_at"
+        ],
+        "properties": {
+          "created_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "goal": {
+            "type": "string"
+          },
+          "max_turns": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "members": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/TeamMember"
+            }
+          },
+          "messages": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/TeamMessage"
+            }
+          },
+          "orchestrator_member_id": {
+            "type": "string"
+          },
+          "session_id": {
+            "$ref": "#/components/schemas/String"
+          },
+          "snapshot_cursor": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Latest session event included in this snapshot. Clients resume the\nsession stream strictly after this cursor.",
+            "minimum": 0
+          },
+          "status": {
+            "$ref": "#/components/schemas/TeamStatus"
+          },
+          "turns_used": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          }
+        }
+      },
+      "TeamAuthorKind": {
+        "type": "string",
+        "description": "Author category for a message in the shared team timeline.",
+        "enum": [
+          "human",
+          "agent",
+          "system"
+        ]
+      },
+      "TeamMember": {
+        "type": "object",
+        "description": "One role-backed agent in a team session.",
+        "required": [
+          "id",
+          "session_id",
+          "handle",
+          "display_name",
+          "role",
+          "thread_id",
+          "mode",
+          "model",
+          "state"
+        ],
+        "properties": {
+          "display_name": {
+            "type": "string"
+          },
+          "handle": {
+            "type": "string",
+            "description": "Unique, mentionable handle without the leading `@`."
+          },
+          "id": {
+            "type": "string"
+          },
+          "mode": {
+            "type": "string"
+          },
+          "model": {
+            "type": "string"
+          },
+          "role": {
+            "type": "string"
+          },
+          "session_id": {
+            "$ref": "#/components/schemas/String"
+          },
+          "state": {
+            "$ref": "#/components/schemas/TeamMemberState"
+          },
+          "thread_id": {
+            "$ref": "#/components/schemas/String"
+          },
+          "usage": {
+            "$ref": "#/components/schemas/Usage",
+            "description": "Aggregate usage for this member's backing thread."
+          }
+        }
+      },
+      "TeamMemberState": {
+        "type": "string",
+        "description": "Current scheduling state for one team member.",
+        "enum": [
+          "idle",
+          "queued",
+          "running",
+          "failed"
+        ]
+      },
+      "TeamMention": {
+        "type": "object",
+        "description": "A resolved teammate mention. Handles are display data; ids are stable.",
+        "required": [
+          "member_id",
+          "handle"
+        ],
+        "properties": {
+          "handle": {
+            "type": "string"
+          },
+          "member_id": {
+            "type": "string"
+          }
+        }
+      },
+      "TeamMessage": {
+        "type": "object",
+        "description": "A canonical entry in the shared team timeline.",
+        "required": [
+          "id",
+          "session_id",
+          "author_handle",
+          "author_kind",
+          "content",
+          "created_at"
+        ],
+        "properties": {
+          "author_handle": {
+            "type": "string"
+          },
+          "author_kind": {
+            "$ref": "#/components/schemas/TeamAuthorKind"
+          },
+          "author_member_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "content": {
+            "type": "string"
+          },
+          "created_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "id": {
+            "type": "string"
+          },
+          "mentions": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/TeamMention"
+            }
+          },
+          "session_id": {
+            "$ref": "#/components/schemas/String"
+          }
+        }
+      },
+      "TeamStatus": {
+        "type": "string",
+        "description": "Lifecycle state for a team session.",
+        "enum": [
+          "active",
+          "paused",
+          "completed",
+          "cancelled"
+        ]
+      },
+      "TeamTemplate": {
+        "type": "object",
+        "description": "A discoverable starting configuration for a team.",
+        "required": [
+          "id",
+          "name",
+          "description",
+          "members"
+        ],
+        "properties": {
+          "description": {
+            "type": "string"
+          },
+          "id": {
+            "type": "string"
+          },
+          "members": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/TeamTemplateMember"
+            }
+          },
+          "name": {
+            "type": "string"
+          }
+        }
+      },
+      "TeamTemplateMember": {
+        "type": "object",
+        "description": "One role in a server-provided team template.",
+        "required": [
+          "handle",
+          "display_name",
+          "role",
+          "mode"
+        ],
+        "properties": {
+          "display_name": {
+            "type": "string"
+          },
+          "handle": {
+            "type": "string"
+          },
+          "mode": {
+            "type": "string"
+          },
+          "role": {
+            "type": "string"
           }
         }
       },
