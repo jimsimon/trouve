@@ -51,6 +51,8 @@ export struct NavRow {
     busy: bool,
     // Completed/failed work landed while the session was not being viewed.
     unread: bool,
+    // A failed turn landed while the session was not being viewed.
+    error: bool,
     // 0 none, 1 open, 2 draft, 3 merged, 4 closed, 5 multiple.
     pr-kind: int,
     pr-tooltip: string,
@@ -2317,7 +2319,7 @@ export component AppWindow inherits Window {
                             // Every session status shares this fixed slot.
                             // Conditions are mutually exclusive and encode
                             // the status precedence from most actionable to
-                            // informational: attention, unread, busy, PR.
+                            // informational: attention, error, unread, busy, PR.
                             status-slot := Rectangle {
                                 width: 26px;
                                 if row.attention-kind != 0: IconButton {
@@ -2331,7 +2333,18 @@ export component AppWindow inherits Window {
                                     tip: row.attention-tooltip;
                                     clicked => { root.nav-row-clicked(idx); }
                                 }
-                                if row.attention-kind == 0 && row.unread: IconButton {
+                                if row.attention-kind == 0 && row.error: IconButton {
+                                    width: 26px;
+                                    height: 30px;
+                                    icon: "×";
+                                    icon-size: Theme.fs(18px);
+                                    icon-color: Theme.c.err;
+                                    hover-icon-color: Theme.c.err;
+                                    hover-bg: Theme.c.err-bg;
+                                    tip: "Turn ended with an error";
+                                    clicked => { root.nav-row-clicked(idx); }
+                                }
+                                if row.attention-kind == 0 && !row.error && row.unread: IconButton {
                                     width: 26px;
                                     height: 30px;
                                     icon: "●";
@@ -2342,7 +2355,7 @@ export component AppWindow inherits Window {
                                     tip: "Unviewed work";
                                     clicked => { root.nav-row-clicked(idx); }
                                 }
-                                if row.attention-kind == 0 && !row.unread && row.busy: Rectangle {
+                                if row.attention-kind == 0 && !row.error && !row.unread && row.busy: Rectangle {
                                     width: 10px;
                                     height: 10px;
                                     // Refer to the fixed slot explicitly: an
@@ -2357,7 +2370,7 @@ export component AppWindow inherits Window {
                                         ? 1.0
                                         : 0.55 + 0.45 * Math.sin(360deg * (animation-tick() / 1.6s));
                                 }
-                                if row.attention-kind == 0 && !row.unread && !row.busy && row.pr-kind != 0: IconButton {
+                                if row.attention-kind == 0 && !row.error && !row.unread && !row.busy && row.pr-kind != 0: IconButton {
                                     width: 26px;
                                     height: 30px;
                                     use-icon-image: true;
