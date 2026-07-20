@@ -58,6 +58,10 @@ These are load-bearing. Do not violate them without a new ADR.
    plugin manifest, internal package pin, and release artifact uses root
    `[workspace.package].version`. Repository releases use `vX.Y.Z` tags (ADR
    0012). Protocol and storage-format compatibility versions remain separate.
+9. **Team coordination is server-owned and durable.** Team roles map to
+   persistent threads; canonical messages, mentions, and deliveries use the
+   session event log and thread prompt queues. Clients and provider backends
+   never coordinate agents through side channels.
 
 ## Conventions
 
