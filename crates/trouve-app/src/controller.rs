@@ -17,8 +17,8 @@ use trouve_client_core::viewmodel::ThreadViewModel;
 use trouve_protocol::{
     AddLocalModelRequest, AgentMode, ApprovalDecision, CompleteLoginRequest, CreateSessionRequest,
     CreateThreadRequest, DirEntry, EventEnvelope, ModelInfo, PermissionMode, Session, Thread,
-    TodoStatus, UpdateSessionRequest, UpdateThreadRequest, UpsertModeRequest,
-    UpsertProviderRequest, Workspace,
+    TitleModelLoadBehavior, TodoStatus, UpdateSessionRequest, UpdateThreadRequest,
+    UpsertModeRequest, UpsertProviderRequest, Workspace,
 };
 
 use crate::render;
@@ -48,20 +48,33 @@ const SERVER_REPLAY_IDLE_FLUSH: std::time::Duration = std::time::Duration::from_
 #[derive(Default)]
 struct ServerReplayBuffer {
     github_prs: HashMap<String, EventEnvelope>,
+    git_worktree_settings: Option<EventEnvelope>,
 }
 
 impl ServerReplayBuffer {
     fn push(&mut self, envelope: EventEnvelope) -> bool {
-        let trouve_protocol::Event::GithubPullRequestsUpdated { pull_requests } = &envelope.event
-        else {
-            return false;
-        };
-        self.github_prs.insert(pull_requests.host.clone(), envelope);
-        true
+        match &envelope.event {
+            trouve_protocol::Event::GithubPullRequestsUpdated { pull_requests } => {
+                self.github_prs.insert(pull_requests.host.clone(), envelope);
+                true
+            }
+            trouve_protocol::Event::GitWorktreeSettingsUpdated { .. } => {
+                if self
+                    .git_worktree_settings
+                    .as_ref()
+                    .is_none_or(|current| envelope.cursor > current.cursor)
+                {
+                    self.git_worktree_settings = Some(envelope);
+                }
+                true
+            }
+            _ => false,
+        }
     }
 
     fn take(&mut self) -> Vec<EventEnvelope> {
         let mut snapshots: Vec<_> = std::mem::take(&mut self.github_prs).into_values().collect();
+        snapshots.extend(self.git_worktree_settings.take());
         snapshots.sort_by_key(|envelope| envelope.cursor);
         snapshots
     }
@@ -316,6 +329,9 @@ pub enum UiCommand {
 
     // Settings window.
     RefreshSettings,
+    SetTitleModelLoadBehavior(i32),
+    InstallTitleModel,
+    CancelTitleModelInstall,
     SaveProvider {
         id: String,
         kind: String,
@@ -3544,11 +3560,12 @@ impl Controller {
                     .get(selection.workspace_idx)
                     .context("no workspace selected")?
                     .clone();
+                let title = self.client.generate_session_title(&prompt).await?.title;
                 let session = self
                     .client
                     .create_session(&CreateSessionRequest {
                         workspace_id: workspace.id,
-                        title: Some(trouve_client_core::title::summarize_session_title(&prompt)),
+                        title: Some(title),
                         base_ref: self.branches.get(selection.branch_idx).cloned(),
                         checkout_ref: None,
                         fetch_latest: selection.fetch_latest,
@@ -3584,6 +3601,7 @@ impl Controller {
     // --- settings --------------------------------------------------------------
 
     async fn refresh_settings(&mut self) {
+        self.refresh_title_model().await;
         if let Ok(gh) = self.client.github_integration().await {
             self.apply_github_integration(gh);
             self.push_github_integration();
@@ -3679,6 +3697,18 @@ impl Controller {
         ui::set_known_providers(&self.ui, known, providers.providers);
         self.refresh_clis().await;
         self.refresh_local();
+    }
+
+    async fn refresh_title_model(&self) {
+        match self.client.git_worktree_settings().await {
+            Ok(settings) => ui::set_git_worktree_settings(&self.ui, settings),
+            Err(error) => {
+                ui::set_settings_status(
+                    &self.ui,
+                    format!("failed to load Git & Worktrees settings: {error:#}"),
+                );
+            }
+        }
     }
 
     /// Estimated bytes/sec for an in-flight download, from consecutive
@@ -4110,10 +4140,14 @@ impl Controller {
     fn handle_server_replay(&mut self, envelopes: Vec<trouve_protocol::EventEnvelope>) {
         let mut changed = false;
         for envelope in envelopes {
-            if let trouve_protocol::Event::GithubPullRequestsUpdated { pull_requests } =
-                envelope.event
-            {
-                changed |= self.apply_github_pr_snapshot(envelope.cursor, pull_requests);
+            match envelope.event {
+                trouve_protocol::Event::GithubPullRequestsUpdated { pull_requests } => {
+                    changed |= self.apply_github_pr_snapshot(envelope.cursor, pull_requests);
+                }
+                trouve_protocol::Event::GitWorktreeSettingsUpdated { settings } => {
+                    ui::set_git_worktree_settings(&self.ui, settings);
+                }
+                _ => {}
             }
         }
         if changed {
@@ -4137,6 +4171,10 @@ impl Controller {
                     self.sync_shared_prs(false);
                     self.push_pr_dashboard();
                 }
+                return;
+            }
+            Event::GitWorktreeSettingsUpdated { settings } => {
+                ui::set_git_worktree_settings(&self.ui, settings);
                 return;
             }
             event => event,
@@ -5238,7 +5276,7 @@ impl Controller {
                 }
             }
             UiCommand::OpenIntegrationsSettings => {
-                ui::set_settings_section(&self.ui, 4);
+                ui::set_settings_section(&self.ui, 5);
                 self.refresh_settings().await;
                 self.refresh_mcp();
                 self.refresh_subscriptions(SubscriptionRefresh::IfStale);
@@ -5424,6 +5462,34 @@ impl Controller {
                 self.reload_catalogs().await;
                 self.refresh_settings().await;
                 self.refresh_subscriptions(SubscriptionRefresh::Force);
+            }
+            UiCommand::SetTitleModelLoadBehavior(index) => {
+                let behavior = match index {
+                    1 => TitleModelLoadBehavior::Always,
+                    2 => TitleModelLoadBehavior::OnDemand,
+                    3 => TitleModelLoadBehavior::Off,
+                    _ => TitleModelLoadBehavior::Auto,
+                };
+                match self.client.set_git_worktree_settings(behavior).await {
+                    Ok(settings) => ui::set_git_worktree_settings(&self.ui, settings),
+                    Err(error) => {
+                        ui::set_settings_status(&self.ui, format!("{error:#}"));
+                        self.refresh_title_model().await;
+                    }
+                }
+            }
+            UiCommand::InstallTitleModel => match self.client.install_title_model().await {
+                Ok(()) => {
+                    self.refresh_title_model().await;
+                }
+                Err(error) => ui::set_settings_status(&self.ui, format!("{error:#}")),
+            },
+            UiCommand::CancelTitleModelInstall => {
+                match self.client.cancel_title_model_install().await {
+                    Ok(()) => {}
+                    Err(error) => ui::set_settings_status(&self.ui, format!("{error:#}")),
+                }
+                self.refresh_title_model().await;
             }
             UiCommand::SaveProvider {
                 id,
@@ -7306,14 +7372,38 @@ mod tests {
         }
     }
 
+    fn git_worktree_settings_snapshot(cursor: u64) -> EventEnvelope {
+        EventEnvelope {
+            cursor,
+            scope: Scope::Server,
+            ts: Utc::now(),
+            event: Event::GitWorktreeSettingsUpdated {
+                settings: trouve_protocol::GitWorktreeSettings {
+                    title_model_load_behavior: trouve_protocol::TitleModelLoadBehavior::Off,
+                    title_model: trouve_protocol::TitleModelStatus {
+                        state: "stopped".into(),
+                        detail: String::new(),
+                        runtime_installed: false,
+                        model_downloaded: false,
+                        install_stage: String::new(),
+                        install_bytes: 0,
+                        install_total: 0,
+                    },
+                },
+            },
+        }
+    }
+
     #[test]
-    fn server_replay_keeps_only_the_newest_pr_snapshot_per_host() {
+    fn server_replay_keeps_only_the_newest_state_snapshots() {
         let mut replay = ServerReplayBuffer::default();
         assert!(replay.push(github_snapshot(1, "github.com")));
         assert!(replay.push(github_snapshot(2, "github.example.com")));
         assert!(replay.push(github_snapshot(3, "github.com")));
+        assert!(replay.push(git_worktree_settings_snapshot(4)));
+        assert!(replay.push(git_worktree_settings_snapshot(5)));
         assert!(!replay.push(EventEnvelope {
-            cursor: 4,
+            cursor: 6,
             scope: Scope::Server,
             ts: Utc::now(),
             event: Event::SessionActivity {
@@ -7329,7 +7419,7 @@ mod tests {
                 .iter()
                 .map(|envelope| envelope.cursor)
                 .collect::<Vec<_>>(),
-            [2, 3]
+            [2, 3, 5]
         );
         assert!(replay.take().is_empty());
     }

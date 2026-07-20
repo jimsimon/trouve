@@ -107,7 +107,11 @@ pub use requests::*;
 // the snapshot's event cursor so clients can skip redundant history (additive).
 // 1.12: failed code-review personas can be retried independently while
 // retaining successful reviewer task outputs (additive).
-pub const PROTOCOL_VERSION: &str = "1.12";
+// 1.13: Git & Worktrees settings persist the title-model load behavior;
+// title-model status/install endpoints and POST /v1/session-title provide
+// synchronous model-assisted naming with a deterministic fallback, while
+// settings.git_worktrees_updated carries lifecycle snapshots (additive).
+pub const PROTOCOL_VERSION: &str = "1.13";
 
 pub type WorkspaceId = String;
 pub type SessionId = String;
