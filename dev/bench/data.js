@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1784514815966,
+  "lastUpdate": 1784521460497,
   "repoUrl": "https://github.com/jimsimon/trouve",
   "entries": {
     "e2e-benchmarks": [
@@ -3071,6 +3071,54 @@ window.BENCHMARK_DATA = {
             "name": "non-git warm query",
             "value": 66.67291572,
             "range": "± 2.4",
+            "unit": "ms"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "jim.j.simon@gmail.com",
+            "name": "Jim Simon",
+            "username": "jimsimon"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "a14b4ae52fa83ab64acde43cc620545204afacbb",
+          "message": "Unify multi-instance GitHub PR data (#103)\n\n* Unify multi-instance GitHub PR data\n\nUse OAuth-only account feeds across configured GitHub instances so the dashboard, session indicators, and PR panel share one periodically refreshed snapshot. Add conflict and reviewer-state grouping plus a responsive two-column dashboard.\n\n* Fix stale GitHub integration comments\n\n* Address GitHub dashboard review feedback",
+          "timestamp": "2026-07-20T00:21:52-04:00",
+          "tree_id": "c882e784d31d860599c593a1dfa2148053608717",
+          "url": "https://github.com/jimsimon/trouve/commit/a14b4ae52fa83ab64acde43cc620545204afacbb"
+        },
+        "date": 1784521459746,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "cold index + query",
+            "value": 131.11923226,
+            "range": "± 6.1",
+            "unit": "ms"
+          },
+          {
+            "name": "warm query",
+            "value": 72.75893172,
+            "range": "± 2",
+            "unit": "ms"
+          },
+          {
+            "name": "incremental (1 file modified)",
+            "value": 82.33285902000001,
+            "range": "± 0.6",
+            "unit": "ms"
+          },
+          {
+            "name": "non-git warm query",
+            "value": 72.65528574,
+            "range": "± 2.6",
             "unit": "ms"
           }
         ]
