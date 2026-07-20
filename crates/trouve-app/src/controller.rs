@@ -444,8 +444,11 @@ pub enum UiCommand {
     RefreshSessionMcp,
     /// Internal: the session MCP fetch finished.
     SessionMcpLoaded(String, Result<Vec<trouve_protocol::McpServerInfo>, String>),
-    /// Internal: the subscription health fetch finished.
-    SubscriptionsLoaded(Vec<trouve_protocol::SubscriptionHealth>),
+    /// Internal: a versioned subscription health fetch finished.
+    SubscriptionsLoaded {
+        generation: u64,
+        result: Result<Vec<trouve_protocol::SubscriptionHealth>, String>,
+    },
 
     // Terminal tab.
     /// A key press in the terminal grid (text + modifiers, Slint encoding).
@@ -534,6 +537,41 @@ fn thread_attention(vm: &ThreadViewModel) -> AttentionCounts {
     AttentionCounts {
         approvals: vm.pending_approvals.len(),
         questions: vm.pending_questions.len(),
+    }
+}
+
+const SUBSCRIPTION_REFRESH_TTL: std::time::Duration = std::time::Duration::from_secs(30);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SubscriptionRefresh {
+    IfStale,
+    Force,
+}
+
+#[derive(Debug, Default)]
+struct SubscriptionRefreshState {
+    last_started_at: Option<std::time::Instant>,
+    generation: u64,
+}
+
+impl SubscriptionRefreshState {
+    /// Start a refresh when forced or stale, returning the generation that
+    /// must accompany its response. Starting one invalidates every older
+    /// in-flight response without requiring the HTTP task to be cancelled.
+    fn begin(&mut self, now: std::time::Instant, freshness: SubscriptionRefresh) -> Option<u64> {
+        let fresh = self
+            .last_started_at
+            .is_some_and(|at| now.saturating_duration_since(at) < SUBSCRIPTION_REFRESH_TTL);
+        if freshness == SubscriptionRefresh::IfStale && fresh {
+            return None;
+        }
+        self.last_started_at = Some(now);
+        self.generation = self.generation.wrapping_add(1);
+        Some(self.generation)
+    }
+
+    fn is_current(&self, generation: u64) -> bool {
+        generation == self.generation
     }
 }
 
@@ -706,9 +744,9 @@ struct Controller {
     /// this cache and the current model catalog, so catalog refreshes cannot
     /// leave the two lists misaligned.
     subscription_health: Vec<trouve_protocol::SubscriptionHealth>,
-    /// Last completed-turn refresh. Background threads can finish in bursts,
-    /// so their provider-side subscription fetches share one short throttle.
-    subscription_refresh_at: Option<std::time::Instant>,
+    /// Shared freshness and response-generation gate for every subscription
+    /// refresh trigger.
+    subscription_refresh: SubscriptionRefreshState,
     /// Thinking dropdown state for the current thread's model: the schema
     /// property the values belong to and the raw value tokens (parallel to
     /// the displayed labels).
@@ -870,7 +908,7 @@ pub async fn run(
         models: Vec::new(),
         default_thinking_level: None,
         subscription_health: Vec::new(),
-        subscription_refresh_at: None,
+        subscription_refresh: SubscriptionRefreshState::default(),
         thinking_key: None,
         thinking_values: Vec::new(),
         context_values: Vec::new(),
@@ -1064,7 +1102,7 @@ impl Controller {
             self.offline = !info.online;
         }
         self.reload_catalogs().await;
-        self.refresh_subscriptions();
+        self.refresh_subscriptions(SubscriptionRefresh::IfStale);
 
         if let Ok(gh) = self.client.github_integration().await {
             self.apply_github_integration(gh);
@@ -1301,7 +1339,7 @@ impl Controller {
             self.offline = !info.online;
         }
         self.reload_catalogs().await; // re-pushes the connectivity banner
-        self.refresh_subscriptions();
+        self.refresh_subscriptions(SubscriptionRefresh::Force);
         let _ = self.reload_sessions().await;
         self.show_connectivity_notice(notice);
     }
@@ -3013,34 +3051,29 @@ impl Controller {
 
     /// Fetch subscription health in the background (the Codex query may
     /// spawn its app-server, which takes a moment).
-    fn refresh_subscriptions(&self) {
+    fn refresh_subscriptions(&mut self, freshness: SubscriptionRefresh) {
+        let Some(generation) = self
+            .subscription_refresh
+            .begin(std::time::Instant::now(), freshness)
+        else {
+            return;
+        };
         let client = self.client.clone();
         let tx = self.tx.clone();
-        let ui = self.ui.clone();
         ui::set_subscriptions(&self.ui, Vec::new(), "checking subscription usage…".into());
         tokio::spawn(async move {
-            match client.subscription_health().await {
-                Ok(subs) => {
-                    let _ = tx.send(UiCommand::SubscriptionsLoaded(subs));
-                }
-                Err(e) => ui::set_subscriptions(
-                    &ui,
-                    Vec::new(),
-                    format!("failed to load subscription usage: {e:#}"),
-                ),
-            }
+            let result = client
+                .subscription_health()
+                .await
+                .map_err(|e| format!("{e:#}"));
+            let _ = tx.send(UiCommand::SubscriptionsLoaded { generation, result });
         });
     }
 
     /// Refresh after a completed turn unless another followed thread already
     /// triggered the same provider-side work within the throttle window.
     fn refresh_subscriptions_after_turn(&mut self) {
-        let now = std::time::Instant::now();
-        if !subscription_refresh_due(self.subscription_refresh_at, now) {
-            return;
-        }
-        self.subscription_refresh_at = Some(now);
-        self.refresh_subscriptions();
+        self.refresh_subscriptions(SubscriptionRefresh::IfStale);
     }
 
     /// Reload the MCP server list in the background: a quick unprobed list
@@ -4159,7 +4192,7 @@ impl Controller {
             UiCommand::OpenSettings => {
                 self.refresh_settings().await;
                 self.refresh_mcp();
-                self.refresh_subscriptions();
+                self.refresh_subscriptions(SubscriptionRefresh::IfStale);
                 ui::set_center_screen(&self.ui, 3);
             }
             UiCommand::CloseSettings => {
@@ -4930,7 +4963,7 @@ impl Controller {
                 ui::set_settings_section(&self.ui, 3);
                 self.refresh_settings().await;
                 self.refresh_mcp();
-                self.refresh_subscriptions();
+                self.refresh_subscriptions(SubscriptionRefresh::IfStale);
                 ui::set_center_screen(&self.ui, 3);
             }
             UiCommand::RefreshMcp => self.refresh_mcp(),
@@ -5050,25 +5083,38 @@ impl Controller {
                 Ok(logs) => ui::set_mcp_logs(&self.ui, name, logs.lines.join("\n")),
                 Err(e) => self.error(&format!("loading MCP logs: {e:#}")),
             },
-            UiCommand::SubscriptionsLoaded(subs) => {
-                let items = subs
-                    .iter()
-                    .map(|s| ui::SubscriptionView {
-                        provider: s.provider_id.clone(),
-                        status: s.status.clone(),
-                        plan: s.plan.clone(),
-                        credits: s.credits.clone(),
-                        note: s.note.clone(),
-                        windows: s
-                            .windows
-                            .iter()
-                            .map(|w| (w.label.clone(), w.used_percent, w.resets.clone()))
-                            .collect(),
-                    })
-                    .collect();
-                self.subscription_health = subs;
-                ui::set_subscriptions(&self.ui, items, String::new());
-                self.push_model_health();
+            UiCommand::SubscriptionsLoaded { generation, result } => {
+                if self.subscription_refresh.is_current(generation) {
+                    match result {
+                        Ok(subs) => {
+                            let items = subs
+                                .iter()
+                                .map(|s| ui::SubscriptionView {
+                                    provider: s.provider_id.clone(),
+                                    status: s.status.clone(),
+                                    plan: s.plan.clone(),
+                                    credits: s.credits.clone(),
+                                    note: s.note.clone(),
+                                    windows: s
+                                        .windows
+                                        .iter()
+                                        .map(|w| {
+                                            (w.label.clone(), w.used_percent, w.resets.clone())
+                                        })
+                                        .collect(),
+                                })
+                                .collect();
+                            self.subscription_health = subs;
+                            ui::set_subscriptions(&self.ui, items, String::new());
+                            self.push_model_health();
+                        }
+                        Err(error) => ui::set_subscriptions(
+                            &self.ui,
+                            Vec::new(),
+                            format!("failed to load subscription usage: {error}"),
+                        ),
+                    }
+                }
             }
             UiCommand::AddGithubHost(host, client_id) => {
                 match self.client.add_github_host(&host, &client_id).await {
@@ -5099,7 +5145,7 @@ impl Controller {
                 // unlock backend models, so refresh the pickers too.
                 self.reload_catalogs().await;
                 self.refresh_settings().await;
-                self.refresh_subscriptions();
+                self.refresh_subscriptions(SubscriptionRefresh::Force);
             }
             UiCommand::SaveProvider {
                 id,
@@ -5134,6 +5180,7 @@ impl Controller {
                         );
                         self.reload_catalogs().await;
                         self.refresh_settings().await;
+                        self.refresh_subscriptions(SubscriptionRefresh::Force);
                     }
                     Err(e) => {
                         ui::set_settings_status(&self.ui, format!("{e:#}"));
@@ -5145,6 +5192,7 @@ impl Controller {
                     ui::set_settings_status(&self.ui, format!("removed {id}"));
                     self.reload_catalogs().await;
                     self.refresh_settings().await;
+                    self.refresh_subscriptions(SubscriptionRefresh::Force);
                 }
                 Err(e) => {
                     ui::set_settings_status(&self.ui, format!("{e:#}"));
@@ -6381,13 +6429,6 @@ fn human_count(n: u64) -> String {
     }
 }
 
-/// Provider subscription probes can spawn vendor processes, so coalesce
-/// completions from concurrently followed threads into one refresh.
-fn subscription_refresh_due(last: Option<std::time::Instant>, now: std::time::Instant) -> bool {
-    const TTL: std::time::Duration = std::time::Duration::from_secs(30);
-    last.is_none_or(|at| now.saturating_duration_since(at) >= TTL)
-}
-
 /// Compact and expanded presentations of one provider's subscription state.
 /// The compact row deliberately uses only the highest reported percentage:
 /// it is the window closest to its cap, not a promise that requests below
@@ -6867,10 +6908,10 @@ fn should_open_chat_at_tail(force_tail: bool, turn_running: bool, has_queue: boo
 #[cfg(test)]
 mod tests {
     use super::{
-        approval_pill, attention_badge, check_pill, classify_pr, download_progress, human_age,
-        human_rate, merge_pill, model_health_view, pr_badge, project_session_prs,
-        reconcile_pr_group_order, reconcile_workspace_order, reorder_id,
-        should_open_chat_at_tail, subscription_refresh_due, thinking_property,
+        SubscriptionRefresh, SubscriptionRefreshState, approval_pill, attention_badge, check_pill,
+        classify_pr, download_progress, human_age, human_rate, merge_pill, model_health_view,
+        pr_badge, project_session_prs, reconcile_pr_group_order, reconcile_workspace_order,
+        reorder_id, should_open_chat_at_tail, thinking_property,
     };
     use chrono::{Duration, TimeZone, Utc};
     use trouve_protocol::{
@@ -7321,16 +7362,42 @@ mod tests {
     }
 
     #[test]
-    fn completed_turn_subscription_refresh_reopens_after_throttle() {
+    fn subscription_refreshes_share_freshness_and_invalidate_old_responses() {
         let now = std::time::Instant::now();
-        assert!(subscription_refresh_due(None, now));
-        assert!(!subscription_refresh_due(
-            Some(now - std::time::Duration::from_secs(29)),
-            now
-        ));
-        assert!(subscription_refresh_due(
-            Some(now - std::time::Duration::from_secs(30)),
-            now
-        ));
+        let mut state = SubscriptionRefreshState::default();
+
+        let first = state.begin(now, SubscriptionRefresh::IfStale).unwrap();
+        assert!(state.is_current(first));
+        assert_eq!(
+            state.begin(
+                now + std::time::Duration::from_secs(29),
+                SubscriptionRefresh::IfStale
+            ),
+            None
+        );
+
+        let forced = state
+            .begin(
+                now + std::time::Duration::from_secs(29),
+                SubscriptionRefresh::Force,
+            )
+            .unwrap();
+        assert!(!state.is_current(first));
+        assert!(state.is_current(forced));
+        assert_eq!(
+            state.begin(
+                now + std::time::Duration::from_secs(58),
+                SubscriptionRefresh::IfStale
+            ),
+            None
+        );
+        assert!(
+            state
+                .begin(
+                    now + std::time::Duration::from_secs(59),
+                    SubscriptionRefresh::IfStale
+                )
+                .is_some()
+        );
     }
 }

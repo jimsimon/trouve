@@ -4202,7 +4202,16 @@ export component AppWindow inherits Window {
                     }
                     }
 
-                    HorizontalLayout {
+                    // Model-specific knobs can exceed the center column at
+                    // the minimum window width. Keep every control reachable
+                    // in one compact row with an as-needed horizontal bar.
+                    composer-controls-scroll := ScrollView {
+                    vertical-stretch: 0;
+                    vertical-scrollbar-policy: ScrollBarPolicy.always-off;
+                    horizontal-scrollbar-policy: ScrollBarPolicy.as-needed;
+                    height: composer-controls.preferred-height
+                        + (composer-controls.preferred-width > self.width ? 14px : 0px);
+                    composer-controls := HorizontalLayout {
                     spacing: 8px;
                     vertical-stretch: 0;
                     VerticalLayout {
@@ -4393,6 +4402,7 @@ export component AppWindow inherits Window {
                         vertical-alignment: center;
                         max-width: 190px;
                         overflow: elide;
+                    }
                     }
                     }
                 }
