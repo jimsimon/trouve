@@ -271,6 +271,21 @@ struct AppendRequest {
 /// the earliest waiter in a batch can be held behind later arrivals.
 const APPEND_BATCH_MAX: usize = 256;
 
+/// Event types intentionally removed by a protocol major-version bump. Their
+/// persisted rows remain in the append-only log, but they no longer have a
+/// meaningful representation in the current protocol.
+const RETIRED_EVENT_TYPES: &[&str] = &["workspace.pull_requests_updated"];
+
+fn is_retired_event(payload: &str) -> bool {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(payload) else {
+        return false;
+    };
+    value
+        .get("type")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|event_type| RETIRED_EVENT_TYPES.contains(&event_type))
+}
+
 fn scope_cols(scope: &Scope) -> (&'static str, String) {
     match scope {
         Scope::Server => ("server", String::new()),
@@ -460,6 +475,7 @@ impl Store {
             // permanently unloadable.
             let event = match serde_json::from_str(&payload) {
                 Ok(e) => e,
+                Err(_) if is_retired_event(&payload) => continue,
                 Err(e) => {
                     tracing::warn!("skipping undeserializable event {cursor}: {e}");
                     continue;
@@ -1578,6 +1594,42 @@ mod tests {
 
         let tail = store.events_after(&scope, all[0].cursor).unwrap();
         assert_eq!(tail.len(), 2);
+    }
+
+    #[test]
+    fn replay_silently_skips_retired_events() {
+        let store = Store::open_in_memory().unwrap();
+        let retired_payload = serde_json::json!({
+            "type": "workspace.pull_requests_updated",
+            "workspace_id": "ws_1",
+            "pull_requests": { "viewer": "octocat", "prs": [] },
+        })
+        .to_string();
+        store
+            .conn
+            .lock()
+            .unwrap()
+            .execute(
+                "INSERT INTO events (scope_kind, scope_id, ts, payload) VALUES ('server', '', ?1, ?2)",
+                params![chrono::Utc::now().to_rfc3339(), retired_payload],
+            )
+            .unwrap();
+        store
+            .append_event(
+                Scope::Server,
+                Event::WorkspaceRegistered {
+                    workspace_id: "ws_1".into(),
+                    path: "/tmp/workspace".into(),
+                },
+            )
+            .unwrap();
+
+        let replayed = store.events_after(&Scope::Server, 0).unwrap();
+        assert_eq!(replayed.len(), 1);
+        assert!(matches!(
+            replayed[0].event,
+            Event::WorkspaceRegistered { .. }
+        ));
     }
 
     #[test]
