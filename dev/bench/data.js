@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1784572617807,
+  "lastUpdate": 1784572651109,
   "repoUrl": "https://github.com/jimsimon/trouve",
   "entries": {
     "e2e-benchmarks": [
@@ -7633,6 +7633,54 @@ window.BENCHMARK_DATA = {
             "name": "dense_query_20k_rows",
             "value": 1384565.8092105263,
             "range": "± 7695",
+            "unit": "ns"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "jim.j.simon@gmail.com",
+            "name": "Jim Simon",
+            "username": "jimsimon"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "870fb619685c05269140292c28f60ae668e44c57",
+          "message": "Batch GitHub pull request reads with GraphQL (#119)\n\n* Batch GitHub pull request reads with GraphQL\n\nReplace the dashboard REST fan-out and branch lookups with GraphQL queries so the one-minute refresh stays within GitHub rate limits. Preserve structured server errors for empty client responses so refresh failures remain actionable.\n\n* Address GitHub refresh review findings",
+          "timestamp": "2026-07-20T14:35:17-04:00",
+          "tree_id": "2a487e2a9a9e98da142afa2189df5a5e00e6d84e",
+          "url": "https://github.com/jimsimon/trouve/commit/870fb619685c05269140292c28f60ae668e44c57"
+        },
+        "date": 1784572649996,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "bm25_build_5k_docs",
+            "value": 3851280.25,
+            "range": "± 6561",
+            "unit": "ns"
+          },
+          {
+            "name": "bm25_query_5k_docs",
+            "value": 28059.053362573097,
+            "range": "± 45",
+            "unit": "ns"
+          },
+          {
+            "name": "chunk_python_200_functions",
+            "value": 2167202.9347826084,
+            "range": "± 650",
+            "unit": "ns"
+          },
+          {
+            "name": "dense_query_20k_rows",
+            "value": 1280653.232388664,
+            "range": "± 2332",
             "unit": "ns"
           }
         ]
