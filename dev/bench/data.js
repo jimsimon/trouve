@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1784514681540,
+  "lastUpdate": 1784514775266,
   "repoUrl": "https://github.com/jimsimon/trouve",
   "entries": {
     "e2e-benchmarks": [
@@ -3023,6 +3023,54 @@ window.BENCHMARK_DATA = {
             "name": "non-git warm query",
             "value": 56.86978294,
             "range": "± 0.8",
+            "unit": "ms"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "jim.j.simon@gmail.com",
+            "name": "Jim Simon",
+            "username": "jimsimon"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "f47613187ba03eb2bcc42afc98ceda1a534eafcc",
+          "message": "Preserve queued prompt editor during chat updates (#100)",
+          "timestamp": "2026-07-19T22:30:20-04:00",
+          "tree_id": "1296cd121d2eedd1066500deafd37284c132a064",
+          "url": "https://github.com/jimsimon/trouve/commit/f47613187ba03eb2bcc42afc98ceda1a534eafcc"
+        },
+        "date": 1784514774275,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "cold index + query",
+            "value": 132.67768952,
+            "range": "± 6.5",
+            "unit": "ms"
+          },
+          {
+            "name": "warm query",
+            "value": 67.80599436000001,
+            "range": "± 1.5",
+            "unit": "ms"
+          },
+          {
+            "name": "incremental (1 file modified)",
+            "value": 79.11511526,
+            "range": "± 1.8",
+            "unit": "ms"
+          },
+          {
+            "name": "non-git warm query",
+            "value": 66.67291572,
+            "range": "± 2.4",
             "unit": "ms"
           }
         ]
