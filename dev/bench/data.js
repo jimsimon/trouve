@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1784529522858,
+  "lastUpdate": 1784529571294,
   "repoUrl": "https://github.com/jimsimon/trouve",
   "entries": {
     "e2e-benchmarks": [
@@ -6769,6 +6769,54 @@ window.BENCHMARK_DATA = {
             "name": "dense_query_20k_rows",
             "value": 1404022.5754385965,
             "range": "± 7248",
+            "unit": "ns"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "jim.j.simon@gmail.com",
+            "name": "Jim Simon",
+            "username": "jimsimon"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "f54ff1648be4a8cec0881ec92a8302631f2f0a30",
+          "message": "Defer chat tail pinning to avoid Slint instantiation chain (#77)\n\n* Defer Slint chat tail pinning\n\n* Share chat tail position calculation",
+          "timestamp": "2026-07-20T02:37:25-04:00",
+          "tree_id": "e42d57f1862ab299fadc0f539eb1fc8ca26e72cc",
+          "url": "https://github.com/jimsimon/trouve/commit/f54ff1648be4a8cec0881ec92a8302631f2f0a30"
+        },
+        "date": 1784529570863,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "bm25_build_5k_docs",
+            "value": 4988349,
+            "range": "± 7454",
+            "unit": "ns"
+          },
+          {
+            "name": "bm25_query_5k_docs",
+            "value": 37048.01104013648,
+            "range": "± 11",
+            "unit": "ns"
+          },
+          {
+            "name": "chunk_python_200_functions",
+            "value": 3094028.205882353,
+            "range": "± 3804",
+            "unit": "ns"
+          },
+          {
+            "name": "dense_query_20k_rows",
+            "value": 1379764.7454545456,
+            "range": "± 10441",
             "unit": "ns"
           }
         ]
