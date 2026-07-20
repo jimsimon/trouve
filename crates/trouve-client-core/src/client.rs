@@ -164,8 +164,8 @@ impl ProtocolClient {
         self.get_json("/workspaces").await
     }
 
-    /// Ask the server to refresh one workspace's PR dashboard. The resulting
-    /// snapshot arrives on the persisted server event stream.
+    /// Refresh account-relevant PR snapshots for every configured GitHub
+    /// host. Results arrive on the persisted server event stream.
     pub async fn refresh_github_prs(&self) -> Result<()> {
         self.post_empty("/github/prs/refresh").await
     }
@@ -751,9 +751,7 @@ impl ProtocolClient {
         self.get_json("/integrations/github").await
     }
 
-    /// Store a GitHub token server-side (empty host = github.com); an
-    /// empty token disconnects the host.
-    /// Register a self-hosted GitHub Enterprise instance.
+    /// Register a self-hosted GitHub Enterprise instance for OAuth sign-in.
     pub async fn add_github_host(&self, host: &str, client_id: &str) -> Result<GithubIntegration> {
         self.post_json(
             "/integrations/github/hosts",

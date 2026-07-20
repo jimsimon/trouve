@@ -3005,6 +3005,18 @@ impl Engine {
     pub async fn refresh_github_prs(&self) -> Result<(), EngineError> {
         let merged_since = chrono::Utc::now() - chrono::Duration::hours(24);
         let workspaces = self.store.list_workspaces()?;
+        let workspace_repositories = tokio::task::spawn_blocking(move || {
+            workspaces
+                .into_iter()
+                .filter_map(|workspace| {
+                    let remote = git::remote_url(Path::new(&workspace.path), "origin")?;
+                    let (host, owner, repo) = crate::github::parse_remote(&remote)?;
+                    Some((host, format!("{owner}/{repo}"), workspace.id))
+                })
+                .collect::<Vec<_>>()
+        })
+        .await
+        .map_err(|error| EngineError::Internal(anyhow!(error)))?;
         let mut failures = Vec::new();
         for (host, _) in self.github_hosts() {
             let Some(token) = self.github_token(&host) else {
@@ -3020,13 +3032,11 @@ impl Engine {
                 }
             };
             for pr in &mut prs {
-                pr.workspace_id = workspaces
+                pr.workspace_id = workspace_repositories
                     .iter()
-                    .find_map(|ws| {
-                        let remote = git::remote_url(Path::new(&ws.path), "origin")?;
-                        let (remote_host, owner, repo) = crate::github::parse_remote(&remote)?;
-                        (remote_host == pr.host && format!("{owner}/{repo}") == pr.repository)
-                            .then(|| ws.id.clone())
+                    .find_map(|(host, repository, workspace_id)| {
+                        (host == &pr.host && repository == &pr.repository)
+                            .then(|| workspace_id.clone())
                     })
                     .unwrap_or_default();
             }

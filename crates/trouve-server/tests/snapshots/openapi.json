@@ -4542,7 +4542,7 @@
       },
       "GithubPrList": {
         "type": "object",
-        "description": "Every dashboard-relevant PR of a workspace's origin repo: all open PRs\nplus those merged in the last day.",
+        "description": "Pull requests relevant to the authenticated account on one GitHub host,\nspanning every repository visible to that account. Includes open PRs the\naccount authored, was asked to review, or participated in, plus recently\nmerged relevant PRs.",
         "required": [
           "host",
           "prs"

@@ -440,8 +440,10 @@ pub struct PrInfo {
     pub merged_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
-/// Every dashboard-relevant PR of a workspace's origin repo: all open PRs
-/// plus those merged in the last day.
+/// Pull requests relevant to the authenticated account on one GitHub host,
+/// spanning every repository visible to that account. Includes open PRs the
+/// account authored, was asked to review, or participated in, plus recently
+/// merged relevant PRs.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct GithubPrList {
     /// Login of the authenticated GitHub user ("" when unknown) — clients

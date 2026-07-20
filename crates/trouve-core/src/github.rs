@@ -168,13 +168,24 @@ impl GitHubAccount {
                 let host = host.clone();
                 async move {
                     let raw = client.pulls(&owner, &repo).get(number).await?;
+                    let issue_comments = raw.comments.unwrap_or(0);
+                    let review_comments = raw.review_comments.unwrap_or(0);
+                    let mergeable = raw.mergeable;
                     let github = GitHub {
                         client,
                         owner,
                         repo,
                     };
                     let mut info = github.enrich(raw).await?;
-                    github.attach_comment_info(number, &mut info).await;
+                    github
+                        .attach_comment_info(
+                            number,
+                            issue_comments,
+                            review_comments,
+                            mergeable,
+                            &mut info,
+                        )
+                        .await;
                     info.host = host;
                     Ok::<_, anyhow::Error>(info)
                 }
@@ -344,8 +355,27 @@ impl GitHub {
         futures::stream::iter(open.into_iter().chain(recently_merged))
             .map(|pr| async move {
                 let number = pr.number;
-                let mut info = self.enrich(pr).await?;
-                self.attach_comment_info(number, &mut info).await;
+                // List responses omit comment counts and mergeability. Fetch
+                // the full PR once, then reuse those fields throughout
+                // enrichment instead of fetching it again afterward.
+                let raw = self
+                    .client
+                    .pulls(&self.owner, &self.repo)
+                    .get(number)
+                    .await
+                    .unwrap_or(pr);
+                let issue_comments = raw.comments.unwrap_or(0);
+                let review_comments = raw.review_comments.unwrap_or(0);
+                let mergeable = raw.mergeable;
+                let mut info = self.enrich(raw).await?;
+                self.attach_comment_info(
+                    number,
+                    issue_comments,
+                    review_comments,
+                    mergeable,
+                    &mut info,
+                )
+                .await;
                 Ok::<_, anyhow::Error>(info)
             })
             .buffer_unordered(DASHBOARD_ENRICH_CONCURRENCY)
@@ -353,18 +383,18 @@ impl GitHub {
             .await
     }
 
-    /// Fill `comments`, `last_comment_at` (issue + review comments), and
-    /// `mergeable`. Best-effort: these endpoints failing must not hide
-    /// the PR.
-    async fn attach_comment_info(&self, number: u64, info: &mut PrInfo) {
-        // The list endpoint omits comment counts and mergeability; only
-        // the single-PR GET reports them.
-        let Ok(pr) = self.client.pulls(&self.owner, &self.repo).get(number).await else {
-            return;
-        };
-        info.mergeable = pr.mergeable;
-        let issue_comments = pr.comments.unwrap_or(0);
-        let review_comments = pr.review_comments.unwrap_or(0);
+    /// Fill comment totals, mergeability, and the newest comment timestamp
+    /// from fields already obtained with the full PR. The two comment-list
+    /// calls are best-effort and only needed to discover timestamps.
+    async fn attach_comment_info(
+        &self,
+        number: u64,
+        issue_comments: u64,
+        review_comments: u64,
+        mergeable: Option<bool>,
+        info: &mut PrInfo,
+    ) {
+        info.mergeable = mergeable;
         info.comments = issue_comments + review_comments;
 
         let mut last: Option<DateTime<Utc>> = None;

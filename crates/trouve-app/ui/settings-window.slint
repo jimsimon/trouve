@@ -2085,7 +2085,7 @@ export component SettingsScreen inherits Rectangle {
                             }
 
                             Text {
-                                text: "Powers the Pull Requests tab and PR creation. Sign in below, or paste a personal access token; token environment variables and gh CLI logins are picked up automatically. Each host authenticates on its own.";
+                                text: "Powers the Pull Requests tab and PR creation. Sign in to each GitHub host separately with OAuth. GitHub Enterprise hosts require a device-flow-enabled OAuth app client ID.";
                                 color: Theme.c.text-soft;
                                 font-size: Theme.fs(11px);
                                 wrap: word-wrap;
