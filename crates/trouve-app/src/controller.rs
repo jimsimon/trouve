@@ -1010,11 +1010,7 @@ impl Controller {
         }
 
         self.reload_sessions().await?;
-        if self.home_workspace_id.is_empty()
-            && let Some(ws) = self.workspaces.first()
-        {
-            self.home_workspace_id = ws.id.clone();
-        }
+        self.sync_home_workspace();
 
         // Seed connectivity before the first catalog load: when the server
         // started offline, the model list is already filtered and the
@@ -1348,6 +1344,24 @@ impl Controller {
         }
         self.refresh_nav_prs(false);
         Ok(())
+    }
+
+    /// Keep the preferred workspace valid after the server's visible
+    /// workspace set changes. Preserve it when still open; otherwise fall
+    /// back to the first open workspace (or none).
+    fn sync_home_workspace(&mut self) {
+        if self
+            .workspaces
+            .iter()
+            .any(|workspace| workspace.id == self.home_workspace_id)
+        {
+            return;
+        }
+        self.home_workspace_id = self
+            .workspaces
+            .first()
+            .map(|workspace| workspace.id.clone())
+            .unwrap_or_default();
     }
 
     /// Build the session-specific part of one nav row.
@@ -3732,7 +3746,9 @@ impl Controller {
             // Workspace lifecycle is server-scoped so another app instance
             // can keep its sidebar in sync with opens and closes here.
             Event::WorkspaceRegistered { .. } | Event::WorkspaceClosed { .. } => {
-                let _ = self.reload_sessions().await;
+                if self.reload_sessions().await.is_ok() {
+                    self.sync_home_workspace();
+                }
             }
             // A session started or finished processing prompts: light up or
             // dim its sidebar indicator.
@@ -3976,9 +3992,6 @@ impl Controller {
                     self.collapsed_workspaces.remove(&id);
                     self.show_archived.remove(&id);
                     self.archived_expanded.remove(&id);
-                    if self.home_workspace_id == id {
-                        self.home_workspace_id.clear();
-                    }
                     if closes_current {
                         self.current_session = None;
                         self.threads.clear();
@@ -3987,13 +4000,12 @@ impl Controller {
                         crate::winstate::save_resume(&self.resume);
                         self.push_threads();
                         self.render_chat(true);
+                        self.push_context();
+                        self.push_queue();
+                        self.push_todos();
                     }
                     self.reload_sessions().await?;
-                    if self.home_workspace_id.is_empty()
-                        && let Some(ws) = self.workspaces.first()
-                    {
-                        self.home_workspace_id = ws.id.clone();
-                    }
+                    self.sync_home_workspace();
                 }
             }
             UiCommand::SessionDelete { row } => {

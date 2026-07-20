@@ -167,6 +167,19 @@ async fn workspace_close_hides_and_reregister_reopens() {
         .unwrap();
     assert!(listed.is_empty());
 
+    // Closing is non-destructive, but a hidden workspace cannot accept new
+    // activity until its path is registered again.
+    let response = client
+        .post(format!("{base}/sessions"))
+        .json(&serde_json::json!({
+            "workspace_id": workspace_id,
+            "title": "Must not start"
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), reqwest::StatusCode::NOT_FOUND);
+
     let reopened: serde_json::Value = client
         .post(format!("{base}/workspaces"))
         .json(&request)

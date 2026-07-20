@@ -424,6 +424,24 @@ impl Store {
         .map_err(Into::into)
     }
 
+    /// A workspace only while it is open and available for new activity.
+    pub fn open_workspace(&self, id: &str) -> Result<Option<Workspace>> {
+        let conn = self.conn.lock().unwrap();
+        conn.query_row(
+            "SELECT id, name, path FROM workspaces WHERE id = ?1 AND closed = 0",
+            params![id],
+            |r| {
+                Ok(Workspace {
+                    id: r.get(0)?,
+                    name: r.get(1)?,
+                    path: r.get(2)?,
+                })
+            },
+        )
+        .optional()
+        .map_err(Into::into)
+    }
+
     pub fn workspace_by_path(&self, path: &str) -> Result<Option<Workspace>> {
         let conn = self.conn.lock().unwrap();
         conn.query_row(
@@ -2038,12 +2056,14 @@ mod tests {
 
         assert!(store.set_workspace_closed(&workspace.id, true).unwrap());
         assert!(store.list_workspaces().unwrap().is_empty());
+        assert!(store.open_workspace(&workspace.id).unwrap().is_none());
         assert_eq!(
             store.workspace(&workspace.id).unwrap().unwrap().path,
             workspace.path
         );
 
         assert!(store.set_workspace_closed(&workspace.id, false).unwrap());
+        assert!(store.open_workspace(&workspace.id).unwrap().is_some());
         let reopened = store.list_workspaces().unwrap();
         assert_eq!(reopened.len(), 1);
         assert_eq!(reopened[0].id, workspace.id);
