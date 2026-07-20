@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1784521530537,
+  "lastUpdate": 1784521621876,
   "repoUrl": "https://github.com/jimsimon/trouve",
   "entries": {
     "e2e-benchmarks": [
@@ -3119,6 +3119,54 @@ window.BENCHMARK_DATA = {
             "name": "non-git warm query",
             "value": 72.65528574,
             "range": "± 2.6",
+            "unit": "ms"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "jim.j.simon@gmail.com",
+            "name": "Jim Simon",
+            "username": "jimsimon"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "237a51c67cbeb09e055d5065e69b70d63054c831",
+          "message": "Unify workspace session status indicators (#101)\n\n* Unify session status indicators\n\n* Show failed turns in session status",
+          "timestamp": "2026-07-20T00:22:36-04:00",
+          "tree_id": "c500463fa4c46554fcaff11e9e0acd6b101cd278",
+          "url": "https://github.com/jimsimon/trouve/commit/237a51c67cbeb09e055d5065e69b70d63054c831"
+        },
+        "date": 1784521621470,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "cold index + query",
+            "value": 138.59658310000003,
+            "range": "± 7.3",
+            "unit": "ms"
+          },
+          {
+            "name": "warm query",
+            "value": 74.66403284,
+            "range": "± 3.9",
+            "unit": "ms"
+          },
+          {
+            "name": "incremental (1 file modified)",
+            "value": 79.99041326,
+            "range": "± 0.8",
+            "unit": "ms"
+          },
+          {
+            "name": "non-git warm query",
+            "value": 69.88885272,
+            "range": "± 2.7",
             "unit": "ms"
           }
         ]
