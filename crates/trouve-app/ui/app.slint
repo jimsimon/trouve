@@ -1514,8 +1514,12 @@ export component AppWindow inherits Window {
     in property <bool> composer-enabled: false;
     in property <bool> composer-turn-running: false;
     // Draft survives the composer being swapped out for the new-thread form.
-    // in-out: Rust splices "@path " mentions into it when one is picked.
+    // Rust owns drafts per thread; this stable key ensures an edit queued
+    // around a thread/session switch is stored against the thread whose
+    // composer was actually edited. in-out lets Rust splice "@path " mentions.
+    in property <string> composer-thread-key;
     in-out property <string> composer-draft;
+    callback composer-draft-changed(/* thread id */ string, /* draft */ string);
     // Files staged for the next prompt (screenshots, logs, …).
     in property <[AttachmentChip]> composer-attachments: [];
     callback attach-file();
@@ -1540,6 +1544,7 @@ export component AppWindow inherits Window {
     changed composer-draft => {
         root.slash-suppressed = false;
         root.at-suppressed = false;
+        root.composer-draft-changed(root.composer-thread-key, root.composer-draft);
         root.slash-filter-changed(root.composer-draft);
         root.at-filter-changed(root.composer-draft, root.composer-cursor);
     }

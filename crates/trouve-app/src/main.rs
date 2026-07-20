@@ -542,6 +542,15 @@ fn main() -> anyhow::Result<()> {
     }
     {
         let tx = tx.clone();
+        window.on_composer_draft_changed(move |thread_id, text| {
+            let _ = tx.send(UiCommand::ComposerDraftChanged {
+                thread_id: thread_id.to_string(),
+                text: text.to_string(),
+            });
+        });
+    }
+    {
+        let tx = tx.clone();
         window.on_send_message(move |text| {
             let _ = tx.send(UiCommand::SendMessage(text.to_string()));
         });
