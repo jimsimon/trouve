@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1784514775266,
+  "lastUpdate": 1784514815966,
   "repoUrl": "https://github.com/jimsimon/trouve",
   "entries": {
     "e2e-benchmarks": [
@@ -6097,6 +6097,54 @@ window.BENCHMARK_DATA = {
             "name": "dense_query_20k_rows",
             "value": 1375303.612121212,
             "range": "± 8906",
+            "unit": "ns"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "jim.j.simon@gmail.com",
+            "name": "Jim Simon",
+            "username": "jimsimon"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "f47613187ba03eb2bcc42afc98ceda1a534eafcc",
+          "message": "Preserve queued prompt editor during chat updates (#100)",
+          "timestamp": "2026-07-19T22:30:20-04:00",
+          "tree_id": "1296cd121d2eedd1066500deafd37284c132a064",
+          "url": "https://github.com/jimsimon/trouve/commit/f47613187ba03eb2bcc42afc98ceda1a534eafcc"
+        },
+        "date": 1784514815592,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "bm25_build_5k_docs",
+            "value": 5022303.85,
+            "range": "± 6909",
+            "unit": "ns"
+          },
+          {
+            "name": "bm25_query_5k_docs",
+            "value": 36656.01749895164,
+            "range": "± 13",
+            "unit": "ns"
+          },
+          {
+            "name": "chunk_python_200_functions",
+            "value": 3015335.0882352944,
+            "range": "± 1004",
+            "unit": "ns"
+          },
+          {
+            "name": "dense_query_20k_rows",
+            "value": 1371651.3859180035,
+            "range": "± 6567",
             "unit": "ns"
           }
         ]
