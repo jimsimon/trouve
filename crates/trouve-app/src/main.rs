@@ -790,6 +790,12 @@ fn main() -> anyhow::Result<()> {
     }
     {
         let tx = tx.clone();
+        window.on_cancel_quit_when_idle(move || {
+            let _ = tx.send(UiCommand::CancelQuitWhenIdle);
+        });
+    }
+    {
+        let tx = tx.clone();
         window.on_undo_turn(move || {
             let _ = tx.send(UiCommand::Undo);
         });
