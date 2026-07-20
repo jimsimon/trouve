@@ -4716,6 +4716,55 @@ impl Engine {
         self.emit_queue(thread_id)
     }
 
+    /// Promote one queued prompt and run it immediately. An active turn is
+    /// cancelled while its dispatcher is marked to continue with the
+    /// promoted queue front; an idle thread starts normally.
+    pub fn dispatch_queued_prompt(
+        self: &Arc<Self>,
+        prompt_id: &str,
+    ) -> Result<(String, Option<u64>), EngineError> {
+        let thread_id = self
+            .store
+            .queued_prompt_thread(prompt_id)?
+            .ok_or_else(|| EngineError::NotFound(format!("queued prompt {prompt_id}")))?;
+        let thread = self.get_thread(&thread_id)?;
+        let preempting = {
+            let active = self.active_threads.lock().unwrap();
+            if self
+                .deleting_sessions
+                .lock()
+                .unwrap()
+                .contains(&thread.session_id)
+            {
+                return Err(EngineError::Conflict(format!(
+                    "session {} is being deleted",
+                    thread.session_id
+                )));
+            }
+            if !self.store.promote_queued_prompt(&thread_id, prompt_id)? {
+                return Err(EngineError::NotFound(format!("queued prompt {prompt_id}")));
+            }
+            let preempting = active.contains_key(&thread_id);
+            self.emit_queue(&thread_id)?;
+            if preempting {
+                self.resume_after_cancel
+                    .lock()
+                    .unwrap()
+                    .insert(thread_id.clone());
+                if let Some(cancel) = self.turn_cancels.lock().unwrap().get(&thread_id) {
+                    cancel.cancel();
+                }
+            }
+            preempting
+        };
+        if preempting {
+            Ok((thread_id, None))
+        } else {
+            let turn = self.dispatch_queue(&thread_id)?;
+            Ok((thread_id, turn))
+        }
+    }
+
     /// Start draining the thread's queue if it's idle — the "Send now"
     /// affordance. Deliberately never called automatically at startup: a
     /// crash may have cut a turn short, and running the queue on top of
@@ -4983,6 +5032,9 @@ impl Engine {
             .lock()
             .unwrap()
             .insert(thread_id.to_string(), token.clone());
+        if self.resume_after_cancel.lock().unwrap().contains(thread_id) {
+            token.cancel();
+        }
         token
     }
 
