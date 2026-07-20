@@ -503,7 +503,9 @@ struct Controller {
     /// (each workspace header's funnel menu toggles its own entry).
     show_archived: HashSet<String>,
     /// Quit once every agent turn finishes (armed from the quit dialog).
-    quit_when_idle: bool,
+    /// Shared with the UI callback so cancellation takes effect before its
+    /// command can race a final session-activity event in this queue.
+    quit_when_idle: std::sync::Arc<std::sync::atomic::AtomicBool>,
 
     threads: Vec<Thread>,
     current_thread: Option<usize>,
@@ -720,6 +722,7 @@ pub async fn run(
     tx: mpsc::UnboundedSender<UiCommand>,
     mut rx: mpsc::UnboundedReceiver<UiCommand>,
     window_focused: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    quit_when_idle: std::sync::Arc<std::sync::atomic::AtomicBool>,
     register_workspace: Option<std::path::PathBuf>,
 ) {
     let (client, server_url, spawned) = match start_local_server().await {
@@ -747,7 +750,7 @@ pub async fn run(
         archived_expanded: HashSet::new(),
         collapsed_workspaces: HashSet::new(),
         show_archived: HashSet::new(),
-        quit_when_idle: false,
+        quit_when_idle,
         threads: Vec::new(),
         current_thread: None,
         github_configured: false,
@@ -1508,7 +1511,11 @@ impl Controller {
         // global event stream, so it is the source of truth for app quit.
         let running = self.busy_sessions.len() as i32;
         ui::set_agents_running(&self.ui, running);
-        if self.quit_when_idle && running == 0 {
+        if self
+            .quit_when_idle
+            .load(std::sync::atomic::Ordering::SeqCst)
+            && running == 0
+        {
             ui::quit(&self.ui);
         }
     }
@@ -5493,13 +5500,15 @@ impl Controller {
                 }
             },
             UiCommand::QuitWhenIdle => {
-                self.quit_when_idle = true;
+                self.quit_when_idle
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
                 ui::set_quit_when_idle(&self.ui, true);
                 self.push_agents_running();
             }
             UiCommand::CancelQuitWhenIdle => {
-                self.quit_when_idle = false;
-                ui::set_quit_when_idle(&self.ui, false);
+                self.quit_when_idle
+                    .store(false, std::sync::atomic::Ordering::SeqCst);
+                ui::finish_cancel_quit_when_idle(&self.ui);
             }
         }
         Ok(())

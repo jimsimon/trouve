@@ -1631,6 +1631,7 @@ export component AppWindow inherits Window {
     in property <int> agents-running: 0;
     in-out property <bool> quit-dialog: false;
     in-out property <bool> quit-when-idle-armed: false;
+    in-out property <bool> quit-cancel-pending: false;
     callback quit-now();
     callback quit-when-idle();
     callback cancel-quit-when-idle();
@@ -4652,8 +4653,8 @@ export component AppWindow inherits Window {
                             ? "Waiting for an agent to finish"
                             : "Waiting for " + root.agents-running + " active sessions")
                         : root.agents-running == 1
-                        ? "An agent is still running"
-                        : root.agents-running + " agents are still running";
+                        ? "1 active session is still running"
+                        : root.agents-running + " active sessions are still running";
                     color: Theme.c.text-hi;
                     font-size: Theme.fs(15px);
                     font-weight: 700;
@@ -4672,13 +4673,17 @@ export component AppWindow inherits Window {
                     spacing: 8px;
                     Rectangle { horizontal-stretch: 1; }
                     Button {
-                        text: root.quit-when-idle-armed ? "Cancel automatic quit" : "Cancel";
+                        text: root.quit-cancel-pending
+                            ? "Cancelling…"
+                            : root.quit-when-idle-armed ? "Cancel automatic quit" : "Cancel";
+                        enabled: !root.quit-cancel-pending;
                         clicked => {
                             if root.quit-when-idle-armed {
-                                root.quit-when-idle-armed = false;
+                                root.quit-cancel-pending = true;
                                 root.cancel-quit-when-idle();
+                            } else {
+                                root.quit-dialog = false;
                             }
-                            root.quit-dialog = false;
                         }
                     }
                     if !root.quit-when-idle-armed: Button {
