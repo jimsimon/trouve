@@ -100,7 +100,9 @@ pub use requests::*;
 // not-applicable persona batches (all additive).
 // 1.9: code-review job details expose durable final-editor rejection reasons
 // for reviewer candidates that were not selected (additive).
-pub const PROTOCOL_VERSION: &str = "1.9";
+// 1.10: data-driven provider configuration fields, safe endpoint/header/query
+// templates, named write-only secrets, and native transport kinds (additive).
+pub const PROTOCOL_VERSION: &str = "1.10";
 
 pub type WorkspaceId = String;
 pub type SessionId = String;

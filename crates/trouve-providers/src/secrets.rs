@@ -159,6 +159,11 @@ pub fn oauth_secret(provider_id: &str) -> String {
     format!("provider:{provider_id}:oauth")
 }
 
+/// Namespaced key for a provider-defined write-only configuration value.
+pub fn provider_secret(provider_id: &str, name: &str) -> String {
+    format!("provider:{provider_id}:field:{name}")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

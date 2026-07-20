@@ -42,36 +42,20 @@ pub struct CatalogEntry {
     pub size_bytes: u64,
     pub params: &'static str,
     pub notes: &'static str,
-    pub thinking: Thinking,
 }
 
 /// How a local model's reasoning is steered through its chat template.
 /// There is no universal knob in llama.cpp — it's per model family, applied
 /// via `chat_template_kwargs` on the request.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum Thinking {
     /// Plain instruct model: no thinking controls.
+    #[default]
     None,
     /// On/off via the `enable_thinking` template kwarg (Qwen3-style).
     Toggle,
     /// low/medium/high via the `reasoning_effort` template kwarg (GPT-OSS).
     Effort,
-}
-
-/// Guess the thinking support of a user-added GGUF from its repo/filename
-/// (catalog entries declare it explicitly). Conservative: only families
-/// whose templates are known to take the kwargs.
-pub fn thinking_support(repo: &str, file: &str) -> Thinking {
-    let s = format!("{repo} {file}").to_ascii_lowercase();
-    if s.contains("gpt-oss") {
-        return Thinking::Effort;
-    }
-    // Qwen3-family hybrids honor enable_thinking; the Coder and Instruct
-    // variants are non-thinking and their templates reject the kwarg.
-    if s.contains("qwen3") && !s.contains("coder") && !s.contains("instruct") {
-        return Thinking::Toggle;
-    }
-    Thinking::None
 }
 
 /// Known-good coding models with working llama.cpp tool calling, smallest
@@ -86,7 +70,6 @@ pub const CATALOG: &[CatalogEntry] = &[
         size_bytes: 2_104_932_800,
         params: "3B",
         notes: "Smallest option; quick answers and light edits on any machine.",
-        thinking: Thinking::None,
     },
     CatalogEntry {
         id: "qwen2.5-coder-7b",
@@ -96,7 +79,6 @@ pub const CATALOG: &[CatalogEntry] = &[
         size_bytes: 4_683_073_536,
         params: "7B",
         notes: "Best pick for 8 GB GPUs; solid completions and small tasks.",
-        thinking: Thinking::None,
     },
     CatalogEntry {
         id: "gpt-oss-20b",
@@ -106,7 +88,6 @@ pub const CATALOG: &[CatalogEntry] = &[
         size_bytes: 12_109_566_560,
         params: "21B MoE",
         notes: "OpenAI's open-weight model; strong reasoning and tool use.",
-        thinking: Thinking::Effort,
     },
     CatalogEntry {
         id: "devstral-small-2507",
@@ -116,7 +97,6 @@ pub const CATALOG: &[CatalogEntry] = &[
         size_bytes: 14_333_915_904,
         params: "24B",
         notes: "Mistral's coding-agent specialist; good at multi-file edits.",
-        thinking: Thinking::None,
     },
     CatalogEntry {
         id: "qwen3.6-27b",
@@ -126,7 +106,6 @@ pub const CATALOG: &[CatalogEntry] = &[
         size_bytes: 16_817_244_384,
         params: "27B",
         notes: "Best all-round coding model for a single 24 GB GPU.",
-        thinking: Thinking::Toggle,
     },
     CatalogEntry {
         id: "qwen3-coder-30b",
@@ -136,15 +115,8 @@ pub const CATALOG: &[CatalogEntry] = &[
         size_bytes: 18_556_689_568,
         params: "30B MoE",
         notes: "Only 3B active parameters — usable even on CPU with enough RAM.",
-        thinking: Thinking::None,
     },
 ];
-
-/// Context window trouve serves every local model with. A fixed, honest
-/// value: it is what `-c` is set to, what ModelInfo reports, and what
-/// compaction budgets against. 32k balances capability against KV-cache
-/// memory; models with smaller native windows are clamped by llama.cpp.
-pub const SERVE_CONTEXT: u64 = 32_768;
 
 // --- user-added models -------------------------------------------------------
 
@@ -210,7 +182,6 @@ pub struct ModelEntry {
     pub params: String,
     pub notes: String,
     pub custom: bool,
-    pub thinking: Thinking,
 }
 
 /// Every model trouve can offer locally: the curated catalog plus the
@@ -227,13 +198,11 @@ pub fn all_entries(config_dir: Option<&Path>) -> Vec<ModelEntry> {
             params: c.params.into(),
             notes: c.notes.into(),
             custom: false,
-            thinking: c.thinking,
         })
         .collect();
     if let Some(dir) = config_dir {
         for custom in read_custom_models(&custom_models_path(dir)) {
             entries.retain(|e| e.id != custom.id);
-            let thinking = thinking_support(&custom.repo, &custom.file);
             entries.push(ModelEntry {
                 id: custom.id,
                 display_name: custom.display_name,
@@ -243,7 +212,6 @@ pub fn all_entries(config_dir: Option<&Path>) -> Vec<ModelEntry> {
                 params: String::new(),
                 notes: String::new(),
                 custom: true,
-                thinking,
             });
         }
     }
@@ -259,6 +227,183 @@ pub fn models_dir(data_dir: &Path) -> PathBuf {
 pub fn gguf_path(data_dir: &Path, entry: &ModelEntry) -> PathBuf {
     let name = entry.file.rsplit('/').next().unwrap_or(&entry.file);
     models_dir(data_dir).join(name)
+}
+
+/// Runtime-relevant metadata embedded in a downloaded GGUF. This is the
+/// model itself describing its identity, native context, and chat-template
+/// controls; repo and filename conventions are not consulted.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ModelMetadata {
+    pub display_name: Option<String>,
+    pub context_window: u64,
+    pub thinking: Thinking,
+}
+
+type MetadataStamp = (u64, Option<std::time::SystemTime>);
+type MetadataCache = std::collections::HashMap<PathBuf, (MetadataStamp, ModelMetadata)>;
+
+/// Read-once process cache: GGUF metadata is immutable after the atomic
+/// download rename, and tokenizer arrays can make a full header scan costly.
+static GGUF_METADATA: std::sync::OnceLock<std::sync::Mutex<MetadataCache>> =
+    std::sync::OnceLock::new();
+
+pub fn model_metadata(path: &Path) -> ModelMetadata {
+    let Ok(fs) = std::fs::metadata(path) else {
+        return ModelMetadata::default();
+    };
+    let stamp = (fs.len(), fs.modified().ok());
+    let cache = GGUF_METADATA.get_or_init(|| std::sync::Mutex::new(MetadataCache::new()));
+    if let Some((cached_stamp, metadata)) = cache.lock().unwrap().get(path)
+        && *cached_stamp == stamp
+    {
+        return metadata.clone();
+    }
+    let metadata = read_gguf_metadata(path).unwrap_or_else(|e| {
+        tracing::warn!(path = %path.display(), "could not read GGUF metadata: {e:#}");
+        ModelMetadata::default()
+    });
+    cache
+        .lock()
+        .unwrap()
+        .insert(path.to_path_buf(), (stamp, metadata.clone()));
+    metadata
+}
+
+fn read_gguf_metadata(path: &Path) -> Result<ModelMetadata> {
+    use std::io::{Read as _, Seek as _, SeekFrom};
+
+    fn bytes<const N: usize>(r: &mut std::fs::File) -> std::io::Result<[u8; N]> {
+        let mut bytes = [0; N];
+        r.read_exact(&mut bytes)?;
+        Ok(bytes)
+    }
+    fn u32_le(r: &mut std::fs::File) -> std::io::Result<u32> {
+        Ok(u32::from_le_bytes(bytes(r)?))
+    }
+    fn u64_le(r: &mut std::fs::File) -> std::io::Result<u64> {
+        Ok(u64::from_le_bytes(bytes(r)?))
+    }
+    fn string(r: &mut std::fs::File, max: u64) -> Result<String> {
+        let len = u64_le(r)?;
+        if len > max {
+            bail!("GGUF string length {len} exceeds metadata limit {max}");
+        }
+        let mut value = vec![0; usize::try_from(len)?];
+        r.read_exact(&mut value)?;
+        String::from_utf8(value).context("GGUF metadata string is not UTF-8")
+    }
+    fn skip(r: &mut std::fs::File, value_type: u32, depth: u8) -> Result<()> {
+        if depth > 4 {
+            bail!("nested GGUF metadata arrays are too deep");
+        }
+        let width = match value_type {
+            0 | 1 | 7 => Some(1),
+            2 | 3 => Some(2),
+            4..=6 => Some(4),
+            10..=12 => Some(8),
+            _ => None,
+        };
+        if let Some(width) = width {
+            r.seek(SeekFrom::Current(width))?;
+            return Ok(());
+        }
+        match value_type {
+            8 => {
+                let len = u64_le(r)?;
+                r.seek(SeekFrom::Current(i64::try_from(len)?))?;
+                Ok(())
+            }
+            9 => {
+                let element_type = u32_le(r)?;
+                let count = u64_le(r)?;
+                if count > 100_000_000 {
+                    bail!("implausible GGUF metadata array length {count}");
+                }
+                for _ in 0..count {
+                    skip(r, element_type, depth + 1)?;
+                }
+                Ok(())
+            }
+            other => bail!("unknown GGUF metadata value type {other}"),
+        }
+    }
+    fn positive_integer(r: &mut std::fs::File, value_type: u32) -> Result<Option<u64>> {
+        let value = match value_type {
+            0 => u64::from(bytes::<1>(r)?[0]),
+            1 => i8::from_le_bytes(bytes(r)?).try_into().unwrap_or(0),
+            2 => u64::from(u16::from_le_bytes(bytes(r)?)),
+            3 => i16::from_le_bytes(bytes(r)?).try_into().unwrap_or(0),
+            4 => u64::from(u32_le(r)?),
+            5 => i32::from_le_bytes(bytes(r)?).try_into().unwrap_or(0),
+            10 => u64_le(r)?,
+            11 => i64::from_le_bytes(bytes(r)?).try_into().unwrap_or(0),
+            _ => {
+                skip(r, value_type, 0)?;
+                return Ok(None);
+            }
+        };
+        Ok((value > 0).then_some(value))
+    }
+
+    let mut file = std::fs::File::open(path)?;
+    if &bytes::<4>(&mut file)? != b"GGUF" {
+        bail!("not a GGUF file");
+    }
+    let version = u32_le(&mut file)?;
+    if !matches!(version, 2 | 3) {
+        bail!("unsupported GGUF version {version}");
+    }
+    let _tensor_count = u64_le(&mut file)?;
+    let metadata_count = u64_le(&mut file)?;
+    if metadata_count > 100_000 {
+        bail!("implausible GGUF metadata count {metadata_count}");
+    }
+
+    let mut architecture = None;
+    let mut display_name = None;
+    let mut chat_template = None;
+    let mut contexts = std::collections::HashMap::<String, u64>::new();
+    for _ in 0..metadata_count {
+        let key = string(&mut file, 64 * 1024)?;
+        let value_type = u32_le(&mut file)?;
+        match key.as_str() {
+            "general.architecture" if value_type == 8 => {
+                architecture = Some(string(&mut file, 1024)?);
+            }
+            "general.name" if value_type == 8 => {
+                display_name = Some(string(&mut file, 1024 * 1024)?);
+            }
+            "tokenizer.chat_template" if value_type == 8 => {
+                chat_template = Some(string(&mut file, 16 * 1024 * 1024)?);
+            }
+            _ if key.ends_with(".context_length") => {
+                if let Some(value) = positive_integer(&mut file, value_type)? {
+                    contexts.insert(key, value);
+                }
+            }
+            _ => skip(&mut file, value_type, 0)?,
+        }
+    }
+
+    let context_window = architecture
+        .as_deref()
+        .and_then(|arch| contexts.get(&format!("{arch}.context_length")))
+        .copied()
+        .or_else(|| contexts.values().copied().max())
+        .unwrap_or(0);
+    let template = chat_template.unwrap_or_default().to_ascii_lowercase();
+    let thinking = if template.contains("reasoning_effort") {
+        Thinking::Effort
+    } else if template.contains("enable_thinking") {
+        Thinking::Toggle
+    } else {
+        Thinking::None
+    };
+    Ok(ModelMetadata {
+        display_name,
+        context_window,
+        thinking,
+    })
 }
 
 /// Direct download URL for a HuggingFace repo file.
@@ -613,6 +758,8 @@ pub struct LlamaManager {
     state: std::sync::Mutex<ServerState>,
     /// Pidfile tracking spawned servers across app runs (crash recovery).
     pids: PathBuf,
+    /// Effective context reported by `/props` for models loaded this run.
+    effective_contexts: std::sync::Mutex<std::collections::HashMap<String, u64>>,
 }
 
 impl LlamaManager {
@@ -626,6 +773,7 @@ impl LlamaManager {
             inner: tokio::sync::Mutex::new(None),
             state: std::sync::Mutex::new(ServerState::Stopped),
             pids,
+            effective_contexts: std::sync::Mutex::new(std::collections::HashMap::new()),
         }
     }
 
@@ -680,6 +828,14 @@ impl LlamaManager {
         }
     }
 
+    pub fn context_window(&self, model_id: &str) -> Option<u64> {
+        self.effective_contexts
+            .lock()
+            .unwrap()
+            .get(model_id)
+            .copied()
+    }
+
     fn set_state(&self, state: ServerState) {
         *self.state.lock().unwrap() = state;
     }
@@ -716,7 +872,13 @@ impl LlamaManager {
         }
         self.set_state(ServerState::Starting(model_id.to_string()));
         match self.spawn_and_wait(bin, gguf, log_path).await {
-            Ok((port, child)) => {
+            Ok((port, child, context_window)) => {
+                if context_window > 0 {
+                    self.effective_contexts
+                        .lock()
+                        .unwrap()
+                        .insert(model_id.to_string(), context_window);
+                }
                 self.set_state(ServerState::Running(model_id.to_string()));
                 *inner = Some(Running {
                     model_id: model_id.to_string(),
@@ -739,7 +901,7 @@ impl LlamaManager {
         bin: &Path,
         gguf: &Path,
         log_path: &Path,
-    ) -> Result<(u16, tokio::process::Child)> {
+    ) -> Result<(u16, tokio::process::Child, u64)> {
         let port = free_port()?;
         let log = std::fs::File::create(log_path)
             .with_context(|| format!("creating {}", log_path.display()))?;
@@ -749,8 +911,10 @@ impl LlamaManager {
             .arg(gguf)
             .args(["--host", "127.0.0.1", "--port"])
             .arg(port.to_string())
+            // Zero asks llama.cpp to load the native context length embedded
+            // in the GGUF instead of imposing a trouve-wide fixed window.
             .arg("-c")
-            .arg(SERVE_CONTEXT.to_string())
+            .arg("0")
             // No -ngl: llama.cpp then auto-fits n_gpu_layers to *free* VRAM,
             // spilling gracefully to CPU instead of into GTT/system memory
             // over PCIe (forcing 999 disables the fit and runs at ~5 tok/s
@@ -813,7 +977,27 @@ impl LlamaManager {
             tokio::time::sleep(std::time::Duration::from_millis(500)).await;
         }
 
-        Ok((port, child))
+        let context_window = http
+            .get(format!("http://127.0.0.1:{port}/props"))
+            .send()
+            .await
+            .ok()
+            .and_then(|resp| resp.error_for_status().ok());
+        let context_window = match context_window {
+            Some(resp) => resp
+                .json::<serde_json::Value>()
+                .await
+                .ok()
+                .and_then(|props| {
+                    props
+                        .pointer("/default_generation_settings/n_ctx")
+                        .and_then(serde_json::Value::as_u64)
+                })
+                .unwrap_or(0),
+            None => 0,
+        };
+
+        Ok((port, child, context_window))
     }
 }
 
@@ -924,14 +1108,31 @@ impl Provider for LocalProvider {
     fn models(&self) -> Vec<trouve_protocol::ModelInfo> {
         self.downloaded_entries()
             .into_iter()
-            .map(|e| trouve_protocol::ModelInfo {
-                id: format!("local/{}", e.id),
-                display_name: format!("{} (local)", e.display_name),
-                context_window: SERVE_CONTEXT,
-                supports_tools: true,
-                input_price_per_mtok: Some(0.0),
-                output_price_per_mtok: Some(0.0),
-                options_schema: options_schema(e.thinking),
+            .map(|e| {
+                let path = gguf_path(&self.data_dir, &e);
+                let metadata = model_metadata(&path);
+                let context_window = self
+                    .manager
+                    .context_window(&e.id)
+                    .unwrap_or(metadata.context_window);
+                trouve_protocol::ModelInfo {
+                    id: format!("local/{}", e.id),
+                    display_name: format!(
+                        "{} (local)",
+                        metadata
+                            .display_name
+                            .as_deref()
+                            .filter(|name| !name.trim().is_empty())
+                            .unwrap_or(&e.display_name)
+                    ),
+                    context_window,
+                    // llama.cpp's --jinja path provides native or generic
+                    // OpenAI-style function calling for chat models.
+                    supports_tools: true,
+                    input_price_per_mtok: Some(0.0),
+                    output_price_per_mtok: Some(0.0),
+                    options_schema: options_schema(metadata.thinking),
+                }
             })
             .collect()
     }
@@ -954,6 +1155,7 @@ impl Provider for LocalProvider {
                 "model {model} is not downloaded — download it in Settings → Providers → Local"
             )));
         }
+        let metadata = model_metadata(&gguf);
         let bin = self.runtime_bin().ok_or_else(|| {
             ProviderError::Request(
                 "the llama.cpp runtime is not installed — install it in \
@@ -975,7 +1177,7 @@ impl Provider for LocalProvider {
         );
         // Thinking knobs travel as template kwargs, not top-level fields.
         let mut options = options.clone();
-        apply_thinking_options(entry.thinking, &mut options);
+        apply_thinking_options(metadata.thinking, &mut options);
         inner.stream_chat(model, messages, tools, &options).await
     }
 }
@@ -1085,33 +1287,49 @@ mod tests {
     }
 
     #[test]
-    fn thinking_support_is_guessed_from_repo_names() {
-        // GPT-OSS takes effort levels; Qwen3 hybrids take the on/off kwarg.
-        assert_eq!(
-            thinking_support("ggml-org/gpt-oss-120b-GGUF", "gpt-oss-120b-mxfp4.gguf"),
-            Thinking::Effort
+    fn context_and_thinking_come_from_gguf_metadata() {
+        fn string(bytes: &mut Vec<u8>, value: &str) {
+            bytes.extend_from_slice(&(value.len() as u64).to_le_bytes());
+            bytes.extend_from_slice(value.as_bytes());
+        }
+        fn string_value(bytes: &mut Vec<u8>, key: &str, value: &str) {
+            string(bytes, key);
+            bytes.extend_from_slice(&8u32.to_le_bytes());
+            string(bytes, value);
+        }
+        fn u32_value(bytes: &mut Vec<u8>, key: &str, value: u32) {
+            string(bytes, key);
+            bytes.extend_from_slice(&4u32.to_le_bytes());
+            bytes.extend_from_slice(&value.to_le_bytes());
+        }
+
+        let mut bytes = b"GGUF".to_vec();
+        bytes.extend_from_slice(&3u32.to_le_bytes());
+        bytes.extend_from_slice(&0u64.to_le_bytes()); // tensors
+        bytes.extend_from_slice(&4u64.to_le_bytes()); // metadata pairs
+        string_value(&mut bytes, "general.architecture", "qwen3");
+        string_value(&mut bytes, "general.name", "Metadata Test Model");
+        u32_value(&mut bytes, "qwen3.context_length", 262_144);
+        string_value(
+            &mut bytes,
+            "tokenizer.chat_template",
+            "{% if enable_thinking %}<think>{% endif %}",
         );
+
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("model.gguf");
+        std::fs::write(&path, bytes).unwrap();
+        let metadata = model_metadata(&path);
         assert_eq!(
-            thinking_support("unsloth/Qwen3-14B-GGUF", "Qwen3-14B-Q4_K_M.gguf"),
-            Thinking::Toggle
+            metadata.display_name.as_deref(),
+            Some("Metadata Test Model")
         );
-        // Coder/Instruct Qwen3 variants don't think; unknown families get
-        // no knobs at all.
-        assert_eq!(
-            thinking_support(
-                "unsloth/Qwen3-Coder-30B-A3B-Instruct-GGUF",
-                "Qwen3-Coder-30B-A3B-Instruct-Q4_K_M.gguf"
-            ),
-            Thinking::None
-        );
-        assert_eq!(
-            thinking_support("mistralai/Devstral-Small-2507_gguf", "d.gguf"),
-            Thinking::None
-        );
+        assert_eq!(metadata.context_window, 262_144);
+        assert_eq!(metadata.thinking, Thinking::Toggle);
     }
 
     #[test]
-    fn options_schema_matches_thinking_support() {
+    fn options_schema_matches_derived_thinking() {
         assert_eq!(options_schema(Thinking::None), serde_json::json!({}));
         assert_eq!(
             options_schema(Thinking::Toggle)
