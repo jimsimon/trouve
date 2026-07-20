@@ -1572,6 +1572,42 @@ mod tests {
     }
 
     #[test]
+    fn append_returns_promptly_when_event_writer_exits() {
+        let store = Store::open_in_memory().unwrap();
+        let conn = Arc::clone(&store.conn);
+        assert!(
+            std::thread::spawn(move || {
+                let _guard = conn.lock().unwrap();
+                panic!("poison event-writer connection");
+            })
+            .join()
+            .is_err()
+        );
+
+        let (result_tx, result_rx) = std::sync::mpsc::sync_channel(1);
+        let append = std::thread::spawn(move || {
+            result_tx
+                .send(store.append_event(
+                    Scope::Server,
+                    Event::AssistantDelta {
+                        turn: 1,
+                        text: "unwritten".into(),
+                    },
+                ))
+                .unwrap();
+        });
+
+        let result = result_rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("append_event blocked after event writer exited");
+        assert_eq!(
+            result.unwrap_err().to_string(),
+            "event writer thread has exited"
+        );
+        append.join().unwrap();
+    }
+
+    #[test]
     fn live_subscription_receives_appends() {
         let store = Store::open_in_memory().unwrap();
         let mut rx = store.subscribe();
