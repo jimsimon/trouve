@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1784534735532,
+  "lastUpdate": 1784534773509,
   "repoUrl": "https://github.com/jimsimon/trouve",
   "entries": {
     "e2e-benchmarks": [
@@ -7441,6 +7441,54 @@ window.BENCHMARK_DATA = {
             "name": "dense_query_20k_rows",
             "value": 1211917.0965367965,
             "range": "± 5573",
+            "unit": "ns"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "jim.j.simon@gmail.com",
+            "name": "Jim Simon",
+            "username": "jimsimon"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "038dbb602538285e939617e5d2858c7b7b684996",
+          "message": "Show Codex reasoning summaries (#114)\n\n* Show Codex reasoning summaries\n\n* Deduplicate Codex reasoning parsing",
+          "timestamp": "2026-07-20T04:04:09-04:00",
+          "tree_id": "9b7806d3860680eb30559fab2c1eb84a75dfaf28",
+          "url": "https://github.com/jimsimon/trouve/commit/038dbb602538285e939617e5d2858c7b7b684996"
+        },
+        "date": 1784534773003,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "bm25_build_5k_docs",
+            "value": 4868746.9,
+            "range": "± 16886",
+            "unit": "ns"
+          },
+          {
+            "name": "bm25_query_5k_docs",
+            "value": 36479.076889421834,
+            "range": "± 8",
+            "unit": "ns"
+          },
+          {
+            "name": "chunk_python_200_functions",
+            "value": 2956435.8823529407,
+            "range": "± 1512",
+            "unit": "ns"
+          },
+          {
+            "name": "dense_query_20k_rows",
+            "value": 1377190.7665688433,
+            "range": "± 5777",
             "unit": "ns"
           }
         ]
