@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1784524884909,
+  "lastUpdate": 1784524912627,
   "repoUrl": "https://github.com/jimsimon/trouve",
   "entries": {
     "e2e-benchmarks": [
@@ -6481,6 +6481,54 @@ window.BENCHMARK_DATA = {
             "name": "dense_query_20k_rows",
             "value": 1374593.5472027971,
             "range": "± 11401",
+            "unit": "ns"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "jim.j.simon@gmail.com",
+            "name": "Jim Simon",
+            "username": "jimsimon"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "070e408d5476ea86aa3be6b468d0b9775e2ab42f",
+          "message": "Batch event-log appends through a dedicated writer thread (#97)\n\n* Batch event-log appends through a dedicated writer thread\n\nUnder many concurrent sessions, every streamed delta serialized on the\nStore's connection mutex with one fsync each. Slow drains backed up\nCodex turn routes until the shared stdout reader dropped them\n(ROUTE_CAPACITY overflow), failing otherwise-healthy turns with\n\"app-server event route closed before turn completed\".\n\nappend_event now queues to a single writer thread that commits all\npending appends in one transaction, then broadcasts and replies in\nqueue order. Callers keep the same blocking API and durability\nguarantee (return means committed), but no longer serialize each other,\nand the per-commit fsync amortizes across whatever queued under load.\nCursor/broadcast ordering now holds by construction: the writer thread\nis the sole author of both.\n\nCo-Authored-By: Claude Fable 5 <noreply@anthropic.com>\n\n* Apply rustfmt\n\nCo-Authored-By: Claude Fable 5 <noreply@anthropic.com>\n\n* Test event writer failure handling\n\n---------\n\nCo-authored-by: Claude Fable 5 <noreply@anthropic.com>",
+          "timestamp": "2026-07-20T01:19:53-04:00",
+          "tree_id": "70139812417b07b049e9b5cc06980f9c777e49bf",
+          "url": "https://github.com/jimsimon/trouve/commit/070e408d5476ea86aa3be6b468d0b9775e2ab42f"
+        },
+        "date": 1784524911400,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "bm25_build_5k_docs",
+            "value": 3829869.5,
+            "range": "± 6164",
+            "unit": "ns"
+          },
+          {
+            "name": "bm25_query_5k_docs",
+            "value": 28195.682343660355,
+            "range": "± 17",
+            "unit": "ns"
+          },
+          {
+            "name": "chunk_python_200_functions",
+            "value": 2217825.4130434785,
+            "range": "± 838",
+            "unit": "ns"
+          },
+          {
+            "name": "dense_query_20k_rows",
+            "value": 1233080.9076479077,
+            "range": "± 3551",
             "unit": "ns"
           }
         ]
