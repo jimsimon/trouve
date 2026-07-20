@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1784530654192,
+  "lastUpdate": 1784532358627,
   "repoUrl": "https://github.com/jimsimon/trouve",
   "entries": {
     "e2e-benchmarks": [
@@ -3551,6 +3551,54 @@ window.BENCHMARK_DATA = {
             "name": "non-git warm query",
             "value": 75.24582962000001,
             "range": "± 3.7",
+            "unit": "ms"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "jim.j.simon@gmail.com",
+            "name": "Jim Simon",
+            "username": "jimsimon"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "71294e4e74f79c66902f4950f0c97ea811ba837e",
+          "message": "Associate pull requests with session activity (#89)\n\n* Associate pull requests with session activity\n\n* Address pull request review feedback\n\n* Keep session pull requests scoped\n\nPreserve cross-branch PRs returned by the session-specific lookup across account dashboard refreshes, while limiting new associations to successful PR creation or remote-ref mutation activity. Read/list output and incidental mentions no longer associate unrelated PRs.",
+          "timestamp": "2026-07-20T03:24:39-04:00",
+          "tree_id": "42b87f40cb49b9ad3e61afc95e6352cacd8b2ff5",
+          "url": "https://github.com/jimsimon/trouve/commit/71294e4e74f79c66902f4950f0c97ea811ba837e"
+        },
+        "date": 1784532357947,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "cold index + query",
+            "value": 108.48446252000001,
+            "range": "± 4.9",
+            "unit": "ms"
+          },
+          {
+            "name": "warm query",
+            "value": 57.548999259999995,
+            "range": "± 0.9",
+            "unit": "ms"
+          },
+          {
+            "name": "incremental (1 file modified)",
+            "value": 68.99359706000001,
+            "range": "± 4.2",
+            "unit": "ms"
+          },
+          {
+            "name": "non-git warm query",
+            "value": 55.63845296,
+            "range": "± 2.3",
             "unit": "ms"
           }
         ]
