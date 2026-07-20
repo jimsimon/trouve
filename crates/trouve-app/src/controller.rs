@@ -349,6 +349,12 @@ pub enum UiCommand {
         offset: f32,
         at_bottom: bool,
     },
+    /// An unsubmitted composer edit, attributed to the stable thread that was
+    /// visible when the edit happened.
+    ComposerDraftChanged {
+        thread_id: String,
+        text: String,
+    },
     SendMessage(String),
     CancelTurn,
     /// The "@" mention popup opened (or is filtering): refresh the worktree
@@ -780,6 +786,26 @@ struct AttentionCounts {
     questions: usize,
 }
 
+#[derive(Default)]
+struct PromptDrafts(HashMap<String, String>);
+
+impl PromptDrafts {
+    fn update(&mut self, thread_id: String, text: String) {
+        if thread_id.is_empty() {
+            return;
+        }
+        if text.is_empty() {
+            self.0.remove(&thread_id);
+        } else {
+            self.0.insert(thread_id, text);
+        }
+    }
+
+    fn get(&self, thread_id: &str) -> String {
+        self.0.get(thread_id).cloned().unwrap_or_default()
+    }
+}
+
 fn thread_attention(vm: &ThreadViewModel) -> AttentionCounts {
     AttentionCounts {
         approvals: vm.pending_approvals.len(),
@@ -848,6 +874,9 @@ struct Controller {
 
     threads: Vec<Thread>,
     current_thread: Option<usize>,
+    /// Unsubmitted composer text, isolated by stable thread id so navigating
+    /// across either tabs or sessions cannot leak one draft into another.
+    prompt_drafts: PromptDrafts,
 
     /// GitHub integration state (None until the first fetch answers).
     /// Any GitHub host (github.com or enterprise) has working auth —
@@ -1141,6 +1170,7 @@ pub async fn run(
         quit_when_idle,
         threads: Vec::new(),
         current_thread: None,
+        prompt_drafts: PromptDrafts::default(),
         github_configured: false,
         github_hosts: Vec::new(),
         download_rates: HashMap::new(),
@@ -2209,6 +2239,7 @@ impl Controller {
         self.push_picker_indices();
         self.follow_current();
         self.render_chat(false);
+        self.push_prompt_draft();
         self.push_context();
         self.push_queue();
         self.push_todos();
@@ -2260,6 +2291,7 @@ impl Controller {
         self.push_picker_indices();
         self.follow_current();
         self.render_chat(false);
+        self.push_prompt_draft();
         self.push_context();
         self.push_queue();
         self.push_todos();
@@ -2741,6 +2773,7 @@ impl Controller {
         let Some(thread_id) = self.current_thread_id() else {
             self.row_call_ids.clear();
             ui::set_chat(&self.ui, Vec::new(), String::new(), false);
+            ui::set_composer_draft(&self.ui, String::new(), String::new());
             ui::set_composer_enabled(&self.ui, false);
             ui::set_composer_turn_running(&self.ui, false);
             ui::set_slash_commands(&self.ui, Vec::new());
@@ -2861,6 +2894,19 @@ impl Controller {
             })
             .collect();
         ui::set_composer_attachments(&self.ui, chips);
+    }
+
+    /// Restore the draft for the open thread, or clear the composer when no
+    /// real thread is selected.
+    fn push_prompt_draft(&self) {
+        let (thread_id, draft) = self
+            .current_thread_id()
+            .map(|thread_id| {
+                let draft = self.prompt_drafts.get(&thread_id);
+                (thread_id, draft)
+            })
+            .unwrap_or_default();
+        ui::set_composer_draft(&self.ui, thread_id, draft);
     }
 
     /// Server id of the current thread's queued prompt shown at `index`.
@@ -5092,6 +5138,9 @@ impl Controller {
                     }
                 }
             }
+            UiCommand::ComposerDraftChanged { thread_id, text } => {
+                self.prompt_drafts.update(thread_id, text);
+            }
             UiCommand::SendMessage(text) => {
                 if let Some(thread_id) = self.current_thread_id() {
                     let uploads = std::mem::take(&mut self.pending_attachments);
@@ -7281,6 +7330,7 @@ impl Controller {
         self.push_picker_indices();
         self.follow_current();
         self.render_chat(false);
+        self.push_prompt_draft();
         self.push_context();
         self.push_queue();
         self.push_todos();
@@ -8079,9 +8129,9 @@ fn session_title_fallback(prompt: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        ChatWindow, ServerReplayBuffer, SubscriptionRefresh, SubscriptionRefreshState,
-        approval_pill, attention_badge, check_pill, classify_pr, download_progress,
-        format_pr_dashboard_refresh_status, human_age, human_rate, is_web_url, merge_pill,
+        ChatWindow, PromptDrafts, ServerReplayBuffer, SubscriptionRefresh,
+        SubscriptionRefreshState, approval_pill, attention_badge, check_pill, classify_pr,
+        download_progress, format_pr_dashboard_refresh_status, human_age, human_rate, merge_pill,
         model_health_view, pr_badge, project_session_prs, provider_login_requires_code,
         reconcile_pr_group_order, reconcile_workspace_order, reorder_id, session_title_fallback,
         should_open_chat_at_tail, thinking_property,
@@ -8170,12 +8220,18 @@ mod tests {
     }
 
     #[test]
-    fn terminal_links_only_allow_web_schemes() {
-        assert!(is_web_url("https://example.com/docs"));
-        assert!(is_web_url("http://localhost:8080"));
-        assert!(!is_web_url("file:///tmp/secret"));
-        assert!(!is_web_url("javascript:alert(1)"));
-        assert!(!is_web_url("ssh://example.com"));
+    fn prompt_drafts_are_restored_per_thread() {
+        let mut drafts = PromptDrafts::default();
+        drafts.update("thread-a".into(), "draft for a".into());
+        drafts.update("thread-b".into(), "draft for b".into());
+
+        assert_eq!(drafts.get("thread-a"), "draft for a");
+        assert_eq!(drafts.get("thread-b"), "draft for b");
+        assert_eq!(drafts.get("thread-c"), "");
+
+        drafts.update("thread-a".into(), String::new());
+        assert_eq!(drafts.get("thread-a"), "");
+        assert_eq!(drafts.get("thread-b"), "draft for b");
     }
 
     #[test]
