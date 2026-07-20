@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1784521460497,
+  "lastUpdate": 1784521530537,
   "repoUrl": "https://github.com/jimsimon/trouve",
   "entries": {
     "e2e-benchmarks": [
@@ -6193,6 +6193,54 @@ window.BENCHMARK_DATA = {
             "name": "dense_query_20k_rows",
             "value": 1371651.3859180035,
             "range": "± 6567",
+            "unit": "ns"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "jim.j.simon@gmail.com",
+            "name": "Jim Simon",
+            "username": "jimsimon"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "a14b4ae52fa83ab64acde43cc620545204afacbb",
+          "message": "Unify multi-instance GitHub PR data (#103)\n\n* Unify multi-instance GitHub PR data\n\nUse OAuth-only account feeds across configured GitHub instances so the dashboard, session indicators, and PR panel share one periodically refreshed snapshot. Add conflict and reviewer-state grouping plus a responsive two-column dashboard.\n\n* Fix stale GitHub integration comments\n\n* Address GitHub dashboard review feedback",
+          "timestamp": "2026-07-20T00:21:52-04:00",
+          "tree_id": "c882e784d31d860599c593a1dfa2148053608717",
+          "url": "https://github.com/jimsimon/trouve/commit/a14b4ae52fa83ab64acde43cc620545204afacbb"
+        },
+        "date": 1784521530115,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "bm25_build_5k_docs",
+            "value": 4839625.55,
+            "range": "± 9517",
+            "unit": "ns"
+          },
+          {
+            "name": "bm25_query_5k_docs",
+            "value": 36597.55803571429,
+            "range": "± 9",
+            "unit": "ns"
+          },
+          {
+            "name": "chunk_python_200_functions",
+            "value": 3007237.0588235296,
+            "range": "± 1473",
+            "unit": "ns"
+          },
+          {
+            "name": "dense_query_20k_rows",
+            "value": 1390368.7170716114,
+            "range": "± 16083",
             "unit": "ns"
           }
         ]
