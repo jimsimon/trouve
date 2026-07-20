@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1784521675233,
+  "lastUpdate": 1784523425837,
   "repoUrl": "https://github.com/jimsimon/trouve",
   "entries": {
     "e2e-benchmarks": [
@@ -3167,6 +3167,54 @@ window.BENCHMARK_DATA = {
             "name": "non-git warm query",
             "value": 69.88885272,
             "range": "± 2.7",
+            "unit": "ms"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "jim.j.simon@gmail.com",
+            "name": "Jim Simon",
+            "username": "jimsimon"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "d16385cbab37676311ffe79612c3bde42206b274",
+          "message": "Fix merged UI and PR dashboard regressions (#107)\n\n* Fix merged UI and PR dashboard regressions\n\nKeep new-session pickers at their intended height and use a broadly supported pull-request glyph. Send bodyless command POSTs without a synthetic JSON payload, and avoid dashboard fan-out while connectivity is unavailable.\n\n* Keep composer action button compact\n\n* Bottom-align composer action button\n\n* Keep queued prompt action as Send now\n\n* Select Rustls crypto provider at startup\n\nThe desktop dependency graph enables both Ring and AWS-LC, so Rustls cannot infer a process provider and panics on the first GitHub HTTPS request. Install Ring explicitly before either client or embedded-server networking begins.\n\n* Harden empty POST transport test\n\nKeep loopback networking out of the default offline-safe suite and validate the request through HTTP framing instead of packet boundaries.\n\n* Run ignored client network test in CI\n\nExtend the gated TROUVE_E2E job and its coverage guard now that client-core intentionally owns an ignored loopback test.",
+          "timestamp": "2026-07-20T00:55:46-04:00",
+          "tree_id": "e512e7ae6f9e3d43b1d54613b59e3bf105ea140e",
+          "url": "https://github.com/jimsimon/trouve/commit/d16385cbab37676311ffe79612c3bde42206b274"
+        },
+        "date": 1784523425001,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "cold index + query",
+            "value": 122.29750720000001,
+            "range": "± 2.9",
+            "unit": "ms"
+          },
+          {
+            "name": "warm query",
+            "value": 65.3922578,
+            "range": "± 1.8",
+            "unit": "ms"
+          },
+          {
+            "name": "incremental (1 file modified)",
+            "value": 74.73565592,
+            "range": "± 1",
+            "unit": "ms"
+          },
+          {
+            "name": "non-git warm query",
+            "value": 64.06669686,
+            "range": "± 1.2",
             "unit": "ms"
           }
         ]
