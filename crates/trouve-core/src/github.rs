@@ -6,7 +6,7 @@
 //! and merge with method selection. Merge queues and GitLab are tracked as
 //! follow-ups.
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
@@ -34,20 +34,34 @@ query TrouvePullRequestSearch(
 ) {
   open: search(query: $openQuery, type: ISSUE, first: 100, after: $openAfter)
     @include(if: $includeOpen) {
-    nodes { ... on PullRequest { id } }
+    nodes { ... on PullRequest { ...TrouvePullRequestProbe } }
     pageInfo { hasNextPage endCursor }
   }
   review: search(query: $reviewQuery, type: ISSUE, first: 100, after: $reviewAfter)
     @include(if: $includeReview) {
-    nodes { ... on PullRequest { id } }
+    nodes { ... on PullRequest { ...TrouvePullRequestProbe } }
     pageInfo { hasNextPage endCursor }
   }
   merged: search(query: $mergedQuery, type: ISSUE, first: 100, after: $mergedAfter)
     @include(if: $includeMerged) {
-    nodes { ... on PullRequest { id } }
+    nodes { ... on PullRequest { ...TrouvePullRequestProbe } }
     pageInfo { hasNextPage endCursor }
   }
   rateLimit { cost remaining resetAt }
+}
+
+fragment TrouvePullRequestProbe on PullRequest {
+  id
+  updatedAt
+  headRefOid
+  mergeable
+  commits(last: 1) {
+    nodes {
+      commit {
+        statusCheckRollup { state }
+      }
+    }
+  }
 }
 "#;
 
@@ -104,6 +118,7 @@ query TrouveOpenPullRequests($owner: String!, $repository: String!, $after: Stri
 
 const PULL_REQUEST_FIELDS: &str = r#"
 fragment TrouvePullRequestFields on PullRequest {
+  id
   repository { nameWithOwner }
   headRepository { nameWithOwner }
   number
@@ -331,6 +346,45 @@ pub struct GitHubAccount {
     graphql: GitHubGraphql,
 }
 
+/// Per-host dashboard state retained by the server between poll ticks.
+///
+/// Search probes are deliberately cheap. Full PR details are fetched only
+/// when a probe changes, which keeps the one-minute dashboard cadence without
+/// paying the nested-connection cost on every unchanged pull request.
+#[derive(Default)]
+pub struct GitHubDashboardCache {
+    viewer: Option<String>,
+    entries: HashMap<String, CachedDashboardPullRequest>,
+}
+
+struct CachedDashboardPullRequest {
+    fingerprint: DashboardFingerprint,
+    pull_request: PrInfo,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct DashboardFingerprint {
+    updated_at: DateTime<Utc>,
+    head_ref_oid: Option<String>,
+    mergeable: String,
+    check_state: Option<String>,
+}
+
+impl GitHubDashboardCache {
+    fn begin_viewer(&mut self, viewer: &str) {
+        if self.viewer.as_deref() != Some(viewer) {
+            self.entries.clear();
+            self.viewer = Some(viewer.to_string());
+        }
+    }
+
+    fn needs_detail_refresh(&self, id: &str, fingerprint: &DashboardFingerprint) -> bool {
+        self.entries
+            .get(id)
+            .is_none_or(|cached| cached.fingerprint != *fingerprint)
+    }
+}
+
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct GraphqlRateLimit {
@@ -367,13 +421,61 @@ struct GraphqlSearchData {
 #[serde(rename_all = "camelCase")]
 struct GraphqlSearchConnection {
     #[serde(default)]
-    nodes: Vec<Option<GraphqlNodeId>>,
+    nodes: Vec<Option<GraphqlDashboardProbe>>,
     page_info: GraphqlPageInfo,
 }
 
 #[derive(Deserialize)]
-struct GraphqlNodeId {
+#[serde(rename_all = "camelCase")]
+struct GraphqlDashboardProbe {
     id: String,
+    updated_at: DateTime<Utc>,
+    #[serde(default)]
+    head_ref_oid: Option<String>,
+    mergeable: String,
+    commits: GraphqlProbeCommits,
+}
+
+impl GraphqlDashboardProbe {
+    fn into_entry(self) -> (String, DashboardFingerprint) {
+        let check_state = self
+            .commits
+            .nodes
+            .into_iter()
+            .flatten()
+            .find_map(|commit| commit.commit.status_check_rollup.map(|rollup| rollup.state));
+        (
+            self.id,
+            DashboardFingerprint {
+                updated_at: self.updated_at,
+                head_ref_oid: self.head_ref_oid,
+                mergeable: self.mergeable,
+                check_state,
+            },
+        )
+    }
+}
+
+#[derive(Deserialize)]
+struct GraphqlProbeCommits {
+    #[serde(default)]
+    nodes: Vec<Option<GraphqlProbePullRequestCommit>>,
+}
+
+#[derive(Deserialize)]
+struct GraphqlProbePullRequestCommit {
+    commit: GraphqlProbeCommit,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GraphqlProbeCommit {
+    status_check_rollup: Option<GraphqlProbeStatusCheckRollup>,
+}
+
+#[derive(Deserialize)]
+struct GraphqlProbeStatusCheckRollup {
+    state: String,
 }
 
 #[derive(Deserialize)]
@@ -447,6 +549,7 @@ struct GraphqlPagedPullRequestConnection {
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct GraphqlPullRequest {
+    id: String,
     repository: GraphqlRepository,
     head_repository: Option<GraphqlRepository>,
     number: u64,
@@ -615,14 +718,19 @@ impl GitHubGraphql {
         Ok(response.viewer.login)
     }
 
-    async fn dashboard_prs(&self, merged_since: DateTime<Utc>) -> Result<(String, Vec<PrInfo>)> {
+    async fn dashboard_prs(
+        &self,
+        merged_since: DateTime<Utc>,
+        cache: &mut GitHubDashboardCache,
+    ) -> Result<(String, Vec<PrInfo>)> {
         let viewer = self.viewer().await?;
+        cache.begin_viewer(&viewer);
         let day = merged_since.format("%Y-%m-%d");
         let mut open = SearchCursor::new(format!("is:pr is:open involves:{viewer}"));
         let mut review = SearchCursor::new(format!("is:pr is:open review-requested:{viewer}"));
         let mut merged =
             SearchCursor::new(format!("is:pr is:merged merged:>={day} involves:{viewer}"));
-        let mut ids = std::collections::BTreeSet::new();
+        let mut probes = BTreeMap::new();
 
         while open.active || review.active || merged.active {
             let response: GraphqlSearchData = self
@@ -644,17 +752,47 @@ impl GitHubGraphql {
                 .await
                 .context("searching account pull requests through GraphQL")?;
             self.trace_rate("pull request search", &response.rate_limit);
-            consume_search_page(response.open, &mut open, &mut ids);
-            consume_search_page(response.review, &mut review, &mut ids);
-            consume_search_page(response.merged, &mut merged, &mut ids);
+            consume_search_page(response.open, &mut open, &mut probes);
+            consume_search_page(response.review, &mut review, &mut probes);
+            consume_search_page(response.merged, &mut merged, &mut probes);
         }
 
-        let mut prs = self.pull_requests_by_id(ids.into_iter().collect()).await?;
+        let refresh_ids = probes
+            .iter()
+            .filter(|(id, fingerprint)| cache.needs_detail_refresh(id, fingerprint))
+            .map(|(id, _)| id.clone())
+            .collect::<Vec<_>>();
+        let refreshed = self.pull_requests_by_id(&refresh_ids).await?;
+
+        // A successful details query is authoritative even when GitHub
+        // returns null for an id (for example, access disappeared between
+        // search and enrichment). Do not keep the old snapshot in that case.
+        for id in &refresh_ids {
+            cache.entries.remove(id);
+        }
+        for (id, pull_request) in refreshed {
+            if let Some(fingerprint) = probes.get(&id) {
+                cache.entries.insert(
+                    id,
+                    CachedDashboardPullRequest {
+                        fingerprint: fingerprint.clone(),
+                        pull_request,
+                    },
+                );
+            }
+        }
+        cache.entries.retain(|id, _| probes.contains_key(id));
+
+        let mut prs = probes
+            .keys()
+            .filter_map(|id| cache.entries.get(id))
+            .map(|cached| cached.pull_request.clone())
+            .collect::<Vec<_>>();
         prs.sort_by_key(|pr| std::cmp::Reverse(pr.number));
         Ok((viewer, prs))
     }
 
-    async fn pull_requests_by_id(&self, ids: Vec<String>) -> Result<Vec<PrInfo>> {
+    async fn pull_requests_by_id(&self, ids: &[String]) -> Result<Vec<(String, PrInfo)>> {
         let mut prs = Vec::with_capacity(ids.len());
         let query = operation_with_pr_fields(DASHBOARD_DETAILS_QUERY);
         for ids in ids.chunks(DASHBOARD_GRAPHQL_BATCH) {
@@ -667,13 +805,10 @@ impl GitHubGraphql {
                 .await
                 .context("loading pull request details through GraphQL")?;
             self.trace_rate("pull request details", &response.rate_limit);
-            prs.extend(
-                response
-                    .nodes
-                    .into_iter()
-                    .flatten()
-                    .map(|pr| pr.into_pr_info(&self.host)),
-            );
+            prs.extend(response.nodes.into_iter().flatten().map(|pr| {
+                let id = pr.id.clone();
+                (id, pr.into_pr_info(&self.host))
+            }));
         }
         Ok(prs)
     }
@@ -913,7 +1048,7 @@ fn newest_comment(comments: GraphqlComments) -> Option<DateTime<Utc>> {
 fn consume_search_page(
     page: Option<GraphqlSearchConnection>,
     cursor: &mut SearchCursor,
-    ids: &mut std::collections::BTreeSet<String>,
+    probes: &mut BTreeMap<String, DashboardFingerprint>,
 ) {
     if !cursor.active {
         return;
@@ -922,7 +1057,12 @@ fn consume_search_page(
         cursor.active = false;
         return;
     };
-    ids.extend(page.nodes.into_iter().flatten().map(|node| node.id));
+    probes.extend(
+        page.nodes
+            .into_iter()
+            .flatten()
+            .map(GraphqlDashboardProbe::into_entry),
+    );
     cursor.pages += 1;
     cursor.active = page.page_info.has_next_page
         && cursor.pages < DASHBOARD_MAX_PR_PAGES
@@ -948,8 +1088,9 @@ impl GitHubAccount {
     pub async fn dashboard_prs(
         &self,
         merged_since: DateTime<Utc>,
+        cache: &mut GitHubDashboardCache,
     ) -> Result<(String, Vec<PrInfo>)> {
-        self.graphql.dashboard_prs(merged_since).await
+        self.graphql.dashboard_prs(merged_since, cache).await
     }
 }
 
@@ -1256,6 +1397,7 @@ mod tests {
     #[test]
     fn graphql_pull_request_maps_dashboard_fields() {
         let raw = serde_json::json!({
+            "id": "PR_42",
             "repository": { "nameWithOwner": "acme/widgets" },
             "headRepository": { "nameWithOwner": "acme/widgets" },
             "number": 42,
@@ -1337,12 +1479,16 @@ mod tests {
     #[test]
     fn graphql_search_stops_at_the_dashboard_page_cap() {
         let mut cursor = SearchCursor::new("is:pr".into());
-        let mut ids = std::collections::BTreeSet::new();
+        let mut probes = BTreeMap::new();
         for page in 1..=DASHBOARD_MAX_PR_PAGES {
             consume_search_page(
                 Some(GraphqlSearchConnection {
-                    nodes: vec![Some(GraphqlNodeId {
+                    nodes: vec![Some(GraphqlDashboardProbe {
                         id: format!("pr-{page}"),
+                        updated_at: "2026-07-20T12:00:00Z".parse().unwrap(),
+                        head_ref_oid: Some(format!("sha-{page}")),
+                        mergeable: "MERGEABLE".into(),
+                        commits: GraphqlProbeCommits { nodes: Vec::new() },
                     })],
                     page_info: GraphqlPageInfo {
                         has_next_page: true,
@@ -1350,12 +1496,60 @@ mod tests {
                     },
                 }),
                 &mut cursor,
-                &mut ids,
+                &mut probes,
             );
         }
 
-        assert_eq!(ids.len(), DASHBOARD_MAX_PR_PAGES);
+        assert_eq!(probes.len(), DASHBOARD_MAX_PR_PAGES);
         assert!(!cursor.active);
         assert_eq!(cursor.pages, DASHBOARD_MAX_PR_PAGES);
+    }
+
+    #[test]
+    fn dashboard_cache_reuses_unchanged_probes_and_resets_for_viewer() {
+        let fingerprint = |check_state: Option<&str>| DashboardFingerprint {
+            updated_at: "2026-07-20T12:00:00Z".parse().unwrap(),
+            head_ref_oid: Some("abc123".into()),
+            mergeable: "MERGEABLE".into(),
+            check_state: check_state.map(str::to_string),
+        };
+        let pending = fingerprint(Some("PENDING"));
+        let mut cache = GitHubDashboardCache::default();
+        cache.begin_viewer("alice");
+        assert!(cache.needs_detail_refresh("PR_42", &pending));
+
+        cache.entries.insert(
+            "PR_42".into(),
+            CachedDashboardPullRequest {
+                fingerprint: pending.clone(),
+                pull_request: PrInfo {
+                    host: "github.com".into(),
+                    repository: "acme/widgets".into(),
+                    workspace_id: String::new(),
+                    number: 42,
+                    url: "https://github.com/acme/widgets/pull/42".into(),
+                    title: "Ship the widgets".into(),
+                    state: "open".into(),
+                    draft: false,
+                    base: "main".into(),
+                    head: "ship-widgets".into(),
+                    checks: Vec::new(),
+                    reviews: Vec::new(),
+                    author: "alice".into(),
+                    requested_reviewers: Vec::new(),
+                    comments: 0,
+                    last_comment_at: None,
+                    mergeable: Some(true),
+                    merged_at: None,
+                },
+            },
+        );
+
+        assert!(!cache.needs_detail_refresh("PR_42", &pending));
+        assert!(cache.needs_detail_refresh("PR_42", &fingerprint(Some("SUCCESS"))));
+        cache.begin_viewer("alice");
+        assert_eq!(cache.entries.len(), 1);
+        cache.begin_viewer("bob");
+        assert!(cache.entries.is_empty());
     }
 }

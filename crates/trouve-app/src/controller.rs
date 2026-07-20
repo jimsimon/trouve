@@ -3890,10 +3890,8 @@ impl Controller {
             }
             // Workspace lifecycle is server-scoped so another app instance
             // can keep its sidebar in sync with opens and closes here.
-            Event::WorkspaceRegistered { .. } => {
-                if self.reload_sessions().await.is_ok() {
-                    self.sync_home_workspace();
-                }
+            Event::WorkspaceRegistered { .. } if self.reload_sessions().await.is_ok() => {
+                self.sync_home_workspace();
             }
             Event::WorkspaceClosed { workspace_id } => {
                 self.close_current_session_if_in_workspace(workspace_id);
