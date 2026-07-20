@@ -35,6 +35,17 @@ use trouve_protocol::{
 };
 use utoipa::OpenApi;
 
+/// Select the process-wide Rustls backend before any HTTP client constructs
+/// a TLS configuration. The desktop binary links both Ring (via Octocrab)
+/// and AWS-LC (via Reqwest), so Rustls cannot infer a provider from features.
+/// Ring is already required by the GitHub client and works on every target
+/// supported by the app.
+pub fn install_crypto_provider() {
+    // Another embedder may have selected a provider before calling us. In
+    // that case the process-wide choice is already valid and immutable.
+    let _ = rustls::crypto::ring::default_provider().install_default();
+}
+
 pub struct ApiError(EngineError);
 
 impl From<EngineError> for ApiError {
@@ -590,6 +601,7 @@ pub async fn bind_local(
     std::net::SocketAddr,
     impl std::future::Future<Output = anyhow::Result<()>> + Send + 'static,
 )> {
+    install_crypto_provider();
     let listener = tokio::net::TcpListener::bind(addr).await?;
     let local = listener.local_addr()?;
     let data = trouve_core::config::data_dir();
