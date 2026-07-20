@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1784530524179,
+  "lastUpdate": 1784530613396,
   "repoUrl": "https://github.com/jimsimon/trouve",
   "entries": {
     "e2e-benchmarks": [
@@ -3503,6 +3503,54 @@ window.BENCHMARK_DATA = {
             "name": "non-git warm query",
             "value": 75.3626708,
             "range": "± 1",
+            "unit": "ms"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "jim.j.simon@gmail.com",
+            "name": "Jim Simon",
+            "username": "jimsimon"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "c1ea35518dbaed65c6847782b71bdaeface9013e",
+          "message": "Add workspace close action (#70)\n\n* Add workspace close action\n\nKeep sessions and worktrees intact when a workspace is closed, and reopen it when the same folder is registered again. Expose the lifecycle over the versioned protocol and consolidate workspace header actions into an overflow menu.\n\n* Address workspace close review feedback\n\nRefresh workspace state from server lifecycle events so multiple clients stay synchronized. Add HTTP coverage for closing, hiding, and reopening a workspace.\n\n* Update OpenAPI snapshot after rebase\n\n* Keep closed workspace state consistent\n\nReset all session-derived panels when closing the active workspace, resynchronize the home workspace for local and remote lifecycle changes, and reject new session or automation activity until a closed workspace is reopened.\n\n* Clear active session on remote workspace close\n\nShare the complete session-derived UI reset between direct and server-event workspace closure paths.",
+          "timestamp": "2026-07-20T02:54:00-04:00",
+          "tree_id": "a968832695f8a934e89c5cae8f632ce344edec20",
+          "url": "https://github.com/jimsimon/trouve/commit/c1ea35518dbaed65c6847782b71bdaeface9013e"
+        },
+        "date": 1784530612895,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "cold index + query",
+            "value": 136.98095436000003,
+            "range": "± 14.7",
+            "unit": "ms"
+          },
+          {
+            "name": "warm query",
+            "value": 75.41981894,
+            "range": "± 2.7",
+            "unit": "ms"
+          },
+          {
+            "name": "incremental (1 file modified)",
+            "value": 87.06318678000001,
+            "range": "± 1.1",
+            "unit": "ms"
+          },
+          {
+            "name": "non-git warm query",
+            "value": 75.24582962000001,
+            "range": "± 3.7",
             "unit": "ms"
           }
         ]
