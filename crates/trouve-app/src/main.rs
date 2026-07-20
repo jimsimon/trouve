@@ -3,6 +3,7 @@
 
 mod controller;
 mod notify;
+mod opener;
 mod render;
 mod theme;
 mod ui;
@@ -336,7 +337,7 @@ fn main() -> anyhow::Result<()> {
             // Web links go to the system opener. File-looking links stay inside
             // the session and use the same Files-panel path as tool-card links.
             if url.starts_with("https://") || url.starts_with("http://") {
-                let _ = open::that_detached(url.as_str());
+                opener::open(url.as_str());
             } else if let Some((path, from, to)) = chat_file_link(&url) {
                 let _ = tx.send(UiCommand::OpenChatFile(path, from, to));
             }
