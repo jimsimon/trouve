@@ -2174,7 +2174,9 @@ export component AppWindow inherits Window {
                         Text {
                             text: "⚙";
                             color: Theme.c.text-mid;
-                            font-size: Theme.fs(14px);
+                            // This glyph has a smaller visual box than the
+                            // pull-request and automation symbols above.
+                            font-size: Theme.fs(18px);
                             vertical-alignment: center;
                         }
                         Text {
