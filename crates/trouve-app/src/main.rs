@@ -1029,6 +1029,24 @@ fn main() -> anyhow::Result<()> {
     }
     {
         let tx = tx.clone();
+        window.on_title_model_load_picked(move |index| {
+            let _ = tx.send(UiCommand::SetTitleModelLoadBehavior(index));
+        });
+    }
+    {
+        let tx = tx.clone();
+        window.on_title_model_install(move || {
+            let _ = tx.send(UiCommand::InstallTitleModel);
+        });
+    }
+    {
+        let tx = tx.clone();
+        window.on_title_model_cancel(move || {
+            let _ = tx.send(UiCommand::CancelTitleModelInstall);
+        });
+    }
+    {
+        let tx = tx.clone();
         window.on_cli_install(move |id| {
             let _ = tx.send(UiCommand::CliInstall(id.to_string()));
         });

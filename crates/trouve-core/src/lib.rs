@@ -19,6 +19,8 @@ pub mod permissions;
 pub mod skills;
 pub mod store;
 pub mod terminal;
+pub mod title;
+pub mod title_model;
 pub mod tools;
 
 pub use engine::Engine;

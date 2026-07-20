@@ -20,3 +20,4 @@ sequentially.
 | [0008](0008-embedded-server-in-desktop-app.md) | Desktop app embeds trouve-server in-process | Accepted |
 | [0009](0009-thread-owned-todo-snapshots.md) | Thread-owned todo snapshots | Accepted |
 | [0010](0010-account-centric-multi-instance-github.md) | Account-centric, multi-instance GitHub integration | Accepted |
+| [0011](0011-server-owned-session-title-model.md) | Server-owned session title model with heuristic fallback | Accepted |

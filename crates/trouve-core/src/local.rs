@@ -146,6 +146,29 @@ pub const CATALOG: &[CatalogEntry] = &[
 /// memory; models with smaller native windows are clamped by llama.cpp.
 pub const SERVE_CONTEXT: u64 = 32_768;
 
+/// Dedicated session-title model. It is intentionally absent from the local
+/// coding-model catalog: the title sidecar has its own lifecycle and never
+/// appears in thread model pickers.
+pub const TITLE_MODEL_ID: &str = "qwen2.5-title-0.5b";
+pub const TITLE_MODEL_CONTEXT: u64 = 1_024;
+pub const TITLE_MODEL_SHA256: &str =
+    "74a4da8c9fdbcd15bd1f6d01d621410d31c6fc00986f5eb687824e7b93d7a9db";
+pub const TITLE_MODEL_LICENSE: &str = "Apache-2.0";
+
+pub fn title_model_entry() -> ModelEntry {
+    ModelEntry {
+        id: TITLE_MODEL_ID.into(),
+        display_name: "Session naming model".into(),
+        repo: "Qwen/Qwen2.5-0.5B-Instruct-GGUF".into(),
+        file: "qwen2.5-0.5b-instruct-q4_k_m.gguf".into(),
+        size_bytes: 491_400_032,
+        params: "0.5B".into(),
+        notes: format!("Dedicated session-title model ({TITLE_MODEL_LICENSE})"),
+        custom: false,
+        thinking: Thinking::None,
+    }
+}
+
 // --- user-added models -------------------------------------------------------
 
 /// A user-added GGUF (settings → Local Models → custom). Persisted in
@@ -468,6 +491,23 @@ fn probe_ram() -> Option<u64> {
     }
 }
 
+/// Memory the OS currently considers available without swapping. Used by
+/// adaptive title-model preloading; total RAM is the conservative fallback
+/// on platforms where an available-memory probe is unavailable.
+pub fn available_ram_bytes() -> u64 {
+    if std::env::consts::OS == "linux"
+        && let Ok(meminfo) = std::fs::read_to_string("/proc/meminfo")
+        && let Some(kb) = meminfo
+            .lines()
+            .find(|line| line.starts_with("MemAvailable:"))
+            .and_then(|line| line.split_whitespace().nth(1))
+            .and_then(|value| value.parse::<u64>().ok())
+    {
+        return kb * 1024;
+    }
+    probe_ram().unwrap_or(0)
+}
+
 /// VRAM of non-NVIDIA cards from `/sys/class/drm/card*/device/`.
 fn probe_drm_gpus(drm: &Path, skip_nvidia: bool) -> Vec<LocalGpu> {
     let mut gpus = Vec::new();
@@ -530,10 +570,7 @@ pub fn fit(size_bytes: u64, hw: &Hardware) -> &'static str {
 
 // --- llama-server lifecycle ---------------------------------------------------
 
-/// Pidfile listing every llama-server this data dir has spawned and not yet
-/// cleanly killed. `kill_on_drop` only covers graceful exits — an app crash
-/// or SIGKILL leaves sidecars running (and holding VRAM), so the next start
-/// reaps whatever the file still lists.
+#[cfg(test)]
 fn pids_path(data_dir: &Path) -> PathBuf {
     data_dir.join("llama-server.pids")
 }
@@ -613,6 +650,23 @@ pub struct LlamaManager {
     state: std::sync::Mutex<ServerState>,
     /// Pidfile tracking spawned servers across app runs (crash recovery).
     pids: PathBuf,
+    context: u64,
+    cpu_only: bool,
+}
+
+/// Restores an honest stopped state if a caller cancels `ensure` while the
+/// child is loading (the title path intentionally has a short time budget).
+struct StartingGuard<'a> {
+    manager: &'a LlamaManager,
+    armed: bool,
+}
+
+impl Drop for StartingGuard<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            self.manager.set_state(ServerState::Stopped);
+        }
+    }
 }
 
 impl LlamaManager {
@@ -620,12 +674,29 @@ impl LlamaManager {
     /// run that ended without cleanup (crash/SIGKILL) — leaked servers keep
     /// multi-GB VRAM allocations alive and starve the next load.
     pub fn new(data_dir: &Path) -> Self {
-        let pids = pids_path(data_dir);
+        Self::configured(data_dir, "llama-server.pids", SERVE_CONTEXT, false)
+    }
+
+    /// Independent short-context, CPU-first sidecar used only for session
+    /// title generation.
+    pub fn title(data_dir: &Path) -> Self {
+        Self::configured(
+            data_dir,
+            "title-llama-server.pids",
+            TITLE_MODEL_CONTEXT,
+            true,
+        )
+    }
+
+    fn configured(data_dir: &Path, pidfile: &str, context: u64, cpu_only: bool) -> Self {
+        let pids = data_dir.join(pidfile);
         Self::reap_stale(&pids, data_dir);
         Self {
             inner: tokio::sync::Mutex::new(None),
             state: std::sync::Mutex::new(ServerState::Stopped),
             pids,
+            context,
+            cpu_only,
         }
     }
 
@@ -715,9 +786,14 @@ impl LlamaManager {
             *inner = None;
         }
         self.set_state(ServerState::Starting(model_id.to_string()));
+        let mut starting = StartingGuard {
+            manager: self,
+            armed: true,
+        };
         match self.spawn_and_wait(bin, gguf, log_path).await {
             Ok((port, child)) => {
                 self.set_state(ServerState::Running(model_id.to_string()));
+                starting.armed = false;
                 *inner = Some(Running {
                     model_id: model_id.to_string(),
                     port,
@@ -725,10 +801,7 @@ impl LlamaManager {
                 });
                 Ok(format!("http://127.0.0.1:{port}/v1"))
             }
-            Err(e) => {
-                self.set_state(ServerState::Stopped);
-                Err(e)
-            }
+            Err(e) => Err(e),
         }
     }
 
@@ -750,7 +823,7 @@ impl LlamaManager {
             .args(["--host", "127.0.0.1", "--port"])
             .arg(port.to_string())
             .arg("-c")
-            .arg(SERVE_CONTEXT.to_string())
+            .arg(self.context.to_string())
             // No -ngl: llama.cpp then auto-fits n_gpu_layers to *free* VRAM,
             // spilling gracefully to CPU instead of into GTT/system memory
             // over PCIe (forcing 999 disables the fit and runs at ~5 tok/s
@@ -761,6 +834,11 @@ impl LlamaManager {
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::from(log))
             .kill_on_drop(true);
+        if self.cpu_only {
+            // The title helper is intentionally small enough for CPU use and
+            // must not compete with a coding model for VRAM.
+            cmd.args(["-ngl", "0"]);
+        }
         // The release tarballs carry their shared libraries next to the
         // binary; rpath usually covers it, but belt and braces.
         if let Some(dir) = bin.parent() {

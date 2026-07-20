@@ -78,7 +78,11 @@ pub use requests::*;
 // account-centric, multi-instance feed (breaking route/event replacement),
 // and DELETE /v1/workspaces/{id} closes a workspace without deleting its
 // sessions while workspace.closed records the state change.
-pub const PROTOCOL_VERSION: &str = "1.0";
+// 1.1: Git & Worktrees settings persist the title-model load behavior;
+// title-model status/install endpoints and POST /v1/session-title provide
+// synchronous model-assisted naming with a deterministic fallback, while
+// settings.git_worktrees_updated carries lifecycle snapshots (additive).
+pub const PROTOCOL_VERSION: &str = "1.1";
 
 pub type WorkspaceId = String;
 pub type SessionId = String;

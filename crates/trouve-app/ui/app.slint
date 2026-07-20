@@ -1504,8 +1504,17 @@ export component AppWindow inherits Window {
     in property <string> settings-status: "";
     in-out property <int> settings-preset-index: 0;
     // Which settings section shows when the screen opens (0 providers …
-    // 3 integrations); the controller sets it before flipping center-screen.
+    // 4 integrations); the controller sets it before flipping center-screen.
     in-out property <int> settings-section: 0;
+    in-out property <int> settings-title-model-load-index: 0;
+    in property <string> settings-title-model-state: "not_installed";
+    in property <string> settings-title-model-detail: "";
+    in property <bool> settings-title-model-installed: false;
+    in property <bool> settings-title-model-installing: false;
+    in property <int> settings-title-model-install-progress: -1;
+    callback title-model-load-picked(int);
+    callback title-model-install();
+    callback title-model-cancel();
     in property <[GithubHostItem]> settings-github-hosts;
     callback github-host-added(/* host */ string, /* client-id */ string);
     callback github-host-removed(/* host */ string);
@@ -5266,6 +5275,15 @@ export component AppWindow inherits Window {
         settings-status: root.settings-status;
         preset-index <=> root.settings-preset-index;
         section <=> root.settings-section;
+        title-model-load-index <=> root.settings-title-model-load-index;
+        title-model-state: root.settings-title-model-state;
+        title-model-detail: root.settings-title-model-detail;
+        title-model-installed: root.settings-title-model-installed;
+        title-model-installing: root.settings-title-model-installing;
+        title-model-install-progress: root.settings-title-model-install-progress;
+        title-model-load-picked(i) => { root.title-model-load-picked(i); }
+        title-model-install => { root.title-model-install(); }
+        title-model-cancel => { root.title-model-cancel(); }
         github-hosts: root.settings-github-hosts;
         github-host-added(host, client-id) => { root.github-host-added(host, client-id); }
         github-host-removed(host) => { root.github-host-removed(host); }

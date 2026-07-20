@@ -960,6 +960,31 @@ pub fn set_settings_section(ui: &Ui, section: i32) {
     let _ = ui.upgrade_in_event_loop(move |ui| ui.set_settings_section(section));
 }
 
+pub fn set_git_worktree_settings(ui: &Ui, settings: trouve_protocol::GitWorktreeSettings) {
+    let behavior = match settings.title_model_load_behavior {
+        trouve_protocol::TitleModelLoadBehavior::Auto => 0,
+        trouve_protocol::TitleModelLoadBehavior::Always => 1,
+        trouve_protocol::TitleModelLoadBehavior::OnDemand => 2,
+        trouve_protocol::TitleModelLoadBehavior::Off => 3,
+    };
+    let status = settings.title_model;
+    let installed = status.runtime_installed && status.model_downloaded;
+    let installing = status.state == "installing";
+    let progress = if installing && status.install_total > 0 {
+        ((status.install_bytes.saturating_mul(100) / status.install_total).min(100)) as i32
+    } else {
+        -1
+    };
+    let _ = ui.upgrade_in_event_loop(move |ui| {
+        ui.set_settings_title_model_load_index(behavior);
+        ui.set_settings_title_model_state(status.state.into());
+        ui.set_settings_title_model_detail(status.detail.into());
+        ui.set_settings_title_model_installed(installed);
+        ui.set_settings_title_model_installing(installing);
+        ui.set_settings_title_model_install_progress(progress);
+    });
+}
+
 pub fn set_diff(ui: &Ui, rows: Vec<slint_diff_view::RowData>, raw: String) {
     let _ = ui.upgrade_in_event_loop(move |ui| {
         let items: Vec<DiffRow> = rows
