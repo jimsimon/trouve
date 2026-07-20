@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1784524912627,
+  "lastUpdate": 1784528130368,
   "repoUrl": "https://github.com/jimsimon/trouve",
   "entries": {
     "e2e-benchmarks": [
@@ -3263,6 +3263,54 @@ window.BENCHMARK_DATA = {
             "name": "non-git warm query",
             "value": 61.31423534,
             "range": "± 2.3",
+            "unit": "ms"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "29139614+renovate[bot]@users.noreply.github.com",
+            "name": "renovate[bot]",
+            "username": "renovate[bot]"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "df740abafb47606d0a3e3266012e3eb5638bd09d",
+          "message": "Lock file maintenance (#109)\n\n* Lock file maintenance\n\n* Pin plugin Node types for Bun declarations\n\n* Reconcile lockfiles with main\n\n---------\n\nCo-authored-by: renovate[bot] <29139614+renovate[bot]@users.noreply.github.com>\nCo-authored-by: Codex <codex@openai.com>",
+          "timestamp": "2026-07-20T02:14:00-04:00",
+          "tree_id": "70139812417b07b049e9b5cc06980f9c777e49bf",
+          "url": "https://github.com/jimsimon/trouve/commit/df740abafb47606d0a3e3266012e3eb5638bd09d"
+        },
+        "date": 1784528129302,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "cold index + query",
+            "value": 136.7024235,
+            "range": "± 5",
+            "unit": "ms"
+          },
+          {
+            "name": "warm query",
+            "value": 77.92253854,
+            "range": "± 1.9",
+            "unit": "ms"
+          },
+          {
+            "name": "incremental (1 file modified)",
+            "value": 90.84493082,
+            "range": "± 3",
+            "unit": "ms"
+          },
+          {
+            "name": "non-git warm query",
+            "value": 76.59683938,
+            "range": "± 1.4",
             "unit": "ms"
           }
         ]
