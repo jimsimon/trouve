@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1784505587069,
+  "lastUpdate": 1784514598508,
   "repoUrl": "https://github.com/jimsimon/trouve",
   "entries": {
     "e2e-benchmarks": [
@@ -2975,6 +2975,54 @@ window.BENCHMARK_DATA = {
             "name": "non-git warm query",
             "value": 57.598679440000005,
             "range": "± 2.8",
+            "unit": "ms"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "jim.j.simon@gmail.com",
+            "name": "Jim Simon",
+            "username": "jimsimon"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "ee24df742f6a1b8a73d4262b982b511045a34037",
+          "message": "Generate session titles offline (#96)",
+          "timestamp": "2026-07-19T22:27:46-04:00",
+          "tree_id": "9b8c303a19cd17e6543be3e402ffa488e99dad88",
+          "url": "https://github.com/jimsimon/trouve/commit/ee24df742f6a1b8a73d4262b982b511045a34037"
+        },
+        "date": 1784514597539,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "cold index + query",
+            "value": 106.47329214000001,
+            "range": "± 841.4",
+            "unit": "ms"
+          },
+          {
+            "name": "warm query",
+            "value": 59.062030799999995,
+            "range": "± 0.5",
+            "unit": "ms"
+          },
+          {
+            "name": "incremental (1 file modified)",
+            "value": 103.98160406000001,
+            "range": "± 27.2",
+            "unit": "ms"
+          },
+          {
+            "name": "non-git warm query",
+            "value": 56.86978294,
+            "range": "± 0.8",
             "unit": "ms"
           }
         ]
