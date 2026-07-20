@@ -102,6 +102,8 @@ pub struct ThreadViewModel {
     pub commands: Vec<trouve_protocol::CommandInfo>,
     /// Prompts waiting their turn, in run order (latest announcement wins).
     pub queue: Vec<trouve_protocol::QueuedPrompt>,
+    /// Current thread todo snapshot (latest announcement wins).
+    pub todos: Vec<trouve_protocol::TodoItem>,
 }
 
 impl ThreadViewModel {
@@ -164,6 +166,10 @@ impl ThreadViewModel {
             }
             Event::QueueUpdated { prompts } => {
                 self.queue = prompts.clone();
+                None
+            }
+            Event::TodosUpdated { todos } => {
+                self.todos = todos.clone();
                 None
             }
             Event::CompactionCompleted { .. } => {
@@ -468,6 +474,31 @@ mod tests {
         completed.ts = start + chrono::Duration::milliseconds(12_400);
         vm.apply(&completed);
         assert_eq!(vm.turn_duration_ms.get(&1), Some(&12_400));
+    }
+
+    #[test]
+    fn todo_snapshot_replaces_previous_state_without_adding_chat_rows() {
+        let mut vm = ThreadViewModel::new();
+        let first = trouve_protocol::TodoItem {
+            id: "one".into(),
+            content: "First".into(),
+            status: trouve_protocol::TodoStatus::InProgress,
+        };
+        assert_eq!(
+            vm.apply(&env(Event::TodosUpdated { todos: vec![first] })),
+            None
+        );
+        let completed = trouve_protocol::TodoItem {
+            id: "one".into(),
+            content: "First".into(),
+            status: trouve_protocol::TodoStatus::Completed,
+        };
+        vm.apply(&env(Event::TodosUpdated {
+            todos: vec![completed.clone()],
+        }));
+
+        assert_eq!(vm.todos, vec![completed]);
+        assert!(vm.items.is_empty());
     }
 
     #[test]

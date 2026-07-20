@@ -17,7 +17,7 @@ mod web;
 pub use search::{VENDOR_SEARCH_GUIDANCE, gc_index_store_in_background, warm_index_in_background};
 
 use std::path::{Component, Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result, bail};
 use serde_json::Value;
@@ -29,6 +29,12 @@ use trouve_providers::ToolSpec;
 #[derive(Debug, Clone, Default)]
 pub struct ToolCtx {
     pub worktree: PathBuf,
+    /// Stable owner for thread-scoped tool artifacts. Empty only in isolated
+    /// tool tests that do not exercise thread state.
+    pub thread_id: String,
+    /// Mutable todo snapshot shared by every tool call in one turn. The
+    /// engine seeds it from persistence and commits successful updates.
+    pub todos: Arc<Mutex<Vec<trouve_protocol::TodoItem>>>,
     /// Config dir for global tool discovery (MCP servers); None in tests.
     pub config_dir: Option<PathBuf>,
     /// Registered workspace repo root: its `.agents/.mcp.json` applies even
@@ -161,7 +167,7 @@ impl LocalToolExecutor {
                 Arc::new(shell::ShellKill { jobs: jobs.clone() }),
                 Arc::new(grep::Grep),
                 Arc::new(web::WebFetch::default()),
-                Arc::new(todo::TodoWrite::default()),
+                Arc::new(todo::TodoWrite),
                 Arc::new(search::Search {
                     cache: search_cache.clone(),
                 }),

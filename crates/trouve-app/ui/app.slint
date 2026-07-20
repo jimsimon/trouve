@@ -1,7 +1,7 @@
 // trouve desktop: three-column layout.
 //   left   — sessions grouped by workspace, settings footer
 //   center — thread tabs, chat stream, composer (or the new-chat screen)
-//   right  — inspection tabs (Diff / Files)
+//   right  — inspection tabs plus a conditional thread Todos panel
 //
 // The window is intentionally dumb: models in, callbacks out. All state
 // folding happens in Rust (client-core view models + the app controller).
@@ -64,6 +64,14 @@ export struct NavRow {
 export struct ThreadTabItem {
     id: string,
     label: string,
+    // Empty when this thread has no todo list; otherwise completed/total.
+    todo-progress: string,
+}
+
+export struct TodoUiItem {
+    content: string,
+    // 0 pending, 1 in progress, 2 completed, 3 cancelled.
+    status: int,
 }
 
 // One pull request in the Pull Requests tab. Checks and reviews come
@@ -1439,6 +1447,13 @@ export component AppWindow inherits Window {
     callback thread-selected(int);
     callback new-thread();
 
+    // Current todo snapshot for the active thread. An empty model hides both
+    // the sticky summary and the conditional right-side Todos tab.
+    in property <[TodoUiItem]> todos;
+    in property <string> todo-progress: "";
+    in property <string> todo-current: "";
+    in-out property <bool> todos-expanded: false;
+
     in property <[ChatRow]> chat-rows;
     callback approval-resolved(/* row index */ int, /* approved */ bool);
     // Question wizard (kind 10): option toggles (index == options.length is
@@ -1459,9 +1474,9 @@ export component AppWindow inherits Window {
     in property <int> file-sel-from: -1;
     in property <int> file-sel-to: -1;
     in property <int> file-sel-seq: 0;
-    // Right-panel tab (0 diff, 1 files, 2 pull requests, 3 mcp,
-    // 4 terminal); the controller flips it when a chat click opens a file,
-    // and watches it to lazily attach the terminal.
+    // Right-panel view (0 diff, 1 files, 2 pull requests, 3 mcp,
+    // 4 terminal, 5 conditional todos); the controller flips it when a chat
+    // click opens a file, and watches it to lazily attach the terminal.
     in-out property <int> right-tab: 0;
     callback right-tab-changed(int);
     changed right-tab => { root.right-tab-changed(root.right-tab); }
@@ -2488,7 +2503,7 @@ export component AppWindow inherits Window {
                 HorizontalLayout {
                     spacing: 6px;
                     for thread[idx] in root.threads: Rectangle {
-                        width: 130px;
+                        width: 145px;
                         height: Theme.fs(30px);
                         background: idx == root.current-thread ? Theme.c.accent-bg : Theme.c.control-bg;
                         border-radius: 6px;
@@ -2502,8 +2517,26 @@ export component AppWindow inherits Window {
                             horizontal-alignment: center;
                             vertical-alignment: center;
                             overflow: elide;
-                            width: parent.width - 12px;
+                            width: parent.width - (thread.todo-progress == "" ? 12px : 50px);
                             x: 6px;
+                        }
+                        if thread.todo-progress != "": Rectangle {
+                            x: parent.width - 40px;
+                            y: (parent.height - self.height) / 2;
+                            width: 34px;
+                            height: Theme.fs(18px);
+                            border-radius: 9px;
+                            background: idx == root.current-thread
+                                ? Theme.c.accent-dim : Theme.c.pill-bg;
+                            Text {
+                                width: 100%;
+                                height: 100%;
+                                text: thread.todo-progress;
+                                color: Theme.c.text-mid;
+                                font-size: Theme.fs(10px);
+                                horizontal-alignment: center;
+                                vertical-alignment: center;
+                            }
                         }
                     }
                     IconButton {
@@ -3483,6 +3516,85 @@ export component AppWindow inherits Window {
                 }
                 }
 
+                // Current-thread todo summary stays visible above the
+                // composer. Expanding it reveals the full checklist without
+                // losing the historical todo cards in the chat stream.
+                if root.center-screen == 0 && root.todos.length > 0: Rectangle {
+                    vertical-stretch: 0;
+                    background: Theme.c.surface;
+                    border-radius: 8px;
+                    border-width: 1px;
+                    border-color: Theme.c.border;
+                    height: todo-sticky.preferred-height;
+                    todo-sticky := VerticalLayout {
+                        padding: 8px;
+                        spacing: 5px;
+                        Rectangle {
+                            height: Theme.fs(24px);
+                            todo-head-ta := TouchArea {
+                                mouse-cursor: pointer;
+                                clicked => { root.todos-expanded = !root.todos-expanded; }
+                            }
+                            HorizontalLayout {
+                                spacing: 8px;
+                                Text {
+                                    text: "Todos";
+                                    color: Theme.c.text-hi;
+                                    font-size: Theme.fs(12px);
+                                    font-weight: 700;
+                                    vertical-alignment: center;
+                                }
+                                Text {
+                                    text: root.todo-progress;
+                                    color: Theme.c.text-soft;
+                                    font-size: Theme.fs(11px);
+                                    vertical-alignment: center;
+                                }
+                                Text {
+                                    text: root.todo-current;
+                                    color: Theme.c.text;
+                                    font-size: Theme.fs(12px);
+                                    vertical-alignment: center;
+                                    overflow: elide;
+                                    horizontal-stretch: 1;
+                                }
+                                Text {
+                                    text: root.todos-expanded ? "▾" : "▸";
+                                    color: Theme.c.text-soft;
+                                    font-size: Theme.fs(11px);
+                                    vertical-alignment: center;
+                                }
+                            }
+                        }
+                        if root.todos-expanded: VerticalLayout {
+                            spacing: 4px;
+                            for todo in root.todos: HorizontalLayout {
+                                spacing: 7px;
+                                Text {
+                                    width: 14px;
+                                    text: todo.status == 2 ? "✓"
+                                        : todo.status == 1 ? "▸"
+                                        : todo.status == 3 ? "✕" : "○";
+                                    color: todo.status == 2 ? Theme.c.ok
+                                        : todo.status == 1 ? Theme.c.accent
+                                        : todo.status == 3 ? Theme.c.text-disabled
+                                        : Theme.c.text-soft;
+                                    font-size: Theme.fs(12px);
+                                    vertical-alignment: center;
+                                    horizontal-alignment: center;
+                                }
+                                Text {
+                                    text: todo.content;
+                                    color: todo.status >= 2 ? Theme.c.text-disabled : Theme.c.text;
+                                    font-size: Theme.fs(12px);
+                                    wrap: word-wrap;
+                                    horizontal-stretch: 1;
+                                }
+                            }
+                        }
+                    }
+                }
+
                 // Composer: multiline prompt on top (grows with content),
                 // then a controls row — pickers, model knobs, send, dial.
                 // Only the chat list above stretches; the composer sticks
@@ -4102,7 +4214,25 @@ export component AppWindow inherits Window {
             width: root.right-width;
             background: Theme.c.panel-bg;
 
-            TabWidget {
+            VerticalLayout {
+                spacing: 0px;
+                if root.todos.length > 0: Rectangle {
+                    height: Theme.fs(34px);
+                    background: Theme.c.raised-bg;
+                    HorizontalLayout {
+                        padding-left: 6px;
+                        padding-right: 6px;
+                        Rectangle { horizontal-stretch: 1; }
+                        PillButton {
+                            label: root.right-tab == 5 ? "← Diff" : "Todos  " + root.todo-progress;
+                            primary: root.right-tab == 5;
+                            clicked => { root.right-tab = root.right-tab == 5 ? 0 : 5; }
+                        }
+                    }
+                }
+
+            if root.right-tab != 5: TabWidget {
+                vertical-stretch: 1;
                 current-index <=> root.right-tab;
                 Tab {
                     title: "Diff";
@@ -4741,6 +4871,71 @@ export component AppWindow inherits Window {
                             grid-resized(cols, rows) => { root.term-resized(cols, rows); }
                         }
                     }
+                }
+            }
+                if root.right-tab == 5 && root.todos.length > 0: VerticalLayout {
+                        vertical-stretch: 1;
+                        padding: 10px;
+                        spacing: 8px;
+                        HorizontalLayout {
+                            spacing: 8px;
+                            Text {
+                                text: "Thread todos";
+                                color: Theme.c.text-hi;
+                                font-size: Theme.fs(13px);
+                                font-weight: 700;
+                                vertical-alignment: center;
+                                horizontal-stretch: 1;
+                            }
+                            Text {
+                                text: root.todo-progress;
+                                color: Theme.c.text-soft;
+                                font-size: Theme.fs(11px);
+                                vertical-alignment: center;
+                            }
+                        }
+                        Rectangle {
+                            vertical-stretch: 1;
+                            background: Theme.c.surface;
+                            border-radius: 6px;
+                            ScrollKeys {
+                                target-y <=> todos-scroll.viewport-y;
+                                page: todos-scroll.visible-height;
+                                total: todos-scroll.viewport-height;
+                            todos-scroll := ListView {
+                                for todo in root.todos: Rectangle {
+                                    height: max(Theme.fs(34px), todo-panel-row.preferred-height + 14px);
+                                    todo-panel-row := HorizontalLayout {
+                                        padding-left: 10px;
+                                        padding-right: 10px;
+                                        spacing: 8px;
+                                        Text {
+                                            width: 16px;
+                                            text: todo.status == 2 ? "✓"
+                                                : todo.status == 1 ? "▸"
+                                                : todo.status == 3 ? "✕" : "○";
+                                            color: todo.status == 2 ? Theme.c.ok
+                                                : todo.status == 1 ? Theme.c.accent
+                                                : todo.status == 3 ? Theme.c.text-disabled
+                                                : Theme.c.text-soft;
+                                            font-size: Theme.fs(13px);
+                                            vertical-alignment: center;
+                                            horizontal-alignment: center;
+                                        }
+                                        Text {
+                                            text: todo.content;
+                                            color: todo.status >= 2
+                                                ? Theme.c.text-disabled : Theme.c.text;
+                                            font-size: Theme.fs(12px);
+                                            wrap: word-wrap;
+                                            vertical-alignment: center;
+                                            horizontal-stretch: 1;
+                                        }
+                                    }
+                                }
+                            }
+                            }
+                        }
                 }
             }
         }

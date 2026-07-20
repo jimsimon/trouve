@@ -77,6 +77,9 @@ Thread scope:
 - `thread.queue_updated` `{prompts}` — the thread's queue of pending prompts
   changed (enqueue/edit/reorder/delete/dispatch); carries the full remaining
   queue in run order, so replaying to the tail reproduces the current queue
+- `thread.todos_updated` `{todos}` — the thread's current todo snapshot
+  changed; carries the full replacement list while `tool.*` events retain
+  the history of how it changed
 
 Session scope:
 

@@ -7,7 +7,7 @@
       "name": "MIT",
       "identifier": "MIT"
     },
-    "version": "0.24"
+    "version": "0.25"
   },
   "paths": {
     "/v1/approvals": {
@@ -4062,6 +4062,28 @@
           },
           {
             "type": "object",
+            "description": "The thread's current todo snapshot changed. Historical `todo_write`\ntool calls remain in the stream; clients replace this snapshot.",
+            "required": [
+              "todos",
+              "type"
+            ],
+            "properties": {
+              "todos": {
+                "type": "array",
+                "items": {
+                  "$ref": "#/components/schemas/TodoItem"
+                }
+              },
+              "type": {
+                "type": "string",
+                "enum": [
+                  "thread.todos_updated"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
             "description": "The thread's transcript neared the model's context window; the engine\nis summarizing older messages. Clients show a busy indicator.",
             "required": [
               "turn",
@@ -5791,8 +5813,45 @@
           "spawned": {
             "type": "boolean",
             "description": "True when an agent spawned this thread (spawn_thread/spawn_session\ntools) rather than the user; clients mark such threads visually."
+          },
+          "todos": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/TodoItem"
+            },
+            "description": "Current todo snapshot for this thread. Tool-call events retain the\nhistory of how the list changed; this field is the initial-load view."
           }
         }
+      },
+      "TodoItem": {
+        "type": "object",
+        "description": "One stable item in a thread's current todo list.",
+        "required": [
+          "id",
+          "content",
+          "status"
+        ],
+        "properties": {
+          "content": {
+            "type": "string"
+          },
+          "id": {
+            "type": "string"
+          },
+          "status": {
+            "$ref": "#/components/schemas/TodoStatus"
+          }
+        }
+      },
+      "TodoStatus": {
+        "type": "string",
+        "description": "Progress state for one item in a thread's current todo list.",
+        "enum": [
+          "pending",
+          "in_progress",
+          "completed",
+          "cancelled"
+        ]
       },
       "ToolStatus": {
         "type": "string",

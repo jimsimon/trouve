@@ -213,6 +213,11 @@ pub enum Event {
     #[serde(rename = "thread.queue_updated")]
     QueueUpdated { prompts: Vec<crate::QueuedPrompt> },
 
+    /// The thread's current todo snapshot changed. Historical `todo_write`
+    /// tool calls remain in the stream; clients replace this snapshot.
+    #[serde(rename = "thread.todos_updated")]
+    TodosUpdated { todos: Vec<crate::TodoItem> },
+
     /// The thread's transcript neared the model's context window; the engine
     /// is summarizing older messages. Clients show a busy indicator.
     #[serde(rename = "thread.compaction_started")]

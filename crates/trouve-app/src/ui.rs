@@ -7,7 +7,7 @@ use slint::{ModelRc, SharedString, VecModel};
 use crate::render::ChatRowData;
 use crate::{
     AppWindow, ChatRow, ChatTableCell, CliItem, DiffRow, FileItem, KnownProviderItem, NavRow,
-    ProviderItem, QOption, QPair, TextSegment, ThreadTabItem,
+    ProviderItem, QOption, QPair, TextSegment, ThreadTabItem, TodoUiItem,
 };
 
 type Ui = slint::Weak<AppWindow>;
@@ -197,17 +197,33 @@ fn set_nav_now(ui: &AppWindow, rows: Vec<NavRowData>) {
     }
 }
 
-pub fn set_threads(ui: &Ui, threads: Vec<(String, String)>, current: i32) {
+pub fn set_threads(ui: &Ui, threads: Vec<(String, String, String)>, current: i32) {
     let _ = ui.upgrade_in_event_loop(move |ui| {
         let items: Vec<ThreadTabItem> = threads
             .into_iter()
-            .map(|(id, label)| ThreadTabItem {
+            .map(|(id, label, todo_progress)| ThreadTabItem {
                 id: id.into(),
                 label: label.into(),
+                todo_progress: todo_progress.into(),
             })
             .collect();
         ui.set_threads(ModelRc::new(VecModel::from(items)));
         ui.set_current_thread(current);
+    });
+}
+
+pub fn set_todos(ui: &Ui, todos: Vec<(String, i32)>, progress: String, current: String) {
+    let _ = ui.upgrade_in_event_loop(move |ui| {
+        let items: Vec<TodoUiItem> = todos
+            .into_iter()
+            .map(|(content, status)| TodoUiItem {
+                content: content.into(),
+                status,
+            })
+            .collect();
+        ui.set_todos(ModelRc::new(VecModel::from(items)));
+        ui.set_todo_progress(progress.into());
+        ui.set_todo_current(current.into());
     });
 }
 
@@ -499,7 +515,7 @@ pub fn set_center_screen(ui: &Ui, screen: i32) {
     let _ = ui.upgrade_in_event_loop(move |ui| ui.set_center_screen(screen));
 }
 
-/// Right-panel tab: 0 = Diff, 1 = Files.
+/// Select a right-panel tab by its stable index.
 pub fn set_right_tab(ui: &Ui, tab: i32) {
     let _ = ui.upgrade_in_event_loop(move |ui| ui.set_right_tab(tab));
 }
