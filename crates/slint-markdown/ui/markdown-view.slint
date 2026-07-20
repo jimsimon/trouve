@@ -24,6 +24,35 @@ export struct MarkdownBlock {
     table-rows: [[MarkdownTableCell]],
 }
 
+// Keep the wrapping text inside a component so its height-for-width layout
+// information survives use in a repeater. A bare repeated Rectangle only
+// reports its unconstrained (single-line) preferred height to the row.
+component MarkdownTableGridCell inherits Rectangle {
+    in property <string> text;
+    in property <int> alignment;
+    in property <bool> header;
+    in property <length> body-font-size;
+    in property <color> foreground;
+    in property <color> header-background;
+    in property <color> row-background;
+
+    background: root.header ? root.header-background : root.row-background;
+
+    VerticalLayout {
+        padding: 6px;
+
+        Text {
+            text: root.text;
+            wrap: word-wrap;
+            color: root.foreground;
+            font-size: root.body-font-size;
+            font-weight: root.header ? 700 : 400;
+            horizontal-alignment: root.alignment == 3 ? right
+                : root.alignment == 2 ? center : left;
+        }
+    }
+}
+
 export component MarkdownView inherits Rectangle {
     in property <[MarkdownBlock]> blocks;
     in property <length> body-font-size: 14px;
@@ -80,26 +109,16 @@ export component MarkdownView inherits Rectangle {
                         for table-row[row-index] in block.table-rows: row-layout := HorizontalLayout {
                             spacing: 1px;
 
-                            for cell in table-row: Rectangle {
+                            for cell in table-row: MarkdownTableGridCell {
                                 min-width: (row-layout.width - 1px * (table-row.length - 1)) / table-row.length;
                                 max-width: self.min-width;
-                                background: row-index == 0
-                                    ? root.table-header-background
-                                    : root.table-row-background;
-
-                                VerticalLayout {
-                                    padding: 6px;
-
-                                    Text {
-                                        text: cell.text;
-                                        wrap: word-wrap;
-                                        color: root.foreground;
-                                        font-size: root.body-font-size;
-                                        font-weight: row-index == 0 ? 700 : 400;
-                                        horizontal-alignment: cell.alignment == 3 ? right
-                                            : cell.alignment == 2 ? center : left;
-                                    }
-                                }
+                                text: cell.text;
+                                alignment: cell.alignment;
+                                header: row-index == 0;
+                                body-font-size: root.body-font-size;
+                                foreground: root.foreground;
+                                header-background: root.table-header-background;
+                                row-background: root.table-row-background;
                             }
                         }
                     }

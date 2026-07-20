@@ -1656,4 +1656,35 @@ mod tests {
             &[("b".into(), -1), ("b".into(), 1), ("b".into(), -1)]
         );
     }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    fn markdown_table_rows_grow_for_wrapped_cells() {
+        i_slint_backend_testing::init_no_event_loop();
+
+        let ui = AppWindow::new().unwrap();
+        ui.window().set_size(PhysicalSize::new(700, 700));
+        let rows = crate::render::markdown_rows(
+            "| Name | Description |\n\
+             | --- | --- |\n\
+             | alpha | This cell contains enough words to wrap across several lines even when the surrounding chat panel has plenty of room. |",
+        );
+        ui.set_chat_rows(ModelRc::new(VecModel::from(
+            rows.iter().map(to_chat_row).collect::<Vec<_>>(),
+        )));
+        ui.show().unwrap();
+        i_slint_backend_testing::mock_elapsed_time(std::time::Duration::ZERO);
+
+        let cell_heights = i_slint_backend_testing::ElementHandle::find_by_element_id(
+            &ui,
+            "TableGrid::cell-background",
+        )
+        .map(|element| element.size().height)
+        .collect::<Vec<_>>();
+        assert_eq!(cell_heights.len(), 4);
+        assert!(
+            cell_heights.iter().any(|height| *height > 40.0),
+            "expected a multiline table cell, got heights {cell_heights:?}"
+        );
+    }
 }
