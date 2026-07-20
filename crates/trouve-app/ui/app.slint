@@ -1305,6 +1305,7 @@ export component AppWindow inherits Window {
 
     // --- pull requests screen --------------------------------------------------
     in property <[PrGroupItem]> pr-dash-groups;
+    in property <[[int]]> pr-dash-group-columns;
     in property <[string]> pr-dash-projects;
     in-out property <int> pr-dash-project-index: 0;
     in property <string> pr-dash-status: "";
@@ -4983,6 +4984,7 @@ export component AppWindow inherits Window {
         width: 100%;
         height: 100%;
         groups: root.pr-dash-groups;
+        group-columns: root.pr-dash-group-columns;
         project-names: root.pr-dash-projects;
         project-index <=> root.pr-dash-project-index;
         status: root.pr-dash-status;

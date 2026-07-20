@@ -740,7 +740,22 @@ pub fn set_pr_dashboard(
                 )),
             })
             .collect();
+        // Keep each half of the ordered groups in its own visual column.
+        // The Slint screen stacks these column models at narrow widths, so
+        // their contiguous ranges also preserve the configured group order.
+        let split = items.len().div_ceil(2);
+        let columns: Vec<ModelRc<i32>> = if split == 0 {
+            Vec::new()
+        } else {
+            (0..items.len())
+                .map(|index| index as i32)
+                .collect::<Vec<_>>()
+                .chunks(split)
+                .map(|column| ModelRc::new(VecModel::from(column.to_vec())))
+                .collect()
+        };
         ui.set_pr_dash_groups(ModelRc::new(VecModel::from(items)));
+        ui.set_pr_dash_group_columns(ModelRc::new(VecModel::from(columns)));
         ui.set_pr_dash_projects(string_model(projects));
         ui.set_pr_dash_project_index(project_index);
         ui.set_pr_dash_status(SharedString::from(status.as_str()));
