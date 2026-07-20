@@ -453,6 +453,16 @@ pub fn set_composer_turn_running(ui: &Ui, running: bool) {
     let _ = ui.upgrade_in_event_loop(move |ui| ui.set_composer_turn_running(running));
 }
 
+/// Restore the draft owned by `thread_id`. The key is updated before the
+/// text so Slint's changed callback always reports the edit under the thread
+/// whose composer is now visible.
+pub fn set_composer_draft(ui: &Ui, thread_id: String, draft: String) {
+    let _ = ui.upgrade_in_event_loop(move |ui| {
+        ui.set_composer_thread_key(thread_id.into());
+        ui.set_composer_draft(draft.into());
+    });
+}
+
 /// Slash commands the current thread's harness accepts, as (name,
 /// description) pairs — the prompt box's "/" completion popup.
 pub fn set_slash_commands(ui: &Ui, commands: Vec<(String, String)>) {
