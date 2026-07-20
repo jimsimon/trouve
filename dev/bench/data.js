@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1784521621876,
+  "lastUpdate": 1784521675233,
   "repoUrl": "https://github.com/jimsimon/trouve",
   "entries": {
     "e2e-benchmarks": [
@@ -6289,6 +6289,54 @@ window.BENCHMARK_DATA = {
             "name": "dense_query_20k_rows",
             "value": 1390368.7170716114,
             "range": "± 16083",
+            "unit": "ns"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "jim.j.simon@gmail.com",
+            "name": "Jim Simon",
+            "username": "jimsimon"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "237a51c67cbeb09e055d5065e69b70d63054c831",
+          "message": "Unify workspace session status indicators (#101)\n\n* Unify session status indicators\n\n* Show failed turns in session status",
+          "timestamp": "2026-07-20T00:22:36-04:00",
+          "tree_id": "c500463fa4c46554fcaff11e9e0acd6b101cd278",
+          "url": "https://github.com/jimsimon/trouve/commit/237a51c67cbeb09e055d5065e69b70d63054c831"
+        },
+        "date": 1784521674198,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "bm25_build_5k_docs",
+            "value": 5282191.6,
+            "range": "± 16032",
+            "unit": "ns"
+          },
+          {
+            "name": "bm25_query_5k_docs",
+            "value": 36766.45953999212,
+            "range": "± 19",
+            "unit": "ns"
+          },
+          {
+            "name": "chunk_python_200_functions",
+            "value": 3020655.794117647,
+            "range": "± 2208",
+            "unit": "ns"
+          },
+          {
+            "name": "dense_query_20k_rows",
+            "value": 1371275.9826653553,
+            "range": "± 10665",
             "unit": "ns"
           }
         ]
