@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1784535201773,
+  "lastUpdate": 1784572617807,
   "repoUrl": "https://github.com/jimsimon/trouve",
   "entries": {
     "e2e-benchmarks": [
@@ -3790,6 +3790,54 @@ window.BENCHMARK_DATA = {
           {
             "name": "non-git warm query",
             "value": 69.09135210000001,
+            "range": "± 1.5",
+            "unit": "ms"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "jim.j.simon@gmail.com",
+            "name": "Jim Simon",
+            "username": "jimsimon"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "870fb619685c05269140292c28f60ae668e44c57",
+          "message": "Batch GitHub pull request reads with GraphQL (#119)\n\n* Batch GitHub pull request reads with GraphQL\n\nReplace the dashboard REST fan-out and branch lookups with GraphQL queries so the one-minute refresh stays within GitHub rate limits. Preserve structured server errors for empty client responses so refresh failures remain actionable.\n\n* Address GitHub refresh review findings",
+          "timestamp": "2026-07-20T14:35:17-04:00",
+          "tree_id": "2a487e2a9a9e98da142afa2189df5a5e00e6d84e",
+          "url": "https://github.com/jimsimon/trouve/commit/870fb619685c05269140292c28f60ae668e44c57"
+        },
+        "date": 1784572616910,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "cold index + query",
+            "value": 141.9699147,
+            "range": "± 11.9",
+            "unit": "ms"
+          },
+          {
+            "name": "warm query",
+            "value": 73.02808730000001,
+            "range": "± 2.7",
+            "unit": "ms"
+          },
+          {
+            "name": "incremental (1 file modified)",
+            "value": 93.66861196,
+            "range": "± 0.5",
+            "unit": "ms"
+          },
+          {
+            "name": "non-git warm query",
+            "value": 70.40191194,
             "range": "± 1.5",
             "unit": "ms"
           }
