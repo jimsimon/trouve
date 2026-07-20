@@ -178,6 +178,18 @@ export struct McpServerItem {
     detail: string,
 }
 
+// A provider-specific setting derived from the catalog transport template.
+// Values are reported as they are edited; secrets never enter the normal
+// provider config payload.
+export struct ProviderConfigFieldItem {
+    id: string,
+    label: string,
+    description: string,
+    required: bool,
+    secret: bool,
+    value: string,
+}
+
 // A well-known provider preset served by the backend; picking one prefills
 // the add/edit form so nothing has to be typed by hand.
 export struct KnownProviderItem {
@@ -186,13 +198,13 @@ export struct KnownProviderItem {
     kind: string,
     base-url: string,
     api-key-env: string,
-    // "api-key", "oauth" (subscription login), "cli" (vendor CLI holds the
-    // subscription auth), or "none" (keyless local).
+    // "api-key", "oauth", "cli", "aws", "gcp", or "none".
     auth: string,
     // "subscription" / "api" / "local".
     category: string,
     // Undocumented vendor endpoint; may break or be restricted at any time.
     experimental: bool,
+    config-fields: [ProviderConfigFieldItem],
 }
 
 // A thin determinate download bar (accent fill over the control track).
@@ -326,6 +338,7 @@ export component SettingsScreen inherits Rectangle {
     in-out property <string> form-kind: "openai-compat";
     in-out property <string> form-hint: "";
     in-out property <bool> form-warning: false;
+    in-out property <[ProviderConfigFieldItem]> form-config-fields;
     // Index into known-provider-names: a preset (fields hidden, prefilled
     // from known-providers[index]) or the trailing "Custom" entry (id/kind/
     // url fields shown). The controller points it at Custom on load.
@@ -375,6 +388,9 @@ export component SettingsScreen inherits Rectangle {
 
     callback provider-saved(/* id */ string, /* kind */ string,
                             /* base-url */ string, /* api-key */ string);
+    callback provider-field-changed(/* id */ string, /* value */ string,
+                                    /* secret */ bool);
+    callback provider-fields-reset();
     callback provider-deleted(string);
     callback provider-login(string);
     callback default-model-picked(/* model-index */ int, /* thinking-level */ string);
@@ -734,12 +750,18 @@ export component SettingsScreen inherits Rectangle {
                                                 vertical-alignment: center;
                                             }
                                             Text {
-                                                text: provider.auth == "oauth"
+                                                text: provider.auth == "aws"
+                                                    ? "AWS credential chain"
+                                                    : (provider.auth == "gcp"
+                                                        ? "Google credential chain"
+                                                : (provider.auth == "oauth"
                                                     ? (provider.has-credentials ? "✓ logged in" : "not logged in")
                                                     : (provider.auth == "cli"
                                                         ? (provider.has-credentials ? "✓ CLI ready" : "CLI not set up")
-                                                        : (provider.has-credentials ? "✓ credentials" : "no credentials"));
-                                                color: provider.has-credentials ? Theme.c.ok : Theme.c.warn;
+                                                        : (provider.has-credentials ? "✓ credentials" : "no credentials"))));
+                                                color: provider.auth == "aws" || provider.auth == "gcp"
+                                                    ? Theme.c.text-mid
+                                                    : (provider.has-credentials ? Theme.c.ok : Theme.c.warn);
                                                 font-size: Theme.fs(11px);
                                                 vertical-alignment: center;
                                             }
@@ -750,6 +772,8 @@ export component SettingsScreen inherits Rectangle {
                                             Button {
                                                 text: "Edit";
                                                 clicked => {
+                                                    root.provider-fields-reset();
+                                                    root.form-config-fields = [];
                                                     root.preset-index = root.active-known-providers.length;
                                                     root.form-id = provider.id;
                                                     root.form-base-url = provider.base-url;
@@ -782,6 +806,7 @@ export component SettingsScreen inherits Rectangle {
                                 model: root.active-known-provider-names;
                                 current-index <=> root.preset-index;
                                 selected => {
+                                    root.provider-fields-reset();
                                     if (!root.preset-is-custom) {
                                         root.form-id = root.active-known-providers[root.preset-index].id;
                                         root.form-base-url = root.active-known-providers[root.preset-index].base-url;
@@ -789,6 +814,8 @@ export component SettingsScreen inherits Rectangle {
                                         root.form-kind-index =
                                             root.active-known-providers[root.preset-index].kind == "anthropic" ? 1 : 0;
                                         root.form-warning = root.active-known-providers[root.preset-index].experimental;
+                                        root.form-config-fields =
+                                            root.active-known-providers[root.preset-index].config-fields;
                                         root.form-hint =
                                             root.active-known-providers[root.preset-index].experimental
                                             ? "Experimental: talks to an undocumented vendor endpoint using your `codex login` token. OpenAI may break or restrict it at any time — use at your own risk. Save, then log in via the Codex CLI."
@@ -796,12 +823,17 @@ export component SettingsScreen inherits Rectangle {
                                                 ? "Subscription via the vendor's CLI: install it, save, then click \"Log in\" in the list above (or log in from a terminal)."
                                                 : (root.active-known-providers[root.preset-index].auth == "oauth"
                                                     ? "Subscription login: save, then click \"Log in\" in the list above."
-                                                    : (root.active-known-providers[root.preset-index].auth == "api-key"
-                                                        ? "Paste your API key below and save. Also honors the "
-                                                            + root.active-known-providers[root.preset-index].api-key-env
-                                                            + " environment variable."
-                                                        : "No API key needed — just save.")));
+                                                    : (root.active-known-providers[root.preset-index].auth == "aws"
+                                                        ? "Uses the standard AWS credential and region chains. No AWS secret is stored by Trouve."
+                                                        : (root.active-known-providers[root.preset-index].auth == "gcp"
+                                                            ? "Uses Google Application Default Credentials. No Google credential is stored by Trouve."
+                                                            : (root.active-known-providers[root.preset-index].auth == "api-key"
+                                                                ? "Paste your API key below and save. Also honors the "
+                                                                    + root.active-known-providers[root.preset-index].api-key-env
+                                                                    + " environment variable."
+                                                                : "No API key needed — just save.")))));
                                     } else {
+                                        root.form-config-fields = [];
                                         root.form-kind = root.form-kind-index == 1 ? "anthropic" : "openai-compat";
                                         root.form-hint = "";
                                         root.form-warning = false;
@@ -827,6 +859,29 @@ export component SettingsScreen inherits Rectangle {
                                     horizontal-stretch: 1;
                                     placeholder-text: "base URL (optional)";
                                     text <=> root.form-base-url;
+                                }
+                            }
+                            for field in root.form-config-fields: VerticalLayout {
+                                spacing: 3px;
+                                Text {
+                                    text: field.label + (field.required ? " *" : "");
+                                    color: Theme.c.text-mid;
+                                    font-size: Theme.fs(12px);
+                                }
+                                LineEdit {
+                                    horizontal-stretch: 1;
+                                    text: field.value;
+                                    placeholder-text: field.id;
+                                    input-type: field.secret ? password : text;
+                                    edited(value) => {
+                                        root.provider-field-changed(field.id, value, field.secret);
+                                    }
+                                }
+                                if field.description != "": Text {
+                                    text: field.description;
+                                    color: Theme.c.text-dim;
+                                    font-size: Theme.fs(11px);
+                                    wrap: word-wrap;
                                 }
                             }
                             HorizontalLayout {

@@ -284,6 +284,8 @@ pub enum UiCommand {
         kind: String,
         base_url: String,
         api_key: String,
+        settings: std::collections::BTreeMap<String, String>,
+        secret_values: std::collections::BTreeMap<String, String>,
     },
     DeleteProvider(String),
     ProviderLogin(String),
@@ -2614,7 +2616,7 @@ impl Controller {
     /// Push the context dial: last turn's input tokens vs the model window.
     fn push_context(&mut self) {
         let Some(thread) = self.current_thread.and_then(|i| self.threads.get(i)) else {
-            ui::set_context(&self.ui, 0.0, false, "no thread selected".into());
+            ui::set_context(&self.ui, 0.0, false, false, "no thread selected".into());
             return;
         };
         let catalog_window = self
@@ -2635,7 +2637,19 @@ impl Controller {
             .as_ref()
             .map(|u| u.input_tokens + u.cached_input_tokens)
             .unwrap_or(0);
+        let unavailable = window.is_none_or(|window| window == 0);
         let (fill, tooltip) = match (used, window) {
+            (_, Some(0) | None) => (
+                0.0,
+                if used == 0 {
+                    "Automatic compaction is disabled because this provider did not report the model's context-window size."
+                        .to_string()
+                } else {
+                    format!(
+                        "context: {used} tokens\nAutomatic compaction is disabled because this provider did not report the model's context-window size."
+                    )
+                },
+            ),
             (0, _) => (0.0, "context: no usage yet".to_string()),
             (used, Some(window)) if window > 0 => {
                 let fill = (used as f32 / window as f32).clamp(0.0, 1.0);
@@ -2644,9 +2658,9 @@ impl Controller {
                     format!("context: {used} / {window} tokens ({:.0}%)", fill * 100.0),
                 )
             }
-            (used, _) => (0.0, format!("context: {used} tokens (window unknown)")),
+            _ => unreachable!("zero and unknown windows handled above"),
         };
-        ui::set_context(&self.ui, fill, vm.compacting, tooltip);
+        ui::set_context(&self.ui, fill, vm.compacting, unavailable, tooltip);
     }
 
     async fn refresh_usage_text(&self) {
@@ -5194,6 +5208,8 @@ impl Controller {
                 kind,
                 base_url,
                 api_key,
+                settings,
+                secret_values,
             } => {
                 let result = self
                     .client
@@ -5203,6 +5219,10 @@ impl Controller {
                             kind,
                             base_url: (!base_url.is_empty()).then_some(base_url),
                             api_key: (!api_key.is_empty()).then_some(api_key),
+                            settings,
+                            secret_values,
+                            headers: Default::default(),
+                            query_params: Default::default(),
                         },
                     )
                     .await;

@@ -1087,7 +1087,7 @@ async fn list_providers(State(engine): State<Arc<Engine>>) -> Json<ProvidersResp
 
 #[utoipa::path(get, path = "/v1/providers/known", responses((status = 200, body = [KnownProvider])))]
 async fn known_providers(State(engine): State<Arc<Engine>>) -> Json<Vec<KnownProvider>> {
-    Json(engine.known_providers())
+    Json(engine.known_providers().await)
 }
 
 #[utoipa::path(put, path = "/v1/providers/{id}", params(("id" = String, Path,)),

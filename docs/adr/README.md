@@ -21,3 +21,4 @@ sequentially.
 | [0009](0009-thread-owned-todo-snapshots.md) | Thread-owned todo snapshots | Accepted |
 | [0010](0010-account-centric-multi-instance-github.md) | Account-centric, multi-instance GitHub integration | Accepted |
 | [0011](0011-github-app-backed-code-review-service.md) | GitHub App-backed code review service | Accepted |
+| [0012](0012-catalog-backed-provider-transports.md) | Catalog-backed provider transports | Accepted |

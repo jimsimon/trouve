@@ -50,6 +50,7 @@ pub struct ClaudeBackend {
     id: String,
     command: String,
     pool: Arc<Pool>,
+    catalog: Arc<trouve_providers::models_dev::ModelsDevCatalog>,
 }
 
 impl ClaudeBackend {
@@ -58,7 +59,16 @@ impl ClaudeBackend {
             id: id.into(),
             command: command.unwrap_or_else(|| "claude".into()),
             pool: Arc::new(Pool::default()),
+            catalog: Arc::new(trouve_providers::models_dev::ModelsDevCatalog::embedded()),
         }
+    }
+
+    pub fn with_catalog(
+        mut self,
+        catalog: Arc<trouve_providers::models_dev::ModelsDevCatalog>,
+    ) -> Self {
+        self.catalog = catalog;
+        self
     }
 }
 
@@ -167,6 +177,71 @@ fn config_fingerprint(turn: &BackendTurn) -> String {
     )
 }
 
+/// Apply the model's reasoning control using Claude Code's current interface.
+/// Adaptive-thinking models use `--effort`; older fixed-budget models retain
+/// the environment variables supported by the CLI. The `thinking_level`
+/// fallback keeps pre-schema-split threads working after an upgrade.
+fn configure_thinking(
+    cmd: &mut Command,
+    turn: &BackendTurn,
+    catalog: &trouve_providers::models_dev::ModelsDevCatalog,
+) {
+    let effort_capable = catalog
+        .model(
+            "anthropic",
+            "claude-code",
+            &turn.model,
+            trouve_providers::models_dev::OptionsDialect::ClaudeCli,
+        )
+        .is_some_and(|model| model.options_schema.pointer("/properties/effort").is_some());
+    let effort = turn
+        .model_options
+        .get("effort")
+        .and_then(Value::as_str)
+        .or_else(|| {
+            if effort_capable {
+                turn.model_options
+                    .get("thinking_level")
+                    .and_then(Value::as_str)
+            } else {
+                None
+            }
+        })
+        .filter(|level| *level != "off");
+    if let Some(effort) = effort {
+        cmd.args(["--effort", effort]);
+        return;
+    }
+    if effort_capable {
+        return;
+    }
+
+    if let Some(budget) = turn
+        .model_options
+        .get("thinking_budget_tokens")
+        .and_then(Value::as_u64)
+    {
+        cmd.env("MAX_THINKING_TOKENS", budget.to_string());
+        return;
+    }
+
+    match turn
+        .model_options
+        .get("thinking_level")
+        .and_then(Value::as_str)
+    {
+        Some("off") => {
+            cmd.env("CLAUDE_CODE_DISABLE_THINKING", "1");
+        }
+        Some(level) => {
+            if let Some(budget) = trouve_providers::catalog::thinking_budget_tokens(level) {
+                cmd.env("MAX_THINKING_TOKENS", budget.to_string());
+            }
+        }
+        None => {}
+    }
+}
+
 #[async_trait::async_trait]
 impl AgentBackend for ClaudeBackend {
     fn id(&self) -> &str {
@@ -177,22 +252,17 @@ impl AgentBackend for ClaudeBackend {
         // The same catalog as the per-use Anthropic API provider, so both
         // surface the same list. Claude Code accepts full model ids; the
         // subscription bills nothing per token, so pricing is dropped.
-        trouve_providers::catalog::anthropic_models(&self.id)
+        self.catalog
+            .provider_models(
+                "anthropic",
+                &self.id,
+                trouve_providers::models_dev::OptionsDialect::ClaudeCli,
+            )
             .into_iter()
             .map(|mut m| {
                 m.display_name = format!("{} (Claude Code)", m.display_name);
                 m.input_price_per_mtok = None;
                 m.output_price_per_mtok = None;
-                // Temperature isn't controllable through the CLI.
-                m.options_schema = serde_json::json!({
-                    "type": "object",
-                    "properties": {
-                        "thinking_level": m.options_schema
-                            .pointer("/properties/thinking_level")
-                            .cloned()
-                            .unwrap_or_default(),
-                    }
-                });
                 m
             })
             .collect()
@@ -539,15 +609,7 @@ impl ClaudeBackend {
         if !turn.model.is_empty() {
             cmd.args(["--model", &turn.model]);
         }
-        // Extended thinking rides on Claude Code's budget env var.
-        if let Some(budget) = turn
-            .model_options
-            .get("thinking_level")
-            .and_then(Value::as_str)
-            .and_then(trouve_providers::catalog::thinking_budget_tokens)
-        {
-            cmd.env("MAX_THINKING_TOKENS", budget.to_string());
-        }
+        configure_thinking(&mut cmd, turn, &self.catalog);
         if let Some(instr) = &turn.instructions {
             cmd.args(["--append-system-prompt", instr]);
         }
@@ -937,6 +999,57 @@ fn parse_reset_at(v: &Value) -> Option<i64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn turn(model: &str, key: &str, value: &str) -> BackendTurn {
+        BackendTurn {
+            thread_id: "thread".into(),
+            worktree: std::env::temp_dir(),
+            session: None,
+            model: model.into(),
+            model_options: serde_json::Map::from_iter([(key.into(), Value::String(value.into()))]),
+            prompt: String::new(),
+            attachments: Vec::new(),
+            instructions: None,
+            permission: BackendPermission::ReadOnly,
+            mcp_bridge: None,
+            mcp_servers: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn adaptive_models_use_cli_effort_flag() {
+        let mut cmd = Command::new("claude");
+        let catalog = trouve_providers::models_dev::ModelsDevCatalog::embedded();
+        configure_thinking(
+            &mut cmd,
+            &turn("claude-fable-5", "effort", "xhigh"),
+            &catalog,
+        );
+        let args: Vec<String> = cmd
+            .as_std()
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(args, ["--effort", "xhigh"]);
+    }
+
+    #[test]
+    fn legacy_off_explicitly_disables_thinking() {
+        let mut cmd = Command::new("claude");
+        let catalog = trouve_providers::models_dev::ModelsDevCatalog::embedded();
+        configure_thinking(
+            &mut cmd,
+            &turn("claude-haiku-4-5", "thinking_level", "off"),
+            &catalog,
+        );
+        let disabled = cmd
+            .as_std()
+            .get_envs()
+            .find(|(key, _)| key.to_string_lossy() == "CLAUDE_CODE_DISABLE_THINKING")
+            .and_then(|(_, value)| value)
+            .map(|value| value.to_string_lossy().into_owned());
+        assert_eq!(disabled.as_deref(), Some("1"));
+    }
 
     fn rfc3339_in(secs: i64) -> String {
         chrono::DateTime::from_timestamp(chrono::Utc::now().timestamp() + secs, 0)

@@ -7,7 +7,7 @@
       "name": "MIT",
       "identifier": "MIT"
     },
-    "version": "1.3"
+    "version": "1.4"
   },
   "paths": {
     "/v1/approvals": {
@@ -5128,7 +5128,6 @@
       },
       "KnownProvider": {
         "type": "object",
-        "description": "A well-known provider preset: clients offer these for one-click setup\ninstead of hand-typed base URLs.",
         "required": [
           "id",
           "display_name",
@@ -5145,7 +5144,7 @@
           },
           "auth": {
             "type": "string",
-            "description": "How the provider authenticates: \"api-key\", \"oauth\" (subscription\nlogin), \"cli\" (the vendor's own CLI holds subscription auth), or\n\"none\" (keyless local endpoints)."
+            "description": "How the provider authenticates: \"api-key\", \"oauth\" (subscription\nlogin), \"cli\" (the vendor's own CLI holds subscription auth), \"aws\"\nor \"gcp\" (ambient cloud credential chains), or \"none\" (keyless local\nendpoints)."
           },
           "base_url": {
             "type": [
@@ -5157,6 +5156,13 @@
             "type": "string",
             "description": "Presentation/billing category: \"subscription\", \"api\", or \"local\"."
           },
+          "config_fields": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ProviderConfigField"
+            },
+            "description": "Provider-specific setup fields rendered by clients. Their values fill\nplaceholders in `base_url`, headers, and query parameters."
+          },
           "display_name": {
             "type": "string"
           },
@@ -5164,13 +5170,32 @@
             "type": "boolean",
             "description": "Uses an undocumented vendor endpoint that may break or be restricted\nat any time; clients should display a warning."
           },
+          "headers": {
+            "type": "object",
+            "description": "Safe templates only; no credential values are returned here.",
+            "additionalProperties": {
+              "type": "string"
+            },
+            "propertyNames": {
+              "type": "string"
+            }
+          },
           "id": {
             "type": "string",
             "description": "Suggested provider id, e.g. \"openrouter\"."
           },
           "kind": {
             "type": "string",
-            "description": "Wire protocol: \"openai-compat\" or \"anthropic\"."
+            "description": "Provider transport family."
+          },
+          "query_params": {
+            "type": "object",
+            "additionalProperties": {
+              "type": "string"
+            },
+            "propertyNames": {
+              "type": "string"
+            }
           }
         }
       },
@@ -5751,6 +5776,46 @@
           }
         }
       },
+      "ProviderConfigField": {
+        "type": "object",
+        "description": "A well-known provider preset: clients offer these for one-click setup\ninstead of hand-typed base URLs.",
+        "required": [
+          "id",
+          "label"
+        ],
+        "properties": {
+          "default_value": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "description": {
+            "type": "string"
+          },
+          "env": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Conventional environment-variable fallback."
+          },
+          "id": {
+            "type": "string",
+            "description": "Placeholder name used in templates and in `UpsertProviderRequest`."
+          },
+          "label": {
+            "type": "string"
+          },
+          "required": {
+            "type": "boolean"
+          },
+          "secret": {
+            "type": "boolean",
+            "description": "Secret fields are written to the secret store and never returned."
+          }
+        }
+      },
       "ProviderInfo": {
         "type": "object",
         "description": "A configured provider, with secrets elided.",
@@ -5763,7 +5828,7 @@
         "properties": {
           "auth": {
             "type": "string",
-            "description": "\"api-key\", \"oauth\", \"cli\" (vendor CLI holds the subscription auth),\nor \"none\" — drives which credential UI to show."
+            "description": "\"api-key\", \"oauth\", \"cli\", \"aws\", \"gcp\", or \"none\" — drives which\ncredential UI to show."
           },
           "base_url": {
             "type": [
@@ -5781,7 +5846,7 @@
           },
           "has_credentials": {
             "type": "boolean",
-            "description": "Whether usable credentials were resolved (key, env, OAuth, or a\nlogged-in vendor CLI)."
+            "description": "Whether credentials are configured or delegated to a cloud credential\nchain. Native cloud credentials are validated on first request."
           },
           "id": {
             "type": "string",
@@ -5789,7 +5854,17 @@
           },
           "kind": {
             "type": "string",
-            "description": "\"openai-compat\" or \"anthropic\"."
+            "description": "Provider transport family."
+          },
+          "settings": {
+            "type": "object",
+            "description": "Non-secret values used to expand the provider's endpoint and request\ntemplates. Secret values are intentionally never returned.",
+            "additionalProperties": {
+              "type": "string"
+            },
+            "propertyNames": {
+              "type": "string"
+            }
           }
         }
       },
@@ -6750,9 +6825,49 @@
               "null"
             ]
           },
+          "headers": {
+            "type": "object",
+            "description": "Additional HTTP header templates for compatible transports. Values\nmay reference `${API_KEY}`, settings, named secrets, or environment\nvariables.",
+            "additionalProperties": {
+              "type": "string"
+            },
+            "propertyNames": {
+              "type": "string"
+            }
+          },
           "kind": {
             "type": "string",
-            "description": "\"openai-compat\" or \"anthropic\"."
+            "description": "Transport family, such as \"openai-compat\", \"anthropic\",\n\"azure-openai\", \"amazon-bedrock\", \"google-vertex\", or\n\"google-vertex-anthropic\"."
+          },
+          "query_params": {
+            "type": "object",
+            "description": "Additional query-parameter templates, with the same expansion rules\nas `headers`.",
+            "additionalProperties": {
+              "type": "string"
+            },
+            "propertyNames": {
+              "type": "string"
+            }
+          },
+          "secret_values": {
+            "type": "object",
+            "description": "Named secrets to store. Omitted entries retain their existing value;\nthese values are write-only and never appear in provider responses.",
+            "additionalProperties": {
+              "type": "string"
+            },
+            "propertyNames": {
+              "type": "string"
+            }
+          },
+          "settings": {
+            "type": "object",
+            "description": "Non-secret `${NAME}` template values.",
+            "additionalProperties": {
+              "type": "string"
+            },
+            "propertyNames": {
+              "type": "string"
+            }
           }
         }
       },

@@ -32,7 +32,7 @@ hmac = "0.12"
 hex = "0.4"
 jsonwebtoken = "10.4"
 octocrab = "0.54"
-reqwest = { version = "0.13", default-features = false, features = ["form", "json", "stream", "rustls"] }
+reqwest = { version = "0.13", default-features = false, features = ["form", "json", "query", "stream", "rustls"] }
 rusqlite = { version = "0.40", features = ["bundled"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 serde = { version = "1.0.228", features = ["derive"] }

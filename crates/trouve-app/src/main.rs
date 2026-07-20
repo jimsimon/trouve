@@ -942,14 +942,47 @@ fn main() -> anyhow::Result<()> {
     }
 
     // --- settings screen callbacks -------------------------------------------
+    let provider_fields = std::rc::Rc::new(std::cell::RefCell::new(std::collections::BTreeMap::<
+        String,
+        (String, bool),
+    >::new()));
+    {
+        let provider_fields = provider_fields.clone();
+        window.on_provider_field_changed(move |id, value, secret| {
+            let value = value.to_string();
+            let mut fields = provider_fields.borrow_mut();
+            if value.is_empty() {
+                fields.remove(id.as_str());
+            } else {
+                fields.insert(id.to_string(), (value, secret));
+            }
+        });
+    }
+    {
+        let provider_fields = provider_fields.clone();
+        window.on_provider_fields_reset(move || provider_fields.borrow_mut().clear());
+    }
     {
         let tx = tx.clone();
+        let provider_fields = provider_fields.clone();
         window.on_provider_saved(move |id, kind, base_url, api_key| {
+            let fields = std::mem::take(&mut *provider_fields.borrow_mut());
+            let mut settings = std::collections::BTreeMap::new();
+            let mut secret_values = std::collections::BTreeMap::new();
+            for (name, (value, secret)) in fields {
+                if secret {
+                    secret_values.insert(name, value);
+                } else {
+                    settings.insert(name, value);
+                }
+            }
             let _ = tx.send(UiCommand::SaveProvider {
                 id: id.to_string(),
                 kind: kind.to_string(),
                 base_url: base_url.to_string(),
                 api_key: api_key.to_string(),
+                settings,
+                secret_values,
             });
         });
     }

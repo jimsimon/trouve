@@ -114,18 +114,14 @@ impl AgentBackend for CodexBackend {
     }
 
     fn models(&self) -> Vec<ModelInfo> {
-        // Minimal offline fallback; `list_models` asks the app-server for
-        // the real catalog (with per-model reasoning-effort variants).
-        let mut models = vec![
-            model(&self.id, "gpt-5.4-codex", "GPT-5.4 Codex", 272_000),
-            model(&self.id, "gpt-5.4", "GPT-5.4", 272_000),
-        ];
-        self.apply_observed_windows(&mut models);
-        models
+        // The app-server is the catalog authority. In particular it does
+        // not expose context windows in `model/list`, so there is no honest
+        // offline model record to synthesize here.
+        Vec::new()
     }
 
     async fn list_models(&self) -> Vec<ModelInfo> {
-        {
+        let stale = {
             let cache = self.models_cache.lock().await;
             if let Some((at, models)) = cache.as_ref()
                 && at.elapsed() < MODELS_TTL
@@ -134,7 +130,8 @@ impl AgentBackend for CodexBackend {
                 self.apply_observed_windows(&mut models);
                 return models;
             }
-        }
+            cache.as_ref().map(|(_, models)| models.clone())
+        };
         let fetched = async {
             let server = self.server().await?;
             server.request("model/list", json!({})).await
@@ -144,15 +141,19 @@ impl AgentBackend for CodexBackend {
             Ok(result) => {
                 let mut models = parse_model_list(&self.id, &result);
                 if models.is_empty() {
-                    return self.models();
+                    let mut models = stale.unwrap_or_default();
+                    self.apply_observed_windows(&mut models);
+                    return models;
                 }
                 *self.models_cache.lock().await = Some((std::time::Instant::now(), models.clone()));
                 self.apply_observed_windows(&mut models);
                 models
             }
             Err(e) => {
-                tracing::debug!("codex model/list failed: {e}; using static list");
-                self.models()
+                tracing::debug!("codex model/list failed: {e}; using stale live list");
+                let mut models = stale.unwrap_or_default();
+                self.apply_observed_windows(&mut models);
+                models
             }
         }
     }
@@ -226,13 +227,15 @@ impl AgentBackend for CodexBackend {
         };
 
         // Start or resume the vendor-side thread.
-        let start_params = with_config(json!({
-            "model": model_or_default(model_name),
+        let mut start_params = with_config(json!({
             "cwd": turn.worktree,
             "approvalPolicy": approval_policy,
             "sandbox": sandbox,
             "serviceName": "trouve",
         }));
+        if !model_name.is_empty() {
+            start_params["model"] = json!(model_name);
+        }
         let mut fresh_session = false;
         let codex_thread_id = match &turn.session {
             Some(sid) => {
@@ -278,7 +281,6 @@ impl AgentBackend for CodexBackend {
         }
         let mut turn_params = json!({
             "threadId": codex_thread_id,
-            "model": model_or_default(model_name),
             "approvalPolicy": approval_policy,
             "sandboxPolicy": sandbox_policy,
             "input": input,
@@ -291,7 +293,7 @@ impl AgentBackend for CodexBackend {
             codex_thread_id.clone(),
             route,
             fresh_session,
-            model_or_default(model_name).to_string(),
+            model_name.to_string(),
             self.observed_windows.clone(),
         );
         Ok(stream.boxed())
@@ -328,14 +330,6 @@ fn mcp_config_override(turn: &crate::BackendTurn) -> Option<Value> {
         return None;
     }
     Some(json!({ "mcp_servers": servers }))
-}
-
-fn model_or_default(model: &str) -> &str {
-    if model.is_empty() {
-        "gpt-5.4-codex"
-    } else {
-        model
-    }
 }
 
 /// Split a `<model>@<effort>` id into its parts. Threads created before the
@@ -384,7 +378,10 @@ fn parse_model_list(backend_id: &str, result: &Value) -> Vec<ModelInfo> {
                     .collect()
             })
             .unwrap_or_default();
-        let mut info = model(backend_id, id, display, 272_000);
+        // `model/list` deliberately has no context-window field. A live
+        // `thread/tokenUsage/updated` notification fills this in after the
+        // first turn; zero means unknown until then.
+        let mut info = model(backend_id, id, display, 0);
         if efforts.len() > 1 {
             info.options_schema = json!({
                 "type": "object",
@@ -1299,26 +1296,23 @@ mod tests {
     }
 
     #[test]
-    fn observed_windows_override_catalog_sizes() {
+    fn observed_windows_fill_unknown_live_sizes() {
         let backend = CodexBackend::new("codex", None);
-        let before = backend.models();
-        assert!(before.iter().all(|m| m.context_window == 272_000));
+        let result = json!({ "data": [{
+            "id": "gpt-5.6",
+            "displayName": "GPT-5.6",
+            "hidden": false,
+        }]});
+        let mut models = parse_model_list("codex", &result);
+        assert_eq!(models[0].context_window, 0);
 
         backend
             .observed_windows
             .lock()
             .unwrap()
-            .insert("gpt-5.4-codex".into(), 400_000);
-        let after = backend.models();
-        let by_id = |id: &str| {
-            after
-                .iter()
-                .find(|m| m.id == id)
-                .map(|m| m.context_window)
-                .unwrap()
-        };
-        assert_eq!(by_id("codex/gpt-5.4-codex"), 400_000);
-        assert_eq!(by_id("codex/gpt-5.4"), 272_000);
+            .insert("gpt-5.6".into(), 1_050_000);
+        backend.apply_observed_windows(&mut models);
+        assert_eq!(models[0].context_window, 1_050_000);
     }
 
     #[test]
@@ -1348,6 +1342,7 @@ mod tests {
         let models = parse_model_list("codex", &result);
         let ids: Vec<&str> = models.iter().map(|m| m.id.as_str()).collect();
         assert_eq!(ids, vec!["codex/gpt-5.5"]);
+        assert_eq!(models[0].context_window, 0);
         assert_eq!(
             models[0]
                 .options_schema
