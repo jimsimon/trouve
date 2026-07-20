@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1784534773509,
+  "lastUpdate": 1784535156166,
   "repoUrl": "https://github.com/jimsimon/trouve",
   "entries": {
     "e2e-benchmarks": [
@@ -3743,6 +3743,54 @@ window.BENCHMARK_DATA = {
             "name": "non-git warm query",
             "value": 74.50092438,
             "range": "± 4.3",
+            "unit": "ms"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "jim.j.simon@gmail.com",
+            "name": "Jim Simon",
+            "username": "jimsimon"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "a921c6673de2cdff3cdda5e5c565b29f751d8022",
+          "message": "Show subscription health in model picker (#84)\n\n* Show subscription health in model picker\n\n* Address subscription health review feedback\n\n* Harden subscription refresh and composer layout\n\n* Refresh subscriptions after batched turns",
+          "timestamp": "2026-07-20T04:11:15-04:00",
+          "tree_id": "d458660358b5a122dea88782c7e26e4f097c90c1",
+          "url": "https://github.com/jimsimon/trouve/commit/a921c6673de2cdff3cdda5e5c565b29f751d8022"
+        },
+        "date": 1784535155712,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "cold index + query",
+            "value": 133.14815416,
+            "range": "± 4.4",
+            "unit": "ms"
+          },
+          {
+            "name": "warm query",
+            "value": 71.64175498,
+            "range": "± 1",
+            "unit": "ms"
+          },
+          {
+            "name": "incremental (1 file modified)",
+            "value": 84.80404638000002,
+            "range": "± 1.7",
+            "unit": "ms"
+          },
+          {
+            "name": "non-git warm query",
+            "value": 69.09135210000001,
+            "range": "± 1.5",
             "unit": "ms"
           }
         ]
