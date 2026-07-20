@@ -306,9 +306,19 @@ fn sse_events(
     resp: reqwest::Response,
 ) -> impl futures::Stream<Item = Result<ProviderEvent, ProviderError>> {
     use futures::StreamExt;
+    sse_byte_events(
+        resp.bytes_stream()
+            .map(|chunk| chunk.map_err(|error| error.to_string())),
+    )
+}
+
+fn sse_byte_events(
+    bytes: impl futures::Stream<Item = Result<bytes::Bytes, String>> + Send + 'static,
+) -> impl futures::Stream<Item = Result<ProviderEvent, ProviderError>> {
+    use futures::StreamExt;
     let (tx, mut rx) = mpsc::channel::<Result<ProviderEvent, ProviderError>>(64);
     tokio::spawn(async move {
-        let mut bytes = resp.bytes_stream();
+        let mut bytes = Box::pin(bytes);
         let mut buf = crate::sse::LineBuffer::default();
         let mut usage = Usage::default();
         // Output deltas do not repeat the phase from output_item.added. Track
@@ -322,8 +332,8 @@ fn sse_events(
         while let Some(chunk) = bytes.next().await {
             let chunk = match chunk {
                 Ok(c) => c,
-                Err(e) => {
-                    let _ = tx.send(Err(ProviderError::Request(e.to_string()))).await;
+                Err(error) => {
+                    let _ = tx.send(Err(ProviderError::Request(error))).await;
                     return;
                 }
             };
@@ -500,6 +510,34 @@ mod tests {
             output_text_delta(&final_event, &commentary),
             Some(ProviderEvent::TextDelta(text)) if text == "Done."
         ));
+    }
+
+    #[tokio::test]
+    async fn streamed_raw_reasoning_is_not_repeated_by_the_completed_item() {
+        use futures::StreamExt;
+
+        let body = concat!(
+            "data: {\"type\":\"response.reasoning_text.delta\",",
+            "\"item_id\":\"reasoning-1\",\"delta\":\"Raw reasoning.\"}\n\n",
+            "data: {\"type\":\"response.output_item.done\",\"item\":{",
+            "\"id\":\"reasoning-1\",\"type\":\"reasoning\",",
+            "\"summary\":[],\"content\":[{\"type\":\"reasoning_text\",",
+            "\"text\":\"Raw reasoning.\"}]}}\n\n",
+        );
+        let chunks = futures::stream::iter([Ok(bytes::Bytes::from_static(body.as_bytes()))]);
+        let events = sse_byte_events(chunks)
+            .map(|event| event.expect("valid SSE event"))
+            .collect::<Vec<_>>()
+            .await;
+        let thinking = events
+            .into_iter()
+            .filter_map(|event| match event {
+                ProviderEvent::ThinkingDelta(text) => Some(text),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(thinking, ["Raw reasoning."]);
     }
 
     #[test]
