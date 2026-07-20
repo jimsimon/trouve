@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1784532358627,
+  "lastUpdate": 1784532411694,
   "repoUrl": "https://github.com/jimsimon/trouve",
   "entries": {
     "e2e-benchmarks": [
@@ -7153,6 +7153,54 @@ window.BENCHMARK_DATA = {
             "name": "dense_query_20k_rows",
             "value": 1381183.1304938272,
             "range": "± 10901",
+            "unit": "ns"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "jim.j.simon@gmail.com",
+            "name": "Jim Simon",
+            "username": "jimsimon"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "71294e4e74f79c66902f4950f0c97ea811ba837e",
+          "message": "Associate pull requests with session activity (#89)\n\n* Associate pull requests with session activity\n\n* Address pull request review feedback\n\n* Keep session pull requests scoped\n\nPreserve cross-branch PRs returned by the session-specific lookup across account dashboard refreshes, while limiting new associations to successful PR creation or remote-ref mutation activity. Read/list output and incidental mentions no longer associate unrelated PRs.",
+          "timestamp": "2026-07-20T03:24:39-04:00",
+          "tree_id": "42b87f40cb49b9ad3e61afc95e6352cacd8b2ff5",
+          "url": "https://github.com/jimsimon/trouve/commit/71294e4e74f79c66902f4950f0c97ea811ba837e"
+        },
+        "date": 1784532411041,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "bm25_build_5k_docs",
+            "value": 5116138.333333334,
+            "range": "± 11848",
+            "unit": "ns"
+          },
+          {
+            "name": "bm25_query_5k_docs",
+            "value": 35633.11759259259,
+            "range": "± 7",
+            "unit": "ns"
+          },
+          {
+            "name": "chunk_python_200_functions",
+            "value": 2811525.25,
+            "range": "± 1084",
+            "unit": "ns"
+          },
+          {
+            "name": "dense_query_20k_rows",
+            "value": 1572589.2328216373,
+            "range": "± 10994",
             "unit": "ns"
           }
         ]
