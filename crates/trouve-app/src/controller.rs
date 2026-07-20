@@ -617,6 +617,9 @@ struct Controller {
     /// Sessions with completed/failed work the user has not brought on
     /// screen since it landed.
     unread_sessions: HashSet<String>,
+    /// Sessions with a failed turn the user has not brought on screen since
+    /// it landed. This is separate from unread so it can take precedence.
+    error_sessions: HashSet<String>,
     /// Desktop notification preferences; persisted on the UI thread, this
     /// copy gates what event notifications fire.
     notify: crate::winstate::Notifications,
@@ -802,6 +805,7 @@ pub async fn run(
         watched_sessions: HashSet::new(),
         attention_by_session: HashMap::new(),
         unread_sessions: HashSet::new(),
+        error_sessions: HashSet::new(),
         notify: crate::winstate::load_notifications(),
         window_focused,
         pending_attachments: Vec::new(),
@@ -1308,6 +1312,7 @@ impl Controller {
         let session_ids: HashSet<String> = self.sessions.iter().map(|s| s.id.clone()).collect();
         self.nav_prs.retain(|id, _| session_ids.contains(id));
         self.unread_sessions.retain(|id| session_ids.contains(id));
+        self.error_sessions.retain(|id| session_ids.contains(id));
         self.watched_sessions.retain(|id| session_ids.contains(id));
         let stale_threads: Vec<String> = self
             .thread_sessions
@@ -1360,6 +1365,7 @@ impl Controller {
             archived,
             busy: self.busy_sessions.contains(&session.id),
             unread: self.unread_sessions.contains(&session.id),
+            error: self.error_sessions.contains(&session.id),
             pr_kind,
             pr_tooltip,
             attention_kind,
@@ -1427,7 +1433,7 @@ impl Controller {
 
     /// Mark completed work unread unless this thread is currently visible in
     /// the focused window. Returns whether the session badge changed.
-    fn mark_thread_unread_if_hidden(&mut self, thread_id: &str) -> bool {
+    fn mark_thread_unread_if_hidden(&mut self, thread_id: &str, failed: bool) -> bool {
         let focused = self
             .window_focused
             .load(std::sync::atomic::Ordering::Relaxed);
@@ -1438,7 +1444,9 @@ impl Controller {
         let Some(session_id) = self.thread_sessions.get(thread_id).cloned() else {
             return false;
         };
-        self.unread_sessions.insert(session_id)
+        let unread_changed = self.unread_sessions.insert(session_id.clone());
+        let error_changed = failed && self.error_sessions.insert(session_id);
+        unread_changed || error_changed
     }
 
     /// Rebuild the grouped left-nav rows and the row → entry map.
@@ -1659,7 +1667,7 @@ impl Controller {
             return;
         }
         if let Some(session_id) = self.current_session_id()
-            && self.unread_sessions.remove(&session_id)
+            && (self.unread_sessions.remove(&session_id) | self.error_sessions.remove(&session_id))
         {
             self.push_nav();
         }
@@ -1691,13 +1699,16 @@ impl Controller {
             return Ok(());
         }
         if self.current_session_id().as_deref() == Some(self.sessions[index].id.as_str()) {
-            if self.unread_sessions.remove(&self.sessions[index].id) {
+            if self.unread_sessions.remove(&self.sessions[index].id)
+                | self.error_sessions.remove(&self.sessions[index].id)
+            {
                 self.push_nav();
             }
             return Ok(());
         }
         self.current_session = Some(index);
         self.unread_sessions.remove(&self.sessions[index].id);
+        self.error_sessions.remove(&self.sessions[index].id);
         self.close_new_chat();
         self.push_nav();
         let session_id = self.sessions[index].id.clone();
@@ -5640,6 +5651,7 @@ impl Controller {
                 let mut changed = false;
                 let mut completed = false;
                 let mut finished = false;
+                let mut failed = false;
                 let mut todos_changed = false;
                 for envelope in &envelopes {
                     todos_changed |= self.capture_todos(&thread_id, envelope);
@@ -5656,6 +5668,7 @@ impl Controller {
                         trouve_protocol::Event::TurnCompleted { .. }
                             | trouve_protocol::Event::TurnFailed { .. }
                     );
+                    failed |= matches!(envelope.event, trouve_protocol::Event::TurnFailed { .. });
                     self.maybe_notify(&thread_id, envelope);
                 }
                 let after = self
@@ -5680,8 +5693,9 @@ impl Controller {
                         self.refresh_usage_text().await;
                     }
                 }
-                let unread_changed =
-                    mark_unread && finished && self.mark_thread_unread_if_hidden(&thread_id);
+                let unread_changed = mark_unread
+                    && finished
+                    && self.mark_thread_unread_if_hidden(&thread_id, failed);
                 if attention_changed || unread_changed {
                     self.push_nav();
                 }
@@ -5716,6 +5730,7 @@ impl Controller {
                     trouve_protocol::Event::TurnCompleted { .. }
                         | trouve_protocol::Event::TurnFailed { .. }
                 );
+                let failed = matches!(envelope.event, trouve_protocol::Event::TurnFailed { .. });
                 if self.current_thread_id().as_deref() == Some(&thread_id) {
                     // Compaction/usage state can change without a chat row
                     // changing, so the dial refreshes on every event.
@@ -5760,7 +5775,7 @@ impl Controller {
                 self.maybe_notify(&thread_id, &envelope);
                 let mut nav_changed = attention_changed;
                 if finished {
-                    nav_changed |= self.mark_thread_unread_if_hidden(&thread_id);
+                    nav_changed |= self.mark_thread_unread_if_hidden(&thread_id, failed);
                 }
                 if nav_changed {
                     self.push_nav();
@@ -5771,7 +5786,8 @@ impl Controller {
             UiCommand::WindowFocusChanged(focused) => {
                 if focused
                     && let Some(session_id) = self.current_session_id()
-                    && self.unread_sessions.remove(&session_id)
+                    && (self.unread_sessions.remove(&session_id)
+                        | self.error_sessions.remove(&session_id))
                 {
                     self.push_nav();
                 }

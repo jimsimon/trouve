@@ -31,6 +31,8 @@ pub struct NavRowData {
     pub busy: bool,
     /// Session has completed/failed work that has not been viewed yet.
     pub unread: bool,
+    /// Session has a failed turn that has not been viewed yet.
+    pub error: bool,
     /// Pull-request badge: 0 none, 1 open, 2 draft, 3 merged, 4 closed,
     /// 5 multiple (neutral).
     pub pr_kind: i32,
@@ -158,6 +160,7 @@ fn set_nav_now(ui: &AppWindow, rows: Vec<NavRowData>) {
             expanded: r.expanded,
             busy: r.busy,
             unread: r.unread,
+            error: r.error,
             pr_kind: r.pr_kind,
             pr_tooltip: r.pr_tooltip.into(),
             attention_kind: r.attention_kind,
