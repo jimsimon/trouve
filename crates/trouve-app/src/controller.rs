@@ -11,6 +11,7 @@
 use std::collections::{HashMap, HashSet};
 
 use anyhow::{Context, Result};
+use slint_media_view::{DecodedMedia, MediaItemData, MediaKind, media_kind};
 use tokio::sync::mpsc;
 use trouve_client_core::client::ProtocolClient;
 use trouve_client_core::viewmodel::ThreadViewModel;
@@ -176,7 +177,31 @@ pub enum UiCommand {
     },
     /// Composer attachment chip ✕ at `index`.
     AttachmentRemoved(usize),
-    /// Queued-prompt panel: replace the text of the row at `index`.
+    /// Attachment tile click, keyed by a stored attachment id or the
+    /// client-local id of a staged draft attachment.
+    AttachmentActivated(String),
+    /// A lazily requested stored image/GIF finished downloading.
+    AttachmentFetched {
+        id: String,
+        kind: MediaKind,
+        result: std::result::Result<Vec<u8>, String>,
+    },
+    /// Queued-prompt panel: open the editor for a row, or close it with -1.
+    QueueEditorChanged(i32),
+    /// Queued-prompt editor 📎 button.
+    QueueAttachFileDialog,
+    /// A file staged inside the currently open queued-prompt editor.
+    QueueAddAttachment {
+        /// Stable prompt id for a long-lived file dialog. Clipboard pastes
+        /// use None because they are captured synchronously from the editor.
+        prompt_id: Option<String>,
+        name: String,
+        mime: String,
+        bytes: Vec<u8>,
+    },
+    /// Remove one existing or newly staged queued-prompt attachment.
+    QueueAttachmentRemoved(usize),
+    /// Queued-prompt panel: replace the text and attachment set of the row.
     QueueEdit {
         index: usize,
         content: String,
@@ -703,9 +728,19 @@ struct Controller {
     /// Whether the app window has focus (winit Focused events, written on
     /// the UI thread). Focused + on-screen threads never notify.
     window_focused: std::sync::Arc<std::sync::atomic::AtomicBool>,
-    /// Files staged for the next prompt (already base64-encoded uploads);
-    /// consumed by the next send from either composer.
-    pending_attachments: Vec<trouve_protocol::AttachmentUpload>,
+    /// Files staged for the next prompt, including client-local preview
+    /// state; consumed by the next send from either composer.
+    pending_attachments: Vec<PendingAttachment>,
+    /// The one queued prompt currently being edited. Stored attachments are
+    /// retained by id; fresh files stay client-local until Save succeeds.
+    queue_edit: Option<QueueEditState>,
+    /// Lazily fetched submitted media. Entries are evicted before the
+    /// decoded/input-byte estimate exceeds the cache budget.
+    media_cache: HashMap<String, CachedMedia>,
+    media_loading: HashSet<String>,
+    /// Lifetime-bound location for videos handed to the OS player. Dropping
+    /// the controller removes every materialized attachment.
+    media_temp_dir: Option<tempfile::TempDir>,
     /// Which session's worktree paths currently back the composer's "@"
     /// mention popup, and when they were fetched (throttles refreshes).
     at_files_fetched: Option<(String, std::time::Instant)>,
@@ -818,6 +853,51 @@ struct FileRow {
     expanded: bool,
 }
 
+#[derive(Clone)]
+struct PendingAttachment {
+    key: String,
+    upload: trouve_protocol::AttachmentUpload,
+    bytes: Vec<u8>,
+    decoded: Option<DecodedMedia>,
+    failed: bool,
+}
+
+struct QueueEditState {
+    prompt_id: String,
+    stored: Vec<trouve_protocol::Attachment>,
+    staged: Vec<PendingAttachment>,
+}
+
+impl QueueEditState {
+    fn request(&self, content: String) -> trouve_protocol::UpdateQueuedPromptRequest {
+        trouve_protocol::UpdateQueuedPromptRequest {
+            content,
+            retained_attachment_ids: Some(
+                self.stored
+                    .iter()
+                    .map(|attachment| attachment.id.clone())
+                    .collect(),
+            ),
+            attachments: self
+                .staged
+                .iter()
+                .map(|attachment| attachment.upload.clone())
+                .collect(),
+        }
+    }
+}
+
+enum AttachmentTarget {
+    Composer,
+    Queue(String),
+}
+
+struct CachedMedia {
+    bytes: Option<Vec<u8>>,
+    decoded: Option<DecodedMedia>,
+    failed: bool,
+}
+
 pub async fn run(
     ui: slint::Weak<crate::AppWindow>,
     tx: mpsc::UnboundedSender<UiCommand>,
@@ -894,6 +974,13 @@ pub async fn run(
         notify: crate::winstate::load_notifications(),
         window_focused,
         pending_attachments: Vec::new(),
+        queue_edit: None,
+        media_cache: HashMap::new(),
+        media_loading: HashSet::new(),
+        media_temp_dir: tempfile::Builder::new()
+            .prefix("trouve-media-")
+            .tempdir()
+            .ok(),
         at_files_fetched: None,
         expanded_tools: HashSet::new(),
         last_delta_render: None,
@@ -2340,6 +2427,43 @@ impl Controller {
         });
     }
 
+    fn open_attachment_dialog(&self, target: AttachmentTarget) {
+        // The portal dialog can stay open indefinitely; run it off the
+        // command loop so events keep flowing meanwhile.
+        let tx = self.tx.clone();
+        tokio::spawn(async move {
+            let picked = rfd::AsyncFileDialog::new()
+                .set_title("Attach files to the prompt")
+                .pick_files()
+                .await;
+            for file in picked.unwrap_or_default() {
+                let path = file.path().to_path_buf();
+                let name = file.file_name();
+                match tokio::fs::read(&path).await {
+                    Ok(bytes) => {
+                        let mime = mime_guess::from_path(&path)
+                            .first_or_octet_stream()
+                            .essence_str()
+                            .to_string();
+                        let command = match &target {
+                            AttachmentTarget::Composer => {
+                                UiCommand::AddAttachment { name, mime, bytes }
+                            }
+                            AttachmentTarget::Queue(prompt_id) => UiCommand::QueueAddAttachment {
+                                prompt_id: Some(prompt_id.clone()),
+                                name,
+                                mime,
+                                bytes,
+                            },
+                        };
+                        let _ = tx.send(command);
+                    }
+                    Err(e) => tracing::warn!("attach {name}: {e}"),
+                }
+            }
+        });
+    }
+
     /// Re-fold the current thread into chat rows. `scroll` jumps the list to
     /// the end — wanted when content arrives or threads switch, jarring for
     /// in-place toggles (tool details, raw view).
@@ -2388,21 +2512,21 @@ impl Controller {
                 }
             }
         }
-        let (rows, call_ids) = render::chat_rows(
+        let (mut rows, call_ids) = render::chat_rows(
             vm,
             &self.expanded_tools,
             &raw_turns,
             &collapsed,
             &self.wizards,
         );
+        let commands = vm
+            .commands
+            .iter()
+            .map(|c| (c.name.clone(), c.description.clone()))
+            .collect();
+        self.prepare_attachment_rows(&mut rows);
         self.row_call_ids = call_ids;
-        ui::set_slash_commands(
-            &self.ui,
-            vm.commands
-                .iter()
-                .map(|c| (c.name.clone(), c.description.clone()))
-                .collect(),
-        );
+        ui::set_slash_commands(&self.ui, commands);
         ui::set_chat(&self.ui, rows, thread_id, scroll);
         ui::set_composer_enabled(&self.ui, true);
     }
@@ -2412,10 +2536,21 @@ impl Controller {
     /// after a restart or a failed turn — resuming is the user's call.
     fn push_queue(&mut self) {
         let Some(thread_id) = self.current_thread_id() else {
+            self.queue_edit = None;
             ui::set_queue(&self.ui, Vec::new(), Vec::new(), false);
+            ui::set_queue_edit_attachments(&self.ui, Vec::new());
             return;
         };
         let vm = self.vms.entry(thread_id).or_default();
+        if self
+            .queue_edit
+            .as_ref()
+            .is_some_and(|edit| !vm.queue.iter().any(|prompt| prompt.id == edit.prompt_id))
+        {
+            self.queue_edit = None;
+            ui::close_queue_editor(&self.ui);
+            ui::set_queue_edit_attachments(&self.ui, Vec::new());
+        }
         let prompts = vm.queue.iter().map(|p| p.content.clone()).collect();
         // Shown beside the row text (not part of it — rows are editable).
         let badges = vm
@@ -2431,19 +2566,355 @@ impl Controller {
 
     /// Mirror the staged attachments as composer chips.
     fn push_attachments(&self) {
-        let chips = self
+        let items = self
             .pending_attachments
             .iter()
-            .map(|a| {
-                // Base64 is 4 chars per 3 bytes; close enough for a label.
-                let bytes = a.data.len() * 3 / 4;
-                (
-                    a.name.clone(),
-                    format!("{} · {}", a.mime, human_size(bytes)),
-                )
-            })
+            .map(pending_media_item)
             .collect();
-        ui::set_composer_attachments(&self.ui, chips);
+        ui::set_composer_attachments(&self.ui, items);
+    }
+
+    /// Push the stored + newly staged files in the open queue editor. Stored
+    /// image bytes use the same lazy cache as chat attachments, so opening an
+    /// editor does not eagerly retain another full decode.
+    fn push_queue_edit_attachments(&mut self) {
+        let Some(edit) = &self.queue_edit else {
+            ui::set_queue_edit_attachments(&self.ui, Vec::new());
+            return;
+        };
+        let mut items = edit
+            .stored
+            .iter()
+            .map(stored_media_item)
+            .chain(edit.staged.iter().map(pending_media_item))
+            .collect::<Vec<_>>();
+        self.prepare_media_items(&mut items);
+        ui::set_queue_edit_attachments(&self.ui, items);
+    }
+
+    async fn send_with_pending(&mut self, thread_id: &str, content: &str) -> Result<()> {
+        let staged = std::mem::take(&mut self.pending_attachments);
+        let uploads = staged.iter().map(|a| a.upload.clone()).collect();
+        self.push_attachments();
+        if let Err(error) = self
+            .client
+            .send_message_with(thread_id, content, uploads)
+            .await
+        {
+            self.pending_attachments = staged;
+            self.push_attachments();
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    fn prepare_attachment_rows(&mut self, rows: &mut [render::ChatRowData]) {
+        for row in rows {
+            self.prepare_media_items(&mut row.attachments);
+        }
+    }
+
+    fn prepare_media_items(&mut self, items: &mut [MediaItemData]) {
+        for item in items {
+            if let Some(cached) = self.media_cache.get(&item.key) {
+                item.decoded = cached.decoded.as_ref().map(thumbnail_only);
+                item.loading = false;
+                item.failed = cached.failed;
+                continue;
+            }
+            if !item.kind.is_viewable() {
+                item.loading = false;
+                continue;
+            }
+            item.loading = true;
+            if !self.media_loading.insert(item.key.clone()) {
+                continue;
+            }
+            let id = item.key.clone();
+            let kind = item.kind;
+            let client = self.client.clone();
+            let tx = self.tx.clone();
+            tokio::spawn(async move {
+                let result = client
+                    .attachment_bytes(&id)
+                    .await
+                    .map_err(|error| format!("{error:#}"));
+                let _ = tx.send(UiCommand::AttachmentFetched { id, kind, result });
+            });
+        }
+    }
+
+    fn insert_media_cache(&mut self, id: String, media: CachedMedia) {
+        const CACHE_BUDGET: usize = 192 * 1024 * 1024;
+        let incoming = cached_media_weight(&media);
+        while !self.media_cache.is_empty()
+            && self
+                .media_cache
+                .values()
+                .map(cached_media_weight)
+                .sum::<usize>()
+                .saturating_add(incoming)
+                > CACHE_BUDGET
+        {
+            if let Some(oldest) = self.media_cache.keys().next().cloned() {
+                self.media_cache.remove(&oldest);
+            }
+        }
+        self.media_cache.insert(id, media);
+    }
+
+    fn pending_gallery(&self, selected_key: &str) -> Option<(Vec<MediaItemData>, usize)> {
+        let mut selected = None;
+        let items = self
+            .pending_attachments
+            .iter()
+            .filter_map(|attachment| {
+                let kind = media_kind(&attachment.upload.name, &attachment.upload.mime);
+                if !kind.is_viewable() || attachment.decoded.is_none() {
+                    return None;
+                }
+                Some(MediaItemData {
+                    key: attachment.key.clone(),
+                    name: attachment.upload.name.clone(),
+                    meta: format!(
+                        "{} · {}",
+                        attachment.upload.mime,
+                        human_size(attachment.bytes.len())
+                    ),
+                    kind,
+                    decoded: attachment.decoded.clone(),
+                    loading: false,
+                    failed: attachment.failed,
+                })
+            })
+            .enumerate()
+            .map(|(index, item)| {
+                if item.key == selected_key {
+                    selected = Some(index);
+                }
+                item
+            })
+            .collect::<Vec<_>>();
+        selected.map(|index| (items, index))
+    }
+
+    fn queue_edit_gallery(&self, selected_key: &str) -> Option<(Vec<MediaItemData>, usize)> {
+        let edit = self.queue_edit.as_ref()?;
+        let stored = edit.stored.iter().filter_map(|attachment| {
+            let kind = media_kind(&attachment.name, &attachment.mime);
+            if !kind.is_viewable() {
+                return None;
+            }
+            let decoded = self.media_cache.get(&attachment.id)?.decoded.clone()?;
+            Some(MediaItemData {
+                key: attachment.id.clone(),
+                name: attachment.name.clone(),
+                meta: format!(
+                    "{} · {}",
+                    attachment.mime,
+                    human_size(attachment.size_bytes as usize)
+                ),
+                kind,
+                decoded: Some(decoded),
+                loading: false,
+                failed: false,
+            })
+        });
+        let staged = edit.staged.iter().filter_map(|attachment| {
+            let kind = media_kind(&attachment.upload.name, &attachment.upload.mime);
+            if !kind.is_viewable() {
+                return None;
+            }
+            let decoded = attachment.decoded.clone()?;
+            Some(MediaItemData {
+                key: attachment.key.clone(),
+                name: attachment.upload.name.clone(),
+                meta: format!(
+                    "{} · {}",
+                    attachment.upload.mime,
+                    human_size(attachment.bytes.len())
+                ),
+                kind,
+                decoded: Some(decoded),
+                loading: false,
+                failed: attachment.failed,
+            })
+        });
+        let mut selected = None;
+        let items = stored
+            .chain(staged)
+            .enumerate()
+            .map(|(index, item)| {
+                if item.key == selected_key {
+                    selected = Some(index);
+                }
+                item
+            })
+            .collect::<Vec<_>>();
+        selected.map(|index| (items, index))
+    }
+
+    fn stored_gallery(&self, selected_key: &str) -> Option<(Vec<MediaItemData>, usize)> {
+        if let Some(gallery) = self.queue_edit_gallery(selected_key) {
+            return Some(gallery);
+        }
+        let thread_id = self.current_thread_id()?;
+        let vm = self.vms.get(&thread_id)?;
+        for chat_item in &vm.items {
+            let trouve_client_core::viewmodel::ChatItem::User { attachments, .. } = chat_item
+            else {
+                continue;
+            };
+            if !attachments.iter().any(|a| a.id == selected_key) {
+                continue;
+            }
+            let mut selected = None;
+            let items = attachments
+                .iter()
+                .filter_map(|attachment| {
+                    let kind = media_kind(&attachment.name, &attachment.mime);
+                    let decoded = self.media_cache.get(&attachment.id)?.decoded.clone()?;
+                    Some((attachment, kind, decoded))
+                })
+                .filter(|(_, kind, _)| kind.is_viewable())
+                .enumerate()
+                .map(|(index, (attachment, kind, decoded))| {
+                    if attachment.id == selected_key {
+                        selected = Some(index);
+                    }
+                    MediaItemData {
+                        key: attachment.id.clone(),
+                        name: attachment.name.clone(),
+                        meta: format!(
+                            "{} · {}",
+                            attachment.mime,
+                            human_size(attachment.size_bytes as usize)
+                        ),
+                        kind,
+                        decoded: Some(decoded),
+                        loading: false,
+                        failed: false,
+                    }
+                })
+                .collect::<Vec<_>>();
+            return selected.map(|index| (items, index));
+        }
+        None
+    }
+
+    fn stored_attachment(&self, id: &str) -> Option<trouve_protocol::Attachment> {
+        if let Some(attachment) = self
+            .queue_edit
+            .as_ref()
+            .and_then(|edit| edit.stored.iter().find(|attachment| attachment.id == id))
+        {
+            return Some(attachment.clone());
+        }
+        let thread_id = self.current_thread_id()?;
+        let vm = self.vms.get(&thread_id)?;
+        vm.items.iter().find_map(|item| {
+            let trouve_client_core::viewmodel::ChatItem::User { attachments, .. } = item else {
+                return None;
+            };
+            attachments.iter().find(|a| a.id == id).cloned()
+        })
+    }
+
+    async fn activate_attachment(&mut self, key: &str) -> Result<()> {
+        if let Some(pending) = self
+            .pending_attachments
+            .iter()
+            .find(|a| a.key == key)
+            .cloned()
+        {
+            let kind = media_kind(&pending.upload.name, &pending.upload.mime);
+            if kind.is_viewable() {
+                if let Some((items, selected)) = self.pending_gallery(key) {
+                    ui::show_gallery(&self.ui, items, selected);
+                } else if pending.failed {
+                    self.error("Image preview is unavailable");
+                }
+            } else if kind == MediaKind::Video {
+                let name = pending.upload.name.clone();
+                let bytes = pending.bytes.clone();
+                self.open_video(key, &name, &bytes).await?;
+            }
+            return Ok(());
+        }
+
+        if let Some(pending) = self
+            .queue_edit
+            .as_ref()
+            .and_then(|edit| edit.staged.iter().find(|a| a.key == key))
+            .cloned()
+        {
+            let kind = media_kind(&pending.upload.name, &pending.upload.mime);
+            if kind.is_viewable() {
+                if let Some((items, selected)) = self.queue_edit_gallery(key) {
+                    ui::show_gallery(&self.ui, items, selected);
+                } else if pending.failed {
+                    self.error("Image preview is unavailable");
+                }
+            } else if kind == MediaKind::Video {
+                self.open_video(key, &pending.upload.name, &pending.bytes)
+                    .await?;
+            }
+            return Ok(());
+        }
+
+        let Some(attachment) = self.stored_attachment(key) else {
+            return Ok(());
+        };
+        let kind = media_kind(&attachment.name, &attachment.mime);
+        if kind.is_viewable() {
+            if let Some((items, selected)) = self.stored_gallery(key) {
+                ui::show_gallery(&self.ui, items, selected);
+            } else if self.media_cache.get(key).is_some_and(|media| media.failed) {
+                self.error("Image preview is unavailable");
+            } else {
+                self.error("Image preview is still loading");
+            }
+        } else if kind == MediaKind::Video {
+            let bytes = if let Some(bytes) = self
+                .media_cache
+                .get(key)
+                .and_then(|cached| cached.bytes.clone())
+            {
+                bytes
+            } else {
+                let bytes = self.client.attachment_bytes(key).await?;
+                self.insert_media_cache(
+                    key.to_string(),
+                    CachedMedia {
+                        bytes: Some(bytes.clone()),
+                        decoded: None,
+                        failed: false,
+                    },
+                );
+                bytes
+            };
+            self.open_video(key, &attachment.name, &bytes).await?;
+        }
+        Ok(())
+    }
+
+    async fn open_video(&self, key: &str, name: &str, bytes: &[u8]) -> Result<()> {
+        let dir = self
+            .media_temp_dir
+            .as_ref()
+            .context("temporary media directory is unavailable")?;
+        let filename = format!(
+            "{}-{}",
+            safe_attachment_name(key),
+            safe_attachment_name(name)
+        );
+        let path = dir.path().join(filename);
+        tokio::fs::write(&path, bytes)
+            .await
+            .with_context(|| format!("writing {}", path.display()))?;
+        open::that_detached(&path)
+            .with_context(|| format!("opening {} in the system video player", path.display()))?;
+        Ok(())
     }
 
     /// Server id of the current thread's queued prompt shown at `index`.
@@ -3283,11 +3754,7 @@ impl Controller {
                 )
                 .await?;
                 if let Some(thread_id) = self.current_thread_id() {
-                    let uploads = std::mem::take(&mut self.pending_attachments);
-                    self.push_attachments();
-                    self.client
-                        .send_message_with(&thread_id, &prompt, uploads)
-                        .await?;
+                    self.send_with_pending(&thread_id, &prompt).await?;
                 }
             }
             _ => {
@@ -3321,11 +3788,7 @@ impl Controller {
                 )
                 .await?;
                 if let Some(thread_id) = self.current_thread_id() {
-                    let uploads = std::mem::take(&mut self.pending_attachments);
-                    self.push_attachments();
-                    self.client
-                        .send_message_with(&thread_id, &prompt, uploads)
-                        .await?;
+                    self.send_with_pending(&thread_id, &prompt).await?;
                 }
             }
         }
@@ -3890,11 +4353,10 @@ impl Controller {
             }
             // Workspace lifecycle is server-scoped so another app instance
             // can keep its sidebar in sync with opens and closes here.
-            Event::WorkspaceRegistered { .. } => {
-                if self.reload_sessions().await.is_ok() {
-                    self.sync_home_workspace();
-                }
+            Event::WorkspaceRegistered { .. } if self.reload_sessions().await.is_ok() => {
+                self.sync_home_workspace();
             }
+            Event::WorkspaceRegistered { .. } => {}
             Event::WorkspaceClosed { workspace_id } => {
                 self.close_current_session_if_in_workspace(workspace_id);
                 if self.reload_sessions().await.is_ok() {
@@ -4313,18 +4775,7 @@ impl Controller {
             }
             UiCommand::SendMessage(text) => {
                 if let Some(thread_id) = self.current_thread_id() {
-                    let uploads = std::mem::take(&mut self.pending_attachments);
-                    self.push_attachments();
-                    if let Err(e) = self
-                        .client
-                        .send_message_with(&thread_id, &text, uploads.clone())
-                        .await
-                    {
-                        // Restage so a transient failure doesn't eat the files.
-                        self.pending_attachments = uploads;
-                        self.push_attachments();
-                        return Err(e);
-                    }
+                    self.send_with_pending(&thread_id, &text).await?;
                     self.apply_scroll_intent(true);
                 }
             }
@@ -4334,44 +4785,14 @@ impl Controller {
                 }
             }
             UiCommand::RefreshAtFiles => self.refresh_at_files(),
-            UiCommand::AttachFileDialog => {
-                // The portal dialog can stay open indefinitely; run it off
-                // the command loop so events keep flowing meanwhile.
-                let tx = self.tx.clone();
-                tokio::spawn(async move {
-                    let picked = rfd::AsyncFileDialog::new()
-                        .set_title("Attach files to the prompt")
-                        .pick_files()
-                        .await;
-                    for file in picked.unwrap_or_default() {
-                        let path = file.path().to_path_buf();
-                        let name = file.file_name();
-                        match tokio::fs::read(&path).await {
-                            Ok(bytes) => {
-                                let mime = mime_guess::from_path(&path)
-                                    .first_or_octet_stream()
-                                    .essence_str()
-                                    .to_string();
-                                let _ = tx.send(UiCommand::AddAttachment { name, mime, bytes });
-                            }
-                            Err(e) => tracing::warn!("attach {name}: {e}"),
-                        }
-                    }
-                });
-            }
+            UiCommand::AttachFileDialog => self.open_attachment_dialog(AttachmentTarget::Composer),
             UiCommand::AddAttachment { name, mime, bytes } => {
-                const MAX_ATTACHMENT_BYTES: usize = 10 * 1024 * 1024;
-                if bytes.len() > MAX_ATTACHMENT_BYTES {
-                    self.error(&format!("{name} is larger than the 10 MB attachment limit"));
-                } else {
-                    use base64::Engine as _;
-                    self.pending_attachments
-                        .push(trouve_protocol::AttachmentUpload {
-                            name,
-                            mime,
-                            data: base64::engine::general_purpose::STANDARD.encode(&bytes),
-                        });
-                    self.push_attachments();
+                match make_pending_attachment(name, mime, bytes) {
+                    Ok(attachment) => {
+                        self.pending_attachments.push(attachment);
+                        self.push_attachments();
+                    }
+                    Err(error) => self.error(&error),
                 }
             }
             UiCommand::AttachmentRemoved(index) => {
@@ -4380,11 +4801,119 @@ impl Controller {
                     self.push_attachments();
                 }
             }
+            UiCommand::AttachmentActivated(key) => {
+                self.activate_attachment(&key).await?;
+            }
+            UiCommand::AttachmentFetched { id, kind, result } => {
+                self.media_loading.remove(&id);
+                let media = match result {
+                    Ok(bytes) => match slint_media_view::decode(&bytes, kind) {
+                        Ok(decoded) => CachedMedia {
+                            bytes: Some(bytes),
+                            decoded: Some(decoded),
+                            failed: false,
+                        },
+                        Err(error) => {
+                            tracing::warn!("stored attachment preview {id} failed: {error}");
+                            CachedMedia {
+                                bytes: Some(bytes),
+                                decoded: None,
+                                failed: true,
+                            }
+                        }
+                    },
+                    Err(error) => {
+                        tracing::warn!("stored attachment fetch {id} failed: {error}");
+                        CachedMedia {
+                            bytes: None,
+                            decoded: None,
+                            failed: true,
+                        }
+                    }
+                };
+                self.insert_media_cache(id, media);
+                self.render_chat(false);
+                self.push_queue_edit_attachments();
+            }
+            UiCommand::QueueEditorChanged(index) => {
+                if index < 0 {
+                    self.queue_edit = None;
+                    self.push_queue_edit_attachments();
+                } else {
+                    let prompt = self.current_thread_id().and_then(|thread_id| {
+                        self.vms
+                            .get(&thread_id)
+                            .and_then(|vm| vm.queue.get(index as usize))
+                            .cloned()
+                    });
+                    self.queue_edit = prompt.map(|prompt| QueueEditState {
+                        prompt_id: prompt.id,
+                        stored: prompt.attachments,
+                        staged: Vec::new(),
+                    });
+                    self.push_queue_edit_attachments();
+                }
+            }
+            UiCommand::QueueAttachFileDialog => {
+                if let Some(edit) = &self.queue_edit {
+                    self.open_attachment_dialog(AttachmentTarget::Queue(edit.prompt_id.clone()));
+                }
+            }
+            UiCommand::QueueAddAttachment {
+                prompt_id,
+                name,
+                mime,
+                bytes,
+            } => {
+                if let Some(edit) = &mut self.queue_edit {
+                    if prompt_id
+                        .as_ref()
+                        .is_some_and(|prompt_id| *prompt_id != edit.prompt_id)
+                    {
+                        return Ok(());
+                    }
+                    match make_pending_attachment(name, mime, bytes) {
+                        Ok(attachment) => {
+                            edit.staged.push(attachment);
+                            self.push_queue_edit_attachments();
+                        }
+                        Err(error) => self.error(&error),
+                    }
+                }
+            }
+            UiCommand::QueueAttachmentRemoved(index) => {
+                if let Some(edit) = &mut self.queue_edit {
+                    if index < edit.stored.len() {
+                        edit.stored.remove(index);
+                    } else {
+                        let staged_index = index - edit.stored.len();
+                        if staged_index < edit.staged.len() {
+                            edit.staged.remove(staged_index);
+                        }
+                    }
+                    self.push_queue_edit_attachments();
+                }
+            }
             UiCommand::QueueEdit { index, content } => {
-                if let Some(id) = self.queued_prompt_id(index)
-                    && let Err(e) = self.client.update_queued_prompt(&id, &content).await
+                if let Some(edit) = self.queue_edit.take() {
+                    let prompt_id = edit.prompt_id.clone();
+                    let request = edit.request(content);
+                    if let Err(error) = self
+                        .client
+                        .update_queued_prompt_with(&prompt_id, request)
+                        .await
+                    {
+                        self.queue_edit = Some(edit);
+                        self.push_queue_edit_attachments();
+                        self.error(&format!("{error:#}"));
+                    } else {
+                        ui::close_queue_editor(&self.ui);
+                        self.push_queue_edit_attachments();
+                    }
+                } else if let Some(id) = self.queued_prompt_id(index)
+                    && let Err(error) = self.client.update_queued_prompt(&id, &content).await
                 {
-                    self.error(&format!("{e:#}"));
+                    self.error(&format!("{error:#}"));
                 }
             }
             UiCommand::QueueDelete(index) => {
@@ -6235,6 +6764,75 @@ fn default_mode_index(modes: &[AgentMode]) -> i32 {
 }
 
 /// "512 B" / "34 KB" / "2.4 MB", for attachment chip labels.
+fn make_pending_attachment(
+    name: String,
+    mime: String,
+    bytes: Vec<u8>,
+) -> std::result::Result<PendingAttachment, String> {
+    const MAX_ATTACHMENT_BYTES: usize = 10 * 1024 * 1024;
+    if bytes.len() > MAX_ATTACHMENT_BYTES {
+        return Err(format!("{name} is larger than the 10 MB attachment limit"));
+    }
+    use base64::Engine as _;
+    let kind = media_kind(&name, &mime);
+    let decoded = kind
+        .is_viewable()
+        .then(|| slint_media_view::decode(&bytes, kind))
+        .transpose();
+    let (decoded, failed) = match decoded {
+        Ok(decoded) => (decoded, false),
+        Err(error) => {
+            tracing::warn!("attachment preview for {name} failed: {error}");
+            (None, true)
+        }
+    };
+    Ok(PendingAttachment {
+        key: uuid::Uuid::new_v4().simple().to_string(),
+        upload: trouve_protocol::AttachmentUpload {
+            name,
+            mime,
+            data: base64::engine::general_purpose::STANDARD.encode(&bytes),
+        },
+        bytes,
+        decoded,
+        failed,
+    })
+}
+
+fn pending_media_item(attachment: &PendingAttachment) -> MediaItemData {
+    let kind = media_kind(&attachment.upload.name, &attachment.upload.mime);
+    MediaItemData {
+        key: attachment.key.clone(),
+        name: attachment.upload.name.clone(),
+        meta: format!(
+            "{} · {}",
+            attachment.upload.mime,
+            human_size(attachment.bytes.len())
+        ),
+        kind,
+        decoded: attachment.decoded.as_ref().map(thumbnail_only),
+        loading: false,
+        failed: attachment.failed,
+    }
+}
+
+fn stored_media_item(attachment: &trouve_protocol::Attachment) -> MediaItemData {
+    let kind = media_kind(&attachment.name, &attachment.mime);
+    MediaItemData {
+        key: attachment.id.clone(),
+        name: attachment.name.clone(),
+        meta: format!(
+            "{} · {}",
+            attachment.mime,
+            human_size(attachment.size_bytes as usize)
+        ),
+        kind,
+        decoded: None,
+        loading: kind.is_viewable(),
+        failed: false,
+    }
+}
+
 fn human_size(bytes: usize) -> String {
     if bytes < 1024 {
         format!("{bytes} B")
@@ -6242,6 +6840,52 @@ fn human_size(bytes: usize) -> String {
         format!("{} KB", bytes / 1024)
     } else {
         format!("{:.1} MB", bytes as f64 / (1024.0 * 1024.0))
+    }
+}
+
+fn cached_media_weight(media: &CachedMedia) -> usize {
+    let input = media.bytes.as_ref().map_or(0, Vec::len);
+    let decoded = media.decoded.as_ref().map_or(0, |decoded| {
+        decoded.thumbnail.rgba.len().saturating_add(
+            decoded
+                .frames
+                .iter()
+                .map(|frame| frame.pixels.rgba.len())
+                .sum(),
+        )
+    });
+    input.saturating_add(decoded)
+}
+
+fn thumbnail_only(media: &DecodedMedia) -> DecodedMedia {
+    DecodedMedia {
+        thumbnail: media.thumbnail.clone(),
+        frames: Vec::new(),
+        animated: false,
+    }
+}
+
+/// Produce one path component while preserving a useful media extension.
+/// The UUID/id prefix used by the caller prevents Windows reserved names.
+fn safe_attachment_name(name: &str) -> String {
+    let basename = name
+        .rsplit(['/', '\\'])
+        .next()
+        .filter(|part| !part.is_empty())
+        .unwrap_or("attachment");
+    let mut safe = String::with_capacity(basename.len().min(120));
+    for ch in basename.chars().take(120) {
+        if ch.is_ascii_alphanumeric() || matches!(ch, '.' | '-' | '_') {
+            safe.push(ch);
+        } else {
+            safe.push('_');
+        }
+    }
+    let safe = safe.trim_matches('.').trim_end_matches(' ');
+    if safe.is_empty() {
+        "attachment".into()
+    } else {
+        safe.into()
     }
 }
 
@@ -6911,10 +7555,11 @@ fn should_open_chat_at_tail(force_tail: bool, turn_running: bool, has_queue: boo
 #[cfg(test)]
 mod tests {
     use super::{
-        SubscriptionRefresh, SubscriptionRefreshState, approval_pill, attention_badge, check_pill,
-        classify_pr, download_progress, human_age, human_rate, merge_pill, model_health_view,
-        pr_badge, project_session_prs, reconcile_pr_group_order, reconcile_workspace_order,
-        reorder_id, should_open_chat_at_tail, thinking_property,
+        QueueEditState, SubscriptionRefresh, SubscriptionRefreshState, approval_pill,
+        attention_badge, check_pill, classify_pr, download_progress, human_age, human_rate,
+        make_pending_attachment, merge_pill, model_health_view, pr_badge, project_session_prs,
+        reconcile_pr_group_order, reconcile_workspace_order, reorder_id, safe_attachment_name,
+        should_open_chat_at_tail, thinking_property,
     };
     use chrono::{Duration, TimeZone, Utc};
     use trouve_protocol::{
@@ -6944,6 +7589,29 @@ mod tests {
         let changed2 = reconcile_workspace_order(&mut order2, &list);
         assert_eq!(order2, ["c", "a", "b", "d"]);
         assert!(!changed2); // No changes when order already matches
+    }
+
+    #[test]
+    fn queued_editor_sends_explicit_retained_ids_and_new_uploads() {
+        let retained = trouve_protocol::Attachment {
+            id: "at_keep".into(),
+            name: "keep.png".into(),
+            mime: "image/png".into(),
+            size_bytes: 3,
+        };
+        let staged =
+            make_pending_attachment("notes.txt".into(), "text/plain".into(), b"new".to_vec())
+                .unwrap();
+        let state = QueueEditState {
+            prompt_id: "qp_1".into(),
+            stored: vec![retained],
+            staged: vec![staged],
+        };
+
+        let request = state.request("updated".into());
+        assert_eq!(request.retained_attachment_ids.unwrap(), ["at_keep"]);
+        assert_eq!(request.attachments.len(), 1);
+        assert_eq!(request.attachments[0].name, "notes.txt");
     }
 
     #[test]
@@ -7402,5 +8070,13 @@ mod tests {
                 )
                 .is_some()
         );
+    }
+
+    #[test]
+    fn attachment_temp_names_are_single_safe_path_components() {
+        assert_eq!(safe_attachment_name("../demo clip.mp4"), "demo_clip.mp4");
+        assert_eq!(safe_attachment_name(r"C:\\temp\\movie.webm"), "movie.webm");
+        assert_eq!(safe_attachment_name("..."), "attachment");
+        assert_eq!(safe_attachment_name("résumé.mov"), "r_sum_.mov");
     }
 }

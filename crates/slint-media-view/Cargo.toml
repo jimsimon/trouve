@@ -1,0 +1,18 @@
+[package]
+name = "slint-media-view"
+version = "0.1.0"
+edition.workspace = true
+description = "Generic attachment thumbnails and image/GIF lightbox components for Slint."
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+keywords = ["slint", "image", "gallery", "attachments"]
+categories = ["gui", "multimedia::images"]
+
+[dependencies]
+image = { version = "0.25.8", default-features = false, features = ["gif", "jpeg", "png", "webp"] }
+slint.workspace = true
+thiserror.workspace = true
+
+[build-dependencies]
+slint-build = "1.17"

@@ -6,8 +6,9 @@ use slint::{Model, ModelRc, SharedString, VecModel};
 
 use crate::render::ChatRowData;
 use crate::{
-    AppWindow, ChatRow, ChatTableCell, CliItem, DiffRow, FileItem, KnownProviderItem,
-    ModelHealthItem, NavRow, ProviderItem, QOption, QPair, TextSegment, ThreadTabItem, TodoUiItem,
+    AppWindow, ChatRow, ChatTableCell, CliItem, DiffRow, FileItem, KnownProviderItem, MediaFrame,
+    MediaItem, ModelHealthItem, NavRow, ProviderItem, QOption, QPair, TextSegment, ThreadTabItem,
+    TodoUiItem,
 };
 
 type Ui = slint::Weak<AppWindow>;
@@ -387,7 +388,50 @@ fn to_chat_row(r: &ChatRowData) -> ChatRow {
         q_can_back: r.q_can_back,
         q_can_next: r.q_can_next,
         q_last: r.q_last,
+        attachments: ModelRc::new(VecModel::from(
+            r.attachments.iter().map(to_media_item).collect::<Vec<_>>(),
+        )),
     }
+}
+
+fn to_media_item(item: &slint_media_view::MediaItemData) -> MediaItem {
+    let (thumbnail, frames) = item.decoded.as_ref().map_or_else(
+        || (slint::Image::default(), ModelRc::default()),
+        |decoded| {
+            (
+                pixels_to_image(&decoded.thumbnail),
+                ModelRc::new(VecModel::from(
+                    decoded
+                        .frames
+                        .iter()
+                        .map(|frame| MediaFrame {
+                            image: pixels_to_image(&frame.pixels),
+                            delay_ms: frame.delay_ms,
+                        })
+                        .collect::<Vec<_>>(),
+                )),
+            )
+        },
+    );
+    MediaItem {
+        key: item.key.as_str().into(),
+        name: item.name.as_str().into(),
+        meta: item.meta.as_str().into(),
+        kind: item.kind.as_i32(),
+        thumbnail,
+        frames,
+        loading: item.loading,
+        failed: item.failed,
+    }
+}
+
+fn pixels_to_image(pixels: &slint_media_view::DecodedPixels) -> slint::Image {
+    let buffer = slint::SharedPixelBuffer::<slint::Rgba8Pixel>::clone_from_slice(
+        &pixels.rgba,
+        pixels.width,
+        pixels.height,
+    );
+    slint::Image::from_rgba8(buffer)
 }
 
 // The previous render's source rows, for diffing (UI thread only).
@@ -524,6 +568,17 @@ pub fn set_queue(ui: &Ui, prompts: Vec<String>, badges: Vec<String>, idle: bool)
     });
 }
 
+pub fn set_queue_edit_attachments(ui: &Ui, items: Vec<slint_media_view::MediaItemData>) {
+    let _ = ui.upgrade_in_event_loop(move |ui| {
+        let rows: Vec<MediaItem> = items.iter().map(to_media_item).collect();
+        ui.set_queue_edit_attachments(ModelRc::new(VecModel::from(rows)));
+    });
+}
+
+pub fn close_queue_editor(ui: &Ui) {
+    let _ = ui.upgrade_in_event_loop(|ui| ui.set_queue_editing(-1));
+}
+
 fn string_model_matches(model: &ModelRc<SharedString>, values: &[String]) -> bool {
     model.row_count() == values.len()
         && values.iter().enumerate().all(|(index, value)| {
@@ -534,16 +589,19 @@ fn string_model_matches(model: &ModelRc<SharedString>, values: &[String]) -> boo
 }
 
 /// Files staged for the next prompt, shown as removable composer chips.
-pub fn set_composer_attachments(ui: &Ui, chips: Vec<(String, String)>) {
+pub fn set_composer_attachments(ui: &Ui, items: Vec<slint_media_view::MediaItemData>) {
     let _ = ui.upgrade_in_event_loop(move |ui| {
-        let rows: Vec<crate::AttachmentChip> = chips
-            .into_iter()
-            .map(|(name, meta)| crate::AttachmentChip {
-                name: name.into(),
-                meta: meta.into(),
-            })
-            .collect();
+        let rows: Vec<MediaItem> = items.iter().map(to_media_item).collect();
         ui.set_composer_attachments(ModelRc::new(VecModel::from(rows)));
+    });
+}
+
+pub fn show_gallery(ui: &Ui, items: Vec<slint_media_view::MediaItemData>, selected: usize) {
+    let _ = ui.upgrade_in_event_loop(move |ui| {
+        let rows: Vec<MediaItem> = items.iter().map(to_media_item).collect();
+        ui.set_gallery_items(ModelRc::new(VecModel::from(rows)));
+        ui.set_gallery_index(selected.min(items.len().saturating_sub(1)) as i32);
+        ui.set_gallery_open(!items.is_empty());
     });
 }
 

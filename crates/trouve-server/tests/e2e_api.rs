@@ -2012,7 +2012,22 @@ async fn queued_prompts_crud_and_in_order_dispatch() {
     let first = send("one").await;
     assert_eq!(first["turn"], 1);
     assert_eq!(first["queued"], false);
-    let second = send("two").await;
+    let second: serde_json::Value = client
+        .post(format!("{base}/threads/{thread_id}/messages"))
+        .json(&serde_json::json!({
+            "content": "two",
+            "attachments": [{
+                "name": "old.txt",
+                "mime": "text/plain",
+                "data": "b2xk"
+            }]
+        }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
     assert_eq!(second["queued"], true);
     assert_eq!(second["turn"], 0);
     send("three").await;
@@ -2042,8 +2057,12 @@ async fn queued_prompts_crud_and_in_order_dispatch() {
     assert_eq!(queue[1]["content"], "three");
     let id_two = queue[0]["id"].as_str().unwrap().to_string();
     let id_three = queue[1]["id"].as_str().unwrap().to_string();
+    let old_attachment_id = queue[0]["attachments"][0]["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
 
-    // Edit a queued prompt.
+    // A text-only edit from an older client preserves every attachment.
     let resp = client
         .patch(format!("{base}/queue/{id_two}"))
         .json(&serde_json::json!({"content": "two v2"}))
@@ -2051,8 +2070,57 @@ async fn queued_prompts_crud_and_in_order_dispatch() {
         .await
         .unwrap();
     assert_eq!(resp.status(), 204);
+    let queue: Vec<serde_json::Value> = client
+        .get(format!("{base}/threads/{thread_id}/queue"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(queue[0]["attachments"][0]["id"], old_attachment_id);
 
-    // Reorder: "three" now runs before "two v2". A stale id set conflicts.
+    // An attachment-aware edit can remove the old file and append a new one.
+    let resp = client
+        .patch(format!("{base}/queue/{id_two}"))
+        .json(&serde_json::json!({
+            "content": "two v3",
+            "retained_attachment_ids": [],
+            "attachments": [{
+                "name": "new.txt",
+                "mime": "text/plain",
+                "data": "bmV3"
+            }]
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 204);
+    let queue: Vec<serde_json::Value> = client
+        .get(format!("{base}/threads/{thread_id}/queue"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(queue[0]["attachments"].as_array().unwrap().len(), 1);
+    assert_eq!(queue[0]["attachments"][0]["name"], "new.txt");
+
+    // A prompt cannot retain an attachment owned by another prompt (or an
+    // arbitrary stored id), and a rejected edit changes nothing.
+    let resp = client
+        .patch(format!("{base}/queue/{id_two}"))
+        .json(&serde_json::json!({
+            "content": "bad edit",
+            "retained_attachment_ids": ["at_not_owned"]
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 400);
+
+    // Reorder: "three" now runs before "two v3". A stale id set conflicts.
     let resp = client
         .put(format!("{base}/threads/{thread_id}/queue"))
         .json(&serde_json::json!({"ids": [id_three, "bogus"]}))
@@ -2070,7 +2138,8 @@ async fn queued_prompts_crud_and_in_order_dispatch() {
         .await
         .unwrap();
     assert_eq!(reordered[0]["content"], "three");
-    assert_eq!(reordered[1]["content"], "two v2");
+    assert_eq!(reordered[1]["content"], "two v3");
+    assert_eq!(reordered[1]["attachments"][0]["name"], "new.txt");
 
     // Delete: queue a fourth prompt and remove it again.
     send("four").await;
@@ -2101,7 +2170,7 @@ async fn queued_prompts_crud_and_in_order_dispatch() {
         .filter(|e| e["type"] == "user.message")
         .map(|e| e["content"].as_str().unwrap())
         .collect();
-    assert_eq!(user_messages, ["one", "three", "two v2"]);
+    assert_eq!(user_messages, ["one", "three", "two v3"]);
 
     // The queue announced every change on the event stream and ended empty.
     let last_queue = events

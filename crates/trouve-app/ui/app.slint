@@ -20,6 +20,7 @@ import { AutomationsScreen, AutomationItem, AutomationTemplateItem } from "autom
 import { PullRequestsScreen, PrGroupItem, PrRowItem } from "pull-requests-screen.slint";
 import { ConnectivityBanner } from "connectivity-banner.slint";
 import { ScrollKeys } from "scroll-keys.slint";
+import { AttachmentTile, MediaFrame, MediaItem, MediaLightbox } from "media-view.slint";
 import { Theme, ThemePalette } from "theme.slint";
 import { Palette } from "std-widgets.slint";
 
@@ -27,7 +28,7 @@ import { Palette } from "std-widgets.slint";
 export {
     DiffRow, TextSegment, TermSpan, ProviderItem, CliItem, KnownProviderItem, McpServerItem,
     SubscriptionItem, ModeItem, LocalModelItem, LocalSearchItem, AutomationItem, GithubHostItem,
-    PrGroupItem, PrRowItem
+    PrGroupItem, PrRowItem, MediaFrame, MediaItem
 }
 export { ThinkingItem }
 export { Theme, ThemePalette }
@@ -194,13 +195,8 @@ export struct ChatRow {
     q-can-next: bool,
     // Last question page ("Review" button) vs earlier ones ("Next").
     q-last: bool,
-}
-
-// A file staged to ride with the next prompt (composer chips).
-export struct AttachmentChip {
-    name: string,
-    // "image/png · 34 KB".
-    meta: string,
+    // Kind 11: prompt attachment tiles.
+    attachments: [MediaItem],
 }
 
 // One visible row of the Files tree, pre-flattened by the controller:
@@ -1064,9 +1060,10 @@ component NewChatForm inherits VerticalLayout {
     callback workspace-changed(int);
     callback register-workspace(string);
     callback model-filter(string);
-    in property <[AttachmentChip]> attachments;
+    in property <[MediaItem]> attachments;
     callback attach-file();
     callback attachment-removed(int);
+    callback attachment-activated(string);
     callback paste-image-attempted() -> bool;
     property <bool> yolo-selected: root.permission-index >= 0
         && root.permission-index < root.permission-options.length
@@ -1251,17 +1248,20 @@ component NewChatForm inherits VerticalLayout {
         }
     }
 
-    if root.attachments.length > 0: HorizontalLayout {
-        spacing: 6px;
-        for chip[i] in root.attachments: Rectangle {
-            height: Theme.fs(24px);
-            background: Theme.c.accent-bg;
-            border-radius: 6px;
-            HorizontalLayout {
-                padding-left: 8px; padding-right: 4px; spacing: 6px;
-                Text { text: chip.name; color: Theme.c.text-hi; font-size: Theme.fs(11px); vertical-alignment: center; }
-                Text { text: chip.meta; color: Theme.c.text-soft; font-size: Theme.fs(10px); vertical-alignment: center; }
-                IconButton { icon: "✕"; tip: "Remove attachment"; clicked => { root.attachment-removed(i); } }
+    if root.attachments.length > 0: Flickable {
+        height: 100px;
+        viewport-height: self.height;
+        HorizontalLayout {
+            spacing: 6px;
+            for item[i] in root.attachments: AttachmentTile {
+                item: item;
+                removable: true;
+                background-color: Theme.c.accent-bg;
+                foreground: Theme.c.text-hi;
+                secondary: Theme.c.text-soft;
+                hover-color: Theme.c.hover-strong;
+                activated(key) => { root.attachment-activated(key); }
+                removed => { root.attachment-removed(i); }
             }
         }
     }
@@ -1627,6 +1627,7 @@ export component AppWindow inherits Window {
     // Filename click on a Read/Edit tool card: open the file in the Files
     // tab; a nonzero 1-based line range gets preselected there.
     callback chat-file-opened(/* path */ string, /* from */ int, /* to */ int);
+    callback attachment-activated(/* media key */ string);
     // File-view selection (0-based inclusive lines; from < 0 clears),
     // applied by the CodeView whenever the seq is bumped.
     in property <int> file-sel-from: -1;
@@ -1646,13 +1647,16 @@ export component AppWindow inherits Window {
     // in-out: Rust splices "@path " mentions into it when one is picked.
     in-out property <string> composer-draft;
     // Files staged for the next prompt (screenshots, logs, …).
-    in property <[AttachmentChip]> composer-attachments: [];
+    in property <[MediaItem]> composer-attachments: [];
     callback attach-file();
     callback attachment-removed(int);
     // Ctrl/Cmd+V in the composer: returns true when the clipboard held an
     // image that was captured as an attachment (so the paste shouldn't
     // also insert text).
     callback paste-image-attempted() -> bool;
+    in-out property <[MediaItem]> gallery-items: [];
+    in-out property <int> gallery-index: 0;
+    in-out property <bool> gallery-open: false;
 
     // "/" skill completion: the harness's slash commands (parallel name /
     // description lists), the fuzzy-ranked match indices (best first,
@@ -1705,7 +1709,14 @@ export component AppWindow inherits Window {
     // Per-row attachment badge ("📎2"; empty hides it). Parallel to
     // queue-prompts so the editable row text stays pristine.
     in property <[string]> queue-badges;
+    // Stored attachments retained by the open editor plus new files staged
+    // locally for its next Save.
+    in property <[MediaItem]> queue-edit-attachments: [];
     in property <bool> queue-idle: false;
+    callback queue-editor-changed(/* index, -1 closes */ int);
+    callback queue-attach-file();
+    callback queue-attachment-removed(/* attachment index */ int);
+    callback queue-paste-image-attempted() -> bool;
     callback queue-edited(/* index */ int, /* content */ string);
     callback queue-deleted(/* index */ int);
     callback queue-moved(/* index */ int, /* delta, -1 up / +1 down */ int);
@@ -1714,7 +1725,7 @@ export component AppWindow inherits Window {
     callback queue-send-now-at(int);
     // Row currently showing its inline editor (-1 = none). Any queue change
     // replaces the list model, which resets this — indices may have shifted.
-    property <int> queue-editing: -1;
+    in-out property <int> queue-editing: -1;
     // Drag-to-reorder state: the row being dragged and its pointer
     // displacement. Rows are uniform height while dragging (the drag closes
     // any open editor), so the drop slot falls out of the row pitch.
@@ -1738,6 +1749,9 @@ export component AppWindow inherits Window {
             root.queue-drag-from = -1;
             root.queue-drag-dy = 0px;
         }
+    }
+    changed queue-editing => {
+        root.queue-editor-changed(root.queue-editing);
     }
 
     in-out property <string> error-text: "";
@@ -2832,6 +2846,7 @@ export component AppWindow inherits Window {
                     attachments: root.composer-attachments;
                     attach-file => { root.attach-file(); }
                     attachment-removed(i) => { root.attachment-removed(i); }
+                    attachment-activated(key) => { root.attachment-activated(key); }
                     paste-image-attempted => { root.paste-image-attempted() }
                     start(ws, br, fetch, mode, model, thinking, permission, prompt) => {
                         root.start-new-chat(ws, br, fetch, mode, model, thinking, permission, prompt);
@@ -2947,7 +2962,7 @@ export component AppWindow inherits Window {
                             property <bool> hdr: row.kind == 7;
                             property <bool> body: row.kind == 0 || row.kind == 1
                                 || row.kind == 3 || row.kind == 4 || row.kind == 6
-                                || row.kind == 9 || row.kind == 10
+                                || row.kind == 9 || row.kind == 10 || row.kind == 11
                                 // Tool cards nested in an assistant card
                                 // indent with the rest of the body, as does
                                 // a nested activity row.
@@ -3171,6 +3186,23 @@ export component AppWindow inherits Window {
                                     : row.md-kind == 3 ? 16px
                                     : 14px);
                                 link-clicked(url) => { root.open-link(url); }
+                            }
+
+                            if row.kind == 11: Flickable {
+                                height: 100px;
+                                viewport-height: self.height;
+                                HorizontalLayout {
+                                    spacing: 6px;
+                                    alignment: start;
+                                    for item in row.attachments: AttachmentTile {
+                                        item: item;
+                                        background-color: Theme.c.accent-bg;
+                                        foreground: Theme.c.text-hi;
+                                        secondary: Theme.c.text-soft;
+                                        hover-color: Theme.c.hover-strong;
+                                        activated(key) => { root.attachment-activated(key); }
+                                    }
+                                }
                             }
 
                             // Tool card header: click anywhere to toggle
@@ -3975,15 +4007,45 @@ export component AppWindow inherits Window {
                                     }
                                 }
                                 if root.queue-editing == qi: VerticalLayout {
-                                    spacing: 4px;
-                                    qedit := TextEdit {
+                                    spacing: 6px;
+                                    qedit := PromptBox {
                                         text: qtext;
-                                        height: Theme.fs(80px);
-                                        wrap: word-wrap;
-                                        font-size: Theme.fs(12px);
+                                        placeholder: "Edit queued prompt…";
+                                        enabled: !root.connectivity-blocked;
+                                        paste-image-attempted => {
+                                            root.queue-paste-image-attempted()
+                                        }
+                                        submitted(text) => {
+                                            root.queue-edited(qi, text);
+                                        }
+                                    }
+                                    if root.queue-edit-attachments.length > 0: Flickable {
+                                        height: 100px;
+                                        viewport-height: self.height;
+                                        HorizontalLayout {
+                                            spacing: 6px;
+                                            alignment: start;
+                                            for item[i] in root.queue-edit-attachments: AttachmentTile {
+                                                item: item;
+                                                removable: true;
+                                                background-color: Theme.c.accent-bg;
+                                                foreground: Theme.c.text-hi;
+                                                secondary: Theme.c.text-soft;
+                                                hover-color: Theme.c.hover-strong;
+                                                activated(key) => { root.attachment-activated(key); }
+                                                removed => { root.queue-attachment-removed(i); }
+                                            }
+                                        }
                                     }
                                     HorizontalLayout {
                                         spacing: 6px;
+                                        IconButton {
+                                            icon: "📎";
+                                            tip: "Attach files (or paste an image with Ctrl+V)";
+                                            enabled: !root.connectivity-blocked;
+                                            clicked => { root.queue-attach-file(); }
+                                        }
+                                        Rectangle { horizontal-stretch: 1; }
                                         alignment: end;
                                         PillButton {
                                             label: "Cancel";
@@ -3995,7 +4057,6 @@ export component AppWindow inherits Window {
                                             enabled: !root.connectivity-blocked;
                                             clicked => {
                                                 root.queue-edited(qi, qedit.text);
-                                                root.queue-editing = -1;
                                             }
                                         }
                                     }
@@ -4102,42 +4163,20 @@ export component AppWindow inherits Window {
                     // each. Kept above the input so pasting a screenshot has
                     // visible, undoable feedback before sending.
                     if root.composer-attachments.length > 0: Flickable {
-                        height: Theme.fs(26px);
+                        height: 100px;
                         viewport-height: self.height;
                         HorizontalLayout {
                             spacing: 6px;
                             alignment: start;
-                            for chip[i] in root.composer-attachments: Rectangle {
-                                background: Theme.c.accent-bg;
-                                border-radius: 6px;
-                                border-width: 1px;
-                                border-color: Theme.c.primary-border;
-                                height: Theme.fs(24px);
-                                HorizontalLayout {
-                                    spacing: 6px;
-                                    padding-left: 8px;
-                                    padding-right: 4px;
-                                    Text {
-                                        text: chip.name;
-                                        color: Theme.c.text-hi;
-                                        font-size: Theme.fs(11px);
-                                        vertical-alignment: center;
-                                        overflow: elide;
-                                        max-width: 220px;
-                                    }
-                                    Text {
-                                        text: chip.meta;
-                                        color: Theme.c.text-soft;
-                                        font-size: Theme.fs(10px);
-                                        vertical-alignment: center;
-                                    }
-                                    IconButton {
-                                        icon: "✕";
-                                        tip: "Remove attachment";
-                                        y: (parent.height - self.height) / 2;
-                                        clicked => { root.attachment-removed(i); }
-                                    }
-                                }
+                            for item[i] in root.composer-attachments: AttachmentTile {
+                                item: item;
+                                removable: true;
+                                background-color: Theme.c.accent-bg;
+                                foreground: Theme.c.text-hi;
+                                secondary: Theme.c.text-soft;
+                                hover-color: Theme.c.hover-strong;
+                                activated(key) => { root.attachment-activated(key); }
+                                removed => { root.attachment-removed(i); }
                             }
                         }
                     }
@@ -4433,6 +4472,7 @@ export component AppWindow inherits Window {
                 attachments: root.composer-attachments;
                 attach-file => { root.attach-file(); }
                 attachment-removed(i) => { root.attachment-removed(i); }
+                attachment-activated(key) => { root.attachment-activated(key); }
                 paste-image-attempted => { root.paste-image-attempted() }
                 start(ws, br, fetch, mode, model, thinking, permission, prompt) => {
                     root.start-new-chat(ws, br, fetch, mode, model, thinking, permission, prompt);
@@ -5533,6 +5573,23 @@ export component AppWindow inherits Window {
             text: Tip.text;
             color: Theme.c.text;
             font-size: Theme.fs(11px);
+        }
+    }
+
+    if root.gallery-open: MediaLightbox {
+        x: 0;
+        y: 0;
+        width: root.width;
+        height: root.height;
+        items: root.gallery-items;
+        selected-index <=> root.gallery-index;
+        reduce-motion: Theme.reduce-motion;
+        panel-color: Theme.c.panel-bg;
+        foreground: Theme.c.text-hi;
+        secondary: Theme.c.text-soft;
+        close => {
+            root.gallery-open = false;
+            root.gallery-items = [];
         }
     }
 }

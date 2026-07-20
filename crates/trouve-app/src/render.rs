@@ -5,6 +5,7 @@
 use std::collections::{HashMap, HashSet};
 
 use slint_markdown::{BlockKind, parse_blocks};
+use slint_media_view::{MediaItemData, media_kind};
 use trouve_client_core::viewmodel::{ChatItem, ThreadViewModel, ToolCallStatus, TurnState};
 use trouve_protocol::QuestionAnswer;
 
@@ -15,7 +16,7 @@ use trouve_protocol::QuestionAnswer;
 /// 7 card header (collapsible group for user/agent items),
 /// 8 horizontal rule between turns, 9 grouped tool-run header
 /// ("Called n tools"), 10 question wizard (pending questions or the
-/// answered summary).
+/// answered summary), 11 prompt attachments.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct ChatRowData {
     pub kind: i32,
@@ -87,6 +88,7 @@ pub struct ChatRowData {
     pub q_can_back: bool,
     pub q_can_next: bool,
     pub q_last: bool,
+    pub attachments: Vec<MediaItemData>,
 }
 
 /// UI-side state of one question wizard, keyed by request id in the
@@ -499,9 +501,9 @@ pub fn chat_rows(
                     if !attachments.is_empty() {
                         body.push((
                             ChatRowData {
-                                kind: 1,
+                                kind: 11,
                                 tone: 1,
-                                text: attachment_line(attachments),
+                                attachments: attachments.iter().map(attachment_item).collect(),
                                 ..Default::default()
                             },
                             None,
@@ -1755,6 +1757,33 @@ fn attachment_line(attachments: &[trouve_protocol::Attachment]) -> String {
         .collect::<Vec<_>>()
         .join(" · ");
     format!("📎 {list}")
+}
+
+fn attachment_item(attachment: &trouve_protocol::Attachment) -> MediaItemData {
+    let kind = media_kind(&attachment.name, &attachment.mime);
+    MediaItemData {
+        key: attachment.id.clone(),
+        name: attachment.name.clone(),
+        meta: format!(
+            "{} · {}",
+            attachment.mime,
+            human_size(attachment.size_bytes)
+        ),
+        kind,
+        decoded: None,
+        loading: kind.is_viewable(),
+        failed: false,
+    }
+}
+
+fn human_size(bytes: u64) -> String {
+    if bytes < 1024 {
+        format!("{bytes} B")
+    } else if bytes < 1024 * 1024 {
+        format!("{} KB", bytes / 1024)
+    } else {
+        format!("{:.1} MB", bytes as f64 / (1024.0 * 1024.0))
+    }
 }
 
 /// One-line teaser for a collapsed card header: the first non-empty line,
@@ -3107,6 +3136,57 @@ mod tests {
         // The rule sits directly above the second prompt's header.
         assert_eq!(rows[rules[0].0 + 1].kind, 7);
         assert_eq!(rows[rules[0].0 + 1].tool_name, "You");
+    }
+
+    #[test]
+    fn prompt_attachments_render_as_an_ordered_mixed_media_strip() {
+        let attachment = |id: &str, name: &str, mime: &str| trouve_protocol::Attachment {
+            id: id.into(),
+            name: name.into(),
+            mime: mime.into(),
+            size_bytes: 2048,
+        };
+        let vm = ThreadViewModel {
+            items: vec![ChatItem::User {
+                turn: 1,
+                content: "compare these".into(),
+                attachments: vec![
+                    attachment("a", "first.png", "image/png"),
+                    attachment("b", "motion.gif", "image/gif"),
+                    attachment("c", "demo.mp4", "video/mp4"),
+                    attachment("d", "trace.log", "text/plain"),
+                ],
+            }],
+            ..Default::default()
+        };
+        let (rows, _) = chat_rows(
+            &vm,
+            &HashSet::new(),
+            &HashSet::new(),
+            &HashSet::new(),
+            &HashMap::new(),
+        );
+        let strip = rows.iter().find(|row| row.kind == 11).unwrap();
+        assert_eq!(
+            strip
+                .attachments
+                .iter()
+                .map(|item| item.name.as_str())
+                .collect::<Vec<_>>(),
+            ["first.png", "motion.gif", "demo.mp4", "trace.log"]
+        );
+        assert_eq!(
+            strip
+                .attachments
+                .iter()
+                .map(|item| item.kind.as_i32())
+                .collect::<Vec<_>>(),
+            [0, 1, 2, 3]
+        );
+        assert!(strip.attachments[0].loading);
+        assert!(strip.attachments[1].loading);
+        assert!(!strip.attachments[2].loading);
+        assert!(!strip.attachments[3].loading);
     }
 
     #[test]

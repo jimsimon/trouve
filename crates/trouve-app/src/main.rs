@@ -565,6 +565,12 @@ fn main() -> anyhow::Result<()> {
         });
     }
     {
+        let tx = tx.clone();
+        window.on_attachment_activated(move |key| {
+            let _ = tx.send(UiCommand::AttachmentActivated(key.to_string()));
+        });
+    }
+    {
         // Ctrl/Cmd+V in the composer: if the clipboard holds an image
         // (a screenshot, usually), stage it as an attachment and swallow
         // the paste; otherwise let the TextInput paste text as normal.
@@ -578,6 +584,43 @@ fn main() -> anyhow::Result<()> {
                     .map(|d| d.as_secs())
                     .unwrap_or(0);
                 let _ = tx.send(UiCommand::AddAttachment {
+                    name: format!("pasted-{stamp}.png"),
+                    mime: "image/png".into(),
+                    bytes,
+                });
+                true
+            }
+            None => false,
+        });
+    }
+    {
+        let tx = tx.clone();
+        window.on_queue_editor_changed(move |index| {
+            let _ = tx.send(UiCommand::QueueEditorChanged(index));
+        });
+    }
+    {
+        let tx = tx.clone();
+        window.on_queue_attach_file(move || {
+            let _ = tx.send(UiCommand::QueueAttachFileDialog);
+        });
+    }
+    {
+        let tx = tx.clone();
+        window.on_queue_attachment_removed(move |index| {
+            let _ = tx.send(UiCommand::QueueAttachmentRemoved(index.max(0) as usize));
+        });
+    }
+    {
+        let tx = tx.clone();
+        window.on_queue_paste_image_attempted(move || match clipboard_image_png() {
+            Some(bytes) => {
+                let stamp = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0);
+                let _ = tx.send(UiCommand::QueueAddAttachment {
+                    prompt_id: None,
                     name: format!("pasted-{stamp}.png"),
                     mime: "image/png".into(),
                     bytes,
