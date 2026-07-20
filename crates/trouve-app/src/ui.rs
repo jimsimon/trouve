@@ -33,8 +33,8 @@ pub struct NavRowData {
     pub unread: bool,
     /// Session has a failed turn that has not been viewed yet.
     pub error: bool,
-    /// Pull-request badge: 0 none, 1 open, 2 draft, 3 merged, 4 closed,
-    /// 5 multiple (neutral).
+    /// Pull-request badge: 0 none, 1 ready to merge, 2 unable to merge,
+    /// 3 merged, 4 closed.
     pub pr_kind: i32,
     /// Hover/focus detail for the pull-request badge.
     pub pr_tooltip: String,

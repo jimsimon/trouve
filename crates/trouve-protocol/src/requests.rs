@@ -444,6 +444,11 @@ pub struct PrInfo {
     /// computes it lazily even on single-PR reads.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mergeable: Option<bool>,
+    /// GitHub's detailed merge state (`clean`, `blocked`, `behind`, ...).
+    /// `clean` means the PR is mergeable and all required checks and reviews
+    /// permit merging. None when unavailable or still unknown.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub merge_state_status: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub merged_at: Option<chrono::DateTime<chrono::Utc>>,
 }

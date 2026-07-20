@@ -131,6 +131,7 @@ fragment TrouvePullRequestFields on PullRequest {
   headRefOid
   author { login }
   mergeable
+  mergeStateStatus
   mergedAt
   totalCommentsCount
   comments(last: 1) {
@@ -563,6 +564,8 @@ struct GraphqlPullRequest {
     head_ref_oid: Option<String>,
     author: Option<GraphqlActor>,
     mergeable: String,
+    #[serde(default)]
+    merge_state_status: Option<String>,
     merged_at: Option<DateTime<Utc>>,
     total_comments_count: Option<u64>,
     comments: GraphqlComments,
@@ -1032,6 +1035,9 @@ impl GraphqlPullRequest {
                 "CONFLICTING" => Some(false),
                 _ => None,
             },
+            merge_state_status: self
+                .merge_state_status
+                .map(|status| status.to_ascii_lowercase()),
             merged_at: self.merged_at,
         }
     }
@@ -1288,6 +1294,9 @@ impl GitHub {
             // Populated on list responses only via the dashboard's
             // single-PR GET; present here when `pr` came from one.
             mergeable: pr.mergeable,
+            // REST does not expose GraphQL's detailed merge state. The next
+            // shared-account or session refresh fills it in.
+            merge_state_status: None,
             merged_at: pr.merged_at,
         })
     }
@@ -1412,6 +1421,7 @@ mod tests {
             "headRefOid": "abc123",
             "author": { "login": "alice" },
             "mergeable": "CONFLICTING",
+            "mergeStateStatus": "BLOCKED",
             "mergedAt": null,
             "totalCommentsCount": 4,
             "comments": {
@@ -1471,6 +1481,7 @@ mod tests {
             Some("2026-07-20T11:00:00Z".parse().unwrap())
         );
         assert_eq!(info.mergeable, Some(false));
+        assert_eq!(info.merge_state_status.as_deref(), Some("blocked"));
         assert_eq!(info.reviews.len(), 1);
         assert_eq!(info.reviews[0].reviewer, "carol");
         assert_eq!(info.reviews[0].state, "changes_requested");
@@ -1545,6 +1556,7 @@ mod tests {
                     comments: 0,
                     last_comment_at: None,
                     mergeable: Some(true),
+                    merge_state_status: None,
                     merged_at: None,
                 },
             },
