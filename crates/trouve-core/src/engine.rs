@@ -156,6 +156,10 @@ pub struct Engine {
     /// a turn runs; `cancel_turn` trips one to interrupt the turn's provider
     /// stream, tool calls, and approval waits at the next await point.
     turn_cancels: Mutex<std::collections::HashMap<String, tokio_util::sync::CancellationToken>>,
+    /// Threads where a new prompt arrived after cancellation was requested.
+    /// The cancelling dispatcher consumes this marker and resumes the queue
+    /// instead of leaving that explicitly submitted follow-up paused.
+    resume_after_cancel: Mutex<HashSet<String>>,
     /// Per-host incremental PR snapshots. Holding this asynchronous lock also
     /// coalesces refresh requests from multiple connected clients into one
     /// upstream GitHub poll.
@@ -459,6 +463,7 @@ impl Engine {
             active_threads: Mutex::new(std::collections::HashMap::new()),
             deleting_sessions: Mutex::new(std::collections::HashSet::new()),
             turn_cancels: Mutex::new(std::collections::HashMap::new()),
+            resume_after_cancel: Mutex::new(HashSet::new()),
             github_dashboard_caches: tokio::sync::Mutex::new(HashMap::new()),
             config: Mutex::new(config.clone()),
             // No write-back by default: only a caller that loaded `config`
@@ -3982,6 +3987,23 @@ impl Engine {
                 )));
             }
             if active.contains_key(thread_id) {
+                // A send that races cancellation cleanup is an explicit
+                // request to keep working. Remember it while holding the
+                // active-thread lock so the cancelling dispatcher either
+                // sees this marker or releases the claim before this send
+                // retries dispatch below.
+                let cancelling = self
+                    .turn_cancels
+                    .lock()
+                    .unwrap()
+                    .get(thread_id)
+                    .is_some_and(tokio_util::sync::CancellationToken::is_cancelled);
+                if cancelling {
+                    self.resume_after_cancel
+                        .lock()
+                        .unwrap()
+                        .insert(thread_id.to_string());
+                }
                 return Ok(None);
             }
             let Some(p) = self.store.claim_queued_prompt(thread_id)? else {
@@ -4062,11 +4084,12 @@ impl Engine {
                 .unwrap_or_else(|| self.register_cancel(&thread.id));
             let result = self.run_turn(&thread, turn, &prompt, cancel.clone()).await;
             let cancelled = cancel.is_cancelled();
-            self.clear_cancel(&thread.id);
             if let Err(e) = result {
+                self.clear_cancel(&thread.id);
                 tracing::error!("turn {turn} of {} failed: {e}", thread.id);
                 let _ = self.store.release_queued_prompt(&prompt.id);
                 let _ = self.emit_queue(&thread.id);
+                self.release_thread(&thread.id);
                 let _ = self.store.append_event(
                     Scope::Thread(thread.id.clone()),
                     Event::TurnFailed {
@@ -4074,18 +4097,24 @@ impl Engine {
                         error: e.to_string(),
                     },
                 );
-                self.release_thread(&thread.id);
                 return;
             }
             if cancelled {
-                // A user-cancelled turn pauses the queue (like a failure, but
-                // not an error): leave queued prompts for the user to resume.
+                // A user-cancelled turn normally pauses the queue (like a
+                // failure, but not an error). A prompt submitted after the
+                // cancel request is itself an explicit resume, though. Make
+                // that decision atomically with releasing the active claim
+                // so the racing send cannot be stranded between the two.
+                let resume = self.finish_cancelled_turn(&thread.id);
                 let _ = self.store.append_event(
                     Scope::Thread(thread.id.clone()),
                     Event::TurnCancelled { turn },
                 );
-                self.release_thread(&thread.id);
-                return;
+                if !resume {
+                    return;
+                }
+            } else {
+                self.clear_cancel(&thread.id);
             }
             // Pop the next prompt; releasing the claim and inspecting the
             // queue must be atomic against concurrent send_message calls.
@@ -4148,6 +4177,32 @@ impl Engine {
 
     fn clear_cancel(&self, thread_id: &str) {
         self.turn_cancels.lock().unwrap().remove(thread_id);
+        self.resume_after_cancel.lock().unwrap().remove(thread_id);
+    }
+
+    /// Finish a cancelled turn while coordinating with sends that may be
+    /// waiting on the same active-thread claim. Returns true when one of
+    /// those sends requested that the queue continue draining.
+    fn finish_cancelled_turn(&self, thread_id: &str) -> bool {
+        let (resume, idle_session) = {
+            // Lock ordering matches `dispatch_queue`: active thread, cancel
+            // token, then resume marker.
+            let mut active = self.active_threads.lock().unwrap();
+            self.turn_cancels.lock().unwrap().remove(thread_id);
+            let resume = self.resume_after_cancel.lock().unwrap().remove(thread_id);
+            let idle_session = if resume {
+                None
+            } else {
+                active
+                    .remove(thread_id)
+                    .filter(|session| !active.values().any(|s| s == session))
+            };
+            (resume, idle_session)
+        };
+        if let Some(session_id) = idle_session {
+            self.emit_session_activity(&session_id, false);
+        }
+        resume
     }
 
     /// Interrupt the turn currently running on a thread. Trips its

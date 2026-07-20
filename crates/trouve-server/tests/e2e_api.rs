@@ -1938,6 +1938,116 @@ impl Provider for GatedProvider {
     }
 }
 
+/// A follow-up submitted after the cancel request must start as the next
+/// turn even when it reaches the engine before cancellation cleanup releases
+/// the active-thread claim.
+#[tokio::test]
+async fn prompt_submitted_during_cancellation_starts_next_turn() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path().join("repo");
+    std::fs::create_dir(&repo).unwrap();
+    init_repo(&repo);
+
+    let gate = Arc::new(tokio::sync::Semaphore::new(0));
+    let store = Store::open(&tmp.path().join("db/trouve.db")).unwrap();
+    let engine = Arc::new(
+        Engine::new(store, tmp.path().join("data"), &Config::default())
+            .with_config_dir(None)
+            .with_provider("gated", Arc::new(GatedProvider { gate: gate.clone() }))
+            .with_default_model("gated/test-model"),
+    );
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let router = trouve_server::build_router(engine.clone());
+    tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+    let base = format!("http://{addr}/v1");
+    let client = reqwest::Client::new();
+
+    let ws: serde_json::Value = client
+        .post(format!("{base}/workspaces"))
+        .json(&serde_json::json!({"path": repo.to_str().unwrap()}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let session: serde_json::Value = client
+        .post(format!("{base}/sessions"))
+        .json(&serde_json::json!({"workspace_id": ws["id"], "title": "Cancel"}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let thread: serde_json::Value = client
+        .post(format!("{base}/threads"))
+        .json(&serde_json::json!({"session_id": session["id"]}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let thread_id = thread["id"].as_str().unwrap();
+
+    client
+        .post(format!("{base}/threads/{thread_id}/messages"))
+        .json(&serde_json::json!({"content": "cancel me"}))
+        .send()
+        .await
+        .unwrap();
+
+    // Wait for the dispatcher to install its token. Once cancellation is
+    // accepted, do not yield before sending: this deterministically covers
+    // the window where the old dispatcher still owns the thread claim.
+    let cancel_deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        match engine.cancel_turn(thread_id) {
+            Ok(()) => break,
+            Err(_) if std::time::Instant::now() < cancel_deadline => {
+                tokio::task::yield_now().await;
+            }
+            Err(error) => panic!("turn never became cancellable: {error}"),
+        }
+    }
+    let accepted = engine
+        .send_message(thread_id, "replacement".into(), Vec::new())
+        .unwrap();
+    assert!(accepted.queued, "the cancelling turn still owns the claim");
+
+    // The cancelled stream never consumes a permit; the replacement does.
+    gate.add_permits(1);
+    let events_url = format!("{base}/threads/{thread_id}/events");
+    let events = tokio::time::timeout(
+        Duration::from_secs(5),
+        wait_for_event(&client, &events_url, |event| {
+            event["type"] == "turn.completed" && event["turn"] == 2
+        }),
+    )
+    .await
+    .expect("replacement prompt never started after cancellation");
+
+    assert!(
+        events
+            .iter()
+            .any(|event| { event["type"] == "turn.cancelled" && event["turn"] == 1 })
+    );
+    assert!(
+        events
+            .iter()
+            .any(|event| { event["type"] == "turn.started" && event["turn"] == 2 })
+    );
+    let user_messages: Vec<&str> = events
+        .iter()
+        .filter(|event| event["type"] == "user.message")
+        .map(|event| event["content"].as_str().unwrap())
+        .collect();
+    assert_eq!(user_messages, ["cancel me", "replacement"]);
+}
+
 #[tokio::test]
 async fn queued_prompts_crud_and_in_order_dispatch() {
     let tmp = tempfile::tempdir().unwrap();
