@@ -198,6 +198,10 @@ export component PullRequestsScreen inherits Rectangle {
     background: Theme.c.win-bg;
 
     in property <[PrGroupItem]> groups;
+    // Contiguous indices into `groups`, one model per visual column. Keeping
+    // each column in its own VerticalLayout lets cards follow one another
+    // without inheriting the height of a taller card beside them.
+    in property <[[int]]> group-columns;
     // "All projects" + one entry per workspace.
     in property <[string]> project-names;
     in-out property <int> project-index: 0;
@@ -347,9 +351,13 @@ export component PullRequestsScreen inherits Rectangle {
                         groups-grid := GridLayout {
                             property <bool> two-columns: root.width >= 1032px;
                             spacing: 10px;
-                            for group[group-index] in root.groups: Rectangle {
-                                row: groups-grid.two-columns ? group-index / 2 : group-index;
-                                col: groups-grid.two-columns ? Math.mod(group-index, 2) : 0;
+                            for column[column-index] in root.group-columns: VerticalLayout {
+                                row: groups-grid.two-columns ? 0 : column-index;
+                                col: groups-grid.two-columns ? column-index : 0;
+                                spacing: 10px;
+                                horizontal-stretch: 1;
+                            for group-index in column: Rectangle {
+                                property <PrGroupItem> group: root.groups[group-index];
                                 background: Theme.c.surface;
                                 border-radius: 8px;
                                 border-width: group-drop.has-drag ? 2px : 1px;
@@ -702,6 +710,7 @@ export component PullRequestsScreen inherits Rectangle {
                                         }
                                     }
                                 }
+                            }
                             }
                         }
                     }
