@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1784572651109,
+  "lastUpdate": 1784572736095,
   "repoUrl": "https://github.com/jimsimon/trouve",
   "entries": {
     "e2e-benchmarks": [
@@ -3839,6 +3839,54 @@ window.BENCHMARK_DATA = {
             "name": "non-git warm query",
             "value": 70.40191194,
             "range": "± 1.5",
+            "unit": "ms"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "jim.j.simon@gmail.com",
+            "name": "Jim Simon",
+            "username": "jimsimon"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "71f0a74fc146b2a3b468252b759edf48ac4722e2",
+          "message": "Show YOLO warning as permissions tooltip (#121)\n\n* Show YOLO warning as selector tooltip\n\n* Label YOLO warning for assistive technology",
+          "timestamp": "2026-07-20T14:35:58-04:00",
+          "tree_id": "0cf58bd86e71b8b5946b9d83a5f7a206ebd9ff47",
+          "url": "https://github.com/jimsimon/trouve/commit/71f0a74fc146b2a3b468252b759edf48ac4722e2"
+        },
+        "date": 1784572734944,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "cold index + query",
+            "value": 117.30532226000001,
+            "range": "± 5.4",
+            "unit": "ms"
+          },
+          {
+            "name": "warm query",
+            "value": 65.20218022,
+            "range": "± 1.3",
+            "unit": "ms"
+          },
+          {
+            "name": "incremental (1 file modified)",
+            "value": 75.40918344,
+            "range": "± 1.2",
+            "unit": "ms"
+          },
+          {
+            "name": "non-git warm query",
+            "value": 63.36992322000001,
+            "range": "± 1.3",
             "unit": "ms"
           }
         ]
