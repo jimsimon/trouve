@@ -706,6 +706,9 @@ struct Controller {
     /// this cache and the current model catalog, so catalog refreshes cannot
     /// leave the two lists misaligned.
     subscription_health: Vec<trouve_protocol::SubscriptionHealth>,
+    /// Last completed-turn refresh. Background threads can finish in bursts,
+    /// so their provider-side subscription fetches share one short throttle.
+    subscription_refresh_at: Option<std::time::Instant>,
     /// Thinking dropdown state for the current thread's model: the schema
     /// property the values belong to and the raw value tokens (parallel to
     /// the displayed labels).
@@ -867,6 +870,7 @@ pub async fn run(
         models: Vec::new(),
         default_thinking_level: None,
         subscription_health: Vec::new(),
+        subscription_refresh_at: None,
         thinking_key: None,
         thinking_values: Vec::new(),
         context_values: Vec::new(),
@@ -3026,6 +3030,17 @@ impl Controller {
                 ),
             }
         });
+    }
+
+    /// Refresh after a completed turn unless another followed thread already
+    /// triggered the same provider-side work within the throttle window.
+    fn refresh_subscriptions_after_turn(&mut self) {
+        let now = std::time::Instant::now();
+        if !subscription_refresh_due(self.subscription_refresh_at, now) {
+            return;
+        }
+        self.subscription_refresh_at = Some(now);
+        self.refresh_subscriptions();
     }
 
     /// Reload the MCP server list in the background: a quick unprobed list
@@ -5927,7 +5942,7 @@ impl Controller {
                 // completed-turn event is the best point to replace the
                 // startup snapshot without polling continuously.
                 if completed {
-                    self.refresh_subscriptions();
+                    self.refresh_subscriptions_after_turn();
                 }
                 self.maybe_notify(&thread_id, &envelope);
                 let mut nav_changed = attention_changed;
@@ -6364,6 +6379,13 @@ fn human_count(n: u64) -> String {
     } else {
         n.to_string()
     }
+}
+
+/// Provider subscription probes can spawn vendor processes, so coalesce
+/// completions from concurrently followed threads into one refresh.
+fn subscription_refresh_due(last: Option<std::time::Instant>, now: std::time::Instant) -> bool {
+    const TTL: std::time::Duration = std::time::Duration::from_secs(30);
+    last.is_none_or(|at| now.saturating_duration_since(at) >= TTL)
 }
 
 /// Compact and expanded presentations of one provider's subscription state.
@@ -6848,7 +6870,7 @@ mod tests {
         approval_pill, attention_badge, check_pill, classify_pr, download_progress, human_age,
         human_rate, merge_pill, model_health_view, pr_badge, project_session_prs,
         reconcile_pr_group_order, reconcile_workspace_order, reorder_id,
-        should_open_chat_at_tail, thinking_property,
+        should_open_chat_at_tail, subscription_refresh_due, thinking_property,
     };
     use chrono::{Duration, TimeZone, Utc};
     use trouve_protocol::{
@@ -7296,5 +7318,19 @@ mod tests {
         };
         assert_eq!(model_health_view(&login).summary, "login required");
         assert_eq!(model_health_view(&login).tone, 3);
+    }
+
+    #[test]
+    fn completed_turn_subscription_refresh_reopens_after_throttle() {
+        let now = std::time::Instant::now();
+        assert!(subscription_refresh_due(None, now));
+        assert!(!subscription_refresh_due(
+            Some(now - std::time::Duration::from_secs(29)),
+            now
+        ));
+        assert!(subscription_refresh_due(
+            Some(now - std::time::Duration::from_secs(30)),
+            now
+        ));
     }
 }

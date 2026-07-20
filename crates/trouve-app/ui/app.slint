@@ -470,7 +470,8 @@ component SubscriptionHealthPill inherits Rectangle {
         : root.tone == 1 ? Theme.c.agent-bg
         : Theme.c.pill-bg;
     border-width: 1px;
-    border-color: root.tone == 3 ? Theme.c.err
+    border-color: pill-focus.has-focus ? Theme.c.accent
+        : root.tone == 3 ? Theme.c.err
         : root.tone == 2 ? Theme.c.warn-border
         : root.tone == 1 ? Theme.c.agent-border
         : Theme.c.border;
@@ -500,6 +501,15 @@ component SubscriptionHealthPill inherits Rectangle {
         }
     }
 
+    pill-focus := FocusScope {
+        key-pressed(event) => {
+            if (event.text == Key.Return || event.text == " ") {
+                detail-popup.show();
+                return accept;
+            }
+            return reject;
+        }
+    }
     pill-ta := TouchArea {
         mouse-cursor: pointer;
         clicked => { detail-popup.show(); }
