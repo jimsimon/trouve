@@ -84,7 +84,7 @@ pub fn gate(
     // web_fetch mutates nothing, but fetching a model-chosen URL is an
     // outbound side channel (prompt-injection exfiltration of anything the
     // ungated read tools can see), so it requires approval in every
-    // permission mode — including read-only modes, where research is
+    // non-yolo mode — including read-only modes, where research is
     // legitimate but silent exfiltration is not. "Always approve" unlocks
     // the session via the allow-list.
     if key == "web_fetch" {
@@ -101,7 +101,9 @@ pub fn gate(
         return Gate::Deny;
     }
     // MCP servers are external code; first-use approval per session in ask
-    // and allow-list modes.
+    // and allow-list modes. Only non-read-only requests reach this branch:
+    // MCP tools are always classified as mutating, so read-only modes
+    // returned Deny above before approval handling.
     if key.starts_with("mcp:") {
         return if allow_list.contains(key) {
             Gate::Allow
@@ -238,6 +240,12 @@ mod tests {
             gate(PermissionMode::Yolo, false, false, &empty, "web_fetch"),
             Gate::Allow
         );
+        // Yolo skips the web_fetch prompt even in read-only modes (it
+        // mutates nothing, so the read-only deny does not apply).
+        assert_eq!(
+            gate(PermissionMode::Yolo, true, false, &empty, "web_fetch"),
+            Gate::Allow
+        );
         // MCP servers need first-use approval in ask/allow-list …
         assert_eq!(
             gate(PermissionMode::Ask, false, true, &empty, "mcp:jira"),
@@ -255,6 +263,16 @@ mod tests {
                 "mcp:jira"
             ),
             Gate::Allow
+        );
+        // Read-only ask/allow-list modes deny MCP calls (always mutating)
+        // before the approval branch is reached.
+        assert_eq!(
+            gate(PermissionMode::Ask, true, true, &empty, "mcp:jira"),
+            Gate::Deny
+        );
+        assert_eq!(
+            gate(PermissionMode::AllowList, true, true, &empty, "mcp:jira"),
+            Gate::Deny
         );
         // web_fetch needs approval in non-yolo modes (exfiltration channel),
         // read-only modes included, until allow-listed for the session.

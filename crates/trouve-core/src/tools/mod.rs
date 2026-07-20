@@ -206,8 +206,9 @@ impl ToolExecutor for LocalToolExecutor {
     fn tool_mutates(&self, name: &str) -> Option<bool> {
         if name.starts_with(crate::mcp::TOOL_PREFIX) {
             // MCP tools are external code: always treated as mutating so
-            // the permission layer gates them (first-use approval in ask /
-            // allow-list modes).
+            // the permission layer gates them (first-use approval in
+            // non-read-only ask / allow-list modes; the mutating
+            // classification makes read-only modes deny them outright).
             return Some(true);
         }
         self.find(name).map(|t| t.mutates())
