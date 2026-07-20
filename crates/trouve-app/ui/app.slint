@@ -581,6 +581,7 @@ component IconButton inherits Rectangle {
     in property <image> icon-image;
     in property <bool> use-icon-image: false;
     in property <string> tip;
+    in property <string> accessibility-label;
     in property <bool> enabled: true;
     in property <length> icon-size: Theme.fs(12px);
     in property <color> icon-color: Theme.c.text-soft;
@@ -616,6 +617,8 @@ component IconButton inherits Rectangle {
     }
     fs := FocusScope {
         enabled: root.enabled;
+        accessible-role: button;
+        accessible-label: root.accessibility-label;
         key-pressed(event) => {
             if (event.text == Key.Return || event.text == " ") {
                 root.clicked();
@@ -4290,6 +4293,7 @@ export component AppWindow inherits Window {
                                 hover-icon-color: Theme.c.err-soft;
                                 hover-bg: Theme.c.err-bg;
                                 tip: "YOLO: changes run without approval";
+                                accessibility-label: "Warning: YOLO changes run without approval";
                             }
                         }
                     }
