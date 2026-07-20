@@ -3746,9 +3746,9 @@ export component AppWindow inherits Window {
                                         font-size: Theme.fs(11px);
                                         vertical-alignment: center;
                                     }
-                                    IconButton {
+                                    if root.queue-idle: IconButton {
                                         icon: "▶";
-                                        tip: root.queue-idle ? "Send this prompt now" : "Run this prompt next";
+                                        tip: "Send now";
                                         enabled: !root.connectivity-blocked;
                                         clicked => { root.queue-send-now-at(qi); }
                                     }
