@@ -51,3 +51,4 @@ sequentially.
 | [0039](0039-retire-servo-qualification-hosts.md) | Retire Servo qualification hosts | Accepted |
 | [0040](0040-durable-root-cause-history-for-code-review.md) | Durable root-cause history for code review | Accepted |
 | [0041](0041-evidence-backed-review-churn-controls.md) | Evidence-backed review churn controls | Accepted |
+| [0042](0042-session-scoped-agent-teams.md) | Session-scoped role-based agent teams | Accepted |

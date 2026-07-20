@@ -6,4 +6,5 @@
 
 pub mod client;
 pub mod protocol_compatibility;
+pub mod team_viewmodel;
 pub mod viewmodel;

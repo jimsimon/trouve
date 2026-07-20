@@ -131,8 +131,22 @@ const eventVariants = event?.oneOf;
 if (!Array.isArray(eventVariants)) {
   throw new TypeError("protocol schema has no Event variants");
 }
+// The team screen treats session-scope team events as invalidations and then
+// loads the authoritative Team snapshot. Keep those payload-rich variants on
+// the compatible-envelope path so the shared ingress validator does not pull
+// the complete team snapshot graph into every application bundle.
+event.oneOf = eventVariants.filter((variant) => {
+  const properties = asRecord(asRecord(variant)?.properties);
+  const values = asRecord(properties?.type)?.enum;
+  return !(
+    Array.isArray(values)
+    && values.length === 1
+    && typeof values[0] === "string"
+    && values[0].startsWith("team.")
+  );
+});
 const knownEventTypes = [];
-for (const variant of eventVariants) {
+for (const variant of event.oneOf) {
   const properties = asRecord(asRecord(variant)?.properties);
   const typeSchema = asRecord(properties?.type);
   const values = typeSchema?.enum;

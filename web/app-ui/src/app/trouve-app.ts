@@ -99,6 +99,7 @@ import {
   type ProtocolModelInfo,
   type ProtocolProvidersResponse,
   type ProtocolSubscriptionHealth,
+  type ProtocolTeamTemplate,
 } from "../services/protocol-client.js";
 import { createBrowserThreadIngress } from "../services/thread-ingress.js";
 import { SubscriptionHealthController } from "../services/subscription-health-controller.js";
@@ -178,6 +179,7 @@ import "../components/command-palette.js";
 import "../components/image-preview.js";
 import "../components/session-list.js";
 import "../components/thread-screen.js";
+import "../components/team-screen.js";
 import "../components/model-picker.js";
 
 const SESSION_TITLE_TIMEOUT_MS = 48_000;
@@ -401,6 +403,7 @@ export class TrouveApp extends withSignalTracking(LitElement) {
   #newSessionSetup: NewSessionSetupLifecycle = createNewSessionSetupLifecycle();
   #newSessionPending = false;
   #newSessionError = "";
+  #newSessionKind: "solo" | "team" = "solo";
   #newSessionWorkspaceId = "";
   #newSessionPreferredBaseRef = "";
   #newSessionBranches: readonly string[] = [];
@@ -409,6 +412,8 @@ export class TrouveApp extends withSignalTracking(LitElement) {
   #newSessionBranchError = "";
   #newSessionBranchGeneration = 0;
   #newSessionModes: readonly ProtocolAgentPersona[] = [];
+  #newSessionTeamTemplates: readonly ProtocolTeamTemplate[] = [];
+  #newSessionTeamTemplateId = "";
   #newSessionModels: readonly ProtocolModelInfo[] = [];
   #newSessionProviders: ProtocolProvidersResponse | undefined;
   #newSessionSubscriptionHealth: readonly ProtocolSubscriptionHealth[] = [];
@@ -1424,6 +1429,7 @@ export class TrouveApp extends withSignalTracking(LitElement) {
     this.#newSessionSetup = opened;
     if (!restoringDraft) {
       this.#newSessionError = "";
+      this.#newSessionKind = "solo";
       this.#newSessionPrompt = "";
       this.#newSessionPromptComposing = false;
       this.#newSessionAttachments = [];
@@ -1808,16 +1814,21 @@ export class TrouveApp extends withSignalTracking(LitElement) {
       this.requestUpdate();
     }, NEW_SESSION_OPTIONS_TIMEOUT_MS);
     try {
-      const [modes, models, providers] = await Promise.all([
+      const [modes, models, providers, teamTemplates] = await Promise.all([
         this.#protocolClient.personas(workspaceId),
         this.#modelCatalog.staticModels(),
         this.#protocolClient.providers(),
+        this.#protocolClient.teamTemplates(),
       ]);
       if (generation !== this.#newSessionOptionsGeneration) return;
       const completedAfterTimeout = this.#newSessionOptionsLifecycle.status === "timed-out";
       this.#newSessionModes = modes;
       this.#newSessionModels = models;
       this.#newSessionProviders = providers;
+      this.#newSessionTeamTemplates = teamTemplates;
+      if (!teamTemplates.some((template) => template.id === this.#newSessionTeamTemplateId)) {
+        this.#newSessionTeamTemplateId = teamTemplates[0]?.id ?? "";
+      }
       this.#newSessionOptionsLifecycle = settleNewSessionOptionLoad(
         this.#newSessionOptionsLifecycle,
         workspaceId,
@@ -2241,9 +2252,12 @@ export class TrouveApp extends withSignalTracking(LitElement) {
       ?? String(data.get("base_ref") ?? "");
     const fetchLatest = retainedCreateRequest?.fetchLatest
       ?? data.get("fetch_latest") === "on";
+    const teamSession = this.#newSessionKind === "team";
     if (
       workspaceId === ""
-      || (prompt === "" && this.#newSessionAttachments.length === 0)
+      || (teamSession
+        ? prompt === ""
+        : prompt === "" && this.#newSessionAttachments.length === 0)
     ) return;
     const submissionOptions = snapshotNewSessionSubmission({
       selections: {
@@ -2283,17 +2297,48 @@ export class TrouveApp extends withSignalTracking(LitElement) {
     this.#shellNotice = "";
     this.requestUpdate();
 
-    let session;
+    let session: Awaited<ReturnType<ProtocolClient["createSession"]>>;
     try {
-      session = await this.#protocolClient.createSession({
-        workspace_id: submittedCreateRequest.workspaceId,
-        idempotency_key: createIdempotencyKey,
-        title: submittedCreateRequest.title,
-        ...(submittedCreateRequest.baseRef === ""
-          ? {}
-          : { base_ref: submittedCreateRequest.baseRef }),
-        fetch_latest: submittedCreateRequest.fetchLatest,
-      });
+      if (teamSession) {
+        const memberDefaults = createNewSessionThreadRequestFromSnapshot({
+          sessionId: "pending-team",
+          title: submittedCreateRequest.title,
+          snapshot: submissionOptions,
+        });
+        const team = await this.#protocolClient.createTeam({
+          workspace_id: submittedCreateRequest.workspaceId,
+          title: submittedCreateRequest.title,
+          ...(submittedCreateRequest.baseRef === ""
+            ? {}
+            : { base_ref: submittedCreateRequest.baseRef }),
+          fetch_latest: submittedCreateRequest.fetchLatest,
+          goal: prompt,
+          ...(this.#newSessionTeamTemplateId === ""
+            ? {}
+            : { template_id: this.#newSessionTeamTemplateId }),
+          ...(memberDefaults.model == null ? {} : { model: memberDefaults.model }),
+          ...(memberDefaults.model_options === undefined
+            ? {}
+            : { model_options: memberDefaults.model_options }),
+          ...(memberDefaults.permission_mode == null
+            ? {}
+            : { permission_mode: memberDefaults.permission_mode }),
+        });
+        const sessions = await this.#protocolClient.sessions();
+        const created = sessions.find((candidate) => candidate.id === team.session_id);
+        if (created === undefined) throw new Error("created team session is missing");
+        session = created;
+      } else {
+        session = await this.#protocolClient.createSession({
+          workspace_id: submittedCreateRequest.workspaceId,
+          idempotency_key: createIdempotencyKey,
+          title: submittedCreateRequest.title,
+          ...(submittedCreateRequest.baseRef === ""
+            ? {}
+            : { base_ref: submittedCreateRequest.baseRef }),
+          fetch_latest: submittedCreateRequest.fetchLatest,
+        });
+      }
     } catch {
       this.#newSessionSetup = navigateNewSessionSetup(
         this.#newSessionSetup,
@@ -2302,10 +2347,13 @@ export class TrouveApp extends withSignalTracking(LitElement) {
       );
       this.#newSessionPending = false;
       this.#newSessionSetup = failNewSessionSetup(this.#newSessionSetup);
-      this.#newSessionError = "Session could not be created.";
+      this.#newSessionError = teamSession
+        ? "Team could not be created."
+        : "Session could not be created.";
       if (this.#newSessionSetup.status === "background-failed") {
-        this.#shellNotice =
-          "Session could not be created. Open New Session to retry with your saved draft.";
+        this.#shellNotice = teamSession
+          ? "Team could not be created. Open New Session to retry with your saved draft."
+          : "Session could not be created. Open New Session to retry with your saved draft.";
       }
       this.requestUpdate();
       return;
@@ -2316,20 +2364,23 @@ export class TrouveApp extends withSignalTracking(LitElement) {
       this.#upgradeSessionTitleInBackground(session.id, submittedCreateRequest.title, prompt);
     }
     let threadId: string | undefined;
-    try {
-      const thread = await this.#protocolClient.createThread(
-        createNewSessionThreadRequestFromSnapshot({
-          sessionId: session.id,
-          title: session.title,
-          snapshot: submissionOptions,
-        }),
-      );
-      this.#store.upsertThread(thread);
-      threadId = thread.id;
-    } catch {
-      this.#shellNotice = "Session created, but its first thread could not be created; the prompt was not sent.";
+    if (!teamSession) {
+      try {
+        const thread = await this.#protocolClient.createThread(
+          createNewSessionThreadRequestFromSnapshot({
+            sessionId: session.id,
+            title: session.title,
+            snapshot: submissionOptions,
+          }),
+        );
+        this.#store.upsertThread(thread);
+        threadId = thread.id;
+      } catch {
+        this.#shellNotice = "Session created, but its first thread could not be created; the prompt was not sent.";
+      }
     }
-    if (threadId !== undefined) {
+
+    if (!teamSession && threadId !== undefined) {
       try {
         await this.#protocolClient.sendMessage(threadId, {
           content: prompt,
@@ -2355,6 +2406,7 @@ export class TrouveApp extends withSignalTracking(LitElement) {
     this.#newSessionOptionsLifecycle = interruptNewSessionOptionLoad(
       this.#newSessionOptionsLifecycle,
     );
+    this.#newSessionKind = "solo";
     this.#newSessionPrompt = "";
     this.#newSessionAttachments = [];
     this.#newSessionAttachmentGeneration += 1;
@@ -2714,9 +2766,9 @@ export class TrouveApp extends withSignalTracking(LitElement) {
       route.kind === "session" && route.threadId !== undefined
         ? this.#store.thread(route.threadId)
         : undefined;
-    const selectedNewSessionMode = this.#newSessionModes.find(
-      (mode) => mode.id === this.#newSessionModeId,
-    );
+    const selectedNewSessionMode = this.#newSessionKind === "team"
+      ? undefined
+      : this.#newSessionModes.find((mode) => mode.id === this.#newSessionModeId);
     const effectiveNewSessionModel = resolveNewSessionModel(
       this.#newSessionModelId,
       selectedNewSessionMode,
@@ -2741,6 +2793,8 @@ export class TrouveApp extends withSignalTracking(LitElement) {
       optionsBlocking: newSessionOptionsBlocking,
       attachmentPending: this.#newSessionAttachmentPending,
     });
+    const activeSessionIsTeam = route.kind === "session"
+      && this.#store.sessionMetadata(route.sessionId)?.kind === "team";
     const serverOffline = readSignal(this.#store.serverInfo)?.online === false;
     const connectionLabel = this.#hostError
       ? "Host unavailable"
@@ -2972,7 +3026,13 @@ export class TrouveApp extends withSignalTracking(LitElement) {
 
         ${route.kind === "session"
           ? this.#routeError === ""
-            ? html`
+            ? activeSessionIsTeam
+              ? html`<trouve-team-screen
+                  class="thread-panel"
+                  aria-label="Active team"
+                  session-id=${route.sessionId}
+                ></trouve-team-screen>`
+              : html`
                 <trouve-thread-screen
                   class="thread-panel"
                   aria-label="Active thread"
@@ -2987,7 +3047,7 @@ export class TrouveApp extends withSignalTracking(LitElement) {
                         (activeView?.queue.length ?? 0) > 0,
                       )}
                 ></trouve-thread-screen>
-              `
+                `
             : html`<section class="thread-panel app-page"><div class="screen-empty" role="alert"><strong>Unable to load session</strong><span>${this.#routeError}</span><span>Retrying automatically.</span></div></section>`
           : route.kind === "settings"
             ? html`<trouve-settings-screen
@@ -3114,6 +3174,57 @@ export class TrouveApp extends withSignalTracking(LitElement) {
                 )}
               </select>
             </label>
+            <label class="new-session-kind">
+              <span>Session type</span>
+              <select
+                name="session_kind"
+                .value=${this.#newSessionKind}
+                ?disabled=${this.#newSessionPending}
+                @change=${(event: Event) => {
+                  this.#newSessionKind =
+                    (event.currentTarget as HTMLSelectElement).value === "team"
+                      ? "team"
+                      : "solo";
+                  if (this.#newSessionKind === "team") {
+                    this.#newSessionAttachments = [];
+                    this.#newSessionAttachmentPending = false;
+                  }
+                  this.#newSessionThinking = "";
+                  this.requestUpdate();
+                }}
+              >
+                <option value="solo">Solo · independent threads</option>
+                <option value="team">Team · role-based collaboration</option>
+              </select>
+            </label>
+            ${this.#newSessionKind === "team"
+              ? html`<label class="new-session-team-template">
+                  <span>Team template</span>
+                  <select
+                    name="team_template"
+                    .value=${this.#newSessionTeamTemplateId}
+                    ?disabled=${this.#newSessionPending}
+                    @change=${(event: Event) => {
+                      this.#newSessionTeamTemplateId =
+                        (event.currentTarget as HTMLSelectElement).value;
+                      this.requestUpdate();
+                    }}
+                  >
+                    ${this.#newSessionTeamTemplates.map(
+                      (template) => html`<option value=${template.id}>${template.name}</option>`,
+                    )}
+                  </select>
+                  ${this.#newSessionTeamTemplates.find(
+                    (template) => template.id === this.#newSessionTeamTemplateId,
+                  ) === undefined
+                    ? nothing
+                    : html`<small class="new-session-team-description">
+                        ${this.#newSessionTeamTemplates.find(
+                          (template) => template.id === this.#newSessionTeamTemplateId,
+                        )?.description}
+                      </small>`}
+                </label>`
+              : nothing}
             <label class="new-session-branch">
               <span>Base branch</span>
               <select
@@ -3154,7 +3265,7 @@ export class TrouveApp extends withSignalTracking(LitElement) {
                   />`}
               <span>Use latest remote branch</span>
             </label>
-            ${this.#newSessionAttachments.length === 0
+            ${this.#newSessionKind === "team" || this.#newSessionAttachments.length === 0
               ? nothing
               : html`<ul class="attachment-list pending-attachments" aria-label="Initial prompt attachments">
                   ${this.#newSessionAttachments.map(
@@ -3183,23 +3294,27 @@ export class TrouveApp extends withSignalTracking(LitElement) {
                   )}
                 </ul>`}
             <label class="new-session-prompt">
-              <span>First message</span>
+              <span>${this.#newSessionKind === "team" ? "Team goal" : "First message"}</span>
               <textarea
                 name="prompt"
                 maxlength="100000"
                 rows="1"
                 autocomplete="off"
-                placeholder="What should the agent do?  (Shift+Enter for a new line)"
+                placeholder=${this.#newSessionKind === "team"
+                  ? "What should the team accomplish?"
+                  : "What should the agent do?  (Shift+Enter for a new line)"}
                 .value=${this.#newSessionPrompt}
                 ?disabled=${this.#newSessionPending}
                 @input=${this.#newSessionPromptChanged}
                 @keydown=${this.#newSessionPromptKeydown}
                 @compositionstart=${this.#newSessionPromptCompositionStarted}
                 @compositionend=${this.#newSessionPromptCompositionEnded}
-                @paste=${this.#newSessionPaste}
+                @paste=${this.#newSessionKind === "team" ? nothing : this.#newSessionPaste}
               ></textarea>
             </label>
-            <label
+            ${this.#newSessionKind === "team"
+              ? html`<p class="new-session-team-note" role="note">Each teammate gets a private backing thread and collaborates through the durable shared timeline.</p>`
+              : html`<label
               class=${`attachment-button dialog-attachment new-session-attachment ${this.#newSessionPending || this.#newSessionAttachmentPending ? "disabled" : ""}`}
               aria-disabled=${this.#newSessionPending || this.#newSessionAttachmentPending ? "true" : "false"}
               title="Attach files to the initial prompt"
@@ -3212,9 +3327,13 @@ export class TrouveApp extends withSignalTracking(LitElement) {
                 @click=${this.#newSessionAttachmentPickerClicked}
                 @change=${this.#newSessionFilesSelected}
               />
-            </label>
-            <div class="dialog-option-grid">
-              <label class="new-session-mode">
+            </label>`}
+            <div class=${this.#newSessionKind === "team"
+              ? "dialog-option-grid team"
+              : "dialog-option-grid"}>
+              ${this.#newSessionKind === "team"
+                ? nothing
+                : html`<label class="new-session-mode">
                 <span>Agent persona</span>
                 <select
                   name="mode"
@@ -3242,7 +3361,7 @@ export class TrouveApp extends withSignalTracking(LitElement) {
                         >${mode.display_name}</option>`,
                       )}
                 </select>
-              </label>
+              </label>`}
               <div class="dialog-field new-session-model">
                 <span>Model</span>
                 <trouve-model-picker
@@ -3387,7 +3506,7 @@ export class TrouveApp extends withSignalTracking(LitElement) {
               ? nothing
               : html`<p class="dialog-error new-session-error" role="alert">${this.#newSessionError}</p>`}
             <footer>
-              <button class="primary" type="submit" ?disabled=${!newSessionCanSubmit || (this.#newSessionPrompt.trim() === "" && this.#newSessionAttachments.length === 0)}>${this.#newSessionPending ? "Starting…" : newSessionOptionsBlocking ? "Loading defaults…" : "Start session"}</button>
+              <button class="primary" type="submit" ?disabled=${!newSessionCanSubmit || (this.#newSessionKind === "team" ? this.#newSessionPrompt.trim() === "" : this.#newSessionPrompt.trim() === "" && this.#newSessionAttachments.length === 0)}>${this.#newSessionPending ? "Starting…" : newSessionOptionsBlocking ? "Loading defaults…" : this.#newSessionKind === "team" ? "Start team" : "Start session"}</button>
               <button type="button" ?disabled=${this.#newSessionPending} @click=${this.#closeNewSession}>Cancel</button>
             </footer>
           </form>

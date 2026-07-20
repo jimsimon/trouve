@@ -88,7 +88,10 @@ describe("root shell parity wiring", () => {
     expect(source).toContain("const newSessionCanSubmit = canSubmitNewSession({");
     expect(source).toContain("?disabled=${!newSessionCanSubmit");
     expect(source).toContain("const timeout = globalThis.setTimeout(");
-    expect(source).toContain("const [modes, models, providers] = await Promise.all([");
+    expect(source).toContain(
+      "const [modes, models, providers, teamTemplates] = await Promise.all([",
+    );
+    expect(source).toContain("this.#protocolClient.teamTemplates()");
     expect(source).toContain('"timed-out",');
     expect(source).toContain('"ready",');
     expect(source).toContain("createNewSessionThreadRequestFromSnapshot({");

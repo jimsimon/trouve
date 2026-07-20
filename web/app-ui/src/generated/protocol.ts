@@ -1299,6 +1299,102 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/v1/sessions/{id}/team": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["get_team"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/sessions/{id}/team/cancel": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post: operations["cancel_team"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/sessions/{id}/team/complete": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post: operations["complete_team"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/sessions/{id}/team/messages": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post: operations["post_team_message"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/sessions/{id}/team/pause": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post: operations["pause_team"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/sessions/{id}/team/resume": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post: operations["resume_team"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v1/sessions/{id}/terminal": {
         parameters: {
             query?: never;
@@ -1373,6 +1469,38 @@ export interface paths {
         get: operations["subscription_health"];
         put?: never;
         post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/team-templates": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["team_templates"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/teams": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post: operations["create_team"];
         delete?: never;
         options?: never;
         head?: never;
@@ -2598,6 +2726,32 @@ export interface components {
             title?: string | null;
             workspace_id: components["schemas"]["String"];
         };
+        /** @description Create a role-based team and enqueue its goal for the orchestrator. */
+        CreateTeamRequest: {
+            base_ref?: string | null;
+            /**
+             * @description Fetch the base branch's configured upstream before creating the team
+             *     session. Refs without an upstream are used as-is.
+             */
+            fetch_latest?: boolean;
+            goal: string;
+            /**
+             * Format: int64
+             * @description Safety budget across automatically delivered team turns.
+             */
+            max_turns?: number | null;
+            /** @description Optional model override applied to every initial member. */
+            model?: string | null;
+            /** @description Model-specific options applied to every initial member. */
+            model_options?: {
+                [key: string]: unknown;
+            };
+            permission_mode?: null | components["schemas"]["PermissionMode"];
+            /** @description Server-provided template id; defaults to `software_delivery`. */
+            template_id?: string | null;
+            title?: string | null;
+            workspace_id: components["schemas"]["String"];
+        };
         CreateThreadRequest: {
             /** @description Agent persona id (default: "code"). */
             mode?: string | null;
@@ -2886,6 +3040,24 @@ export interface components {
             job_id: string;
             /** @enum {string} */
             type: "code_review.job_updated";
+        } | {
+            team: components["schemas"]["Team"];
+            /** @enum {string} */
+            type: "team.created";
+        } | {
+            message: components["schemas"]["TeamMessage"];
+            /** @enum {string} */
+            type: "team.message_posted";
+        } | {
+            member: components["schemas"]["TeamMember"];
+            /** @enum {string} */
+            type: "team.member_updated";
+        } | {
+            status: components["schemas"]["TeamStatus"];
+            /** Format: int64 */
+            turns_used: number;
+            /** @enum {string} */
+            type: "team.status_changed";
         } | {
             path: string;
             /** @enum {string} */
@@ -3409,6 +3581,10 @@ export interface components {
              */
             origin: string;
             persona: components["schemas"]["AgentPersona"];
+        };
+        /** @description Post a human-authored message to a team timeline. */
+        PostTeamMessageRequest: {
+            content: string;
         };
         /**
          * @description Typed PR-page actions. The server resolves every opaque target against the
@@ -4101,6 +4277,13 @@ export interface components {
             /** Format: date-time */
             created_at: string;
             id: components["schemas"]["String"];
+            /** @description Solo chat or role-based agent team. */
+            kind?: components["schemas"]["SessionKind"];
+            /**
+             * Format: int32
+             * @description Number of agents in a team session; zero for solo sessions.
+             */
+            team_member_count?: number;
             title: string;
             workspace_id: components["schemas"]["String"];
             /** @description Absolute path of the session worktree. */
@@ -4141,6 +4324,11 @@ export interface components {
             diff: string;
             path: string;
         };
+        /**
+         * @description The collaboration shape hosted by a session.
+         * @enum {string}
+         */
+        SessionKind: "solo" | "team";
         /**
          * @description A fresh session-level notification edge derived from a durable thread
          *     event. Clients apply their own notification preferences and foreground
@@ -4320,6 +4508,88 @@ export interface components {
             resets: string;
             /** Format: int64 */
             used_percent: number;
+        };
+        /** @description Current durable snapshot of a team session. */
+        Team: {
+            /** Format: date-time */
+            created_at: string;
+            goal: string;
+            /** Format: int64 */
+            max_turns: number;
+            members: components["schemas"]["TeamMember"][];
+            messages: components["schemas"]["TeamMessage"][];
+            orchestrator_member_id: string;
+            session_id: components["schemas"]["String"];
+            /**
+             * Format: int64
+             * @description Latest session event included in this snapshot. Clients resume the
+             *     session stream strictly after this cursor.
+             */
+            snapshot_cursor?: number;
+            status: components["schemas"]["TeamStatus"];
+            /** Format: int64 */
+            turns_used: number;
+        };
+        /**
+         * @description Author category for a message in the shared team timeline.
+         * @enum {string}
+         */
+        TeamAuthorKind: "human" | "agent" | "system";
+        /** @description One role-backed agent in a team session. */
+        TeamMember: {
+            display_name: string;
+            /** @description Unique, mentionable handle without the leading `@`. */
+            handle: string;
+            id: string;
+            mode: string;
+            model: string;
+            role: string;
+            session_id: components["schemas"]["String"];
+            state: components["schemas"]["TeamMemberState"];
+            thread_id: components["schemas"]["String"];
+            /** @description Aggregate usage for this member's backing thread. */
+            usage?: components["schemas"]["Usage"];
+        };
+        /**
+         * @description Current scheduling state for one team member.
+         * @enum {string}
+         */
+        TeamMemberState: "idle" | "queued" | "running" | "failed";
+        /** @description A resolved teammate mention. Handles are display data; ids are stable. */
+        TeamMention: {
+            handle: string;
+            member_id: string;
+        };
+        /** @description A canonical entry in the shared team timeline. */
+        TeamMessage: {
+            author_handle: string;
+            author_kind: components["schemas"]["TeamAuthorKind"];
+            author_member_id?: string | null;
+            content: string;
+            /** Format: date-time */
+            created_at: string;
+            id: string;
+            mentions?: components["schemas"]["TeamMention"][];
+            session_id: components["schemas"]["String"];
+        };
+        /**
+         * @description Lifecycle state for a team session.
+         * @enum {string}
+         */
+        TeamStatus: "active" | "paused" | "completed" | "cancelled";
+        /** @description A discoverable starting configuration for a team. */
+        TeamTemplate: {
+            description: string;
+            id: string;
+            members: components["schemas"]["TeamTemplateMember"][];
+            name: string;
+        };
+        /** @description One role in a server-provided team template. */
+        TeamTemplateMember: {
+            display_name: string;
+            handle: string;
+            mode: string;
+            role: string;
         };
         TerminalInfo: {
             /** Format: int32 */
@@ -7797,6 +8067,272 @@ export interface operations {
             };
         };
     };
+    get_team: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Team"];
+                };
+            };
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    cancel_team: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Team"];
+                };
+            };
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    complete_team: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Team"];
+                };
+            };
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    post_team_message: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["PostTeamMessageRequest"];
+            };
+        };
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TeamMessage"];
+                };
+            };
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    pause_team: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Team"];
+                };
+            };
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    resume_team: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Team"];
+                };
+            };
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
     open_terminal: {
         parameters: {
             query?: never;
@@ -7963,6 +8499,72 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["SubscriptionHealth"][];
+                };
+            };
+        };
+    };
+    team_templates: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TeamTemplate"][];
+                };
+            };
+        };
+    };
+    create_team: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["CreateTeamRequest"];
+            };
+        };
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Team"];
+                };
+            };
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
                 };
             };
         };

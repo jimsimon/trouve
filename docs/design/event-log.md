@@ -55,6 +55,9 @@ session stream.
   transcripts are transferred as bounded newest-first pages. Snapshots are
   rebuildable projections of this log; they do not replace it as the durable
   source of truth.
+- Snapshot endpoints that fold session events return their replay boundary;
+  `Team.snapshot_cursor` is the latest session event represented by that
+  snapshot, so clients begin following strictly after it.
 
 Completed folded transcript rows are materialized in the indexed
 `thread_view_items` projection, while `thread_view_cache` retains only the
@@ -192,6 +195,14 @@ Session scope:
 - `checkpoint.created` `{checkpoint_id, turn, thread_id, ref}`
 - `checkpoint.restored` `{checkpoint_id, direction}` (undo/redo/exact)
 - `worktree.created` / `worktree.removed` `{path, branch}`
+- `team.created` `{team}` — complete initial team snapshot, including roster
+  and finite automatic-turn budget
+- `team.message_posted` `{message}` — one canonical shared-timeline message;
+  resolved mentions carry stable member ids as well as display handles
+- `team.member_updated` `{member}` — a member's queue/run state or aggregate
+  usage changed
+- `team.status_changed` `{status, turns_used}` — lifecycle or automatic-turn
+  budget changed; reaching the budget pauses the team
 
 Server scope:
 

@@ -27,6 +27,7 @@ const auditedSources = [
   "crates/trouve-client-core/src/client.rs",
   "crates/trouve-client-core/src/lib.rs",
   "crates/trouve-client-core/src/protocol_compatibility.rs",
+  "crates/trouve-client-core/src/team_viewmodel.rs",
   "crates/trouve-client-core/src/viewmodel.rs",
   "crates/trouve-desktop-host/src/gateway.rs",
   "crates/trouve-desktop-host/src/lib.rs",

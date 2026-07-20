@@ -990,26 +990,31 @@ trouve-session-info-panel:not(:defined)::before, trouve-inspection-workspace:not
 .new-session-screen textarea { width: 100%; min-height: 30px; border: 1px solid var(--trouve-border-strong); border-radius: var(--trouve-radius-sm); padding: 4px 8px; color: var(--trouve-text); background: var(--trouve-control-bg); font-weight: 400; }
 .new-session-screen textarea { height: 34px; min-height: 34px; max-height: 162px; resize: none; overflow-y: hidden; line-height: 1.45; }
 .new-session-workspace { order: 1; }
-.new-session-branch { order: 2; }
-.new-session-branch-warning { order: 3; }
-.new-session-screen .dialog-checkbox { order: 4; display: grid; grid-template-columns: auto minmax(0, 1fr); align-items: center; gap: 8px; font-weight: 400; }
+.new-session-kind { order: 2; }
+.new-session-team-template { order: 3; }
+.new-session-team-description { color: var(--trouve-text-dim); font-size: 10px; font-weight: 400; line-height: 1.4; }
+.new-session-branch { order: 4; }
+.new-session-branch-warning { order: 5; }
+.new-session-screen .dialog-checkbox { order: 6; display: grid; grid-template-columns: auto minmax(0, 1fr); align-items: center; gap: 8px; font-weight: 400; }
 .new-session-screen .dialog-checkbox input { width: auto; min-height: auto; margin: 0; }
-.new-session-screen .dialog-option-grid { order: 5; display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px 12px; }
+.new-session-screen .dialog-option-grid { order: 7; display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px 12px; }
 .new-session-mode { grid-column: 1; grid-row: 1; }
 .new-session-model { grid-column: 2; grid-row: 1; }
+.new-session-screen .dialog-option-grid.team .new-session-model { grid-column: 1 / -1; }
 .new-session-thinking { grid-column: 1; grid-row: 2; }
 .new-session-permission { grid-column: 2; grid-row: 2; }
 .new-session-screen .dialog-option-grid.no-thinking .new-session-permission { grid-column: 1 / -1; }
-.new-session-options-warning { order: 6; }
-.new-session-options-status { order: 6; margin: 0; color: var(--trouve-text-dim); }
-.new-session-yolo-warning { order: 6; display: grid; gap: 4px; border: 1px solid var(--trouve-err); border-radius: var(--trouve-radius); padding: 10px; color: var(--trouve-err-soft); background: var(--trouve-err-bg); font-size: 11px; }
+.new-session-options-warning { order: 8; }
+.new-session-options-status { order: 8; margin: 0; color: var(--trouve-text-dim); }
+.new-session-yolo-warning { order: 8; display: grid; gap: 4px; border: 1px solid var(--trouve-err); border-radius: var(--trouve-radius); padding: 10px; color: var(--trouve-err-soft); background: var(--trouve-err-bg); font-size: 11px; }
 .new-session-yolo-warning strong { color: var(--trouve-err); font-size: 12px; }
-.new-session-prompt { order: 7; }
-.new-session-screen .pending-attachments { order: 8; margin: 0; padding: 0; }
-.new-session-screen .new-session-attachment { order: 9; min-height: 30px; justify-self: start; padding: 3px 7px; font-weight: 400; }
+.new-session-prompt { order: 9; }
+.new-session-team-note { order: 10; margin: 0; color: var(--trouve-text-dim); font-size: 11px; line-height: 1.4; }
+.new-session-screen .pending-attachments { order: 10; margin: 0; padding: 0; }
+.new-session-screen .new-session-attachment { order: 11; min-height: 30px; justify-self: start; padding: 3px 7px; font-weight: 400; }
 .new-session-screen .new-session-attachment input { width: 1px; height: 1px; min-height: 1px; padding: 0; }
-.new-session-error { order: 10; }
-.new-session-screen footer { order: 11; display: flex; align-items: center; justify-content: flex-start; gap: 8px; }
+.new-session-error { order: 12; }
+.new-session-screen footer { order: 13; display: flex; align-items: center; justify-content: flex-start; gap: 8px; }
 .new-session-screen footer button { min-height: 30px; border: 1px solid var(--trouve-border-strong); border-radius: var(--trouve-radius-sm); padding: 4px 9px; background: var(--trouve-control-bg); }
 .new-session-screen footer button.primary { border-color: var(--trouve-primary-border); color: var(--trouve-on-accent); background: var(--trouve-primary-bg); }
 .new-session-screen .dialog-error { margin: 0; color: var(--trouve-err); }
