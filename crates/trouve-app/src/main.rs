@@ -453,6 +453,12 @@ fn main() -> anyhow::Result<()> {
     }
     {
         let tx = tx.clone();
+        window.on_workspace_closed(move |row| {
+            let _ = tx.send(UiCommand::CloseWorkspace { row: row as usize });
+        });
+    }
+    {
+        let tx = tx.clone();
         window.on_open_settings(move || {
             let _ = tx.send(UiCommand::OpenSettings);
         });

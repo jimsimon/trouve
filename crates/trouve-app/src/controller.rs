@@ -56,6 +56,10 @@ pub enum UiCommand {
     ToggleArchivedFilter {
         row: usize,
     },
+    /// Remove a workspace from the sidebar without deleting its sessions.
+    CloseWorkspace {
+        row: usize,
+    },
     /// Quit once all running agent turns complete.
     QuitWhenIdle,
     /// Disarm a previously requested deferred quit.
@@ -1011,11 +1015,7 @@ impl Controller {
         }
 
         self.reload_sessions().await?;
-        if self.home_workspace_id.is_empty()
-            && let Some(ws) = self.workspaces.first()
-        {
-            self.home_workspace_id = ws.id.clone();
-        }
+        self.sync_home_workspace();
 
         // Seed connectivity before the first catalog load: when the server
         // started offline, the model list is already filtered and the
@@ -1350,6 +1350,47 @@ impl Controller {
         }
         self.refresh_nav_prs(false);
         Ok(())
+    }
+
+    /// Keep the preferred workspace valid after the server's visible
+    /// workspace set changes. Preserve it when still open; otherwise fall
+    /// back to the first open workspace (or none).
+    fn sync_home_workspace(&mut self) {
+        if self
+            .workspaces
+            .iter()
+            .any(|workspace| workspace.id == self.home_workspace_id)
+        {
+            return;
+        }
+        self.home_workspace_id = self
+            .workspaces
+            .first()
+            .map(|workspace| workspace.id.clone())
+            .unwrap_or_default();
+    }
+
+    /// Clear session-derived UI when its workspace is closed locally or by
+    /// another client. Persisted session/thread data remains available if the
+    /// workspace is reopened later.
+    fn close_current_session_if_in_workspace(&mut self, workspace_id: &str) {
+        let closes_current = self
+            .current_session
+            .and_then(|index| self.sessions.get(index))
+            .is_some_and(|session| session.workspace_id == workspace_id);
+        if !closes_current {
+            return;
+        }
+        self.current_session = None;
+        self.threads.clear();
+        self.current_thread = None;
+        self.resume.session_id.clear();
+        crate::winstate::save_resume(&self.resume);
+        self.push_threads();
+        self.render_chat(true);
+        self.push_context();
+        self.push_queue();
+        self.push_todos();
     }
 
     /// Build the session-specific part of one nav row.
@@ -3738,6 +3779,19 @@ impl Controller {
             Event::SessionCreated { .. } | Event::SessionDeleted { .. } => {
                 let _ = self.reload_sessions().await;
             }
+            // Workspace lifecycle is server-scoped so another app instance
+            // can keep its sidebar in sync with opens and closes here.
+            Event::WorkspaceRegistered { .. } => {
+                if self.reload_sessions().await.is_ok() {
+                    self.sync_home_workspace();
+                }
+            }
+            Event::WorkspaceClosed { workspace_id } => {
+                self.close_current_session_if_in_workspace(workspace_id);
+                if self.reload_sessions().await.is_ok() {
+                    self.sync_home_workspace();
+                }
+            }
             // A session started or finished processing prompts: light up or
             // dim its sidebar indicator.
             Event::SessionActivity {
@@ -3966,6 +4020,20 @@ impl Controller {
                         self.show_archived.insert(id);
                     }
                     self.push_nav();
+                }
+            }
+            UiCommand::CloseWorkspace { row } => {
+                if let Some(NavEntry::Workspace(wi)) = self.nav.get(row)
+                    && let Some(ws) = self.workspaces.get(*wi)
+                {
+                    let id = ws.id.clone();
+                    self.client.close_workspace(&id).await?;
+                    self.collapsed_workspaces.remove(&id);
+                    self.show_archived.remove(&id);
+                    self.archived_expanded.remove(&id);
+                    self.close_current_session_if_in_workspace(&id);
+                    self.reload_sessions().await?;
+                    self.sync_home_workspace();
                 }
             }
             UiCommand::SessionDelete { row } => {

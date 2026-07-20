@@ -258,6 +258,8 @@ pub enum Event {
     /// instance. Clients replace the previously folded host slice.
     #[serde(rename = "github.pull_requests_updated")]
     GithubPullRequestsUpdated { pull_requests: crate::GithubPrList },
+    #[serde(rename = "workspace.closed")]
+    WorkspaceClosed { workspace_id: WorkspaceId },
     #[serde(rename = "session.created")]
     SessionCreated {
         session_id: SessionId,

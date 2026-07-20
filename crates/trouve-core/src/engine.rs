@@ -1413,7 +1413,7 @@ impl Engine {
         if req.prompt.trim().is_empty() {
             return Err(EngineError::BadRequest("automations need a prompt".into()));
         }
-        if self.store.workspace(&req.workspace_id)?.is_none() {
+        if self.store.open_workspace(&req.workspace_id)?.is_none() {
             return Err(EngineError::NotFound(format!(
                 "workspace {}",
                 req.workspace_id
@@ -1473,6 +1473,18 @@ impl Engine {
         let now = chrono::Utc::now();
         for automation in automations {
             if !automation.enabled {
+                continue;
+            }
+            // Closing a workspace pauses its scheduled activity without
+            // deleting or disabling the persisted automation. Reopening the
+            // workspace makes it eligible on a later scheduler tick.
+            if self
+                .store
+                .open_workspace(&automation.workspace_id)
+                .ok()
+                .flatten()
+                .is_none()
+            {
                 continue;
             }
             let due = automation
@@ -2974,6 +2986,15 @@ impl Engine {
         }
         let path_str = canonical.to_string_lossy().to_string();
         if let Some(existing) = self.store.workspace_by_path(&path_str)? {
+            if self.store.set_workspace_closed(&existing.id, false)? {
+                self.store.append_event(
+                    Scope::Server,
+                    Event::WorkspaceRegistered {
+                        workspace_id: existing.id.clone(),
+                        path: path_str,
+                    },
+                )?;
+            }
             return Ok(existing);
         }
         let ws = Workspace {
@@ -3053,6 +3074,24 @@ impl Engine {
         Ok(())
     }
 
+    /// Hide a workspace from clients and reject new sessions/automation runs
+    /// while retaining existing sessions, worktrees, and automation records.
+    /// Registering the same path later reopens it.
+    pub fn close_workspace(&self, id: &str) -> Result<(), EngineError> {
+        if self.store.workspace(id)?.is_none() {
+            return Err(EngineError::NotFound(format!("workspace {id}")));
+        }
+        if self.store.set_workspace_closed(id, true)? {
+            self.store.append_event(
+                Scope::Server,
+                Event::WorkspaceClosed {
+                    workspace_id: id.to_string(),
+                },
+            )?;
+        }
+        Ok(())
+    }
+
     /// Local branches of the workspace repo, for base-ref selection.
     pub async fn workspace_branches(&self, id: &str) -> Result<BranchList, EngineError> {
         let ws = self
@@ -3075,7 +3114,7 @@ impl Engine {
     pub async fn create_session(&self, req: CreateSessionRequest) -> Result<Session, EngineError> {
         let ws = self
             .store
-            .workspace(&req.workspace_id)?
+            .open_workspace(&req.workspace_id)?
             .ok_or_else(|| EngineError::NotFound(format!("workspace {}", req.workspace_id)))?;
         let repo = PathBuf::from(&ws.path);
         let title = req.title.unwrap_or_else(|| "New session".into());

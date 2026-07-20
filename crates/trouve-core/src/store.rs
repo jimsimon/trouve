@@ -19,6 +19,7 @@ CREATE TABLE IF NOT EXISTS workspaces (
   id TEXT PRIMARY KEY,
   name TEXT NOT NULL,
   path TEXT NOT NULL UNIQUE,
+  closed INTEGER NOT NULL DEFAULT 0,
   created_at TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS sessions (
@@ -133,6 +134,7 @@ CREATE TABLE IF NOT EXISTS automations (
 /// `CREATE TABLE IF NOT EXISTS` won't touch existing tables, so each entry
 /// is applied and "duplicate column" errors are ignored.
 const MIGRATIONS: &[&str] = &[
+    "ALTER TABLE workspaces ADD COLUMN closed INTEGER NOT NULL DEFAULT 0",
     "ALTER TABLE sessions ADD COLUMN archived INTEGER NOT NULL DEFAULT 0",
     "ALTER TABLE queued_prompts ADD COLUMN attachments TEXT NOT NULL DEFAULT '[]'",
     "ALTER TABLE queued_prompts ADD COLUMN claimed INTEGER NOT NULL DEFAULT 0",
@@ -488,10 +490,36 @@ impl Store {
         Ok(())
     }
 
+    pub fn set_workspace_closed(&self, id: &str, closed: bool) -> Result<bool> {
+        let changed = self.conn.lock().unwrap().execute(
+            "UPDATE workspaces SET closed = ?2 WHERE id = ?1 AND closed != ?2",
+            params![id, closed],
+        )?;
+        Ok(changed != 0)
+    }
+
     pub fn workspace(&self, id: &str) -> Result<Option<Workspace>> {
         let conn = self.conn.lock().unwrap();
         conn.query_row(
             "SELECT id, name, path FROM workspaces WHERE id = ?1",
+            params![id],
+            |r| {
+                Ok(Workspace {
+                    id: r.get(0)?,
+                    name: r.get(1)?,
+                    path: r.get(2)?,
+                })
+            },
+        )
+        .optional()
+        .map_err(Into::into)
+    }
+
+    /// A workspace only while it is open and available for new activity.
+    pub fn open_workspace(&self, id: &str) -> Result<Option<Workspace>> {
+        let conn = self.conn.lock().unwrap();
+        conn.query_row(
+            "SELECT id, name, path FROM workspaces WHERE id = ?1 AND closed = 0",
             params![id],
             |r| {
                 Ok(Workspace {
@@ -524,7 +552,9 @@ impl Store {
 
     pub fn list_workspaces(&self) -> Result<Vec<Workspace>> {
         let conn = self.conn.lock().unwrap();
-        let mut stmt = conn.prepare("SELECT id, name, path FROM workspaces ORDER BY created_at")?;
+        let mut stmt = conn.prepare(
+            "SELECT id, name, path FROM workspaces WHERE closed = 0 ORDER BY created_at",
+        )?;
         let rows = stmt.query_map([], |r| {
             Ok(Workspace {
                 id: r.get(0)?,
@@ -2181,5 +2211,30 @@ mod tests {
             store.checkpoint_at("se_1", 1).unwrap().unwrap().commit_hash,
             "c1b"
         );
+    }
+
+    #[test]
+    fn closing_workspace_hides_it_without_deleting_it() {
+        let store = Store::open_in_memory().unwrap();
+        let workspace = Workspace {
+            id: "ws_close".into(),
+            name: "close me".into(),
+            path: "/tmp/close-me".into(),
+        };
+        store.insert_workspace(&workspace).unwrap();
+
+        assert!(store.set_workspace_closed(&workspace.id, true).unwrap());
+        assert!(store.list_workspaces().unwrap().is_empty());
+        assert!(store.open_workspace(&workspace.id).unwrap().is_none());
+        assert_eq!(
+            store.workspace(&workspace.id).unwrap().unwrap().path,
+            workspace.path
+        );
+
+        assert!(store.set_workspace_closed(&workspace.id, false).unwrap());
+        assert!(store.open_workspace(&workspace.id).unwrap().is_some());
+        let reopened = store.list_workspaces().unwrap();
+        assert_eq!(reopened.len(), 1);
+        assert_eq!(reopened[0].id, workspace.id);
     }
 }

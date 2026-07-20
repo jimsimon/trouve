@@ -2903,6 +2903,37 @@
         }
       }
     },
+    "/v1/workspaces/{id}": {
+      "delete": {
+        "tags": [],
+        "operationId": "close_workspace",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": ""
+          },
+          "404": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/v1/workspaces/{id}/branches": {
       "get": {
         "tags": [],
@@ -4211,6 +4242,24 @@
                 "enum": [
                   "github.pull_requests_updated"
                 ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "workspace_id",
+              "type"
+            ],
+            "properties": {
+              "type": {
+                "type": "string",
+                "enum": [
+                  "workspace.closed"
+                ]
+              },
+              "workspace_id": {
+                "$ref": "#/components/schemas/String"
               }
             }
           },

@@ -80,6 +80,7 @@ impl IntoResponse for ApiError {
         info,
         register_workspace,
         list_workspaces,
+        close_workspace,
         workspace_branches,
         refresh_github_prs,
         create_session,
@@ -449,6 +450,10 @@ pub fn build_router(engine: Arc<Engine>) -> Router {
             "/v1/workspaces",
             post(register_workspace).get(list_workspaces),
         )
+        .route(
+            "/v1/workspaces/{id}",
+            axum::routing::delete(close_workspace),
+        )
         .route("/v1/workspaces/{id}/branches", get(workspace_branches))
         .route("/v1/github/prs/refresh", post(refresh_github_prs))
         .route("/v1/sessions", post(create_session).get(list_sessions))
@@ -671,6 +676,16 @@ async fn list_workspaces(
     State(engine): State<Arc<Engine>>,
 ) -> Result<Json<Vec<Workspace>>, ApiError> {
     Ok(Json(engine.list_workspaces()?))
+}
+
+#[utoipa::path(delete, path = "/v1/workspaces/{id}", params(("id" = String, Path,)),
+    responses((status = 204), (status = 404, body = ErrorBody)))]
+async fn close_workspace(
+    State(engine): State<Arc<Engine>>,
+    Path(id): Path<String>,
+) -> Result<StatusCode, ApiError> {
+    engine.close_workspace(&id)?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 #[utoipa::path(get, path = "/v1/workspaces/{id}/branches", params(("id" = String, Path,)),
