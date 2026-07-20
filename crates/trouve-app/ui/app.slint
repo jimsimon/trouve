@@ -3990,6 +3990,8 @@ export component AppWindow inherits Window {
                     }
                     Button {
                         width: Theme.fs(76px);
+                        height: Theme.fs(34px);
+                        vertical-stretch: 0;
                         text: root.composer-turn-running
                             ? (composer.text != "" || root.composer-attachments.length > 0 ? "Queue" : "Cancel")
                             : "Send";
