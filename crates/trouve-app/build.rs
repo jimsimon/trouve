@@ -5,6 +5,7 @@ fn main() {
         "../trouve-slint-code-view/ui".into(),
         "../trouve-slint-diff-view/ui".into(),
         "../trouve-slint-markdown/ui".into(),
+        "../trouve-slint-media-view/ui".into(),
         "../trouve-slint-terminal/ui".into(),
     ]);
     slint_build::compile_with_config("ui/app.slint", config).expect("slint compiles");

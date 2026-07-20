@@ -26,6 +26,7 @@ slint = { workspace = true, features = ["unstable-winit-030", "renderer-skia"] }
 tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
+uuid.workspace = true
 trouve-client-core.workspace = true
 trouve-protocol.workspace = true
 # Embedded local server (ADR 0008): the app calls one bootstrap entry point
@@ -37,6 +38,7 @@ trouve-server.workspace = true
 trouve-slint-code-view.workspace = true
 trouve-slint-diff-view.workspace = true
 trouve-slint-markdown.workspace = true
+trouve-slint-media-view.workspace = true
 trouve-slint-terminal.workspace = true
 # Syntax highlighting for the file viewer.
 syntect = { version = "5", default-features = false, features = ["default-fancy"] }
@@ -60,6 +62,7 @@ arboard = { version = "3.6.1", features = ["wayland-data-control"] }
 mime_guess = "2.0.5"
 png = "0.18.1"
 base64 = "0.22"
+tempfile.workspace = true
 
 [build-dependencies]
 slint-build = "1.17"
