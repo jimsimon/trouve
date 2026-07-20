@@ -33,6 +33,37 @@ const TODOS_TAB: i32 = 5;
 /// API pressure from the per-PR enrichment requests.
 const PR_DASH_REFRESH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
 
+fn same_pull_request(left: &trouve_protocol::PrInfo, right: &trouve_protocol::PrInfo) -> bool {
+    left.number == right.number
+        && left.host.eq_ignore_ascii_case(&right.host)
+        && left.repository.eq_ignore_ascii_case(&right.repository)
+}
+
+/// Project the account feed into one session without broadening association.
+/// Exact session-branch matches are intrinsically related; cross-branch PRs
+/// enter only after the session endpoint has returned them in `known` based
+/// on durable activity from this session and all of its threads.
+fn project_session_prs<'a>(
+    session: &Session,
+    dashboard: impl IntoIterator<Item = &'a trouve_protocol::PrInfo>,
+    known: &[trouve_protocol::PrInfo],
+) -> Vec<trouve_protocol::PrInfo> {
+    let mut prs = Vec::new();
+    for pr in dashboard {
+        let exact_branch = pr.workspace_id == session.workspace_id && pr.head == session.branch;
+        if exact_branch || known.iter().any(|existing| same_pull_request(existing, pr)) {
+            prs.push(pr.clone());
+        }
+    }
+    for pr in known {
+        if !prs.iter().any(|existing| same_pull_request(existing, pr)) {
+            prs.push(pr.clone());
+        }
+    }
+    prs.sort_by_key(|pr| (pr.state != "open", std::cmp::Reverse(pr.number)));
+    prs
+}
+
 /// Terminal scrollback the client-side screen model keeps, in lines.
 const TERM_SCROLLBACK: usize = 5000;
 const TERM_FRAME_INTERVAL: std::time::Duration = std::time::Duration::from_millis(16);
@@ -583,7 +614,7 @@ struct Controller {
     /// Pre-canned automation templates (static server catalog, fetched on
     /// first open of the screen).
     automation_templates: Vec<trouve_protocol::AutomationTemplate>,
-    /// PRs detected for the current session's branch, and the one shown.
+    /// PRs associated with the current session, and the one shown.
     prs: Vec<trouve_protocol::PrInfo>,
     pr_selected: usize,
     pr_error: String,
@@ -601,8 +632,8 @@ struct Controller {
     pr_collapsed: HashSet<String>,
     /// Project filter: `host/owner/repo` (None = all projects).
     pr_dash_filter: Option<String>,
-    /// PRs per session for the compact sidebar badge. An empty vector means
-    /// the branch was checked and has no associated PRs.
+    /// PRs per session for the compact sidebar badge. Values come only from
+    /// an exact session-branch match or the authoritative session endpoint.
     nav_prs: HashMap<String, Vec<trouve_protocol::PrInfo>>,
 
     vms: HashMap<String, ThreadViewModel>,
@@ -2531,15 +2562,14 @@ impl Controller {
     }
 
     fn shared_prs_for_session(&self, session: &Session) -> Vec<trouve_protocol::PrInfo> {
-        let mut prs: Vec<_> = self
-            .pr_dash
-            .values()
-            .flat_map(|list| list.prs.iter())
-            .filter(|pr| pr.workspace_id == session.workspace_id && pr.head == session.branch)
-            .cloned()
-            .collect();
-        prs.sort_by_key(|pr| (pr.state != "open", std::cmp::Reverse(pr.number)));
-        prs
+        project_session_prs(
+            session,
+            self.pr_dash.values().flat_map(|list| list.prs.iter()),
+            self.nav_prs
+                .get(&session.id)
+                .map(Vec::as_slice)
+                .unwrap_or_default(),
+        )
     }
 
     /// Fold the shared account snapshots into sidebar icons and the current
@@ -2572,8 +2602,9 @@ impl Controller {
         self.push_nav();
     }
 
-    /// Populate the right panel from the shared account feed when possible;
-    /// use a targeted branch lookup only when that feed has no matching PR.
+    /// Populate the right panel immediately from known account data, then run
+    /// the authoritative session lookup. The account feed cannot discover
+    /// cross-branch associations by itself and must never broaden them.
     fn refresh_prs(&mut self) {
         let Some(session_id) = self.current_session_id() else {
             self.prs.clear();
@@ -2594,14 +2625,12 @@ impl Controller {
             .unwrap_or_default();
         if !shared.is_empty() {
             self.prs = shared.clone();
-            self.nav_prs.insert(session_id, shared);
+            self.nav_prs.insert(session_id.clone(), shared);
             self.pr_selected = self.pr_selected.min(self.prs.len().saturating_sub(1));
             self.pr_error.clear();
             self.push_prs();
             self.push_nav();
-            return;
-        }
-        if self.prs.is_empty() {
+        } else if self.prs.is_empty() {
             self.pr_error = "looking for pull requests…".into();
         }
         self.push_prs();
@@ -6604,11 +6633,11 @@ fn should_open_chat_at_tail(force_tail: bool, turn_running: bool, has_queue: boo
 mod tests {
     use super::{
         approval_pill, attention_badge, check_pill, classify_pr, download_progress, human_age,
-        human_rate, merge_pill, pr_badge, reconcile_pr_group_order, reconcile_workspace_order,
-        reorder_id, should_open_chat_at_tail, thinking_property,
+        human_rate, merge_pill, pr_badge, project_session_prs, reconcile_pr_group_order,
+        reconcile_workspace_order, reorder_id, should_open_chat_at_tail, thinking_property,
     };
     use chrono::{Duration, TimeZone, Utc};
-    use trouve_protocol::{CheckRun, PrInfo, PrReview, Workspace};
+    use trouve_protocol::{CheckRun, PrInfo, PrReview, Session, Workspace};
 
     fn workspaces(ids: &[&str]) -> Vec<Workspace> {
         ids.iter()
@@ -6690,6 +6719,52 @@ mod tests {
             mergeable: None,
             merged_at: None,
         }
+    }
+
+    #[test]
+    fn session_projection_keeps_only_branch_or_authoritative_associations() {
+        let session = Session {
+            id: "se_1".into(),
+            workspace_id: "ws_1".into(),
+            title: "session".into(),
+            branch: "trouve/session".into(),
+            worktree_path: "/tmp/session".into(),
+            base_ref: "main".into(),
+            archived: false,
+            active: false,
+            created_at: Utc::now(),
+        };
+
+        let mut exact = pr();
+        exact.number = 41;
+        exact.head = session.branch.clone();
+
+        let mut unrelated = pr();
+        unrelated.number = 42;
+        unrelated.head = "someone-elses-work".into();
+
+        let mut associated = pr();
+        associated.number = 43;
+        associated.head = "created-through-gh".into();
+        associated.title = "fresh dashboard details".into();
+
+        let mut cached_associated = associated.clone();
+        cached_associated.title = "older targeted details".into();
+        let mut cached_missing = pr();
+        cached_missing.number = 44;
+        cached_missing.head = "created-through-graphql".into();
+
+        let projected = project_session_prs(
+            &session,
+            [&exact, &unrelated, &associated],
+            &[cached_associated, cached_missing],
+        );
+        assert_eq!(
+            projected.iter().map(|pr| pr.number).collect::<Vec<_>>(),
+            vec![44, 43, 41]
+        );
+        assert_eq!(projected[1].title, "fresh dashboard details");
+        assert!(!projected.iter().any(|pr| pr.number == unrelated.number));
     }
 
     fn passing_check() -> CheckRun {

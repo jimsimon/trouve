@@ -137,6 +137,7 @@ fn pr_head_matches_evidence(
     commit_ids.contains(&sha.to_ascii_lowercase())
         || branch_evidence.iter().any(|text| {
             text_mentions_ref(text, branch)
+                || text_mentions_ref(text, &format!("refs/heads/{branch}"))
                 || label.is_some_and(|label| text_mentions_ref(text, label))
         })
 }
@@ -169,6 +170,7 @@ pub fn oauth_config(host: &str, client_id: &str) -> trouve_providers::auth::OAut
 
 pub struct GitHub {
     client: Octocrab,
+    host: String,
     owner: String,
     repo: String,
 }
@@ -262,6 +264,7 @@ impl GitHubAccount {
                     let mergeable = raw.mergeable;
                     let github = GitHub {
                         client,
+                        host: host.clone(),
                         owner,
                         repo,
                     };
@@ -299,6 +302,7 @@ impl GitHub {
         let client = builder.build().context("building GitHub client")?;
         Ok(Self {
             client,
+            host: host.to_string(),
             owner: owner.to_string(),
             repo: repo.to_string(),
         })
@@ -663,7 +667,7 @@ impl GitHub {
             .unwrap_or_default();
 
         Ok(PrInfo {
-            host: String::new(),
+            host: self.host.clone(),
             repository: format!("{}/{}", self.owner, self.repo),
             workspace_id: String::new(),
             number,
@@ -765,6 +769,13 @@ mod tests {
         assert!(text_mentions_ref(
             r#"{\"head\":\"alice:fix/cross-branch-pr\"}"#,
             "alice:fix/cross-branch-pr"
+        ));
+        assert!(pr_head_matches_evidence(
+            "fix/cross-branch-pr",
+            None,
+            "unrelated",
+            &[r#"{\"ref\":\"refs/heads/fix/cross-branch-pr\"}"#.into()],
+            &HashSet::new(),
         ));
         assert!(!text_mentions_ref(
             "git push origin prefix-fix/cross-branch-pr-old",

@@ -5084,6 +5084,11 @@ impl Engine {
         // Remember their names until completion so their result can update
         // the same persisted snapshot as trouve's bridged/native tool.
         let mut tool_calls = HashMap::<String, (String, serde_json::Value)>::new();
+        // Creation tools sometimes stream their final PR URL before the
+        // completion payload. Buffer output only for calls whose request is
+        // demonstrably creating a PR; list/view output must never associate
+        // every PR it happens to mention with this session.
+        let mut github_creation_output = HashMap::<String, String>::new();
         // A vendor may use any GitHub client instead of trouve's create-PR
         // endpoint. Turn repository-specific PR references in its output into
         // the same durable session event, independent of the tool name.
@@ -5169,13 +5174,14 @@ impl Engine {
                         .append_event(scope.clone(), Event::ToolStarted { call_id })?;
                 }
                 BackendEvent::ToolOutput { call_id, chunk } => {
-                    if let Some(repository @ (host, owner, repo)) = &github_repository {
-                        self.record_session_pr_numbers(
-                            &session.id,
-                            repository,
-                            crate::github::pr_numbers_in_text(&chunk, host, owner, repo),
-                            &mut recorded_prs,
-                        )?;
+                    if let Some((_, owner, repo)) = &github_repository
+                        && let Some((tool, args)) = tool_calls.get(&call_id)
+                        && requests_pull_request_creation(tool, args, owner, repo)
+                    {
+                        github_creation_output
+                            .entry(call_id.clone())
+                            .or_default()
+                            .push_str(&chunk);
                     }
                     self.store
                         .append_event(scope.clone(), Event::ToolOutput { call_id, chunk })?;
@@ -5204,13 +5210,26 @@ impl Engine {
                         )?,
                         None => None,
                     };
-                    if let Some(repository @ (host, owner, repo)) = &github_repository {
+                    if ok
+                        && let Some(repository @ (host, owner, repo)) = &github_repository
+                        && let Some((tool, args)) = tool_calls.get(&call_id)
+                        && requests_pull_request_creation(tool, args, owner, repo)
+                    {
+                        let mut numbers = pr_numbers_in_value(args, host, owner, repo);
+                        numbers.extend(pr_numbers_in_value(&result, host, owner, repo));
+                        if let Some(output) = github_creation_output.remove(&call_id) {
+                            numbers.extend(crate::github::pr_numbers_in_text(
+                                &output, host, owner, repo,
+                            ));
+                        }
                         self.record_session_pr_numbers(
                             &session.id,
                             repository,
-                            pr_numbers_in_value(&result, host, owner, repo),
+                            numbers,
                             &mut recorded_prs,
                         )?;
+                    } else {
+                        github_creation_output.remove(&call_id);
                     }
                     self.store.append_event(
                         scope.clone(),
@@ -5754,15 +5773,20 @@ impl Engine {
             &outcome.result,
             Some(&call.arguments),
         )?;
-        if let Ok(repository) = self.github_repository_for_session(session) {
+        if matches!(outcome.status, ToolStatus::Ok)
+            && let Ok(repository) = self.github_repository_for_session(session)
+            && requests_pull_request_creation(
+                &call.name,
+                &call.arguments,
+                &repository.1,
+                &repository.2,
+            )
+        {
             let (host, owner, repo) = &repository;
             let mut recorded_prs = self.recorded_session_pr_numbers(&session.id)?;
-            self.record_session_pr_numbers(
-                &session.id,
-                &repository,
-                pr_numbers_in_value(&outcome.result, host, owner, repo),
-                &mut recorded_prs,
-            )?;
+            let mut numbers = pr_numbers_in_value(&call.arguments, host, owner, repo);
+            numbers.extend(pr_numbers_in_value(&outcome.result, host, owner, repo));
+            self.record_session_pr_numbers(&session.id, &repository, numbers, &mut recorded_prs)?;
         }
         self.store.append_event(
             scope.clone(),
@@ -6494,6 +6518,168 @@ fn git_commit_ids_in_value(value: &serde_json::Value) -> HashSet<String> {
     commits
 }
 
+/// Lowercase words from tool names and arguments, with punctuation treated
+/// as separators so CLI commands and snake/camel-ish tool names can be
+/// recognized without depending on one provider's schema.
+fn activity_words(text: &str) -> String {
+    text.chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() {
+                character.to_ascii_lowercase()
+            } else {
+                ' '
+            }
+        })
+        .collect()
+}
+
+fn compact_activity(text: &str) -> String {
+    text.chars()
+        .filter(char::is_ascii_alphanumeric)
+        .map(|character| character.to_ascii_lowercase())
+        .collect()
+}
+
+fn mentions_exact_path(text: &str, expected_path: &str) -> bool {
+    text.split_whitespace().any(|token| {
+        let token = token.trim_matches(|character: char| {
+            matches!(
+                character,
+                '"' | '\'' | '{' | '}' | '[' | ']' | '(' | ')' | ','
+            )
+        });
+        let path = token
+            .split(['?', '#'])
+            .next()
+            .unwrap_or(token)
+            .trim_end_matches('/')
+            .to_ascii_lowercase();
+        path == expected_path.trim_start_matches('/') || path.ends_with(expected_path)
+    })
+}
+
+/// Whether a structured HTTP request mutates the expected REST collection.
+fn contains_rest_mutation(
+    value: &serde_json::Value,
+    expected_path: &str,
+    methods: &[&str],
+    descendants: bool,
+) -> bool {
+    match value {
+        serde_json::Value::Array(items) => items
+            .iter()
+            .any(|item| contains_rest_mutation(item, expected_path, methods, descendants)),
+        serde_json::Value::Object(fields) => {
+            let direct = fields
+                .get("method")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|method| {
+                    methods
+                        .iter()
+                        .any(|expected| method.eq_ignore_ascii_case(expected))
+                })
+                && fields
+                    .get("url")
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(|url| {
+                        let path = url
+                            .split(['?', '#'])
+                            .next()
+                            .unwrap_or(url)
+                            .trim_end_matches('/')
+                            .to_ascii_lowercase();
+                        path.ends_with(expected_path)
+                            || (descendants && path.contains(&format!("{expected_path}/")))
+                    });
+            direct
+                || fields
+                    .values()
+                    .any(|item| contains_rest_mutation(item, expected_path, methods, descendants))
+        }
+        _ => false,
+    }
+}
+
+/// A successful tool call that actually creates a pull request. Merely
+/// listing, viewing, or mentioning a PR must not associate it with a session.
+fn requests_pull_request_creation(
+    tool: &str,
+    args: &serde_json::Value,
+    owner: &str,
+    repo: &str,
+) -> bool {
+    let tool_words = activity_words(tool);
+    let tool_compact = compact_activity(tool);
+    let args_text = args.to_string();
+    let args_words = activity_words(&args_text);
+    let args_compact = compact_activity(&args_text);
+    let shell_like = ["shell", "bash", "command", "terminal", "exec", "gh"]
+        .iter()
+        .any(|word| tool_words.split_whitespace().any(|part| part == *word));
+    let browser_like = ["browser", "playwright", "web", "click"]
+        .iter()
+        .any(|word| tool_words.split_whitespace().any(|part| part == *word));
+    let graphql_mutation = args_words.split_whitespace().any(|word| word == "mutation")
+        && args_compact.contains("createpullrequest");
+    let rest_path = format!("/repos/{owner}/{repo}/pulls").to_ascii_lowercase();
+    let shell_rest_creation = shell_like
+        && mentions_exact_path(&args_text, &rest_path)
+        && (format!(" {args_words} ").contains(" post ")
+            || args_text.contains(" -f ")
+            || args_text.contains(" --field ")
+            || args_text.contains(" --raw-field "));
+
+    tool_compact.contains("createpullrequest")
+        || tool_compact.ends_with("createpr")
+        || (shell_like && args_words.contains("gh pr create"))
+        || graphql_mutation
+        || (browser_like && args_words.contains("create pull request"))
+        || shell_rest_creation
+        || contains_rest_mutation(args, &rest_path, &["POST"], false)
+}
+
+/// A successful tool call that creates or updates a remote branch. This is
+/// the evidence needed to find a PR opened later through github.com.
+fn requests_remote_ref_mutation(
+    tool: &str,
+    args: &serde_json::Value,
+    owner: &str,
+    repo: &str,
+) -> bool {
+    let tool_words = activity_words(tool);
+    let tool_compact = compact_activity(tool);
+    let args_text = args.to_string();
+    let args_words = activity_words(&args_text);
+    let args_compact = compact_activity(&args_text);
+    let shell_like = ["shell", "bash", "command", "terminal", "exec", "gh"]
+        .iter()
+        .any(|word| tool_words.split_whitespace().any(|part| part == *word));
+    let graphql_mutation = args_words.split_whitespace().any(|word| word == "mutation")
+        && (args_compact.contains("createref") || args_compact.contains("updateref"));
+    let rest_path = format!("/repos/{owner}/{repo}/git/refs").to_ascii_lowercase();
+    let args_lower = args_text.to_ascii_lowercase();
+    let shell_rest_mutation = shell_like
+        && (args_lower.contains(&rest_path)
+            || args_lower.contains(rest_path.trim_start_matches('/')))
+        && [" post ", " patch ", " put "]
+            .iter()
+            .any(|method| format!(" {args_words} ").contains(method));
+
+    [
+        "pushbranch",
+        "createbranch",
+        "updateref",
+        "createref",
+        "pushref",
+    ]
+    .iter()
+    .any(|operation| tool_compact.contains(operation))
+        || (shell_like && args_words.contains("git push"))
+        || graphql_mutation
+        || shell_rest_mutation
+        || contains_rest_mutation(args, &rest_path, &["POST", "PATCH", "PUT"], true)
+}
+
 /// Evidence that associates PRs with a session independently of the client.
 #[derive(Default)]
 struct SessionPrEvidence {
@@ -6525,13 +6711,15 @@ fn pr_evidence_from_events(
     let mut evidence = SessionPrEvidence::default();
     for event in events {
         match event {
-            Event::ToolRequested { call_id, args, .. } => {
-                requested.insert(call_id, args);
+            Event::ToolRequested {
+                call_id,
+                tool,
+                args,
+                ..
+            } => {
+                requested.insert(call_id, (tool, args));
             }
             Event::ToolOutput { call_id, chunk } => {
-                evidence
-                    .numbers
-                    .extend(crate::github::pr_numbers_in_text(&chunk, host, owner, repo));
                 output.entry(call_id).or_default().push_str(&chunk);
             }
             Event::ToolCompleted {
@@ -6539,30 +6727,31 @@ fn pr_evidence_from_events(
                 status,
                 result,
             } => {
-                evidence
-                    .numbers
-                    .extend(pr_numbers_in_value(&result, host, owner, repo));
-                if matches!(status, ToolStatus::Ok) {
-                    evidence.commit_ids.extend(git_commit_ids_in_value(&result));
-                    if let Some(output) = output.remove(&call_id) {
-                        evidence.commit_ids.extend(git_commit_ids_in_text(&output));
-                    }
-                    if let Some(args) = requested.remove(&call_id) {
+                let request = requested.remove(&call_id);
+                let output = output.remove(&call_id).unwrap_or_default();
+                if matches!(status, ToolStatus::Ok)
+                    && let Some((tool, args)) = request
+                {
+                    let creates_pr = requests_pull_request_creation(&tool, &args, owner, repo);
+                    let mutates_ref = requests_remote_ref_mutation(&tool, &args, owner, repo);
+                    if creates_pr {
                         evidence
                             .numbers
                             .extend(pr_numbers_in_value(&args, host, owner, repo));
+                        evidence
+                            .numbers
+                            .extend(pr_numbers_in_value(&result, host, owner, repo));
+                        evidence.numbers.extend(crate::github::pr_numbers_in_text(
+                            &output, host, owner, repo,
+                        ));
+                    }
+                    if creates_pr || mutates_ref {
                         evidence.commit_ids.extend(git_commit_ids_in_value(&args));
+                        evidence.commit_ids.extend(git_commit_ids_in_value(&result));
+                        evidence.commit_ids.extend(git_commit_ids_in_text(&output));
                         evidence.successful_tool_args.push(args.to_string());
                     }
-                } else {
-                    requested.remove(&call_id);
-                    output.remove(&call_id);
                 }
-            }
-            Event::UserMessage { content, .. } | Event::AssistantMessage { content, .. } => {
-                evidence.numbers.extend(crate::github::pr_numbers_in_text(
-                    &content, host, owner, repo,
-                ));
             }
             _ => {}
         }
@@ -7199,31 +7388,143 @@ mod tests {
             Event::ToolRequested {
                 turn: 1,
                 call_id: "failed".into(),
-                tool: "git_push".into(),
-                args: serde_json::json!({"branch": "fix/failed"}),
+                tool: "shell".into(),
+                args: serde_json::json!({"cmd": "gh pr create --head fix/failed"}),
                 requires_approval: false,
+            },
+            Event::ToolOutput {
+                call_id: "failed".into(),
+                chunk: "https://github.com/o/r/pull/76".into(),
             },
             Event::ToolCompleted {
                 call_id: "failed".into(),
                 status: ToolStatus::Error,
                 result: serde_json::Value::Null,
             },
+            Event::ToolRequested {
+                turn: 1,
+                call_id: "graphql".into(),
+                tool: "github_graphql".into(),
+                args: serde_json::json!({
+                    "query": "mutation { createPullRequest(input: $input) { pullRequest { url } } }"
+                }),
+                requires_approval: false,
+            },
             Event::ToolOutput {
                 call_id: "graphql".into(),
                 chunk: structured_pr.to_string(),
             },
+            Event::ToolCompleted {
+                call_id: "graphql".into(),
+                status: ToolStatus::Ok,
+                result: serde_json::Value::Null,
+            },
+            // Successful list/view output may mention many PRs, but none of
+            // them were created by this session.
+            Event::ToolRequested {
+                turn: 1,
+                call_id: "list".into(),
+                tool: "shell".into(),
+                args: serde_json::json!({"cmd": "gh pr list --json url"}),
+                requires_approval: false,
+            },
+            Event::ToolOutput {
+                call_id: "list".into(),
+                chunk: "https://github.com/o/r/pull/74".into(),
+            },
+            Event::ToolCompleted {
+                call_id: "list".into(),
+                status: ToolStatus::Ok,
+                result: serde_json::Value::Null,
+            },
             Event::UserMessage {
                 turn: 2,
-                content: "I opened repos/o/r/pulls/74 manually".into(),
+                content: "Please compare with repos/o/r/pulls/73".into(),
                 attachments: vec![],
             },
         ];
         let evidence = pr_evidence_from_events(events, "github.com", "o", "r");
-        assert_eq!(evidence.numbers, HashSet::from([74, 75]));
-        assert_eq!(evidence.successful_tool_args, vec![branch_args.to_string()]);
-        assert!(evidence.successful_tool_args[0].contains("fix/manual-pr"));
-        assert!(!evidence.successful_tool_args[0].contains("fix/failed"));
+        assert_eq!(evidence.numbers, HashSet::from([75]));
+        assert_eq!(evidence.successful_tool_args.len(), 2);
+        assert!(
+            evidence
+                .successful_tool_args
+                .iter()
+                .any(|args| args.contains("fix/manual-pr"))
+        );
+        assert!(
+            evidence
+                .successful_tool_args
+                .iter()
+                .all(|args| !args.contains("fix/failed"))
+        );
         assert_eq!(evidence.commit_ids, HashSet::from([remote_commit.into()]));
+    }
+
+    #[test]
+    fn recognizes_creation_without_treating_pr_reads_as_associations() {
+        assert!(requests_pull_request_creation(
+            "functions.exec",
+            &serde_json::json!({"cmd": "gh pr create --head fix/other"}),
+            "o",
+            "r"
+        ));
+        assert!(requests_pull_request_creation(
+            "github_rest",
+            &serde_json::json!({
+                "request": {
+                    "method": "POST",
+                    "url": "https://api.github.com/repos/o/r/pulls"
+                }
+            }),
+            "o",
+            "r"
+        ));
+        assert!(requests_pull_request_creation(
+            "functions.exec",
+            &serde_json::json!({
+                "cmd": "gh api repos/o/r/pulls --method POST --field title=test"
+            }),
+            "o",
+            "r"
+        ));
+        assert!(!requests_pull_request_creation(
+            "functions.exec",
+            &serde_json::json!({"cmd": "gh pr list --json url"}),
+            "o",
+            "r"
+        ));
+        assert!(!requests_pull_request_creation(
+            "github_rest",
+            &serde_json::json!({
+                "request": {
+                    "method": "POST",
+                    "url": "https://api.github.com/repos/o/r/pulls/75/comments"
+                }
+            }),
+            "o",
+            "r"
+        ));
+        assert!(requests_remote_ref_mutation(
+            "functions.exec",
+            &serde_json::json!({"cmd": "git push origin HEAD:fix/manual-pr"}),
+            "o",
+            "r"
+        ));
+        assert!(requests_remote_ref_mutation(
+            "functions.exec",
+            &serde_json::json!({
+                "cmd": "gh api repos/o/r/git/refs --method POST --field ref=refs/heads/fix/api"
+            }),
+            "o",
+            "r"
+        ));
+        assert!(!requests_remote_ref_mutation(
+            "functions.exec",
+            &serde_json::json!({"cmd": "git fetch origin fix/unrelated"}),
+            "o",
+            "r"
+        ));
     }
 
     #[test]
