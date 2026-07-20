@@ -1364,6 +1364,29 @@ impl Controller {
             .unwrap_or_default();
     }
 
+    /// Clear session-derived UI when its workspace is closed locally or by
+    /// another client. Persisted session/thread data remains available if the
+    /// workspace is reopened later.
+    fn close_current_session_if_in_workspace(&mut self, workspace_id: &str) {
+        let closes_current = self
+            .current_session
+            .and_then(|index| self.sessions.get(index))
+            .is_some_and(|session| session.workspace_id == workspace_id);
+        if !closes_current {
+            return;
+        }
+        self.current_session = None;
+        self.threads.clear();
+        self.current_thread = None;
+        self.resume.session_id.clear();
+        crate::winstate::save_resume(&self.resume);
+        self.push_threads();
+        self.render_chat(true);
+        self.push_context();
+        self.push_queue();
+        self.push_todos();
+    }
+
     /// Build the session-specific part of one nav row.
     fn session_nav_row(&self, index: usize, archived: bool) -> NavRowData {
         let session = &self.sessions[index];
@@ -3745,7 +3768,13 @@ impl Controller {
             }
             // Workspace lifecycle is server-scoped so another app instance
             // can keep its sidebar in sync with opens and closes here.
-            Event::WorkspaceRegistered { .. } | Event::WorkspaceClosed { .. } => {
+            Event::WorkspaceRegistered { .. } => {
+                if self.reload_sessions().await.is_ok() {
+                    self.sync_home_workspace();
+                }
+            }
+            Event::WorkspaceClosed { workspace_id } => {
+                self.close_current_session_if_in_workspace(workspace_id);
                 if self.reload_sessions().await.is_ok() {
                     self.sync_home_workspace();
                 }
@@ -3984,26 +4013,11 @@ impl Controller {
                     && let Some(ws) = self.workspaces.get(*wi)
                 {
                     let id = ws.id.clone();
-                    let closes_current = self
-                        .current_session
-                        .and_then(|i| self.sessions.get(i))
-                        .is_some_and(|s| s.workspace_id == id);
                     self.client.close_workspace(&id).await?;
                     self.collapsed_workspaces.remove(&id);
                     self.show_archived.remove(&id);
                     self.archived_expanded.remove(&id);
-                    if closes_current {
-                        self.current_session = None;
-                        self.threads.clear();
-                        self.current_thread = None;
-                        self.resume.session_id.clear();
-                        crate::winstate::save_resume(&self.resume);
-                        self.push_threads();
-                        self.render_chat(true);
-                        self.push_context();
-                        self.push_queue();
-                        self.push_todos();
-                    }
+                    self.close_current_session_if_in_workspace(&id);
                     self.reload_sessions().await?;
                     self.sync_home_workspace();
                 }
