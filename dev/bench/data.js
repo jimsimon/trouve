@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1784529793769,
+  "lastUpdate": 1784530494428,
   "repoUrl": "https://github.com/jimsimon/trouve",
   "entries": {
     "e2e-benchmarks": [
@@ -3455,6 +3455,54 @@ window.BENCHMARK_DATA = {
             "name": "non-git warm query",
             "value": 64.81926724,
             "range": "± 1.6",
+            "unit": "ms"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "29139614+renovate[bot]@users.noreply.github.com",
+            "name": "renovate[bot]",
+            "username": "renovate[bot]"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "c612e43e0524956f36710bdd5f7bc92862b81351",
+          "message": "Update Rust crate serde_json to v1.0.151 (#112)\n\nCo-authored-by: renovate[bot] <29139614+renovate[bot]@users.noreply.github.com>",
+          "timestamp": "2026-07-20T02:53:17-04:00",
+          "tree_id": "78cc4ad9e30a121733d6b3f3346d10887f0cd4be",
+          "url": "https://github.com/jimsimon/trouve/commit/c612e43e0524956f36710bdd5f7bc92862b81351"
+        },
+        "date": 1784530493256,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "cold index + query",
+            "value": 138.7920588,
+            "range": "± 6",
+            "unit": "ms"
+          },
+          {
+            "name": "warm query",
+            "value": 79.47949777999999,
+            "range": "± 2.3",
+            "unit": "ms"
+          },
+          {
+            "name": "incremental (1 file modified)",
+            "value": 89.07257754,
+            "range": "± 2.4",
+            "unit": "ms"
+          },
+          {
+            "name": "non-git warm query",
+            "value": 75.3626708,
+            "range": "± 1",
             "unit": "ms"
           }
         ]
