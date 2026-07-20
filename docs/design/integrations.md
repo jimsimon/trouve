@@ -62,9 +62,12 @@ and tombstoned entries stay listed, dimmed, with the disabling layer named.
 ### First-use approval
 
 MCP tools are always treated as mutating, and the permission layer requires
-approval for the first use of each server per session **even in yolo mode**
-(`allow_key` = `mcp:<server>`; a plain Approve unlocks the server for the
-rest of the session). Rationale: MCP servers are external code and a
+approval for the first use of each server per session in non-read-only ask and
+allow-list modes (`allow_key` = `mcp:<server>`; a plain Approve unlocks the
+server for the rest of the session). Read-only modes never reach approval:
+the always-mutating classification hits the read-only denial first, so MCP
+calls are denied outright. Yolo skips all approval prompts, including MCP.
+Rationale for the ask/allow-list gate: MCP servers are external code and a
 prompt-injection channel — see the risk register in the plan.
 
 ## Skills
