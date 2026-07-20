@@ -5905,6 +5905,9 @@ impl Controller {
                         self.refresh_usage_text().await;
                     }
                 }
+                if completed {
+                    self.refresh_subscriptions_after_turn();
+                }
                 let unread_changed = mark_unread
                     && finished
                     && self.mark_thread_unread_if_hidden(&thread_id, failed);
