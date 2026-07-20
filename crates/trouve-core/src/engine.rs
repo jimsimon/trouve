@@ -4659,8 +4659,18 @@ impl Engine {
     ) -> Result<String, EngineError> {
         let (session, thread, mode, ctx) = self.bridged_context(thread_id)?;
         let turn = self.store.last_turn(thread_id)?;
+        // The vendor's stream announces this call before executing it, and
+        // that announcement already created a tool card. Reuse its call id
+        // so execution attaches to the vendor's card instead of recording a
+        // second identical one; the vendor's own tool_result completes the
+        // same card in place afterwards. ask_question keeps a fresh id — it
+        // draws no card, and its id doubles as the question request id.
+        let call_id = (name != "ask_question")
+            .then(|| self.open_bridged_card(thread_id, turn, name, arguments))
+            .flatten()
+            .unwrap_or_else(|| new_id("call"));
         let call = trouve_providers::ToolCallRequest {
-            id: new_id("call"),
+            id: call_id,
             name: name.to_string(),
             arguments: arguments.clone(),
         };
@@ -4802,6 +4812,22 @@ impl Engine {
             .find(|(_, a)| strip(a) == *args)
             .or(open.last())
             .map(|(id, _)| id.clone())
+    }
+
+    /// See [`open_bridged_card_in`]: the vendor tool card a bridged
+    /// `tools/call` should attach to instead of drawing its own.
+    fn open_bridged_card(
+        &self,
+        thread_id: &str,
+        turn: u64,
+        name: &str,
+        arguments: &serde_json::Value,
+    ) -> Option<String> {
+        let events = self
+            .store
+            .events_after(&Scope::Thread(thread_id.to_string()), 0)
+            .ok()?;
+        open_bridged_card_in(events.iter().map(|env| &env.event), turn, name, arguments)
     }
 
     /// Whether a `tool.requested` card already exists for this call in the
@@ -5659,16 +5685,20 @@ impl Engine {
             call.name.as_str(),
             "spawn_thread" | "spawn_session" | "spawn_output" | "search_transcript"
         ) {
-            self.store.append_event(
-                scope.clone(),
-                Event::ToolRequested {
-                    turn,
-                    call_id: call_id.clone(),
-                    tool: call.name.clone(),
-                    args: call.arguments.clone(),
-                    requires_approval: false,
-                },
-            )?;
+            // A bridged call attaching to the vendor's announced card must
+            // not draw a second one.
+            if !self.tool_card_exists(&thread.id, turn, &call_id) {
+                self.store.append_event(
+                    scope.clone(),
+                    Event::ToolRequested {
+                        turn,
+                        call_id: call_id.clone(),
+                        tool: call.name.clone(),
+                        args: call.arguments.clone(),
+                        requires_approval: false,
+                    },
+                )?;
+            }
             let outcome = if call.name == "search_transcript" {
                 self.handle_search_transcript(session, thread, &call.arguments)
             } else {
@@ -5717,16 +5747,21 @@ impl Engine {
         // UI diff can number its gutter. Stored/executed args stay pristine.
         let mut display_args = call.arguments.clone();
         annotate_edit_lines(Path::new(&session.worktree_path), &mut display_args);
-        self.store.append_event(
-            scope.clone(),
-            Event::ToolRequested {
-                turn,
-                call_id: call_id.clone(),
-                tool: call.name.clone(),
-                args: display_args,
-                requires_approval: decision == Gate::NeedsApproval,
-            },
-        )?;
+        // A bridged call attaching to the vendor's announced card must not
+        // draw a second one; ApprovalRequested below still flips the
+        // existing card to awaiting-approval when the gate asks.
+        if !self.tool_card_exists(&thread.id, turn, &call_id) {
+            self.store.append_event(
+                scope.clone(),
+                Event::ToolRequested {
+                    turn,
+                    call_id: call_id.clone(),
+                    tool: call.name.clone(),
+                    args: display_args,
+                    requires_approval: decision == Gate::NeedsApproval,
+                },
+            )?;
+        }
 
         let decision = match decision {
             Gate::Deny => {
@@ -6798,6 +6833,50 @@ fn pr_evidence_from_events(
     evidence
 }
 
+/// The newest still-open tool card in this turn announcing the bridged call
+/// `name(arguments)`. Vendors announce trouve's bridged tools under their
+/// own MCP naming — Claude as `mcp__trouve__<name>` with the raw arguments,
+/// Codex as an `mcpToolCall` item carrying the real call in its
+/// `tool`/`arguments` fields — so match on the base name and exact
+/// arguments. `None` when the announcement hasn't been processed yet (the
+/// bridge request can race the vendor's stream).
+fn open_bridged_card_in<'a>(
+    events: impl Iterator<Item = &'a Event>,
+    turn: u64,
+    name: &str,
+    arguments: &serde_json::Value,
+) -> Option<String> {
+    let mut open: Vec<String> = Vec::new();
+    for event in events {
+        match event {
+            Event::ToolRequested {
+                turn: t,
+                call_id,
+                tool,
+                args,
+                ..
+            } if *t == turn => {
+                let (tool, args) = if tool == "mcpToolCall" {
+                    (
+                        args.get("tool").and_then(|v| v.as_str()).unwrap_or(tool),
+                        args.get("arguments").unwrap_or(args),
+                    )
+                } else {
+                    (tool.as_str(), args)
+                };
+                if tool.rsplit("__").next() == Some(name) && args == arguments {
+                    open.push(call_id.clone());
+                }
+            }
+            Event::ToolCompleted { call_id, .. } => {
+                open.retain(|id| id != call_id);
+            }
+            _ => {}
+        }
+    }
+    open.pop()
+}
+
 /// Make a stored transcript safe to send to a provider. A crash or restart
 /// between persisting an assistant message with `tool_calls` and persisting
 /// its results (tool execution can take minutes; approval waits are
@@ -7386,6 +7465,62 @@ fn resolved_api_key(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bridged_call_attaches_to_vendor_card() {
+        let args = serde_json::json!({"query": "status indicator"});
+        // Claude announces trouve's bridged search under its MCP-mangled
+        // name; the bridge then executes plain `search` with the same args.
+        let claude = vec![Event::ToolRequested {
+            turn: 3,
+            call_id: "toolu_1".into(),
+            tool: "mcp__trouve__search".into(),
+            args: args.clone(),
+            requires_approval: false,
+        }];
+        assert_eq!(
+            open_bridged_card_in(claude.iter(), 3, "search", &args),
+            Some("toolu_1".into())
+        );
+        // Wrong turn or different args: no attach, fall back to a fresh id.
+        assert_eq!(open_bridged_card_in(claude.iter(), 2, "search", &args), None);
+        assert_eq!(
+            open_bridged_card_in(
+                claude.iter(),
+                3,
+                "search",
+                &serde_json::json!({"query": "other"})
+            ),
+            None
+        );
+        // An already-completed card is closed; nothing to attach to.
+        let mut closed = claude.clone();
+        closed.push(Event::ToolCompleted {
+            call_id: "toolu_1".into(),
+            status: ToolStatus::Ok,
+            result: serde_json::Value::Null,
+        });
+        assert_eq!(open_bridged_card_in(closed.iter(), 3, "search", &args), None);
+        // Codex wraps MCP calls in an `mcpToolCall` item carrying the real
+        // tool and arguments.
+        let codex = vec![Event::ToolRequested {
+            turn: 1,
+            call_id: "item_7".into(),
+            tool: "mcpToolCall".into(),
+            args: serde_json::json!({
+                "id": "item_7",
+                "type": "mcpToolCall",
+                "server": "trouve",
+                "tool": "search",
+                "arguments": args,
+            }),
+            requires_approval: false,
+        }];
+        assert_eq!(
+            open_bridged_card_in(codex.iter(), 1, "search", &args),
+            Some("item_7".into())
+        );
+    }
 
     #[test]
     fn collects_provider_neutral_pr_evidence() {
