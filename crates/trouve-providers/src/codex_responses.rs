@@ -20,6 +20,7 @@ use std::path::PathBuf;
 use serde_json::{Map, Value, json};
 use tokio::sync::mpsc;
 
+use crate::codex::completed_reasoning_text;
 use crate::{EventStream, Message, Provider, ProviderError, ProviderEvent, ToolSpec};
 use trouve_protocol::Usage;
 
@@ -208,27 +209,6 @@ fn reasoning_options(options: &Map<String, Value>) -> Value {
         reasoning["effort"] = json!(effort);
     }
     reasoning
-}
-
-/// Extract readable text from both Responses reasoning parts (`{type,text}`)
-/// and older flattened string arrays.
-fn completed_reasoning_text(item: &Value) -> Option<String> {
-    for field in ["summary", "content"] {
-        let parts = item[field]
-            .as_array()
-            .into_iter()
-            .flatten()
-            .filter_map(|part| {
-                part.as_str()
-                    .or_else(|| part.get("text").and_then(Value::as_str))
-            })
-            .filter(|part| !part.is_empty())
-            .collect::<Vec<_>>();
-        if !parts.is_empty() {
-            return Some(parts.join("\n\n"));
-        }
-    }
-    None
 }
 
 /// Map trouve messages onto Responses API input items. The base system

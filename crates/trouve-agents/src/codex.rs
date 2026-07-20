@@ -27,6 +27,7 @@ use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin};
 use tokio::sync::{Mutex, mpsc, oneshot};
 use trouve_protocol::{ModelInfo, Usage};
+use trouve_providers::codex::completed_reasoning_text;
 
 use crate::{
     AgentBackend, BackendError, BackendEvent, BackendEventStream, BackendLogin, BackendPermission,
@@ -627,30 +628,6 @@ fn turn_stream(
         }
         server.unsubscribe(&codex_thread_id).await;
     })
-}
-
-/// Extract the displayable text from a completed Codex reasoning item.
-/// Summary text is preferred; raw content is used by open-source models.
-fn completed_reasoning_text(item: &Value) -> Option<String> {
-    for field in ["summary", "content"] {
-        let parts = item[field]
-            .as_array()
-            .into_iter()
-            .flatten()
-            // App-server ThreadItems use strings. ResponseItems use typed
-            // `{ type, text }` parts; accept both so newer model-specific
-            // item shapes remain displayable.
-            .filter_map(|part| {
-                part.as_str()
-                    .or_else(|| part.get("text").and_then(Value::as_str))
-            })
-            .filter(|part| !part.is_empty())
-            .collect::<Vec<_>>();
-        if !parts.is_empty() {
-            return Some(parts.join("\n\n"));
-        }
-    }
-    None
 }
 
 fn json_rpc_id(id: &Value) -> String {
