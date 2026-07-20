@@ -916,13 +916,14 @@ async fn cancel_turn(
 
 #[utoipa::path(patch, path = "/v1/queue/{id}", params(("id" = String, Path,)),
     request_body = UpdateQueuedPromptRequest,
-    responses((status = 204), (status = 404, body = ErrorBody)))]
+    responses((status = 204), (status = 400, body = ErrorBody),
+              (status = 404, body = ErrorBody)))]
 async fn update_queued_prompt(
     State(engine): State<Arc<Engine>>,
     Path(id): Path<String>,
     Json(req): Json<UpdateQueuedPromptRequest>,
 ) -> Result<StatusCode, ApiError> {
-    engine.update_queued_prompt(&id, &req.content)?;
+    engine.update_queued_prompt(&id, req)?;
     Ok(StatusCode::NO_CONTENT)
 }
 

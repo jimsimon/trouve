@@ -916,6 +916,29 @@ impl Store {
         Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
     }
 
+    /// One visible, unclaimed queued prompt by id. A prompt claimed by the
+    /// dispatcher is no longer editable and intentionally reads as absent.
+    pub fn queued_prompt(&self, id: &str) -> Result<Option<trouve_protocol::QueuedPrompt>> {
+        let conn = self.conn.lock().unwrap();
+        Ok(conn
+            .query_row(
+                "SELECT thread_id, position, content, attachments, created_at
+                 FROM queued_prompts WHERE id = ?1 AND claimed = 0",
+                params![id],
+                |r| {
+                    Ok(trouve_protocol::QueuedPrompt {
+                        id: id.to_string(),
+                        thread_id: r.get(0)?,
+                        position: r.get::<_, i64>(1)? as u64,
+                        content: r.get(2)?,
+                        attachments: parse_attachments(&r.get::<_, String>(3)?),
+                        created_at: r.get(4)?,
+                    })
+                },
+            )
+            .optional()?)
+    }
+
     /// Thread the queued prompt belongs to, if it still exists.
     pub fn queued_prompt_thread(&self, id: &str) -> Result<Option<String>> {
         let conn = self.conn.lock().unwrap();
@@ -929,11 +952,18 @@ impl Store {
     }
 
     /// Returns false when the prompt no longer exists (already dispatched).
-    pub fn update_queued_prompt(&self, id: &str, content: &str) -> Result<bool> {
+    pub fn update_queued_prompt(
+        &self,
+        id: &str,
+        content: &str,
+        attachments: &[trouve_protocol::Attachment],
+    ) -> Result<bool> {
+        let attachments_json = serde_json::to_string(attachments)?;
         let conn = self.conn.lock().unwrap();
         let n = conn.execute(
-            "UPDATE queued_prompts SET content = ?2 WHERE id = ?1 AND claimed = 0",
-            params![id, content],
+            "UPDATE queued_prompts SET content = ?2, attachments = ?3
+             WHERE id = ?1 AND claimed = 0",
+            params![id, content, attachments_json],
         )?;
         Ok(n > 0)
     }
@@ -1999,7 +2029,7 @@ mod tests {
         assert_eq!(store.queued_prompt_thread(&a.id).unwrap().unwrap(), "th_1");
 
         // Edit and delete.
-        assert!(store.update_queued_prompt(&b.id, "second v2").unwrap());
+        assert!(store.update_queued_prompt(&b.id, "second v2", &[]).unwrap());
         assert!(store.delete_queued_prompt(&a.id).unwrap());
         assert!(!store.delete_queued_prompt(&a.id).unwrap());
 
@@ -2148,13 +2178,31 @@ mod tests {
         assert_eq!(path, "/data/attachments/at_1.png");
         assert!(store.attachment("at_missing").unwrap().is_none());
 
-        store
+        let queued = store
             .enqueue_prompt("th_1", "with file", std::slice::from_ref(&att))
             .unwrap();
         let q = store.queued_prompts("th_1").unwrap();
         assert_eq!(q[0].attachments, vec![att.clone()]);
+        let replacement = trouve_protocol::Attachment {
+            id: "at_2".into(),
+            name: "notes.txt".into(),
+            mime: "text/plain".into(),
+            size_bytes: 7,
+        };
+        assert!(
+            store
+                .update_queued_prompt(
+                    &queued.id,
+                    "with different file",
+                    std::slice::from_ref(&replacement),
+                )
+                .unwrap()
+        );
+        let q = store.queued_prompts("th_1").unwrap();
+        assert_eq!(q[0].content, "with different file");
+        assert_eq!(q[0].attachments, vec![replacement.clone()]);
         let claimed = store.claim_queued_prompt("th_1").unwrap().unwrap();
-        assert_eq!(claimed.attachments, vec![att]);
+        assert_eq!(claimed.attachments, vec![replacement]);
     }
 
     #[test]

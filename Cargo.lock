@@ -7041,6 +7041,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "slint-media-view"
+version = "0.1.0"
+dependencies = [
+ "image",
+ "slint",
+ "slint-build",
+ "thiserror 2.0.19",
+]
+
+[[package]]
 name = "slint-terminal"
 version = "0.1.0"
 dependencies = [
@@ -8574,8 +8584,10 @@ dependencies = [
  "slint-code-view",
  "slint-diff-view",
  "slint-markdown",
+ "slint-media-view",
  "slint-terminal",
  "syntect",
+ "tempfile",
  "tokio",
  "tracing",
  "tracing-subscriber",

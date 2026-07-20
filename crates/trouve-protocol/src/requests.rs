@@ -296,6 +296,15 @@ pub struct QueuedPrompt {
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct UpdateQueuedPromptRequest {
     pub content: String,
+    /// Existing stored attachments to keep, in their desired order. `None`
+    /// preserves the complete existing list for compatibility with clients
+    /// that only edit text; an explicit empty list removes every existing
+    /// attachment from the queued prompt.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retained_attachment_ids: Option<Vec<String>>,
+    /// New files to append after the retained stored attachments.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub attachments: Vec<AttachmentUpload>,
 }
 
 /// Full desired order for a thread's queue (every queued prompt id, first
@@ -1047,5 +1056,19 @@ mod tests {
             serde_json::from_value(serde_json::json!({ "workspace_id": "ws_test" })).unwrap();
 
         assert!(request.fetch_latest);
+    }
+
+    #[test]
+    fn text_only_queue_edits_leave_attachment_selection_unspecified() {
+        let request: UpdateQueuedPromptRequest =
+            serde_json::from_value(serde_json::json!({ "content": "reworded" })).unwrap();
+
+        assert_eq!(request.content, "reworded");
+        assert!(request.retained_attachment_ids.is_none());
+        assert!(request.attachments.is_empty());
+        assert_eq!(
+            serde_json::to_value(&request).unwrap(),
+            serde_json::json!({ "content": "reworded" })
+        );
     }
 }

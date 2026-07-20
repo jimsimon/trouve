@@ -229,6 +229,32 @@ impl ProtocolClient {
         .await
     }
 
+    /// Fetch the raw bytes of a stored prompt attachment. The request uses
+    /// the same authenticated client as every other protocol operation.
+    pub async fn attachment_bytes(&self, attachment_id: &str) -> Result<Vec<u8>> {
+        let path = format!("/attachments/{attachment_id}");
+        let resp = self
+            .http
+            .get(format!("{}{path}", self.base))
+            .send()
+            .await
+            .with_context(|| format!("GET {path}"))?;
+        let status = resp.status();
+        if !status.is_success() {
+            let message = resp
+                .json::<ErrorBody>()
+                .await
+                .map(|e| e.message)
+                .unwrap_or_else(|_| status.to_string());
+            bail!("{path}: {message}");
+        }
+        Ok(resp
+            .bytes()
+            .await
+            .with_context(|| format!("reading {path}"))?
+            .to_vec())
+    }
+
     // --- queued prompts ---------------------------------------------------
 
     pub async fn list_queue(&self, thread_id: &str) -> Result<Vec<trouve_protocol::QueuedPrompt>> {
@@ -236,13 +262,27 @@ impl ProtocolClient {
     }
 
     pub async fn update_queued_prompt(&self, prompt_id: &str, content: &str) -> Result<()> {
+        self.update_queued_prompt_with(
+            prompt_id,
+            trouve_protocol::UpdateQueuedPromptRequest {
+                content: content.into(),
+                retained_attachment_ids: None,
+                attachments: Vec::new(),
+            },
+        )
+        .await
+    }
+
+    pub async fn update_queued_prompt_with(
+        &self,
+        prompt_id: &str,
+        request: trouve_protocol::UpdateQueuedPromptRequest,
+    ) -> Result<()> {
         let path = format!("/queue/{prompt_id}");
         let resp = self
             .http
             .patch(format!("{}{path}", self.base))
-            .json(&trouve_protocol::UpdateQueuedPromptRequest {
-                content: content.into(),
-            })
+            .json(&request)
             .send()
             .await
             .with_context(|| format!("PATCH {path}"))?;

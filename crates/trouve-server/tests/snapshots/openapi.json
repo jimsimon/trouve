@@ -7,7 +7,7 @@
       "name": "MIT",
       "identifier": "MIT"
     },
-    "version": "1.0"
+    "version": "1.1"
   },
   "paths": {
     "/v1/approvals": {
@@ -1519,6 +1519,16 @@
         "responses": {
           "204": {
             "description": ""
+          },
+          "400": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
           },
           "404": {
             "description": "",
@@ -5906,8 +5916,25 @@
           "content"
         ],
         "properties": {
+          "attachments": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/AttachmentUpload"
+            },
+            "description": "New files to append after the retained stored attachments."
+          },
           "content": {
             "type": "string"
+          },
+          "retained_attachment_ids": {
+            "type": [
+              "array",
+              "null"
+            ],
+            "items": {
+              "type": "string"
+            },
+            "description": "Existing stored attachments to keep, in their desired order. `None`\npreserves the complete existing list for compatibility with clients\nthat only edit text; an explicit empty list removes every existing\nattachment from the queued prompt."
           }
         }
       },

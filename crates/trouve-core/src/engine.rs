@@ -3881,12 +3881,46 @@ impl Engine {
         Ok(self.store.queued_prompts(thread_id)?)
     }
 
-    pub fn update_queued_prompt(&self, prompt_id: &str, content: &str) -> Result<(), EngineError> {
-        let thread_id = self
+    pub fn update_queued_prompt(
+        &self,
+        prompt_id: &str,
+        req: trouve_protocol::UpdateQueuedPromptRequest,
+    ) -> Result<(), EngineError> {
+        let prompt = self
             .store
-            .queued_prompt_thread(prompt_id)?
+            .queued_prompt(prompt_id)?
             .ok_or_else(|| EngineError::NotFound(format!("queued prompt {prompt_id}")))?;
-        if !self.store.update_queued_prompt(prompt_id, content)? {
+        let thread_id = prompt.thread_id.clone();
+        let mut attachments = if let Some(ids) = req.retained_attachment_ids {
+            let by_id: HashMap<_, _> = prompt
+                .attachments
+                .iter()
+                .map(|attachment| (attachment.id.as_str(), attachment))
+                .collect();
+            let mut seen = HashSet::new();
+            let mut retained = Vec::with_capacity(ids.len());
+            for id in ids {
+                if !seen.insert(id.clone()) {
+                    return Err(EngineError::BadRequest(format!(
+                        "attachment {id} is retained more than once"
+                    )));
+                }
+                let attachment = by_id.get(id.as_str()).ok_or_else(|| {
+                    EngineError::BadRequest(format!(
+                        "attachment {id} does not belong to queued prompt {prompt_id}"
+                    ))
+                })?;
+                retained.push((*attachment).clone());
+            }
+            retained
+        } else {
+            prompt.attachments
+        };
+        attachments.extend(self.save_attachments(&thread_id, req.attachments)?);
+        if !self
+            .store
+            .update_queued_prompt(prompt_id, &req.content, &attachments)?
+        {
             return Err(EngineError::NotFound(format!("queued prompt {prompt_id}")));
         }
         self.emit_queue(&thread_id)
