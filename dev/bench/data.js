@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1784514598508,
+  "lastUpdate": 1784514681540,
   "repoUrl": "https://github.com/jimsimon/trouve",
   "entries": {
     "e2e-benchmarks": [
@@ -6001,6 +6001,54 @@ window.BENCHMARK_DATA = {
             "name": "dense_query_20k_rows",
             "value": 1199656.2482142858,
             "range": "± 5967",
+            "unit": "ns"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "jim.j.simon@gmail.com",
+            "name": "Jim Simon",
+            "username": "jimsimon"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "ee24df742f6a1b8a73d4262b982b511045a34037",
+          "message": "Generate session titles offline (#96)",
+          "timestamp": "2026-07-19T22:27:46-04:00",
+          "tree_id": "9b8c303a19cd17e6543be3e402ffa488e99dad88",
+          "url": "https://github.com/jimsimon/trouve/commit/ee24df742f6a1b8a73d4262b982b511045a34037"
+        },
+        "date": 1784514680969,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "bm25_build_5k_docs",
+            "value": 4824458.277777778,
+            "range": "± 9413",
+            "unit": "ns"
+          },
+          {
+            "name": "bm25_query_5k_docs",
+            "value": 36590.811851958526,
+            "range": "± 12",
+            "unit": "ns"
+          },
+          {
+            "name": "chunk_python_200_functions",
+            "value": 2987842.588235294,
+            "range": "± 3657",
+            "unit": "ns"
+          },
+          {
+            "name": "dense_query_20k_rows",
+            "value": 1375303.612121212,
+            "range": "± 8906",
             "unit": "ns"
           }
         ]
