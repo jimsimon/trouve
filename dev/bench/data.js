@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1784573729326,
+  "lastUpdate": 1784573794992,
   "repoUrl": "https://github.com/jimsimon/trouve",
   "entries": {
     "e2e-benchmarks": [
@@ -7825,6 +7825,54 @@ window.BENCHMARK_DATA = {
             "name": "dense_query_20k_rows",
             "value": 1457397.526340769,
             "range": "± 10460",
+            "unit": "ns"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "29139614+renovate[bot]@users.noreply.github.com",
+            "name": "renovate[bot]",
+            "username": "renovate[bot]"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "06ca57180340a1318324ea9b1467d6e5ccafffde",
+          "message": "Update all non-major dependencies (#126)\n\nCo-authored-by: renovate[bot] <29139614+renovate[bot]@users.noreply.github.com>",
+          "timestamp": "2026-07-20T14:52:54-04:00",
+          "tree_id": "7595034bb3ceed3796cb986ce1a42281559bd1af",
+          "url": "https://github.com/jimsimon/trouve/commit/06ca57180340a1318324ea9b1467d6e5ccafffde"
+        },
+        "date": 1784573794331,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "bm25_build_5k_docs",
+            "value": 5080711.6,
+            "range": "± 6502",
+            "unit": "ns"
+          },
+          {
+            "name": "bm25_query_5k_docs",
+            "value": 35710.29727678571,
+            "range": "± 8",
+            "unit": "ns"
+          },
+          {
+            "name": "chunk_python_200_functions",
+            "value": 2811294.805555556,
+            "range": "± 1297",
+            "unit": "ns"
+          },
+          {
+            "name": "dense_query_20k_rows",
+            "value": 1539346.806862745,
+            "range": "± 10433",
             "unit": "ns"
           }
         ]
