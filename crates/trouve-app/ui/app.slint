@@ -1041,8 +1041,8 @@ component NewChatForm inherits VerticalLayout {
     in-out property <bool> use-latest-remote: true;
     in property <[string]> modes;
     in-out property <int> mode-index;
-    // Per-mode default model as an index into models (-1 = none); picking
-    // a mode jumps the model picker to its default.
+    // Per-mode effective default model as an index into models (the mode
+    // override, then the global default); picking a mode applies it.
     in property <[int]> mode-model-indices;
     in property <[string]> models;
     in property <[ModelHealthItem]> model-health;
@@ -1755,8 +1755,8 @@ export component AppWindow inherits Window {
     in property <string> connectivity-notice: "";
 
     in property <[string]> modes;
-    // Aligned with modes: each mode's default model as an index into
-    // models (-1 = none/global default).
+    // Aligned with modes: each mode's effective default model as an index
+    // into models (-1 when no model is available).
     in property <[int]> mode-model-indices;
     in property <[string]> models;
     // Aligned with models; empty entries mean the provider does not expose
@@ -1808,8 +1808,11 @@ export component AppWindow inherits Window {
     in-out property <int> nc-thinking-index: -1;
     in-out property <int> nc-permission-index: 0;
     in property <[string]> nc-permission-options: ["Mode default", "Ask", "Allow list", "Yolo"];
-    callback nc-model-changed(int);
-    changed nc-model-index => { root.nc-model-changed(root.nc-model-index); }
+    callback nc-model-changed(/* mode */ int, /* model */ int);
+    // Thinking defaults can change with either picker. A mode change must
+    // notify even when its effective model is the one already selected.
+    changed nc-mode-index => { root.nc-model-changed(root.nc-mode-index, root.nc-model-index); }
+    changed nc-model-index => { root.nc-model-changed(root.nc-mode-index, root.nc-model-index); }
     callback nc-workspace-changed(int);
     callback register-workspace-path(string);
     callback start-new-chat(/* ws */ int, /* branch */ int, /* fetch */ bool, /* mode */ int,

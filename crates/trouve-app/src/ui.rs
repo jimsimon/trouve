@@ -1210,8 +1210,8 @@ pub fn set_settings_modes(ui: &Ui, modes: Vec<ModeView>, mut model_names: Vec<St
     });
 }
 
-/// Aligned with the composer/new-chat mode picker: each mode's default
-/// model as an index into the models list (-1 = none).
+/// Aligned with the new-chat mode picker: each mode's effective default
+/// model as an index into the models list (-1 = no available model).
 pub fn set_mode_model_indices(ui: &Ui, indices: Vec<i32>) {
     let _ = ui.upgrade_in_event_loop(move |ui| {
         ui.set_mode_model_indices(ModelRc::new(VecModel::from(indices)));

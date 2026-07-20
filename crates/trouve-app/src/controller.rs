@@ -136,7 +136,10 @@ pub enum UiCommand {
     NewThread,
     CancelNewChat,
     NewChatWorkspaceChanged(usize),
-    NewChatModelChanged(usize),
+    NewChatModelChanged {
+        mode_idx: usize,
+        model_idx: usize,
+    },
     RegisterWorkspacePath(String),
     StartNewChat {
         workspace_idx: usize,
@@ -737,6 +740,9 @@ struct Controller {
     /// custom / workspace) — drives the settings Modes & Models section.
     mode_origins: Vec<String>,
     models: Vec<ModelInfo>,
+    /// Global model default, kept with the catalogs so new-session and
+    /// new-thread forms start on the model the server would inherit.
+    default_model: String,
     /// Global thinking default, kept with the catalogs so switching a live
     /// thread's mode can apply the same inheritance as thread creation.
     default_thinking_level: Option<String>,
@@ -906,6 +912,7 @@ pub async fn run(
         modes: Vec::new(),
         mode_origins: Vec::new(),
         models: Vec::new(),
+        default_model: String::new(),
         default_thinking_level: None,
         subscription_health: Vec::new(),
         subscription_refresh: SubscriptionRefreshState::default(),
@@ -1196,6 +1203,7 @@ impl Controller {
         self.mode_origins = infos.into_iter().map(|i| i.origin).collect();
         self.models = self.client.list_models().await.unwrap_or_default();
         if let Ok(providers) = self.client.list_providers().await {
+            self.default_model = providers.default_model;
             self.default_thinking_level = providers.default_thinking_level;
         }
         let mode_names = self
@@ -1209,13 +1217,19 @@ impl Controller {
             self.models.iter().map(|m| m.id.clone()).collect(),
         );
         self.push_model_health();
-        // Each mode's default model, so mode pickers can jump the model
-        // picker to it.
+        // Each mode's effective default model, so a new-chat mode change
+        // applies the same mode > global precedence as thread creation.
         ui::set_mode_model_indices(
             &self.ui,
             self.modes
                 .iter()
-                .map(|m| self.model_index_of(m.default_model.as_deref()))
+                .map(|m| {
+                    preferred_model_index(
+                        &self.models,
+                        m.default_model.as_deref(),
+                        Some(self.default_model.as_str()),
+                    )
+                })
                 .collect(),
         );
         self.push_picker_indices();
@@ -1402,6 +1416,24 @@ impl Controller {
             .and_then(|id| self.models.iter().position(|m| m.id == id))
             .map(|i| i as i32)
             .unwrap_or(-1)
+    }
+
+    /// Initial picker positions for a fresh thread. This mirrors the
+    /// server's mode-default > global-default model precedence while still
+    /// falling back to the first runnable catalog entry if a configured
+    /// default is currently unavailable (for example while offline).
+    fn new_chat_default_indices(&self) -> (i32, i32) {
+        let mode_index = default_mode_index(&self.modes);
+        let mode_default = usize::try_from(mode_index)
+            .ok()
+            .and_then(|index| self.modes.get(index))
+            .and_then(|mode| mode.default_model.as_deref());
+        let model_index = preferred_model_index(
+            &self.models,
+            mode_default,
+            Some(self.default_model.as_str()),
+        );
+        (mode_index, model_index)
     }
 
     async fn reload_sessions(&mut self) -> Result<()> {
@@ -2164,7 +2196,7 @@ impl Controller {
         );
     }
 
-    fn push_new_chat_knobs(&mut self, model_index: usize) {
+    fn push_new_chat_knobs(&mut self, mode_index: usize, model_index: usize) {
         let thinking = self
             .models
             .get(model_index)
@@ -2173,11 +2205,14 @@ impl Controller {
             Some((key, values, default)) => (Some(key), values, default),
             None => (None, Vec::new(), None),
         };
-        let selected = default
-            .as_ref()
-            .and_then(|value| values.iter().position(|candidate| candidate == value))
-            .map(|index| index as i32)
-            .unwrap_or_else(|| if values.is_empty() { -1 } else { 0 });
+        let selected = preferred_thinking_index(
+            &values,
+            self.modes
+                .get(mode_index)
+                .and_then(|mode| mode.default_thinking_level.as_deref()),
+            self.default_thinking_level.as_deref(),
+            default.as_deref(),
+        );
         self.new_chat_thinking_key = key;
         self.new_chat_thinking_values = values.clone();
         ui::set_new_chat_knobs(
@@ -3171,6 +3206,7 @@ impl Controller {
     /// or None to default to the current session's / home workspace.
     async fn open_new_session_screen(&mut self, workspace: Option<usize>) -> Result<()> {
         self.new_chat = Some(NewChat::Session);
+        let (mode_index, model_index) = self.new_chat_default_indices();
         let ws_index = workspace
             .filter(|i| *i < self.workspaces.len())
             .unwrap_or_else(|| {
@@ -3192,10 +3228,13 @@ impl Controller {
             ws_index as i32,
             Vec::new(),
             -1,
-            default_mode_index(&self.modes),
-            0,
+            mode_index,
+            model_index,
         );
-        self.push_new_chat_knobs(0);
+        self.push_new_chat_knobs(
+            usize::try_from(mode_index).unwrap_or(0),
+            usize::try_from(model_index).unwrap_or(0),
+        );
         ui::set_center_screen(&self.ui, 1);
         self.load_branches(ws_index).await;
         Ok(())
@@ -3210,16 +3249,20 @@ impl Controller {
             return; // Already on the provisional tab.
         }
         self.new_chat = Some(NewChat::Thread);
+        let (mode_index, model_index) = self.new_chat_default_indices();
         ui::set_new_chat(
             &self.ui,
             Vec::new(),
             -1,
             Vec::new(),
             -1,
-            default_mode_index(&self.modes),
-            0,
+            mode_index,
+            model_index,
         );
-        self.push_new_chat_knobs(0);
+        self.push_new_chat_knobs(
+            usize::try_from(mode_index).unwrap_or(0),
+            usize::try_from(model_index).unwrap_or(0),
+        );
         self.push_threads();
         ui::set_center_screen(&self.ui, 2);
     }
@@ -3349,6 +3392,7 @@ impl Controller {
         let model_ids: Vec<String> = self.models.iter().map(|m| m.id.clone()).collect();
         let default_model = providers.default_model.clone();
         let default_thinking_level = providers.default_thinking_level.clone();
+        self.default_model = default_model.clone();
         self.default_thinking_level = default_thinking_level.clone();
         let default_index = model_ids
             .iter()
@@ -4243,16 +4287,20 @@ impl Controller {
                 // Refresh the new-session pickers only when that screen is
                 // up ("+ Open" also lands here with the chat view showing).
                 if matches!(self.new_chat, Some(NewChat::Session)) {
+                    let (mode_index, model_index) = self.new_chat_default_indices();
                     ui::set_new_chat(
                         &self.ui,
                         self.workspaces.iter().map(|w| w.name.clone()).collect(),
                         index as i32,
                         Vec::new(),
                         -1,
-                        default_mode_index(&self.modes),
-                        0,
+                        mode_index,
+                        model_index,
                     );
-                    self.push_new_chat_knobs(0);
+                    self.push_new_chat_knobs(
+                        usize::try_from(mode_index).unwrap_or(0),
+                        usize::try_from(model_index).unwrap_or(0),
+                    );
                     self.load_branches(index).await;
                 }
             }
@@ -4280,7 +4328,10 @@ impl Controller {
                 )
                 .await?
             }
-            UiCommand::NewChatModelChanged(i) => self.push_new_chat_knobs(i),
+            UiCommand::NewChatModelChanged {
+                mode_idx,
+                model_idx,
+            } => self.push_new_chat_knobs(mode_idx, model_idx),
             UiCommand::SelectThread(i) => {
                 self.open_thread_index(i, false);
                 // i == threads.len() is the provisional tab itself: no-op.
@@ -6234,6 +6285,46 @@ fn default_mode_index(modes: &[AgentMode]) -> i32 {
         .unwrap_or(0)
 }
 
+/// Resolve the model a new thread should display and submit. Configured
+/// defaults that are absent from the runnable catalog are skipped so the
+/// form remains usable when provider availability changes.
+fn preferred_model_index(
+    models: &[ModelInfo],
+    mode_default: Option<&str>,
+    global_default: Option<&str>,
+) -> i32 {
+    [mode_default, global_default]
+        .into_iter()
+        .flatten()
+        .find_map(|preferred| {
+            models
+                .iter()
+                .position(|model| model.id == preferred)
+                .map(|index| index as i32)
+        })
+        .unwrap_or(if models.is_empty() { -1 } else { 0 })
+}
+
+/// Resolve the thinking selection with the same inheritance as thread
+/// creation, followed by the model schema's own default.
+fn preferred_thinking_index(
+    values: &[String],
+    mode_default: Option<&str>,
+    global_default: Option<&str>,
+    schema_default: Option<&str>,
+) -> i32 {
+    [mode_default.or(global_default), schema_default]
+        .into_iter()
+        .flatten()
+        .find_map(|preferred| {
+            values
+                .iter()
+                .position(|value| value == preferred)
+                .map(|index| index as i32)
+        })
+        .unwrap_or(if values.is_empty() { -1 } else { 0 })
+}
+
 /// "512 B" / "34 KB" / "2.4 MB", for attachment chip labels.
 fn human_size(bytes: usize) -> String {
     if bytes < 1024 {
@@ -6913,13 +7004,75 @@ mod tests {
     use super::{
         SubscriptionRefresh, SubscriptionRefreshState, approval_pill, attention_badge, check_pill,
         classify_pr, download_progress, human_age, human_rate, merge_pill, model_health_view,
-        pr_badge, project_session_prs, reconcile_pr_group_order, reconcile_workspace_order,
-        reorder_id, should_open_chat_at_tail, thinking_property,
+        pr_badge, preferred_model_index, preferred_thinking_index, project_session_prs,
+        reconcile_pr_group_order, reconcile_workspace_order, reorder_id, should_open_chat_at_tail,
+        thinking_property,
     };
     use chrono::{Duration, TimeZone, Utc};
     use trouve_protocol::{
-        CheckRun, PrInfo, PrReview, Session, SubscriptionHealth, SubscriptionWindow, Workspace,
+        CheckRun, ModelInfo, PrInfo, PrReview, Session, SubscriptionHealth, SubscriptionWindow,
+        Workspace,
     };
+
+    fn model(id: &str) -> ModelInfo {
+        ModelInfo {
+            id: id.into(),
+            display_name: id.into(),
+            context_window: 1,
+            supports_tools: true,
+            input_price_per_mtok: None,
+            output_price_per_mtok: None,
+            options_schema: serde_json::json!({}),
+        }
+    }
+
+    #[test]
+    fn new_chat_model_uses_mode_then_global_default() {
+        let models = vec![
+            model("first/model"),
+            model("global/model"),
+            model("mode/model"),
+        ];
+
+        assert_eq!(
+            preferred_model_index(&models, Some("mode/model"), Some("global/model")),
+            2
+        );
+        assert_eq!(
+            preferred_model_index(&models, None, Some("global/model")),
+            1
+        );
+        assert_eq!(
+            preferred_model_index(&models, Some("missing/model"), Some("global/model")),
+            1
+        );
+        assert_eq!(
+            preferred_model_index(&models, Some("missing/model"), Some("also/missing")),
+            0
+        );
+        assert_eq!(preferred_model_index(&[], None, None), -1);
+    }
+
+    #[test]
+    fn new_chat_thinking_uses_inherited_then_schema_default() {
+        let values = vec!["low".into(), "medium".into(), "high".into()];
+
+        assert_eq!(
+            preferred_thinking_index(&values, Some("high"), Some("low"), Some("medium")),
+            2
+        );
+        assert_eq!(
+            preferred_thinking_index(&values, None, Some("low"), Some("medium")),
+            0
+        );
+        // An unsupported mode override takes precedence over the global
+        // setting, then resolves to the model's own default like the core.
+        assert_eq!(
+            preferred_thinking_index(&values, Some("xhigh"), Some("high"), Some("medium")),
+            1
+        );
+        assert_eq!(preferred_thinking_index(&[], None, None, None), -1);
+    }
 
     fn workspaces(ids: &[&str]) -> Vec<Workspace> {
         ids.iter()
