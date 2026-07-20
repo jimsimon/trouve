@@ -317,6 +317,29 @@ export component SettingsScreen inherits Rectangle {
     property <[string]> mode-permission-names: ["Global default", "Ask", "Allow list", "Yolo"];
     in property <string> settings-status: "";
 
+    // Git & Worktrees: lifecycle for the optional session-naming model.
+    // 0 adaptive, 1 keep ready, 2 load when needed, 3 rules only.
+    in-out property <int> title-model-load-index: 0;
+    property <[string]> title-model-load-names: [
+        "Adaptive (Recommended)", "Keep Ready", "Load When Needed", "Rules Only"
+    ];
+    property <string> title-model-load-description:
+        root.title-model-load-index == 0
+            ? "Keeps the naming model ready when this computer has comfortable memory headroom; otherwise loads it only when needed."
+        : root.title-model-load-index == 1
+            ? "Loads the naming model at startup and keeps it in memory for the fastest new-session creation."
+        : root.title-model-load-index == 2
+            ? "Loads the naming model when a session is created, then releases it after a short idle period."
+        : "Uses fast built-in heuristics and never loads the optional naming model.";
+    in property <string> title-model-state: "not_installed";
+    in property <string> title-model-detail: "";
+    in property <bool> title-model-installed: false;
+    in property <bool> title-model-installing: false;
+    in property <int> title-model-install-progress: -1;
+    callback title-model-load-picked(int);
+    callback title-model-install();
+    callback title-model-cancel();
+
     // Provider form state (prefilled by "Edit" or a preset).
     in-out property <string> form-id: "";
     in-out property <string> form-base-url: "";
@@ -503,12 +526,12 @@ export component SettingsScreen inherits Rectangle {
     property <int> mode-form-thinking-model-index: root.mode-form-model >= 0
         ? root.mode-form-model : root.default-model-index;
 
-    // Side-nav selection: 0 providers, 1 modes & models, 2 mcp servers,
-    // 3 integrations, 4 appearance, 5 notifications, 6 about. in-out so
+    // Side-nav selection: 0 providers, 1 modes & models, 2 git & worktrees,
+    // 3 mcp servers, 4 integrations, 5 appearance, 6 notifications, 7 about. in-out so
     // the app can open straight to a section (e.g. the
     // PR tab's "set up GitHub" button).
     in-out property <int> section: 0;
-    property <[string]> section-names: ["Providers", "Modes & Models", "MCP Servers", "Integrations", "Appearance", "Notifications", "About"];
+    property <[string]> section-names: ["Providers", "Modes & Models", "Git & Worktrees", "MCP Servers", "Integrations", "Appearance", "Notifications", "About"];
 
     VerticalLayout {
         // Header: title + a way back to wherever the user came from.
@@ -1776,8 +1799,105 @@ export component SettingsScreen inherits Rectangle {
                             }
                         }
 
-                        // ---------------- mcp servers ----------------
+                        // ---------------- git & worktrees ----------------
                         if root.section == 2: VerticalLayout {
+                            spacing: 12px;
+
+                            Text {
+                                text: "Git & Worktrees";
+                                color: Theme.c.text-hi;
+                                font-size: Theme.fs(16px);
+                                font-weight: 700;
+                            }
+                            Text {
+                                text: "Session names become branch names too, so trouve derives a concise title before creating the session worktree.";
+                                color: Theme.c.text-soft;
+                                font-size: Theme.fs(11px);
+                                wrap: word-wrap;
+                            }
+
+                            Rectangle {
+                                background: Theme.c.surface;
+                                border-radius: 6px;
+                                height: naming-card.preferred-height + 28px;
+                                naming-card := VerticalLayout {
+                                    padding: 14px;
+                                    spacing: 10px;
+                                    Text {
+                                        text: "Session naming";
+                                        color: Theme.c.text-hi;
+                                        font-size: Theme.fs(13px);
+                                        font-weight: 700;
+                                    }
+                                    ComboBox {
+                                        model: root.title-model-load-names;
+                                        current-index <=> root.title-model-load-index;
+                                        selected => {
+                                            root.title-model-load-picked(root.title-model-load-index);
+                                        }
+                                    }
+                                    Text {
+                                        text: root.title-model-load-description;
+                                        color: Theme.c.text-mid;
+                                        font-size: Theme.fs(12px);
+                                        wrap: word-wrap;
+                                    }
+                                    Text {
+                                        text: "The optional model is about 470 MB to download and runs on the CPU, leaving GPU memory available for local coding models.";
+                                        color: Theme.c.text-soft;
+                                        font-size: Theme.fs(11px);
+                                        wrap: word-wrap;
+                                    }
+
+                                    Rectangle {
+                                        height: 1px;
+                                        background: Theme.c.border;
+                                    }
+                                    HorizontalLayout {
+                                        spacing: 8px;
+                                        VerticalLayout {
+                                            spacing: 4px;
+                                            horizontal-stretch: 1;
+                                            Text {
+                                                text: root.title-model-state == "ready" ? "Ready"
+                                                    : root.title-model-state == "loading" ? "Loading"
+                                                    : root.title-model-state == "installing" ? "Installing"
+                                                    : root.title-model-state == "stopped" ? "Available"
+                                                    : root.title-model-state == "error" ? "Needs attention"
+                                                    : "Optional model not installed";
+                                                color: root.title-model-state == "error" ? Theme.c.err
+                                                    : root.title-model-state == "ready" ? Theme.c.ok
+                                                    : Theme.c.text-mid;
+                                                font-size: Theme.fs(12px);
+                                                font-weight: 700;
+                                            }
+                                            if root.title-model-detail != "": Text {
+                                                text: root.title-model-detail;
+                                                color: root.title-model-state == "error" ? Theme.c.err : Theme.c.text-soft;
+                                                font-size: Theme.fs(11px);
+                                                wrap: word-wrap;
+                                            }
+                                            if root.title-model-installing && root.title-model-install-progress >= 0: DownloadBar {
+                                                pct: root.title-model-install-progress;
+                                            }
+                                        }
+                                        if root.title-model-installing: Button {
+                                            text: "Cancel";
+                                            clicked => { root.title-model-cancel(); }
+                                        }
+                                        if !root.title-model-installed && !root.title-model-installing
+                                                && root.title-model-load-index != 3: Button {
+                                            text: "Install naming model";
+                                            primary: true;
+                                            clicked => { root.title-model-install(); }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
+                        // ---------------- mcp servers ----------------
+                        if root.section == 3: VerticalLayout {
                             spacing: 12px;
 
                             HorizontalLayout {
@@ -2074,7 +2194,7 @@ export component SettingsScreen inherits Rectangle {
                         }
 
                         // ---------------- integrations ----------------
-                        if root.section == 3: VerticalLayout {
+                        if root.section == 4: VerticalLayout {
                             spacing: 12px;
 
                             Text {
@@ -2206,7 +2326,7 @@ export component SettingsScreen inherits Rectangle {
                         }
 
                         // ---------------- appearance ----------------
-                        if root.section == 4: VerticalLayout {
+                        if root.section == 5: VerticalLayout {
                             spacing: 12px;
 
                             Text {
@@ -2286,7 +2406,7 @@ export component SettingsScreen inherits Rectangle {
                         }
 
                         // ---------------- notifications ----------------
-                        if root.section == 5: VerticalLayout {
+                        if root.section == 6: VerticalLayout {
                             spacing: 12px;
 
                             Text {
@@ -2344,7 +2464,7 @@ export component SettingsScreen inherits Rectangle {
                         }
 
                         // ---------------- about ----------------
-                        if root.section == 6: VerticalLayout {
+                        if root.section == 7: VerticalLayout {
                             spacing: 12px;
 
                             Text {

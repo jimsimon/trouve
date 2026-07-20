@@ -178,6 +178,18 @@ impl ProtocolClient {
             .await
     }
 
+    /// Generate the title that will be used for both the session and its
+    /// branch before either is created.
+    pub async fn generate_session_title(&self, prompt: &str) -> Result<GeneratedSessionTitle> {
+        self.post_json(
+            "/session-title",
+            &GenerateSessionTitleRequest {
+                prompt: prompt.into(),
+            },
+        )
+        .await
+    }
+
     pub async fn create_session(&self, req: &CreateSessionRequest) -> Result<Session> {
         self.post_json("/sessions", req).await
     }
@@ -535,6 +547,33 @@ impl ProtocolClient {
             &SetDefaultPermissionModeRequest { permission_mode },
         )
         .await
+    }
+
+    pub async fn git_worktree_settings(&self) -> Result<GitWorktreeSettings> {
+        self.get_json("/config/git-worktrees").await
+    }
+
+    pub async fn set_git_worktree_settings(
+        &self,
+        title_model_load_behavior: TitleModelLoadBehavior,
+    ) -> Result<GitWorktreeSettings> {
+        self.put_json(
+            "/config/git-worktrees",
+            &SetGitWorktreeSettingsRequest {
+                title_model_load_behavior,
+            },
+        )
+        .await
+    }
+
+    pub async fn install_title_model(&self) -> Result<()> {
+        self.post_empty("/config/git-worktrees/title-model/install")
+            .await
+    }
+
+    pub async fn cancel_title_model_install(&self) -> Result<()> {
+        self.delete("/config/git-worktrees/title-model/install")
+            .await
     }
 
     pub async fn session_diff(&self, session_id: &str) -> Result<SessionDiff> {

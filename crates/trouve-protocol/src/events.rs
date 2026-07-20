@@ -320,6 +320,13 @@ pub enum Event {
     /// state for initial fetches.
     #[serde(rename = "server.connectivity_changed")]
     ConnectivityChanged { online: bool },
+    /// The persisted Git & Worktrees settings or the session-title model's
+    /// install/load state changed. Carries a full replacement snapshot so
+    /// replay and reconnect reconstruct the settings UI exactly.
+    #[serde(rename = "settings.git_worktrees_updated")]
+    GitWorktreeSettingsUpdated {
+        settings: crate::GitWorktreeSettings,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
@@ -362,6 +369,27 @@ mod tests {
             }
             _ => panic!("wrong event variant"),
         }
+    }
+
+    #[test]
+    fn git_worktree_settings_event_uses_namespaced_tag() {
+        let event = Event::GitWorktreeSettingsUpdated {
+            settings: crate::GitWorktreeSettings {
+                title_model_load_behavior: crate::TitleModelLoadBehavior::Off,
+                title_model: crate::TitleModelStatus {
+                    state: "stopped".into(),
+                    detail: "Built-in naming heuristics are active.".into(),
+                    runtime_installed: false,
+                    model_downloaded: false,
+                    install_stage: String::new(),
+                    install_bytes: 0,
+                    install_total: 0,
+                },
+            },
+        };
+        let value = serde_json::to_value(event).unwrap();
+        assert_eq!(value["type"], "settings.git_worktrees_updated");
+        assert_eq!(value["settings"]["title_model_load_behavior"], "off");
     }
 
     #[test]

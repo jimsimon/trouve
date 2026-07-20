@@ -171,6 +171,9 @@ pub struct Engine {
     cli_installs: Mutex<HashMap<String, CliInstallState>>,
     /// The llama-server sidecar behind the built-in "local" provider.
     local_manager: Arc<crate::local::LlamaManager>,
+    /// A separate, CPU-only sidecar for session titles. It never displaces
+    /// the local coding model from memory.
+    title_model: Arc<crate::title_model::TitleModelManager>,
     /// The built-in "local" provider, kept around so enabling re-injects
     /// the same instance after a disable removed it from the registry.
     local_provider: Arc<dyn Provider>,
@@ -424,6 +427,11 @@ impl Engine {
         // Construction reaps llama-servers leaked by a crashed previous run
         // (they hold VRAM and would starve this run's model loads).
         let local_manager = Arc::new(crate::local::LlamaManager::new(&data_dir));
+        let title_model = Arc::new(crate::title_model::TitleModelManager::new(
+            data_dir.clone(),
+            config.title_model_load_behavior.unwrap_or_default(),
+            store.clone(),
+        ));
         let local_provider: Arc<dyn Provider> = Arc::new(crate::local::LocalProvider::new(
             data_dir.clone(),
             config_dir.clone(),
@@ -470,6 +478,7 @@ impl Engine {
             logins: Mutex::new(HashMap::new()),
             cli_installs: Mutex::new(HashMap::new()),
             local_manager,
+            title_model,
             local_provider,
             local_downloads: Mutex::new(HashMap::new()),
             hardware: std::sync::OnceLock::new(),
@@ -2128,6 +2137,78 @@ impl Engine {
         }
         *self.default_permission_mode.write().unwrap() = mode;
         Ok(())
+    }
+
+    /// Current settings and runtime state for session naming.
+    pub fn git_worktree_settings(&self) -> trouve_protocol::GitWorktreeSettings {
+        self.title_model.settings()
+    }
+
+    /// Persist and immediately apply the session-title model lifecycle.
+    pub async fn set_title_model_load_behavior(
+        &self,
+        behavior: trouve_protocol::TitleModelLoadBehavior,
+    ) -> Result<trouve_protocol::GitWorktreeSettings, EngineError> {
+        {
+            let mut config = self.config.lock().unwrap();
+            config.title_model_load_behavior = Some(behavior);
+            self.persist_config(&config);
+        }
+        self.title_model.set_behavior(behavior).await;
+        Ok(self.git_worktree_settings())
+    }
+
+    /// Warm the dedicated title model according to its configured lifecycle.
+    /// This is non-blocking and is safe to call once the Tokio runtime exists.
+    pub fn warm_title_model(&self) {
+        self.title_model.warm_on_start();
+    }
+
+    pub fn install_title_model(&self) -> Result<(), EngineError> {
+        self.title_model
+            .start_install()
+            .map_err(|error| EngineError::Conflict(error.to_string()))?;
+        Ok(())
+    }
+
+    pub fn cancel_title_model_install(&self) -> Result<(), EngineError> {
+        self.title_model
+            .cancel_install()
+            .map_err(|error| EngineError::Conflict(error.to_string()))?;
+        Ok(())
+    }
+
+    /// Derive a title without ever blocking session creation on optional
+    /// model assets or model-quality failures.
+    pub async fn generate_session_title(
+        &self,
+        prompt: &str,
+    ) -> trouve_protocol::GeneratedSessionTitle {
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(8),
+            self.title_model.generate(prompt),
+        )
+        .await;
+        match result {
+            Ok(Ok(title)) => trouve_protocol::GeneratedSessionTitle {
+                title,
+                source: "model".into(),
+            },
+            Ok(Err(error)) => {
+                tracing::debug!("using heuristic session title: {error:#}");
+                trouve_protocol::GeneratedSessionTitle {
+                    title: crate::title::summarize_session_title(prompt),
+                    source: "heuristic".into(),
+                }
+            }
+            Err(_) => {
+                tracing::debug!("using heuristic session title: model exceeded 8-second budget");
+                trouve_protocol::GeneratedSessionTitle {
+                    title: crate::title::summarize_session_title(prompt),
+                    source: "heuristic".into(),
+                }
+            }
+        }
     }
 
     fn persist_config(&self, config: &Config) {

@@ -2765,6 +2765,83 @@ async fn automation_records_the_turn_outcome_not_just_dispatch() {
     assert_eq!(threads[0]["permission_mode"], "yolo");
 }
 
+/// Session naming settings persist through the protocol, and missing model
+/// assets always degrade to the deterministic heuristic instead of blocking
+/// creation.
+#[tokio::test]
+async fn session_title_settings_and_fallback() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Store::open(&tmp.path().join("db/trouve.db")).unwrap();
+    let config_file = tmp.path().join("config.toml");
+    let engine = Arc::new(
+        Engine::new(store, tmp.path().join("data"), &Config::default())
+            .with_config_dir(None)
+            .with_config_file(Some(config_file.clone())),
+    );
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let router = trouve_server::build_router(engine.clone());
+    tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+    let base = format!("http://{addr}/v1");
+    let client = reqwest::Client::new();
+
+    let settings: serde_json::Value = client
+        .get(format!("{base}/config/git-worktrees"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(settings["title_model_load_behavior"], "auto");
+    assert_eq!(settings["title_model"]["state"], "not_installed");
+
+    let settings: serde_json::Value = client
+        .put(format!("{base}/config/git-worktrees"))
+        .json(&serde_json::json!({"title_model_load_behavior": "off"}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(settings["title_model_load_behavior"], "off");
+    assert!(
+        std::fs::read_to_string(&config_file)
+            .unwrap()
+            .contains("title_model_load_behavior = \"off\"")
+    );
+    assert!(
+        engine
+            .store()
+            .events_after(&trouve_protocol::Scope::Server, 0)
+            .unwrap()
+            .iter()
+            .any(|envelope| matches!(
+                envelope.event,
+                trouve_protocol::Event::GitWorktreeSettingsUpdated { .. }
+            ))
+    );
+
+    let title: serde_json::Value = client
+        .post(format!("{base}/session-title"))
+        .json(&serde_json::json!({
+            "prompt": "When initially naming a new session, can the app create an intelligent summarized title based on the prompt instead of just using the prompt as-is?"
+        }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(title["source"], "heuristic");
+    assert_eq!(
+        title["title"],
+        "Create intelligent summarized title from prompt"
+    );
+}
+
 /// GitHub Enterprise hosts: the integration always lists github.com
 /// first, added hosts get their own entry (persisted to config),
 /// duplicates and bad hostnames are rejected, and removal works —

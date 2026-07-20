@@ -7,7 +7,7 @@
       "name": "MIT",
       "identifier": "MIT"
     },
-    "version": "1.0"
+    "version": "1.1"
   },
   "paths": {
     "/v1/approvals": {
@@ -495,6 +495,90 @@
             "description": ""
           },
           "400": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/config/git-worktrees": {
+      "get": {
+        "tags": [],
+        "operationId": "get_git_worktree_settings",
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GitWorktreeSettings"
+                }
+              }
+            }
+          }
+        }
+      },
+      "put": {
+        "tags": [],
+        "operationId": "set_git_worktree_settings",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SetGitWorktreeSettingsRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GitWorktreeSettings"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/config/git-worktrees/title-model/install": {
+      "post": {
+        "tags": [],
+        "operationId": "install_title_model",
+        "responses": {
+          "202": {
+            "description": ""
+          },
+          "409": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      },
+      "delete": {
+        "tags": [],
+        "operationId": "cancel_title_model_install",
+        "responses": {
+          "204": {
+            "description": ""
+          },
+          "409": {
             "description": "",
             "content": {
               "application/json": {
@@ -1526,6 +1610,34 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/session-title": {
+      "post": {
+        "tags": [],
+        "operationId": "generate_session_title",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/GenerateSessionTitleRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GeneratedSessionTitle"
                 }
               }
             }
@@ -4478,6 +4590,25 @@
                 ]
               }
             }
+          },
+          {
+            "type": "object",
+            "description": "The persisted Git & Worktrees settings or the session-title model's\ninstall/load state changed. Carries a full replacement snapshot so\nreplay and reconnect reconstruct the settings UI exactly.",
+            "required": [
+              "settings",
+              "type"
+            ],
+            "properties": {
+              "settings": {
+                "$ref": "#/components/schemas/GitWorktreeSettings"
+              },
+              "type": {
+                "type": "string",
+                "enum": [
+                  "settings.git_worktrees_updated"
+                ]
+              }
+            }
           }
         ],
         "description": "Every event type in the log. Serialized with a `type` tag using\ndot-namespaced names, per the event-log design doc."
@@ -4526,6 +4657,50 @@
           },
           "path": {
             "type": "string"
+          }
+        }
+      },
+      "GenerateSessionTitleRequest": {
+        "type": "object",
+        "description": "Ask the server to derive the title used to create a session and branch.",
+        "required": [
+          "prompt"
+        ],
+        "properties": {
+          "prompt": {
+            "type": "string"
+          }
+        }
+      },
+      "GeneratedSessionTitle": {
+        "type": "object",
+        "required": [
+          "title",
+          "source"
+        ],
+        "properties": {
+          "source": {
+            "type": "string",
+            "description": "`model` or `heuristic`."
+          },
+          "title": {
+            "type": "string"
+          }
+        }
+      },
+      "GitWorktreeSettings": {
+        "type": "object",
+        "description": "Global settings shown under Settings → Git & Worktrees.",
+        "required": [
+          "title_model_load_behavior",
+          "title_model"
+        ],
+        "properties": {
+          "title_model": {
+            "$ref": "#/components/schemas/TitleModelStatus"
+          },
+          "title_model_load_behavior": {
+            "$ref": "#/components/schemas/TitleModelLoadBehavior"
           }
         }
       },
@@ -5648,6 +5823,18 @@
           }
         }
       },
+      "SetGitWorktreeSettingsRequest": {
+        "type": "object",
+        "description": "Update Settings → Git & Worktrees.",
+        "required": [
+          "title_model_load_behavior"
+        ],
+        "properties": {
+          "title_model_load_behavior": {
+            "$ref": "#/components/schemas/TitleModelLoadBehavior"
+          }
+        }
+      },
       "SetLocalEnabledRequest": {
         "type": "object",
         "description": "Turn local models on or off (`PUT /v1/local/enabled`). Disabling stops\nthe llama-server sidecar and unregisters the \"local\" provider.",
@@ -5836,6 +6023,55 @@
               "$ref": "#/components/schemas/TodoItem"
             },
             "description": "Current todo snapshot for this thread. Tool-call events retain the\nhistory of how the list changed; this field is the initial-load view."
+          }
+        }
+      },
+      "TitleModelLoadBehavior": {
+        "type": "string",
+        "description": "When the dedicated session-title model should occupy memory.",
+        "enum": [
+          "auto",
+          "always",
+          "on_demand",
+          "off"
+        ]
+      },
+      "TitleModelStatus": {
+        "type": "object",
+        "description": "Runtime status for the managed session-title model.",
+        "required": [
+          "state",
+          "runtime_installed",
+          "model_downloaded"
+        ],
+        "properties": {
+          "detail": {
+            "type": "string",
+            "description": "Human-readable context for the settings screen."
+          },
+          "install_bytes": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "install_stage": {
+            "type": "string",
+            "description": "Empty, `runtime`, or `model`."
+          },
+          "install_total": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "model_downloaded": {
+            "type": "boolean"
+          },
+          "runtime_installed": {
+            "type": "boolean"
+          },
+          "state": {
+            "type": "string",
+            "description": "`not_installed`, `installing`, `stopped`, `loading`, `ready`, or\n`error`."
           }
         }
       },

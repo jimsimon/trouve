@@ -5,5 +5,4 @@
 //! chat items.
 
 pub mod client;
-pub mod title;
 pub mod viewmodel;

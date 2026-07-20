@@ -48,6 +48,10 @@ pub struct Config {
     /// active. Unset means enabled.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub local_enabled: Option<bool>,
+    /// Lifecycle policy for the dedicated session-title model. Unset uses
+    /// adaptive loading.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title_model_load_behavior: Option<trouve_protocol::TitleModelLoadBehavior>,
     /// Client id of a GitHub OAuth app (with device flow enabled) for
     /// "Sign in with GitHub" on github.com. Unset uses the built-in shared
     /// Trouve app (`github::DEFAULT_CLIENT_ID`); set it to route sign-in
@@ -221,6 +225,13 @@ mod tests {
         assert!(!cfg.load_failed);
         assert_eq!(cfg.default_model.as_deref(), Some("openai/gpt"));
         assert_eq!(cfg.default_thinking_level.as_deref(), Some("high"));
+        let mut cfg = cfg;
+        cfg.title_model_load_behavior = Some(trouve_protocol::TitleModelLoadBehavior::OnDemand);
         cfg.save_to(&path).unwrap();
+        let cfg = Config::load_from(&path);
+        assert_eq!(
+            cfg.title_model_load_behavior,
+            Some(trouve_protocol::TitleModelLoadBehavior::OnDemand)
+        );
     }
 }

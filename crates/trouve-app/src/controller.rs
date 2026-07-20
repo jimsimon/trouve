@@ -16,8 +16,9 @@ use trouve_client_core::client::ProtocolClient;
 use trouve_client_core::viewmodel::ThreadViewModel;
 use trouve_protocol::{
     AddLocalModelRequest, AgentMode, ApprovalDecision, CreateSessionRequest, CreateThreadRequest,
-    DirEntry, EventEnvelope, ModelInfo, PermissionMode, Session, Thread, TodoStatus,
-    UpdateSessionRequest, UpdateThreadRequest, UpsertModeRequest, UpsertProviderRequest, Workspace,
+    DirEntry, EventEnvelope, ModelInfo, PermissionMode, Session, Thread, TitleModelLoadBehavior,
+    TodoStatus, UpdateSessionRequest, UpdateThreadRequest, UpsertModeRequest,
+    UpsertProviderRequest, Workspace,
 };
 
 use crate::render;
@@ -255,6 +256,9 @@ pub enum UiCommand {
 
     // Settings window.
     RefreshSettings,
+    SetTitleModelLoadBehavior(i32),
+    InstallTitleModel,
+    CancelTitleModelInstall,
     SaveProvider {
         id: String,
         kind: String,
@@ -3296,11 +3300,12 @@ impl Controller {
                     .get(selection.workspace_idx)
                     .context("no workspace selected")?
                     .clone();
+                let title = self.client.generate_session_title(&prompt).await?.title;
                 let session = self
                     .client
                     .create_session(&CreateSessionRequest {
                         workspace_id: workspace.id,
-                        title: Some(trouve_client_core::title::summarize_session_title(&prompt)),
+                        title: Some(title),
                         base_ref: self.branches.get(selection.branch_idx).cloned(),
                         fetch_latest: selection.fetch_latest,
                     })
@@ -3335,6 +3340,7 @@ impl Controller {
     // --- settings --------------------------------------------------------------
 
     async fn refresh_settings(&mut self) {
+        self.refresh_title_model().await;
         if let Ok(gh) = self.client.github_integration().await {
             self.apply_github_integration(gh);
             self.push_github_integration();
@@ -3443,6 +3449,18 @@ impl Controller {
         }
         self.refresh_clis().await;
         self.refresh_local();
+    }
+
+    async fn refresh_title_model(&self) {
+        match self.client.git_worktree_settings().await {
+            Ok(settings) => ui::set_git_worktree_settings(&self.ui, settings),
+            Err(error) => {
+                ui::set_settings_status(
+                    &self.ui,
+                    format!("failed to load Git & Worktrees settings: {error:#}"),
+                );
+            }
+        }
     }
 
     /// Estimated bytes/sec for an in-flight download, from consecutive
@@ -3866,6 +3884,10 @@ impl Controller {
                 .insert(pull_requests.host.clone(), pull_requests.clone());
             self.sync_shared_prs(false);
             self.push_pr_dashboard();
+            return;
+        }
+        if let Event::GitWorktreeSettingsUpdated { settings } = &envelope.event {
+            ui::set_git_worktree_settings(&self.ui, settings.clone());
             return;
         }
 
@@ -4960,7 +4982,7 @@ impl Controller {
                 }
             }
             UiCommand::OpenIntegrationsSettings => {
-                ui::set_settings_section(&self.ui, 3);
+                ui::set_settings_section(&self.ui, 4);
                 self.refresh_settings().await;
                 self.refresh_mcp();
                 self.refresh_subscriptions(SubscriptionRefresh::IfStale);
@@ -5146,6 +5168,34 @@ impl Controller {
                 self.reload_catalogs().await;
                 self.refresh_settings().await;
                 self.refresh_subscriptions(SubscriptionRefresh::Force);
+            }
+            UiCommand::SetTitleModelLoadBehavior(index) => {
+                let behavior = match index {
+                    1 => TitleModelLoadBehavior::Always,
+                    2 => TitleModelLoadBehavior::OnDemand,
+                    3 => TitleModelLoadBehavior::Off,
+                    _ => TitleModelLoadBehavior::Auto,
+                };
+                match self.client.set_git_worktree_settings(behavior).await {
+                    Ok(settings) => ui::set_git_worktree_settings(&self.ui, settings),
+                    Err(error) => {
+                        ui::set_settings_status(&self.ui, format!("{error:#}"));
+                        self.refresh_title_model().await;
+                    }
+                }
+            }
+            UiCommand::InstallTitleModel => match self.client.install_title_model().await {
+                Ok(()) => {
+                    self.refresh_title_model().await;
+                }
+                Err(error) => ui::set_settings_status(&self.ui, format!("{error:#}")),
+            },
+            UiCommand::CancelTitleModelInstall => {
+                match self.client.cancel_title_model_install().await {
+                    Ok(()) => {}
+                    Err(error) => ui::set_settings_status(&self.ui, format!("{error:#}")),
+                }
+                self.refresh_title_model().await;
             }
             UiCommand::SaveProvider {
                 id,
