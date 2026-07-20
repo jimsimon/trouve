@@ -71,10 +71,7 @@ impl ProtocolClient {
             .send()
             .await
             .with_context(|| format!("POST {path}"))?;
-        if !resp.status().is_success() {
-            bail!("{path}: {}", resp.status());
-        }
-        Ok(())
+        decode_empty(resp, path).await
     }
 
     async fn patch_json<T: serde::de::DeserializeOwned>(
@@ -115,10 +112,7 @@ impl ProtocolClient {
             .send()
             .await
             .with_context(|| format!("PUT {path}"))?;
-        if !resp.status().is_success() {
-            bail!("{path}: {}", resp.status());
-        }
-        Ok(())
+        decode_empty(resp, path).await
     }
 
     async fn delete(&self, path: &str) -> Result<()> {
@@ -128,10 +122,7 @@ impl ProtocolClient {
             .send()
             .await
             .with_context(|| format!("DELETE {path}"))?;
-        if !resp.status().is_success() {
-            bail!("{path}: {}", resp.status());
-        }
-        Ok(())
+        decode_empty(resp, path).await
     }
 
     async fn delete_json<T: serde::de::DeserializeOwned>(&self, path: &str) -> Result<T> {
@@ -941,23 +932,78 @@ async fn decode<T: serde::de::DeserializeOwned>(resp: reqwest::Response, path: &
     let status = resp.status();
     let bytes = resp.bytes().await?;
     if !status.is_success() {
-        let message = serde_json::from_slice::<ErrorBody>(&bytes)
-            .map(|e| e.message)
-            .unwrap_or_else(|_| String::from_utf8_lossy(&bytes).to_string());
-        bail!("{path}: {message} ({status})");
+        return Err(response_error(path, status, &bytes));
     }
     serde_json::from_slice(&bytes).with_context(|| format!("decoding {path} response"))
 }
 
+async fn decode_empty(resp: reqwest::Response, path: &str) -> Result<()> {
+    let status = resp.status();
+    if status.is_success() {
+        return Ok(());
+    }
+    let bytes = resp.bytes().await?;
+    Err(response_error(path, status, &bytes))
+}
+
+fn response_error(path: &str, status: reqwest::StatusCode, bytes: &[u8]) -> anyhow::Error {
+    let message = serde_json::from_slice::<ErrorBody>(bytes)
+        .map(|error| error.message)
+        .unwrap_or_else(|_| {
+            let message = String::from_utf8_lossy(bytes);
+            if message.is_empty() {
+                status.to_string()
+            } else {
+                message.into_owned()
+            }
+        });
+    anyhow::anyhow!("{path}: {message} ({status})")
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{ProtocolClient, urlencode};
+    use super::{ProtocolClient, response_error, urlencode};
 
     #[test]
     fn urlencode_percent_encodes_utf8_bytes() {
         assert_eq!(urlencode("src/café.rs"), "src/caf%C3%A9.rs");
         assert_eq!(urlencode("🙂 notes"), "%F0%9F%99%82%20notes");
         assert_eq!(urlencode("a/b~c"), "a/b~c");
+    }
+
+    #[test]
+    fn empty_response_preserves_structured_server_error() {
+        let error = response_error(
+            "/github/prs/refresh",
+            reqwest::StatusCode::BAD_REQUEST,
+            br#"{"code":"bad_request","message":"github.com: API rate limit exceeded"}"#,
+        );
+        assert_eq!(
+            error.to_string(),
+            "/github/prs/refresh: github.com: API rate limit exceeded (400 Bad Request)"
+        );
+    }
+
+    #[test]
+    fn bodyless_error_response_uses_http_status_as_message() {
+        let error = response_error("/github/prs/refresh", reqwest::StatusCode::BAD_REQUEST, b"");
+        assert_eq!(
+            error.to_string(),
+            "/github/prs/refresh: 400 Bad Request (400 Bad Request)"
+        );
+    }
+
+    #[test]
+    fn non_json_error_response_preserves_raw_body() {
+        let error = response_error(
+            "/github/prs/refresh",
+            reqwest::StatusCode::BAD_GATEWAY,
+            b"upstream unavailable",
+        );
+        assert_eq!(
+            error.to_string(),
+            "/github/prs/refresh: upstream unavailable (502 Bad Gateway)"
+        );
     }
 
     #[tokio::test]
