@@ -14,11 +14,13 @@
 //!   expires we ask the user to run any `codex` command, which refreshes
 //!   `auth.json` through the sanctioned path.
 
+use std::collections::HashSet;
 use std::path::PathBuf;
 
 use serde_json::{Map, Value, json};
 use tokio::sync::mpsc;
 
+use crate::codex::completed_reasoning_text;
 use crate::{EventStream, Message, Provider, ProviderError, ProviderEvent, ToolSpec};
 use trouve_protocol::Usage;
 
@@ -129,7 +131,7 @@ impl Provider for CodexResponsesProvider {
             .and_then(|p| std::fs::read_to_string(p).ok())
             .unwrap_or_else(|| BASE_INSTRUCTIONS.to_string());
 
-        let mut body = json!({
+        let body = json!({
             "model": model,
             "instructions": instructions,
             "input": input_items(messages),
@@ -145,10 +147,8 @@ impl Provider for CodexResponsesProvider {
             "store": false,
             "stream": true,
             "include": [],
+            "reasoning": reasoning_options(options),
         });
-        if let Some(effort) = options.get("reasoning_effort").and_then(Value::as_str) {
-            body["reasoning"] = json!({ "effort": effort });
-        }
 
         let url = match std::env::var("TROUVE_CODEX_RESPONSES_URL") {
             Ok(u) if !u.is_empty() => {
@@ -199,6 +199,16 @@ impl Provider for CodexResponsesProvider {
 
         Ok(Box::pin(sse_events(resp)))
     }
+}
+
+/// Request displayable summaries instead of relying on a model-specific
+/// default that may be `none`.
+fn reasoning_options(options: &Map<String, Value>) -> Value {
+    let mut reasoning = json!({ "summary": "auto" });
+    if let Some(effort) = options.get("reasoning_effort").and_then(Value::as_str) {
+        reasoning["effort"] = json!(effort);
+    }
+    reasoning
 }
 
 /// Map trouve messages onto Responses API input items. The base system
@@ -284,6 +294,10 @@ fn sse_events(
         let mut bytes = resp.bytes_stream();
         let mut buf = crate::sse::LineBuffer::default();
         let mut usage = Usage::default();
+        // A few Codex models omit reasoning delta events but populate the
+        // completed reasoning item. Track streamed item ids so that fallback
+        // remains lossless without duplicating summaries that did stream.
+        let mut streamed_reasoning = HashSet::new();
         while let Some(chunk) = bytes.next().await {
             let chunk = match chunk {
                 Ok(c) => c,
@@ -314,6 +328,11 @@ fn sse_events(
                     // Reasoning summaries (and raw reasoning where exposed).
                     "response.reasoning_summary_text.delta" | "response.reasoning_text.delta" => {
                         if let Some(d) = ev["delta"].as_str() {
+                            if let Some(id) =
+                                ev["item_id"].as_str().or_else(|| ev["itemId"].as_str())
+                            {
+                                streamed_reasoning.insert(id.to_string());
+                            }
                             let _ = tx
                                 .send(Ok(ProviderEvent::ThinkingDelta(d.to_string())))
                                 .await;
@@ -321,7 +340,14 @@ fn sse_events(
                     }
                     "response.output_item.done" => {
                         let item = &ev["item"];
-                        if item["type"].as_str() == Some("function_call") {
+                        if item["type"].as_str() == Some("reasoning")
+                            && item["id"]
+                                .as_str()
+                                .is_none_or(|id| !streamed_reasoning.contains(id))
+                            && let Some(text) = completed_reasoning_text(item)
+                        {
+                            let _ = tx.send(Ok(ProviderEvent::ThinkingDelta(text))).await;
+                        } else if item["type"].as_str() == Some("function_call") {
                             let arguments = item["arguments"]
                                 .as_str()
                                 .and_then(|s| serde_json::from_str::<Value>(s).ok())
@@ -409,6 +435,40 @@ mod tests {
         assert_eq!(items[3]["type"], "function_call");
         assert_eq!(items[3]["arguments"], "{\"path\":\"x\"}");
         assert_eq!(items[4]["type"], "function_call_output");
+    }
+
+    #[test]
+    fn requests_reasoning_summaries_with_or_without_effort() {
+        let mut options = Map::new();
+        assert_eq!(reasoning_options(&options), json!({ "summary": "auto" }));
+
+        options.insert("reasoning_effort".into(), json!("high"));
+        assert_eq!(
+            reasoning_options(&options),
+            json!({ "summary": "auto", "effort": "high" })
+        );
+    }
+
+    #[test]
+    fn extracts_completed_structured_reasoning() {
+        let item = json!({
+            "type": "reasoning",
+            "summary": [
+                { "type": "summary_text", "text": "First thought" },
+                { "type": "summary_text", "text": "Second thought" },
+            ],
+            "content": [{ "type": "reasoning_text", "text": "raw thought" }],
+        });
+        assert_eq!(
+            completed_reasoning_text(&item).as_deref(),
+            Some("First thought\n\nSecond thought")
+        );
+
+        assert_eq!(
+            completed_reasoning_text(&json!({ "summary": [], "content": ["raw thought"] }))
+                .as_deref(),
+            Some("raw thought")
+        );
     }
 
     #[test]

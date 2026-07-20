@@ -27,6 +27,7 @@ use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin};
 use tokio::sync::{Mutex, mpsc, oneshot};
 use trouve_protocol::{ModelInfo, Usage};
+use trouve_providers::codex::completed_reasoning_text;
 
 use crate::{
     AgentBackend, BackendError, BackendEvent, BackendEventStream, BackendLogin, BackendPermission,
@@ -282,9 +283,7 @@ impl AgentBackend for CodexBackend {
             "sandboxPolicy": sandbox_policy,
             "input": input,
         });
-        if let Some(effort) = effort {
-            turn_params["effort"] = json!(effort);
-        }
+        apply_reasoning_options(&mut turn_params, effort);
         server.request("turn/start", turn_params).await?;
 
         let stream = turn_stream(
@@ -346,6 +345,17 @@ fn split_effort(model: &str) -> (&str, Option<&str>) {
     match model.rsplit_once('@') {
         Some((m, e)) if !m.is_empty() && !e.is_empty() => (m, Some(e)),
         _ => (model, None),
+    }
+}
+
+/// Ask Codex for the readable reasoning summaries that drive trouve's
+/// thinking blocks. Model defaults can disable summaries (notably for some
+/// dynamically-listed models), so relying on the omitted-field behavior is
+/// not sufficient.
+fn apply_reasoning_options(params: &mut Value, effort: Option<&str>) {
+    params["summary"] = json!("auto");
+    if let Some(effort) = effort {
+        params["effort"] = json!(effort);
     }
 }
 
@@ -618,24 +628,6 @@ fn turn_stream(
         }
         server.unsubscribe(&codex_thread_id).await;
     })
-}
-
-/// Extract the displayable text from a completed Codex reasoning item.
-/// Summary text is preferred; raw content is used by open-source models.
-fn completed_reasoning_text(item: &Value) -> Option<String> {
-    for field in ["summary", "content"] {
-        let parts = item[field]
-            .as_array()
-            .into_iter()
-            .flatten()
-            .filter_map(Value::as_str)
-            .filter(|part| !part.is_empty())
-            .collect::<Vec<_>>();
-        if !parts.is_empty() {
-            return Some(parts.join("\n\n"));
-        }
-    }
-    None
 }
 
 fn json_rpc_id(id: &Value) -> String {
@@ -1064,10 +1056,35 @@ mod tests {
 
         let raw = json!({ "type": "reasoning", "summary": [], "content": ["thinking"] });
         assert_eq!(completed_reasoning_text(&raw).as_deref(), Some("thinking"));
+        let response_item = json!({
+            "type": "reasoning",
+            "summary": [
+                { "type": "summary_text", "text": "Checking the adapter" },
+                { "type": "summary_text", "text": "Found the rich item shape" },
+            ],
+            "content": [{ "type": "reasoning_text", "text": "raw thought" }],
+        });
+        assert_eq!(
+            completed_reasoning_text(&response_item).as_deref(),
+            Some("Checking the adapter\n\nFound the rich item shape")
+        );
         assert_eq!(
             completed_reasoning_text(&json!({ "type": "reasoning" })),
             None
         );
+    }
+
+    #[test]
+    fn turn_requests_readable_reasoning_summaries() {
+        let mut params = json!({ "threadId": "thread-1", "input": [] });
+        apply_reasoning_options(&mut params, Some("high"));
+        assert_eq!(params["summary"], "auto");
+        assert_eq!(params["effort"], "high");
+
+        let mut without_effort = json!({});
+        apply_reasoning_options(&mut without_effort, None);
+        assert_eq!(without_effort["summary"], "auto");
+        assert!(without_effort["effort"].is_null());
     }
 
     #[tokio::test]

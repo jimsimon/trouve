@@ -9,6 +9,7 @@
 pub mod anthropic;
 pub mod auth;
 pub mod catalog;
+pub mod codex;
 pub mod codex_responses;
 pub mod kimi_usage;
 pub mod openai_compat;
