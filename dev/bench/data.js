@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1784530494428,
+  "lastUpdate": 1784530524179,
   "repoUrl": "https://github.com/jimsimon/trouve",
   "entries": {
     "e2e-benchmarks": [
@@ -6961,6 +6961,54 @@ window.BENCHMARK_DATA = {
             "name": "dense_query_20k_rows",
             "value": 1556239.0288420604,
             "range": "± 9248",
+            "unit": "ns"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "29139614+renovate[bot]@users.noreply.github.com",
+            "name": "renovate[bot]",
+            "username": "renovate[bot]"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "c612e43e0524956f36710bdd5f7bc92862b81351",
+          "message": "Update Rust crate serde_json to v1.0.151 (#112)\n\nCo-authored-by: renovate[bot] <29139614+renovate[bot]@users.noreply.github.com>",
+          "timestamp": "2026-07-20T02:53:17-04:00",
+          "tree_id": "78cc4ad9e30a121733d6b3f3346d10887f0cd4be",
+          "url": "https://github.com/jimsimon/trouve/commit/c612e43e0524956f36710bdd5f7bc92862b81351"
+        },
+        "date": 1784530523552,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "bm25_build_5k_docs",
+            "value": 3824115.041666667,
+            "range": "± 6171",
+            "unit": "ns"
+          },
+          {
+            "name": "bm25_query_5k_docs",
+            "value": 28156.70227963526,
+            "range": "± 5",
+            "unit": "ns"
+          },
+          {
+            "name": "chunk_python_200_functions",
+            "value": 2174254.195652174,
+            "range": "± 674",
+            "unit": "ns"
+          },
+          {
+            "name": "dense_query_20k_rows",
+            "value": 1223723.6753432495,
+            "range": "± 8817",
             "unit": "ns"
           }
         ]
