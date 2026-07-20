@@ -1440,13 +1440,13 @@ export component AppWindow inherits Window {
     in property <[string]> pr-dash-projects;
     in-out property <int> pr-dash-project-index: 0;
     in property <string> pr-dash-status: "";
+    in property <string> pr-dash-refresh-status: "";
     in property <bool> pr-dash-has-workspaces: true;
     // Set immediately before a keyboard move so the rebuilt repeater returns
     // focus to the moved group's handle.
     in-out property <string> pr-group-reorder-focus-key: "";
     callback open-pull-requests();
     callback close-pull-requests();
-    callback pull-requests-refresh();
     callback pr-dash-filter-picked(/* project index; 0 = all */ int);
     callback pr-group-toggled(/* group key */ string);
     // Group ordering. Drag payloads stay opaque in Slint and are
@@ -1838,7 +1838,6 @@ export component AppWindow inherits Window {
     // Fetch failure or "loading…" note; empty when the list is live.
     in property <string> pr-error: "";
     callback create-pr();
-    callback refresh-prs();
     callback pr-picked(int);
     callback open-pr-url(string);
     callback open-integrations-settings();
@@ -4779,10 +4778,6 @@ export component AppWindow inherits Window {
                                 horizontal-stretch: 1;
                             }
                             Button {
-                                text: "⟳ Refresh";
-                                clicked => { root.refresh-prs(); }
-                            }
-                            Button {
                                 text: "Create PR";
                                 clicked => { root.create-pr(); }
                             }
@@ -5194,6 +5189,7 @@ export component AppWindow inherits Window {
         project-names: root.pr-dash-projects;
         project-index <=> root.pr-dash-project-index;
         status: root.pr-dash-status;
+        refresh-status: root.pr-dash-refresh-status;
         configured: root.pr-configured;
         has-workspaces: root.pr-dash-has-workspaces;
         blocked-severe: root.connectivity-severe;
@@ -5201,7 +5197,6 @@ export component AppWindow inherits Window {
         online-notice: root.connectivity-notice;
         reorder-focus-key <=> root.pr-group-reorder-focus-key;
         close => { root.close-pull-requests(); }
-        refresh => { root.pull-requests-refresh(); }
         filter-picked(index) => { root.pr-dash-filter-picked(index); }
         group-toggled(key) => { root.pr-group-toggled(key); }
         group-drag-data(key) => { root.pr-group-drag-data(key) }

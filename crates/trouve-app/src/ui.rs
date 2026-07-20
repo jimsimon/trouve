@@ -739,6 +739,7 @@ pub fn set_pr_dashboard(
     projects: Vec<String>,
     project_index: i32,
     status: String,
+    refresh_status: String,
     has_workspaces: bool,
 ) {
     let _ = ui.upgrade_in_event_loop(move |ui| {
@@ -797,7 +798,15 @@ pub fn set_pr_dashboard(
         ui.set_pr_dash_projects(string_model(projects));
         ui.set_pr_dash_project_index(project_index);
         ui.set_pr_dash_status(SharedString::from(status.as_str()));
+        ui.set_pr_dash_refresh_status(SharedString::from(refresh_status.as_str()));
         ui.set_pr_dash_has_workspaces(has_workspaces);
+    });
+}
+
+/// Update the live dashboard freshness clock without replacing its PR models.
+pub fn set_pr_dashboard_refresh_status(ui: &Ui, status: String) {
+    let _ = ui.upgrade_in_event_loop(move |ui| {
+        ui.set_pr_dash_refresh_status(SharedString::from(status.as_str()));
     });
 }
 

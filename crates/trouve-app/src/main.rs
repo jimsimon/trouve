@@ -860,12 +860,6 @@ fn main() -> anyhow::Result<()> {
     }
     {
         let tx = tx.clone();
-        window.on_refresh_prs(move || {
-            let _ = tx.send(UiCommand::RefreshPrs);
-        });
-    }
-    {
-        let tx = tx.clone();
         window.on_refresh_session_mcp(move || {
             let _ = tx.send(UiCommand::RefreshSessionMcp);
         });
@@ -1144,12 +1138,6 @@ fn main() -> anyhow::Result<()> {
         let tx = tx.clone();
         window.on_close_pull_requests(move || {
             let _ = tx.send(UiCommand::ClosePullRequests);
-        });
-    }
-    {
-        let tx = tx.clone();
-        window.on_pull_requests_refresh(move || {
-            let _ = tx.send(UiCommand::RefreshPullRequests);
         });
     }
     {

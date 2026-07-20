@@ -349,7 +349,7 @@ pub struct GitHubAccount {
 /// Per-host dashboard state retained by the server between poll ticks.
 ///
 /// Search probes are deliberately cheap. Full PR details are fetched only
-/// when a probe changes, which keeps the one-minute dashboard cadence without
+/// when a probe changes, which keeps the 30-second dashboard cadence without
 /// paying the nested-connection cost on every unchanged pull request.
 #[derive(Default)]
 pub struct GitHubDashboardCache {

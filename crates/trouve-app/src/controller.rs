@@ -29,9 +29,34 @@ const TERMINAL_TAB: i32 = 4;
 /// Conditional Todos panel. It sits above the stable inspection TabWidget,
 /// so showing or hiding it never changes the indices above.
 const TODOS_TAB: i32 = 5;
-/// GitHub data is fresh enough for a dashboard without creating sustained
-/// API pressure from the per-PR enrichment requests.
-const PR_DASH_REFRESH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
+/// Fingerprint caching keeps unchanged PRs out of the detail query, making a
+/// 30-second account refresh sustainable while preserving a useful reserve.
+const PR_DASH_REFRESH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
+/// The dashboard refresh clock is repainted once per second without rebuilding
+/// the PR grid or contacting GitHub.
+const PR_DASH_CLOCK_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
+
+fn format_pr_dashboard_refresh_status(
+    last_refreshed: Option<std::time::Instant>,
+    next_refresh: Option<std::time::Instant>,
+    refreshing: bool,
+    now: std::time::Instant,
+) -> String {
+    let Some(next_refresh) = next_refresh else {
+        return String::new();
+    };
+    let remaining = next_refresh.saturating_duration_since(now);
+    let next_seconds = remaining.as_secs() + u64::from(remaining.subsec_nanos() != 0);
+    let last = match last_refreshed {
+        Some(last_refreshed) => format!(
+            "Last refreshed {} seconds ago",
+            now.saturating_duration_since(last_refreshed).as_secs()
+        ),
+        None if refreshing => "Refreshing for the first time".to_string(),
+        None => "Not refreshed yet".to_string(),
+    };
+    format!("{last}, next refresh in {next_seconds} seconds")
+}
 
 fn same_pull_request(left: &trouve_protocol::PrInfo, right: &trouve_protocol::PrInfo) -> bool {
     left.number == right.number
@@ -239,7 +264,6 @@ pub enum UiCommand {
     Undo,
     Redo,
     CreatePr,
-    RefreshPrs,
     SelectPr(usize),
     OpenPrUrl(String),
     /// Internal: a background PR fetch finished (session it was for, PRs or
@@ -340,9 +364,8 @@ pub enum UiCommand {
     OpenPullRequests,
     /// Leave the pull-requests dashboard (back to chat / new-chat).
     ClosePullRequests,
-    /// Re-fetch account PRs from every authenticated GitHub instance.
-    RefreshPullRequests,
-    /// Internal periodic refresh of the shared GitHub account snapshots.
+    /// Internal one-second clock tick. A due tick refreshes the shared GitHub
+    /// account snapshots; other ticks only repaint the dashboard countdown.
     GithubRefreshTick,
     /// Internal: the multi-instance refresh command finished. Successful
     /// dashboard data arrives separately as a persisted server event.
@@ -666,6 +689,11 @@ struct Controller {
     pr_dash_errors: HashMap<String, String>,
     /// Shared GitHub refreshes in flight (the `github` key is the guard).
     pr_dash_loading: HashSet<String>,
+    /// Completion time of the last successful account refresh, for the live
+    /// dashboard freshness message.
+    pr_dash_last_refreshed: Option<std::time::Instant>,
+    /// Client-local deadline for the next automatic account refresh.
+    pr_dash_next_refresh: Option<std::time::Instant>,
     /// Client-local display order of the dashboard groups, persisted like
     /// the workspace sidebar order.
     pr_group_order: Vec<String>,
@@ -879,6 +907,8 @@ pub async fn run(
         pr_dash: HashMap::new(),
         pr_dash_errors: HashMap::new(),
         pr_dash_loading: HashSet::new(),
+        pr_dash_last_refreshed: None,
+        pr_dash_next_refresh: None,
         pr_group_order: crate::winstate::load_pr_group_order(),
         pr_collapsed: HashSet::new(),
         pr_dash_filter: None,
@@ -957,15 +987,15 @@ pub async fn run(
     });
 
     // One shared account refresh keeps the dashboard, sidebar PR indicators,
-    // and right-panel PR data current. The existing in-flight key prevents
-    // this timer from overlapping a slow manual refresh.
+    // and right-panel PR data current. One-second ticks also drive the live
+    // freshness message; only a due tick contacts the server.
     tokio::spawn({
         let tx = ctl.tx.clone();
         async move {
-            let mut tick = tokio::time::interval(PR_DASH_REFRESH_INTERVAL);
+            let mut tick = tokio::time::interval(PR_DASH_CLOCK_INTERVAL);
             tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-            // `interval`'s first tick is immediate; opening the dashboard
-            // performs the initial fetch, so wait for the first real period.
+            // `interval`'s first tick is immediate; bootstrap performs the
+            // initial fetch and establishes the first refresh deadline.
             tick.tick().await;
             loop {
                 tick.tick().await;
@@ -2832,6 +2862,7 @@ impl Controller {
 
     /// Kick off one account-level refresh across all configured instances.
     fn refresh_pr_dashboard(&mut self) {
+        self.pr_dash_next_refresh = Some(std::time::Instant::now() + PR_DASH_REFRESH_INTERVAL);
         if self.github_configured
             && !self.offline
             && !self.server_unreachable
@@ -2849,6 +2880,21 @@ impl Controller {
             });
         }
         self.push_pr_dashboard();
+    }
+
+    fn pr_dashboard_refresh_status(&self) -> String {
+        format_pr_dashboard_refresh_status(
+            self.pr_dash_last_refreshed,
+            self.pr_dash_next_refresh,
+            !self.pr_dash_loading.is_empty(),
+            std::time::Instant::now(),
+        )
+    }
+
+    /// Repaint only the one-second freshness clock, leaving the PR models in
+    /// place so delegates and keyboard focus remain stable.
+    fn push_pr_dashboard_refresh_status(&self) {
+        ui::set_pr_dashboard_refresh_status(&self.ui, self.pr_dashboard_refresh_status());
     }
 
     /// Rebuild the dashboard view: reconcile the persisted group order,
@@ -2980,6 +3026,7 @@ impl Controller {
             projects,
             filter_index,
             status_parts.join("\n"),
+            self.pr_dashboard_refresh_status(),
             !self.workspaces.is_empty(),
         );
     }
@@ -4912,10 +4959,6 @@ impl Controller {
                     self.refresh_prs();
                 }
             }
-            UiCommand::RefreshPrs => {
-                self.refresh_pr_dashboard();
-                self.refresh_prs();
-            }
             UiCommand::SelectPr(i) => {
                 if i < self.prs.len() {
                     self.pr_selected = i;
@@ -5557,8 +5600,16 @@ impl Controller {
                     },
                 );
             }
-            UiCommand::RefreshPullRequests => self.refresh_pr_dashboard(),
-            UiCommand::GithubRefreshTick => self.refresh_pr_dashboard(),
+            UiCommand::GithubRefreshTick => {
+                let refresh_due = self
+                    .pr_dash_next_refresh
+                    .is_none_or(|deadline| std::time::Instant::now() >= deadline);
+                if refresh_due {
+                    self.refresh_pr_dashboard();
+                } else {
+                    self.push_pr_dashboard_refresh_status();
+                }
+            }
             UiCommand::PrDashRefreshFinished(workspace_id, result) => {
                 self.pr_dash_loading.remove(&workspace_id);
                 let succeeded = result.is_ok();
@@ -5573,6 +5624,7 @@ impl Controller {
                 // The command result owns progress/error state only; the PR
                 // snapshot itself is folded exclusively from the SSE event.
                 if succeeded {
+                    self.pr_dash_last_refreshed = Some(std::time::Instant::now());
                     self.sync_shared_prs(true);
                 }
                 self.push_pr_dashboard();
@@ -6910,9 +6962,9 @@ fn should_open_chat_at_tail(force_tail: bool, turn_running: bool, has_queue: boo
 mod tests {
     use super::{
         SubscriptionRefresh, SubscriptionRefreshState, approval_pill, attention_badge, check_pill,
-        classify_pr, download_progress, human_age, human_rate, merge_pill, model_health_view,
-        pr_badge, project_session_prs, reconcile_pr_group_order, reconcile_workspace_order,
-        reorder_id, should_open_chat_at_tail, thinking_property,
+        classify_pr, download_progress, format_pr_dashboard_refresh_status, human_age, human_rate,
+        merge_pill, model_health_view, pr_badge, project_session_prs, reconcile_pr_group_order,
+        reconcile_workspace_order, reorder_id, should_open_chat_at_tail, thinking_property,
     };
     use chrono::{Duration, TimeZone, Utc};
     use trouve_protocol::{
@@ -6976,6 +7028,26 @@ mod tests {
             ]
         );
         assert!(!reconcile_pr_group_order(&mut order));
+    }
+
+    #[test]
+    fn pr_dashboard_refresh_status_tracks_last_and_next_refreshes() {
+        let now = std::time::Instant::now();
+        let last = now.checked_sub(std::time::Duration::from_secs(7)).unwrap();
+        let next = now + std::time::Duration::from_millis(12_500);
+        assert_eq!(
+            format_pr_dashboard_refresh_status(Some(last), Some(next), false, now),
+            "Last refreshed 7 seconds ago, next refresh in 13 seconds"
+        );
+        assert_eq!(
+            format_pr_dashboard_refresh_status(
+                None,
+                Some(now + std::time::Duration::from_secs(30)),
+                true,
+                now,
+            ),
+            "Refreshing for the first time, next refresh in 30 seconds"
+        );
     }
 
     fn pr() -> PrInfo {
