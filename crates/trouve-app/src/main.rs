@@ -109,6 +109,11 @@ fn workspace_arg() -> Option<std::path::PathBuf> {
 }
 
 fn main() -> anyhow::Result<()> {
+    // Must precede both the external-server client path and the embedded
+    // server: the final desktop binary links two Rustls provider features,
+    // so automatic provider selection would panic on the first HTTPS call.
+    trouve_server::install_crypto_provider();
+
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),

@@ -33,16 +33,16 @@ jobs:
           RUSTDOCFLAGS: -D warnings
       - name: versions in sync
         run: python3 scripts/sync_versions.py --check
-      # The test-with-model job in test.yml only compiles trouve-search, so
-      # an #[ignore]d test anywhere else would silently never run in CI.
-      # Keep them all in trouve-search, or widen that job's scope on purpose.
+      # The test-with-model job in test.yml runs ignored tests from these two
+      # crates, so an #[ignore]d test anywhere else would silently never run.
+      # Keep them there, or widen that job's scope on purpose.
       # Matches bare #[ignore] and #[cfg_attr(..., ignore)] forms; a comment
       # or string that happens to match fails loudly here, which is cheap to
       # fix, unlike a silently skipped test.
-      - name: ignored tests live in trouve-search
+      - name: ignored tests are covered by the gated job
         run: |
-          if grep -rlnE '#\[(cfg_attr\(.*,[[:space:]]*)?ignore\b' crates --include='*.rs' | grep -v '^crates/trouve-search/'; then
-            echo "Found #[ignore]d tests outside crates/trouve-search — update the test-with-model job in test.yml or move the test" >&2
+          if grep -rlnE '#\[(cfg_attr\(.*,[[:space:]]*)?ignore\b' crates --include='*.rs' | grep -vE '^crates/(trouve-search|trouve-client-core)/'; then
+            echo "Found an #[ignore]d test outside crates covered by test-with-model — update test.yml or move the test" >&2
             exit 1
           fi
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0

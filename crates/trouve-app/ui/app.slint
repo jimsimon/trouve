@@ -973,6 +973,8 @@ component NewChatForm inherits VerticalLayout {
         spacing: 6px;
         Text { text: "Workspace"; color: Theme.c.text-mid; font-size: Theme.fs(12px); font-weight: 700; }
         ComboBox {
+            height: Theme.fs(30px);
+            vertical-stretch: 0;
             model: root.workspaces;
             current-index <=> root.workspace-index;
             enabled: !root.blocked;
@@ -1000,6 +1002,8 @@ component NewChatForm inherits VerticalLayout {
         spacing: 6px;
         Text { text: "Base branch"; color: Theme.c.text-mid; font-size: Theme.fs(12px); font-weight: 700; }
         ComboBox {
+            height: Theme.fs(30px);
+            vertical-stretch: 0;
             model: root.branches;
             current-index <=> root.branch-index;
             enabled: !root.blocked;
@@ -1018,6 +1022,8 @@ component NewChatForm inherits VerticalLayout {
             horizontal-stretch: 1;
             Text { text: "Agent mode"; color: Theme.c.text-mid; font-size: Theme.fs(12px); font-weight: 700; }
             ComboBox {
+                height: Theme.fs(30px);
+                vertical-stretch: 0;
                 model: root.modes;
                 current-index <=> root.mode-index;
                 enabled: !root.blocked;
@@ -1035,6 +1041,8 @@ component NewChatForm inherits VerticalLayout {
             horizontal-stretch: 1;
             Text { text: "Model"; color: Theme.c.text-mid; font-size: Theme.fs(12px); font-weight: 700; }
             SearchPicker {
+                height: Theme.fs(30px);
+                vertical-stretch: 0;
                 up: false;
                 options: root.models;
                 matches: root.model-matches;
@@ -1050,7 +1058,10 @@ component NewChatForm inherits VerticalLayout {
         if root.thinking-options.length > 0: VerticalLayout {
             spacing: 6px; horizontal-stretch: 1;
             Text { text: "Thinking level"; color: Theme.c.text-mid; font-size: Theme.fs(12px); font-weight: 700; }
-            ComboBox { model: root.thinking-options; current-index <=> root.thinking-index; enabled: !root.blocked; }
+            ComboBox {
+                height: Theme.fs(30px); vertical-stretch: 0;
+                model: root.thinking-options; current-index <=> root.thinking-index; enabled: !root.blocked;
+            }
         }
         VerticalLayout {
             spacing: 6px; horizontal-stretch: 1;
@@ -1059,7 +1070,10 @@ component NewChatForm inherits VerticalLayout {
                 color: root.yolo-selected ? Theme.c.err : Theme.c.text-mid;
                 font-size: Theme.fs(12px); font-weight: 700;
             }
-            ComboBox { model: root.permission-options; current-index <=> root.permission-index; enabled: !root.blocked; }
+            ComboBox {
+                height: Theme.fs(30px); vertical-stretch: 0;
+                model: root.permission-options; current-index <=> root.permission-index; enabled: !root.blocked;
+            }
         }
     }
     if root.yolo-selected: Rectangle {
@@ -3732,9 +3746,9 @@ export component AppWindow inherits Window {
                                         font-size: Theme.fs(11px);
                                         vertical-alignment: center;
                                     }
-                                    IconButton {
+                                    if root.queue-idle: IconButton {
                                         icon: "▶";
-                                        tip: root.queue-idle ? "Send this prompt now" : "Run this prompt next";
+                                        tip: "Send now";
                                         enabled: !root.connectivity-blocked;
                                         clicked => { root.queue-send-now-at(qi); }
                                     }
@@ -3974,21 +3988,26 @@ export component AppWindow inherits Window {
                             self.text = "";
                         }
                     }
-                    Button {
+                    VerticalLayout {
                         width: Theme.fs(76px);
-                        text: root.composer-turn-running
-                            ? (composer.text != "" || root.composer-attachments.length > 0 ? "Queue" : "Cancel")
-                            : "Send";
-                        primary: !root.composer-turn-running || composer.text != "" || root.composer-attachments.length > 0;
-                        enabled: root.composer-enabled && !root.connectivity-blocked
-                            && (root.composer-turn-running || composer.text != "" || root.composer-attachments.length > 0);
-                        clicked => {
-                            if (root.composer-turn-running && composer.text == ""
-                                && root.composer-attachments.length == 0) {
-                                root.cancel-turn();
-                            } else {
-                                root.send-message(composer.text);
-                                composer.text = "";
+                        Rectangle { vertical-stretch: 1; }
+                        Button {
+                            height: Theme.fs(34px);
+                            vertical-stretch: 0;
+                            text: root.composer-turn-running
+                                ? (composer.text != "" || root.composer-attachments.length > 0 ? "Queue" : "Cancel")
+                                : "Send";
+                            primary: !root.composer-turn-running || composer.text != "" || root.composer-attachments.length > 0;
+                            enabled: root.composer-enabled && !root.connectivity-blocked
+                                && (root.composer-turn-running || composer.text != "" || root.composer-attachments.length > 0);
+                            clicked => {
+                                if (root.composer-turn-running && composer.text == ""
+                                    && root.composer-attachments.length == 0) {
+                                    root.cancel-turn();
+                                } else {
+                                    root.send-message(composer.text);
+                                    composer.text = "";
+                                }
                             }
                         }
                     }

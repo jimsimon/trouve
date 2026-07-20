@@ -31,6 +31,7 @@ futures = "0.3"
 octocrab = "0.54"
 reqwest = { version = "0.13", default-features = false, features = ["form", "json", "stream", "rustls"] }
 rusqlite = { version = "0.40", features = ["bundled"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 serde = { version = "1.0.228", features = ["derive"] }
 slint = "1.17"
 serde_json = { version = "1.0.150", features = ["preserve_order"] }

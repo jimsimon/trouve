@@ -42,11 +42,10 @@ jobs:
         if: github.ref == 'refs/heads/main'
         run: cargo build --release
 
-  # End-to-end tests that download the embedding model from Hugging Face.
-  # Scoped to trouve-search: it holds every #[ignore]d test in the
-  # workspace (enforced by the "ignored tests" check in lint.yml), and
-  # crate-level scoping skips compiling the Slint/GUI crates — which is
-  # also why this job needs no fontconfig/dbus apt packages.
+  # Opt-in tests: model-backed trouve-search coverage plus loopback protocol
+  # client coverage. These crates hold every #[ignore]d test in the workspace
+  # (enforced by the "ignored tests" check in lint.yml); neither pulls in the
+  # Slint/GUI crates, so this job needs no fontconfig/dbus apt packages.
   test-with-model:
     runs-on: ubuntu-latest
     steps:
@@ -60,6 +59,10 @@ jobs:
           key: hf-potion-code-16m
       - name: Model-backed end-to-end tests
         run: cargo test -p trouve-search -- --ignored
+        env:
+          TROUVE_E2E: "1"
+      - name: Protocol client network tests
+        run: cargo test -p trouve-client-core -- --ignored
         env:
           TROUVE_E2E: "1"
 

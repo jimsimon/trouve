@@ -68,7 +68,6 @@ impl ProtocolClient {
         let resp = self
             .http
             .post(format!("{}{path}", self.base))
-            .json(&serde_json::json!({}))
             .send()
             .await
             .with_context(|| format!("POST {path}"))?;
@@ -948,12 +947,77 @@ async fn decode<T: serde::de::DeserializeOwned>(resp: reqwest::Response, path: &
 
 #[cfg(test)]
 mod tests {
-    use super::urlencode;
+    use super::{ProtocolClient, urlencode};
 
     #[test]
     fn urlencode_percent_encodes_utf8_bytes() {
         assert_eq!(urlencode("src/café.rs"), "src/caf%C3%A9.rs");
         assert_eq!(urlencode("🙂 notes"), "%F0%9F%99%82%20notes");
         assert_eq!(urlencode("a/b~c"), "a/b~c");
+    }
+
+    #[tokio::test]
+    #[ignore = "binds a loopback socket; run with TROUVE_E2E=1 cargo test -- --ignored"]
+    async fn empty_post_has_no_json_body() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        if std::env::var("TROUVE_E2E").ok().as_deref() != Some("1") {
+            eprintln!("skipping: set TROUVE_E2E=1 to run network tests");
+            return;
+        }
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            loop {
+                let mut chunk = [0_u8; 1024];
+                let read = stream.read(&mut chunk).await.unwrap();
+                assert_ne!(read, 0, "request ended before its headers");
+                request.extend_from_slice(&chunk[..read]);
+                if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            let header_end = request
+                .windows(4)
+                .position(|window| window == b"\r\n\r\n")
+                .unwrap()
+                + 4;
+            let (headers, buffered_body) = request.split_at(header_end);
+            let headers = std::str::from_utf8(headers).unwrap();
+            assert!(headers.starts_with("POST /v1/empty HTTP/1.1\r\n"));
+
+            let mut content_length = None;
+            let mut has_transfer_encoding = false;
+            let mut has_content_type = false;
+            for line in headers.lines().skip(1) {
+                let Some((name, value)) = line.split_once(':') else {
+                    continue;
+                };
+                if name.eq_ignore_ascii_case("content-length") {
+                    content_length = Some(value.trim().parse::<u64>().unwrap());
+                } else if name.eq_ignore_ascii_case("transfer-encoding") {
+                    has_transfer_encoding = true;
+                } else if name.eq_ignore_ascii_case("content-type") {
+                    has_content_type = true;
+                }
+            }
+            assert!(content_length.is_none_or(|length| length == 0));
+            assert!(!has_transfer_encoding);
+            assert!(!has_content_type);
+            assert!(buffered_body.is_empty());
+            stream
+                .write_all(b"HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n")
+                .await
+                .unwrap();
+        });
+
+        ProtocolClient::new(&format!("http://{addr}"))
+            .post_empty("/empty")
+            .await
+            .unwrap();
+        server.await.unwrap();
     }
 }
