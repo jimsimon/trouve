@@ -147,6 +147,7 @@ fn main() -> anyhow::Result<()> {
 
     let window = AppWindow::new()?;
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<UiCommand>();
+    let quit_when_idle = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
 
     // Window focus for the controller's notification gate (events on the
     // focused, on-screen thread never pop a desktop notification). Sampled
@@ -819,8 +820,18 @@ fn main() -> anyhow::Result<()> {
     });
     {
         let tx = tx.clone();
+        let quit_when_idle = quit_when_idle.clone();
         window.on_quit_when_idle(move || {
+            quit_when_idle.store(true, std::sync::atomic::Ordering::SeqCst);
             let _ = tx.send(UiCommand::QuitWhenIdle);
+        });
+    }
+    {
+        let tx = tx.clone();
+        let quit_when_idle = quit_when_idle.clone();
+        window.on_cancel_quit_when_idle(move || {
+            quit_when_idle.store(false, std::sync::atomic::Ordering::SeqCst);
+            let _ = tx.send(UiCommand::CancelQuitWhenIdle);
         });
     }
     {
@@ -1266,12 +1277,20 @@ fn main() -> anyhow::Result<()> {
     let geometry_tx = tx.clone();
     let weak = window.as_weak();
     let focused = window_focused.clone();
+    let deferred_quit = quit_when_idle.clone();
     std::thread::spawn(move || {
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()
             .expect("tokio runtime");
-        runtime.block_on(controller::run(weak, tx, rx, focused, workspace_arg()));
+        runtime.block_on(controller::run(
+            weak,
+            tx,
+            rx,
+            focused,
+            deferred_quit,
+            workspace_arg(),
+        ));
     });
 
     // Restore the last window geometry (position picks the monitor too);

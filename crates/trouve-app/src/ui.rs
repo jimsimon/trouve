@@ -553,6 +553,20 @@ pub fn set_agents_running(ui: &Ui, count: i32) {
     let _ = ui.upgrade_in_event_loop(move |ui| ui.set_agents_running(count));
 }
 
+/// Show whether the app is waiting for active agents before quitting.
+pub fn set_quit_when_idle(ui: &Ui, armed: bool) {
+    let _ = ui.upgrade_in_event_loop(move |ui| ui.set_quit_when_idle_armed(armed));
+}
+
+/// Acknowledge deferred-quit cancellation and dismiss its status dialog.
+pub fn finish_cancel_quit_when_idle(ui: &Ui) {
+    let _ = ui.upgrade_in_event_loop(move |ui| {
+        ui.set_quit_when_idle_armed(false);
+        ui.set_quit_cancel_pending(false);
+        ui.set_quit_dialog(false);
+    });
+}
+
 /// Tear down the UI event loop (deferred quit).
 pub fn quit(ui: &Ui) {
     let _ = ui.upgrade_in_event_loop(|_| {

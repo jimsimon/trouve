@@ -1926,8 +1926,11 @@ export component AppWindow inherits Window {
     // turns opens the modal instead of quitting.
     in property <int> agents-running: 0;
     in-out property <bool> quit-dialog: false;
+    in-out property <bool> quit-when-idle-armed: false;
+    in-out property <bool> quit-cancel-pending: false;
     callback quit-now();
     callback quit-when-idle();
+    callback cancel-quit-when-idle();
 
     HorizontalLayout {
         // Hidden (not removed — the chat list keeps its scroll state) while
@@ -5247,16 +5250,22 @@ export component AppWindow inherits Window {
                 spacing: 12px;
 
                 Text {
-                    text: root.agents-running == 1
-                        ? "An agent is still running"
-                        : root.agents-running + " agents are still running";
+                    text: root.quit-when-idle-armed
+                        ? (root.agents-running == 1
+                            ? "Waiting for an agent to finish"
+                            : "Waiting for " + root.agents-running + " active sessions")
+                        : root.agents-running == 1
+                        ? "1 active session is still running"
+                        : root.agents-running + " active sessions are still running";
                     color: Theme.c.text-hi;
                     font-size: Theme.fs(15px);
                     font-weight: 700;
                     wrap: word-wrap;
                 }
                 Text {
-                    text: "Quitting now stops the running work mid-turn. You can also let the agents finish and quit automatically.";
+                    text: root.quit-when-idle-armed
+                        ? "trouve will quit automatically when the running work finishes."
+                        : "Quitting now stops the running work mid-turn. You can also let the agents finish and quit automatically.";
                     color: Theme.c.text-dim;
                     font-size: Theme.fs(12px);
                     wrap: word-wrap;
@@ -5266,13 +5275,23 @@ export component AppWindow inherits Window {
                     spacing: 8px;
                     Rectangle { horizontal-stretch: 1; }
                     Button {
-                        text: "Cancel";
-                        clicked => { root.quit-dialog = false; }
+                        text: root.quit-cancel-pending
+                            ? "Cancelling…"
+                            : root.quit-when-idle-armed ? "Cancel automatic quit" : "Cancel";
+                        enabled: !root.quit-cancel-pending;
+                        clicked => {
+                            if root.quit-when-idle-armed {
+                                root.quit-cancel-pending = true;
+                                root.cancel-quit-when-idle();
+                            } else {
+                                root.quit-dialog = false;
+                            }
+                        }
                     }
-                    Button {
+                    if !root.quit-when-idle-armed: Button {
                         text: "Quit when agents finish";
                         clicked => {
-                            root.quit-dialog = false;
+                            root.quit-when-idle-armed = true;
                             root.quit-when-idle();
                         }
                     }

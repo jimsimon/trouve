@@ -58,6 +58,8 @@ pub enum UiCommand {
     },
     /// Quit once all running agent turns complete.
     QuitWhenIdle,
+    /// Disarm a previously requested deferred quit.
+    CancelQuitWhenIdle,
     /// Native folder picker → register the chosen directory as a workspace.
     OpenWorkspaceDialog,
     /// The "+" on a workspace header row: new session there.
@@ -520,7 +522,9 @@ struct Controller {
     /// (each workspace header's funnel menu toggles its own entry).
     show_archived: HashSet<String>,
     /// Quit once every agent turn finishes (armed from the quit dialog).
-    quit_when_idle: bool,
+    /// Shared with the UI callback so cancellation takes effect before its
+    /// command can race a final session-activity event in this queue.
+    quit_when_idle: std::sync::Arc<std::sync::atomic::AtomicBool>,
 
     threads: Vec<Thread>,
     current_thread: Option<usize>,
@@ -739,6 +743,7 @@ pub async fn run(
     tx: mpsc::UnboundedSender<UiCommand>,
     mut rx: mpsc::UnboundedReceiver<UiCommand>,
     window_focused: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    quit_when_idle: std::sync::Arc<std::sync::atomic::AtomicBool>,
     register_workspace: Option<std::path::PathBuf>,
 ) {
     let (client, server_url, spawned) = match start_local_server().await {
@@ -766,7 +771,7 @@ pub async fn run(
         archived_expanded: HashSet::new(),
         collapsed_workspaces: HashSet::new(),
         show_archived: HashSet::new(),
-        quit_when_idle: false,
+        quit_when_idle,
         threads: Vec::new(),
         current_thread: None,
         github_configured: false,
@@ -1307,6 +1312,7 @@ impl Controller {
             .filter(|s| s.active)
             .map(|s| s.id.clone())
             .collect();
+        self.push_agents_running();
         self.current_session =
             current_id.and_then(|id| self.sessions.iter().position(|s| s.id == id));
         let session_ids: HashSet<String> = self.sessions.iter().map(|s| s.id.clone()).collect();
@@ -1542,13 +1548,20 @@ impl Controller {
         self.drop_workspace(workspace_id, &target_id, target > source);
     }
 
-    /// Push the number of threads with an active turn to the UI (feeds the
-    /// quit-confirmation dialog) and, when a deferred quit is armed, leave
-    /// as soon as that count reaches zero.
+    /// Push the server-authoritative number of active sessions to the UI
+    /// (feeds the quit-confirmation dialog) and, when a deferred quit is
+    /// armed, leave as soon as that count reaches zero.
     fn push_agents_running(&mut self) {
-        let running = self.vms.values().filter(|vm| vm.turn_running).count() as i32;
+        // Cached view models can retain an old `turn_running` bit. Session
+        // activity is seeded by the sessions endpoint and updated by the
+        // global event stream, so it is the source of truth for app quit.
+        let running = self.busy_sessions.len() as i32;
         ui::set_agents_running(&self.ui, running);
-        if self.quit_when_idle && running == 0 {
+        if self
+            .quit_when_idle
+            .load(std::sync::atomic::Ordering::SeqCst)
+            && running == 0
+        {
             ui::quit(&self.ui);
         }
     }
@@ -3749,6 +3762,7 @@ impl Controller {
                 }
                 if changed {
                     self.push_nav();
+                    self.push_agents_running();
                 }
             }
             Event::ThreadCreated {
@@ -5841,8 +5855,15 @@ impl Controller {
                 }
             },
             UiCommand::QuitWhenIdle => {
-                self.quit_when_idle = true;
+                self.quit_when_idle
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
+                ui::set_quit_when_idle(&self.ui, true);
                 self.push_agents_running();
+            }
+            UiCommand::CancelQuitWhenIdle => {
+                self.quit_when_idle
+                    .store(false, std::sync::atomic::Ordering::SeqCst);
+                ui::finish_cancel_quit_when_idle(&self.ui);
             }
         }
         Ok(())
