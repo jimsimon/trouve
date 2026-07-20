@@ -399,9 +399,9 @@ export component SettingsScreen inherits Rectangle {
     callback reduce-motion-toggled(bool);
     callback close();
 
-    // Integrations: per-host GitHub auth state comes from the server —
-    // github.com first, then configured enterprise hosts. Saving an empty
-    // token disconnects a host.
+    // OAuth-only GitHub integrations: github.com first, then configured
+    // enterprise hosts. Hosts are added with an OAuth client id and removed
+    // through the callbacks below.
     in property <[GithubHostItem]> github-hosts;
     callback github-host-added(/* host */ string, /* client-id */ string);
     callback github-host-removed(/* host */ string);

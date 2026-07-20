@@ -208,7 +208,6 @@ pub enum UiCommand {
     /// Internal: a background PR fetch finished (session it was for, PRs or
     /// an error message).
     PrsLoaded(String, Result<Vec<trouve_protocol::PrInfo>, String>),
-    /// Internal: a sidebar-only PR summary fetch finished.
     FileActivated(usize),
     /// Open a worktree-relative file in the user's preferred editor.
     OpenFileExternally(String),
