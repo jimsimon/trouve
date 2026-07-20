@@ -53,8 +53,10 @@ chrono.workspace = true
 uuid.workspace = true
 
 # Prompt attachments: clipboard image paste (arboard), PNG encoding of the
-# pasted RGBA pixels, and MIME sniffing for picked files.
-arboard = "3.6.1"
+# pasted RGBA pixels, and MIME sniffing for picked files. Arboard otherwise
+# builds with an X11-only Linux backend, which cannot see native Wayland
+# clipboard images produced by apps such as KDE Spectacle.
+arboard = { version = "3.6.1", features = ["wayland-data-control"] }
 mime_guess = "2.0.5"
 png = "0.18.1"
 base64 = "0.22"
