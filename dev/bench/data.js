@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1784523425837,
+  "lastUpdate": 1784523479541,
   "repoUrl": "https://github.com/jimsimon/trouve",
   "entries": {
     "e2e-benchmarks": [
@@ -6385,6 +6385,54 @@ window.BENCHMARK_DATA = {
             "name": "dense_query_20k_rows",
             "value": 1371275.9826653553,
             "range": "± 10665",
+            "unit": "ns"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "jim.j.simon@gmail.com",
+            "name": "Jim Simon",
+            "username": "jimsimon"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "d16385cbab37676311ffe79612c3bde42206b274",
+          "message": "Fix merged UI and PR dashboard regressions (#107)\n\n* Fix merged UI and PR dashboard regressions\n\nKeep new-session pickers at their intended height and use a broadly supported pull-request glyph. Send bodyless command POSTs without a synthetic JSON payload, and avoid dashboard fan-out while connectivity is unavailable.\n\n* Keep composer action button compact\n\n* Bottom-align composer action button\n\n* Keep queued prompt action as Send now\n\n* Select Rustls crypto provider at startup\n\nThe desktop dependency graph enables both Ring and AWS-LC, so Rustls cannot infer a process provider and panics on the first GitHub HTTPS request. Install Ring explicitly before either client or embedded-server networking begins.\n\n* Harden empty POST transport test\n\nKeep loopback networking out of the default offline-safe suite and validate the request through HTTP framing instead of packet boundaries.\n\n* Run ignored client network test in CI\n\nExtend the gated TROUVE_E2E job and its coverage guard now that client-core intentionally owns an ignored loopback test.",
+          "timestamp": "2026-07-20T00:55:46-04:00",
+          "tree_id": "e512e7ae6f9e3d43b1d54613b59e3bf105ea140e",
+          "url": "https://github.com/jimsimon/trouve/commit/d16385cbab37676311ffe79612c3bde42206b274"
+        },
+        "date": 1784523478453,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "bm25_build_5k_docs",
+            "value": 4900220.1,
+            "range": "± 6790",
+            "unit": "ns"
+          },
+          {
+            "name": "bm25_query_5k_docs",
+            "value": 37105.11374158249,
+            "range": "± 11",
+            "unit": "ns"
+          },
+          {
+            "name": "chunk_python_200_functions",
+            "value": 2981954.617647059,
+            "range": "± 2358",
+            "unit": "ns"
+          },
+          {
+            "name": "dense_query_20k_rows",
+            "value": 1374593.5472027971,
+            "range": "± 11401",
             "unit": "ns"
           }
         ]
