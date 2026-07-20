@@ -3007,7 +3007,7 @@ impl Controller {
                     .client
                     .create_session(&CreateSessionRequest {
                         workspace_id: workspace.id,
-                        title: Some(session_title(&prompt)),
+                        title: Some(trouve_client_core::title::summarize_session_title(&prompt)),
                         base_ref: self.branches.get(selection.branch_idx).cloned(),
                         fetch_latest: selection.fetch_latest,
                     })
@@ -5864,21 +5864,6 @@ fn human_size(bytes: usize) -> String {
     }
 }
 
-/// Derive a session title from the first prompt: first line, word-truncated.
-fn session_title(prompt: &str) -> String {
-    let line = prompt.lines().next().unwrap_or(prompt).trim();
-    if line.len() <= 48 {
-        return line.to_string();
-    }
-    let mut cut = 48;
-    while cut > 0 && !line.is_char_boundary(cut) {
-        cut -= 1;
-    }
-    let head = &line[..cut];
-    let head = head.rsplit_once(' ').map(|(h, _)| h).unwrap_or(head);
-    format!("{head}…")
-}
-
 fn format_tokens(n: u64) -> String {
     if n >= 1_000_000 {
         format!("{:.1}M", n as f64 / 1_000_000.0)
@@ -6414,7 +6399,7 @@ mod tests {
     use super::{
         approval_pill, attention_badge, check_pill, classify_pr, download_progress, human_age,
         human_rate, pr_badge, reconcile_pr_group_order, reconcile_workspace_order, reorder_id,
-        session_title, should_open_chat_at_tail, thinking_property,
+        should_open_chat_at_tail, thinking_property,
     };
     use chrono::{Duration, TimeZone, Utc};
     use trouve_protocol::{CheckRun, PrInfo, PrReview, Workspace};
@@ -6659,18 +6644,6 @@ mod tests {
         assert_eq!(human_rate(850e3), " · 850 kB/s");
         assert_eq!(human_rate(120.0), " · 120 B/s");
     }
-
-    #[test]
-    fn session_title_truncates_at_word_boundary() {
-        assert_eq!(session_title("Fix the login bug"), "Fix the login bug");
-        let long = "Refactor the authentication middleware to support refresh tokens";
-        let title = session_title(long);
-        assert!(title.ends_with('…'));
-        assert!(title.len() <= 50);
-        assert!(!title.contains('\n'));
-        assert_eq!(session_title("first line\nsecond"), "first line");
-    }
-
     #[test]
     fn thinking_picker_requires_a_model_advertised_enum() {
         let supported = serde_json::json!({
