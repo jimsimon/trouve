@@ -858,6 +858,9 @@ echo '{"jsonrpc":"2.0","method":"item/agentMessage/delta","params":{"threadId":"
 echo '{"jsonrpc":"2.0","method":"item/completed","params":{"threadId":"thr-1","item":{"id":"thinking-1","type":"agentMessage","text":"Checking the workspace.","phase":"commentary"}}}'
 echo '{"jsonrpc":"2.0","method":"item/started","params":{"threadId":"thr-1","item":{"id":"i1","type":"agentMessage","text":"","phase":"final_answer"}}}'
 echo '{"jsonrpc":"2.0","method":"item/agentMessage/delta","params":{"threadId":"thr-1","itemId":"i1","delta":"Hello"}}'
+echo '{"jsonrpc":"2.0","method":"item/started","params":{"threadId":"thr-1","item":{"id":"reasoning-1","type":"reasoning","summary":[],"content":[]}}}'
+echo '{"jsonrpc":"2.0","method":"item/reasoning/textDelta","params":{"threadId":"thr-1","itemId":"reasoning-1","delta":"Raw reasoning."}}'
+echo '{"jsonrpc":"2.0","method":"item/completed","params":{"threadId":"thr-1","item":{"id":"reasoning-1","type":"reasoning","summary":[],"content":["Raw reasoning."]}}}'
 echo '{"jsonrpc":"2.0","method":"item/started","params":{"threadId":"thr-1","item":{"id":"c1","type":"commandExecution","command":"ls"}}}'
 echo '{"jsonrpc":"2.0","id":100,"method":"item/commandExecution/requestApproval","params":{"threadId":"thr-1","itemId":"c1","command":"ls"}}'
 IFS= read -r approval
@@ -875,7 +878,7 @@ cat > /dev/null
     })
     .await;
 
-    let mut saw_thinking = false;
+    let mut thinking = Vec::new();
     let mut saw_text = false;
     let mut saw_tool_started = false;
     let mut saw_tool_output = false;
@@ -885,7 +888,7 @@ cat > /dev/null
     while let Some(ev) = stream.next().await {
         match ev.unwrap() {
             BackendEvent::SessionStarted { session_id } => sessions.push(session_id),
-            BackendEvent::ThinkingDelta(t) => saw_thinking |= t == "Checking the workspace.",
+            BackendEvent::ThinkingDelta(t) => thinking.push(t),
             BackendEvent::TextDelta(t) => saw_text |= t == "Hello",
             BackendEvent::ToolStarted { call_id, .. } => saw_tool_started |= call_id == "c1",
             BackendEvent::ToolOutput { call_id, .. } => saw_tool_output |= call_id == "c1",
@@ -908,7 +911,19 @@ cat > /dev/null
     }
 
     assert_eq!(sessions, vec!["thr-1"]);
-    assert!(saw_thinking);
+    assert!(
+        thinking
+            .iter()
+            .any(|text| text == "Checking the workspace.")
+    );
+    assert_eq!(
+        thinking
+            .iter()
+            .filter(|text| text.as_str() == "Raw reasoning.")
+            .count(),
+        1,
+        "completed reasoning must not repeat a streamed raw delta: {thinking:?}"
+    );
     assert!(saw_text && saw_tool_started && saw_tool_output && saw_tool_completed);
     let usage = usage.expect("turn completed");
     assert_eq!(usage.input_tokens, 11);
