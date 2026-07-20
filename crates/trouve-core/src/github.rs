@@ -282,6 +282,16 @@ fn pr_head_matches_evidence(
         })
 }
 
+fn same_repository(left: &str, right: &str) -> bool {
+    left.eq_ignore_ascii_case(right)
+}
+
+fn normalized_head_label(name_with_owner: &str, branch: &str) -> Option<String> {
+    name_with_owner
+        .split_once('/')
+        .map(|(owner, _)| format!("{}:{branch}", owner.to_ascii_lowercase()))
+}
+
 /// Token from the environment for `host`. github.com reads
 /// `GITHUB_TOKEN` / `GH_TOKEN`; enterprise hosts read
 /// `GH_ENTERPRISE_TOKEN` / `GITHUB_ENTERPRISE_TOKEN` (the gh CLI's own
@@ -702,9 +712,9 @@ impl GitHubGraphql {
             .flat_map(|repository| repository.pull_requests.nodes)
             .flatten()
             .filter(|pr| {
-                pr.head_repository
-                    .as_ref()
-                    .is_some_and(|repository| repository.name_with_owner == head_repository)
+                pr.head_repository.as_ref().is_some_and(|repository| {
+                    same_repository(&repository.name_with_owner, &head_repository)
+                })
             })
             .map(|pr| pr.into_pr_info(&self.host))
             .collect();
@@ -772,10 +782,7 @@ impl GitHubGraphql {
             let page = repository.pull_requests;
             for pr in page.nodes.into_iter().flatten() {
                 let label = pr.head_repository.as_ref().and_then(|repository| {
-                    repository
-                        .name_with_owner
-                        .split_once('/')
-                        .map(|(owner, _)| format!("{owner}:{}", pr.head_ref_name))
+                    normalized_head_label(&repository.name_with_owner, &pr.head_ref_name)
                 });
                 if pr_head_matches_evidence(
                     &pr.head_ref_name,
@@ -1226,6 +1233,15 @@ mod tests {
             &[],
             &HashSet::from(["9f2c6d8b18c86d48ca2c3f58191f9f5277b9269a".into()]),
         ));
+    }
+
+    #[test]
+    fn repository_matching_and_head_labels_normalize_owner_case() {
+        assert!(same_repository("JimSimon/Trouve", "jimsimon/trouve"));
+        assert_eq!(
+            normalized_head_label("JimSimon/Trouve", "fix/graphql-refresh"),
+            Some("jimsimon:fix/graphql-refresh".into())
+        );
     }
 
     #[test]

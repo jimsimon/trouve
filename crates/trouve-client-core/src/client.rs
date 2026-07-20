@@ -949,7 +949,14 @@ async fn decode_empty(resp: reqwest::Response, path: &str) -> Result<()> {
 fn response_error(path: &str, status: reqwest::StatusCode, bytes: &[u8]) -> anyhow::Error {
     let message = serde_json::from_slice::<ErrorBody>(bytes)
         .map(|error| error.message)
-        .unwrap_or_else(|_| String::from_utf8_lossy(bytes).to_string());
+        .unwrap_or_else(|_| {
+            let message = String::from_utf8_lossy(bytes);
+            if message.is_empty() {
+                status.to_string()
+            } else {
+                message.into_owned()
+            }
+        });
     anyhow::anyhow!("{path}: {message} ({status})")
 }
 
@@ -974,6 +981,28 @@ mod tests {
         assert_eq!(
             error.to_string(),
             "/github/prs/refresh: github.com: API rate limit exceeded (400 Bad Request)"
+        );
+    }
+
+    #[test]
+    fn bodyless_error_response_uses_http_status_as_message() {
+        let error = response_error("/github/prs/refresh", reqwest::StatusCode::BAD_REQUEST, b"");
+        assert_eq!(
+            error.to_string(),
+            "/github/prs/refresh: 400 Bad Request (400 Bad Request)"
+        );
+    }
+
+    #[test]
+    fn non_json_error_response_preserves_raw_body() {
+        let error = response_error(
+            "/github/prs/refresh",
+            reqwest::StatusCode::BAD_GATEWAY,
+            b"upstream unavailable",
+        );
+        assert_eq!(
+            error.to_string(),
+            "/github/prs/refresh: upstream unavailable (502 Bad Gateway)"
         );
     }
 
