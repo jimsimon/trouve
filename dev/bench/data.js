@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1784530613396,
+  "lastUpdate": 1784530654192,
   "repoUrl": "https://github.com/jimsimon/trouve",
   "entries": {
     "e2e-benchmarks": [
@@ -7057,6 +7057,54 @@ window.BENCHMARK_DATA = {
             "name": "dense_query_20k_rows",
             "value": 1223723.6753432495,
             "range": "± 8817",
+            "unit": "ns"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "jim.j.simon@gmail.com",
+            "name": "Jim Simon",
+            "username": "jimsimon"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "c1ea35518dbaed65c6847782b71bdaeface9013e",
+          "message": "Add workspace close action (#70)\n\n* Add workspace close action\n\nKeep sessions and worktrees intact when a workspace is closed, and reopen it when the same folder is registered again. Expose the lifecycle over the versioned protocol and consolidate workspace header actions into an overflow menu.\n\n* Address workspace close review feedback\n\nRefresh workspace state from server lifecycle events so multiple clients stay synchronized. Add HTTP coverage for closing, hiding, and reopening a workspace.\n\n* Update OpenAPI snapshot after rebase\n\n* Keep closed workspace state consistent\n\nReset all session-derived panels when closing the active workspace, resynchronize the home workspace for local and remote lifecycle changes, and reject new session or automation activity until a closed workspace is reopened.\n\n* Clear active session on remote workspace close\n\nShare the complete session-derived UI reset between direct and server-event workspace closure paths.",
+          "timestamp": "2026-07-20T02:54:00-04:00",
+          "tree_id": "a968832695f8a934e89c5cae8f632ce344edec20",
+          "url": "https://github.com/jimsimon/trouve/commit/c1ea35518dbaed65c6847782b71bdaeface9013e"
+        },
+        "date": 1784530653700,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "bm25_build_5k_docs",
+            "value": 4835958.7,
+            "range": "± 12192",
+            "unit": "ns"
+          },
+          {
+            "name": "bm25_query_5k_docs",
+            "value": 36734.318152218155,
+            "range": "± 12",
+            "unit": "ns"
+          },
+          {
+            "name": "chunk_python_200_functions",
+            "value": 3019246.382352941,
+            "range": "± 1834",
+            "unit": "ns"
+          },
+          {
+            "name": "dense_query_20k_rows",
+            "value": 1381183.1304938272,
+            "range": "± 10901",
             "unit": "ns"
           }
         ]
