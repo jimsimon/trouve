@@ -76,6 +76,16 @@ export struct TodoUiItem {
     status: int,
 }
 
+// Subscription health aligned with the model catalog. The same provider
+// summary is repeated for each of its models so fuzzy-search results remain
+// self-contained even when providers are interleaved.
+export struct ModelHealthItem {
+    summary: string,
+    detail: string,
+    // 0 neutral/unmetered, 1 healthy, 2 warning, 3 unavailable/exhausted.
+    tone: int,
+}
+
 // One pull request in the Pull Requests tab. Checks and reviews come
 // pre-rendered as multi-line text (one entry per line).
 export struct PrItem {
@@ -290,6 +300,7 @@ component DropUpPicker inherits Rectangle {
 // match first), so the popup just renders whatever the harness returns.
 component SearchPicker inherits Rectangle {
     in property <[string]> options;
+    in property <[ModelHealthItem]> health;
     in-out property <int> current-index: -1;
     in property <bool> enabled: true;
     in property <string> placeholder: "select…";
@@ -319,7 +330,7 @@ component SearchPicker inherits Rectangle {
         close-policy: close-on-click-outside;
         x: 0;
         y: root.up ? -root.popup-h - 8px : root.height + 4px;
-        width: max(root.width, 260px);
+        width: max(root.width, 480px);
         height: root.popup-h;
 
         Rectangle {
@@ -370,14 +381,42 @@ component SearchPicker inherits Rectangle {
                                 popup.close();
                             }
                         }
-                        Text {
-                            x: 8px;
-                            width: parent.width - 16px;
-                            text: root.options[oi];
-                            color: Theme.c.text;
-                            font-size: Theme.fs(12px);
-                            vertical-alignment: center;
-                            overflow: elide;
+                        HorizontalLayout {
+                            padding-left: 8px;
+                            padding-right: 8px;
+                            spacing: 8px;
+                            Text {
+                                text: root.options[oi];
+                                color: Theme.c.text;
+                                font-size: Theme.fs(12px);
+                                vertical-alignment: center;
+                                overflow: elide;
+                                horizontal-stretch: 1;
+                            }
+                            if oi >= 0 && oi < root.health.length
+                                && root.health[oi].summary != "": HorizontalLayout {
+                                spacing: 5px;
+                                Rectangle {
+                                    width: 7px;
+                                    height: 7px;
+                                    border-radius: 3.5px;
+                                    y: (parent.height - self.height) / 2;
+                                    background: root.health[oi].tone == 3 ? Theme.c.err
+                                        : root.health[oi].tone == 2 ? Theme.c.warn
+                                        : root.health[oi].tone == 1 ? Theme.c.ok
+                                        : Theme.c.text-faint;
+                                }
+                                Text {
+                                    text: root.health[oi].summary;
+                                    color: root.health[oi].tone == 3 ? Theme.c.err-soft
+                                        : root.health[oi].tone == 2 ? Theme.c.warn
+                                        : Theme.c.text-dim;
+                                    font-size: Theme.fs(11px);
+                                    vertical-alignment: center;
+                                    overflow: elide;
+                                    max-width: 190px;
+                                }
+                            }
                         }
                     }
                 }
@@ -412,6 +451,91 @@ component SearchPicker inherits Rectangle {
             color: Theme.c.text-soft;
             font-size: Theme.fs(10px);
             vertical-alignment: center;
+        }
+    }
+}
+
+// Persistent health for the provider behind the selected model. Clicking it
+// opens the same complete usage snapshot summarized in the picker rows.
+component SubscriptionHealthPill inherits Rectangle {
+    in property <string> summary;
+    in property <string> detail;
+    in property <int> tone;
+
+    width: min(health-label.preferred-width + 30px, 170px);
+    height: Theme.fs(30px);
+    border-radius: 6px;
+    background: root.tone == 3 ? Theme.c.err-bg
+        : root.tone == 2 ? Theme.c.warn-bg
+        : root.tone == 1 ? Theme.c.agent-bg
+        : Theme.c.pill-bg;
+    border-width: 1px;
+    border-color: pill-focus.has-focus ? Theme.c.accent
+        : root.tone == 3 ? Theme.c.err
+        : root.tone == 2 ? Theme.c.warn-border
+        : root.tone == 1 ? Theme.c.agent-border
+        : Theme.c.border;
+
+    detail-popup := PopupWindow {
+        close-policy: close-on-click-outside;
+        // Right-align the wider detail card to the compact pill so it stays
+        // inside the chat column at narrower window sizes.
+        x: root.width - self.width;
+        y: -self.height - 8px;
+        width: 360px;
+        height: detail-text.preferred-height + 24px;
+        Rectangle {
+            background: Theme.c.popup-bg;
+            border-radius: 7px;
+            border-width: 1px;
+            border-color: Theme.c.border-strong;
+            detail-text := Text {
+                x: 12px;
+                y: 12px;
+                width: parent.width - 24px;
+                text: root.detail;
+                color: Theme.c.text-mid;
+                font-size: Theme.fs(11px);
+                wrap: word-wrap;
+            }
+        }
+    }
+
+    pill-focus := FocusScope {
+        key-pressed(event) => {
+            if (event.text == Key.Return || event.text == " ") {
+                detail-popup.show();
+                return accept;
+            }
+            return reject;
+        }
+    }
+    pill-ta := TouchArea {
+        mouse-cursor: pointer;
+        clicked => { detail-popup.show(); }
+    }
+    HorizontalLayout {
+        padding-left: 9px;
+        padding-right: 9px;
+        spacing: 6px;
+        Rectangle {
+            width: 7px;
+            height: 7px;
+            border-radius: 3.5px;
+            y: (parent.height - self.height) / 2;
+            background: root.tone == 3 ? Theme.c.err
+                : root.tone == 2 ? Theme.c.warn
+                : root.tone == 1 ? Theme.c.ok
+                : Theme.c.text-faint;
+        }
+        health-label := Text {
+            text: root.summary;
+            color: root.tone == 3 ? Theme.c.err-soft
+                : root.tone == 2 ? Theme.c.warn
+                : Theme.c.text-mid;
+            font-size: Theme.fs(11px);
+            vertical-alignment: center;
+            overflow: elide;
         }
     }
 }
@@ -918,6 +1042,7 @@ component NewChatForm inherits VerticalLayout {
     // a mode jumps the model picker to its default.
     in property <[int]> mode-model-indices;
     in property <[string]> models;
+    in property <[ModelHealthItem]> model-health;
     in property <[int]> model-matches;
     in-out property <int> model-index;
     in property <[string]> thinking-options;
@@ -1045,6 +1170,7 @@ component NewChatForm inherits VerticalLayout {
                 vertical-stretch: 0;
                 up: false;
                 options: root.models;
+                health: root.model-health;
                 matches: root.model-matches;
                 current-index <=> root.model-index;
                 enabled: !root.blocked;
@@ -1630,6 +1756,9 @@ export component AppWindow inherits Window {
     // models (-1 = none/global default).
     in property <[int]> mode-model-indices;
     in property <[string]> models;
+    // Aligned with models; empty entries mean the provider does not expose
+    // subscription state through the harness.
+    in property <[ModelHealthItem]> model-health;
     // Fuzzy-filtered model indices for the search pickers (Rust computes;
     // only one picker popup is ever open, so the state is shared).
     in property <[int]> model-filter-matches;
@@ -2686,6 +2815,7 @@ export component AppWindow inherits Window {
                     mode-model-indices: root.mode-model-indices;
                     mode-index <=> root.nc-mode-index;
                     models: root.models;
+                    model-health: root.model-health;
                     model-matches: root.model-filter-matches;
                     model-index <=> root.nc-model-index;
                     thinking-options: root.nc-thinking-options;
@@ -4072,7 +4202,16 @@ export component AppWindow inherits Window {
                     }
                     }
 
-                    HorizontalLayout {
+                    // Model-specific knobs can exceed the center column at
+                    // the minimum window width. Keep every control reachable
+                    // in one compact row with an as-needed horizontal bar.
+                    composer-controls-scroll := ScrollView {
+                    vertical-stretch: 0;
+                    vertical-scrollbar-policy: ScrollBarPolicy.always-off;
+                    horizontal-scrollbar-policy: ScrollBarPolicy.as-needed;
+                    height: composer-controls.preferred-height
+                        + (composer-controls.preferred-width > self.width ? 14px : 0px);
+                    composer-controls := HorizontalLayout {
                     spacing: 8px;
                     vertical-stretch: 0;
                     VerticalLayout {
@@ -4093,12 +4232,23 @@ export component AppWindow inherits Window {
                         SearchPicker {
                             width: 210px;
                             options: root.models;
+                            health: root.model-health;
                             matches: root.model-filter-matches;
                             current-index <=> root.model-index;
                             enabled: root.composer-enabled && !root.connectivity-blocked;
                             placeholder: "model";
                             changed(i) => { root.composer-model-changed(i); }
                             filter-edited(q) => { root.model-filter-changed(q); }
+                        }
+                    }
+                    if root.model-index >= 0 && root.model-index < root.model-health.length
+                        && root.model-health[root.model-index].summary != "": VerticalLayout {
+                        spacing: 2px;
+                        Text { text: "Subscription"; color: Theme.c.text-faint; font-size: Theme.fs(10px); }
+                        SubscriptionHealthPill {
+                            summary: root.model-health[root.model-index].summary;
+                            detail: root.model-health[root.model-index].detail;
+                            tone: root.model-health[root.model-index].tone;
                         }
                     }
                     if root.thinking-options.length > 0: VerticalLayout {
@@ -4254,6 +4404,7 @@ export component AppWindow inherits Window {
                         overflow: elide;
                     }
                     }
+                    }
                 }
                 }
             }
@@ -4271,6 +4422,7 @@ export component AppWindow inherits Window {
                 mode-model-indices: root.mode-model-indices;
                 mode-index <=> root.nc-mode-index;
                 models: root.models;
+                model-health: root.model-health;
                 model-matches: root.model-filter-matches;
                 model-index <=> root.nc-model-index;
                 thinking-options: root.nc-thinking-options;
