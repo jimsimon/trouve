@@ -536,8 +536,11 @@ fn main() -> anyhow::Result<()> {
     }
     {
         let tx = tx.clone();
-        window.on_nc_model_changed(move |i| {
-            let _ = tx.send(UiCommand::NewChatModelChanged(i.max(0) as usize));
+        window.on_nc_model_changed(move |mode, model| {
+            let _ = tx.send(UiCommand::NewChatModelChanged {
+                mode_idx: mode.max(0) as usize,
+                model_idx: model.max(0) as usize,
+            });
         });
     }
     {
