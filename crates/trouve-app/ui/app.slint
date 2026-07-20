@@ -2004,6 +2004,45 @@ export component AppWindow inherits Window {
                     }
                 }
 
+                Rectangle {
+                    height: Theme.fs(34px);
+                    border-radius: 6px;
+                    background: settings-ta.has-hover ? Theme.c.hover-bg : Theme.c.raised-bg;
+                    settings-ta := TouchArea {
+                        clicked => { root.open-settings(); }
+                    }
+                    HorizontalLayout {
+                        padding-left: 10px;
+                        padding-right: 10px;
+                        spacing: 8px;
+                        Text {
+                            text: "⚙";
+                            color: Theme.c.text-mid;
+                            font-size: Theme.fs(14px);
+                            vertical-alignment: center;
+                        }
+                        Text {
+                            text: "Settings";
+                            color: Theme.c.text-hi;
+                            font-size: Theme.fs(13px);
+                            font-weight: 700;
+                            vertical-alignment: center;
+                            horizontal-stretch: 1;
+                        }
+                    }
+                }
+
+                Rectangle {
+                    height: Theme.fs(9px);
+                    Rectangle {
+                        x: 6px;
+                        y: (parent.height - self.height) / 2;
+                        width: parent.width - 12px;
+                        height: 1px;
+                        background: Theme.c.border;
+                    }
+                }
+
                 HorizontalLayout {
                     Text {
                         text: "Workspaces";
@@ -2447,18 +2486,6 @@ export component AppWindow inherits Window {
                 }
                 }
 
-                // Footer: settings gear (bottom-left, app-level convention).
-                HorizontalLayout {
-                    IconButton {
-                        icon: "⚙";
-                        tip: "Settings";
-                        width: 28px;
-                        height: 28px;
-                        icon-size: Theme.fs(18px);
-                        clicked => { root.open-settings(); }
-                    }
-                    Rectangle { horizontal-stretch: 1; }
-                }
             }
         }
 
