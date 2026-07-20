@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1784535156166,
+  "lastUpdate": 1784535201773,
   "repoUrl": "https://github.com/jimsimon/trouve",
   "entries": {
     "e2e-benchmarks": [
@@ -7537,6 +7537,54 @@ window.BENCHMARK_DATA = {
             "name": "dense_query_20k_rows",
             "value": 1377190.7665688433,
             "range": "± 5777",
+            "unit": "ns"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "jim.j.simon@gmail.com",
+            "name": "Jim Simon",
+            "username": "jimsimon"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "a921c6673de2cdff3cdda5e5c565b29f751d8022",
+          "message": "Show subscription health in model picker (#84)\n\n* Show subscription health in model picker\n\n* Address subscription health review feedback\n\n* Harden subscription refresh and composer layout\n\n* Refresh subscriptions after batched turns",
+          "timestamp": "2026-07-20T04:11:15-04:00",
+          "tree_id": "d458660358b5a122dea88782c7e26e4f097c90c1",
+          "url": "https://github.com/jimsimon/trouve/commit/a921c6673de2cdff3cdda5e5c565b29f751d8022"
+        },
+        "date": 1784535201245,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "bm25_build_5k_docs",
+            "value": 4895781.181818182,
+            "range": "± 9437",
+            "unit": "ns"
+          },
+          {
+            "name": "bm25_query_5k_docs",
+            "value": 36656.40686550152,
+            "range": "± 16",
+            "unit": "ns"
+          },
+          {
+            "name": "chunk_python_200_functions",
+            "value": 3036923.970588235,
+            "range": "± 1334",
+            "unit": "ns"
+          },
+          {
+            "name": "dense_query_20k_rows",
+            "value": 1384565.8092105263,
+            "range": "± 7695",
             "unit": "ns"
           }
         ]
