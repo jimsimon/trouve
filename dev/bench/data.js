@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1784529571294,
+  "lastUpdate": 1784529743367,
   "repoUrl": "https://github.com/jimsimon/trouve",
   "entries": {
     "e2e-benchmarks": [
@@ -3407,6 +3407,54 @@ window.BENCHMARK_DATA = {
             "name": "non-git warm query",
             "value": 65.47559312000001,
             "range": "± 2.2",
+            "unit": "ms"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "jim.j.simon@gmail.com",
+            "name": "Jim Simon",
+            "username": "jimsimon"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "847e3b0d9f9a58058130902a4ded10ee9dec875c",
+          "message": "Tighten pull request dashboard spacing (#110)",
+          "timestamp": "2026-07-20T02:41:10-04:00",
+          "tree_id": "6fbdc97272b5c79539dc28c40246cf5b7a092b12",
+          "url": "https://github.com/jimsimon/trouve/commit/847e3b0d9f9a58058130902a4ded10ee9dec875c"
+        },
+        "date": 1784529742955,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "cold index + query",
+            "value": 121.43013576000001,
+            "range": "± 7",
+            "unit": "ms"
+          },
+          {
+            "name": "warm query",
+            "value": 67.36844434,
+            "range": "± 2.4",
+            "unit": "ms"
+          },
+          {
+            "name": "incremental (1 file modified)",
+            "value": 78.56182868,
+            "range": "± 1.2",
+            "unit": "ms"
+          },
+          {
+            "name": "non-git warm query",
+            "value": 64.81926724,
+            "range": "± 1.6",
             "unit": "ms"
           }
         ]
