@@ -7,7 +7,7 @@
       "name": "MIT",
       "identifier": "MIT"
     },
-    "version": "1.3"
+    "version": "1.4"
   },
   "paths": {
     "/v1/approvals": {
@@ -2826,6 +2826,74 @@
         }
       }
     },
+    "/v1/threads/{id}/commands": {
+      "post": {
+        "tags": [],
+        "operationId": "execute_command",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ExecuteCommandRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CommandResult"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/v1/threads/{id}/messages": {
       "post": {
         "tags": [],
@@ -3826,9 +3894,62 @@
           }
         }
       },
+      "CommandAction": {
+        "oneOf": [
+          {
+            "type": "object",
+            "required": [
+              "type"
+            ],
+            "properties": {
+              "type": {
+                "type": "string",
+                "enum": [
+                  "none"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "description": "Select a newly created thread.",
+            "required": [
+              "thread_id",
+              "type"
+            ],
+            "properties": {
+              "thread_id": {
+                "$ref": "#/components/schemas/String"
+              },
+              "type": {
+                "type": "string",
+                "enum": [
+                  "switch_thread"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "description": "Reveal and attach the current session's integrated terminal.",
+            "required": [
+              "type"
+            ],
+            "properties": {
+              "type": {
+                "type": "string",
+                "enum": [
+                  "open_terminal"
+                ]
+              }
+            }
+          }
+        ],
+        "description": "Client-side action that follows a completed command. Persistent state is\nstill reported through the event log; these are navigation hints only."
+      },
       "CommandInfo": {
         "type": "object",
-        "description": "One slash command / skill the vendor harness accepts in prompts (e.g.\n\"/simplify\"), surfaced by clients as prompt-box completions.",
+        "description": "One slash command or skill accepted by Trouve, surfaced by clients as a\nprompt-box completion.",
         "required": [
           "name"
         ],
@@ -3836,9 +3957,45 @@
           "description": {
             "type": "string"
           },
+          "kind": {
+            "$ref": "#/components/schemas/CommandKind",
+            "description": "Whether submitting this command starts a model turn or executes a\ndeterministic Trouve action."
+          },
           "name": {
             "type": "string",
             "description": "Name without the leading slash."
+          },
+          "usage": {
+            "type": "string",
+            "description": "User-facing invocation syntax, including the leading slash."
+          }
+        }
+      },
+      "CommandKind": {
+        "type": "string",
+        "description": "How a slash command is dispatched by clients.",
+        "enum": [
+          "prompt",
+          "action"
+        ]
+      },
+      "CommandResult": {
+        "type": "object",
+        "description": "Result of a deterministic slash command.",
+        "required": [
+          "name",
+          "output"
+        ],
+        "properties": {
+          "action": {
+            "$ref": "#/components/schemas/CommandAction",
+            "description": "Optional client navigation requested by the command."
+          },
+          "name": {
+            "type": "string"
+          },
+          "output": {
+            "type": "string"
           }
         }
       },
@@ -4426,7 +4583,55 @@
           },
           {
             "type": "object",
-            "description": "The slash commands / skills the vendor harness currently accepts in\nprompts. Replaces any previously announced list for the thread.",
+            "description": "Trouve's authoritative slash-command and skill catalog for this\nthread. Replaces any previously announced catalog.",
+            "required": [
+              "commands",
+              "type"
+            ],
+            "properties": {
+              "commands": {
+                "type": "array",
+                "items": {
+                  "$ref": "#/components/schemas/CommandInfo"
+                }
+              },
+              "type": {
+                "type": "string",
+                "enum": [
+                  "thread.command_catalog_updated"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "description": "A deterministic Trouve command completed. The output is persisted so\nreplay and every client render the same command history.",
+            "required": [
+              "name",
+              "output",
+              "type"
+            ],
+            "properties": {
+              "arguments": {
+                "type": "string"
+              },
+              "name": {
+                "type": "string"
+              },
+              "output": {
+                "type": "string"
+              },
+              "type": {
+                "type": "string",
+                "enum": [
+                  "thread.command_executed"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "description": "Legacy vendor-reported slash commands / skills. Kept for replay of\nexisting event logs; new turns publish CommandCatalogUpdated instead.",
             "required": [
               "commands",
               "type"
@@ -4967,6 +5172,23 @@
           }
         ],
         "description": "The envelope every event is delivered in (and persisted as)."
+      },
+      "ExecuteCommandRequest": {
+        "type": "object",
+        "description": "Execute one deterministic Trouve slash command. Prompt commands from the\ncatalog continue to use `SendMessageRequest` so they start a model turn.",
+        "required": [
+          "name"
+        ],
+        "properties": {
+          "arguments": {
+            "type": "string",
+            "description": "Everything following the command name, without leading whitespace."
+          },
+          "name": {
+            "type": "string",
+            "description": "Catalog name without the leading slash."
+          }
+        }
       },
       "FileContent": {
         "type": "object",
@@ -5751,6 +5973,14 @@
           }
         }
       },
+      "ProviderCapabilityMode": {
+        "type": "string",
+        "description": "Who controls the agent-facing capability surface for this provider.",
+        "enum": [
+          "authoritative",
+          "compatibility"
+        ]
+      },
       "ProviderInfo": {
         "type": "object",
         "description": "A configured provider, with secrets elided.",
@@ -5770,6 +6000,10 @@
               "string",
               "null"
             ]
+          },
+          "capability_mode": {
+            "$ref": "#/components/schemas/ProviderCapabilityMode",
+            "description": "Whether the provider receives Trouve's authoritative agent surface or\nruns with a mixed vendor/Trouve compatibility surface."
           },
           "category": {
             "type": "string",

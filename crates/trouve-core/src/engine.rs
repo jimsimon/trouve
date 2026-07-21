@@ -5,6 +5,7 @@
 //! serialized per session (threads share the session worktree, ADR 0003).
 
 use std::collections::{HashMap, HashSet};
+use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, RwLock};
 
@@ -12,10 +13,11 @@ use anyhow::{Context, Result, anyhow, bail};
 use futures::{FutureExt, StreamExt};
 use trouve_agents::{AgentBackend, BackendEvent, BackendPermission, BackendTurn};
 use trouve_protocol::{
-    AgentMode, ApprovalDecision, BranchList, CreateSessionRequest, CreateThreadRequest, Event,
-    ProviderInfo, ProvidersResponse, RestoreDirection, Scope, Session, Thread, ToolStatus,
-    TurnAccepted, UpdateSessionRequest, UpdateThreadRequest, UpsertProviderRequest, Usage,
-    Workspace,
+    AgentMode, ApprovalDecision, BranchList, CommandAction, CommandInfo, CommandResult,
+    CreateSessionRequest, CreateThreadRequest, Event, ExecuteCommandRequest, PermissionMode,
+    ProviderCapabilityMode, ProviderInfo, ProvidersResponse, RestoreDirection, Scope, Session,
+    Thread, ToolStatus, TurnAccepted, UpdateSessionRequest, UpdateThreadRequest,
+    UpsertProviderRequest, Usage, Workspace,
 };
 use trouve_providers::{Message, Provider, ProviderEvent, ToolSpec};
 
@@ -123,6 +125,62 @@ fn normalize_thinking_option(
     if let Some(selected) = selected {
         options.insert(key.into(), serde_json::Value::String(selected));
     }
+}
+
+fn require_no_command_arguments(
+    spec: &crate::commands::CommandSpec,
+    arguments: &str,
+) -> Result<(), EngineError> {
+    if arguments.is_empty() {
+        Ok(())
+    } else {
+        Err(EngineError::BadRequest(format!("usage: {}", spec.usage)))
+    }
+}
+
+fn single_command_argument<'a>(
+    spec: &crate::commands::CommandSpec,
+    arguments: &'a str,
+) -> Result<&'a str, EngineError> {
+    let mut parts = arguments.split_whitespace();
+    let Some(value) = parts.next() else {
+        return Err(EngineError::BadRequest(format!("usage: {}", spec.usage)));
+    };
+    if parts.next().is_some() {
+        return Err(EngineError::BadRequest(format!("usage: {}", spec.usage)));
+    }
+    Ok(value)
+}
+
+fn permission_name(mode: PermissionMode) -> &'static str {
+    match mode {
+        PermissionMode::Ask => "ask",
+        PermissionMode::AllowList => "allow-list",
+        PermissionMode::Yolo => "yolo",
+    }
+}
+
+fn command_preview(text: &str, max_chars: usize) -> String {
+    let flattened = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    let mut preview: String = flattened.chars().take(max_chars).collect();
+    if flattened.chars().count() > max_chars {
+        preview.push('…');
+    }
+    preview
+}
+
+fn truncate_command_output(mut output: String) -> String {
+    const MAX_COMMAND_OUTPUT_BYTES: usize = 64 * 1024;
+    if output.len() <= MAX_COMMAND_OUTPUT_BYTES {
+        return output;
+    }
+    let mut end = MAX_COMMAND_OUTPUT_BYTES;
+    while !output.is_char_boundary(end) {
+        end -= 1;
+    }
+    output.truncate(end);
+    output.push_str("\n\n_Output truncated by Trouve._");
+    output
 }
 
 pub struct Engine {
@@ -282,6 +340,49 @@ fn cli_for_kind(kind: &str) -> Option<trouve_agents::install::CliId> {
 /// Config kinds handled by the [`AgentBackend`] seam rather than a Provider.
 fn is_backend_kind(kind: &str) -> bool {
     matches!(kind, "codex-app-server" | "cursor-cli" | "claude-cli")
+}
+
+/// Native providers already run inside Trouve's loop. Claude and Codex can
+/// also be isolated behind the full MCP bridge; Cursor currently cannot turn
+/// off its built-ins and must disclose its mixed compatibility surface.
+fn provider_capability_mode(pc: &ProviderConfig) -> ProviderCapabilityMode {
+    match pc.kind.as_str() {
+        "cursor-cli" => ProviderCapabilityMode::Compatibility,
+        "claude-cli" | "codex-app-server" if pc.tool_bridge == Some(false) => {
+            ProviderCapabilityMode::Compatibility
+        }
+        _ => ProviderCapabilityMode::Authoritative,
+    }
+}
+
+/// Instruction loading is a read-only harness primitive, like asking the
+/// user a question or searching the transcript. A mode may restrict
+/// executable workspace tools, but must not advertise skills the model is
+/// then unable to load.
+fn mode_allows_tool(mode: &AgentMode, name: &str) -> bool {
+    name == "load_skill"
+        || mode.allowed_tools.is_empty()
+        || mode.allowed_tools.iter().any(|allowed| allowed == name)
+}
+
+/// Stable-enough cache key for one process lifetime. Vendor harnesses cache
+/// MCP catalogs; changing this value in the bridge URL forces an adapter to
+/// remount when mode policy or a user MCP schema changes.
+fn tool_catalog_revision(specs: &[ToolSpec]) -> u64 {
+    let mut rows: Vec<_> = specs
+        .iter()
+        .map(|spec| {
+            (
+                spec.name.as_str(),
+                spec.description.as_str(),
+                spec.parameters.to_string(),
+            )
+        })
+        .collect();
+    rows.sort_unstable_by(|a, b| a.0.cmp(b.0));
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    rows.hash(&mut hasher);
+    hasher.finish()
 }
 
 /// Config kinds whose auth lives in a vendor CLI (backends plus the
@@ -748,6 +849,7 @@ impl Engine {
                     ),
                     auth,
                     experimental: pc.kind == "codex-responses",
+                    capability_mode: provider_capability_mode(pc),
                 }
             })
             .collect();
@@ -767,6 +869,7 @@ impl Engine {
                     auth: if local { "none" } else { "api-key" }.into(),
                     category: if local { "local" } else { "api" }.into(),
                     experimental: false,
+                    capability_mode: ProviderCapabilityMode::Authoritative,
                 });
             }
         }
@@ -895,6 +998,7 @@ impl Engine {
             ),
             auth,
             experimental: req.kind == "codex-responses",
+            capability_mode: provider_capability_mode(&pc),
         })
     }
 
@@ -3578,7 +3682,470 @@ impl Engine {
                 session_id: session.id,
             },
         )?;
+        self.emit_command_catalog(&thread.id, Path::new(&ws.path))?;
         Ok(thread)
+    }
+
+    fn command_catalog(&self, workspace_root: &Path) -> Vec<CommandInfo> {
+        crate::commands::catalog(crate::skills::command_catalog(
+            self.config_dir.as_deref(),
+            Some(workspace_root),
+        ))
+    }
+
+    fn emit_command_catalog(&self, thread_id: &str, workspace_root: &Path) -> Result<()> {
+        self.store.append_event(
+            Scope::Thread(thread_id.to_string()),
+            Event::CommandCatalogUpdated {
+                commands: self.command_catalog(workspace_root),
+            },
+        )?;
+        Ok(())
+    }
+
+    /// Execute one Trouve-owned slash command. Prompt commands never enter
+    /// this path; clients send those through `send_message` so skills start a
+    /// normal model turn.
+    pub async fn execute_command(
+        self: &Arc<Self>,
+        thread_id: &str,
+        req: ExecuteCommandRequest,
+    ) -> Result<CommandResult, EngineError> {
+        let name = req.name.trim().trim_start_matches('/');
+        let Some(spec) = crate::commands::action_spec(name) else {
+            return Err(EngineError::BadRequest(format!(
+                "unknown action command: /{name}"
+            )));
+        };
+        let arguments = req.arguments.trim().to_string();
+        let thread = self.get_thread(thread_id)?;
+        let session = self.get_session(&thread.session_id)?;
+        let workspace = self
+            .store
+            .workspace(&session.workspace_id)?
+            .ok_or_else(|| EngineError::NotFound(format!("workspace {}", session.workspace_id)))?;
+        let workspace_root = Path::new(&workspace.path);
+
+        let (output, action) = match name {
+            "help" => {
+                let catalog = self.command_catalog(workspace_root);
+                let target = arguments.trim_start_matches('/');
+                if target.is_empty() {
+                    let mut output = String::from(
+                        "## Trouve commands\n\n| Command | Description |\n| --- | --- |\n",
+                    );
+                    for command in catalog {
+                        output.push_str(&format!(
+                            "| `{}` | {} |\n",
+                            command.usage.replace('|', "\\|"),
+                            command.description.replace('|', "\\|")
+                        ));
+                    }
+                    (output, CommandAction::None)
+                } else {
+                    let command = catalog
+                        .iter()
+                        .find(|command| command.name == target)
+                        .ok_or_else(|| {
+                            EngineError::BadRequest(format!("unknown command: /{target}"))
+                        })?;
+                    (
+                        format!(
+                            "## `{}`\n\n{}\n\nKind: **{}**",
+                            command.usage,
+                            command.description,
+                            match command.kind {
+                                trouve_protocol::CommandKind::Prompt => "model prompt",
+                                trouve_protocol::CommandKind::Action => "Trouve action",
+                            }
+                        ),
+                        CommandAction::None,
+                    )
+                }
+            }
+            "status" => {
+                require_no_command_arguments(spec, &arguments)?;
+                let providers = self.list_providers();
+                let provider_id = thread.model.split_once('/').map_or("", |(id, _)| id);
+                let provider = providers
+                    .providers
+                    .iter()
+                    .find(|provider| provider.id == provider_id);
+                let provider_line = provider.map_or_else(
+                    || "not configured".to_string(),
+                    |provider| {
+                        format!(
+                            "{} / {} / {}",
+                            provider.kind,
+                            provider.auth,
+                            match provider.capability_mode {
+                                ProviderCapabilityMode::Authoritative => "authoritative",
+                                ProviderCapabilityMode::Compatibility => "compatibility",
+                            }
+                        )
+                    },
+                );
+                let turn = if self.turn_cancels.lock().unwrap().contains_key(thread_id) {
+                    "running"
+                } else {
+                    "idle"
+                };
+                (
+                    format!(
+                        "## Status\n\n- Session: **{}** (`{}`)\n- Thread: `{}`\n- Mode: `{}`\n- Model: `{}`\n- Permissions: `{}`\n- Provider: {}\n- Current turn: **{}**\n- Session activity: **{}**",
+                        session.title,
+                        session.id,
+                        thread.id,
+                        thread.mode,
+                        thread.model,
+                        permission_name(thread.permission_mode),
+                        provider_line,
+                        turn,
+                        if session.active { "active" } else { "idle" }
+                    ),
+                    CommandAction::None,
+                )
+            }
+            "skills" => {
+                let skills =
+                    crate::skills::discover(self.config_dir.as_deref(), Some(workspace_root));
+                if arguments.is_empty() {
+                    let mut output = String::from(
+                        "## Available skills\n\n| Skill | Origin | Invocation | Description |\n| --- | --- | --- | --- |\n",
+                    );
+                    for skill in skills {
+                        let invocation = if skill.user_invocable {
+                            if skill.argument_hint.is_empty() {
+                                format!("/{}", skill.name)
+                            } else {
+                                format!("/{} {}", skill.name, skill.argument_hint)
+                            }
+                        } else {
+                            "model only".into()
+                        };
+                        output.push_str(&format!(
+                            "| `{}` | {} | `{}` | {} |\n",
+                            skill.name,
+                            skill.origin,
+                            invocation.replace('|', "\\|"),
+                            skill.description.replace('|', "\\|")
+                        ));
+                    }
+                    (output, CommandAction::None)
+                } else {
+                    let target = single_command_argument(spec, &arguments)?;
+                    let skill = skills
+                        .iter()
+                        .find(|skill| skill.name == target)
+                        .ok_or_else(|| {
+                            EngineError::BadRequest(format!("unknown skill: {target}"))
+                        })?;
+                    let invocation = if skill.user_invocable {
+                        if skill.argument_hint.is_empty() {
+                            format!("/{}", skill.name)
+                        } else {
+                            format!("/{} {}", skill.name, skill.argument_hint)
+                        }
+                    } else {
+                        "Not user-invocable".into()
+                    };
+                    (
+                        format!(
+                            "## `{}`\n\n{}\n\n- Origin: **{}**\n- Invocation: `{}`\n- Automatic model invocation: **{}**",
+                            skill.name,
+                            skill.description,
+                            skill.origin,
+                            invocation,
+                            if skill.disable_model_invocation {
+                                "disabled"
+                            } else {
+                                "enabled"
+                            }
+                        ),
+                        CommandAction::None,
+                    )
+                }
+            }
+            "mode" => {
+                let modes = self.list_modes(Some(&session.workspace_id))?;
+                if arguments.is_empty() {
+                    let mut output = format!("## Modes\n\nCurrent: `{}`\n", thread.mode);
+                    for mode in modes {
+                        let marker = if mode.id == thread.mode {
+                            " **(current)**"
+                        } else {
+                            ""
+                        };
+                        output.push_str(&format!(
+                            "\n- `{}` — {}{}",
+                            mode.id, mode.display_name, marker
+                        ));
+                    }
+                    (output, CommandAction::None)
+                } else {
+                    let mode = single_command_argument(spec, &arguments)?;
+                    let updated = self.update_thread(
+                        thread_id,
+                        &UpdateThreadRequest {
+                            mode: Some(mode.to_string()),
+                            ..Default::default()
+                        },
+                    )?;
+                    (
+                        format!("Mode changed to `{}`.", updated.mode),
+                        CommandAction::None,
+                    )
+                }
+            }
+            "model" => {
+                if arguments.is_empty() {
+                    let models = self.list_models().await;
+                    let mut output = format!("## Models\n\nCurrent: `{}`\n", thread.model);
+                    for model in models {
+                        let marker = if model.id == thread.model {
+                            " **(current)**"
+                        } else {
+                            ""
+                        };
+                        output.push_str(&format!(
+                            "\n- `{}` — {} ({} token context){}",
+                            model.id, model.display_name, model.context_window, marker
+                        ));
+                    }
+                    (output, CommandAction::None)
+                } else {
+                    let model = single_command_argument(spec, &arguments)?;
+                    let updated = self.update_thread(
+                        thread_id,
+                        &UpdateThreadRequest {
+                            model: Some(model.to_string()),
+                            ..Default::default()
+                        },
+                    )?;
+                    (
+                        format!("Model changed to `{}`.", updated.model),
+                        CommandAction::None,
+                    )
+                }
+            }
+            "permissions" => {
+                if arguments.is_empty() {
+                    (
+                        format!(
+                            "Current permission policy: `{}`.\n\nAvailable: `ask`, `allow-list`, `yolo`.",
+                            permission_name(thread.permission_mode)
+                        ),
+                        CommandAction::None,
+                    )
+                } else {
+                    let value = single_command_argument(spec, &arguments)?;
+                    let permission_mode = match value {
+                        "ask" => PermissionMode::Ask,
+                        "allow-list" | "allow_list" => PermissionMode::AllowList,
+                        "yolo" => PermissionMode::Yolo,
+                        _ => {
+                            return Err(EngineError::BadRequest(format!("usage: {}", spec.usage)));
+                        }
+                    };
+                    let updated = self.update_thread(
+                        thread_id,
+                        &UpdateThreadRequest {
+                            permission_mode: Some(permission_mode),
+                            ..Default::default()
+                        },
+                    )?;
+                    (
+                        format!(
+                            "Permission policy changed to `{}`.",
+                            permission_name(updated.permission_mode)
+                        ),
+                        CommandAction::None,
+                    )
+                }
+            }
+            "undo" => {
+                require_no_command_arguments(spec, &arguments)?;
+                self.undo(&session.id).await?;
+                (
+                    "Restored the previous checkpoint.".into(),
+                    CommandAction::None,
+                )
+            }
+            "redo" => {
+                require_no_command_arguments(spec, &arguments)?;
+                self.redo(&session.id).await?;
+                ("Restored the next checkpoint.".into(), CommandAction::None)
+            }
+            "cancel" => {
+                require_no_command_arguments(spec, &arguments)?;
+                self.cancel_turn(thread_id)?;
+                (
+                    "Cancellation requested for the current turn.".into(),
+                    CommandAction::None,
+                )
+            }
+            "new" => {
+                require_no_command_arguments(spec, &arguments)?;
+                let created = self.create_thread(CreateThreadRequest {
+                    session_id: session.id.clone(),
+                    mode: Some(thread.mode.clone()),
+                    model: Some(thread.model.clone()),
+                    model_options: thread.model_options.clone(),
+                    permission_mode: Some(thread.permission_mode),
+                })?;
+                (
+                    format!("Created thread `{}`.", created.id),
+                    CommandAction::SwitchThread {
+                        thread_id: created.id,
+                    },
+                )
+            }
+            "tools" => {
+                require_no_command_arguments(spec, &arguments)?;
+                let mut tools = self.bridged_tool_specs(thread_id).await?;
+                tools.sort_by(|left, right| left.name.cmp(&right.name));
+                let mut output = String::from(
+                    "## Available Trouve tools\n\n| Tool | Description |\n| --- | --- |\n",
+                );
+                for tool in tools {
+                    output.push_str(&format!(
+                        "| `{}` | {} |\n",
+                        tool.name,
+                        tool.description.replace('|', "\\|").replace('\n', " ")
+                    ));
+                }
+                (output, CommandAction::None)
+            }
+            "mcp" => {
+                require_no_command_arguments(spec, &arguments)?;
+                let servers = self.session_mcp_servers(&session.id)?;
+                let mut output = String::from(
+                    "## Session MCP servers\n\n| Server | Scope | Health | Detail |\n| --- | --- | --- | --- |\n",
+                );
+                if servers.is_empty() {
+                    output.push_str("| _None configured_ | | | |\n");
+                } else {
+                    for server in servers {
+                        output.push_str(&format!(
+                            "| `{}` | {} | {} | {} |\n",
+                            server.name,
+                            server.scope,
+                            server.health,
+                            server.detail.replace('|', "\\|").replace('\n', " ")
+                        ));
+                    }
+                }
+                (output, CommandAction::None)
+            }
+            "usage" => {
+                require_no_command_arguments(spec, &arguments)?;
+                let usage = self.thread_usage(thread_id)?;
+                (
+                    format!(
+                        "## Thread usage\n\n- Turns: {}\n- Input tokens: {}\n- Cached input tokens: {}\n- Output tokens: {}\n- Cost: ${:.4}",
+                        usage.turns,
+                        usage.input_tokens,
+                        usage.cached_input_tokens,
+                        usage.output_tokens,
+                        usage.cost_usd
+                    ),
+                    CommandAction::None,
+                )
+            }
+            "diff" => {
+                require_no_command_arguments(spec, &arguments)?;
+                let diff = self.session_diff(&session.id).await?;
+                let output = if diff.trim().is_empty() {
+                    "No changes against the session base revision.".into()
+                } else {
+                    format!("## Session diff\n\n````diff\n{}\n````", diff.trim_end())
+                };
+                (output, CommandAction::None)
+            }
+            "files" => {
+                require_no_command_arguments(spec, &arguments)?;
+                let paths = self.session_list_paths(&session.id).await?;
+                let total = paths.len();
+                let mut output = String::from("## Session files\n");
+                for path in paths.into_iter().take(500) {
+                    output.push_str(&format!("\n- `{}`", path.replace('`', "\\`")));
+                }
+                if total > 500 {
+                    output.push_str(&format!("\n\n_Showing 500 of {total} paths._"));
+                }
+                (output, CommandAction::None)
+            }
+            "queue" => {
+                require_no_command_arguments(spec, &arguments)?;
+                let prompts = self.list_queued_prompts(thread_id)?;
+                let mut output = String::from("## Prompt queue\n");
+                if prompts.is_empty() {
+                    output.push_str("\nThe queue is empty.");
+                } else {
+                    for (index, prompt) in prompts.iter().enumerate() {
+                        let preview = command_preview(&prompt.content, 160);
+                        output.push_str(&format!("\n{}. {}", index + 1, preview));
+                    }
+                }
+                (output, CommandAction::None)
+            }
+            "instructions" => {
+                require_no_command_arguments(spec, &arguments)?;
+                let all_modes =
+                    modes::resolve_modes(self.config_dir.as_deref(), Some(workspace_root));
+                let mode = modes::find_mode(&all_modes, &thread.mode)
+                    .cloned()
+                    .unwrap_or_else(modes::fallback_mode);
+                let instructions =
+                    context::system_prompt(&mode, self.config_dir.as_deref(), workspace_root);
+                (
+                    format!(
+                        "## Effective instructions\n\n````text\n{}\n````",
+                        instructions.trim_end()
+                    ),
+                    CommandAction::None,
+                )
+            }
+            "rename" => {
+                if arguments.is_empty() {
+                    return Err(EngineError::BadRequest(format!("usage: {}", spec.usage)));
+                }
+                let updated = self.update_session(
+                    &session.id,
+                    &UpdateSessionRequest {
+                        title: Some(arguments.clone()),
+                        archived: None,
+                    },
+                )?;
+                (
+                    format!("Session renamed to **{}**.", updated.title),
+                    CommandAction::None,
+                )
+            }
+            "terminal" => {
+                require_no_command_arguments(spec, &arguments)?;
+                (
+                    "Opening the integrated terminal for this session.".into(),
+                    CommandAction::OpenTerminal,
+                )
+            }
+            _ => unreachable!("action command registry and executor diverged"),
+        };
+
+        let output = truncate_command_output(output);
+        self.store.append_event(
+            Scope::Thread(thread_id.to_string()),
+            Event::CommandExecuted {
+                name: name.to_string(),
+                arguments: arguments.clone(),
+                output: output.clone(),
+            },
+        )?;
+        Ok(CommandResult {
+            name: name.to_string(),
+            output,
+            action,
+        })
     }
 
     pub fn get_thread(&self, id: &str) -> Result<Thread, EngineError> {
@@ -3799,7 +4366,34 @@ impl Engine {
         content: String,
         uploads: Vec<trouve_protocol::AttachmentUpload>,
     ) -> Result<TurnAccepted, EngineError> {
-        self.get_thread(thread_id)?; // 404 for unknown threads
+        let thread = self.get_thread(thread_id)?; // 404 for unknown threads
+        if let Some(after_slash) = content.trim().strip_prefix('/') {
+            let name_end = after_slash
+                .find(char::is_whitespace)
+                .unwrap_or(after_slash.len());
+            let name = &after_slash[..name_end];
+            if crate::commands::action_spec(name).is_some() {
+                return Err(EngineError::BadRequest(format!(
+                    "/{name} is a Trouve action command; use the thread command endpoint"
+                )));
+            }
+            // Validate explicit skill syntax before the prompt becomes
+            // durable. Otherwise `/skill missing` would fail only inside the
+            // dispatcher and remain queued for the next retry.
+            let session = self.get_session(&thread.session_id)?;
+            let workspace = self
+                .store
+                .workspace(&session.workspace_id)?
+                .ok_or_else(|| {
+                    EngineError::NotFound(format!("workspace {}", session.workspace_id))
+                })?;
+            crate::skills::expand_invocation(
+                self.config_dir.as_deref(),
+                Some(Path::new(&workspace.path)),
+                &content,
+            )
+            .map_err(|error| EngineError::BadRequest(error.to_string()))?;
+        }
         let attachments = self.save_attachments(thread_id, uploads)?;
         self.store
             .enqueue_prompt(thread_id, &content, &attachments)?;
@@ -4217,6 +4811,16 @@ impl Engine {
         let mode = modes::find_mode(&all_modes, &thread.mode)
             .cloned()
             .unwrap_or_else(modes::fallback_mode);
+        // Skills can be installed or edited while a thread is idle. Publish
+        // the current core-owned catalog before every turn so all providers
+        // and reconnecting clients converge on the same completion surface.
+        self.emit_command_catalog(&thread.id, Path::new(&ws.path))?;
+        let model_content = crate::skills::expand_invocation(
+            self.config_dir.as_deref(),
+            Some(Path::new(&ws.path)),
+            &content,
+        )?
+        .unwrap_or_else(|| content.clone());
 
         // Serialize worktree mutations across the session's threads — except
         // agent-spawned children in read-only modes: they can't write, and
@@ -4243,6 +4847,7 @@ impl Engine {
                     backend,
                     model_name,
                     content,
+                    model_content,
                     attachments,
                     concurrent_child,
                     cancel,
@@ -4298,7 +4903,7 @@ impl Engine {
         // open is useless — a worktree-relative copy is reachable.
         let resolved = self.resolve_attachments(&attachments);
         let materialized = materialize_attachments(&worktree, &resolved);
-        let content = annotate_attachments(content, &materialized);
+        let content = annotate_attachments(model_content, &materialized);
         self.store
             .append_message(&thread.id, &serde_json::to_value(Message::User(content))?)?;
         if !self.store.finish_queued_prompt(&prompt.id)? {
@@ -4307,14 +4912,15 @@ impl Engine {
         self.emit_queue(&thread.id)?;
 
         // Tool policy: empty allowed_tools = all registered tools. The
-        // engine-served ask_question tool always rides along (deferring to
-        // the user is an interaction primitive, not a capability).
+        // read-only load_skill primitive and engine-served ask_question tool
+        // always ride along; a restrictive mode must not strand the model
+        // without advertised instructions or a way to defer to the user.
         let mut specs: Vec<ToolSpec> = self
             .executor
             .specs(&ctx)
             .await
             .into_iter()
-            .filter(|s| mode.allowed_tools.is_empty() || mode.allowed_tools.contains(&s.name))
+            .filter(|s| mode_allows_tool(&mode, &s.name))
             .collect();
         specs.push(ask_question_spec());
         specs.push(search_transcript_spec());
@@ -4322,9 +4928,7 @@ impl Engine {
         // spawn grandchildren (also enforced at execution). They also respect
         // the mode's tool policy, so restrictive/read-only modes that don't
         // list them can't create branches or child agents.
-        let spawn_allowed = |name: &str| {
-            mode.allowed_tools.is_empty() || mode.allowed_tools.iter().any(|t| t == name)
-        };
+        let spawn_allowed = |name: &str| mode_allows_tool(&mode, name);
         if self.store.spawn_parent(&thread.id)?.is_none() {
             if spawn_allowed("spawn_thread") {
                 specs.push(spawn_thread_spec());
@@ -4604,37 +5208,44 @@ impl Engine {
         Some((backend_id.to_string(), backend, model_name.to_string()))
     }
 
-    /// MCP tool-bridge config for a backend turn. Claude Code always gets
-    /// the bridge (it carries the approval-prompt gate for Ask mode, and
-    /// optionally — `tool_bridge = true` — trouve's tools in place of
-    /// Claude's built-ins). Codex gets it too, for trouve's semantic search
-    /// and question tools; its approvals stay native app-server RPCs.
-    fn mcp_bridge_for(
+    /// MCP tool-bridge config for a backend turn. Trouve tools are the
+    /// default for subscription CLIs. Claude and Codex can isolate their
+    /// built-ins and become authoritative; Cursor can mount the same HTTP MCP
+    /// surface but remains compatibility-only until it gains an isolation
+    /// control. Vendor-native approvals are retained only where needed.
+    async fn mcp_bridge_for(
         &self,
         model: &str,
         thread_id: &str,
-    ) -> Option<trouve_agents::McpBridgeConfig> {
-        let backend_id = model.split_once('/')?.0;
+    ) -> Result<Option<trouve_agents::McpBridgeConfig>> {
+        let Some((backend_id, _)) = model.split_once('/') else {
+            return Ok(None);
+        };
         let (kind, bridge_tools) = {
             let config = self.config.lock().unwrap();
-            let pc = config.providers.get(backend_id)?;
-            (pc.kind.clone(), pc.tool_bridge.unwrap_or(false))
+            let Some(pc) = config.providers.get(backend_id) else {
+                return Ok(None);
+            };
+            (pc.kind.clone(), pc.tool_bridge.unwrap_or(true))
         };
-        if kind != "claude-cli" && kind != "codex-app-server" {
-            return None;
+        if !matches!(
+            kind.as_str(),
+            "claude-cli" | "codex-app-server" | "cursor-cli"
+        ) {
+            return Ok(None);
         }
-        // Full tool bridging (vendor built-ins stand down) is Claude-only.
-        let bridge_tools = bridge_tools && kind == "claude-cli";
-        let Some(base_url) = self.base_url.read().unwrap().clone() else {
-            tracing::warn!(
-                "MCP bridge wanted for {backend_id} but the server base URL is unknown; \
-                 running without it (approvals will fail in ask mode)"
-            );
-            return None;
-        };
-        // Codex approvals are native RPCs; serving Claude's permission-gate
-        // tool would only tempt the model to call it.
-        let approval = if kind == "codex-app-server" { 0 } else { 1 };
+        let base_url = self.base_url.read().unwrap().clone().ok_or_else(|| {
+            anyhow!(
+                "Trouve's tool bridge is required for {backend_id}, but the server base URL is \
+                 unavailable; refusing to start a CLI turn without the authoritative tool path"
+            )
+        })?;
+        let authoritative =
+            bridge_tools && matches!(kind.as_str(), "claude-cli" | "codex-app-server");
+        // Codex and Cursor own their approval protocol. Claude needs the
+        // permission-prompt target only in non-authoritative compatibility
+        // mode; authoritative calls are gated inside ToolExecutor.
+        let approval = (kind == "claude-cli" && !authoritative) as u8;
         let mut url = format!(
             "{}/internal/threads/{}/mcp?tools={}&approval={}",
             base_url.trim_end_matches('/'),
@@ -4642,16 +5253,22 @@ impl Engine {
             bridge_tools as u8,
             approval,
         );
+        if bridge_tools {
+            let revision = tool_catalog_revision(&self.bridged_tool_specs(thread_id).await?);
+            url.push_str("&catalog_revision=");
+            url.push_str(&format!("{revision:016x}"));
+        }
         if let Some(token) = self.bridge_token.read().unwrap().as_deref() {
             url.push_str("&bridge_token=");
             url.push_str(token);
         }
-        Some(trouve_agents::McpBridgeConfig {
+        Ok(Some(trouve_agents::McpBridgeConfig {
             url,
             bridge_tools,
+            authoritative,
             // Claude built-ins stand down; trouve's executor is the tool
             // source (reads included, for full permission fidelity).
-            disallowed_tools: if bridge_tools {
+            disallowed_tools: if authoritative && kind == "claude-cli" {
                 [
                     "Bash",
                     "Edit",
@@ -4671,7 +5288,7 @@ impl Engine {
             } else {
                 Vec::new()
             },
-        })
+        }))
     }
 
     // --- bridged tools (MCP tool bridge, Phase 6) -----------------------------
@@ -4685,16 +5302,23 @@ impl Engine {
             .specs(&ctx)
             .await
             .into_iter()
-            .filter(|s| mode.allowed_tools.is_empty() || mode.allowed_tools.contains(&s.name))
+            .filter(|s| mode_allows_tool(&mode, &s.name))
             .collect();
         // Engine-served, always available (see handle_tool_call).
         specs.push(ask_question_spec());
         specs.push(search_transcript_spec());
         // Spawn tools: top-level agents only, same as native turns.
+        let spawn_allowed = |name: &str| mode_allows_tool(&mode, name);
         if self.store.spawn_parent(thread_id)?.is_none() {
-            specs.push(spawn_thread_spec());
-            specs.push(spawn_session_spec());
-            specs.push(spawn_output_spec());
+            if spawn_allowed("spawn_thread") {
+                specs.push(spawn_thread_spec());
+            }
+            if spawn_allowed("spawn_session") {
+                specs.push(spawn_session_spec());
+            }
+            if spawn_allowed("spawn_thread") || spawn_allowed("spawn_session") {
+                specs.push(spawn_output_spec());
+            }
         }
         Ok(specs)
     }
@@ -4706,7 +5330,7 @@ impl Engine {
         thread_id: &str,
         name: &str,
         arguments: &serde_json::Value,
-    ) -> Result<String, EngineError> {
+    ) -> Result<(String, Vec<trouve_providers::ToolImage>), EngineError> {
         let (session, thread, mode, ctx) = self.bridged_context(thread_id)?;
         let turn = self.store.last_turn(thread_id)?;
         let call = trouve_providers::ToolCallRequest {
@@ -4714,10 +5338,8 @@ impl Engine {
             name: name.to_string(),
             arguments: arguments.clone(),
         };
-        // Bridged responses are text-only (MCP content blocks could carry
-        // images, but no bridged vendor consumes them yet); the summary the
-        // engine leaves in place of "_images" still tells the model the
-        // image was read.
+        // Image payloads stay out of the persisted text result and return as
+        // native MCP image content blocks alongside the compact summary.
         // Share the running turn's cancellation token when there is one, so a
         // cancel also unblocks a bridged tool's approval wait.
         let cancel = self
@@ -4727,11 +5349,11 @@ impl Engine {
             .get(thread_id)
             .cloned()
             .unwrap_or_default();
-        let (content, _images) = self
+        let (content, images) = self
             .handle_tool_call(&session, &thread, turn, &mode, &ctx, &call, &cancel)
             .await
             .map_err(EngineError::Internal)?;
-        Ok(content)
+        Ok((content, images))
     }
 
     /// Gate a vendor-side tool call (Claude Code's `--permission-prompt-tool`
@@ -4985,49 +5607,11 @@ impl Engine {
         Ok((session, thread, mode, ctx))
     }
 
-    /// User-configured MCP servers for a session's worktree, flattened for
-    /// a vendor agent CLI: scopes merged (user < workspace < worktree),
-    /// disabled entries dropped, env `${VAR}` references expanded. The name
-    /// "trouve" is reserved for the bridge and skipped.
-    fn mcp_servers_for(
-        &self,
-        session: &Session,
-    ) -> Result<Vec<trouve_agents::McpServerLaunch>, EngineError> {
-        let workspace_root = self
-            .store
-            .workspace(&session.workspace_id)?
-            .map(|ws| PathBuf::from(ws.path));
-        // Only trusted (user-config) servers are handed to the vendor CLI:
-        // it would otherwise spawn a cloned repo's command with the expanded
-        // environment, same RCE/exfiltration risk as the native path.
-        let configs = crate::mcp::trusted_configs(
-            self.config_dir.as_deref(),
-            workspace_root.as_deref(),
-            Path::new(&session.worktree_path),
-        );
-        Ok(configs
-            .into_iter()
-            .filter(|(name, _)| name != "trouve")
-            .map(|(name, config)| trouve_agents::McpServerLaunch {
-                name,
-                command: config.command,
-                args: config.args,
-                env: config
-                    .env
-                    .iter()
-                    .map(|(k, v)| (k.clone(), crate::mcp::expand_env(v)))
-                    .collect(),
-            })
-            .collect())
-    }
-
-    /// Run one turn through an external agent backend. The vendor harness
-    /// plans, calls tools, and edits the worktree; we persist its events,
-    /// gate its approval requests through our permission layer, and keep the
-    /// checkpoint/usage flow identical to native turns. Compaction and the
-    /// system prompt are the vendor's job (the mode prompt rides along as
-    /// appended instructions); the local transcript is kept for rendering
-    /// and history, not as the model's context.
+    /// Run one turn through an external agent backend. The vendor retains
+    /// inference and conversation state; in authoritative mode all executable
+    /// work returns through the MCP bridge and `ToolExecutor`. Compatibility
+    /// backends may still report native tools and approvals. Both retain the
+    /// same session lock/checkpoint semantics as native turns.
     #[allow(clippy::too_many_arguments)]
     async fn run_backend_turn(
         &self,
@@ -5038,6 +5622,7 @@ impl Engine {
         backend_id: &str,
         backend: Arc<dyn AgentBackend>,
         model_name: String,
+        display_content: String,
         content: String,
         attachments: Vec<trouve_protocol::Attachment>,
         concurrent_child: bool,
@@ -5045,13 +5630,36 @@ impl Engine {
         queued_prompt_id: &str,
     ) -> Result<()> {
         let scope = Scope::Thread(thread.id.clone());
+        let workspace = self
+            .store
+            .workspace(&session.workspace_id)?
+            .context("workspace vanished")?;
+        let mcp_bridge = self.mcp_bridge_for(&thread.model, &thread.id).await?;
+        let authoritative_tools = mcp_bridge
+            .as_ref()
+            .is_some_and(|bridge| bridge.authoritative);
+        // A session created with vendor-native tools must never be resumed
+        // after authoritative isolation is enabled. The namespace is also a
+        // deliberate migration key: bump it whenever the isolation contract
+        // changes in a way that requires a fresh vendor context.
+        let backend_session_key = if authoritative_tools {
+            format!("{backend_id}#trouve-tools-v1")
+        } else {
+            backend_id.to_string()
+        };
         // Vendor sessions are per (thread, backend): each vendor keeps its
         // own history, and switching models away and back resumes it.
         // Vendors can't read our transcript, so whatever part of the
         // thread's past this one hasn't seen — everything for a vendor
         // joining mid-conversation, the interleaved turns other models ran
         // for a resumed one — is handed off as a digest in the prompt.
-        let resume = self.store.backend_session(&thread.id, backend_id)?;
+        let resume = if authoritative_tools {
+            self.store
+                .backend_session_exact(&thread.id, &backend_session_key)?
+        } else {
+            self.store
+                .backend_session(&thread.id, &backend_session_key)?
+        };
         let payloads = self.store.messages(&thread.id)?;
         let unseen = match &resume {
             // A compaction can shrink the transcript below the watermark;
@@ -5082,7 +5690,7 @@ impl Engine {
             scope.clone(),
             Event::UserMessage {
                 turn,
-                content: content.clone(),
+                content: display_content,
                 attachments: attachments.clone(),
             },
         )?;
@@ -5093,7 +5701,11 @@ impl Engine {
         let (images, files): (Vec<_>, Vec<_>) = resolved
             .into_iter()
             .partition(|(a, _)| a.mime.starts_with("image/"));
-        let content = annotate_attachments(content, &files);
+        // Authoritative CLI turns use the same sandboxed file tools as
+        // native/API turns. Stage non-image uploads inside the worktree so
+        // the prompt never points those tools at an unreadable data-dir path.
+        let materialized_files = materialize_attachments(Path::new(&session.worktree_path), &files);
+        let content = annotate_attachments(content, &materialized_files);
         let turn_attachments: Vec<trouve_agents::TurnAttachment> = images
             .into_iter()
             .map(|(a, path)| trouve_agents::TurnAttachment {
@@ -5120,11 +5732,11 @@ impl Engine {
             }
         };
 
-        let mcp_bridge = self.mcp_bridge_for(&thread.model, &thread.id);
         // Vendor agents get the mode prompt plus, when the bridge serves
         // trouve's search tools, guidance to prefer them over built-ins
         // (MCP instructions alone are too weak a signal).
-        let mut instructions = mode.system_prompt.trim().to_string();
+        let mut instructions =
+            context::system_prompt(mode, self.config_dir.as_deref(), Path::new(&workspace.path));
         if mcp_bridge.is_some() {
             if !instructions.is_empty() {
                 instructions.push_str("\n\n");
@@ -5154,7 +5766,10 @@ impl Engine {
             instructions: (!instructions.is_empty()).then_some(instructions),
             permission,
             mcp_bridge,
-            mcp_servers: self.mcp_servers_for(session)?,
+            // User MCP servers are already part of LocalToolExecutor's specs
+            // and execution path. Mounting them directly in a vendor would
+            // create a second, ungated side-effect path.
+            mcp_servers: Vec::new(),
         };
 
         let mut stream = backend
@@ -5201,8 +5816,11 @@ impl Engine {
             };
             match ev.map_err(|e| anyhow!("backend stream error: {e}"))? {
                 BackendEvent::SessionStarted { session_id } => {
-                    self.store
-                        .set_backend_session(&thread.id, backend_id, &session_id)?;
+                    self.store.set_backend_session(
+                        &thread.id,
+                        &backend_session_key,
+                        &session_id,
+                    )?;
                 }
                 BackendEvent::TextDelta(delta) => {
                     text.push_str(&delta);
@@ -5243,6 +5861,19 @@ impl Engine {
                             },
                         )?;
                     }
+                    if authoritative_tools {
+                        if !is_trouve_bridge_tool_event(&tool, &args) {
+                            bail!(
+                                "authoritative tool isolation failed: vendor backend {backend_id} \
+                                 exposed unexpected built-in tool {tool}"
+                            );
+                        }
+                        // The MCP request itself already produced the one
+                        // canonical ToolExecutor card. Vendor lifecycle
+                        // notifications have a different call id and would
+                        // otherwise duplicate it.
+                        continue;
+                    }
                     // Snippet edits carry no position; the worktree file is
                     // still un-edited at announcement time, so resolve line
                     // hints now for the UI's diff gutter.
@@ -5253,7 +5884,7 @@ impl Engine {
                             Event::ToolRequested {
                                 turn,
                                 call_id: call_id.clone(),
-                                tool,
+                                tool: canonical_vendor_tool(&tool).to_string(),
                                 args,
                                 requires_approval: false,
                             },
@@ -5263,6 +5894,9 @@ impl Engine {
                         .append_event(scope.clone(), Event::ToolStarted { call_id })?;
                 }
                 BackendEvent::ToolOutput { call_id, chunk } => {
+                    if authoritative_tools {
+                        continue;
+                    }
                     if let Some((_, owner, repo)) = &github_repository
                         && let Some((tool, args)) = tool_calls.get(&call_id)
                         && requests_pull_request_creation(tool, args, owner, repo)
@@ -5275,15 +5909,18 @@ impl Engine {
                     self.store
                         .append_event(scope.clone(), Event::ToolOutput { call_id, chunk })?;
                 }
-                BackendEvent::CommandsUpdated { commands } => {
-                    self.store
-                        .append_event(scope.clone(), Event::CommandsUpdated { commands })?;
-                }
+                // Vendor command catalogs are intentionally non-authoritative.
+                // Adapters may still report them for compatibility telemetry,
+                // but only Trouve's CommandCatalogUpdated reaches clients.
+                BackendEvent::CommandsUpdated { .. } => {}
                 BackendEvent::ToolCompleted {
                     call_id,
                     ok,
                     result,
                 } => {
+                    if authoritative_tools {
+                        continue;
+                    }
                     let status = if ok {
                         ToolStatus::Ok
                     } else {
@@ -5339,6 +5976,13 @@ impl Engine {
                     args,
                     responder,
                 } => {
+                    if authoritative_tools {
+                        let _ = responder.send(false);
+                        bail!(
+                            "authoritative tool isolation failed: vendor backend {backend_id} \
+                             requested approval for built-in tool {tool}"
+                        );
+                    }
                     if !segment.is_empty() {
                         self.store.append_event(
                             scope.clone(),
@@ -5359,6 +6003,13 @@ impl Engine {
                     questions,
                     responder,
                 } => {
+                    if authoritative_tools {
+                        let _ = responder.send(None);
+                        bail!(
+                            "authoritative tool isolation failed: vendor backend {backend_id} \
+                             invoked its own question workflow"
+                        );
+                    }
                     if !segment.is_empty() {
                         self.store.append_event(
                             scope.clone(),
@@ -5431,7 +6082,7 @@ impl Engine {
             })?,
         )?;
         self.store
-            .mark_backend_seen(&thread.id, backend_id, seen_after)?;
+            .mark_backend_seen(&thread.id, &backend_session_key, seen_after)?;
 
         // Vendors report one usage per turn, so the totals already reflect
         // the last (only) request — use them as the context-size proxy.
@@ -5746,8 +6397,7 @@ impl Engine {
         }
 
         let known = self.executor.tool_mutates(&call.name);
-        let allowed_by_mode =
-            mode.allowed_tools.is_empty() || mode.allowed_tools.contains(&call.name);
+        let allowed_by_mode = mode_allows_tool(mode, &call.name);
         let mutates = known.unwrap_or(true);
         let key = allow_key(&call.name, &call.arguments);
         let decision = if known.is_none() || !allowed_by_mode {
@@ -6475,7 +7125,7 @@ fn ceil_char_boundary(s: &str, mut at: usize) -> usize {
 }
 
 /// Copy prompt attachments into the session worktree (under a gitignored
-/// `.trouve/attachments/` dir) so the native file tools — which only open
+/// `.trouve/attachments/` dir) so Trouve's file tools — which only open
 /// worktree-relative paths — can read them. Returns each attachment paired
 /// with its worktree-relative path. Failures drop that attachment with a
 /// warning rather than failing the turn.
@@ -6492,15 +7142,53 @@ fn materialize_attachments(
         tracing::warn!("cannot stage attachments in {}: {e}", abs_dir.display());
         return Vec::new();
     }
+    let canonical_worktree = match worktree.canonicalize() {
+        Ok(path) => path,
+        Err(e) => {
+            tracing::warn!("cannot resolve worktree {}: {e}", worktree.display());
+            return Vec::new();
+        }
+    };
+    let canonical_abs_dir = match abs_dir.canonicalize() {
+        Ok(path) if path.starts_with(&canonical_worktree) => path,
+        Ok(path) => {
+            tracing::warn!(
+                "refusing attachment directory {} outside worktree {}",
+                path.display(),
+                canonical_worktree.display()
+            );
+            return Vec::new();
+        }
+        Err(e) => {
+            tracing::warn!(
+                "cannot resolve attachment directory {}: {e}",
+                abs_dir.display()
+            );
+            return Vec::new();
+        }
+    };
     // Keep the staged files out of the user's diffs/commits.
     let _ = std::fs::write(worktree.join(".trouve").join(".gitignore"), "*\n");
     let mut out = Vec::new();
     for (meta, src) in files {
         // Prefix with the id so distinct attachments with the same filename
-        // don't collide.
-        let file_name = format!("{}-{}", meta.id, meta.name);
+        // don't collide. Upload metadata is protocol input, so flatten every
+        // path separator/control character rather than trusting a basename.
+        let safe_name: String = meta
+            .name
+            .chars()
+            .take(160)
+            .map(|c| {
+                if c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_') {
+                    c
+                } else {
+                    '_'
+                }
+            })
+            .collect();
+        let file_name = format!("{}-{}", meta.id, safe_name);
         let rel = rel_dir.join(&file_name);
-        match std::fs::copy(src, worktree.join(&rel)) {
+        match std::fs::copy(src, canonical_abs_dir.join(&file_name)) {
             Ok(_) => out.push((meta.clone(), rel)),
             Err(e) => tracing::warn!("cannot stage attachment {}: {e}", meta.name),
         }
@@ -6523,6 +7211,41 @@ fn annotate_attachments(
         out.push_str(&format!("\n- {} ({}): {}", a.name, a.mime, path.display()));
     }
     out
+}
+
+/// Runtime assertion for authoritative CLI turns. Claude reports the MCP
+/// function name directly; Codex reports an `mcpToolCall` item carrying the
+/// server separately. Anything else means a vendor execution tool escaped
+/// suppression and the turn must fail closed.
+fn is_trouve_bridge_tool_event(tool: &str, args: &serde_json::Value) -> bool {
+    tool.starts_with("mcp__trouve__")
+        || (tool == "mcpToolCall"
+            && args
+                .get("server")
+                .or_else(|| args.get("serverName"))
+                .and_then(serde_json::Value::as_str)
+                == Some("trouve"))
+}
+
+/// Legacy/compatibility backends still announce vendor vocabulary. Persist a
+/// canonical operation id so current UI rendering does not depend on which
+/// provider happened to run the turn. Historical raw events remain readable
+/// through the client's compatibility aliases.
+fn canonical_vendor_tool(tool: &str) -> &str {
+    match tool {
+        "Bash" | "bash" | "execute" | "commandExecution" | "shell_command" | "exec_command" => {
+            "shell"
+        }
+        "Read" | "read" => "read_file",
+        "Write" | "write" => "write_file",
+        "Edit" | "edit" => "edit_file",
+        "MultiEdit" | "NotebookEdit" | "fileChange" => "apply_patch",
+        "Glob" => "glob",
+        "Grep" => "grep",
+        "WebFetch" | "WebSearch" => "web_fetch",
+        "Task" | "Agent" => "spawn_thread",
+        other => other,
+    }
 }
 
 /// Remove the `_images` vision payload from a tool result, leaving a small
@@ -7615,6 +8338,178 @@ mod tests {
             "o",
             "r"
         ));
+    }
+
+    #[test]
+    fn provider_capability_mode_discloses_mixed_vendor_surfaces() {
+        let config = |kind: &str, tool_bridge: Option<bool>| ProviderConfig {
+            kind: kind.into(),
+            tool_bridge,
+            ..ProviderConfig::default()
+        };
+
+        for kind in ["openai-compat", "anthropic", "codex-responses"] {
+            assert_eq!(
+                provider_capability_mode(&config(kind, None)),
+                ProviderCapabilityMode::Authoritative
+            );
+        }
+        for kind in ["claude-cli", "codex-app-server"] {
+            assert_eq!(
+                provider_capability_mode(&config(kind, None)),
+                ProviderCapabilityMode::Authoritative
+            );
+            assert_eq!(
+                provider_capability_mode(&config(kind, Some(true))),
+                ProviderCapabilityMode::Authoritative
+            );
+            assert_eq!(
+                provider_capability_mode(&config(kind, Some(false))),
+                ProviderCapabilityMode::Compatibility
+            );
+        }
+        assert_eq!(
+            provider_capability_mode(&config("cursor-cli", Some(true))),
+            ProviderCapabilityMode::Compatibility
+        );
+    }
+
+    #[test]
+    fn restricted_modes_can_still_load_advertised_skills() {
+        let mode = AgentMode {
+            id: "locked".into(),
+            display_name: "Locked".into(),
+            system_prompt: String::new(),
+            allowed_tools: vec!["read_file".into()],
+            read_only: true,
+            default_permission_mode: Some(trouve_protocol::PermissionMode::Ask),
+            default_model: None,
+            default_thinking_level: None,
+        };
+        assert!(mode_allows_tool(&mode, "read_file"));
+        assert!(mode_allows_tool(&mode, "load_skill"));
+        assert!(!mode_allows_tool(&mode, "shell"));
+    }
+
+    #[test]
+    fn tool_catalog_revision_tracks_schema_not_order() {
+        let spec = |name: &str, description: &str| ToolSpec {
+            name: name.into(),
+            description: description.into(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": { "path": { "type": "string" } }
+            }),
+        };
+        let a = spec("read_file", "Read a file");
+        let b = spec("grep", "Search text");
+        assert_eq!(
+            tool_catalog_revision(&[a.clone(), b.clone()]),
+            tool_catalog_revision(&[b.clone(), a.clone()])
+        );
+        assert_ne!(
+            tool_catalog_revision(&[a, b]),
+            tool_catalog_revision(&[
+                spec("read_file", "Read one file"),
+                spec("grep", "Search text")
+            ])
+        );
+    }
+
+    #[test]
+    fn attachments_are_materialized_for_sandboxed_tools() {
+        let tmp = tempfile::tempdir().unwrap();
+        let worktree = tmp.path().join("worktree");
+        let source = tmp.path().join("source.txt");
+        std::fs::create_dir_all(&worktree).unwrap();
+        std::fs::write(&source, "attachment body").unwrap();
+        let attachment = trouve_protocol::Attachment {
+            id: "at_1".into(),
+            name: "../../notes.txt".into(),
+            mime: "text/plain".into(),
+            size_bytes: 15,
+        };
+
+        let staged = materialize_attachments(&worktree, &[(attachment, source)]);
+        assert_eq!(staged.len(), 1);
+        assert_eq!(
+            staged[0].1,
+            Path::new(".trouve/attachments/at_1-.._.._notes.txt")
+        );
+        assert_eq!(
+            std::fs::read_to_string(worktree.join(&staged[0].1)).unwrap(),
+            "attachment body"
+        );
+        assert!(
+            annotate_attachments("inspect this".into(), &staged)
+                .contains(".trouve/attachments/at_1-.._.._notes.txt")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn attachment_staging_rejects_symlink_escape() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let worktree = tmp.path().join("worktree");
+        let outside = tmp.path().join("outside");
+        let source = tmp.path().join("source.txt");
+        std::fs::create_dir_all(worktree.join(".trouve")).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(&source, "attachment body").unwrap();
+        symlink(&outside, worktree.join(".trouve/attachments")).unwrap();
+        let attachment = trouve_protocol::Attachment {
+            id: "at_1".into(),
+            name: "notes.txt".into(),
+            mime: "text/plain".into(),
+            size_bytes: 15,
+        };
+
+        let staged = materialize_attachments(&worktree, &[(attachment, source)]);
+
+        assert!(staged.is_empty());
+        assert!(!outside.join("at_1-notes.txt").exists());
+    }
+
+    #[test]
+    fn authoritative_tool_event_assertion_accepts_only_trouve_mcp() {
+        assert!(is_trouve_bridge_tool_event(
+            "mcp__trouve__read_file",
+            &serde_json::json!({"path": "src/lib.rs"})
+        ));
+        assert!(is_trouve_bridge_tool_event(
+            "mcpToolCall",
+            &serde_json::json!({"server": "trouve", "tool": "apply_patch"})
+        ));
+        assert!(is_trouve_bridge_tool_event(
+            "mcpToolCall",
+            &serde_json::json!({"serverName": "trouve", "tool": "shell"})
+        ));
+        assert!(!is_trouve_bridge_tool_event(
+            "commandExecution",
+            &serde_json::json!({"command": "git status"})
+        ));
+        assert!(!is_trouve_bridge_tool_event(
+            "mcpToolCall",
+            &serde_json::json!({"server": "ambient-user-server"})
+        ));
+    }
+
+    #[test]
+    fn compatibility_tool_names_normalize_before_persistence() {
+        for (vendor, canonical) in [
+            ("Bash", "shell"),
+            ("commandExecution", "shell"),
+            ("Read", "read_file"),
+            ("Write", "write_file"),
+            ("Edit", "edit_file"),
+            ("fileChange", "apply_patch"),
+            ("Task", "spawn_thread"),
+        ] {
+            assert_eq!(canonical_vendor_tool(vendor), canonical);
+        }
+        assert_eq!(canonical_vendor_tool("custom_tool"), "custom_tool");
     }
 
     #[test]

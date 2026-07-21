@@ -1103,10 +1103,10 @@ pub fn set_file_view(ui: &Ui, name: String, content: String, lines: Vec<Vec<(Str
 
 // --- settings screen ---------------------------------------------------------
 
-/// (id, kind, base_url, has_credentials, auth, category, experimental) per provider.
+/// Provider settings rows, including category and capability authority.
 pub fn set_settings_data(
     ui: &Ui,
-    providers: Vec<(String, String, String, bool, String, String, bool)>,
+    providers: Vec<(String, String, String, bool, String, String, bool, String)>,
     models: Vec<String>,
     thinking: Vec<ModelThinkingView>,
     default_model_index: i32,
@@ -1117,7 +1117,16 @@ pub fn set_settings_data(
         let items: Vec<ProviderItem> = providers
             .into_iter()
             .map(
-                |(id, kind, base_url, has_credentials, auth, category, experimental)| {
+                |(
+                    id,
+                    kind,
+                    base_url,
+                    has_credentials,
+                    auth,
+                    category,
+                    experimental,
+                    capability_mode,
+                )| {
                     ProviderItem {
                         id: id.into(),
                         kind: kind.into(),
@@ -1126,6 +1135,7 @@ pub fn set_settings_data(
                         auth: auth.into(),
                         category: category.into(),
                         experimental,
+                        capability_mode: capability_mode.into(),
                     }
                 },
             )

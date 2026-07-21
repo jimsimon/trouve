@@ -74,6 +74,16 @@ Thread scope:
   decision, by}`
 - `tool.started` `{call_id}` / `tool.output` `{call_id, chunk}` /
   `tool.completed` `{call_id, status, result}`
+- `thread.command_catalog_updated` `{commands}` — Trouve's authoritative
+  typed slash-command and skill completion catalog; each entry declares
+  whether it is a model `prompt` or deterministic Trouve `action`, plus its
+  usage. It replaces the prior catalog for the thread.
+  `thread.commands_updated` is legacy vendor data retained only for old
+  event-log replay.
+- `thread.command_executed` `{name, arguments, output}` — a deterministic
+  Trouve action completed. Persisting its rendered output makes command
+  history identical on replay and across clients; any response navigation
+  hint is deliberately not state.
 - `thread.queue_updated` `{prompts}` — the thread's queue of pending prompts
   changed (enqueue/edit/reorder/delete/dispatch); carries the full remaining
   queue in run order, so replaying to the tail reproduces the current queue

@@ -282,6 +282,42 @@ pub struct TurnAccepted {
     pub queued: bool,
 }
 
+// --- slash commands -------------------------------------------------------
+
+/// Execute one deterministic Trouve slash command. Prompt commands from the
+/// catalog continue to use `SendMessageRequest` so they start a model turn.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct ExecuteCommandRequest {
+    /// Catalog name without the leading slash.
+    pub name: String,
+    /// Everything following the command name, without leading whitespace.
+    #[serde(default)]
+    pub arguments: String,
+}
+
+/// Result of a deterministic slash command.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct CommandResult {
+    pub name: String,
+    pub output: String,
+    /// Optional client navigation requested by the command.
+    #[serde(default)]
+    pub action: CommandAction,
+}
+
+/// Client-side action that follows a completed command. Persistent state is
+/// still reported through the event log; these are navigation hints only.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum CommandAction {
+    #[default]
+    None,
+    /// Select a newly created thread.
+    SwitchThread { thread_id: ThreadId },
+    /// Reveal and attach the current session's integrated terminal.
+    OpenTerminal,
+}
+
 // --- queued prompts --------------------------------------------------------
 
 /// A prompt waiting its turn. Queued prompts persist on disk and run in
@@ -803,6 +839,18 @@ pub struct BranchList {
 
 // --- provider configuration -------------------------------------------------
 
+/// Who controls the agent-facing capability surface for this provider.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderCapabilityMode {
+    /// Trouve owns tools, permissions, commands, skills, and MCP routing.
+    #[default]
+    Authoritative,
+    /// Trouve provides its capability surface, but the vendor agent may also
+    /// expose native capabilities that cannot yet be suppressed.
+    Compatibility,
+}
+
 /// A configured provider, with secrets elided.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct ProviderInfo {
@@ -827,6 +875,10 @@ pub struct ProviderInfo {
     /// at any time; clients should display a warning.
     #[serde(default)]
     pub experimental: bool,
+    /// Whether the provider receives Trouve's authoritative agent surface or
+    /// runs with a mixed vendor/Trouve compatibility surface.
+    #[serde(default)]
+    pub capability_mode: ProviderCapabilityMode,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]

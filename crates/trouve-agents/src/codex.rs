@@ -37,7 +37,7 @@ use crate::{
 pub struct CodexBackend {
     id: String,
     command: String,
-    server: Mutex<Option<Arc<AppServer>>>,
+    server: Arc<Mutex<Option<Arc<AppServer>>>>,
     /// `model/list` result, cached for [`MODELS_TTL`].
     models_cache: Mutex<Option<(std::time::Instant, Vec<ModelInfo>)>>,
     /// Real context windows by model name, learned from
@@ -72,7 +72,7 @@ impl CodexBackend {
         Self {
             id: id.into(),
             command: command.unwrap_or_else(|| "codex".into()),
-            server: Mutex::new(None),
+            server: Arc::new(Mutex::new(None)),
             models_cache: Mutex::new(None),
             observed_windows: Arc::new(std::sync::Mutex::new(HashMap::new())),
         }
@@ -158,9 +158,7 @@ impl AgentBackend for CodexBackend {
     }
 
     fn status(&self) -> BackendStatus {
-        let auth = dirs::home_dir()
-            .map(|h| h.join(".codex").join("auth.json").exists())
-            .unwrap_or(false);
+        let auth = codex_auth_path().is_some_and(|path| path.exists());
         BackendStatus {
             installed: binary_on_path(&self.command),
             has_credentials: auth,
@@ -187,10 +185,48 @@ impl AgentBackend for CodexBackend {
     }
 
     async fn start_login(&self) -> Result<BackendLogin, BackendError> {
-        spawn_login(&self.command, &["login"]).await
+        let BackendLogin {
+            verification_url,
+            user_code,
+            done,
+        } = spawn_login(&self.command, &["login"]).await?;
+        let server = self.server.clone();
+        Ok(BackendLogin {
+            verification_url,
+            user_code,
+            done: Box::pin(async move {
+                let result = done.await;
+                if result.is_ok() {
+                    // AppServer snapshots auth into an isolated CODEX_HOME.
+                    // Force the next request to create a fresh snapshot after
+                    // login rather than retaining a pre-login process.
+                    *server.lock().await = None;
+                }
+                result
+            }),
+        })
     }
 
     async fn run_turn(&self, turn: BackendTurn) -> Result<BackendEventStream, BackendError> {
+        let authoritative = turn
+            .mcp_bridge
+            .as_ref()
+            .is_some_and(|bridge| bridge.authoritative);
+        if authoritative
+            && turn
+                .mcp_bridge
+                .as_ref()
+                .is_some_and(|bridge| !bridge.bridge_tools)
+        {
+            return Err(BackendError::Protocol(
+                "authoritative Codex turns require Trouve's full tool bridge".into(),
+            ));
+        }
+        if authoritative && !turn.mcp_servers.is_empty() {
+            return Err(BackendError::Protocol(
+                "authoritative Codex turns may mount only Trouve's MCP bridge".into(),
+            ));
+        }
         let server = self.server().await?;
 
         // Effort comes from the thread's model options; `@effort` model ids
@@ -212,11 +248,10 @@ impl AgentBackend for CodexBackend {
             json!({ "type": sandbox_policy_type })
         };
 
-        // Per-thread config overrides: the trouve MCP bridge rides along so
-        // codex gets trouve's semantic search / question tools, plus any
-        // user-configured MCP servers (both thread/start and thread/resume
-        // accept `config`, and resumed threads re-spawn their MCP servers
-        // from it).
+        // Per-thread config overrides mount Trouve's MCP bridge. In
+        // authoritative mode user MCP is already inside ToolExecutor and is
+        // deliberately not mounted directly in Codex (both thread/start and
+        // thread/resume accept `config`).
         let config_override = mcp_config_override(&turn);
         let with_config = |mut params: Value| {
             if let Some(config) = &config_override {
@@ -226,18 +261,31 @@ impl AgentBackend for CodexBackend {
         };
 
         // Start or resume the vendor-side thread.
-        let start_params = with_config(json!({
+        let mut start_params = with_config(json!({
             "model": model_or_default(model_name),
             "cwd": turn.worktree,
             "approvalPolicy": approval_policy,
             "sandbox": sandbox,
             "serviceName": "trouve",
+            "developerInstructions": turn.instructions,
         }));
+        if authoritative {
+            // No execution environment means Codex cannot register its
+            // shell, apply_patch, view_image, or permission tools. MCP tools
+            // remain available and execute back inside Trouve.
+            start_params["environments"] = json!([]);
+        }
         let mut fresh_session = false;
         let codex_thread_id = match &turn.session {
             Some(sid) => {
                 let resumed = server
-                    .request("thread/resume", with_config(json!({ "threadId": sid })))
+                    .request(
+                        "thread/resume",
+                        with_config(json!({
+                            "threadId": sid,
+                            "developerInstructions": turn.instructions,
+                        })),
+                    )
                     .await;
                 match resumed {
                     Ok(v) => thread_id_of(&v)?,
@@ -258,16 +306,7 @@ impl AgentBackend for CodexBackend {
 
         let route = server.subscribe(&codex_thread_id).await;
 
-        // Mode instructions (which include the search-tool guidance when
-        // the bridge is mounted) ride along in the first user message of a
-        // fresh vendor session (app-server owns the system prompt).
-        let text = match (&turn.instructions, fresh_session) {
-            (Some(instr), true) => format!(
-                "<mode-instructions>\n{instr}\n</mode-instructions>\n\n{}",
-                turn.prompt
-            ),
-            _ => turn.prompt.clone(),
-        };
+        let text = turn.prompt.clone();
 
         // Images ride as localImage items (app-server reads the file
         // itself); the engine already turned non-image uploads into path
@@ -284,6 +323,12 @@ impl AgentBackend for CodexBackend {
             "input": input,
         });
         apply_reasoning_options(&mut turn_params, effort);
+        if authoritative {
+            // Repeat the empty selection on every turn. This keeps resumed
+            // threads fail-closed even if a future app-server changes how it
+            // persists thread-level environment selection.
+            turn_params["environments"] = json!([]);
+        }
         server.request("turn/start", turn_params).await?;
 
         let stream = turn_stream(
@@ -298,10 +343,9 @@ impl AgentBackend for CodexBackend {
     }
 }
 
-/// Codex config overrides mounting the trouve MCP bridge and the user's
-/// configured MCP servers as per-thread MCP servers (same shape as
-/// `mcp_servers` in codex's config.toml). `None` when there is nothing to
-/// mount.
+/// Codex config overrides mounting the Trouve MCP bridge (and direct servers
+/// only for adapter-level compatibility callers) in config.toml shape.
+/// `None` when there is nothing to mount.
 fn mcp_config_override(turn: &crate::BackendTurn) -> Option<Value> {
     let env_map = |env: &[(String, String)]| -> serde_json::Map<String, Value> {
         env.iter()
@@ -322,12 +366,47 @@ fn mcp_config_override(turn: &crate::BackendTurn) -> Option<Value> {
     if let Some(bridge) = &turn.mcp_bridge {
         // Streamable-HTTP server (`url` instead of `command` selects the
         // transport in codex's mcp_servers config shape).
-        servers.insert("trouve".into(), json!({ "url": bridge.url }));
+        servers.insert(
+            "trouve".into(),
+            json!({
+                "url": bridge.url,
+                // ToolExecutor already classifies and gates every call. Do
+                // not wrap it in Codex's separate MCP approval heuristic.
+                "default_tools_approval_mode": "approve",
+            }),
+        );
     }
-    if servers.is_empty() {
+    let authoritative = turn
+        .mcp_bridge
+        .as_ref()
+        .is_some_and(|bridge| bridge.authoritative);
+    if servers.is_empty() && !authoritative {
         return None;
     }
-    Some(json!({ "mcp_servers": servers }))
+    let mut config = json!({ "mcp_servers": servers });
+    if authoritative {
+        config["web_search"] = json!("disabled");
+        config["experimental_request_user_input_enabled"] = json!(false);
+        config["features"] = json!({
+            "apps": false,
+            "browser_use": false,
+            "browser_use_external": false,
+            "computer_use": false,
+            "current_time_reminder": false,
+            "goals": false,
+            "hooks": false,
+            "image_generation": false,
+            "memories": false,
+            "multi_agent": false,
+            "plugins": false,
+            "remote_plugin": false,
+            "shell_snapshot": false,
+            "shell_tool": false,
+            "tool_suggest": false,
+            "workspace_dependencies": false,
+        });
+    }
+    Some(config)
 }
 
 fn model_or_default(model: &str) -> &str {
@@ -902,13 +981,29 @@ struct AppServer {
     buffered: Buffered,
     /// Held so the child (kill_on_drop) lives as long as the server handle.
     _child: Child,
+    /// A clean Codex home containing credentials only. Keeping the TempDir
+    /// alive prevents ambient config, skills, plugins, hooks, and MCP servers
+    /// from becoming a second capability source.
+    _isolated_home: tempfile::TempDir,
     closed: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl AppServer {
     async fn spawn(command: &str) -> Result<Self, BackendError> {
+        let isolated_home = tempfile::Builder::new()
+            .prefix("trouve-codex-home-")
+            .tempdir()
+            .map_err(BackendError::Io)?;
+        if let Some(source) = codex_auth_path()
+            && source.is_file()
+        {
+            std::fs::copy(&source, isolated_home.path().join("auth.json"))
+                .map_err(BackendError::Io)?;
+        }
         let mut child = tokio::process::Command::new(command)
             .arg("app-server")
+            .arg("--strict-config")
+            .env("CODEX_HOME", isolated_home.path())
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
@@ -928,6 +1023,7 @@ impl AppServer {
             routes: Arc::new(Mutex::new(HashMap::new())),
             buffered: Arc::new(Mutex::new(HashMap::new())),
             _child: child,
+            _isolated_home: isolated_home,
             closed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         };
         server.start_reader(stdout);
@@ -951,6 +1047,7 @@ impl AppServer {
             "initialize",
             json!({
                 "clientInfo": { "name": "trouve", "version": env!("CARGO_PKG_VERSION") },
+                "capabilities": { "experimentalApi": true },
             }),
         )
         .await?;
@@ -1013,6 +1110,13 @@ impl AppServer {
         self.routes.lock().await.remove(thread_id);
         self.buffered.lock().await.remove(thread_id);
     }
+}
+
+fn codex_auth_path() -> Option<std::path::PathBuf> {
+    std::env::var_os("CODEX_HOME")
+        .map(std::path::PathBuf::from)
+        .or_else(|| dirs::home_dir().map(|home| home.join(".codex")))
+        .map(|home| home.join("auth.json"))
 }
 
 #[cfg(test)]
@@ -1212,6 +1316,7 @@ mod tests {
         turn.mcp_bridge = Some(crate::McpBridgeConfig {
             url: "http://127.0.0.1:1/internal/threads/th_1/mcp?tools=0&approval=0".into(),
             bridge_tools: false,
+            authoritative: false,
             disallowed_tools: Vec::new(),
         });
         let config = mcp_config_override(&turn).unwrap();
@@ -1222,6 +1327,7 @@ mod tests {
             servers["trouve"]["url"],
             "http://127.0.0.1:1/internal/threads/th_1/mcp?tools=0&approval=0"
         );
+        assert_eq!(servers["trouve"]["default_tools_approval_mode"], "approve");
         assert!(servers["trouve"]["command"].is_null());
 
         // User servers alone (no bridge) still produce an override.
@@ -1229,6 +1335,56 @@ mod tests {
         let config = mcp_config_override(&turn).unwrap();
         assert!(config["mcp_servers"]["jira"].is_object());
         assert!(config["mcp_servers"]["trouve"].is_null());
+    }
+
+    #[test]
+    fn authoritative_config_disables_codex_capability_sources() {
+        let mut turn = bare_turn();
+        turn.mcp_bridge = Some(crate::McpBridgeConfig {
+            url: "http://127.0.0.1:1/internal/threads/th_1/mcp?tools=1&approval=0".into(),
+            bridge_tools: true,
+            authoritative: true,
+            disallowed_tools: Vec::new(),
+        });
+
+        let config = mcp_config_override(&turn).unwrap();
+        assert_eq!(config["web_search"], "disabled");
+        assert_eq!(
+            config["mcp_servers"]
+                .as_object()
+                .unwrap()
+                .keys()
+                .collect::<Vec<_>>(),
+            vec!["trouve"]
+        );
+        for feature in [
+            "apps",
+            "browser_use",
+            "browser_use_external",
+            "computer_use",
+            "current_time_reminder",
+            "goals",
+            "hooks",
+            "image_generation",
+            "memories",
+            "multi_agent",
+            "plugins",
+            "remote_plugin",
+            "shell_snapshot",
+            "shell_tool",
+            "tool_suggest",
+            "workspace_dependencies",
+        ] {
+            assert_eq!(
+                config["features"][feature], false,
+                "feature {feature} escaped authoritative isolation"
+            );
+        }
+        assert_eq!(config["experimental_request_user_input_enabled"], false);
+        assert_eq!(
+            config["mcp_servers"]["trouve"]["default_tools_approval_mode"],
+            "approve"
+        );
     }
 
     #[test]

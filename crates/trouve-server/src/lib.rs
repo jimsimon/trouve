@@ -22,19 +22,19 @@ use trouve_core::Engine;
 use trouve_core::engine::EngineError;
 use trouve_protocol::{
     AddLocalModelRequest, AgentMode, Automation, BranchList, CliInfo, CliInstallStatus, CliList,
-    CodeReviewDashboard, CodeReviewRepository, ConfigureGithubAppRequest, CreatePrRequest,
-    CreateSessionRequest, CreateThreadRequest, DirEntry, ErrorBody, FileContent, GithubAppStatus,
-    GithubIntegration, GithubPrList, KnownProvider, LocalSearchResult, LocalStatus, LoginStarted,
-    LoginStatus, McpLogs, McpServerInfo, MergePrRequest, ModeInfo, ModelInfo, OpenTerminalRequest,
-    PROTOCOL_VERSION, PrInfo, ProviderInfo, ProvidersResponse, QueuedPrompt,
-    RegisterWorkspaceRequest, ReorderQueueRequest, ResolveApprovalRequest, ResolveQuestionRequest,
-    ReviewerProfile, Scope, SendMessageRequest, ServerInfo, Session, SessionDiff,
-    SetDefaultModelRequest, SetDefaultPermissionModeRequest, SetLocalEnabledRequest,
-    SubscriptionHealth, TerminalInfo, TerminalInputRequest, TerminalResizeRequest, Thread,
-    TurnAccepted, UpdateCodeReviewRepositoryRequest, UpdateQueuedPromptRequest,
-    UpdateSessionRequest, UpdateThreadRequest, UpsertAutomationRequest, UpsertMcpServerRequest,
-    UpsertModeRequest, UpsertProviderRequest, UpsertReviewerProfileRequest, UsageSummary,
-    Workspace,
+    CodeReviewDashboard, CodeReviewRepository, CommandResult, ConfigureGithubAppRequest,
+    CreatePrRequest, CreateSessionRequest, CreateThreadRequest, DirEntry, ErrorBody,
+    ExecuteCommandRequest, FileContent, GithubAppStatus, GithubIntegration, GithubPrList,
+    KnownProvider, LocalSearchResult, LocalStatus, LoginStarted, LoginStatus, McpLogs,
+    McpServerInfo, MergePrRequest, ModeInfo, ModelInfo, OpenTerminalRequest, PROTOCOL_VERSION,
+    PrInfo, ProviderInfo, ProvidersResponse, QueuedPrompt, RegisterWorkspaceRequest,
+    ReorderQueueRequest, ResolveApprovalRequest, ResolveQuestionRequest, ReviewerProfile, Scope,
+    SendMessageRequest, ServerInfo, Session, SessionDiff, SetDefaultModelRequest,
+    SetDefaultPermissionModeRequest, SetLocalEnabledRequest, SubscriptionHealth, TerminalInfo,
+    TerminalInputRequest, TerminalResizeRequest, Thread, TurnAccepted,
+    UpdateCodeReviewRepositoryRequest, UpdateQueuedPromptRequest, UpdateSessionRequest,
+    UpdateThreadRequest, UpsertAutomationRequest, UpsertMcpServerRequest, UpsertModeRequest,
+    UpsertProviderRequest, UpsertReviewerProfileRequest, UsageSummary, Workspace,
 };
 use utoipa::OpenApi;
 
@@ -97,6 +97,7 @@ impl IntoResponse for ApiError {
         list_threads,
         get_thread,
         update_thread,
+        execute_command,
         send_message,
         get_attachment,
         list_queue,
@@ -193,6 +194,10 @@ impl IntoResponse for ApiError {
         trouve_protocol::QuestionOption,
         trouve_protocol::QuestionAnswer,
         trouve_protocol::CommandInfo,
+        trouve_protocol::CommandKind,
+        ExecuteCommandRequest,
+        CommandResult,
+        trouve_protocol::CommandAction,
         ModelInfo,
         ProviderInfo,
         ProvidersResponse,
@@ -599,6 +604,7 @@ pub fn build_router(engine: Arc<Engine>) -> Router {
         )
         .route("/v1/threads", post(create_thread).get(list_threads))
         .route("/v1/threads/{id}", get(get_thread).patch(update_thread))
+        .route("/v1/threads/{id}/commands", post(execute_command))
         .route("/v1/threads/{id}/messages", post(send_message))
         .route("/v1/attachments/{id}", get(get_attachment))
         .route("/v1/threads/{id}/queue", get(list_queue).put(reorder_queue))
@@ -942,6 +948,18 @@ async fn update_thread(
     Json(req): Json<UpdateThreadRequest>,
 ) -> Result<Json<Thread>, ApiError> {
     Ok(Json(engine.update_thread(&id, &req)?))
+}
+
+#[utoipa::path(post, path = "/v1/threads/{id}/commands",
+    params(("id" = String, Path,)), request_body = ExecuteCommandRequest,
+    responses((status = 200, body = CommandResult), (status = 400, body = ErrorBody),
+              (status = 404, body = ErrorBody), (status = 409, body = ErrorBody)))]
+async fn execute_command(
+    State(engine): State<Arc<Engine>>,
+    Path(id): Path<String>,
+    Json(req): Json<ExecuteCommandRequest>,
+) -> Result<Json<CommandResult>, ApiError> {
+    Ok(Json(engine.execute_command(&id, req).await?))
 }
 
 #[utoipa::path(post, path = "/v1/threads/{id}/messages",

@@ -45,11 +45,15 @@ const POOL_CAP: usize = 3;
 const IDLE_TIMEOUT: Duration = Duration::from_secs(300);
 /// How often the reaper scans the pool.
 const REAP_INTERVAL: Duration = Duration::from_secs(60);
+/// First Claude Code release certified against the granular authoritative
+/// controls below. Older releases silently ignore some environment toggles.
+const MIN_AUTHORITATIVE_VERSION: (u64, u64, u64) = (2, 1, 201);
 
 pub struct ClaudeBackend {
     id: String,
     command: String,
     pool: Arc<Pool>,
+    authority_probe: tokio::sync::OnceCell<Result<(), String>>,
 }
 
 impl ClaudeBackend {
@@ -58,8 +62,73 @@ impl ClaudeBackend {
             id: id.into(),
             command: command.unwrap_or_else(|| "claude".into()),
             pool: Arc::new(Pool::default()),
+            authority_probe: tokio::sync::OnceCell::new(),
         }
     }
+}
+
+fn parse_cli_version(text: &str) -> Option<(u64, u64, u64)> {
+    text.split_whitespace().find_map(|token| {
+        let mut parts = token.trim_start_matches('v').split('.');
+        let major = parts.next()?.parse().ok()?;
+        let minor = parts.next()?.parse().ok()?;
+        let patch = parts
+            .next()?
+            .split(|c: char| !c.is_ascii_digit())
+            .next()?
+            .parse()
+            .ok()?;
+        Some((major, minor, patch))
+    })
+}
+
+async fn certify_authoritative_cli(command: &str) -> Result<(), String> {
+    let invoke = |arg: &'static str| async move {
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            Command::new(command).arg(arg).stdin(Stdio::null()).output(),
+        )
+        .await
+        .map_err(|_| format!("{command} {arg} timed out"))?
+        .map_err(|e| format!("cannot run {command} {arg}: {e}"))
+    };
+    let version_output = invoke("--version").await?;
+    if !version_output.status.success() {
+        return Err(format!("{command} --version failed"));
+    }
+    let version_text = String::from_utf8_lossy(&version_output.stdout);
+    let version = parse_cli_version(&version_text)
+        .ok_or_else(|| format!("cannot parse Claude Code version from {version_text:?}"))?;
+    if version < MIN_AUTHORITATIVE_VERSION {
+        return Err(format!(
+            "Claude Code {}.{}.{} is too old for Trouve's authoritative tool mode; need at least {}.{}.{}",
+            version.0,
+            version.1,
+            version.2,
+            MIN_AUTHORITATIVE_VERSION.0,
+            MIN_AUTHORITATIVE_VERSION.1,
+            MIN_AUTHORITATIVE_VERSION.2,
+        ));
+    }
+    let help_output = invoke("--help").await?;
+    if !help_output.status.success() {
+        return Err(format!("{command} --help failed"));
+    }
+    let help = String::from_utf8_lossy(&help_output.stdout);
+    for required in [
+        "--setting-sources",
+        "--settings",
+        "--disable-slash-commands",
+        "--strict-mcp-config",
+        "--tools",
+    ] {
+        if !help.contains(required) {
+            return Err(format!(
+                "Claude Code {version_text:?} lacks required isolation control {required}"
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Live `claude` processes keyed by trouve thread id.
@@ -146,10 +215,12 @@ impl ClaudeProc {
 
 /// Spawn-time configuration that must match for a process to be reused.
 fn config_fingerprint(turn: &BackendTurn) -> String {
-    let bridge = turn
-        .mcp_bridge
-        .as_ref()
-        .map(|b| format!("{}|{}|{:?}", b.url, b.bridge_tools, b.disallowed_tools));
+    let bridge = turn.mcp_bridge.as_ref().map(|b| {
+        format!(
+            "{}|{}|{}|{:?}",
+            b.url, b.bridge_tools, b.authoritative, b.disallowed_tools
+        )
+    });
     let servers: Vec<String> = turn
         .mcp_servers
         .iter()
@@ -233,6 +304,33 @@ impl AgentBackend for ClaudeBackend {
     }
 
     async fn run_turn(&self, turn: BackendTurn) -> Result<BackendEventStream, BackendError> {
+        let authoritative = turn
+            .mcp_bridge
+            .as_ref()
+            .is_some_and(|bridge| bridge.authoritative);
+        if authoritative
+            && turn
+                .mcp_bridge
+                .as_ref()
+                .is_some_and(|bridge| !bridge.bridge_tools)
+        {
+            return Err(BackendError::Protocol(
+                "authoritative Claude turns require Trouve's full tool bridge".into(),
+            ));
+        }
+        if authoritative && !turn.mcp_servers.is_empty() {
+            return Err(BackendError::Protocol(
+                "authoritative Claude turns may mount only Trouve's MCP bridge".into(),
+            ));
+        }
+        if authoritative
+            && let Err(message) = self
+                .authority_probe
+                .get_or_init(|| certify_authoritative_cli(&self.command))
+                .await
+        {
+            return Err(BackendError::Protocol(message.clone()));
+        }
         self.start_reaper();
         let proc_ = self.proc_for(&turn).await?;
         let pool = self.pool.clone();
@@ -604,7 +702,37 @@ impl ClaudeBackend {
             mcp_config_file = Some(file);
         }
         if let Some(bridge) = &turn.mcp_bridge {
-            if bridge.bridge_tools {
+            if bridge.authoritative {
+                // Subscription auth and vendor context remain, but every
+                // customization and executable built-in stands down. Do not
+                // use --safe-mode here: it also suppresses the explicit
+                // Trouve MCP server. The granular controls preserve OAuth
+                // while leaving the command-line MCP config as the one tool
+                // source. Unknown flags fail rather than silently restoring
+                // the vendor surface.
+                cmd.args(["--setting-sources", ""])
+                    .args(["--settings", r#"{"disableAllHooks":true}"#])
+                    .arg("--disable-slash-commands")
+                    .arg("--no-chrome")
+                    .args(["--prompt-suggestions", "false"])
+                    .args(["--tools", ""])
+                    .env("CLAUDE_AGENT_SDK_DISABLE_BUILTIN_AGENTS", "1")
+                    .env("CLAUDE_CODE_AUTO_CONNECT_IDE", "false")
+                    .env("CLAUDE_CODE_DISABLE_ADVISOR_TOOL", "1")
+                    .env("CLAUDE_CODE_DISABLE_AGENT_VIEW", "1")
+                    .env("CLAUDE_CODE_DISABLE_ARTIFACT", "1")
+                    .env("CLAUDE_CODE_DISABLE_AUTO_MEMORY", "1")
+                    .env("CLAUDE_CODE_DISABLE_BACKGROUND_TASKS", "1")
+                    .env("CLAUDE_CODE_DISABLE_BUNDLED_SKILLS", "1")
+                    .env("CLAUDE_CODE_DISABLE_CLAUDE_MDS", "1")
+                    .env("CLAUDE_CODE_DISABLE_CRON", "1")
+                    .env("CLAUDE_CODE_DISABLE_EXPLORE_PLAN_AGENTS", "1")
+                    .env("CLAUDE_CODE_DISABLE_GIT_INSTRUCTIONS", "1")
+                    .env("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "1")
+                    .env("CLAUDE_CODE_DISABLE_OFFICIAL_MARKETPLACE_AUTOINSTALL", "1")
+                    .env("CLAUDE_CODE_DISABLE_POLICY_SKILLS", "1")
+                    .env("CLAUDE_CODE_DISABLE_WORKFLOWS", "1")
+                    .env("ENABLE_CLAUDEAI_MCP_SERVERS", "false");
                 if !bridge.disallowed_tools.is_empty() {
                     cmd.args(["--disallowedTools", &bridge.disallowed_tools.join(",")]);
                 }
@@ -616,16 +744,21 @@ impl ClaudeBackend {
                 // (they are gated inside trouve).
                 cmd.args([
                     "--allowedTools",
-                    "mcp__trouve__search,mcp__trouve__find_related,mcp__trouve__ask_question",
+                    "mcp__trouve__search,mcp__trouve__find_related,mcp__trouve__ask_question,mcp__trouve__load_skill",
                 ]);
             }
-            // Even Yolo routes through the engine: it auto-approves normal
-            // calls but still enforces the session-worktree boundary.
-            cmd.args(["--permission-prompt-tool", "mcp__trouve__approval_prompt"]);
+            // Compatibility mode retains Claude's built-ins, so every
+            // permission level (including Yolo) routes through the engine:
+            // Yolo auto-approves normal calls while the worktree boundary
+            // remains enforced. Authoritative mode executes only bridged
+            // Trouve tools, whose permission gate is already in-process.
+            if !bridge.authoritative {
+                cmd.args(["--permission-prompt-tool", "mcp__trouve__approval_prompt"]);
+            }
         }
         match turn.permission {
             BackendPermission::Yolo => {
-                // Direct backend use may have no embedded bridge. Preserve
+                // Direct adapter use may have no embedded bridge. Preserve
                 // Yolo semantics in that degraded case; normal engine turns
                 // have a bridge and auto-approve through its path guard.
                 if turn.mcp_bridge.is_none() {
@@ -643,7 +776,7 @@ impl ClaudeBackend {
                 let vendor_tools_stand_down = turn
                     .mcp_bridge
                     .as_ref()
-                    .is_some_and(|bridge| bridge.bridge_tools);
+                    .is_some_and(|bridge| bridge.authoritative);
                 if !vendor_tools_stand_down {
                     cmd.args(["--disallowedTools", "Write,Edit,MultiEdit,NotebookEdit"]);
                 }
@@ -722,6 +855,8 @@ fn map_event(ev: &Value) -> Vec<BackendEvent> {
                         .map(|name| trouve_protocol::CommandInfo {
                             name: name.to_string(),
                             description: String::new(),
+                            kind: trouve_protocol::CommandKind::Prompt,
+                            usage: format!("/{name}"),
                         })
                         .collect(),
                 });
@@ -937,6 +1072,16 @@ fn parse_reset_at(v: &Value) -> Option<i64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parses_claude_cli_versions_for_authority_certification() {
+        assert_eq!(
+            parse_cli_version("2.1.201 (Claude Code)"),
+            Some((2, 1, 201))
+        );
+        assert_eq!(parse_cli_version("claude v3.0.4-beta"), Some((3, 0, 4)));
+        assert_eq!(parse_cli_version("unknown"), None);
+    }
 
     fn rfc3339_in(secs: i64) -> String {
         chrono::DateTime::from_timestamp(chrono::Utc::now().timestamp() + secs, 0)

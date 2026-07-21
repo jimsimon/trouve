@@ -441,7 +441,9 @@ pub fn chat_rows(
         for (i, item) in vm.items.iter().enumerate() {
             match item {
                 ChatItem::Assistant { .. } => prev = Some(i),
-                ChatItem::User { .. } | ChatItem::TurnStatus { .. } => prev = None,
+                ChatItem::User { .. } | ChatItem::Command { .. } | ChatItem::TurnStatus { .. } => {
+                    prev = None
+                }
                 ChatItem::ToolCall { .. }
                 | ChatItem::Thinking { .. }
                 | ChatItem::Questions { .. } => {
@@ -455,7 +457,9 @@ pub fn chat_rows(
         for (i, item) in vm.items.iter().enumerate().rev() {
             match item {
                 ChatItem::Assistant { .. } => next = Some(i),
-                ChatItem::User { .. } | ChatItem::TurnStatus { .. } => next = None,
+                ChatItem::User { .. } | ChatItem::Command { .. } | ChatItem::TurnStatus { .. } => {
+                    next = None
+                }
                 ChatItem::ToolCall { .. }
                 | ChatItem::Thinking { .. }
                 | ChatItem::Questions { .. } => {
@@ -516,6 +520,40 @@ pub fn chat_rows(
                         preview(content)
                     },
                     detail: content.clone(),
+                    expanded: open,
+                    card_key: key,
+                    ..Default::default()
+                };
+                push_card(&mut rows, &mut call_ids, header, body);
+            }
+            ChatItem::Command {
+                name,
+                arguments,
+                output,
+            } => {
+                if !rows.is_empty() {
+                    rows.push(ChatRowData {
+                        kind: 8,
+                        ..Default::default()
+                    });
+                    call_ids.push(None);
+                }
+                let key = format!("c:{i}");
+                let open = !collapsed.contains(&key);
+                let mut body = Vec::new();
+                if open {
+                    push_blocks(&mut body, output);
+                }
+                let invocation = if arguments.is_empty() {
+                    format!("/{name}")
+                } else {
+                    format!("/{name} {arguments}")
+                };
+                let header = ChatRowData {
+                    tool_name: "Trouve".into(),
+                    subtitle: invocation.clone(),
+                    text: preview(output),
+                    detail: output.clone(),
                     expanded: open,
                     card_key: key,
                     ..Default::default()
@@ -1792,7 +1830,9 @@ fn latest_turn(vm: &ThreadViewModel) -> u64 {
             | ChatItem::Assistant { turn, .. }
             | ChatItem::Thinking { turn, .. }
             | ChatItem::TurnStatus { turn, .. } => Some(*turn),
-            ChatItem::ToolCall { .. } | ChatItem::Questions { .. } => None,
+            ChatItem::ToolCall { .. } | ChatItem::Questions { .. } | ChatItem::Command { .. } => {
+                None
+            }
         })
         .max()
         .unwrap_or(0)
@@ -2012,6 +2052,30 @@ fn highlight_lines(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn trouve_command_output_renders_as_its_own_card() {
+        let vm = ThreadViewModel {
+            items: vec![ChatItem::Command {
+                name: "status".into(),
+                arguments: String::new(),
+                output: "## Status\n\nReady".into(),
+            }],
+            ..Default::default()
+        };
+        let (rows, call_ids) = chat_rows(
+            &vm,
+            &HashSet::new(),
+            &HashSet::new(),
+            &HashSet::new(),
+            &HashMap::new(),
+        );
+        assert_eq!(rows[0].kind, 7);
+        assert_eq!(rows[0].tool_name, "Trouve");
+        assert_eq!(rows[0].subtitle, "/status");
+        assert!(rows.iter().any(|row| row.text == "Ready"));
+        assert!(call_ids.iter().all(Option::is_none));
+    }
 
     #[test]
     fn fenced_code_is_highlighted_before_ui_mapping() {

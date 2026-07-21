@@ -3,11 +3,12 @@
 //! trouve's session worktrees.
 //!
 //! Unlike a `trouve_providers::Provider` (raw model inference inside
-//! trouve's own agent loop), an [`AgentBackend`] owns the whole turn: the
-//! vendor harness plans, calls its own tools, and edits files. Trouve
-//! translates its event stream into the trouve protocol and bridges its
-//! approval requests through the engine's permission layer. Subscription
-//! auth stays inside the vendor binary — we never touch vendor OAuth tokens.
+//! trouve's own agent loop), an [`AgentBackend`] owns the vendor-side turn
+//! and conversation state. In authoritative mode, however, its executable
+//! capability surface is replaced by Trouve's thread-scoped MCP bridge, so
+//! every side effect still crosses `ToolExecutor`. Subscription auth stays
+//! inside the vendor binary — Trouve only stages the minimum credential file
+//! an isolated process needs.
 
 pub mod claude;
 pub mod codex;
@@ -58,11 +59,12 @@ pub struct BackendTurn {
     /// the vendor protocol allows.
     pub instructions: Option<String>,
     pub permission: BackendPermission,
-    /// When set, the vendor agent runs with its built-in tools disabled and
-    /// trouve's ToolExecutor bridged in over MCP (Claude Code only, v1).
+    /// Thread-scoped Trouve MCP surface. `authoritative` determines whether
+    /// the adapter must also isolate all vendor-native capabilities.
     pub mcp_bridge: Option<McpBridgeConfig>,
-    /// User-configured MCP servers (user/workspace/worktree scopes, already
-    /// merged and env-expanded by the engine) to mount alongside the bridge.
+    /// Direct vendor MCP mounts are compatibility-only. Authoritative engine
+    /// turns leave this empty because user MCP is resolved and executed by
+    /// Trouve's `ToolExecutor` through the bridge.
     pub mcp_servers: Vec<McpServerLaunch>,
 }
 
@@ -107,10 +109,15 @@ pub struct McpBridgeConfig {
     /// Full endpoint URL, thread-scoped, with the tool/approval surface
     /// selected via query parameters.
     pub url: String,
-    /// When true the bridge serves trouve's ToolExecutor tools and the
-    /// vendor's built-ins are disabled; when false it only serves the
-    /// approval-prompt gate.
+    /// When true the bridge serves Trouve's full ToolExecutor set; when
+    /// false it serves only the cross-provider baseline tools and optional
+    /// approval gate. See `authoritative` for whether vendor tools also
+    /// stand down.
     pub bridge_tools: bool,
+    /// The adapter has isolated or disabled every vendor execution tool, so
+    /// Trouve is the only executable capability source. When false, bridged
+    /// tools may coexist with vendor built-ins (compatibility mode).
+    pub authoritative: bool,
     /// Vendor built-in tools to disable while the bridge supplies tools.
     pub disallowed_tools: Vec<String>,
 }

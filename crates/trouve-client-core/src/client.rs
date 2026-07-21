@@ -211,6 +211,23 @@ impl ProtocolClient {
         self.send_message_with(thread_id, content, Vec::new()).await
     }
 
+    /// Execute a Trouve-owned action command without starting a model turn.
+    pub async fn execute_command(
+        &self,
+        thread_id: &str,
+        name: &str,
+        arguments: &str,
+    ) -> Result<CommandResult> {
+        self.post_json(
+            &format!("/threads/{thread_id}/commands"),
+            &ExecuteCommandRequest {
+                name: name.into(),
+                arguments: arguments.into(),
+            },
+        )
+        .await
+    }
+
     /// Send a prompt with attachment uploads (base64 bytes; stored
     /// server-side and passed to the agent).
     pub async fn send_message_with(

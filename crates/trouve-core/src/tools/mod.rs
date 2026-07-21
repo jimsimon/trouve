@@ -12,6 +12,7 @@ mod grep;
 mod patch;
 mod search;
 mod shell;
+mod skill;
 mod todo;
 mod web;
 
@@ -216,6 +217,7 @@ impl LocalToolExecutor {
                 Arc::new(search::FindRelated {
                     cache: search_cache,
                 }),
+                Arc::new(skill::LoadSkill),
             ],
             mcp: crate::mcp::McpManager::with_logs(logs),
             jobs,

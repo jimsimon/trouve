@@ -22,6 +22,7 @@ export struct ProviderItem {
     // "subscription" / "api" / "local".
     category: string,
     experimental: bool,
+    capability-mode: string,
 }
 
 // A vendor CLI (cursor-agent, claude, codex) trouve can download and manage.
@@ -730,6 +731,12 @@ export component SettingsScreen inherits Rectangle {
                                             if provider.experimental: Text {
                                                 text: "⚠ experimental";
                                                 color: Theme.c.err;
+                                                font-size: Theme.fs(11px);
+                                                vertical-alignment: center;
+                                            }
+                                            if provider.capability-mode == "compatibility": Text {
+                                                text: "⚠ mixed tools";
+                                                color: Theme.c.warn;
                                                 font-size: Theme.fs(11px);
                                                 vertical-alignment: center;
                                             }
