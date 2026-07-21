@@ -27,11 +27,12 @@ docker compose -f docker-compose.review.yml pull
 docker compose -f docker-compose.review.yml up -d
 ```
 
-Images are published from `main` to GitHub Container Registry as
-`ghcr.io/jimsimon/trouve-server:latest` and
-`ghcr.io/jimsimon/trouve-review-ui:latest`, with an additional immutable tag
-for each commit. To build both images from the current checkout instead, run
-`docker compose -f docker-compose.review.yml up -d --build`.
+Images are published with each `trouve-search-vX.Y.Z` GitHub release to GitHub
+Container Registry as `ghcr.io/jimsimon/trouve-server:latest` and
+`ghcr.io/jimsimon/trouve-review-ui:latest`. Each release also publishes the
+release version (for example, `2.1.0`) and an immutable commit-SHA tag. To build
+both images from the current checkout instead, use the same Compose file with
+the `--build` flag.
 
 Open `http://your-server:7433`, enter `TROUVE_AUTH_TOKEN`, and add at least
 one model provider. The token is kept in browser session storage, so closing
