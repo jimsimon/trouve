@@ -1538,6 +1538,40 @@ async fn session_and_thread_updates_and_provider_config() {
             .any(|p| p["id"] == "openrouter")
     );
 
+    // Provider routing preference is a persisted, ordered subset. The
+    // response appends unlisted providers deterministically for settings UI.
+    let resp = client
+        .put(format!("{base}/config/provider-order"))
+        .json(&serde_json::json!({
+            "provider_ids": ["openrouter", "scripted"]
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 204);
+    let providers: serde_json::Value = client
+        .get(format!("{base}/providers"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(providers["provider_order"][0], "openrouter");
+    assert_eq!(providers["provider_order"][1], "scripted");
+    let config_text = std::fs::read_to_string(&config_file).unwrap();
+    assert!(config_text.contains("provider_order"));
+
+    let resp = client
+        .put(format!("{base}/config/provider-order"))
+        .json(&serde_json::json!({
+            "provider_ids": ["openrouter", "openrouter"]
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 400);
+
     // Global defaults persist together in one config-file update.
     let resp = client
         .put(format!("{base}/config/defaults"))

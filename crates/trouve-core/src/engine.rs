@@ -4,7 +4,9 @@
 //! reported exclusively through the event log. Worktree mutations are
 //! serialized per session (threads share the session worktree, ADR 0003).
 
-use std::collections::{HashMap, HashSet};
+mod routing;
+
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, RwLock, Weak};
@@ -1135,7 +1137,6 @@ struct TurnScheduler {
 
 struct TurnCapacityGuard {
     _permits: Vec<tokio::sync::OwnedSemaphorePermit>,
-    wait_ms: u64,
 }
 
 impl TurnScheduler {
@@ -1201,7 +1202,7 @@ impl TurnScheduler {
                 _ = tokio::time::sleep(cooldown) => {}
             }
         }
-        let mut permits = Vec::with_capacity(if background { 4 } else { 2 });
+        let mut permits = Vec::with_capacity(if background { 2 } else { 1 });
         if background {
             permits.push(tokio::select! {
                 biased;
@@ -1380,6 +1381,18 @@ fn validate_persona_id(id: &str) -> Result<(), EngineError> {
     if !personas::is_valid_persona_id(id) {
         return Err(EngineError::BadRequest(
             "persona id must be non-empty and [a-zA-Z0-9_-] only".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_model_selection(model: &str) -> Result<(), EngineError> {
+    if model.trim().is_empty() {
+        return Err(EngineError::BadRequest("model must not be empty".into()));
+    }
+    if model.trim() != model {
+        return Err(EngineError::BadRequest(
+            "model must not have surrounding whitespace".into(),
         ));
     }
     Ok(())
@@ -2359,7 +2372,7 @@ impl Engine {
                 model: config
                     .default_model
                     .clone()
-                    .unwrap_or_else(|| "openai/gpt-4.1-mini".into()),
+                    .unwrap_or_else(|| "auto/gpt-4.1-mini".into()),
                 thinking_level: config.default_thinking_level.clone(),
                 permission_mode: config.default_permission_mode.unwrap_or_default(),
             }),
@@ -2812,6 +2825,83 @@ impl Engine {
     /// on. Live account and vendor-CLI availability is resolved separately by
     /// refresh_models so first paint never waits for network or CLI startup.
     pub async fn list_models(&self) -> Vec<trouve_protocol::ModelInfo> {
+        let mut models: Vec<_> = self
+            .available_model_candidates()
+            .await
+            .into_iter()
+            .map(|candidate| candidate.info)
+            .collect();
+        models.sort_by(|a, b| a.id.cmp(&b.id));
+        models
+    }
+
+    /// Provider-neutral catalog for current clients. The provider-qualified
+    /// `/models` catalog remains intact for compatibility and explicit route
+    /// pinning.
+    pub async fn list_model_routes(&self) -> Vec<trouve_protocol::RoutedModelInfo> {
+        let mut grouped = BTreeMap::<String, Vec<ModelCandidate>>::new();
+        for candidate in self.available_model_candidates().await {
+            grouped
+                .entry(candidate.selection_id())
+                .or_default()
+                .push(candidate);
+        }
+
+        grouped
+            .into_iter()
+            .map(|(id, mut candidates)| {
+                candidates.sort_by(|a, b| {
+                    a.provider_id
+                        .cmp(&b.provider_id)
+                        .then_with(|| a.provider_model.cmp(&b.provider_model))
+                });
+                let first = &candidates[0].info;
+                let display_name = if candidates
+                    .iter()
+                    .all(|candidate| candidate.info.display_name == first.display_name)
+                {
+                    first.display_name.clone()
+                } else {
+                    id.clone()
+                };
+                let context_window = candidates
+                    .iter()
+                    .map(|candidate| candidate.info.context_window)
+                    .filter(|window| *window > 0)
+                    .min()
+                    .unwrap_or(0);
+                trouve_protocol::RoutedModelInfo {
+                    id,
+                    display_name,
+                    context_window,
+                    supports_tools: candidates
+                        .iter()
+                        .all(|candidate| candidate.info.supports_tools),
+                    input_price_per_mtok: common_price(&candidates, |model| {
+                        model.input_price_per_mtok
+                    }),
+                    output_price_per_mtok: common_price(&candidates, |model| {
+                        model.output_price_per_mtok
+                    }),
+                    options_schema: routed_options_schema(
+                        &candidates
+                            .iter()
+                            .map(|candidate| &candidate.info)
+                            .collect::<Vec<_>>(),
+                    ),
+                    routes: candidates
+                        .iter()
+                        .map(|candidate| trouve_protocol::ModelRouteInfo {
+                            provider_id: candidate.provider_id.clone(),
+                            provider_model: candidate.provider_model.clone(),
+                        })
+                        .collect(),
+                }
+            })
+            .collect()
+    }
+
+    async fn available_model_candidates(&self) -> Vec<ModelCandidate> {
         let online = self.is_online();
         let offline_capable = if online {
             std::collections::HashSet::new()
@@ -2886,15 +2976,167 @@ impl Engine {
                     let status = backend.status();
                     status.installed && status.has_credentials
                 })
-                .cloned()
+                .map(|(id, backend)| (id.clone(), backend.clone()))
                 .collect()
         } else {
             Vec::new()
         };
-        let listings = futures::future::join_all(ready.iter().map(|b| b.list_models())).await;
-        models.extend(listings.into_iter().flatten());
-        models.sort_by(|a, b| a.id.cmp(&b.id));
-        models
+        let listings =
+            futures::future::join_all(ready.into_iter().map(|(provider_id, backend)| async move {
+                let models = backend.list_models().await;
+                (provider_id, backend, models)
+            }))
+            .await;
+        for (provider_id, backend, models) in listings {
+            candidates.extend(models.into_iter().map(|info| ModelCandidate {
+                provider_model: model_name_for_provider(&provider_id, &info.id).to_string(),
+                provider_qualified: false,
+                provider_id: provider_id.clone(),
+                info,
+                executor: ModelExecutor::Backend(backend.clone()),
+            }));
+        }
+        candidates
+    }
+
+    /// Resolve a provider-neutral id to runnable routes, applying open
+    /// circuits, reported exhaustion, user preference, live subscription
+    /// headroom, and learned success. A provider-qualified id is an explicit
+    /// pin and resolves to that route only.
+    async fn resolve_model_candidates(
+        &self,
+        model: &str,
+    ) -> Result<Vec<ModelCandidate>, EngineError> {
+        let all = self.available_model_candidates().await;
+        if let Some(candidate) = all.iter().find(|candidate| candidate.info.id == model) {
+            return Ok(vec![candidate.clone()]);
+        }
+        // Preserve the legacy provider-qualified escape hatch even for
+        // injected/custom providers that can run arbitrary model names and
+        // therefore publish no finite catalog.
+        if let Some((provider_id, provider_model)) = model.split_once('/') {
+            if let Some(provider) = self.providers.read().unwrap().get(provider_id).cloned() {
+                return Ok(vec![ModelCandidate {
+                    provider_id: provider_id.to_string(),
+                    provider_model: provider_model.to_string(),
+                    info: fallback_model_info(model, provider_model),
+                    executor: ModelExecutor::Native(provider),
+                    provider_qualified: self.offline_capable_provider_ids().contains(provider_id),
+                }]);
+            }
+            if let Some(backend) = self.backends.read().unwrap().get(provider_id).cloned() {
+                return Ok(vec![ModelCandidate {
+                    provider_id: provider_id.to_string(),
+                    provider_model: provider_model.to_string(),
+                    info: fallback_model_info(model, provider_model),
+                    executor: ModelExecutor::Backend(backend),
+                    provider_qualified: false,
+                }]);
+            }
+        }
+        let candidates: Vec<_> = all
+            .into_iter()
+            .filter(|candidate| candidate.selection_id() == model)
+            .collect();
+        if candidates.is_empty() {
+            return Err(EngineError::BadRequest(format!(
+                "model {model} has no available provider route"
+            )));
+        }
+        self.rank_model_candidates(candidates).await
+    }
+
+    async fn rank_model_candidates(
+        &self,
+        mut candidates: Vec<ModelCandidate>,
+    ) -> Result<Vec<ModelCandidate>, EngineError> {
+        let learned = self.store.route_health().map_err(EngineError::Internal)?;
+        let now = chrono::Utc::now().timestamp();
+        let cooling = |candidate: &ModelCandidate| {
+            learned
+                .get(&(
+                    candidate.provider_id.clone(),
+                    candidate.provider_model.clone(),
+                ))
+                .and_then(|health| health.retry_after)
+                .is_some_and(|retry_after| retry_after > now)
+        };
+        if candidates.iter().all(&cooling) {
+            let retry_after = candidates
+                .iter()
+                .filter_map(|candidate| {
+                    learned
+                        .get(&(
+                            candidate.provider_id.clone(),
+                            candidate.provider_model.clone(),
+                        ))
+                        .and_then(|health| health.retry_after)
+                })
+                .min()
+                .unwrap_or(now);
+            return Err(EngineError::Conflict(format!(
+                "all routes for this model are cooling down; retry in {} seconds",
+                retry_after.saturating_sub(now).max(1)
+            )));
+        }
+        // Do not keep open circuits as tail fallbacks. If every fresh route
+        // fails, the next turn re-ranks from persisted state and advances to
+        // routes that were not exercised yet.
+        candidates.retain(|candidate| !cooling(candidate));
+
+        let provider_order = self.config.lock().unwrap().provider_order.clone();
+        let preference: HashMap<&str, usize> = provider_order
+            .iter()
+            .enumerate()
+            .map(|(index, provider)| (provider.as_str(), index))
+            .collect();
+        let mut scored = futures::future::join_all(candidates.into_iter().map(|candidate| async {
+            let rank = match &candidate.executor {
+                ModelExecutor::Native(_) => (1u8, 0i64),
+                ModelExecutor::Backend(backend) => match tokio::time::timeout(
+                    std::time::Duration::from_secs(5),
+                    backend.subscription_health(),
+                )
+                .await
+                {
+                    Ok(Some(health)) => subscription_health_rank(&health),
+                    _ => (1, 0),
+                },
+            };
+            let preferred = preference.get(candidate.provider_id.as_str()).copied();
+            let route = learned.get(&(
+                candidate.provider_id.clone(),
+                candidate.provider_model.clone(),
+            ));
+            let last_success = route.and_then(|health| health.last_success_at);
+            let score = (
+                u8::from(rank.0 >= 2),
+                u8::from(preferred.is_none()),
+                preferred.unwrap_or(usize::MAX),
+                rank.0,
+                rank.1,
+                u8::from(last_success.is_none()),
+                last_success.map(|timestamp| -timestamp).unwrap_or(i64::MAX),
+            );
+            (score, rank, candidate)
+        }))
+        .await;
+        if scored.iter().all(|(_, rank, _)| rank.0 >= 3) {
+            return Err(EngineError::Conflict(
+                "every route for this model reports exhausted capacity".into(),
+            ));
+        }
+        scored.retain(|(_, rank, _)| rank.0 < 3);
+        scored.sort_by(|(score_a, _, a), (score_b, _, b)| {
+            score_a
+                .cmp(score_b)
+                .then_with(|| a.provider_id.cmp(&b.provider_id))
+                .then_with(|| a.provider_model.cmp(&b.provider_model))
+        });
+        Ok(scored
+            .into_iter()
+            .map(|(_, _, candidate)| candidate)
+            .collect())
     }
 
     /// Provider ids that keep working without internet: the built-in local
@@ -2970,9 +3212,23 @@ impl Engine {
             }
         }
         infos.sort_by(|a, b| a.id.cmp(&b.id));
+        let configured_ids: HashSet<&str> = infos.iter().map(|info| info.id.as_str()).collect();
+        let mut provider_order = Vec::with_capacity(infos.len());
+        for id in &config.provider_order {
+            if configured_ids.contains(id.as_str()) && !provider_order.contains(id) {
+                provider_order.push(id.clone());
+            }
+        }
+        for info in &infos {
+            if !provider_order.contains(&info.id) {
+                provider_order.push(info.id.clone());
+            }
+        }
+        drop(config);
         let defaults = self.global_defaults.read().unwrap().clone();
         ProvidersResponse {
             providers: infos,
+            provider_order,
             default_model: defaults.model,
             default_thinking_level: defaults.thinking_level,
             default_permission_mode: defaults.permission_mode,
@@ -3116,8 +3372,16 @@ impl Engine {
                     entry.query_params = req.query_params.clone();
                 }
             }
+            if !config.provider_order.is_empty()
+                && !config.provider_order.iter().any(|provider| provider == id)
+            {
+                config.provider_order.push(id.to_string());
+            }
             self.persist_config(&config);
         }
+        self.store
+            .clear_route_health(id)
+            .map_err(EngineError::Internal)?;
         self.reload_providers();
         let config = self.config.lock().unwrap();
         let registry = self.providers.read().unwrap();
@@ -3150,6 +3414,7 @@ impl Engine {
                 .providers
                 .remove(id)
                 .ok_or_else(|| EngineError::NotFound(format!("provider {id}")))?;
+            config.provider_order.retain(|provider| provider != id);
             self.persist_config(&config);
             removed.secret_names
         };
@@ -3164,7 +3429,41 @@ impl Engine {
                 .secrets
                 .delete(&trouve_providers::secrets::provider_secret(id, &name));
         }
+        self.store
+            .clear_route_health(id)
+            .map_err(EngineError::Internal)?;
         self.reload_providers();
+        Ok(())
+    }
+
+    /// Replace the explicit provider preference prefix. Omitted providers
+    /// remain routable after the listed entries.
+    pub fn set_provider_order(&self, provider_ids: &[String]) -> Result<(), EngineError> {
+        let known: HashSet<String> = self
+            .providers
+            .read()
+            .unwrap()
+            .keys()
+            .chain(self.backends.read().unwrap().keys())
+            .cloned()
+            .chain(self.config.lock().unwrap().providers.keys().cloned())
+            .collect();
+        let mut seen = HashSet::new();
+        for id in provider_ids {
+            if !known.contains(id) {
+                return Err(EngineError::BadRequest(format!(
+                    "provider order contains unknown provider {id}"
+                )));
+            }
+            if !seen.insert(id) {
+                return Err(EngineError::BadRequest(format!(
+                    "provider order contains duplicate provider {id}"
+                )));
+            }
+        }
+        let mut config = self.config.lock().unwrap();
+        config.provider_order = provider_ids.to_vec();
+        self.persist_config(&config);
         Ok(())
     }
 
@@ -4466,17 +4765,14 @@ impl Engine {
         }
     }
 
-    /// Set the default model for new threads (provider-qualified).
+    /// Set the default model for new threads. Provider-qualified values pin
+    /// one route; provider-neutral values are selected dynamically.
     pub fn set_default_model(
         &self,
         model: &str,
         thinking_level: Option<&str>,
     ) -> Result<(), EngineError> {
-        if !model.contains('/') {
-            return Err(EngineError::BadRequest(format!(
-                "model must be provider-qualified (e.g. openai/gpt-4.1-mini): {model}"
-            )));
-        }
+        validate_model_selection(model)?;
         validate_thinking_level(thinking_level)?;
         {
             let mut config = self.config.lock().unwrap();
@@ -4865,12 +5161,8 @@ impl Engine {
             .config_dir
             .as_deref()
             .ok_or_else(|| EngineError::BadRequest("no config dir".into()))?;
-        if let Some(model) = req.default_model.as_deref()
-            && !model.contains('/')
-        {
-            return Err(EngineError::BadRequest(format!(
-                "default_model must be provider-qualified (\"provider/model\"), got {model}"
-            )));
+        if let Some(model) = req.default_model.as_deref() {
+            validate_model_selection(model)?;
         }
         validate_thinking_level(req.default_thinking_level.as_deref())?;
         let persona = AgentPersona {
@@ -8125,6 +8417,7 @@ impl Engine {
             .model
             .or_else(|| mode.default_model.clone())
             .unwrap_or_else(|| global_defaults.model.clone());
+        validate_model_selection(&model)?;
         let mut model_options = req.model_options;
         // `thinking_level` is the canonical inherited key. Before a turn it
         // is resolved to the selected model's advertised key
@@ -8414,12 +8707,8 @@ impl Engine {
             personas::find_persona(&all_modes, mode_id)
                 .ok_or_else(|| EngineError::BadRequest(format!("unknown persona: {mode_id}")))?;
         }
-        if let Some(model) = req.model.as_deref()
-            && !model.contains('/')
-        {
-            return Err(EngineError::BadRequest(format!(
-                "model must be provider-qualified (e.g. openai/gpt-4.1-mini): {model}"
-            )));
+        if let Some(model) = req.model.as_deref() {
+            validate_model_selection(model)?;
         }
         self.store.update_thread_with_event(
             id,
@@ -8462,6 +8751,33 @@ impl Engine {
         &self,
         model: &str,
     ) -> Result<trouve_protocol::ModelInfo, EngineError> {
+        if !model.contains('/') {
+            let routes =
+                tokio::time::timeout(MODEL_CATALOG_VALIDATION_TIMEOUT, self.list_model_routes())
+                    .await
+                    .map_err(|_| {
+                        EngineError::BadRequest(format!(
+                            "timed out loading model metadata for {model}"
+                        ))
+                    })?;
+            return routes
+                .into_iter()
+                .find(|candidate| candidate.id == model)
+                .map(|candidate| trouve_protocol::ModelInfo {
+                    id: candidate.id,
+                    display_name: candidate.display_name,
+                    context_window: candidate.context_window,
+                    supports_tools: candidate.supports_tools,
+                    input_price_per_mtok: candidate.input_price_per_mtok,
+                    output_price_per_mtok: candidate.output_price_per_mtok,
+                    options_schema: candidate.options_schema,
+                })
+                .ok_or_else(|| {
+                    EngineError::BadRequest(format!(
+                        "model {model} has no available provider route"
+                    ))
+                });
+        }
         if let Some((_, backend, _)) = self.backend_for(model) {
             let models =
                 tokio::time::timeout(MODEL_CATALOG_VALIDATION_TIMEOUT, backend.list_models())
@@ -10542,10 +10858,9 @@ impl Engine {
     /// An explicit `tool_bridge = false` retains the vendor-native fallback.
     fn mcp_bridge_for(
         &self,
-        model: &str,
+        backend_id: &str,
         thread_id: &str,
     ) -> Option<trouve_agents::McpBridgeConfig> {
-        let backend_id = model.split_once('/')?.0;
         let (kind, bridge_tools) = {
             let config = self.config.lock().unwrap();
             let pc = config.providers.get(backend_id)?;
@@ -13467,13 +13782,16 @@ impl Engine {
             models = provider.list_models() => models,
         };
         let known = provider.models();
-        let Some(context_window) = live
+        let reported_context_window = live
             .iter()
             .chain(known.iter())
             .find(|m| m.id == thread.model)
             .map(|m| m.context_window)
-            .filter(|w| *w > 0)
-        else {
+            .filter(|w| *w > 0);
+        let context_window = (context_window > 0)
+            .then_some(context_window)
+            .or(reported_context_window);
+        let Some(context_window) = context_window else {
             if self
                 .compaction_warnings
                 .lock()
@@ -14248,9 +14566,6 @@ impl Engine {
             .and_then(serde_json::Value::as_str)
             .unwrap_or(&thread.model)
             .to_string();
-        if !child_model.contains('/') {
-            bail!("model must be provider-qualified (e.g. openai/gpt-4.1-mini): {child_model}");
-        }
         // Same model: the parent's option choices (thinking level, …) carry
         // over. A different model validates its own options; start clean.
         let model_options = if child_model == thread.model {
@@ -20775,6 +21090,147 @@ default_permission_mode = "ask"
         let cleared = store.latest_github_pr_snapshot(HOST).unwrap().unwrap();
         assert!(cleared.viewer.is_empty());
         assert!(cleared.prs.is_empty());
+    }
+
+    #[test]
+    fn neutral_ids_merge_only_stable_unnamespaced_names() {
+        assert_eq!(
+            neutral_model_id("gpt-5.6-sol").as_deref(),
+            Some("gpt-5.6-sol")
+        );
+        assert_eq!(
+            neutral_model_id("qwen2.5-coder:7b").as_deref(),
+            Some("qwen2.5-coder:7b")
+        );
+        assert_eq!(neutral_model_id("default"), None);
+        assert_eq!(neutral_model_id("AUTO"), None);
+        assert_eq!(neutral_model_id("openai/gpt-5.6-sol"), None);
+    }
+
+    #[test]
+    fn picker_keeps_local_and_transport_owned_models_provider_qualified() {
+        assert_eq!(
+            model_selection_id("qwen2.5-coder:7b", "local/qwen2.5-coder:7b", true),
+            "local/qwen2.5-coder:7b"
+        );
+        assert_eq!(
+            model_selection_id("qwen2.5-coder:7b", "openrouter/qwen2.5-coder:7b", false),
+            "qwen2.5-coder:7b"
+        );
+        assert_eq!(
+            model_selection_id("default", "cursor/default", false),
+            "cursor/default"
+        );
+    }
+
+    #[test]
+    fn models_dev_normalizes_hosted_routes_to_one_picker_id() {
+        let catalog = trouve_providers::models_dev::ModelsDevCatalog::embedded();
+        let api = catalog
+            .model(
+                "openai",
+                "openai",
+                "gpt-5.6-sol",
+                trouve_providers::models_dev::OptionsDialect::OpenAi,
+            )
+            .unwrap();
+        let codex = catalog
+            .model(
+                "openai",
+                "codex",
+                "gpt-5.6-sol",
+                trouve_providers::models_dev::OptionsDialect::CodexCli,
+            )
+            .unwrap();
+
+        assert_eq!(
+            model_selection_id(model_name_for_provider("openai", &api.id), &api.id, false),
+            "gpt-5.6-sol"
+        );
+        assert_eq!(
+            model_selection_id(
+                model_name_for_provider("codex", &codex.id),
+                &codex.id,
+                false
+            ),
+            "gpt-5.6-sol"
+        );
+        assert_eq!(api.display_name, codex.display_name);
+        assert_eq!(api.context_window, codex.context_window);
+    }
+
+    #[test]
+    fn subscription_routes_rank_known_headroom_before_unknown_capacity() {
+        let health = |status: &str, windows: &[i64]| trouve_protocol::SubscriptionHealth {
+            provider_id: "test".into(),
+            status: status.into(),
+            plan: String::new(),
+            windows: windows
+                .iter()
+                .map(|used_percent| trouve_protocol::SubscriptionWindow {
+                    label: "window".into(),
+                    used_percent: *used_percent,
+                    resets: String::new(),
+                })
+                .collect(),
+            credits: String::new(),
+            note: String::new(),
+        };
+
+        assert_eq!(subscription_health_rank(&health("ok", &[10, 40])), (0, 40));
+        assert_eq!(subscription_health_rank(&health("ok", &[])), (1, 0));
+        assert_eq!(
+            subscription_health_rank(&health("unavailable", &[])),
+            (2, 0)
+        );
+        assert_eq!(subscription_health_rank(&health("ok", &[100])), (3, 100));
+    }
+
+    #[test]
+    fn routed_schema_keeps_only_options_shared_by_every_provider() {
+        let model = |id: &str, thinking_key: &str, default: &str, provider_only: bool| {
+            let mut properties = serde_json::Map::from_iter([
+                (
+                    thinking_key.to_string(),
+                    serde_json::json!({
+                        "type": "string",
+                        "enum": ["low", "medium", "high"],
+                        "default": default
+                    }),
+                ),
+                (
+                    "fast".into(),
+                    serde_json::json!({"type": "boolean", "default": false}),
+                ),
+            ]);
+            if provider_only {
+                properties.insert(
+                    "provider_only".into(),
+                    serde_json::json!({"type": "boolean"}),
+                );
+            }
+            trouve_protocol::ModelInfo {
+                id: id.into(),
+                display_name: id.into(),
+                context_window: 100_000,
+                supports_tools: true,
+                input_price_per_mtok: None,
+                output_price_per_mtok: None,
+                options_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": properties
+                }),
+            }
+        };
+        let codex = model("codex/shared", "reasoning_effort", "high", true);
+        let cursor = model("cursor/shared", "thinking_level", "low", false);
+        let schema = routed_options_schema(&[&codex, &cursor]);
+
+        assert!(schema.pointer("/properties/fast").is_some());
+        assert!(schema.pointer("/properties/thinking_level").is_some());
+        assert_eq!(schema["properties"]["thinking_level"]["default"], "medium");
+        assert!(schema.pointer("/properties/reasoning_effort").is_none());
+        assert!(schema.pointer("/properties/provider_only").is_none());
     }
 
     #[test]

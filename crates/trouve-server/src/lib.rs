@@ -152,6 +152,7 @@ impl IntoResponse for ApiError {
         known_providers,
         upsert_provider,
         delete_provider,
+        set_provider_order,
         start_login,
         complete_login,
         login_status,
@@ -270,6 +271,8 @@ impl IntoResponse for ApiError {
         trouve_protocol::QuestionAnswer,
         trouve_protocol::CommandInfo,
         ModelInfo,
+        trouve_protocol::ModelRouteInfo,
+        RoutedModelInfo,
         ProviderInfo,
         ProvidersResponse,
         KnownProvider,
@@ -290,6 +293,7 @@ impl IntoResponse for ApiError {
         SetDefaultPermissionModeRequest,
         CodeReviewSettings,
         SetCodeReviewSettingsRequest,
+        SetProviderOrderRequest,
         trouve_protocol::TitleModelLoadBehavior,
         trouve_protocol::TitleModelStatus,
         GitWorktreeSettings,
@@ -620,6 +624,10 @@ pub fn build_router(engine: Arc<Engine>) -> Router {
         )
         .route("/v1/providers", get(list_providers))
         .route("/v1/providers/known", get(known_providers))
+        .route(
+            "/v1/config/provider-order",
+            axum::routing::put(set_provider_order),
+        )
         .route(
             "/v1/providers/{id}",
             axum::routing::put(upsert_provider).delete(delete_provider),
@@ -2083,6 +2091,17 @@ async fn set_code_review_settings(
 ) -> Result<impl IntoResponse, ApiError> {
     let (cursor, settings) = engine.set_code_review_settings(req)?;
     Ok(([(EVENT_CURSOR_HEADER, cursor.to_string())], Json(settings)))
+}
+
+#[utoipa::path(put, path = "/v1/config/provider-order",
+    request_body = SetProviderOrderRequest,
+    responses((status = 204), (status = 400, body = ErrorBody)))]
+async fn set_provider_order(
+    State(engine): State<Arc<Engine>>,
+    Json(req): Json<SetProviderOrderRequest>,
+) -> Result<StatusCode, ApiError> {
+    engine.set_provider_order(&req.provider_ids)?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 #[utoipa::path(get, path = "/v1/config/git-worktrees",

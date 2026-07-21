@@ -32,7 +32,14 @@ pub fn config_path() -> PathBuf {
 pub struct Config {
     #[serde(default)]
     pub providers: std::collections::BTreeMap<String, ProviderConfig>,
-    /// Default model for new threads, e.g. "openai/gpt-4.1-mini".
+    /// Global preference order for provider-neutral model routing. Providers
+    /// omitted from this list remain eligible after the explicitly ordered
+    /// entries. An empty list leaves routing to live health and learned
+    /// route history.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub provider_order: Vec<String>,
+    /// Default provider-neutral model for new threads. A provider-qualified
+    /// value remains supported and explicitly pins that route.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default_model: Option<String>,
     /// Global thinking level for new threads. The selected model's options

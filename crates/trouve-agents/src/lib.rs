@@ -398,6 +398,34 @@ pub enum BackendError {
     Io(#[from] std::io::Error),
 }
 
+impl BackendError {
+    /// Whether the vendor harness positively reported exhausted request
+    /// capacity. Generic protocol and I/O errors are intentionally terminal
+    /// because their side-effect outcome may be unknown.
+    pub fn is_capacity_exhausted(&self) -> bool {
+        let Self::Protocol(message) = self else {
+            return false;
+        };
+        let message = message.to_ascii_lowercase();
+        [
+            "429",
+            "too many requests",
+            "rate limit",
+            "rate_limit",
+            "quota exceeded",
+            "quota_exceeded",
+            "insufficient_quota",
+            "resource_exhausted",
+            "capacity exhausted",
+            "capacity_exhausted",
+            "usage limit",
+            "usage_limit",
+        ]
+        .iter()
+        .any(|signal| message.contains(signal))
+    }
+}
+
 pub type BackendEventStream = BoxStream<'static, Result<BackendEvent, BackendError>>;
 
 /// Best-effort provider health. Implementations should keep this fast;

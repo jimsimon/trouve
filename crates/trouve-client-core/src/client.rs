@@ -467,6 +467,12 @@ impl ProtocolClient {
         self.get_json("/models").await
     }
 
+    /// Model-selector catalog containing both `auto/<model>` dynamic choices
+    /// and concrete `provider/<model>` pins.
+    pub async fn list_model_routes(&self) -> Result<Vec<RoutedModelInfo>> {
+        self.get_json("/model-routes").await
+    }
+
     pub async fn list_personas(&self, workspace_id: Option<&str>) -> Result<Vec<AgentPersona>> {
         match workspace_id {
             Some(id) => self.get_json(&format!("/personas?workspace_id={id}")).await,
@@ -549,6 +555,14 @@ impl ProtocolClient {
 
     pub async fn delete_provider(&self, id: &str) -> Result<()> {
         self.delete(&format!("/providers/{id}")).await
+    }
+
+    pub async fn set_provider_order(&self, provider_ids: Vec<String>) -> Result<()> {
+        self.put_empty(
+            "/config/provider-order",
+            &SetProviderOrderRequest { provider_ids },
+        )
+        .await
     }
 
     pub async fn list_clis(&self) -> Result<CliList> {

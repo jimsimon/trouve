@@ -2778,12 +2778,6 @@ impl Engine {
                 .map(str::trim)
                 .filter(|model| !model.is_empty())
                 .map(str::to_string);
-            if model.as_deref().is_some_and(|model| !model.contains('/')) {
-                return Err(EngineError::BadRequest(format!(
-                    "model override for reviewer {:?} must be provider-qualified",
-                    reviewer_override.reviewer_id
-                )));
-            }
             let thinking_level = reviewer_override
                 .thinking_level
                 .as_deref()
@@ -2910,11 +2904,6 @@ impl Engine {
         if request.model.is_some() && model.is_none() {
             return Err(EngineError::BadRequest("model cannot be empty".into()));
         }
-        if model.as_deref().is_some_and(|model| !model.contains('/')) {
-            return Err(EngineError::BadRequest(
-                "review model must be provider-qualified".into(),
-            ));
-        }
         if request.mode != CodeReviewMode::Off && model.is_none() {
             return Err(EngineError::BadRequest(
                 "enabled code review requires an explicit repository model".into(),
@@ -2939,14 +2928,6 @@ impl Engine {
         if request.router_model.is_some() && router_model.is_none() {
             return Err(EngineError::BadRequest(
                 "router model cannot be empty".into(),
-            ));
-        }
-        if router_model
-            .as_deref()
-            .is_some_and(|model| !model.contains('/'))
-        {
-            return Err(EngineError::BadRequest(
-                "router model must be provider-qualified".into(),
             ));
         }
         let router_thinking_level = request
@@ -20249,6 +20230,13 @@ mod tests {
             .find(|repository| repository.repository == "acme/widgets")
             .unwrap();
         assert_eq!(unchanged.router_thinking_level.as_deref(), Some("low"));
+
+        let saved = engine
+            .update_code_review_repository(&request(Some("router"), Some("high")))
+            .await
+            .unwrap();
+        assert_eq!(saved.router_model.as_deref(), Some("router"));
+        assert_eq!(saved.router_thinking_level.as_deref(), Some("high"));
 
         let error = engine
             .update_code_review_repository(&request(Some("provider/plain"), Some("low")))
