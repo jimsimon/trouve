@@ -1094,32 +1094,40 @@ pub fn set_file_view(ui: &Ui, name: String, content: String, lines: Vec<Vec<(Str
 
 // --- settings screen ---------------------------------------------------------
 
-/// (id, kind, base_url, has_credentials, auth, category, experimental) per provider.
-pub fn set_settings_data(
-    ui: &Ui,
-    providers: Vec<(String, String, String, bool, String, String, bool)>,
-    models: Vec<String>,
-    thinking: Vec<ModelThinkingView>,
-    default_model_index: i32,
-    default_thinking_index: i32,
-    default_permission_index: i32,
-) {
+pub struct ProviderSettingsView {
+    pub id: String,
+    pub kind: String,
+    pub base_url: String,
+    pub has_credentials: bool,
+    pub auth: String,
+    pub category: String,
+    pub experimental: bool,
+}
+
+pub struct SettingsView {
+    pub providers: Vec<ProviderSettingsView>,
+    pub provider_order: Vec<String>,
+    pub models: Vec<String>,
+    pub thinking: Vec<ModelThinkingView>,
+    pub default_model_index: i32,
+    pub default_thinking_index: i32,
+    pub default_permission_index: i32,
+}
+
+pub fn set_settings_data(ui: &Ui, view: SettingsView) {
     let _ = ui.upgrade_in_event_loop(move |ui| {
-        let items: Vec<ProviderItem> = providers
+        let items: Vec<ProviderItem> = view
+            .providers
             .into_iter()
-            .map(
-                |(id, kind, base_url, has_credentials, auth, category, experimental)| {
-                    ProviderItem {
-                        id: id.into(),
-                        kind: kind.into(),
-                        base_url: base_url.into(),
-                        has_credentials,
-                        auth: auth.into(),
-                        category: category.into(),
-                        experimental,
-                    }
-                },
-            )
+            .map(|provider| ProviderItem {
+                id: provider.id.into(),
+                kind: provider.kind.into(),
+                base_url: provider.base_url.into(),
+                has_credentials: provider.has_credentials,
+                auth: provider.auth.into(),
+                category: provider.category.into(),
+                experimental: provider.experimental,
+            })
             .collect();
         let subscription: Vec<ProviderItem> = items
             .iter()
@@ -1142,8 +1150,10 @@ pub fn set_settings_data(
         ui.set_settings_subscription_providers(ModelRc::new(VecModel::from(subscription)));
         ui.set_settings_api_providers(ModelRc::new(VecModel::from(api)));
         ui.set_settings_local_providers(ModelRc::new(VecModel::from(local)));
-        ui.set_settings_models(string_model(models));
-        let thinking_items: Vec<crate::ThinkingItem> = thinking
+        ui.set_settings_provider_order(string_model(view.provider_order));
+        ui.set_settings_models(string_model(view.models));
+        let thinking_items: Vec<crate::ThinkingItem> = view
+            .thinking
             .into_iter()
             .map(|item| {
                 let mut mode_names = vec!["Global default".into()];
@@ -1157,9 +1167,9 @@ pub fn set_settings_data(
             })
             .collect();
         ui.set_settings_model_thinking_items(ModelRc::new(VecModel::from(thinking_items)));
-        ui.set_settings_default_model_index(default_model_index);
-        ui.set_settings_default_thinking_index(default_thinking_index);
-        ui.set_settings_default_permission_index(default_permission_index);
+        ui.set_settings_default_model_index(view.default_model_index);
+        ui.set_settings_default_thinking_index(view.default_thinking_index);
+        ui.set_settings_default_permission_index(view.default_permission_index);
     });
 }
 

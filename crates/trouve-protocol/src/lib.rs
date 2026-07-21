@@ -78,7 +78,11 @@ pub use requests::*;
 // account-centric, multi-instance feed (breaking route/event replacement),
 // and DELETE /v1/workspaces/{id} closes a workspace without deleting its
 // sessions while workspace.closed records the state change.
-pub const PROTOCOL_VERSION: &str = "1.0";
+// 1.1: provider-neutral model routing — GET /v1/model-routes and the
+// model.route_selected audit event (additive).
+// 1.2: configurable provider preference order — ProvidersResponse gains
+// provider_order and PUT /v1/config/provider-order updates it (additive).
+pub const PROTOCOL_VERSION: &str = "1.2";
 
 pub type WorkspaceId = String;
 pub type SessionId = String;

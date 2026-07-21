@@ -27,11 +27,12 @@ use trouve_protocol::{
     LoginStatus, McpLogs, McpServerInfo, MergePrRequest, ModeInfo, ModelInfo, OpenTerminalRequest,
     PROTOCOL_VERSION, PrInfo, ProviderInfo, ProvidersResponse, QueuedPrompt,
     RegisterWorkspaceRequest, ReorderQueueRequest, ResolveApprovalRequest, ResolveQuestionRequest,
-    Scope, SendMessageRequest, ServerInfo, Session, SessionDiff, SetDefaultModelRequest,
-    SetDefaultPermissionModeRequest, SetLocalEnabledRequest, SubscriptionHealth, TerminalInfo,
-    TerminalInputRequest, TerminalResizeRequest, Thread, TurnAccepted, UpdateQueuedPromptRequest,
-    UpdateSessionRequest, UpdateThreadRequest, UpsertAutomationRequest, UpsertMcpServerRequest,
-    UpsertModeRequest, UpsertProviderRequest, UsageSummary, Workspace,
+    RoutedModelInfo, Scope, SendMessageRequest, ServerInfo, Session, SessionDiff,
+    SetDefaultModelRequest, SetDefaultPermissionModeRequest, SetLocalEnabledRequest,
+    SetProviderOrderRequest, SubscriptionHealth, TerminalInfo, TerminalInputRequest,
+    TerminalResizeRequest, Thread, TurnAccepted, UpdateQueuedPromptRequest, UpdateSessionRequest,
+    UpdateThreadRequest, UpsertAutomationRequest, UpsertMcpServerRequest, UpsertModeRequest,
+    UpsertProviderRequest, UsageSummary, Workspace,
 };
 use utoipa::OpenApi;
 
@@ -105,6 +106,7 @@ impl IntoResponse for ApiError {
         resolve_approval,
         resolve_question,
         list_models,
+        list_model_routes,
         list_modes,
         list_mode_infos,
         upsert_mode,
@@ -113,6 +115,7 @@ impl IntoResponse for ApiError {
         known_providers,
         upsert_provider,
         delete_provider,
+        set_provider_order,
         start_login,
         login_status,
         list_clis,
@@ -185,6 +188,8 @@ impl IntoResponse for ApiError {
         trouve_protocol::QuestionAnswer,
         trouve_protocol::CommandInfo,
         ModelInfo,
+        trouve_protocol::ModelRouteInfo,
+        RoutedModelInfo,
         ProviderInfo,
         ProvidersResponse,
         KnownProvider,
@@ -201,6 +206,7 @@ impl IntoResponse for ApiError {
         UpsertProviderRequest,
         SetDefaultModelRequest,
         SetDefaultPermissionModeRequest,
+        SetProviderOrderRequest,
         UsageSummary,
         SessionDiff,
         DirEntry,
@@ -497,6 +503,7 @@ pub fn build_router(engine: Arc<Engine>) -> Router {
         .route("/v1/mcp-servers/{name}/logs", get(mcp_server_logs))
         .route("/v1/subscriptions", get(subscription_health))
         .route("/v1/models", get(list_models))
+        .route("/v1/model-routes", get(list_model_routes))
         .route("/v1/modes", get(list_modes))
         .route("/v1/mode-infos", get(list_mode_infos))
         .route(
@@ -505,6 +512,10 @@ pub fn build_router(engine: Arc<Engine>) -> Router {
         )
         .route("/v1/providers", get(list_providers))
         .route("/v1/providers/known", get(known_providers))
+        .route(
+            "/v1/config/provider-order",
+            axum::routing::put(set_provider_order),
+        )
         .route(
             "/v1/providers/{id}",
             axum::routing::put(upsert_provider).delete(delete_provider),
@@ -961,6 +972,11 @@ async fn list_models(State(engine): State<Arc<Engine>>) -> Json<Vec<ModelInfo>> 
     Json(engine.list_models().await)
 }
 
+#[utoipa::path(get, path = "/v1/model-routes", responses((status = 200, body = [RoutedModelInfo])))]
+async fn list_model_routes(State(engine): State<Arc<Engine>>) -> Json<Vec<RoutedModelInfo>> {
+    Json(engine.list_model_routes().await)
+}
+
 #[utoipa::path(get, path = "/v1/providers", responses((status = 200, body = ProvidersResponse)))]
 async fn list_providers(State(engine): State<Arc<Engine>>) -> Json<ProvidersResponse> {
     Json(engine.list_providers())
@@ -1230,6 +1246,17 @@ async fn set_default_permission_mode(
     Json(req): Json<SetDefaultPermissionModeRequest>,
 ) -> Result<StatusCode, ApiError> {
     engine.set_default_permission_mode(req.permission_mode)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+#[utoipa::path(put, path = "/v1/config/provider-order",
+    request_body = SetProviderOrderRequest,
+    responses((status = 204), (status = 400, body = ErrorBody)))]
+async fn set_provider_order(
+    State(engine): State<Arc<Engine>>,
+    Json(req): Json<SetProviderOrderRequest>,
+) -> Result<StatusCode, ApiError> {
+    engine.set_provider_order(&req.provider_ids)?;
     Ok(StatusCode::NO_CONTENT)
 }
 

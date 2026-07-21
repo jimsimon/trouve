@@ -165,7 +165,8 @@ pub struct CreateThreadRequest {
     /// Agent mode id (default: "code").
     #[serde(skip_serializing_if = "Option::is_none")]
     pub mode: Option<String>,
-    /// Provider/model identifier, e.g. "openai/gpt-4.1".
+    /// Provider-neutral model id from `/v1/model-routes`. A provider-qualified
+    /// id from `/v1/models` explicitly pins the thread to that route.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
     /// Model-specific options validated against the model's options schema.
@@ -637,7 +638,13 @@ pub struct ProviderInfo {
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct ProvidersResponse {
     pub providers: Vec<ProviderInfo>,
-    /// Default model for new threads, e.g. "openai/gpt-4.1-mini".
+    /// Provider ids in preferred routing order. Every currently configured
+    /// provider is present; providers not explicitly ordered on the server
+    /// are appended deterministically.
+    #[serde(default)]
+    pub provider_order: Vec<String>,
+    /// Default provider-neutral model for new threads. Provider-qualified
+    /// legacy values remain supported and pin one route.
     pub default_model: String,
     /// Global thinking level for new threads. None leaves the selected
     /// model at its own default.
@@ -663,7 +670,7 @@ pub struct UpsertProviderRequest {
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct SetDefaultModelRequest {
-    /// Provider-qualified id, e.g. "openai/gpt-4.1-mini".
+    /// Provider-neutral model id, or a provider-qualified id to pin a route.
     pub model: String,
     /// Global thinking level for the selected model. Omitted when the model
     /// has no thinking knob, preserving the existing global setting for
@@ -677,6 +684,15 @@ pub struct SetDefaultModelRequest {
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct SetDefaultPermissionModeRequest {
     pub permission_mode: PermissionMode,
+}
+
+/// Replace the global preference order used for provider-neutral routing.
+/// The list may contain a subset of configured providers; omitted providers
+/// remain eligible after all listed providers.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, ToSchema)]
+pub struct SetProviderOrderRequest {
+    #[serde(default)]
+    pub provider_ids: Vec<String>,
 }
 
 /// A well-known provider preset: clients offer these for one-click setup
@@ -1016,6 +1032,40 @@ pub struct ModelInfo {
     /// Clients render these controls from the schema, not from hardcoded
     /// per-model knowledge.
     pub options_schema: serde_json::Value,
+}
+
+/// One concrete provider route for a provider-neutral model selection.
+/// `provider_model` is the provider's own model id, without trouve's
+/// provider prefix, and is the value passed to that provider at execution.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct ModelRouteInfo {
+    pub provider_id: String,
+    pub provider_model: String,
+}
+
+/// A stable model identity that one or more currently available providers
+/// can run. Clients use this catalog for provider-neutral model pickers;
+/// [`ModelInfo`] remains the provider-qualified compatibility catalog.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct RoutedModelInfo {
+    /// Provider-neutral id stored on new threads (for example
+    /// "gpt-5.4-codex"). Models without a safe neutral identity retain their
+    /// provider-qualified id and have exactly one route.
+    pub id: String,
+    pub display_name: String,
+    /// Smallest context window across the available routes, so clients never
+    /// advertise a limit that the selected provider cannot honor.
+    pub context_window: u64,
+    pub supports_tools: bool,
+    /// Prices are present only when every route reports the same value.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub input_price_per_mtok: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub output_price_per_mtok: Option<f64>,
+    /// Provider-neutral options schema. Provider-specific option names are
+    /// translated after the harness selects a route.
+    pub options_schema: serde_json::Value,
+    pub routes: Vec<ModelRouteInfo>,
 }
 
 /// Aggregated usage for a thread or session.

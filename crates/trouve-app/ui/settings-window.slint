@@ -291,6 +291,7 @@ export component SettingsScreen inherits Rectangle {
     in property <[ProviderItem]> subscription-providers;
     in property <[ProviderItem]> api-providers;
     in property <[ProviderItem]> local-providers;
+    in property <[string]> provider-order;
     in property <[CliItem]> clis;
     in property <[KnownProviderItem]> known-providers;
     // Preset display names (alphabetical; index i maps to
@@ -377,6 +378,7 @@ export component SettingsScreen inherits Rectangle {
                             /* base-url */ string, /* api-key */ string);
     callback provider-deleted(string);
     callback provider-login(string);
+    callback provider-priority-moved(/* id */ string, /* offset */ int);
     callback default-model-picked(/* model-index */ int, /* thinking-level */ string);
     // 0 ask, 1 allow-list, 2 yolo.
     callback default-permission-picked(int);
@@ -604,6 +606,59 @@ export component SettingsScreen inherits Rectangle {
                                 Button {
                                     text: "Refresh";
                                     clicked => { root.refresh-settings(); }
+                                }
+                            }
+
+                            Text {
+                                text: "Routing priority";
+                                color: Theme.c.text-mid;
+                                font-size: Theme.fs(13px);
+                                font-weight: 700;
+                            }
+                            Text {
+                                text: "For provider-neutral models, higher providers are preferred while they are healthy. Failed routes enter a cooldown and are skipped automatically.";
+                                color: Theme.c.text-soft;
+                                font-size: Theme.fs(11px);
+                                wrap: word-wrap;
+                            }
+                            Rectangle {
+                                background: Theme.c.surface;
+                                border-radius: 6px;
+                                height: min(160px, root.provider-order.length * Theme.fs(34px));
+                                ListView {
+                                    for provider[index] in root.provider-order: Rectangle {
+                                        height: Theme.fs(34px);
+                                        HorizontalLayout {
+                                            padding-left: 10px;
+                                            padding-right: 6px;
+                                            spacing: 8px;
+                                            Text {
+                                                text: (index + 1) + ".";
+                                                color: Theme.c.text-dim;
+                                                font-size: Theme.fs(11px);
+                                                vertical-alignment: center;
+                                                width: 24px;
+                                            }
+                                            Text {
+                                                text: provider;
+                                                color: Theme.c.text-hi;
+                                                font-size: Theme.fs(12px);
+                                                vertical-alignment: center;
+                                                horizontal-stretch: 1;
+                                                overflow: elide;
+                                            }
+                                            Button {
+                                                text: "Up";
+                                                enabled: index > 0;
+                                                clicked => { root.provider-priority-moved(provider, -1); }
+                                            }
+                                            Button {
+                                                text: "Down";
+                                                enabled: index + 1 < root.provider-order.length;
+                                                clicked => { root.provider-priority-moved(provider, 1); }
+                                            }
+                                        }
+                                    }
                                 }
                             }
 
