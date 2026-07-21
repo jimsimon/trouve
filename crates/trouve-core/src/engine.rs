@@ -32,6 +32,10 @@ const MAX_ITERATIONS: usize = 32;
 /// model's context window.
 const COMPACTION_THRESHOLD: f64 = 0.8;
 
+/// End-to-end budget for refreshing one GitHub host. This bounds how long a
+/// stalled GraphQL request can retain the shared dashboard-cache lock.
+const GITHUB_DASHBOARD_REFRESH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
 #[derive(Debug, thiserror::Error)]
 pub enum EngineError {
     #[error("not found: {0}")]
@@ -3200,10 +3204,22 @@ impl Engine {
             let account =
                 crate::github::GitHubAccount::new(&token, &host).map_err(EngineError::Internal)?;
             let cache = dashboard_caches.entry(host.clone()).or_default();
-            let (viewer, mut prs) = match account.dashboard_prs(merged_since, cache).await {
-                Ok(result) => result,
-                Err(error) => {
+            let refresh = tokio::time::timeout(
+                GITHUB_DASHBOARD_REFRESH_TIMEOUT,
+                account.dashboard_prs(merged_since, cache),
+            )
+            .await;
+            let (viewer, mut prs) = match refresh {
+                Ok(Ok(result)) => result,
+                Ok(Err(error)) => {
                     failures.push(format!("{host}: {error:#}"));
+                    continue;
+                }
+                Err(_) => {
+                    failures.push(format!(
+                        "{host}: GitHub dashboard refresh timed out after {}s",
+                        GITHUB_DASHBOARD_REFRESH_TIMEOUT.as_secs()
+                    ));
                     continue;
                 }
             };
