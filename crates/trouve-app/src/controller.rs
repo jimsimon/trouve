@@ -16,7 +16,7 @@ use trouve_client_core::client::ProtocolClient;
 use trouve_client_core::viewmodel::ThreadViewModel;
 use trouve_protocol::{
     AddLocalModelRequest, AgentMode, ApprovalDecision, CreateSessionRequest, CreateThreadRequest,
-    DirEntry, EventEnvelope, ModelInfo, PermissionMode, Session, Thread, TodoStatus,
+    DirEntry, EventEnvelope, PermissionMode, RoutedModelInfo, Session, Thread, TodoStatus,
     UpdateSessionRequest, UpdateThreadRequest, UpsertModeRequest, UpsertProviderRequest, Workspace,
 };
 
@@ -263,6 +263,7 @@ pub enum UiCommand {
     },
     DeleteProvider(String),
     ProviderLogin(String),
+    MoveProviderPriority(String, i32),
     SetDefaultModel(usize, Option<String>),
     /// Set the global default permission mode (0 ask/1 allow-list/2 yolo).
     SetDefaultPermission(i32),
@@ -736,7 +737,10 @@ struct Controller {
     /// Provenance per mode, aligned with `modes` (builtin / customized /
     /// custom / workspace) — drives the settings Modes & Models section.
     mode_origins: Vec<String>,
-    models: Vec<ModelInfo>,
+    models: Vec<RoutedModelInfo>,
+    /// Global provider preference order shown in Settings and sent back as
+    /// a full permutation when the user moves a row.
+    provider_order: Vec<String>,
     /// Global thinking default, kept with the catalogs so switching a live
     /// thread's mode can apply the same inheritance as thread creation.
     default_thinking_level: Option<String>,
@@ -906,6 +910,7 @@ pub async fn run(
         modes: Vec::new(),
         mode_origins: Vec::new(),
         models: Vec::new(),
+        provider_order: Vec::new(),
         default_thinking_level: None,
         subscription_health: Vec::new(),
         subscription_refresh: SubscriptionRefreshState::default(),
@@ -1194,7 +1199,7 @@ impl Controller {
             .unwrap_or_default();
         self.modes = infos.iter().map(|i| i.mode.clone()).collect();
         self.mode_origins = infos.into_iter().map(|i| i.origin).collect();
-        self.models = self.client.list_models().await.unwrap_or_default();
+        self.models = self.client.list_model_routes().await.unwrap_or_default();
         if let Ok(providers) = self.client.list_providers().await {
             self.default_thinking_level = providers.default_thinking_level;
         }
@@ -1237,12 +1242,33 @@ impl Controller {
             .models
             .iter()
             .map(|model| {
-                model
-                    .id
-                    .split_once('/')
-                    .and_then(|(provider, _)| by_provider.get(provider).copied())
-                    .map(model_health_view)
-                    .unwrap_or_default()
+                let best_route = model.routes.iter().min_by_key(|route| {
+                    by_provider
+                        .get(route.provider_id.as_str())
+                        .map(|health| model_health_rank(health))
+                        .unwrap_or((1, 0))
+                });
+                let Some(best) = best_route
+                    .and_then(|route| by_provider.get(route.provider_id.as_str()).copied())
+                else {
+                    return ui::ModelHealthView::default();
+                };
+                let mut view = model_health_view(best);
+                if model.routes.len() > 1 && !view.summary.is_empty() {
+                    view.summary = format!("{} via {}", view.summary, best.provider_id);
+                    let routes = model
+                        .routes
+                        .iter()
+                        .map(|route| route.provider_id.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    view.detail = if view.detail.is_empty() {
+                        format!("Routed at turn time across {routes}.")
+                    } else {
+                        format!("Routed at turn time across {routes}. {}", view.detail)
+                    };
+                }
+                view
             })
             .collect();
         ui::set_model_health(&self.ui, health);
@@ -1396,10 +1422,14 @@ impl Controller {
         }
     }
 
-    /// Index of a provider-qualified model id in the models catalog.
+    /// Index of a provider-neutral id, also accepting a legacy pinned route.
     fn model_index_of(&self, model: Option<&str>) -> i32 {
         model
-            .and_then(|id| self.models.iter().position(|m| m.id == id))
+            .and_then(|id| {
+                self.models
+                    .iter()
+                    .position(|model| routed_model_matches(model, id))
+            })
             .map(|i| i as i32)
             .unwrap_or(-1)
     }
@@ -2087,7 +2117,7 @@ impl Controller {
                     .unwrap_or(-1),
                 self.models
                     .iter()
-                    .position(|m| m.id == thread.model)
+                    .position(|model| routed_model_matches(model, &thread.model))
                     .map(|i| i as i32)
                     .unwrap_or(-1),
                 permission_index_of(Some(thread.permission_mode)),
@@ -2103,7 +2133,11 @@ impl Controller {
     /// model's options schema; selections from the thread's stored options.
     fn push_model_knobs(&mut self) {
         let thread = self.current_thread.and_then(|i| self.threads.get(i));
-        let info = thread.and_then(|t| self.models.iter().find(|m| m.id == t.model));
+        let info = thread.and_then(|thread| {
+            self.models
+                .iter()
+                .find(|model| routed_model_matches(model, &thread.model))
+        });
 
         let thinking = info.and_then(|m| thinking_property(&m.options_schema));
         let (key, values, default) = match thinking {
@@ -2114,11 +2148,10 @@ impl Controller {
             .as_deref()
             .and_then(|k| thread?.model_options.get(k)?.as_str().map(String::from))
             .or_else(|| {
-                thread?
-                    .model_options
-                    .get("thinking_level")?
-                    .as_str()
-                    .map(String::from)
+                let options = &thread?.model_options;
+                ["thinking_level", "reasoning_effort", "effort", "reasoning"]
+                    .iter()
+                    .find_map(|key| options.get(*key)?.as_str().map(String::from))
             })
             .filter(|current| values.iter().any(|value| value == current))
             .or(default);
@@ -2590,7 +2623,7 @@ impl Controller {
         let catalog_window = self
             .models
             .iter()
-            .find(|m| m.id == thread.model)
+            .find(|model| routed_model_matches(model, &thread.model))
             .map(|m| m.context_window);
         let vm = self.vms.entry(thread.id.clone()).or_default();
         // A window reported live by the provider (codex sends the real one
@@ -3347,6 +3380,7 @@ impl Controller {
             }
         };
         let model_ids: Vec<String> = self.models.iter().map(|m| m.id.clone()).collect();
+        self.provider_order = providers.provider_order.clone();
         let default_model = providers.default_model.clone();
         let default_thinking_level = providers.default_thinking_level.clone();
         self.default_thinking_level = default_thinking_level.clone();
@@ -3385,26 +3419,29 @@ impl Controller {
             .unwrap_or(-1);
         ui::set_settings_data(
             &self.ui,
-            providers
-                .providers
-                .into_iter()
-                .map(|p| {
-                    (
-                        p.id,
-                        p.kind,
-                        p.base_url.unwrap_or_default(),
-                        p.has_credentials,
-                        p.auth,
-                        p.category,
-                        p.experimental,
-                    )
-                })
-                .collect(),
-            model_ids.clone(),
-            thinking_views,
-            default_index,
-            default_thinking_index,
-            permission_index_of(Some(providers.default_permission_mode)),
+            ui::SettingsView {
+                providers: providers
+                    .providers
+                    .into_iter()
+                    .map(|provider| ui::ProviderSettingsView {
+                        id: provider.id,
+                        kind: provider.kind,
+                        base_url: provider.base_url.unwrap_or_default(),
+                        has_credentials: provider.has_credentials,
+                        auth: provider.auth,
+                        category: provider.category,
+                        experimental: provider.experimental,
+                    })
+                    .collect(),
+                provider_order: self.provider_order.clone(),
+                models: model_ids.clone(),
+                thinking: thinking_views,
+                default_model_index: default_index,
+                default_thinking_index,
+                default_permission_index: permission_index_of(Some(
+                    providers.default_permission_mode,
+                )),
+            },
         );
         let mode_views = self
             .modes
@@ -3890,10 +3927,8 @@ impl Controller {
             }
             // Workspace lifecycle is server-scoped so another app instance
             // can keep its sidebar in sync with opens and closes here.
-            Event::WorkspaceRegistered { .. } => {
-                if self.reload_sessions().await.is_ok() {
-                    self.sync_home_workspace();
-                }
+            Event::WorkspaceRegistered { .. } if self.reload_sessions().await.is_ok() => {
+                self.sync_home_workspace();
             }
             Event::WorkspaceClosed { workspace_id } => {
                 self.close_current_session_if_in_workspace(workspace_id);
@@ -4575,7 +4610,11 @@ impl Controller {
                 let model = selected_mode
                     .as_ref()
                     .and_then(|m| m.default_model.clone())
-                    .filter(|m| self.models.iter().any(|known| known.id == *m));
+                    .filter(|selection| {
+                        self.models
+                            .iter()
+                            .any(|known| routed_model_matches(known, selection))
+                    });
                 let mut model_options = if model.is_some() {
                     serde_json::Map::new()
                 } else {
@@ -5254,6 +5293,38 @@ impl Controller {
                     ui::set_settings_status(&self.ui, format!("{e:#}"));
                 }
             },
+            UiCommand::MoveProviderPriority(id, offset) => {
+                let Some(index) = self
+                    .provider_order
+                    .iter()
+                    .position(|provider| provider == &id)
+                else {
+                    ui::set_settings_status(&self.ui, format!("provider {id} is no longer listed"));
+                    return Ok(());
+                };
+                let target = if offset < 0 {
+                    index.checked_sub(1)
+                } else {
+                    index
+                        .checked_add(1)
+                        .filter(|target| *target < self.provider_order.len())
+                };
+                let Some(target) = target else {
+                    return Ok(());
+                };
+                let mut order = self.provider_order.clone();
+                order.swap(index, target);
+                match self.client.set_provider_order(order.clone()).await {
+                    Ok(()) => {
+                        self.provider_order = order;
+                        ui::set_settings_status(&self.ui, "provider priority saved".into());
+                        self.refresh_settings().await;
+                    }
+                    Err(error) => {
+                        ui::set_settings_status(&self.ui, format!("{error:#}"));
+                    }
+                }
+            }
             UiCommand::SetDefaultModel(i, thinking_level) => {
                 if let Some(model) = self.models.get(i) {
                     match self
@@ -6148,6 +6219,19 @@ fn short_model(model: &str) -> String {
     model.rsplit('/').next().unwrap_or(model).to_string()
 }
 
+fn routed_model_matches(model: &RoutedModelInfo, selection: &str) -> bool {
+    if model.id == selection {
+        return true;
+    }
+    let Some((provider_id, provider_model)) = selection.split_once('/') else {
+        return false;
+    };
+    model
+        .routes
+        .iter()
+        .any(|route| route.provider_id == provider_id && route.provider_model == provider_model)
+}
+
 /// The thinking-style enum in a model's options schema, if any: property
 /// name, value tokens, and the schema default. Providers name the knob
 /// differently (anthropic: thinking_level, codex: reasoning_effort,
@@ -6436,6 +6520,25 @@ fn human_count(n: u64) -> String {
 /// The compact row deliberately uses only the highest reported percentage:
 /// it is the window closest to its cap, not a promise that requests below
 /// 100% will succeed.
+fn model_health_rank(health: &trouve_protocol::SubscriptionHealth) -> (u8, i64) {
+    match health.status.as_str() {
+        "ok" => {
+            let used = health
+                .windows
+                .iter()
+                .map(|window| window.used_percent.max(0))
+                .max();
+            match used {
+                Some(used) if used >= 100 => (3, used),
+                Some(used) => (0, used),
+                None => (1, 0),
+            }
+        }
+        "unavailable" => (2, 0),
+        _ => (1, 0),
+    }
+}
+
 fn model_health_view(health: &trouve_protocol::SubscriptionHealth) -> ui::ModelHealthView {
     let plan = display_plan(&health.plan);
     let constrained = health
@@ -6912,13 +7015,15 @@ fn should_open_chat_at_tail(force_tail: bool, turn_running: bool, has_queue: boo
 mod tests {
     use super::{
         SubscriptionRefresh, SubscriptionRefreshState, approval_pill, attention_badge, check_pill,
-        classify_pr, download_progress, human_age, human_rate, merge_pill, model_health_view,
-        pr_badge, project_session_prs, reconcile_pr_group_order, reconcile_workspace_order,
-        reorder_id, should_open_chat_at_tail, thinking_property,
+        classify_pr, download_progress, human_age, human_rate, merge_pill, model_health_rank,
+        model_health_view, pr_badge, project_session_prs, reconcile_pr_group_order,
+        reconcile_workspace_order, reorder_id, routed_model_matches, should_open_chat_at_tail,
+        thinking_property,
     };
     use chrono::{Duration, TimeZone, Utc};
     use trouve_protocol::{
-        CheckRun, PrInfo, PrReview, Session, SubscriptionHealth, SubscriptionWindow, Workspace,
+        CheckRun, PrInfo, PrReview, RoutedModelInfo, Session, SubscriptionHealth,
+        SubscriptionWindow, Workspace,
     };
 
     fn workspaces(ids: &[&str]) -> Vec<Workspace> {
@@ -7362,6 +7467,37 @@ mod tests {
         };
         assert_eq!(model_health_view(&login).summary, "login required");
         assert_eq!(model_health_view(&login).tone, 3);
+        assert!(model_health_rank(&api) < model_health_rank(&login));
+
+        let no_windows = SubscriptionHealth {
+            provider_id: "codex".into(),
+            status: "ok".into(),
+            plan: "pro".into(),
+            windows: Vec::new(),
+            credits: String::new(),
+            note: String::new(),
+        };
+        assert_eq!(model_health_rank(&no_windows), (1, 0));
+    }
+
+    #[test]
+    fn routed_model_matching_accepts_neutral_and_pinned_ids() {
+        let model = RoutedModelInfo {
+            id: "gpt-shared".into(),
+            display_name: "GPT Shared".into(),
+            context_window: 100_000,
+            supports_tools: true,
+            input_price_per_mtok: None,
+            output_price_per_mtok: None,
+            options_schema: serde_json::json!({}),
+            routes: vec![trouve_protocol::ModelRouteInfo {
+                provider_id: "codex".into(),
+                provider_model: "gpt-shared".into(),
+            }],
+        };
+        assert!(routed_model_matches(&model, "gpt-shared"));
+        assert!(routed_model_matches(&model, "codex/gpt-shared"));
+        assert!(!routed_model_matches(&model, "cursor/gpt-shared"));
     }
 
     #[test]

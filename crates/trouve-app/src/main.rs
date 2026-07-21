@@ -973,6 +973,12 @@ fn main() -> anyhow::Result<()> {
     }
     {
         let tx = tx.clone();
+        window.on_provider_priority_moved(move |id, offset| {
+            let _ = tx.send(UiCommand::MoveProviderPriority(id.to_string(), offset));
+        });
+    }
+    {
+        let tx = tx.clone();
         window.on_default_model_picked(move |i, thinking| {
             let thinking = (!thinking.is_empty()).then(|| thinking.to_string());
             let _ = tx.send(UiCommand::SetDefaultModel(i.max(0) as usize, thinking));

@@ -951,6 +951,40 @@ async fn session_and_thread_updates_and_provider_config() {
             .any(|p| p["id"] == "openrouter")
     );
 
+    // Provider routing preference is a persisted, ordered subset. The
+    // response appends unlisted providers deterministically for settings UI.
+    let resp = client
+        .put(format!("{base}/config/provider-order"))
+        .json(&serde_json::json!({
+            "provider_ids": ["openrouter", "scripted"]
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 204);
+    let providers: serde_json::Value = client
+        .get(format!("{base}/providers"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(providers["provider_order"][0], "openrouter");
+    assert_eq!(providers["provider_order"][1], "scripted");
+    let config_text = std::fs::read_to_string(&config_file).unwrap();
+    assert!(config_text.contains("provider_order"));
+
+    let resp = client
+        .put(format!("{base}/config/provider-order"))
+        .json(&serde_json::json!({
+            "provider_ids": ["openrouter", "openrouter"]
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 400);
+
     // Default model change persists.
     let resp = client
         .put(format!("{base}/config/default-model"))
@@ -989,6 +1023,13 @@ async fn session_and_thread_updates_and_provider_config() {
             .unwrap()
             .iter()
             .any(|p| p["id"] == "openrouter")
+    );
+    assert!(
+        !providers["provider_order"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|provider| provider == "openrouter")
     );
 }
 
@@ -1504,6 +1545,916 @@ async fn model_swap_hands_off_history_and_keeps_vendor_sessions() {
         );
         assert!(prompt.ends_with("fourth message"));
     }
+}
+
+/// Two native chat providers exposing the same neutral model. Native
+/// providers do not currently report subscription headroom, so their stable
+/// provider ids break the tie; the first one exhausts capacity after a
+/// partial response and the second resumes it.
+struct CapacityNativeProvider {
+    name: &'static str,
+    fail_capacity: bool,
+    requests: std::sync::Mutex<Vec<Vec<Message>>>,
+}
+
+impl CapacityNativeProvider {
+    fn new(name: &'static str, fail_capacity: bool) -> Self {
+        Self {
+            name,
+            fail_capacity,
+            requests: std::sync::Mutex::new(Vec::new()),
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl Provider for CapacityNativeProvider {
+    fn id(&self) -> &str {
+        self.name
+    }
+
+    fn models(&self) -> Vec<trouve_protocol::ModelInfo> {
+        vec![trouve_protocol::ModelInfo {
+            id: format!("{}/native-shared-model", self.name),
+            display_name: "Native Shared Model".into(),
+            context_window: 100_000,
+            supports_tools: true,
+            input_price_per_mtok: Some(if self.fail_capacity { 1.0 } else { 10.0 }),
+            output_price_per_mtok: Some(if self.fail_capacity { 1.0 } else { 10.0 }),
+            options_schema: serde_json::json!({"type": "object", "properties": {}}),
+        }]
+    }
+
+    async fn stream_chat(
+        &self,
+        _model: &str,
+        messages: &[Message],
+        _tools: &[ToolSpec],
+        _options: &serde_json::Map<String, serde_json::Value>,
+    ) -> Result<EventStream, ProviderError> {
+        let call = {
+            let mut requests = self.requests.lock().unwrap();
+            let call = requests.len();
+            requests.push(messages.to_vec());
+            call
+        };
+        let events = match (self.fail_capacity, call) {
+            // Complete one provider round-trip before exhausting capacity on
+            // the next. This verifies that billed usage and completed tool
+            // work survive a genuinely mid-turn route switch.
+            (true, 0) => vec![
+                Ok(ProviderEvent::ToolCall(ToolCallRequest {
+                    id: "native_search".into(),
+                    name: "search_transcript".into(),
+                    arguments: serde_json::json!({"query": "native task"}),
+                })),
+                Ok(ProviderEvent::Completed {
+                    usage: Usage {
+                        input_tokens: 1_000_000,
+                        ..Default::default()
+                    },
+                }),
+            ],
+            (true, _) => vec![
+                Ok(ProviderEvent::TextDelta(
+                    "partial from native preferred. ".into(),
+                )),
+                Err(ProviderError::Api("429 quota exceeded".into())),
+            ],
+            (false, _) => vec![
+                Ok(ProviderEvent::TextDelta(
+                    "finished by native fallback".into(),
+                )),
+                Ok(ProviderEvent::Completed {
+                    usage: Usage {
+                        input_tokens: 1_000_000,
+                        ..Default::default()
+                    },
+                }),
+            ],
+        };
+        Ok(Box::pin(futures::stream::iter(events)))
+    }
+}
+
+#[tokio::test]
+async fn neutral_native_model_resumes_on_capacity_exhaustion() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path().join("repo");
+    std::fs::create_dir(&repo).unwrap();
+    init_repo(&repo);
+
+    let preferred = Arc::new(CapacityNativeProvider::new("native-a", true));
+    let fallback = Arc::new(CapacityNativeProvider::new("native-b", false));
+    let store = Store::open(&tmp.path().join("db/trouve.db")).unwrap();
+    let engine = Arc::new(
+        Engine::new(store, tmp.path().join("data"), &Config::default())
+            .with_config_dir(None)
+            .with_provider("native-a", preferred.clone())
+            .with_provider("native-b", fallback.clone())
+            .with_default_model("native-shared-model"),
+    );
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let router = trouve_server::build_router(engine);
+    tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+    let base = format!("http://{addr}/v1");
+    let client = reqwest::Client::new();
+
+    let ws: serde_json::Value = client
+        .post(format!("{base}/workspaces"))
+        .json(&serde_json::json!({"path": repo.to_str().unwrap()}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let session: serde_json::Value = client
+        .post(format!("{base}/sessions"))
+        .json(&serde_json::json!({"workspace_id": ws["id"], "title": "Native routing"}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let thread: serde_json::Value = client
+        .post(format!("{base}/threads"))
+        .json(&serde_json::json!({"session_id": session["id"]}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let thread_id = thread["id"].as_str().unwrap();
+
+    client
+        .post(format!("{base}/threads/{thread_id}/messages"))
+        .json(&serde_json::json!({"content": "finish the native task"}))
+        .send()
+        .await
+        .unwrap();
+    let events = wait_for_event(
+        &client,
+        &format!("{base}/threads/{thread_id}/events"),
+        |event| event["type"] == "turn.completed",
+    )
+    .await;
+    let selected: Vec<_> = events
+        .iter()
+        .filter(|event| event["type"] == "model.route_selected")
+        .collect();
+    assert_eq!(selected.len(), 2);
+    assert_eq!(selected[0]["provider_id"], "native-a");
+    assert_eq!(selected[1]["provider_id"], "native-b");
+    assert_eq!(selected[1]["reason"], "capacity_failover");
+    let completed = events
+        .iter()
+        .find(|event| event["type"] == "turn.completed")
+        .unwrap();
+    assert_eq!(completed["usage"]["cost_usd"], 11.0);
+
+    assert_eq!(preferred.requests.lock().unwrap().len(), 2);
+    let fallback_requests = fallback.requests.lock().unwrap();
+    assert_eq!(fallback_requests.len(), 1);
+    assert!(fallback_requests[0].iter().any(|message| matches!(
+        message,
+        Message::Assistant { content, .. } if content.contains("partial from native preferred")
+    )));
+    assert!(fallback_requests[0].iter().any(|message| matches!(
+        message,
+        Message::User(content) if content.contains("Continue the in-progress response")
+    )));
+}
+
+async fn start_routing_test_thread(
+    engine: Arc<Engine>,
+    repo: &Path,
+    title: &str,
+    settings: RoutingThreadSettings,
+) -> (reqwest::Client, String, String) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let router = trouve_server::build_router(engine);
+    tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+    let base = format!("http://{addr}/v1");
+    let client = reqwest::Client::new();
+    let workspace: serde_json::Value = client
+        .post(format!("{base}/workspaces"))
+        .json(&serde_json::json!({"path": repo.to_str().unwrap()}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let session: serde_json::Value = client
+        .post(format!("{base}/sessions"))
+        .json(&serde_json::json!({"workspace_id": workspace["id"], "title": title}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let thread: serde_json::Value = client
+        .post(format!("{base}/threads"))
+        .json(&trouve_protocol::CreateThreadRequest {
+            session_id: session["id"].as_str().unwrap().to_string(),
+            mode: settings.mode,
+            model: None,
+            model_options: settings.model_options,
+            permission_mode: settings.permission_mode,
+        })
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    (client, base, thread["id"].as_str().unwrap().to_string())
+}
+
+#[derive(Default)]
+struct RoutingThreadSettings {
+    mode: Option<String>,
+    model_options: serde_json::Map<String, serde_json::Value>,
+    permission_mode: Option<trouve_protocol::PermissionMode>,
+}
+
+fn cross_model_options_schema(thinking_key: &str) -> serde_json::Value {
+    let mut properties = serde_json::Map::new();
+    properties.insert(
+        thinking_key.into(),
+        serde_json::json!({
+            "type": "string",
+            "enum": ["low", "medium", "high"],
+            "default": "medium"
+        }),
+    );
+    properties.insert(
+        "fast".into(),
+        serde_json::json!({"type": "boolean", "default": false}),
+    );
+    serde_json::json!({"type": "object", "properties": properties})
+}
+
+fn cross_thread_model_options() -> serde_json::Map<String, serde_json::Value> {
+    serde_json::from_value(serde_json::json!({
+        "thinking_level": "high",
+        "fast": true
+    }))
+    .unwrap()
+}
+
+struct CrossAdapterNative {
+    name: &'static str,
+    fail_capacity: bool,
+    requests: std::sync::Mutex<Vec<Vec<Message>>>,
+    options: std::sync::Mutex<Vec<serde_json::Map<String, serde_json::Value>>>,
+    tools: std::sync::Mutex<Vec<Vec<String>>>,
+}
+
+#[async_trait::async_trait]
+impl Provider for CrossAdapterNative {
+    fn id(&self) -> &str {
+        self.name
+    }
+
+    fn models(&self) -> Vec<trouve_protocol::ModelInfo> {
+        vec![trouve_protocol::ModelInfo {
+            id: format!("{}/cross-model", self.name),
+            display_name: "Cross Adapter Model".into(),
+            context_window: 100_000,
+            supports_tools: true,
+            input_price_per_mtok: Some(1.0),
+            output_price_per_mtok: Some(1.0),
+            options_schema: cross_model_options_schema("reasoning_effort"),
+        }]
+    }
+
+    async fn stream_chat(
+        &self,
+        _model: &str,
+        messages: &[Message],
+        tools: &[ToolSpec],
+        options: &serde_json::Map<String, serde_json::Value>,
+    ) -> Result<EventStream, ProviderError> {
+        self.requests.lock().unwrap().push(messages.to_vec());
+        self.options.lock().unwrap().push(options.clone());
+        self.tools.lock().unwrap().push(
+            tools
+                .iter()
+                .map(|spec| spec.name.clone())
+                .collect::<Vec<_>>(),
+        );
+        let events = if self.fail_capacity {
+            vec![
+                Ok(ProviderEvent::TextDelta("partial from native. ".into())),
+                Err(ProviderError::Api("429 quota exceeded".into())),
+            ]
+        } else {
+            vec![
+                Ok(ProviderEvent::TextDelta("finished by native".into())),
+                Ok(ProviderEvent::Completed {
+                    usage: Usage::default(),
+                }),
+            ]
+        };
+        Ok(Box::pin(futures::stream::iter(events)))
+    }
+}
+
+struct CrossAdapterBackend {
+    name: &'static str,
+    fail_capacity: bool,
+    prompts: std::sync::Mutex<Vec<String>>,
+    options: std::sync::Mutex<Vec<serde_json::Map<String, serde_json::Value>>>,
+    permissions: std::sync::Mutex<Vec<trouve_agents::BackendPermission>>,
+}
+
+#[async_trait::async_trait]
+impl trouve_agents::AgentBackend for CrossAdapterBackend {
+    fn id(&self) -> &str {
+        self.name
+    }
+
+    fn models(&self) -> Vec<trouve_protocol::ModelInfo> {
+        vec![trouve_protocol::ModelInfo {
+            id: format!("{}/cross-model", self.name),
+            display_name: "Cross Adapter Model".into(),
+            context_window: 100_000,
+            supports_tools: true,
+            input_price_per_mtok: None,
+            output_price_per_mtok: None,
+            options_schema: cross_model_options_schema("effort"),
+        }]
+    }
+
+    fn status(&self) -> trouve_agents::BackendStatus {
+        trouve_agents::BackendStatus {
+            installed: true,
+            has_credentials: true,
+        }
+    }
+
+    async fn start_login(
+        &self,
+    ) -> Result<trouve_agents::BackendLogin, trouve_agents::BackendError> {
+        Err(trouve_agents::BackendError::Auth("not needed".into()))
+    }
+
+    async fn run_turn(
+        &self,
+        turn: trouve_agents::BackendTurn,
+    ) -> Result<trouve_agents::BackendEventStream, trouve_agents::BackendError> {
+        self.prompts.lock().unwrap().push(turn.prompt.clone());
+        self.options
+            .lock()
+            .unwrap()
+            .push(turn.model_options.clone());
+        self.permissions.lock().unwrap().push(turn.permission);
+        let events = if self.fail_capacity {
+            vec![
+                Ok(trouve_agents::BackendEvent::ToolStarted {
+                    call_id: "cross-tool".into(),
+                    tool: "shell".into(),
+                    args: serde_json::json!({"cmd": "in progress"}),
+                }),
+                Ok(trouve_agents::BackendEvent::TextDelta(
+                    "partial from backend. ".into(),
+                )),
+                Err(trouve_agents::BackendError::Protocol(
+                    "429 rate limit exceeded".into(),
+                )),
+            ]
+        } else {
+            vec![
+                Ok(trouve_agents::BackendEvent::TextDelta(
+                    "finished by backend".into(),
+                )),
+                Ok(trouve_agents::BackendEvent::Completed {
+                    usage: Usage::default(),
+                }),
+            ]
+        };
+        Ok(Box::pin(futures::stream::iter(events)))
+    }
+}
+
+#[tokio::test]
+async fn neutral_model_crosses_from_native_provider_to_agent_backend() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path().join("repo");
+    std::fs::create_dir(&repo).unwrap();
+    init_repo(&repo);
+    let native = Arc::new(CrossAdapterNative {
+        name: "native-cross",
+        fail_capacity: true,
+        requests: std::sync::Mutex::new(Vec::new()),
+        options: std::sync::Mutex::new(Vec::new()),
+        tools: std::sync::Mutex::new(Vec::new()),
+    });
+    let backend = Arc::new(CrossAdapterBackend {
+        name: "backend-cross",
+        fail_capacity: false,
+        prompts: std::sync::Mutex::new(Vec::new()),
+        options: std::sync::Mutex::new(Vec::new()),
+        permissions: std::sync::Mutex::new(Vec::new()),
+    });
+    let config = Config {
+        default_model: Some("cross-model".into()),
+        provider_order: vec!["native-cross".into(), "backend-cross".into()],
+        ..Default::default()
+    };
+    let engine = Arc::new(
+        Engine::new(
+            Store::open(&tmp.path().join("db/trouve.db")).unwrap(),
+            tmp.path().join("data"),
+            &config,
+        )
+        .with_config_dir(None)
+        .with_provider("native-cross", native.clone())
+        .with_backend("backend-cross", backend.clone()),
+    );
+    let (client, base, thread_id) = start_routing_test_thread(
+        engine,
+        &repo,
+        "Cross route",
+        RoutingThreadSettings {
+            model_options: cross_thread_model_options(),
+            permission_mode: Some(trouve_protocol::PermissionMode::Yolo),
+            ..Default::default()
+        },
+    )
+    .await;
+    client
+        .post(format!("{base}/threads/{thread_id}/messages"))
+        .json(&serde_json::json!({"content": "finish this task"}))
+        .send()
+        .await
+        .unwrap();
+    let events = wait_for_event(
+        &client,
+        &format!("{base}/threads/{thread_id}/events"),
+        |event| event["type"] == "turn.completed",
+    )
+    .await;
+    let selected: Vec<_> = events
+        .iter()
+        .filter(|event| event["type"] == "model.route_selected")
+        .collect();
+    assert_eq!(selected[0]["provider_id"], "native-cross");
+    assert_eq!(selected[1]["provider_id"], "backend-cross");
+    assert_eq!(selected[1]["reason"], "capacity_failover");
+    let prompts = backend.prompts.lock().unwrap();
+    assert!(prompts[0].contains("partial from native"));
+    assert!(prompts[0].contains("Continue the in-progress task"));
+    drop(prompts);
+    assert_eq!(
+        serde_json::Value::Object(native.options.lock().unwrap()[0].clone()),
+        serde_json::json!({"reasoning_effort": "high", "fast": true})
+    );
+    assert_eq!(
+        serde_json::Value::Object(backend.options.lock().unwrap()[0].clone()),
+        serde_json::json!({"effort": "high", "fast": true})
+    );
+    assert_eq!(
+        backend.permissions.lock().unwrap().as_slice(),
+        &[trouve_agents::BackendPermission::Yolo]
+    );
+}
+
+#[tokio::test]
+async fn neutral_model_crosses_from_agent_backend_to_native_provider() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path().join("repo");
+    std::fs::create_dir(&repo).unwrap();
+    init_repo(&repo);
+    let native = Arc::new(CrossAdapterNative {
+        name: "native-cross",
+        fail_capacity: false,
+        requests: std::sync::Mutex::new(Vec::new()),
+        options: std::sync::Mutex::new(Vec::new()),
+        tools: std::sync::Mutex::new(Vec::new()),
+    });
+    let backend = Arc::new(CrossAdapterBackend {
+        name: "backend-cross",
+        fail_capacity: true,
+        prompts: std::sync::Mutex::new(Vec::new()),
+        options: std::sync::Mutex::new(Vec::new()),
+        permissions: std::sync::Mutex::new(Vec::new()),
+    });
+    let config = Config {
+        default_model: Some("cross-model".into()),
+        provider_order: vec!["backend-cross".into(), "native-cross".into()],
+        ..Default::default()
+    };
+    let engine = Arc::new(
+        Engine::new(
+            Store::open(&tmp.path().join("db/trouve.db")).unwrap(),
+            tmp.path().join("data"),
+            &config,
+        )
+        .with_config_dir(None)
+        .with_backend("backend-cross", backend.clone())
+        .with_provider("native-cross", native.clone()),
+    );
+    let (client, base, thread_id) = start_routing_test_thread(
+        engine,
+        &repo,
+        "Cross route",
+        RoutingThreadSettings {
+            mode: Some("plan".into()),
+            model_options: cross_thread_model_options(),
+            // Read-only mode must override an otherwise permissive thread.
+            permission_mode: Some(trouve_protocol::PermissionMode::Yolo),
+        },
+    )
+    .await;
+    client
+        .post(format!("{base}/threads/{thread_id}/messages"))
+        .json(&serde_json::json!({"content": "finish this task"}))
+        .send()
+        .await
+        .unwrap();
+    let events = wait_for_event(
+        &client,
+        &format!("{base}/threads/{thread_id}/events"),
+        |event| event["type"] == "turn.completed",
+    )
+    .await;
+    let selected: Vec<_> = events
+        .iter()
+        .filter(|event| event["type"] == "model.route_selected")
+        .collect();
+    assert_eq!(selected[0]["provider_id"], "backend-cross");
+    assert_eq!(selected[1]["provider_id"], "native-cross");
+    assert!(events.iter().any(|event| {
+        event["type"] == "tool.completed"
+            && event["call_id"] == "cross-tool"
+            && event["status"] == "aborted"
+    }));
+    let requests = native.requests.lock().unwrap();
+    assert!(requests[0].iter().any(|message| matches!(
+        message,
+        Message::Assistant { content, .. } if content.contains("partial from backend")
+    )));
+    assert!(requests[0].iter().any(|message| matches!(
+        message,
+        Message::User(content) if content.contains("Continue the in-progress response")
+    )));
+    assert!(requests[0].iter().any(|message| matches!(
+        message,
+        Message::System(content) if content.contains("Do not modify any files")
+    )));
+    drop(requests);
+    assert_eq!(
+        serde_json::Value::Object(backend.options.lock().unwrap()[0].clone()),
+        serde_json::json!({"effort": "high", "fast": true})
+    );
+    assert_eq!(
+        backend.permissions.lock().unwrap().as_slice(),
+        &[trouve_agents::BackendPermission::ReadOnly]
+    );
+    assert_eq!(
+        serde_json::Value::Object(native.options.lock().unwrap()[0].clone()),
+        serde_json::json!({"reasoning_effort": "high", "fast": true})
+    );
+    let tools = native.tools.lock().unwrap();
+    assert!(tools[0].iter().any(|tool| tool == "read_file"));
+    assert!(!tools[0].iter().any(|tool| tool == "write_file"));
+    assert!(!tools[0].iter().any(|tool| tool == "shell"));
+}
+
+struct UnavailableRouteProvider {
+    name: String,
+    available: bool,
+    calls: AtomicUsize,
+}
+
+#[async_trait::async_trait]
+impl Provider for UnavailableRouteProvider {
+    fn id(&self) -> &str {
+        &self.name
+    }
+
+    fn models(&self) -> Vec<trouve_protocol::ModelInfo> {
+        vec![trouve_protocol::ModelInfo {
+            id: format!("{}/guarded-model", self.name),
+            display_name: "Guarded Model".into(),
+            context_window: 100_000,
+            supports_tools: true,
+            input_price_per_mtok: None,
+            output_price_per_mtok: None,
+            options_schema: serde_json::json!({"type": "object", "properties": {}}),
+        }]
+    }
+
+    async fn stream_chat(
+        &self,
+        _model: &str,
+        _messages: &[Message],
+        _tools: &[ToolSpec],
+        _options: &serde_json::Map<String, serde_json::Value>,
+    ) -> Result<EventStream, ProviderError> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        if !self.available {
+            return Err(ProviderError::Auth("misconfigured test route".into()));
+        }
+        Ok(Box::pin(futures::stream::iter(vec![
+            Ok(ProviderEvent::TextDelta("working route".into())),
+            Ok(ProviderEvent::Completed {
+                usage: Usage::default(),
+            }),
+        ])))
+    }
+}
+
+#[tokio::test]
+async fn route_circuit_breaker_bounds_attempts_and_skips_failures_next_turn() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path().join("repo");
+    std::fs::create_dir(&repo).unwrap();
+    init_repo(&repo);
+    let store = Store::open(&tmp.path().join("db/trouve.db")).unwrap();
+    let mut engine = Engine::new(store, tmp.path().join("data"), &Config::default())
+        .with_config_dir(None)
+        .with_default_model("guarded-model");
+    let mut routes = Vec::new();
+    for (name, available) in [
+        ("route-a", false),
+        ("route-b", false),
+        ("route-c", false),
+        ("route-d", false),
+        ("route-e", true),
+    ] {
+        let provider = Arc::new(UnavailableRouteProvider {
+            name: name.into(),
+            available,
+            calls: AtomicUsize::new(0),
+        });
+        engine = engine.with_provider(name, provider.clone());
+        routes.push(provider);
+    }
+    let (client, base, thread_id) = start_routing_test_thread(
+        Arc::new(engine),
+        &repo,
+        "Circuit breaker",
+        RoutingThreadSettings::default(),
+    )
+    .await;
+    let events_url = format!("{base}/threads/{thread_id}/events");
+    client
+        .post(format!("{base}/threads/{thread_id}/messages"))
+        .json(&serde_json::json!({"content": "first attempt"}))
+        .send()
+        .await
+        .unwrap();
+    let failed = wait_for_event(&client, &events_url, |event| {
+        event["type"] == "turn.failed" && event["turn"] == 1
+    })
+    .await;
+    let error = failed
+        .iter()
+        .find(|event| event["type"] == "turn.failed")
+        .unwrap()["error"]
+        .as_str()
+        .unwrap();
+    assert!(error.contains("stopped after 4 route attempts"));
+    assert_eq!(routes[0].calls.load(Ordering::SeqCst), 1);
+    assert_eq!(routes[1].calls.load(Ordering::SeqCst), 1);
+    assert_eq!(routes[2].calls.load(Ordering::SeqCst), 1);
+    assert_eq!(routes[3].calls.load(Ordering::SeqCst), 1);
+    assert_eq!(routes[4].calls.load(Ordering::SeqCst), 0);
+
+    client
+        .post(format!("{base}/threads/{thread_id}/messages"))
+        .json(&serde_json::json!({"content": "try another route"}))
+        .send()
+        .await
+        .unwrap();
+    wait_for_event(&client, &events_url, |event| {
+        event["type"] == "turn.completed" && event["turn"] == 2
+    })
+    .await;
+    assert_eq!(routes[0].calls.load(Ordering::SeqCst), 1);
+    assert_eq!(routes[1].calls.load(Ordering::SeqCst), 1);
+    assert_eq!(routes[2].calls.load(Ordering::SeqCst), 1);
+    assert_eq!(routes[3].calls.load(Ordering::SeqCst), 1);
+    assert_eq!(routes[4].calls.load(Ordering::SeqCst), 1);
+}
+
+/// Two subscription backends exposing the same model. The lower-utilization
+/// one is selected first; `fail_capacity` makes it exhaust quota after
+/// streaming partial text so the engine must hand the same turn to its peer.
+struct CapacityBackend {
+    name: &'static str,
+    used_percent: i64,
+    fail_capacity: bool,
+    prompts: std::sync::Mutex<Vec<String>>,
+}
+
+impl CapacityBackend {
+    fn new(name: &'static str, used_percent: i64, fail_capacity: bool) -> Self {
+        Self {
+            name,
+            used_percent,
+            fail_capacity,
+            prompts: std::sync::Mutex::new(Vec::new()),
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl trouve_agents::AgentBackend for CapacityBackend {
+    fn id(&self) -> &str {
+        self.name
+    }
+
+    fn models(&self) -> Vec<trouve_protocol::ModelInfo> {
+        vec![trouve_protocol::ModelInfo {
+            id: format!("{}/shared-model", self.name),
+            display_name: "Shared Model".into(),
+            context_window: 100_000,
+            supports_tools: true,
+            input_price_per_mtok: None,
+            output_price_per_mtok: None,
+            options_schema: serde_json::json!({"type": "object", "properties": {}}),
+        }]
+    }
+
+    fn status(&self) -> trouve_agents::BackendStatus {
+        trouve_agents::BackendStatus {
+            installed: true,
+            has_credentials: true,
+        }
+    }
+
+    async fn subscription_health(&self) -> Option<trouve_protocol::SubscriptionHealth> {
+        Some(trouve_protocol::SubscriptionHealth {
+            provider_id: self.name.into(),
+            status: "ok".into(),
+            plan: "test".into(),
+            windows: vec![trouve_protocol::SubscriptionWindow {
+                label: "Weekly".into(),
+                used_percent: self.used_percent,
+                resets: String::new(),
+            }],
+            credits: String::new(),
+            note: String::new(),
+        })
+    }
+
+    async fn start_login(
+        &self,
+    ) -> Result<trouve_agents::BackendLogin, trouve_agents::BackendError> {
+        Err(trouve_agents::BackendError::Auth("not needed".into()))
+    }
+
+    async fn run_turn(
+        &self,
+        turn: trouve_agents::BackendTurn,
+    ) -> Result<trouve_agents::BackendEventStream, trouve_agents::BackendError> {
+        self.prompts.lock().unwrap().push(turn.prompt);
+        let events = if self.fail_capacity {
+            vec![
+                Ok(trouve_agents::BackendEvent::ToolStarted {
+                    call_id: "capacity_tool".into(),
+                    tool: "shell".into(),
+                    args: serde_json::json!({"cmd": "in-progress"}),
+                }),
+                Ok(trouve_agents::BackendEvent::TextDelta(
+                    "partial from preferred. ".into(),
+                )),
+                Err(trouve_agents::BackendError::Protocol(
+                    "429 rate limit exceeded".into(),
+                )),
+            ]
+        } else {
+            vec![
+                Ok(trouve_agents::BackendEvent::TextDelta(
+                    "finished by fallback".into(),
+                )),
+                Ok(trouve_agents::BackendEvent::Completed {
+                    usage: Usage::default(),
+                }),
+            ]
+        };
+        Ok(Box::pin(futures::stream::iter(events)))
+    }
+}
+
+#[tokio::test]
+async fn neutral_model_prefers_capacity_and_resumes_on_exhaustion() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path().join("repo");
+    std::fs::create_dir(&repo).unwrap();
+    init_repo(&repo);
+
+    let preferred = Arc::new(CapacityBackend::new("preferred", 10, true));
+    let fallback = Arc::new(CapacityBackend::new("fallback", 70, false));
+    let store = Store::open(&tmp.path().join("db/trouve.db")).unwrap();
+    let engine = Arc::new(
+        Engine::new(store, tmp.path().join("data"), &Config::default())
+            .with_config_dir(None)
+            .with_backend("preferred", preferred.clone())
+            .with_backend("fallback", fallback.clone())
+            .with_default_model("shared-model"),
+    );
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let router = trouve_server::build_router(engine);
+    tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+    let base = format!("http://{addr}/v1");
+    let client = reqwest::Client::new();
+
+    let routes: serde_json::Value = client
+        .get(format!("{base}/model-routes"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let shared = routes
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|model| model["id"] == "shared-model")
+        .expect("provider-neutral catalog entry");
+    assert_eq!(shared["routes"].as_array().unwrap().len(), 2);
+
+    let ws: serde_json::Value = client
+        .post(format!("{base}/workspaces"))
+        .json(&serde_json::json!({"path": repo.to_str().unwrap()}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let session: serde_json::Value = client
+        .post(format!("{base}/sessions"))
+        .json(&serde_json::json!({"workspace_id": ws["id"], "title": "Routing"}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let thread: serde_json::Value = client
+        .post(format!("{base}/threads"))
+        .json(&serde_json::json!({"session_id": session["id"]}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(thread["model"], "shared-model");
+    let thread_id = thread["id"].as_str().unwrap();
+    let events_url = format!("{base}/threads/{thread_id}/events");
+
+    client
+        .post(format!("{base}/threads/{thread_id}/messages"))
+        .json(&serde_json::json!({"content": "finish the task"}))
+        .send()
+        .await
+        .unwrap();
+    let events = wait_for_event(&client, &events_url, |event| {
+        event["type"] == "turn.completed"
+    })
+    .await;
+    let selected: Vec<_> = events
+        .iter()
+        .filter(|event| event["type"] == "model.route_selected")
+        .collect();
+    assert_eq!(selected.len(), 2);
+    assert_eq!(selected[0]["provider_id"], "preferred");
+    assert_eq!(selected[0]["reason"], "initial");
+    assert_eq!(selected[1]["provider_id"], "fallback");
+    assert_eq!(selected[1]["reason"], "capacity_failover");
+    assert!(events.iter().all(|event| event["type"] != "turn.failed"));
+    assert!(events.iter().any(|event| {
+        event["type"] == "tool.completed"
+            && event["call_id"] == "capacity_tool"
+            && event["status"] == "aborted"
+    }));
+
+    assert_eq!(
+        preferred.prompts.lock().unwrap().as_slice(),
+        ["finish the task"]
+    );
+    let fallback_prompts = fallback.prompts.lock().unwrap();
+    assert_eq!(fallback_prompts.len(), 1);
+    assert!(fallback_prompts[0].contains("finish the task"));
+    assert!(fallback_prompts[0].contains("partial from preferred"));
+    assert!(fallback_prompts[0].contains("Continue the in-progress task"));
 }
 
 /// Scripted `AgentBackend`: every turn asks for approval of one "command",

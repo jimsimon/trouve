@@ -210,6 +210,34 @@ pub enum BackendError {
     Io(#[from] std::io::Error),
 }
 
+impl BackendError {
+    /// Whether the vendor harness positively reported exhausted request
+    /// capacity. Generic protocol and I/O errors are intentionally terminal
+    /// because their side-effect outcome may be unknown.
+    pub fn is_capacity_exhausted(&self) -> bool {
+        let Self::Protocol(message) = self else {
+            return false;
+        };
+        let message = message.to_ascii_lowercase();
+        [
+            "429",
+            "too many requests",
+            "rate limit",
+            "rate_limit",
+            "quota exceeded",
+            "quota_exceeded",
+            "insufficient_quota",
+            "resource_exhausted",
+            "capacity exhausted",
+            "capacity_exhausted",
+            "usage limit",
+            "usage_limit",
+        ]
+        .iter()
+        .any(|signal| message.contains(signal))
+    }
+}
+
 pub type BackendEventStream = BoxStream<'static, Result<BackendEvent, BackendError>>;
 
 /// Cheap, filesystem-based health check (no subprocesses) so provider
@@ -324,5 +352,22 @@ pub(crate) fn model(backend_id: &str, name: &str, display: &str, context_window:
         input_price_per_mtok: None,
         output_price_per_mtok: None,
         options_schema: empty_schema(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::BackendError;
+
+    #[test]
+    fn capacity_errors_are_narrowly_classified() {
+        assert!(
+            BackendError::Protocol("RESOURCE_EXHAUSTED: usage limit reached".into())
+                .is_capacity_exhausted()
+        );
+        assert!(!BackendError::Protocol("app-server closed".into()).is_capacity_exhausted());
+        assert!(
+            !BackendError::Auth("rate limit account login expired".into()).is_capacity_exhausted()
+        );
     }
 }

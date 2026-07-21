@@ -7,7 +7,7 @@
       "name": "MIT",
       "identifier": "MIT"
     },
-    "version": "1.0"
+    "version": "1.2"
   },
   "paths": {
     "/v1/approvals": {
@@ -485,6 +485,37 @@
             "application/json": {
               "schema": {
                 "$ref": "#/components/schemas/SetDefaultPermissionModeRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "204": {
+            "description": ""
+          },
+          "400": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/config/provider-order": {
+      "put": {
+        "tags": [],
+        "operationId": "set_provider_order",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SetProviderOrderRequest"
               }
             }
           },
@@ -1111,6 +1142,27 @@
                   "type": "array",
                   "items": {
                     "$ref": "#/components/schemas/ModeInfo"
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/model-routes": {
+      "get": {
+        "tags": [],
+        "operationId": "list_model_routes",
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/RoutedModelInfo"
                   }
                 }
               }
@@ -3510,7 +3562,7 @@
               "string",
               "null"
             ],
-            "description": "Provider/model identifier, e.g. \"openai/gpt-4.1\"."
+            "description": "Provider-neutral model id from `/v1/model-routes`. A provider-qualified\nid from `/v1/models` explicitly pins the thread to that route."
           },
           "model_options": {
             "type": "object",
@@ -3592,6 +3644,44 @@
                 "type": "string",
                 "enum": [
                   "turn.started"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "description": "The concrete provider route chosen for a provider-neutral model. A\nlater event for the same turn records a safe route failover.",
+            "required": [
+              "turn",
+              "model",
+              "provider_id",
+              "provider_model",
+              "reason",
+              "type"
+            ],
+            "properties": {
+              "model": {
+                "type": "string"
+              },
+              "provider_id": {
+                "type": "string"
+              },
+              "provider_model": {
+                "type": "string"
+              },
+              "reason": {
+                "type": "string",
+                "description": "\"initial\", \"capacity_failover\", or \"route_failover\"."
+              },
+              "turn": {
+                "type": "integer",
+                "format": "int64",
+                "minimum": 0
+              },
+              "type": {
+                "type": "string",
+                "enum": [
+                  "model.route_selected"
                 ]
               }
             }
@@ -5083,6 +5173,22 @@
           }
         }
       },
+      "ModelRouteInfo": {
+        "type": "object",
+        "description": "One concrete provider route for a provider-neutral model selection.\n`provider_model` is the provider's own model id, without trouve's\nprovider prefix, and is the value passed to that provider at execution.",
+        "required": [
+          "provider_id",
+          "provider_model"
+        ],
+        "properties": {
+          "provider_id": {
+            "type": "string"
+          },
+          "provider_model": {
+            "type": "string"
+          }
+        }
+      },
       "OpenTerminalRequest": {
         "type": "object",
         "description": "Open (or re-attach to) the session's terminal.",
@@ -5282,7 +5388,7 @@
         "properties": {
           "default_model": {
             "type": "string",
-            "description": "Default model for new threads, e.g. \"openai/gpt-4.1-mini\"."
+            "description": "Default provider-neutral model for new threads. Provider-qualified\nlegacy values remain supported and pin one route."
           },
           "default_permission_mode": {
             "$ref": "#/components/schemas/PermissionMode",
@@ -5294,6 +5400,13 @@
               "null"
             ],
             "description": "Global thinking level for new threads. None leaves the selected\nmodel at its own default."
+          },
+          "provider_order": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Provider ids in preferred routing order. Every currently configured\nprovider is present; providers not explicitly ordered on the server\nare appended deterministically."
           },
           "providers": {
             "type": "array",
@@ -5485,6 +5598,60 @@
           "redo"
         ]
       },
+      "RoutedModelInfo": {
+        "type": "object",
+        "description": "A stable model identity that one or more currently available providers\ncan run. Clients use this catalog for provider-neutral model pickers;\n[`ModelInfo`] remains the provider-qualified compatibility catalog.",
+        "required": [
+          "id",
+          "display_name",
+          "context_window",
+          "supports_tools",
+          "options_schema",
+          "routes"
+        ],
+        "properties": {
+          "context_window": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Smallest context window across the available routes, so clients never\nadvertise a limit that the selected provider cannot honor.",
+            "minimum": 0
+          },
+          "display_name": {
+            "type": "string"
+          },
+          "id": {
+            "type": "string",
+            "description": "Provider-neutral id stored on new threads (for example\n\"gpt-5.4-codex\"). Models without a safe neutral identity retain their\nprovider-qualified id and have exactly one route."
+          },
+          "input_price_per_mtok": {
+            "type": [
+              "number",
+              "null"
+            ],
+            "format": "double",
+            "description": "Prices are present only when every route reports the same value."
+          },
+          "options_schema": {
+            "description": "Provider-neutral options schema. Provider-specific option names are\ntranslated after the harness selects a route."
+          },
+          "output_price_per_mtok": {
+            "type": [
+              "number",
+              "null"
+            ],
+            "format": "double"
+          },
+          "routes": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ModelRouteInfo"
+            }
+          },
+          "supports_tools": {
+            "type": "boolean"
+          }
+        }
+      },
       "Scope": {
         "oneOf": [
           {
@@ -5632,7 +5799,7 @@
           },
           "model": {
             "type": "string",
-            "description": "Provider-qualified id, e.g. \"openai/gpt-4.1-mini\"."
+            "description": "Provider-neutral model id, or a provider-qualified id to pin a route."
           }
         }
       },
@@ -5657,6 +5824,18 @@
         "properties": {
           "enabled": {
             "type": "boolean"
+          }
+        }
+      },
+      "SetProviderOrderRequest": {
+        "type": "object",
+        "description": "Replace the global preference order used for provider-neutral routing.\nThe list may contain a subset of configured providers; omitted providers\nremain eligible after all listed providers.",
+        "properties": {
+          "provider_ids": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
           }
         }
       },

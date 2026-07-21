@@ -98,6 +98,39 @@ pub enum ProviderError {
     Auth(String),
 }
 
+impl ProviderError {
+    /// Whether the provider positively reported exhausted request capacity.
+    /// This deliberately excludes generic transport failures: retrying those
+    /// through another provider could replay a side effect whose outcome is
+    /// unknown.
+    pub fn is_capacity_exhausted(&self) -> bool {
+        match self {
+            Self::Api(message) | Self::Request(message) => capacity_message(message),
+            Self::Auth(_) => false,
+        }
+    }
+}
+
+fn capacity_message(message: &str) -> bool {
+    let message = message.to_ascii_lowercase();
+    [
+        "429",
+        "too many requests",
+        "rate limit",
+        "rate_limit",
+        "quota exceeded",
+        "quota_exceeded",
+        "insufficient_quota",
+        "resource_exhausted",
+        "capacity exhausted",
+        "capacity_exhausted",
+        "usage limit",
+        "usage_limit",
+    ]
+    .iter()
+    .any(|signal| message.contains(signal))
+}
+
 pub type EventStream = BoxStream<'static, Result<ProviderEvent, ProviderError>>;
 
 #[async_trait::async_trait]
@@ -127,4 +160,20 @@ pub trait Provider: Send + Sync {
         tools: &[ToolSpec],
         options: &serde_json::Map<String, serde_json::Value>,
     ) -> Result<EventStream, ProviderError>;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ProviderError;
+
+    #[test]
+    fn capacity_errors_are_narrowly_classified() {
+        assert!(ProviderError::Api("429 Too Many Requests".into()).is_capacity_exhausted());
+        assert!(
+            ProviderError::Api("rate_limit_exceeded: weekly quota exceeded".into())
+                .is_capacity_exhausted()
+        );
+        assert!(!ProviderError::Request("connection reset".into()).is_capacity_exhausted());
+        assert!(!ProviderError::Auth("quota account login expired".into()).is_capacity_exhausted());
+    }
 }

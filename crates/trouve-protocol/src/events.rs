@@ -123,6 +123,17 @@ pub enum Event {
         mode: String,
         model: String,
     },
+    /// The concrete provider route chosen for a provider-neutral model. A
+    /// later event for the same turn records a safe route failover.
+    #[serde(rename = "model.route_selected")]
+    ModelRouteSelected {
+        turn: u64,
+        model: String,
+        provider_id: String,
+        provider_model: String,
+        /// "initial", "capacity_failover", or "route_failover".
+        reason: String,
+    },
     #[serde(rename = "turn.completed")]
     TurnCompleted {
         turn: u64,

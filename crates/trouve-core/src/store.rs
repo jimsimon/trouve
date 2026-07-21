@@ -6,6 +6,7 @@
 //! what was sent to/received from the model, which the event taxonomy does
 //! not try to encode.
 
+use std::collections::HashMap;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
@@ -79,6 +80,14 @@ CREATE TABLE IF NOT EXISTS backend_sessions (
   -- a resumed vendor session be told what other models did in between.
   seen_messages INTEGER NOT NULL DEFAULT 0,
   PRIMARY KEY (thread_id, backend)
+);
+CREATE TABLE IF NOT EXISTS route_health (
+  provider_id TEXT NOT NULL,
+  provider_model TEXT NOT NULL,
+  consecutive_failures INTEGER NOT NULL DEFAULT 0,
+  retry_after INTEGER,             -- UTC unix seconds; NULL = not cooling down
+  last_success_at INTEGER,         -- UTC unix seconds; sticky healthy-route hint
+  PRIMARY KEY (provider_id, provider_model)
 );
 CREATE TABLE IF NOT EXISTS queued_prompts (
   id TEXT PRIMARY KEY,
@@ -236,6 +245,16 @@ fn row_to_automation(r: &rusqlite::Row<'_>) -> rusqlite::Result<trouve_protocol:
 pub enum UsageScope<'a> {
     Thread(&'a str),
     Session(&'a str),
+}
+
+/// Persisted circuit-breaker state for one concrete provider/model route.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RouteHealthRow {
+    pub provider_id: String,
+    pub provider_model: String,
+    pub consecutive_failures: u32,
+    pub retry_after: Option<i64>,
+    pub last_success_at: Option<i64>,
 }
 
 #[derive(Debug, Clone)]
@@ -1332,6 +1351,115 @@ impl Store {
         Ok(())
     }
 
+    // --- provider route health -----------------------------------------------
+
+    /// Circuit-breaker snapshots keyed by concrete provider/model route.
+    pub fn route_health(&self) -> Result<HashMap<(String, String), RouteHealthRow>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT provider_id, provider_model, consecutive_failures,
+                    retry_after, last_success_at
+             FROM route_health",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            let provider_id: String = row.get(0)?;
+            let provider_model: String = row.get(1)?;
+            Ok(RouteHealthRow {
+                provider_id: provider_id.clone(),
+                provider_model: provider_model.clone(),
+                consecutive_failures: row.get::<_, i64>(2)?.max(0) as u32,
+                retry_after: row.get(3)?,
+                last_success_at: row.get(4)?,
+            })
+        })?;
+        let mut health = HashMap::new();
+        for row in rows {
+            let row = row?;
+            health.insert((row.provider_id.clone(), row.provider_model.clone()), row);
+        }
+        Ok(health)
+    }
+
+    /// Open or extend a route's cooldown with capped exponential backoff.
+    /// Returns the row written so callers can include the retry horizon in
+    /// diagnostics without querying again.
+    pub fn record_route_failure(
+        &self,
+        provider_id: &str,
+        provider_model: &str,
+        base_cooldown_secs: i64,
+        max_cooldown_secs: i64,
+    ) -> Result<RouteHealthRow> {
+        let conn = self.conn.lock().unwrap();
+        let previous = conn
+            .query_row(
+                "SELECT consecutive_failures, last_success_at FROM route_health
+                 WHERE provider_id = ?1 AND provider_model = ?2",
+                params![provider_id, provider_model],
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, Option<i64>>(1)?)),
+            )
+            .optional()?;
+        let consecutive_failures = previous
+            .as_ref()
+            .map(|(failures, _)| failures.saturating_add(1))
+            .unwrap_or(1)
+            .max(1);
+        let exponent = u32::try_from(consecutive_failures.saturating_sub(1).min(20)).unwrap_or(20);
+        let multiplier = 1i64.checked_shl(exponent).unwrap_or(i64::MAX);
+        let cooldown = base_cooldown_secs
+            .max(1)
+            .saturating_mul(multiplier)
+            .min(max_cooldown_secs.max(1));
+        let retry_after = chrono::Utc::now().timestamp().saturating_add(cooldown);
+        conn.execute(
+            "INSERT INTO route_health
+                 (provider_id, provider_model, consecutive_failures, retry_after, last_success_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT(provider_id, provider_model) DO UPDATE SET
+                 consecutive_failures = excluded.consecutive_failures,
+                 retry_after = excluded.retry_after",
+            params![
+                provider_id,
+                provider_model,
+                consecutive_failures,
+                retry_after,
+                previous.as_ref().and_then(|(_, success)| *success),
+            ],
+        )?;
+        Ok(RouteHealthRow {
+            provider_id: provider_id.into(),
+            provider_model: provider_model.into(),
+            consecutive_failures: consecutive_failures as u32,
+            retry_after: Some(retry_after),
+            last_success_at: previous.and_then(|(_, success)| success),
+        })
+    }
+
+    /// Close a route's circuit and remember it as a proven-good choice.
+    pub fn record_route_success(&self, provider_id: &str, provider_model: &str) -> Result<()> {
+        self.conn.lock().unwrap().execute(
+            "INSERT INTO route_health
+                 (provider_id, provider_model, consecutive_failures, retry_after, last_success_at)
+             VALUES (?1, ?2, 0, NULL, ?3)
+             ON CONFLICT(provider_id, provider_model) DO UPDATE SET
+                 consecutive_failures = 0,
+                 retry_after = NULL,
+                 last_success_at = excluded.last_success_at",
+            params![provider_id, provider_model, chrono::Utc::now().timestamp()],
+        )?;
+        Ok(())
+    }
+
+    /// Configuration changes invalidate failures learned under the previous
+    /// credentials or endpoint.
+    pub fn clear_route_health(&self, provider_id: &str) -> Result<()> {
+        self.conn.lock().unwrap().execute(
+            "DELETE FROM route_health WHERE provider_id = ?1",
+            params![provider_id],
+        )?;
+        Ok(())
+    }
+
     // --- usage accounting -------------------------------------------------------
 
     /// Record a turn's usage. `usage` totals are summed across the turn's
@@ -1894,6 +2022,33 @@ mod tests {
             None,
             "legacy fallback row should be gone after a keyed write"
         );
+    }
+
+    #[test]
+    fn route_health_persists_backoff_success_and_config_reset() {
+        let store = Store::open_in_memory().unwrap();
+        let now = chrono::Utc::now().timestamp();
+        let first = store
+            .record_route_failure("provider", "model", 10, 25)
+            .unwrap();
+        assert_eq!(first.consecutive_failures, 1);
+        assert!(first.retry_after.unwrap() >= now + 10);
+
+        let second = store
+            .record_route_failure("provider", "model", 10, 25)
+            .unwrap();
+        assert_eq!(second.consecutive_failures, 2);
+        assert!(second.retry_after.unwrap() >= now + 20);
+
+        store.record_route_success("provider", "model").unwrap();
+        let health = store.route_health().unwrap();
+        let route = &health[&("provider".to_string(), "model".to_string())];
+        assert_eq!(route.consecutive_failures, 0);
+        assert_eq!(route.retry_after, None);
+        assert!(route.last_success_at.is_some());
+
+        store.clear_route_health("provider").unwrap();
+        assert!(store.route_health().unwrap().is_empty());
     }
 
     /// Opening a database created before backend_sessions was keyed by

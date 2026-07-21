@@ -66,6 +66,10 @@ Thread scope:
 
 - `turn.started` `{turn, mode, model}` / `turn.completed` `{turn, usage,
   checkpoint_id?}` / `turn.failed` `{turn, error}`
+- `model.route_selected` `{turn, model, provider_id, provider_model, reason}`
+  — the concrete route chosen for a provider-neutral model; repeats with
+  `reason: capacity_failover` when an exhausted route hands off the turn, or
+  `reason: route_failover` when a safely retryable unavailable route does so
 - `user.message` `{turn, content}`
 - `assistant.delta` `{turn, text}` — streamed model output
 - `assistant.message` `{turn, content}` — folded final text for the turn
