@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1784600697635,
+  "lastUpdate": 1784600762374,
   "repoUrl": "https://github.com/jimsimon/trouve",
   "entries": {
     "e2e-benchmarks": [
@@ -7921,6 +7921,54 @@ window.BENCHMARK_DATA = {
             "name": "dense_query_20k_rows",
             "value": 1539346.806862745,
             "range": "± 10433",
+            "unit": "ns"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "jim.j.simon@gmail.com",
+            "name": "Jim Simon",
+            "username": "jimsimon"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "c542605c5413bb047fdc0e53f039bbcc6bd590c9",
+          "message": "Cache GitHub PR details and refresh every 30 seconds (#134)\n\n* Cache GitHub dashboard details\n\n* Refresh PR dashboards every 30 seconds\n\nReplace manual PR refresh controls with a live freshness clock while the cached account feed updates both dashboard views automatically.\n\n* Bound GitHub dashboard refreshes\n\nElide the freshness status within the available header width and time out stalled per-host dashboard requests so they release the shared cache lock.",
+          "timestamp": "2026-07-20T22:22:17-04:00",
+          "tree_id": "9da5898c0c1667c51e0b5b46e9b9292b43e8e272",
+          "url": "https://github.com/jimsimon/trouve/commit/c542605c5413bb047fdc0e53f039bbcc6bd590c9"
+        },
+        "date": 1784600761183,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "bm25_build_5k_docs",
+            "value": 4888331.1,
+            "range": "± 8825",
+            "unit": "ns"
+          },
+          {
+            "name": "bm25_query_5k_docs",
+            "value": 36587.672750350146,
+            "range": "± 12",
+            "unit": "ns"
+          },
+          {
+            "name": "chunk_python_200_functions",
+            "value": 3033876.588235294,
+            "range": "± 7451",
+            "unit": "ns"
+          },
+          {
+            "name": "dense_query_20k_rows",
+            "value": 1419264.104807692,
+            "range": "± 5717",
             "unit": "ns"
           }
         ]
