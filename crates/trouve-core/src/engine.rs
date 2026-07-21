@@ -1743,6 +1743,7 @@ impl Engine {
             workspace_id: req.workspace_id,
             mode: req.mode,
             model: req.model,
+            model_options: req.model_options,
             permission_mode: req.permission_mode,
             schedule: req.schedule,
             enabled: req.enabled,
@@ -1771,6 +1772,7 @@ impl Engine {
         automation.workspace_id = req.workspace_id;
         automation.mode = req.mode;
         automation.model = req.model;
+        automation.model_options = req.model_options;
         automation.permission_mode = req.permission_mode;
         automation.schedule = req.schedule;
         automation.enabled = req.enabled;
@@ -1964,7 +1966,7 @@ impl Engine {
             session_id: session.id.clone(),
             mode: automation.mode.clone(),
             model: automation.model.clone(),
-            model_options: Default::default(),
+            model_options: automation.model_options.clone(),
             // Scoped to this fresh run session; it does not change global
             // mode defaults or carry approvals into future runs.
             permission_mode: Some(automation.permission_mode),
