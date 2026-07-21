@@ -121,8 +121,9 @@ After creating it:
 6. Choose a model and set each repository to **Manual** or **Automatic**.
 
 `Manual` runs only when the bot is selected (or re-requested) through
-GitHub's reviewer UI. `Automatic` reviews every new non-draft head SHA and
-also honors reviewer re-requests. Mentions are intentionally not triggers.
+GitHub's reviewer UI. `Automatic` reviews every new non-draft base/head
+revision and also honors reviewer re-requests. Mentions are intentionally not
+triggers.
 
 ## Runtime behavior
 
@@ -131,13 +132,16 @@ be the only trigger source, or serve as a fallback when webhooks provide the
 fast path. Set `TROUVE_CODE_REVIEW_POLL_INTERVAL_SECONDS` to any positive number
 of seconds and restart the server container to change the interval. Invalid and
 zero values fall back to 60 seconds. Polling uses lightweight PR metadata and
-durable deduplication; the model runs at most once for an automatic head/config
-combination, while each reviewer re-request gets its own generation.
+durable deduplication; the model runs at most once for an automatic
+base/head/config combination, while each reviewer re-request gets its own
+generation.
 
 Each job fetches the exact base and head commits into a managed repository,
 creates an isolated trouve session at that head, and runs the built-in
-read-only review mode. Before publishing, trouve reads the PR again and marks
-the job stale if the head moved. Inline findings that GitHub rejects are
+read-only review mode. When either commit changes, queued reviews for the old
+revision are marked stale and an in-flight model turn is cancelled before the
+replacement is queued. Before publishing, trouve reads the PR again and marks
+the job stale if either commit moved. Inline findings that GitHub rejects are
 preserved in a summary-only fallback review.
 
 The dashboard displays the most recently observed installation rate-limit

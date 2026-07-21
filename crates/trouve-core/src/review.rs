@@ -16,6 +16,7 @@ use jsonwebtoken::{Algorithm, EncodingKey, Header};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use sha2::{Digest, Sha256};
 use tokio::sync::Notify;
+use tokio_util::sync::CancellationToken;
 use trouve_protocol::{
     CodeReviewDashboard, CodeReviewMode, CodeReviewRepository, ConfigureGithubAppRequest,
     CreateSessionRequest, CreateThreadRequest, Event, GithubAppStatus, PermissionMode, Scope,
@@ -69,6 +70,23 @@ pub struct CodeReviewRuntime {
     reconcile_lock: tokio::sync::Mutex<()>,
     poll_wake: Notify,
     job_wake: Notify,
+    running: Mutex<Option<RunningReview>>,
+}
+
+#[derive(Clone)]
+struct RunningReview {
+    job_id: String,
+    cancel: CancellationToken,
+}
+
+impl CodeReviewRuntime {
+    fn cancel_superseded(&self, job_ids: &[String]) {
+        if let Some(running) = self.running.lock().unwrap().clone()
+            && job_ids.contains(&running.job_id)
+        {
+            running.cancel.cancel();
+        }
+    }
 }
 
 #[derive(Default)]
@@ -574,6 +592,19 @@ impl Engine {
         for pull in pulls {
             validate_sha(&pull.base.sha)?;
             validate_sha(&pull.head.sha)?;
+            let superseded = self.store.supersede_code_review_jobs(
+                &repository.repository,
+                pull.number,
+                &pull.base.sha,
+                &pull.head.sha,
+            )?;
+            let revision_changed = !superseded.is_empty();
+            if revision_changed {
+                self.code_review.cancel_superseded(&superseded);
+                for job_id in superseded {
+                    self.emit_code_review_updated(Some(job_id))?;
+                }
+            }
             let manual_requested = pull
                 .requested_reviewers
                 .iter()
@@ -583,10 +614,19 @@ impl Engine {
                 pull.number,
                 manual_requested,
             )?;
-            if pull.draft && generation.is_none() {
+            // If a manually requested review is superseded while the bot is
+            // still selected, replace it for the new revision without
+            // requiring the user to toggle the review request off and on.
+            let replace_manual_review = should_replace_manual_review(
+                repository.mode,
+                revision_changed,
+                manual_requested,
+                generation,
+            );
+            if pull.draft && generation.is_none() && !replace_manual_review {
                 continue;
             }
-            let trigger = if generation.is_some() {
+            let trigger = if generation.is_some() || replace_manual_review {
                 "manual"
             } else if repository.mode == CodeReviewMode::Automatic {
                 "automatic"
@@ -597,8 +637,8 @@ impl Engine {
                 format!("{:?}\0{}", repository.model, repository.prompt).as_bytes(),
             ));
             let automatic_key = format!(
-                "{}#{}:{}:automatic:{config_hash}",
-                repository.repository, pull.number, pull.head.sha
+                "{}#{}:{}:{}:automatic:{config_hash}",
+                repository.repository, pull.number, pull.base.sha, pull.head.sha
             );
             // A manual request that arrives before this automatic head was
             // seen satisfies the automatic review too. Later re-requests get
@@ -611,12 +651,14 @@ impl Engine {
                 } else {
                     format!("manual:{generation}")
                 }
+            } else if replace_manual_review {
+                "manual:revision".into()
             } else {
                 "automatic".into()
             };
             let dedupe_key = format!(
-                "{}#{}:{}:{identity}:{config_hash}",
-                repository.repository, pull.number, pull.head.sha
+                "{}#{}:{}:{}:{identity}:{config_hash}",
+                repository.repository, pull.number, pull.base.sha, pull.head.sha
             );
             let job = self.store.enqueue_code_review_job(&NewCodeReviewJob {
                 dedupe_key,
@@ -762,8 +804,32 @@ impl Engine {
 
     async fn run_code_review_job(self: &Arc<Self>, record: CodeReviewJobRecord) {
         let job_id = record.job.id.clone();
+        let cancel = CancellationToken::new();
+        *self.code_review.running.lock().unwrap() = Some(RunningReview {
+            job_id: job_id.clone(),
+            cancel: cancel.clone(),
+        });
+        match self.store.code_review_job(&job_id) {
+            Ok(Some(current)) if current.job.status == "running" => {}
+            Ok(_) => cancel.cancel(),
+            Err(error) => {
+                self.record_review_error(format!(
+                    "checking whether review job {job_id} is still current: {error:#}"
+                ));
+            }
+        }
         let _ = self.emit_code_review_updated(Some(job_id.clone()));
-        let result = tokio::time::timeout(REVIEW_TIMEOUT, self.execute_code_review(&record)).await;
+        let result =
+            tokio::time::timeout(REVIEW_TIMEOUT, self.execute_code_review(&record, &cancel)).await;
+        {
+            let mut running = self.code_review.running.lock().unwrap();
+            if running
+                .as_ref()
+                .is_some_and(|running| running.job_id == job_id)
+            {
+                *running = None;
+            }
+        }
         let (status, review_url, error) = match result {
             Ok(Ok(url)) => ("succeeded", url, String::new()),
             Ok(Err(error)) if error.to_string().starts_with("stale:") => {
@@ -825,8 +891,13 @@ impl Engine {
         }
     }
 
-    async fn execute_code_review(self: &Arc<Self>, record: &CodeReviewJobRecord) -> Result<String> {
+    async fn execute_code_review(
+        self: &Arc<Self>,
+        record: &CodeReviewJobRecord,
+        superseded: &CancellationToken,
+    ) -> Result<String> {
         let job = &record.job;
+        ensure_review_current(superseded)?;
         validate_repository(&job.repository)?;
         validate_sha(&job.base_ref)?;
         validate_sha(&job.head_sha)?;
@@ -843,6 +914,7 @@ impl Engine {
             })
             .await
             .map_err(|error| anyhow!(error))?;
+        ensure_review_current(superseded)?;
         let workspace = self.register_workspace(
             &repository_path.to_string_lossy(),
             Some(job.repository.clone()),
@@ -863,9 +935,20 @@ impl Engine {
             model_options: serde_json::Map::new(),
             permission_mode: Some(PermissionMode::Yolo),
         })?;
-        self.store
-            .set_code_review_job_session(&job.id, &session.id, &thread.id)?;
+        if !self
+            .store
+            .set_code_review_job_session(&job.id, &session.id, &thread.id)?
+        {
+            if let Err(error) = self.delete_session(&session.id).await {
+                self.record_review_error(format!(
+                    "cleaning up superseded review job {} before dispatch: {error}",
+                    job.id
+                ));
+            }
+            bail!("stale: review was superseded before model dispatch");
+        }
         self.emit_code_review_updated(Some(job.id.clone()))?;
+        ensure_review_current(superseded)?;
 
         let scope = Scope::Thread(thread.id.clone());
         let mut events = self.store.subscribe();
@@ -879,10 +962,26 @@ impl Engine {
         let accepted = self.send_message(&thread.id, review_prompt(record), Vec::new())?;
         let turn = accepted.turn;
         let mut output = String::new();
+        let mut cancellation_requested = false;
         loop {
+            if superseded.is_cancelled() && !cancellation_requested {
+                let _ = self.cancel_turn(&thread.id);
+                cancellation_requested = true;
+            }
             let envelope = match replay.pop_front() {
                 Some(envelope) => envelope,
-                None => match events.recv().await {
+                None => match if cancellation_requested {
+                    events.recv().await
+                } else {
+                    tokio::select! {
+                        received = events.recv() => received,
+                        _ = superseded.cancelled() => {
+                            let _ = self.cancel_turn(&thread.id);
+                            cancellation_requested = true;
+                            continue;
+                        }
+                    }
+                } {
                     Ok(envelope) => envelope,
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
                         tracing::warn!(
@@ -926,11 +1025,15 @@ impl Engine {
                     bail!("model review failed: {error}");
                 }
                 Event::TurnCancelled { turn: event_turn } if event_turn == turn => {
+                    if superseded.is_cancelled() {
+                        bail!("stale: review was superseded while the model was running");
+                    }
                     bail!("model review was cancelled");
                 }
                 _ => {}
             }
         }
+        ensure_review_current(superseded)?;
         if output.trim().is_empty() {
             bail!("model returned an empty review");
         }
@@ -943,8 +1046,11 @@ impl Engine {
             ))
             .await?;
         self.record_review_rate(rate);
-        if current.state != "open" || current.head.sha != job.head_sha {
-            bail!("stale: pull request head changed before the review was published");
+        if current.state != "open"
+            || current.base.sha != job.base_ref
+            || current.head.sha != job.head_sha
+        {
+            bail!("stale: pull request revision changed before the review was published");
         }
         let parsed = parse_review_output(&output)?;
         let review_url = self.publish_review(&api, job, parsed).await?;
@@ -1040,6 +1146,22 @@ impl Engine {
     }
 }
 
+fn ensure_review_current(superseded: &CancellationToken) -> Result<()> {
+    if superseded.is_cancelled() {
+        bail!("stale: review was superseded by a newer pull request revision");
+    }
+    Ok(())
+}
+
+fn should_replace_manual_review(
+    mode: CodeReviewMode,
+    revision_changed: bool,
+    manual_requested: bool,
+    generation: Option<u64>,
+) -> bool {
+    mode == CodeReviewMode::Manual && revision_changed && manual_requested && generation.is_none()
+}
+
 fn review_prompt(record: &CodeReviewJobRecord) -> String {
     let job = &record.job;
     let extra = if record.prompt.trim().is_empty() {
@@ -1110,6 +1232,49 @@ mod tests {
         for value in ["", "0", "nope"] {
             assert_eq!(parse_code_review_poll_interval(value), None);
         }
+    }
+
+    #[test]
+    fn outstanding_manual_request_replaces_a_superseded_review() {
+        assert!(should_replace_manual_review(
+            CodeReviewMode::Manual,
+            true,
+            true,
+            None
+        ));
+        assert!(!should_replace_manual_review(
+            CodeReviewMode::Automatic,
+            true,
+            true,
+            None
+        ));
+        assert!(!should_replace_manual_review(
+            CodeReviewMode::Manual,
+            false,
+            true,
+            None
+        ));
+        assert!(!should_replace_manual_review(
+            CodeReviewMode::Manual,
+            true,
+            true,
+            Some(2)
+        ));
+    }
+
+    #[test]
+    fn superseded_job_cancels_the_running_review() {
+        let runtime = CodeReviewRuntime::default();
+        let cancel = CancellationToken::new();
+        *runtime.running.lock().unwrap() = Some(RunningReview {
+            job_id: "rv_old".into(),
+            cancel: cancel.clone(),
+        });
+
+        runtime.cancel_superseded(&["rv_other".into()]);
+        assert!(!cancel.is_cancelled());
+        runtime.cancel_superseded(&["rv_old".into()]);
+        assert!(cancel.is_cancelled());
     }
 
     #[test]

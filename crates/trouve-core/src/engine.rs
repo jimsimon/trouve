@@ -4009,6 +4009,9 @@ impl Engine {
                 return Err(e.into());
             }
         };
+        // Register cancellation before returning from dispatch so an
+        // immediate cancel cannot race the spawned turn task.
+        let cancel = self.register_cancel(thread_id);
         let engine = self.clone();
         tokio::spawn(async move {
             let thread_id = thread.id.clone();
@@ -4017,9 +4020,10 @@ impl Engine {
             // token) are always released and the UI unsticks — tokio would
             // otherwise swallow the panic and leave the thread wedged as
             // "active" with no TurnFailed event.
-            let drained = std::panic::AssertUnwindSafe(engine.drain_queue(thread, turn, prompt))
-                .catch_unwind()
-                .await;
+            let drained =
+                std::panic::AssertUnwindSafe(engine.drain_queue(thread, turn, prompt, cancel))
+                    .catch_unwind()
+                    .await;
             if drained.is_err() {
                 tracing::error!("turn dispatcher for {thread_id} panicked");
                 let _ = engine.store.release_queued_prompt(&prompt_id);
@@ -4046,12 +4050,16 @@ impl Engine {
         thread: Thread,
         turn: u64,
         prompt: trouve_protocol::QueuedPrompt,
+        first_cancel: tokio_util::sync::CancellationToken,
     ) {
         let mut thread = thread;
         let mut turn = turn;
         let mut prompt = prompt;
+        let mut first_cancel = Some(first_cancel);
         loop {
-            let cancel = self.register_cancel(&thread.id);
+            let cancel = first_cancel
+                .take()
+                .unwrap_or_else(|| self.register_cancel(&thread.id));
             let result = self.run_turn(&thread, turn, &prompt, cancel.clone()).await;
             let cancelled = cancel.is_cancelled();
             self.clear_cancel(&thread.id);

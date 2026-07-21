@@ -1468,6 +1468,51 @@ impl Store {
         ))
     }
 
+    pub fn supersede_code_review_jobs(
+        &self,
+        repository: &str,
+        pull_number: u64,
+        base_ref: &str,
+        head_sha: &str,
+    ) -> Result<Vec<String>> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        let ids = {
+            let mut stmt = tx.prepare(
+                "SELECT id FROM code_review_jobs
+                 WHERE repository = ?1 AND pull_number = ?2
+                   AND status IN ('queued', 'running')
+                   AND (base_ref != ?3 OR head_sha != ?4)
+                 ORDER BY created_at",
+            )?;
+            let rows = stmt.query_map(
+                params![repository, pull_number as i64, base_ref, head_sha],
+                |row| row.get(0),
+            )?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        if !ids.is_empty() {
+            tx.execute(
+                "UPDATE code_review_jobs
+                 SET status = 'stale', review_url = '',
+                     error = ?5, completed_at = ?6
+                 WHERE repository = ?1 AND pull_number = ?2
+                   AND status IN ('queued', 'running')
+                   AND (base_ref != ?3 OR head_sha != ?4)",
+                params![
+                    repository,
+                    pull_number as i64,
+                    base_ref,
+                    head_sha,
+                    format!("superseded by pull request revision {base_ref}..{head_sha}"),
+                    chrono::Utc::now().to_rfc3339(),
+                ],
+            )?;
+        }
+        tx.commit()?;
+        Ok(ids)
+    }
+
     pub fn list_code_review_jobs(
         &self,
         limit: usize,
@@ -1549,12 +1594,13 @@ impl Store {
         id: &str,
         session_id: &str,
         thread_id: &str,
-    ) -> Result<()> {
-        self.conn.lock().unwrap().execute(
-            "UPDATE code_review_jobs SET session_id = ?2, thread_id = ?3 WHERE id = ?1",
+    ) -> Result<bool> {
+        let updated = self.conn.lock().unwrap().execute(
+            "UPDATE code_review_jobs SET session_id = ?2, thread_id = ?3
+             WHERE id = ?1 AND status = 'running'",
             params![id, session_id, thread_id],
         )?;
-        Ok(())
+        Ok(updated > 0)
     }
 
     pub fn finish_code_review_job(
@@ -1563,11 +1609,11 @@ impl Store {
         status: &str,
         review_url: &str,
         error: &str,
-    ) -> Result<()> {
-        self.conn.lock().unwrap().execute(
+    ) -> Result<bool> {
+        let updated = self.conn.lock().unwrap().execute(
             "UPDATE code_review_jobs SET status = ?2, review_url = ?3, error = ?4,
                     completed_at = ?5
-             WHERE id = ?1",
+             WHERE id = ?1 AND status = 'running'",
             params![
                 id,
                 status,
@@ -1576,7 +1622,7 @@ impl Store {
                 chrono::Utc::now().to_rfc3339()
             ],
         )?;
-        Ok(())
+        Ok(updated > 0)
     }
 
     pub fn pending_code_review_job_cleanups(&self) -> Result<Vec<(String, String)>> {
@@ -2856,5 +2902,91 @@ mod tests {
             assert!(job.thread_id.is_none());
         }
         assert!(store.pending_code_review_job_cleanups().unwrap().is_empty());
+    }
+
+    #[test]
+    fn newer_pull_revision_supersedes_queued_and_running_jobs() {
+        let store = Store::open_in_memory().unwrap();
+        let enqueue = |suffix: &str, base_ref: &str, head_sha: &str| {
+            store
+                .enqueue_code_review_job(&NewCodeReviewJob {
+                    dedupe_key: format!("acme/widgets#42:{suffix}"),
+                    installation_id: 7,
+                    repository: "acme/widgets".into(),
+                    pull_number: 42,
+                    pull_title: "Ship widgets".into(),
+                    pull_url: "https://github.com/acme/widgets/pull/42".into(),
+                    head_sha: head_sha.into(),
+                    base_ref: base_ref.into(),
+                    head_ref: "ship".into(),
+                    trigger: "automatic".into(),
+                    model: None,
+                    prompt: String::new(),
+                })
+                .unwrap()
+                .unwrap()
+        };
+
+        let old_head = enqueue("old-head", "base-2", "head-1");
+        assert_eq!(
+            store.claim_code_review_job().unwrap().unwrap().job.id,
+            old_head.id
+        );
+        assert!(
+            store
+                .set_code_review_job_session(&old_head.id, "se_old", "th_old")
+                .unwrap()
+        );
+        let old_base = enqueue("old-base", "base-1", "head-2");
+        let current = enqueue("current", "base-2", "head-2");
+
+        let mut superseded = store
+            .supersede_code_review_jobs("acme/widgets", 42, "base-2", "head-2")
+            .unwrap();
+        let mut expected = vec![old_head.id.clone(), old_base.id.clone()];
+        superseded.sort();
+        expected.sort();
+        assert_eq!(superseded, expected);
+        assert_eq!(
+            store
+                .code_review_job(&old_head.id)
+                .unwrap()
+                .unwrap()
+                .job
+                .status,
+            "stale"
+        );
+        assert_eq!(
+            store
+                .code_review_job(&old_base.id)
+                .unwrap()
+                .unwrap()
+                .job
+                .status,
+            "stale"
+        );
+        assert_eq!(
+            store
+                .code_review_job(&current.id)
+                .unwrap()
+                .unwrap()
+                .job
+                .status,
+            "queued"
+        );
+        assert!(
+            !store
+                .set_code_review_job_session(&old_base.id, "se_late", "th_late")
+                .unwrap()
+        );
+        assert!(
+            !store
+                .finish_code_review_job(&old_head.id, "failed", "", "cancelled")
+                .unwrap()
+        );
+        assert_eq!(
+            store.pending_code_review_job_cleanups().unwrap(),
+            vec![(old_head.id, "se_old".into())]
+        );
     }
 }
