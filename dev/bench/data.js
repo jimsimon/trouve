@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1784612217552,
+  "lastUpdate": 1784612251445,
   "repoUrl": "https://github.com/jimsimon/trouve",
   "entries": {
     "e2e-benchmarks": [
@@ -3983,6 +3983,54 @@ window.BENCHMARK_DATA = {
             "name": "non-git warm query",
             "value": 72.73382128,
             "range": "± 1.5",
+            "unit": "ms"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "29139614+renovate[bot]@users.noreply.github.com",
+            "name": "renovate[bot]",
+            "username": "renovate[bot]"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "aa113ce876066093acb00ab45e4c6c9f6c1f5eb6",
+          "message": "Update Rust crate libc to v0.2.187 (#139)\n\nCo-authored-by: renovate[bot] <29139614+renovate[bot]@users.noreply.github.com>",
+          "timestamp": "2026-07-21T01:34:46-04:00",
+          "tree_id": "56c10f753592fa8040d2c6479bf92e2b59dc3615",
+          "url": "https://github.com/jimsimon/trouve/commit/aa113ce876066093acb00ab45e4c6c9f6c1f5eb6"
+        },
+        "date": 1784612250599,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "cold index + query",
+            "value": 131.99236212000002,
+            "range": "± 4.8",
+            "unit": "ms"
+          },
+          {
+            "name": "warm query",
+            "value": 68.5284388,
+            "range": "± 1.8",
+            "unit": "ms"
+          },
+          {
+            "name": "incremental (1 file modified)",
+            "value": 80.03115822,
+            "range": "± 1.8",
+            "unit": "ms"
+          },
+          {
+            "name": "non-git warm query",
+            "value": 67.94318238,
+            "range": "± 1.4",
             "unit": "ms"
           }
         ]
