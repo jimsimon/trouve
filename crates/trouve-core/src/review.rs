@@ -18,9 +18,9 @@ use sha2::{Digest, Sha256};
 use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
 use trouve_protocol::{
-    CodeReviewDashboard, CodeReviewIdentity, CodeReviewMode, CodeReviewRepository,
-    ConfigureGithubAppRequest, CreateSessionRequest, CreateThreadRequest, Event, GithubAppStatus,
-    PermissionMode, Scope, UpdateCodeReviewRepositoryRequest, UpsertCodeReviewIdentityRequest,
+    CodeReviewDashboard, CodeReviewMode, CodeReviewRepository, ConfigureGithubAppRequest,
+    CreateSessionRequest, CreateThreadRequest, Event, GithubAppStatus, PermissionMode,
+    ReviewerProfile, Scope, UpdateCodeReviewRepositoryRequest, UpsertReviewerProfileRequest,
 };
 
 use crate::config::GithubReviewAppConfig;
@@ -205,8 +205,8 @@ struct ReviewBatch {
 
 #[derive(Debug, Clone, Serialize)]
 struct CandidateFinding {
-    identity_id: String,
-    identity_name: String,
+    reviewer_id: String,
+    reviewer_name: String,
     finding: ReviewFinding,
 }
 
@@ -438,57 +438,58 @@ impl Engine {
     pub fn code_review_dashboard(&self) -> Result<CodeReviewDashboard, EngineError> {
         Ok(CodeReviewDashboard {
             app: self.github_app_status()?,
-            identities: self.code_review_identity_catalog()?,
+            reviewers: self.code_review_reviewer_catalog()?,
             repositories: self.store.list_code_review_repositories()?,
             jobs: self.store.list_code_review_jobs(100)?,
         })
     }
 
-    fn code_review_identity_catalog(&self) -> Result<Vec<CodeReviewIdentity>, EngineError> {
-        let mut identities = crate::review_identities::native_identities();
-        identities.extend(self.store.list_custom_code_review_identities()?);
-        Ok(identities)
+    fn code_review_reviewer_catalog(&self) -> Result<Vec<ReviewerProfile>, EngineError> {
+        let mut reviewers = crate::reviewers::built_in_reviewers();
+        reviewers.extend(self.store.list_custom_reviewer_profiles()?);
+        Ok(reviewers)
     }
 
-    fn resolve_code_review_identities(
+    fn resolve_code_review_reviewers(
         &self,
         ids: &[String],
-    ) -> Result<Vec<CodeReviewIdentity>, EngineError> {
-        let catalog = self.code_review_identity_catalog()?;
+    ) -> Result<Vec<ReviewerProfile>, EngineError> {
+        let catalog = self.code_review_reviewer_catalog()?;
         let by_id: HashMap<_, _> = catalog
             .into_iter()
-            .map(|identity| (identity.id.clone(), identity))
+            .map(|reviewer| (reviewer.id.clone(), reviewer))
             .collect();
         let mut seen = std::collections::HashSet::new();
         let mut resolved = Vec::with_capacity(ids.len());
         for id in ids {
             if !seen.insert(id) {
                 return Err(EngineError::BadRequest(format!(
-                    "duplicate code-review identity {id:?}"
+                    "duplicate reviewer id {id:?}"
                 )));
             }
-            let identity = by_id.get(id).cloned().ok_or_else(|| {
-                EngineError::BadRequest(format!("unknown code-review identity {id:?}"))
-            })?;
-            resolved.push(identity);
+            let reviewer = by_id
+                .get(id)
+                .cloned()
+                .ok_or_else(|| EngineError::BadRequest(format!("unknown reviewer id {id:?}")))?;
+            resolved.push(reviewer);
         }
         Ok(resolved)
     }
 
-    pub fn upsert_code_review_identity(
+    pub fn upsert_reviewer_profile(
         &self,
-        request: UpsertCodeReviewIdentityRequest,
-    ) -> Result<CodeReviewIdentity, EngineError> {
+        request: UpsertReviewerProfileRequest,
+    ) -> Result<ReviewerProfile, EngineError> {
         let name = request.name.trim();
         let prompt = request.prompt.trim();
         if name.is_empty() || name.len() > 100 {
             return Err(EngineError::BadRequest(
-                "identity name must contain 1 to 100 bytes".into(),
+                "reviewer name must contain 1 to 100 bytes".into(),
             ));
         }
         if prompt.is_empty() || prompt.len() > 16_000 {
             return Err(EngineError::BadRequest(
-                "identity prompt must contain 1 to 16000 bytes".into(),
+                "reviewer prompt must contain 1 to 16000 bytes".into(),
             ));
         }
         let model = request
@@ -497,51 +498,51 @@ impl Engine {
             .filter(|model| !model.is_empty());
         if model.as_deref().is_some_and(|model| !model.contains('/')) {
             return Err(EngineError::BadRequest(
-                "identity model must be provider-qualified".into(),
+                "reviewer model must be provider-qualified".into(),
             ));
         }
         let updating = request.id.is_some();
         let id = request
             .id
-            .unwrap_or_else(|| format!("custom:{}", crate::new_id("ri")));
+            .unwrap_or_else(|| format!("custom:{}", crate::new_id("rp")));
         if !id.starts_with("custom:") {
             return Err(EngineError::BadRequest(
-                "native code-review identities cannot be changed".into(),
+                "built-in reviewers cannot be changed".into(),
             ));
         }
         if id.len() > 150 {
-            return Err(EngineError::BadRequest("identity id is too long".into()));
+            return Err(EngineError::BadRequest("reviewer id is too long".into()));
         }
         if updating
             && !self
                 .store
-                .list_custom_code_review_identities()?
+                .list_custom_reviewer_profiles()?
                 .iter()
-                .any(|identity| identity.id == id)
+                .any(|reviewer| reviewer.id == id)
         {
-            return Err(EngineError::NotFound(format!("code-review identity {id}")));
+            return Err(EngineError::NotFound(format!("reviewer profile {id}")));
         }
-        let identity = CodeReviewIdentity {
+        let reviewer = ReviewerProfile {
             id,
             name: name.into(),
             prompt: prompt.into(),
             model,
-            native: false,
+            built_in: false,
         };
-        self.store.upsert_custom_code_review_identity(&identity)?;
+        self.store.upsert_custom_reviewer_profile(&reviewer)?;
         self.code_review.poll_wake.notify_one();
         self.emit_code_review_updated(None)?;
-        Ok(identity)
+        Ok(reviewer)
     }
 
-    pub fn delete_code_review_identity(&self, id: &str) -> Result<(), EngineError> {
+    pub fn delete_reviewer_profile(&self, id: &str) -> Result<(), EngineError> {
         if !id.starts_with("custom:") {
             return Err(EngineError::BadRequest(
-                "native code-review identities cannot be deleted".into(),
+                "built-in reviewers cannot be deleted".into(),
             ));
         }
-        if !self.store.delete_custom_code_review_identity(id)? {
-            return Err(EngineError::NotFound(format!("code-review identity {id}")));
+        if !self.store.delete_custom_reviewer_profile(id)? {
+            return Err(EngineError::NotFound(format!("reviewer profile {id}")));
         }
         self.code_review.poll_wake.notify_one();
         self.emit_code_review_updated(None)?;
@@ -566,24 +567,24 @@ impl Engine {
             .list_code_review_repositories()?
             .into_iter()
             .find(|repository| repository.repository == request.repository);
-        let identity_ids = request
-            .identity_ids
+        let reviewer_ids = request
+            .reviewer_ids
             .clone()
-            .or_else(|| existing.map(|repository| repository.identity_ids))
-            .unwrap_or_else(crate::review_identities::default_identity_ids);
-        if request.mode != CodeReviewMode::Off && identity_ids.is_empty() {
+            .or_else(|| existing.map(|repository| repository.reviewer_ids))
+            .unwrap_or_else(crate::reviewers::default_reviewer_ids);
+        if request.mode != CodeReviewMode::Off && reviewer_ids.is_empty() {
             return Err(EngineError::BadRequest(
-                "an enabled repository must select at least one review identity".into(),
+                "an enabled repository must select at least one reviewer".into(),
             ));
         }
-        self.resolve_code_review_identities(&identity_ids)?;
+        self.resolve_code_review_reviewers(&reviewer_ids)?;
         let normalized = UpdateCodeReviewRepositoryRequest {
             installation_id: request.installation_id,
             repository: request.repository.clone(),
             mode: request.mode,
             model: request.model.clone(),
             prompt: request.prompt.clone(),
-            identity_ids: Some(identity_ids),
+            reviewer_ids: Some(reviewer_ids),
         };
         self.store.update_code_review_repository(&normalized)?;
         let repository = self
@@ -714,11 +715,11 @@ impl Engine {
 
     async fn poll_code_review_repository(&self, repository: &CodeReviewRepository) -> Result<()> {
         validate_repository(&repository.repository)?;
-        let identities = self.resolve_code_review_identities(&repository.identity_ids)?;
-        let identity_config = serde_json::to_string(&identities)?;
+        let reviewers = self.resolve_code_review_reviewers(&repository.reviewer_ids)?;
+        let reviewer_config = serde_json::to_string(&reviewers)?;
         let config_hash = hex::encode(Sha256::digest(
             format!(
-                "{:?}\0{}\0{identity_config}",
+                "{:?}\0{}\0{reviewer_config}",
                 repository.model, repository.prompt
             )
             .as_bytes(),
@@ -795,7 +796,7 @@ impl Engine {
             // A manual request that arrives before this automatic head was
             // seen satisfies the automatic review too. Later re-requests get
             // their own generation and intentionally run again.
-            let identity = if let Some(generation) = generation {
+            let trigger_key = if let Some(generation) = generation {
                 if repository.mode == CodeReviewMode::Automatic
                     && !self.store.code_review_job_exists(&automatic_key)?
                 {
@@ -809,7 +810,7 @@ impl Engine {
                 "automatic".into()
             };
             let dedupe_key = format!(
-                "{}#{}:{}:{}:{identity}:{config_hash}",
+                "{}#{}:{}:{}:{trigger_key}:{config_hash}",
                 repository.repository, pull.number, pull.base.sha, pull.head.sha
             );
             let job = self.store.enqueue_code_review_job(&NewCodeReviewJob {
@@ -825,7 +826,7 @@ impl Engine {
                 trigger: trigger.into(),
                 model: repository.model.clone(),
                 prompt: repository.prompt.clone(),
-                identities: identities.clone(),
+                reviewers: reviewers.clone(),
                 config_hash: config_hash.clone(),
             })?;
             if let Some(job) = job {
@@ -1112,19 +1113,19 @@ impl Engine {
             .await
             .map_err(|error| anyhow!(error))?;
         let batches = build_review_batches(&diff_files);
-        let identities = if record.identities.is_empty() {
-            self.resolve_code_review_identities(&crate::review_identities::default_identity_ids())?
+        let reviewers = if record.reviewers.is_empty() {
+            self.resolve_code_review_reviewers(&crate::reviewers::default_reviewer_ids())?
         } else {
-            record.identities.clone()
+            record.reviewers.clone()
         };
         let mut candidates = Vec::new();
-        for identity in &identities {
+        for reviewer in &reviewers {
             for (batch_index, batch) in batches.iter().enumerate() {
                 ensure_review_current(superseded)?;
                 let thread = self.create_thread(CreateThreadRequest {
                     session_id: session.id.clone(),
                     mode: Some("review".into()),
-                    model: identity.model.clone().or_else(|| job.model.clone()),
+                    model: reviewer.model.clone().or_else(|| job.model.clone()),
                     model_options: serde_json::Map::new(),
                     permission_mode: Some(PermissionMode::Yolo),
                 })?;
@@ -1132,19 +1133,19 @@ impl Engine {
                     .run_code_review_turn(
                         job,
                         &thread.id,
-                        identity_review_prompt(record, identity, batch, batch_index, batches.len()),
+                        reviewer_prompt(record, reviewer, batch, batch_index, batches.len()),
                         superseded,
                     )
                     .await?;
                 let parsed = parse_review_output(&output)?;
                 candidates.extend(parsed.findings.into_iter().map(|finding| CandidateFinding {
-                    identity_id: identity.id.clone(),
-                    identity_name: identity.name.clone(),
+                    reviewer_id: reviewer.id.clone(),
+                    reviewer_name: reviewer.name.clone(),
                     finding,
                 }));
                 if candidates.len() > MAX_CANDIDATE_FINDINGS {
                     bail!(
-                        "review identities returned more than {MAX_CANDIDATE_FINDINGS} candidate findings"
+                        "reviewers returned more than {MAX_CANDIDATE_FINDINGS} candidate findings"
                     );
                 }
             }
@@ -1153,8 +1154,8 @@ impl Engine {
         let parsed = if candidates.is_empty() {
             ReviewOutput {
                 summary: format!(
-                    "{} review identity/identities examined {} changed file(s); no actionable issues were confirmed.",
-                    identities.len(),
+                    "{} reviewer(s) examined {} changed file(s); no actionable issues were confirmed.",
+                    reviewers.len(),
                     diff_files.len()
                 ),
                 findings: Vec::new(),
@@ -1471,9 +1472,9 @@ fn split_diff_chunks(diff: &str, limit: usize) -> Vec<&str> {
     chunks
 }
 
-fn identity_review_prompt(
+fn reviewer_prompt(
     record: &CodeReviewJobRecord,
-    identity: &CodeReviewIdentity,
+    reviewer: &ReviewerProfile,
     batch: &ReviewBatch,
     batch_index: usize,
     batch_count: usize,
@@ -1485,8 +1486,8 @@ fn identity_review_prompt(
         format!("\nRepository-specific instructions:\n{}\n", record.prompt)
     };
     format!(
-        "You are the `{identity_name}` review identity. Your focused mandate is:\n\
-         {identity_prompt}\n\nReview pull request #{number} ({title}) at immutable head {head}, \
+        "You are the `{reviewer_name}` reviewer. Your focused mandate is:\n\
+         {reviewer_instructions}\n\nReview pull request #{number} ({title}) at immutable head {head}, \
          compared with base commit {base}. This is complete diff batch {batch_number} of \
          {batch_count}; review every supplied file or fragment. Inspect relevant unchanged \
          code with read/search tools when needed. Report only concrete, actionable problems \
@@ -1497,8 +1498,8 @@ fn identity_review_prompt(
          Use RIGHT for added/context lines in the new version and LEFT only \
          for removed lines. Return an empty findings array when there are no \
          actionable issues.",
-        identity_name = identity.name,
-        identity_prompt = identity.prompt,
+        reviewer_name = reviewer.name,
+        reviewer_instructions = reviewer.prompt,
         number = job.pull_number,
         title = job.pull_title,
         head = job.head_sha,
@@ -1539,7 +1540,7 @@ fn validation_prompt(
          and retain only findings a maintainer should act on. Use git_diff with base `{base}` \
          and its path/offset pagination when exact removed or context lines need verification; \
          use read/search tools for surrounding code. Do not add a finding merely because an \
-         identity suggested it.\n\n{extra}Changed paths: {paths}\n\nCandidate findings:\n{candidates}\n\n\
+         reviewer suggested it.\n\n{extra}Changed paths: {paths}\n\nCandidate findings:\n{candidates}\n\n\
          Return JSON only, with no Markdown fence, using exactly this shape:\n\
          {{\"summary\":\"concise final assessment that mentions validated coverage\",\"findings\":[{{\"path\":\"relative/file.rs\",\"line\":123,\"side\":\"RIGHT\",\"severity\":\"high|medium|low\",\"body\":\"specific verified problem and fix\"}}]}}",
         number = job.pull_number,
@@ -1748,8 +1749,8 @@ mod tests {
             diff: "diff --git a/src/lib.rs b/src/lib.rs\n--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -20,2 +2,3 @@\n context\n+added\n tail\n".into(),
         }];
         let candidate = |path: &str, side: &str, body: &str| CandidateFinding {
-            identity_id: "correctness".into(),
-            identity_name: "Correctness".into(),
+            reviewer_id: "correctness".into(),
+            reviewer_name: "Correctness".into(),
             finding: ReviewFinding {
                 path: path.into(),
                 line: 3,

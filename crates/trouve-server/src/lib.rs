@@ -22,19 +22,19 @@ use trouve_core::Engine;
 use trouve_core::engine::EngineError;
 use trouve_protocol::{
     AddLocalModelRequest, AgentMode, Automation, BranchList, CliInfo, CliInstallStatus, CliList,
-    CodeReviewDashboard, CodeReviewIdentity, CodeReviewRepository, ConfigureGithubAppRequest,
-    CreatePrRequest, CreateSessionRequest, CreateThreadRequest, DirEntry, ErrorBody, FileContent,
-    GithubAppStatus, GithubIntegration, GithubPrList, KnownProvider, LocalSearchResult,
-    LocalStatus, LoginStarted, LoginStatus, McpLogs, McpServerInfo, MergePrRequest, ModeInfo,
-    ModelInfo, OpenTerminalRequest, PROTOCOL_VERSION, PrInfo, ProviderInfo, ProvidersResponse,
-    QueuedPrompt, RegisterWorkspaceRequest, ReorderQueueRequest, ResolveApprovalRequest,
-    ResolveQuestionRequest, Scope, SendMessageRequest, ServerInfo, Session, SessionDiff,
+    CodeReviewDashboard, CodeReviewRepository, ConfigureGithubAppRequest, CreatePrRequest,
+    CreateSessionRequest, CreateThreadRequest, DirEntry, ErrorBody, FileContent, GithubAppStatus,
+    GithubIntegration, GithubPrList, KnownProvider, LocalSearchResult, LocalStatus, LoginStarted,
+    LoginStatus, McpLogs, McpServerInfo, MergePrRequest, ModeInfo, ModelInfo, OpenTerminalRequest,
+    PROTOCOL_VERSION, PrInfo, ProviderInfo, ProvidersResponse, QueuedPrompt,
+    RegisterWorkspaceRequest, ReorderQueueRequest, ResolveApprovalRequest, ResolveQuestionRequest,
+    ReviewerProfile, Scope, SendMessageRequest, ServerInfo, Session, SessionDiff,
     SetDefaultModelRequest, SetDefaultPermissionModeRequest, SetLocalEnabledRequest,
     SubscriptionHealth, TerminalInfo, TerminalInputRequest, TerminalResizeRequest, Thread,
     TurnAccepted, UpdateCodeReviewRepositoryRequest, UpdateQueuedPromptRequest,
-    UpdateSessionRequest, UpdateThreadRequest, UpsertAutomationRequest,
-    UpsertCodeReviewIdentityRequest, UpsertMcpServerRequest, UpsertModeRequest,
-    UpsertProviderRequest, UsageSummary, Workspace,
+    UpdateSessionRequest, UpdateThreadRequest, UpsertAutomationRequest, UpsertMcpServerRequest,
+    UpsertModeRequest, UpsertProviderRequest, UpsertReviewerProfileRequest, UsageSummary,
+    Workspace,
 };
 use utoipa::OpenApi;
 
@@ -166,8 +166,8 @@ impl IntoResponse for ApiError {
         run_automation,
         code_review_dashboard,
         configure_github_review_app,
-        upsert_code_review_identity,
-        delete_code_review_identity,
+        upsert_reviewer_profile,
+        delete_reviewer_profile,
         update_code_review_repository,
         refresh_code_reviews,
     ),
@@ -235,13 +235,13 @@ impl IntoResponse for ApiError {
         trouve_protocol::AutomationTemplate,
         UpsertAutomationRequest,
         CodeReviewDashboard,
-        CodeReviewIdentity,
+        ReviewerProfile,
         CodeReviewRepository,
         trouve_protocol::CodeReviewJob,
         trouve_protocol::CodeReviewMode,
         GithubAppStatus,
         ConfigureGithubAppRequest,
-        UpsertCodeReviewIdentityRequest,
+        UpsertReviewerProfileRequest,
         UpdateCodeReviewRepositoryRequest,
         ErrorBody,
         trouve_protocol::EventEnvelope,
@@ -558,12 +558,12 @@ pub fn build_router(engine: Arc<Engine>) -> Router {
             axum::routing::put(configure_github_review_app),
         )
         .route(
-            "/v1/code-review/identity",
-            axum::routing::put(upsert_code_review_identity),
+            "/v1/code-review/reviewer",
+            axum::routing::put(upsert_reviewer_profile),
         )
         .route(
-            "/v1/code-review/identity/{id}",
-            axum::routing::delete(delete_code_review_identity),
+            "/v1/code-review/reviewer/{id}",
+            axum::routing::delete(delete_reviewer_profile),
         )
         .route(
             "/v1/code-review/repository",
@@ -717,24 +717,24 @@ async fn configure_github_review_app(
     Ok(Json(engine.configure_github_review_app(request).await?))
 }
 
-#[utoipa::path(put, path = "/v1/code-review/identity",
-    request_body = UpsertCodeReviewIdentityRequest,
-    responses((status = 200, body = CodeReviewIdentity), (status = 400, body = ErrorBody)))]
-async fn upsert_code_review_identity(
+#[utoipa::path(put, path = "/v1/code-review/reviewer",
+    request_body = UpsertReviewerProfileRequest,
+    responses((status = 200, body = ReviewerProfile), (status = 400, body = ErrorBody)))]
+async fn upsert_reviewer_profile(
     State(engine): State<Arc<Engine>>,
-    Json(request): Json<UpsertCodeReviewIdentityRequest>,
-) -> Result<Json<CodeReviewIdentity>, ApiError> {
-    Ok(Json(engine.upsert_code_review_identity(request)?))
+    Json(request): Json<UpsertReviewerProfileRequest>,
+) -> Result<Json<ReviewerProfile>, ApiError> {
+    Ok(Json(engine.upsert_reviewer_profile(request)?))
 }
 
-#[utoipa::path(delete, path = "/v1/code-review/identity/{id}",
-    params(("id" = String, Path, description = "Custom review identity id")),
+#[utoipa::path(delete, path = "/v1/code-review/reviewer/{id}",
+    params(("id" = String, Path, description = "Custom reviewer profile id")),
     responses((status = 204), (status = 400, body = ErrorBody), (status = 404, body = ErrorBody)))]
-async fn delete_code_review_identity(
+async fn delete_reviewer_profile(
     State(engine): State<Arc<Engine>>,
     Path(id): Path<String>,
 ) -> Result<StatusCode, ApiError> {
-    engine.delete_code_review_identity(&id)?;
+    engine.delete_reviewer_profile(&id)?;
     Ok(StatusCode::NO_CONTENT)
 }
 

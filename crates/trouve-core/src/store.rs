@@ -128,6 +128,8 @@ CREATE TABLE IF NOT EXISTS automations (
   last_error TEXT NOT NULL DEFAULT '',
   created_at TEXT NOT NULL
 );
+-- The identity-based SQL names below are retained for compatibility with
+-- preview databases; the Rust and wire APIs expose reviewer profiles.
 CREATE TABLE IF NOT EXISTS code_review_repositories (
   repository TEXT PRIMARY KEY,
   installation_id INTEGER NOT NULL,
@@ -326,8 +328,8 @@ fn row_to_code_review_repository(
         mode: code_review_mode_from(&mode),
         model: r.get(4)?,
         prompt: r.get(5)?,
-        identity_ids: serde_json::from_str::<Vec<String>>(&r.get::<_, String>(6)?)
-            .unwrap_or_else(|_| crate::review_identities::default_identity_ids()),
+        reviewer_ids: serde_json::from_str::<Vec<String>>(&r.get::<_, String>(6)?)
+            .unwrap_or_else(|_| crate::reviewers::default_reviewer_ids()),
     })
 }
 
@@ -345,7 +347,7 @@ pub struct NewCodeReviewJob {
     pub trigger: String,
     pub model: Option<String>,
     pub prompt: String,
-    pub identities: Vec<trouve_protocol::CodeReviewIdentity>,
+    pub reviewers: Vec<trouve_protocol::ReviewerProfile>,
     pub config_hash: String,
 }
 
@@ -353,11 +355,11 @@ pub struct NewCodeReviewJob {
 pub struct CodeReviewJobRecord {
     pub job: trouve_protocol::CodeReviewJob,
     pub prompt: String,
-    pub identities: Vec<trouve_protocol::CodeReviewIdentity>,
+    pub reviewers: Vec<trouve_protocol::ReviewerProfile>,
 }
 
 fn row_to_code_review_job(r: &rusqlite::Row<'_>) -> rusqlite::Result<CodeReviewJobRecord> {
-    let identities: Vec<trouve_protocol::CodeReviewIdentity> =
+    let reviewers: Vec<trouve_protocol::ReviewerProfile> =
         serde_json::from_str(&r.get::<_, String>(13)?).unwrap_or_default();
     Ok(CodeReviewJobRecord {
         job: trouve_protocol::CodeReviewJob {
@@ -373,9 +375,9 @@ fn row_to_code_review_job(r: &rusqlite::Row<'_>) -> rusqlite::Result<CodeReviewJ
             trigger: r.get(9)?,
             status: r.get(10)?,
             model: r.get(11)?,
-            identity_ids: identities
+            reviewer_ids: reviewers
                 .iter()
-                .map(|identity| identity.id.clone())
+                .map(|reviewer| reviewer.id.clone())
                 .collect(),
             session_id: r.get(15)?,
             thread_id: r.get(16)?,
@@ -386,7 +388,7 @@ fn row_to_code_review_job(r: &rusqlite::Row<'_>) -> rusqlite::Result<CodeReviewJ
             completed_at: parse_optional_datetime(r.get(21)?),
         },
         prompt: r.get(12)?,
-        identities,
+        reviewers,
     })
 }
 
@@ -1388,30 +1390,28 @@ impl Store {
 
     // --- automated code review ---------------------------------------------
 
-    pub fn list_custom_code_review_identities(
-        &self,
-    ) -> Result<Vec<trouve_protocol::CodeReviewIdentity>> {
+    pub fn list_custom_reviewer_profiles(&self) -> Result<Vec<trouve_protocol::ReviewerProfile>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
             "SELECT id, name, prompt, model
              FROM code_review_identities ORDER BY lower(name), id",
         )?;
         let rows = stmt.query_map([], |row| {
-            Ok(trouve_protocol::CodeReviewIdentity {
+            Ok(trouve_protocol::ReviewerProfile {
                 id: row.get(0)?,
                 name: row.get(1)?,
                 prompt: row.get(2)?,
                 model: row.get(3)?,
-                native: false,
+                built_in: false,
             })
         })?;
         rows.collect::<rusqlite::Result<Vec<_>>>()
             .map_err(Into::into)
     }
 
-    pub fn upsert_custom_code_review_identity(
+    pub fn upsert_custom_reviewer_profile(
         &self,
-        identity: &trouve_protocol::CodeReviewIdentity,
+        reviewer: &trouve_protocol::ReviewerProfile,
     ) -> Result<()> {
         let now = chrono::Utc::now().to_rfc3339();
         self.conn.lock().unwrap().execute(
@@ -1424,17 +1424,17 @@ impl Store {
                model = excluded.model,
                updated_at = excluded.updated_at",
             params![
-                identity.id,
-                identity.name,
-                identity.prompt,
-                identity.model,
+                reviewer.id,
+                reviewer.name,
+                reviewer.prompt,
+                reviewer.model,
                 now,
             ],
         )?;
         Ok(())
     }
 
-    pub fn delete_custom_code_review_identity(&self, id: &str) -> Result<bool> {
+    pub fn delete_custom_reviewer_profile(&self, id: &str) -> Result<bool> {
         let mut conn = self.conn.lock().unwrap();
         let tx = conn.transaction()?;
         let deleted = tx.execute(
@@ -1451,10 +1451,10 @@ impl Store {
             for (repository, encoded) in repositories {
                 let mut ids: Vec<String> = serde_json::from_str(&encoded).unwrap_or_default();
                 let before = ids.len();
-                ids.retain(|identity_id| identity_id != id);
+                ids.retain(|reviewer_id| reviewer_id != id);
                 if ids.len() != before {
                     if ids.is_empty() {
-                        ids = crate::review_identities::default_identity_ids();
+                        ids = crate::reviewers::default_reviewer_ids();
                     }
                     tx.execute(
                         "UPDATE code_review_repositories
@@ -1513,8 +1513,8 @@ impl Store {
         &self,
         request: &trouve_protocol::UpdateCodeReviewRepositoryRequest,
     ) -> Result<()> {
-        let identity_ids = request
-            .identity_ids
+        let reviewer_ids = request
+            .reviewer_ids
             .as_ref()
             .map(serde_json::to_string)
             .transpose()?;
@@ -1537,7 +1537,7 @@ impl Store {
                 code_review_mode_str(request.mode),
                 request.model,
                 request.prompt,
-                identity_ids,
+                reviewer_ids,
                 chrono::Utc::now().to_rfc3339(),
             ],
         )?;
@@ -1551,7 +1551,7 @@ impl Store {
         let id = crate::new_id("rv");
         let now = chrono::Utc::now().to_rfc3339();
         let conn = self.conn.lock().unwrap();
-        let identities = serde_json::to_string(&new_job.identities)?;
+        let reviewers = serde_json::to_string(&new_job.reviewers)?;
         let inserted = conn.execute(
             "INSERT OR IGNORE INTO code_review_jobs
                     (id, dedupe_key, installation_id, repository, pull_number, pull_title,
@@ -1573,7 +1573,7 @@ impl Store {
                 new_job.trigger,
                 new_job.model,
                 new_job.prompt,
-                identities,
+                reviewers,
                 new_job.config_hash,
                 now,
             ],
@@ -2906,7 +2906,7 @@ mod tests {
                 mode: trouve_protocol::CodeReviewMode::Automatic,
                 model: Some("openai/gpt-5".into()),
                 prompt: "focus on concurrency".into(),
-                identity_ids: Some(crate::review_identities::default_identity_ids()),
+                reviewer_ids: Some(crate::reviewers::default_reviewer_ids()),
             })
             .unwrap();
         let configured = store.list_code_review_repositories().unwrap().remove(0);
@@ -2948,15 +2948,15 @@ mod tests {
             trigger: "automatic".into(),
             model: configured.model,
             prompt: configured.prompt,
-            identities: crate::review_identities::native_identities()
+            reviewers: crate::reviewers::built_in_reviewers()
                 .into_iter()
-                .filter(|identity| configured.identity_ids.contains(&identity.id))
+                .filter(|reviewer| configured.reviewer_ids.contains(&reviewer.id))
                 .collect(),
             config_hash: "config".into(),
         };
         let queued = store.enqueue_code_review_job(&new_job).unwrap().unwrap();
         assert_eq!(queued.status, "queued");
-        assert_eq!(queued.identity_ids, configured.identity_ids);
+        assert_eq!(queued.reviewer_ids, configured.reviewer_ids);
         assert!(store.enqueue_code_review_job(&new_job).unwrap().is_none());
         assert!(store.code_review_job_exists(&new_job.dedupe_key).unwrap());
         let running = store.claim_code_review_job().unwrap().unwrap();
@@ -3006,7 +3006,7 @@ mod tests {
                     trigger: "automatic".into(),
                     model: None,
                     prompt: String::new(),
-                    identities: Vec::new(),
+                    reviewers: Vec::new(),
                     config_hash: "config".into(),
                 })
                 .unwrap()
@@ -3047,18 +3047,18 @@ mod tests {
     }
 
     #[test]
-    fn custom_review_identities_are_durable_and_removed_from_policies() {
+    fn custom_reviewer_profiles_are_durable_and_removed_from_policies() {
         let store = Store::open_in_memory().unwrap();
-        let identity = trouve_protocol::CodeReviewIdentity {
+        let reviewer = trouve_protocol::ReviewerProfile {
             id: "custom:domain".into(),
             name: "Domain invariants".into(),
             prompt: "Check widget state transitions.".into(),
             model: Some("openai/gpt-5".into()),
-            native: false,
+            built_in: false,
         };
-        store.upsert_custom_code_review_identity(&identity).unwrap();
-        let identities = store.list_custom_code_review_identities().unwrap();
-        assert_eq!(identities.as_slice(), std::slice::from_ref(&identity));
+        store.upsert_custom_reviewer_profile(&reviewer).unwrap();
+        let reviewers = store.list_custom_reviewer_profiles().unwrap();
+        assert_eq!(reviewers.as_slice(), std::slice::from_ref(&reviewer));
         store
             .update_code_review_repository(&trouve_protocol::UpdateCodeReviewRepositoryRequest {
                 installation_id: 7,
@@ -3066,29 +3066,20 @@ mod tests {
                 mode: trouve_protocol::CodeReviewMode::Automatic,
                 model: None,
                 prompt: String::new(),
-                identity_ids: Some(vec![identity.id.clone()]),
+                reviewer_ids: Some(vec![reviewer.id.clone()]),
             })
             .unwrap();
         let repositories = store.list_code_review_repositories().unwrap();
         assert_eq!(
-            repositories[0].identity_ids.as_slice(),
-            std::slice::from_ref(&identity.id)
+            repositories[0].reviewer_ids.as_slice(),
+            std::slice::from_ref(&reviewer.id)
         );
 
-        assert!(
-            store
-                .delete_custom_code_review_identity(&identity.id)
-                .unwrap()
-        );
-        assert!(
-            store
-                .list_custom_code_review_identities()
-                .unwrap()
-                .is_empty()
-        );
+        assert!(store.delete_custom_reviewer_profile(&reviewer.id).unwrap());
+        assert!(store.list_custom_reviewer_profiles().unwrap().is_empty());
         assert_eq!(
-            store.list_code_review_repositories().unwrap()[0].identity_ids,
-            crate::review_identities::default_identity_ids()
+            store.list_code_review_repositories().unwrap()[0].reviewer_ids,
+            crate::reviewers::default_reviewer_ids()
         );
     }
 
@@ -3110,7 +3101,7 @@ mod tests {
                     trigger: "automatic".into(),
                     model: None,
                     prompt: String::new(),
-                    identities: Vec::new(),
+                    reviewers: Vec::new(),
                     config_hash: config_hash.into(),
                 })
                 .unwrap()

@@ -656,23 +656,23 @@ pub struct ConfigureGithubAppRequest {
     pub webhook_secret: String,
 }
 
-/// One focused reviewer persona. Native identities are shipped by trouve;
-/// custom identities are user-managed and may choose their own model.
+/// Configuration for one focused reviewer. Built-in profiles are shipped by
+/// trouve; custom profiles are user-managed and may choose their own model.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
-pub struct CodeReviewIdentity {
+pub struct ReviewerProfile {
     pub id: String,
     pub name: String,
     pub prompt: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
     #[serde(default)]
-    pub native: bool,
+    pub built_in: bool,
 }
 
-/// Create or update a custom code-review identity. Omit `id` to create one;
-/// native identities cannot be changed through this request.
+/// Create or update a custom reviewer profile. Omit `id` to create one;
+/// built-in profiles cannot be changed through this request.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-pub struct UpsertCodeReviewIdentityRequest {
+pub struct UpsertReviewerProfileRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub id: Option<String>,
     pub name: String,
@@ -697,9 +697,9 @@ pub struct CodeReviewRepository {
     /// Extra repository-specific review instructions.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub prompt: String,
-    /// Ordered reviewer identities run for each revision.
+    /// Ordered reviewer profiles run for each revision.
     #[serde(default)]
-    pub identity_ids: Vec<String>,
+    pub reviewer_ids: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -713,7 +713,7 @@ pub struct UpdateCodeReviewRepositoryRequest {
     pub prompt: String,
     /// Omitted by older clients to preserve the current/default selection.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub identity_ids: Option<Vec<String>>,
+    pub reviewer_ids: Option<Vec<String>>,
 }
 
 /// A durable execution of one model review against one immutable PR head.
@@ -734,10 +734,10 @@ pub struct CodeReviewJob {
     pub status: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
-    /// Identity definitions are snapshotted internally; their stable ids are
+    /// Reviewer profiles are snapshotted internally; their stable ids are
     /// exposed here for history and diagnostics.
     #[serde(default)]
-    pub identity_ids: Vec<String>,
+    pub reviewer_ids: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -756,7 +756,7 @@ pub struct CodeReviewJob {
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct CodeReviewDashboard {
     pub app: GithubAppStatus,
-    pub identities: Vec<CodeReviewIdentity>,
+    pub reviewers: Vec<ReviewerProfile>,
     pub repositories: Vec<CodeReviewRepository>,
     pub jobs: Vec<CodeReviewJob>,
 }

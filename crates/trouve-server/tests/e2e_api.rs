@@ -3756,17 +3756,17 @@ async fn code_review_dashboard_and_repository_policy_round_trip() {
         .unwrap();
     assert_eq!(empty["app"]["configured"], false);
     assert_eq!(empty["repositories"], serde_json::json!([]));
-    assert!(empty["identities"].as_array().unwrap().len() >= 12);
+    assert!(empty["reviewers"].as_array().unwrap().len() >= 12);
     assert!(
-        empty["identities"]
+        empty["reviewers"]
             .as_array()
             .unwrap()
             .iter()
-            .any(|identity| identity["id"] == "correctness" && identity["native"] == true)
+            .any(|reviewer| reviewer["id"] == "correctness" && reviewer["built_in"] == true)
     );
 
     let custom: serde_json::Value = client
-        .put(format!("{base}/identity"))
+        .put(format!("{base}/reviewer"))
         .json(&serde_json::json!({
             "name": "Widget invariants",
             "prompt": "Check every widget state transition.",
@@ -3780,7 +3780,7 @@ async fn code_review_dashboard_and_repository_policy_round_trip() {
         .unwrap();
     let custom_id = custom["id"].as_str().unwrap();
     assert!(custom_id.starts_with("custom:"));
-    assert_eq!(custom["native"], false);
+    assert_eq!(custom["built_in"], false);
 
     let response = client
         .put(format!("{base}/repository"))
@@ -3790,7 +3790,7 @@ async fn code_review_dashboard_and_repository_policy_round_trip() {
             "mode": "automatic",
             "model": "openai/gpt-5",
             "prompt": "focus on concurrency",
-            "identity_ids": ["correctness", custom_id]
+            "reviewer_ids": ["correctness", custom_id]
         }))
         .send()
         .await
@@ -3809,12 +3809,12 @@ async fn code_review_dashboard_and_repository_policy_round_trip() {
     assert_eq!(dashboard["repositories"][0]["mode"], "automatic");
     assert_eq!(dashboard["repositories"][0]["model"], "openai/gpt-5");
     assert_eq!(
-        dashboard["repositories"][0]["identity_ids"],
+        dashboard["repositories"][0]["reviewer_ids"],
         serde_json::json!(["correctness", custom_id])
     );
 
     let deleted = client
-        .delete(format!("{base}/identity/{custom_id}"))
+        .delete(format!("{base}/reviewer/{custom_id}"))
         .send()
         .await
         .unwrap();

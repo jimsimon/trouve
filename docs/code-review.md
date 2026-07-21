@@ -118,7 +118,7 @@ After creating it:
    GitHub webhook secret when webhooks are enabled.
 5. Click **Poll now**. The installed repositories will appear with review
    mode **Off**.
-6. Choose a model, select its review identities, and set each repository to
+6. Choose a model, select its reviewers, and set each repository to
    **Manual** or **Automatic**.
 
 `Manual` runs only when the bot is selected (or re-requested) through
@@ -126,21 +126,21 @@ GitHub's reviewer UI. `Automatic` reviews every new non-draft base/head
 revision and also honors reviewer re-requests. Mentions are intentionally not
 triggers.
 
-## Review identities
+## Reviewers
 
-An identity is one focused model pass over the pull request. trouve ships
-native identities for correctness, security, reliability, performance,
+Each reviewer is one focused model pass over the pull request. trouve ships
+built-in reviewers for correctness, security, reliability, performance,
 concurrency, API compatibility, data integrity, testing, maintainability,
 dependencies, accessibility, and operations. New and existing repository
 policies start with the core correctness, security, API compatibility, and
-testing identities selected.
+testing reviewers selected.
 
-Select only the identities relevant to a repository: each selected identity
-reviews every diff batch, so adding identities increases model usage and review
-latency. Native identities use the repository's selected model (or the server
-default). Custom identities are reusable across repositories and contain a
-name, focused prompt, and optional model override. Create and manage them in the
-dashboard's **Identities** section, then enable them on each repository.
+Select only the reviewers relevant to a repository: each selected reviewer
+examines every diff batch, so adding reviewers increases model usage and review
+latency. Built-in reviewers use the repository's selected model (or the server
+default). Custom reviewer profiles are reusable across repositories and contain
+a name, focused prompt, and optional model override. Create and manage them in
+the dashboard's **Reviewers** section, then enable them on each repository.
 
 ## Runtime behavior
 
@@ -156,9 +156,9 @@ generation.
 Each job fetches the exact base and head commits into a managed repository and
 creates an isolated trouve session at that head. The complete diff is enumerated
 by changed path and divided into bounded per-file batches; every selected
-identity receives every batch in the built-in read-only review mode, including
-files beyond the model-facing aggregate diff limit. Identity definitions and
-models are snapshotted with the durable job.
+reviewer receives every batch in the built-in read-only review mode, including
+files beyond the model-facing aggregate diff limit. Reviewer profiles and models
+are snapshotted with the durable job.
 
 Candidate findings are first checked against actual commentable diff lines. A
 separate final editor pass then verifies them against the repository, removes
