@@ -151,7 +151,6 @@ the SQLite job/event log, managed repositories, and review sessions. Upgrade
 by changing `TROUVE_VERSION` in `.env`, then run:
 
 ```bash
-git pull
 docker compose -f docker-compose.review.yml pull
 docker compose -f docker-compose.review.yml up -d
 ```

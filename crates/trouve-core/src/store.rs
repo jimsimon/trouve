@@ -1583,7 +1583,7 @@ impl Store {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
             "SELECT id, session_id FROM code_review_jobs
-             WHERE status = 'succeeded' AND session_id IS NOT NULL
+             WHERE status IN ('succeeded', 'failed', 'stale') AND session_id IS NOT NULL
              ORDER BY completed_at",
         )?;
         let rows = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
@@ -1593,7 +1593,7 @@ impl Store {
     pub fn complete_code_review_job_cleanup(&self, id: &str, session_id: &str) -> Result<()> {
         self.conn.lock().unwrap().execute(
             "UPDATE code_review_jobs SET session_id = NULL, thread_id = NULL
-             WHERE id = ?1 AND status = 'succeeded' AND session_id = ?2",
+             WHERE id = ?1 AND status IN ('succeeded', 'failed', 'stale') AND session_id = ?2",
             params![id, session_id],
         )?;
         Ok(())
@@ -2800,5 +2800,61 @@ mod tests {
 
         assert!(store.claim_github_webhook_delivery("delivery-1").unwrap());
         assert!(!store.claim_github_webhook_delivery("delivery-1").unwrap());
+    }
+
+    #[test]
+    fn terminal_code_review_jobs_are_cleanup_eligible() {
+        let store = Store::open_in_memory().unwrap();
+        let finish_job = |status: &str, suffix: &str| {
+            let queued = store
+                .enqueue_code_review_job(&NewCodeReviewJob {
+                    dedupe_key: format!("acme/widgets#42:{suffix}"),
+                    installation_id: 7,
+                    repository: "acme/widgets".into(),
+                    pull_number: 42,
+                    pull_title: "Ship widgets".into(),
+                    pull_url: "https://github.com/acme/widgets/pull/42".into(),
+                    head_sha: "1111111111111111111111111111111111111111".into(),
+                    base_ref: "0000000000000000000000000000000000000000".into(),
+                    head_ref: "ship".into(),
+                    trigger: "automatic".into(),
+                    model: None,
+                    prompt: String::new(),
+                })
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                store.claim_code_review_job().unwrap().unwrap().job.id,
+                queued.id
+            );
+            let session_id = format!("se_{suffix}");
+            store
+                .set_code_review_job_session(&queued.id, &session_id, &format!("th_{suffix}"))
+                .unwrap();
+            store
+                .finish_code_review_job(&queued.id, status, "", status)
+                .unwrap();
+            (queued.id, session_id)
+        };
+
+        let mut expected = [
+            finish_job("succeeded", "succeeded"),
+            finish_job("failed", "failed"),
+            finish_job("stale", "stale"),
+        ];
+        let mut pending = store.pending_code_review_job_cleanups().unwrap();
+        expected.sort();
+        pending.sort();
+        assert_eq!(pending, expected);
+
+        for (job_id, session_id) in expected {
+            store
+                .complete_code_review_job_cleanup(&job_id, &session_id)
+                .unwrap();
+            let job = store.code_review_job(&job_id).unwrap().unwrap().job;
+            assert!(job.session_id.is_none());
+            assert!(job.thread_id.is_none());
+        }
+        assert!(store.pending_code_review_job_cleanups().unwrap().is_empty());
     }
 }

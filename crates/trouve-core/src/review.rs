@@ -788,7 +788,7 @@ impl Engine {
         } else {
             true
         };
-        if finished && status == "succeeded" {
+        if finished {
             self.retry_code_review_cleanup().await;
         }
         let _ = self.emit_code_review_updated(Some(job_id));
@@ -818,7 +818,7 @@ impl Engine {
                 }
                 Err(error) => {
                     self.record_review_error(format!(
-                        "cleaning up successful review job {job_id}: {error}"
+                        "cleaning up terminal review job {job_id}: {error}"
                     ));
                 }
             }
