@@ -52,12 +52,13 @@ use futures::StreamExt;
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin};
-use tokio::sync::{Mutex, mpsc, oneshot};
+use tokio::sync::{Mutex, oneshot};
 use trouve_protocol::{ModelInfo, Usage};
 
 use crate::{
-    AgentBackend, BackendError, BackendEvent, BackendEventStream, BackendLogin, BackendPermission,
-    BackendStatus, BackendTurn, async_stream, binary_on_path, format_reset, model,
+    AgentBackend, BackendError, BackendEvent, BackendEventSender, BackendEventStream, BackendLogin,
+    BackendPermission, BackendStatus, BackendTurn, async_stream, binary_on_path, format_reset,
+    model,
     route::{ROUTE_EVENT_BUDGET, RouteReceiver, RouteSendError, RouteSender, route_channel},
     spawn_login,
 };
@@ -749,11 +750,7 @@ fn turn_stream(
 
 /// Map one routed ACP message to backend events. `Err(())` means the
 /// receiving stream is gone.
-async fn handle_msg(
-    server: &AcpServer,
-    msg: ServerMsg,
-    tx: &mpsc::Sender<Result<BackendEvent, BackendError>>,
-) -> Result<(), ()> {
+async fn handle_msg(server: &AcpServer, msg: ServerMsg, tx: &BackendEventSender) -> Result<(), ()> {
     match msg {
         ServerMsg::Notification { method, params } => {
             if method != "session/update" {
@@ -862,7 +859,7 @@ async fn handle_ask_question(
     server: &AcpServer,
     id: Value,
     params: &Value,
-    tx: &mpsc::Sender<Result<BackendEvent, BackendError>>,
+    tx: &BackendEventSender,
 ) -> Result<(), ()> {
     let questions: Vec<trouve_protocol::Question> = params["questions"]
         .as_array()
