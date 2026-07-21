@@ -1,5 +1,5 @@
 [package]
-name = "slint-code-view"
+name = "trouve-slint-code-view"
 version = "0.1.0"
 edition.workspace = true
 description = "Virtualized, selectable code viewer component for Slint, with span-based syntax highlight tokens."

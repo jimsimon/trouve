@@ -789,7 +789,7 @@ struct Controller {
     new_chat: Option<NewChat>,
     branches: Vec<String>,
 
-    diff_files: Vec<slint_diff_view::FileDiff>,
+    diff_files: Vec<trouve_slint_diff_view::FileDiff>,
     diff_collapsed: Vec<bool>,
     diff_raw: String,
     /// Files tab tree: directory listings cached by worktree-relative path
@@ -829,7 +829,7 @@ struct RateSample {
 /// Client-side state of one session's terminal.
 struct TermState {
     terminal_id: String,
-    grid: slint_terminal::GridState,
+    grid: trouve_slint_terminal::GridState,
     /// Bytes consumed from the output stream (resume offset).
     offset: u64,
     exited: bool,
@@ -2526,7 +2526,7 @@ impl Controller {
         // the next resize event if it disagrees.
         let mut state = TermState {
             terminal_id: info.id.clone(),
-            grid: slint_terminal::GridState::new(rows, cols, TERM_SCROLLBACK),
+            grid: trouve_slint_terminal::GridState::new(rows, cols, TERM_SCROLLBACK),
             offset: 0,
             exited: info.exited,
         };
@@ -2687,7 +2687,7 @@ impl Controller {
             .filter(|(_, c)| **c)
             .map(|(f, _)| f.path.clone())
             .collect();
-        self.diff_files = slint_diff_view::parse_unified_diff(&diff.diff);
+        self.diff_files = trouve_slint_diff_view::parse_unified_diff(&diff.diff);
         self.diff_collapsed = self
             .diff_files
             .iter()
@@ -2701,7 +2701,7 @@ impl Controller {
     fn push_diff(&self) {
         ui::set_diff(
             &self.ui,
-            slint_diff_view::build_rows(&self.diff_files, &self.diff_collapsed),
+            trouve_slint_diff_view::build_rows(&self.diff_files, &self.diff_collapsed),
             self.diff_raw.clone(),
         );
     }
@@ -4714,8 +4714,13 @@ impl Controller {
             }
             UiCommand::TermKey { text, ctrl, alt } => {
                 let Some((id, bytes)) = self.term_attached().and_then(|(id, state)| {
-                    slint_terminal::encode_key(&text, ctrl, alt, state.grid.application_cursor())
-                        .map(|b| (id, b))
+                    trouve_slint_terminal::encode_key(
+                        &text,
+                        ctrl,
+                        alt,
+                        state.grid.application_cursor(),
+                    )
+                    .map(|b| (id, b))
                 }) else {
                     return Ok(());
                 };
@@ -4737,7 +4742,7 @@ impl Controller {
                 else {
                     return Ok(());
                 };
-                let bytes = slint_terminal::encode_paste(&text, bracketed);
+                let bytes = trouve_slint_terminal::encode_paste(&text, bracketed);
                 if let Err(e) = self.client.terminal_input(&id, &bytes).await {
                     self.error(&format!("terminal paste: {e:#}"));
                 }

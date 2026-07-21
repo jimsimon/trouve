@@ -1,8 +1,10 @@
 //! Spike demo: a 10,000-line file with fake highlight spans in the
-//! virtualized code view. Run with: cargo run -p slint-code-view --example code_view_demo
+//! virtualized code view. Run with: cargo run -p trouve-slint-code-view --example code_view_demo
 
 use slint::ComponentHandle;
-use slint_code_view::{CodeViewWindow, Span, copy_text_from, line_numbers_model, lines_model};
+use trouve_slint_code_view::{
+    CodeViewWindow, Span, copy_text_from, line_numbers_model, lines_model,
+};
 
 fn main() {
     // Generate a big file with a few colored spans per line.

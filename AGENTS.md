@@ -17,7 +17,7 @@ on. Decisions live in `docs/adr/` — check there before re-litigating one.
   protocol.
 - `crates/trouve-client-core` — shared client logic (protocol client, session
   state, view models) for native clients.
-- `crates/slint-*` — standalone, reusable Slint widgets (code view, diff
+- `crates/trouve-slint-*` — standalone, reusable Slint widgets (code view, diff
   view, markdown, terminal). No trouve-specific types in their public APIs.
 - `crates/trouve-app` — thin Slint desktop/mobile app composing the above.
 - `docs/adr/` — architectural decision records. `docs/design/` — living
@@ -49,11 +49,14 @@ These are load-bearing. Do not violate them without a new ADR.
 6. **Agent modes are data.** Modes (plan/code/review/…) are prompt + tool
    policy + default permission mode. Adding a mode must not require new Rust
    control flow.
-7. **Widget crates stay generic.** `slint-*` crates take plain data (text,
+7. **Widget crates stay generic.** `trouve-slint-*` crates take plain data (text,
    spans, hunks), not trouve protocol types.
 
 ## Conventions
 
+- Every Cargo package and crate directory we create is prefixed `trouve-`.
+  Keep `trouve-app` as the main application package. Use the
+  `create-trouve-crate` skill whenever adding or renaming a workspace crate.
 - Rust edition/lints come from the workspace; run `cargo fmt --all` and
   `cargo clippy --all-targets -- -D warnings` before finishing.
 - Tests: `cargo test --workspace` must stay offline-safe. Model-downloading

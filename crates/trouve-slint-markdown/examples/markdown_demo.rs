@@ -1,12 +1,12 @@
 //! Spike demo: streams a markdown document into the view at ~50 deltas/s,
 //! the way assistant output arrives. Run with:
-//! cargo run -p slint-markdown --example markdown_demo
+//! cargo run -p trouve-slint-markdown --example markdown_demo
 
 use std::cell::RefCell;
 use std::rc::Rc;
 
 use slint::ComponentHandle;
-use slint_markdown::{MarkdownWindow, StreamingMarkdown};
+use trouve_slint_markdown::{MarkdownWindow, StreamingMarkdown};
 
 const DOCUMENT: &str = r#"# Streaming markdown
 

@@ -3,7 +3,7 @@
 # Members:
 #   crates/trouve-search   — code search/indexing library + CLI (published)
 #   crates/trouve-*        — harness crates (protocol, core, providers, server, cli, ...)
-#   crates/slint-*         — reusable Slint widget crates (published independently)
+#   crates/trouve-slint-*  — reusable Slint widget crates (published independently)
 #
 # Crates are versioned independently; releases are tagged per crate
 # (e.g. `trouve-search-v1.2.0`). See docs/adr/0001-monorepo-workspace.md.

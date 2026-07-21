@@ -1,11 +1,11 @@
 //! Demo: streams colored fake build output into the scrollback.
-//! Run with: cargo run -p slint-terminal --example terminal_demo
+//! Run with: cargo run -p trouve-slint-terminal --example terminal_demo
 
 use std::cell::RefCell;
 use std::rc::Rc;
 
 use slint::ComponentHandle;
-use slint_terminal::{Scrollback, TerminalWindow};
+use trouve_slint_terminal::{Scrollback, TerminalWindow};
 
 fn main() {
     let window = TerminalWindow::new().unwrap();

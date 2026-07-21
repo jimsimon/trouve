@@ -26,8 +26,9 @@ Candidates examined in depth:
   sharing `trouve-client-core` (protocol client, session state, view
   models).
 - The code-centric widgets Slint lacks are built as **standalone, reusable
-  crates** (`slint-code-view`, `slint-diff-view`, `slint-markdown`,
-  `slint-terminal`) — useful to the wider Slint ecosystem and testable in
+  crates** (`trouve-slint-code-view`, `trouve-slint-diff-view`,
+  `trouve-slint-markdown`, `trouve-slint-terminal`) — useful to the wider
+  Slint ecosystem and testable in
   isolation.
 - A **Phase 3 spike gates the bet**: a virtualized, selectable code view
   rendering large files smoothly. If the spike fails, fall back to

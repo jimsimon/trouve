@@ -1,11 +1,11 @@
 //! Spike demo: a ~3k-line synthetic diff with per-file collapse.
-//! Run with: cargo run -p slint-diff-view --example diff_view_demo
+//! Run with: cargo run -p trouve-slint-diff-view --example diff_view_demo
 
 use std::cell::RefCell;
 use std::rc::Rc;
 
 use slint::ComponentHandle;
-use slint_diff_view::{DiffViewWindow, parse_unified_diff, rows_model};
+use trouve_slint_diff_view::{DiffViewWindow, parse_unified_diff, rows_model};
 
 fn main() {
     let mut diff = String::new();

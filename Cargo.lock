@@ -7005,22 +7005,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "slint-code-view"
-version = "0.1.0"
-dependencies = [
- "slint",
- "slint-build",
-]
-
-[[package]]
-name = "slint-diff-view"
-version = "0.1.0"
-dependencies = [
- "slint",
- "slint-build",
-]
-
-[[package]]
 name = "slint-macros"
 version = "1.17.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -7030,23 +7014,6 @@ dependencies = [
  "proc-macro2",
  "quote",
  "spin_on",
-]
-
-[[package]]
-name = "slint-markdown"
-version = "0.1.0"
-dependencies = [
- "slint",
- "slint-build",
-]
-
-[[package]]
-name = "slint-terminal"
-version = "0.1.0"
-dependencies = [
- "slint",
- "slint-build",
- "vt100",
 ]
 
 [[package]]
@@ -8571,10 +8538,6 @@ dependencies = [
  "shlex 2.0.1",
  "slint",
  "slint-build",
- "slint-code-view",
- "slint-diff-view",
- "slint-markdown",
- "slint-terminal",
  "syntect",
  "tokio",
  "tracing",
@@ -8582,6 +8545,10 @@ dependencies = [
  "trouve-client-core",
  "trouve-protocol",
  "trouve-server",
+ "trouve-slint-code-view",
+ "trouve-slint-diff-view",
+ "trouve-slint-markdown",
+ "trouve-slint-terminal",
  "uuid",
 ]
 
@@ -8777,6 +8744,39 @@ dependencies = [
  "trouve-providers",
  "utoipa",
  "uuid",
+]
+
+[[package]]
+name = "trouve-slint-code-view"
+version = "0.1.0"
+dependencies = [
+ "slint",
+ "slint-build",
+]
+
+[[package]]
+name = "trouve-slint-diff-view"
+version = "0.1.0"
+dependencies = [
+ "slint",
+ "slint-build",
+]
+
+[[package]]
+name = "trouve-slint-markdown"
+version = "0.1.0"
+dependencies = [
+ "slint",
+ "slint-build",
+]
+
+[[package]]
+name = "trouve-slint-terminal"
+version = "0.1.0"
+dependencies = [
+ "slint",
+ "slint-build",
+ "vt100",
 ]
 
 [[package]]
