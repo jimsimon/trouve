@@ -780,17 +780,26 @@ impl Engine {
         }
 
         let repositories = self.store.list_code_review_repositories()?;
+        let mut repository_failed = false;
         for repository in repositories.iter().filter(|repository| {
             repository.mode != CodeReviewMode::Off
                 && active_repositories
                     .contains(&(repository.installation_id, repository.repository.clone()))
         }) {
-            self.poll_code_review_repository(repository).await?;
+            if let Err(error) = self.poll_code_review_repository(repository).await {
+                repository_failed = true;
+                self.record_review_error(format!(
+                    "polling code review repository {} failed: {error:#}",
+                    repository.repository
+                ));
+            }
         }
         {
             let mut state = self.code_review.state.lock().unwrap();
             state.last_poll_at = Some(Utc::now());
-            state.last_error.clear();
+            if !repository_failed {
+                state.last_error.clear();
+            }
         }
         self.emit_code_review_updated(None)?;
         Ok(())

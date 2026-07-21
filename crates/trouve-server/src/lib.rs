@@ -418,14 +418,14 @@ async fn enforce_security(
     request: axum::extract::Request,
     next: axum::middleware::Next,
 ) -> Response {
-    if security.require_loopback_host && !host_is_loopback(request.headers()) {
+    let webhook = request.uri().path() == "/github/webhooks";
+    if !webhook && security.require_loopback_host && !host_is_loopback(request.headers()) {
         return (
             StatusCode::FORBIDDEN,
             "host not allowed (set TROUVE_ALLOW_REMOTE to serve non-loopback hosts)",
         )
             .into_response();
     }
-    let webhook = request.uri().path() == "/github/webhooks";
     let internal = request.uri().path().starts_with("/internal/");
     if internal {
         if let Some(expected) = security.internal_token.as_deref() {

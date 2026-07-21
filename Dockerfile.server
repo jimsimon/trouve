@@ -5,7 +5,7 @@ RUN cargo build --locked --release -p trouve-server
 
 FROM debian:bookworm-slim
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates curl git \
+    && apt-get install -y --no-install-recommends ca-certificates curl git sqlite3 \
     && rm -rf /var/lib/apt/lists/* \
     && groupadd --system --gid 10001 trouve \
     && useradd --system --uid 10001 --gid trouve --home-dir /var/lib/trouve \

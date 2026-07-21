@@ -21,6 +21,16 @@ TROUVE_REVIEW_PORT=7433
 TROUVE_CODE_REVIEW_POLL_INTERVAL_SECONDS=60
 ```
 
+Keep `.env` out of version control and restrict it to the deployment account:
+
+```bash
+chmod 600 .env
+```
+
+Treat `TROUVE_AUTH_TOKEN` like a password. Generate and store it with your
+secret manager or password manager, and share it only through an approved
+secret-sharing channel—not chat, email, issue trackers, or shell history.
+
 For a published release, set `TROUVE_VERSION` to that release's version and
 pull and start both containers:
 
@@ -187,9 +197,55 @@ server and consumes no GitHub requests.
 
 ## Backup and upgrades
 
-Back up the `trouve-data` Docker volume. It contains configuration, secrets,
-the SQLite job/event log, managed repositories, and review sessions. Upgrade
-by changing `TROUVE_VERSION` in `.env`, then run:
+The `trouve-data` Docker volume contains configuration, secrets, the SQLite
+job/event log, managed repositories, and review sessions. Never copy its live
+SQLite files. Quiesce both services, use SQLite's `.backup` mechanism for the
+database, and archive the remaining volume data separately. The server image
+includes the required `sqlite3` CLI.
+
+The following example runs from the deployment directory and uses
+[age](https://age-encryption.org/) for encryption. Set
+`TROUVE_BACKUP_AGE_RECIPIENT` to a recipient managed by your secret-management
+system:
+
+```bash
+set -eu
+umask 077
+backup_stamp=$(date -u +%Y%m%dT%H%M%SZ)
+backup_stage=$(mktemp -d)
+backup_container="trouve-backup-${backup_stamp}"
+backup_output="trouve-backup-${backup_stamp}.tar.gz.age"
+
+cleanup_review_backup() {
+  docker rm -f "$backup_container" >/dev/null 2>&1 || true
+  rm -rf "$backup_stage"
+  docker compose -f docker-compose.review.yml start trouve-server review-ui
+}
+trap cleanup_review_backup EXIT
+
+docker compose -f docker-compose.review.yml stop review-ui trouve-server
+docker compose -f docker-compose.review.yml run \
+  --name "$backup_container" --no-deps --entrypoint sh trouve-server -eu -c '
+    mkdir -p /tmp/trouve-backup
+    sqlite3 /var/lib/trouve/trouve.db ".backup /tmp/trouve-backup/trouve.db"
+    tar --exclude=./trouve.db --exclude=./trouve.db-wal \
+      --exclude=./trouve.db-shm -C /var/lib/trouve \
+      -czf /tmp/trouve-backup/trouve-data-files.tar.gz .
+    tar -C /tmp/trouve-backup -czf /tmp/trouve-backup.tar.gz .
+  '
+docker cp "$backup_container:/tmp/trouve-backup.tar.gz" \
+  "$backup_stage/trouve-backup.tar.gz"
+age --recipient "$TROUVE_BACKUP_AGE_RECIPIENT" \
+  --output "$backup_output" "$backup_stage/trouve-backup.tar.gz"
+chmod 600 "$backup_output"
+```
+
+Store only the encrypted output in backup storage. Restrict read access to the
+operators responsible for recovery, protect the age private key separately,
+and test restores periodically. The cleanup trap removes plaintext staging data
+and restarts the services even if a backup step fails.
+
+Upgrade by changing `TROUVE_VERSION` in `.env`, then run:
 
 ```bash
 docker compose -f docker-compose.review.yml pull

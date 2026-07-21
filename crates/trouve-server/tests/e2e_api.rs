@@ -3588,6 +3588,16 @@ async fn secured_router_enforces_token_and_loopback_host() {
         .unwrap();
     assert_eq!(resp.status(), reqwest::StatusCode::FORBIDDEN);
 
+    // GitHub's public webhook route bypasses bearer and loopback-host checks;
+    // its handler still rejects unauthenticated payloads before processing.
+    let resp = client
+        .post(format!("http://{addr}/github/webhooks"))
+        .header(reqwest::header::HOST, "hooks.example.com")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::BAD_REQUEST);
+
     let initialize = serde_json::json!({
         "jsonrpc": "2.0",
         "id": 1,
@@ -3840,6 +3850,13 @@ async fn code_review_dashboard_and_repository_policy_round_trip() {
         .await
         .unwrap();
     assert_eq!(deleted.status(), reqwest::StatusCode::NO_CONTENT);
+
+    let built_in = client
+        .delete(format!("{base}/reviewer/correctness"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(built_in.status(), reqwest::StatusCode::BAD_REQUEST);
 
     let dashboard: serde_json::Value = client
         .get(&base)
