@@ -1,5 +1,6 @@
 services:
   trouve-server:
+    image: ghcr.io/jimsimon/trouve-server:latest
     build:
       context: .
       dockerfile: Dockerfile.server
@@ -13,6 +14,7 @@ services:
       - trouve-data:/var/lib/trouve
 
   review-ui:
+    image: ghcr.io/jimsimon/trouve-review-ui:latest
     build: web/review-ui
     restart: unless-stopped
     depends_on:

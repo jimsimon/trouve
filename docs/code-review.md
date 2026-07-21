@@ -20,11 +20,18 @@ TROUVE_REVIEW_PORT=7433
 TROUVE_CODE_REVIEW_POLL_INTERVAL_SECONDS=60
 ```
 
-Then build and start both containers:
+Then pull and start both containers:
 
 ```bash
-docker compose -f docker-compose.review.yml up -d --build
+docker compose -f docker-compose.review.yml pull
+docker compose -f docker-compose.review.yml up -d
 ```
+
+Images are published from `main` to GitHub Container Registry as
+`ghcr.io/jimsimon/trouve-server:latest` and
+`ghcr.io/jimsimon/trouve-review-ui:latest`, with an additional immutable tag
+for each commit. To build both images from the current checkout instead, run
+`docker compose -f docker-compose.review.yml up -d --build`.
 
 Open `http://your-server:7433`, enter `TROUVE_AUTH_TOKEN`, and add at least
 one model provider. The token is kept in browser session storage, so closing
@@ -100,5 +107,6 @@ with:
 
 ```bash
 git pull
-docker compose -f docker-compose.review.yml up -d --build
+docker compose -f docker-compose.review.yml pull
+docker compose -f docker-compose.review.yml up -d
 ```
