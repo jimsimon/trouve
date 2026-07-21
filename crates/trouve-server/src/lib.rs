@@ -22,17 +22,18 @@ use trouve_core::Engine;
 use trouve_core::engine::EngineError;
 use trouve_protocol::{
     AddLocalModelRequest, AgentMode, Automation, BranchList, CliInfo, CliInstallStatus, CliList,
-    CodeReviewDashboard, CodeReviewRepository, ConfigureGithubAppRequest, CreatePrRequest,
-    CreateSessionRequest, CreateThreadRequest, DirEntry, ErrorBody, FileContent, GithubAppStatus,
-    GithubIntegration, GithubPrList, KnownProvider, LocalSearchResult, LocalStatus, LoginStarted,
-    LoginStatus, McpLogs, McpServerInfo, MergePrRequest, ModeInfo, ModelInfo, OpenTerminalRequest,
-    PROTOCOL_VERSION, PrInfo, ProviderInfo, ProvidersResponse, QueuedPrompt,
-    RegisterWorkspaceRequest, ReorderQueueRequest, ResolveApprovalRequest, ResolveQuestionRequest,
-    Scope, SendMessageRequest, ServerInfo, Session, SessionDiff, SetDefaultModelRequest,
-    SetDefaultPermissionModeRequest, SetLocalEnabledRequest, SubscriptionHealth, TerminalInfo,
-    TerminalInputRequest, TerminalResizeRequest, Thread, TurnAccepted,
-    UpdateCodeReviewRepositoryRequest, UpdateQueuedPromptRequest, UpdateSessionRequest,
-    UpdateThreadRequest, UpsertAutomationRequest, UpsertMcpServerRequest, UpsertModeRequest,
+    CodeReviewDashboard, CodeReviewIdentity, CodeReviewRepository, ConfigureGithubAppRequest,
+    CreatePrRequest, CreateSessionRequest, CreateThreadRequest, DirEntry, ErrorBody, FileContent,
+    GithubAppStatus, GithubIntegration, GithubPrList, KnownProvider, LocalSearchResult,
+    LocalStatus, LoginStarted, LoginStatus, McpLogs, McpServerInfo, MergePrRequest, ModeInfo,
+    ModelInfo, OpenTerminalRequest, PROTOCOL_VERSION, PrInfo, ProviderInfo, ProvidersResponse,
+    QueuedPrompt, RegisterWorkspaceRequest, ReorderQueueRequest, ResolveApprovalRequest,
+    ResolveQuestionRequest, Scope, SendMessageRequest, ServerInfo, Session, SessionDiff,
+    SetDefaultModelRequest, SetDefaultPermissionModeRequest, SetLocalEnabledRequest,
+    SubscriptionHealth, TerminalInfo, TerminalInputRequest, TerminalResizeRequest, Thread,
+    TurnAccepted, UpdateCodeReviewRepositoryRequest, UpdateQueuedPromptRequest,
+    UpdateSessionRequest, UpdateThreadRequest, UpsertAutomationRequest,
+    UpsertCodeReviewIdentityRequest, UpsertMcpServerRequest, UpsertModeRequest,
     UpsertProviderRequest, UsageSummary, Workspace,
 };
 use utoipa::OpenApi;
@@ -165,6 +166,8 @@ impl IntoResponse for ApiError {
         run_automation,
         code_review_dashboard,
         configure_github_review_app,
+        upsert_code_review_identity,
+        delete_code_review_identity,
         update_code_review_repository,
         refresh_code_reviews,
     ),
@@ -232,11 +235,13 @@ impl IntoResponse for ApiError {
         trouve_protocol::AutomationTemplate,
         UpsertAutomationRequest,
         CodeReviewDashboard,
+        CodeReviewIdentity,
         CodeReviewRepository,
         trouve_protocol::CodeReviewJob,
         trouve_protocol::CodeReviewMode,
         GithubAppStatus,
         ConfigureGithubAppRequest,
+        UpsertCodeReviewIdentityRequest,
         UpdateCodeReviewRepositoryRequest,
         ErrorBody,
         trouve_protocol::EventEnvelope,
@@ -553,6 +558,14 @@ pub fn build_router(engine: Arc<Engine>) -> Router {
             axum::routing::put(configure_github_review_app),
         )
         .route(
+            "/v1/code-review/identity",
+            axum::routing::put(upsert_code_review_identity),
+        )
+        .route(
+            "/v1/code-review/identity/{id}",
+            axum::routing::delete(delete_code_review_identity),
+        )
+        .route(
             "/v1/code-review/repository",
             axum::routing::put(update_code_review_repository),
         )
@@ -702,6 +715,27 @@ async fn configure_github_review_app(
     Json(request): Json<ConfigureGithubAppRequest>,
 ) -> Result<Json<GithubAppStatus>, ApiError> {
     Ok(Json(engine.configure_github_review_app(request).await?))
+}
+
+#[utoipa::path(put, path = "/v1/code-review/identity",
+    request_body = UpsertCodeReviewIdentityRequest,
+    responses((status = 200, body = CodeReviewIdentity), (status = 400, body = ErrorBody)))]
+async fn upsert_code_review_identity(
+    State(engine): State<Arc<Engine>>,
+    Json(request): Json<UpsertCodeReviewIdentityRequest>,
+) -> Result<Json<CodeReviewIdentity>, ApiError> {
+    Ok(Json(engine.upsert_code_review_identity(request)?))
+}
+
+#[utoipa::path(delete, path = "/v1/code-review/identity/{id}",
+    params(("id" = String, Path, description = "Custom review identity id")),
+    responses((status = 204), (status = 400, body = ErrorBody), (status = 404, body = ErrorBody)))]
+async fn delete_code_review_identity(
+    State(engine): State<Arc<Engine>>,
+    Path(id): Path<String>,
+) -> Result<StatusCode, ApiError> {
+    engine.delete_code_review_identity(&id)?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 #[utoipa::path(put, path = "/v1/code-review/repository",

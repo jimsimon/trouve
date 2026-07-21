@@ -7,7 +7,7 @@
       "name": "MIT",
       "identifier": "MIT"
     },
-    "version": "1.1"
+    "version": "1.2"
   },
   "paths": {
     "/v1/approvals": {
@@ -499,6 +499,86 @@
             }
           },
           "400": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/code-review/identity": {
+      "put": {
+        "tags": [],
+        "operationId": "upsert_code_review_identity",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UpsertCodeReviewIdentityRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CodeReviewIdentity"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/code-review/identity/{id}": {
+      "delete": {
+        "tags": [],
+        "operationId": "delete_code_review_identity",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Custom review identity id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": ""
+          },
+          "400": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
             "description": "",
             "content": {
               "application/json": {
@@ -3552,12 +3632,19 @@
         "type": "object",
         "required": [
           "app",
+          "identities",
           "repositories",
           "jobs"
         ],
         "properties": {
           "app": {
             "$ref": "#/components/schemas/GithubAppStatus"
+          },
+          "identities": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/CodeReviewIdentity"
+            }
           },
           "jobs": {
             "type": "array",
@@ -3570,6 +3657,35 @@
             "items": {
               "$ref": "#/components/schemas/CodeReviewRepository"
             }
+          }
+        }
+      },
+      "CodeReviewIdentity": {
+        "type": "object",
+        "description": "One focused reviewer persona. Native identities are shipped by trouve;\ncustom identities are user-managed and may choose their own model.",
+        "required": [
+          "id",
+          "name",
+          "prompt"
+        ],
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "model": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "name": {
+            "type": "string"
+          },
+          "native": {
+            "type": "boolean"
+          },
+          "prompt": {
+            "type": "string"
           }
         }
       },
@@ -3616,6 +3732,13 @@
           },
           "id": {
             "type": "string"
+          },
+          "identity_ids": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Identity definitions are snapshotted internally; their stable ids are\nexposed here for history and diagnostics."
           },
           "installation_id": {
             "type": "integer",
@@ -3691,6 +3814,13 @@
           "repository"
         ],
         "properties": {
+          "identity_ids": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Ordered reviewer identities run for each revision."
+          },
           "installation_id": {
             "type": "integer",
             "format": "int64",
@@ -6320,6 +6450,16 @@
           "mode"
         ],
         "properties": {
+          "identity_ids": {
+            "type": [
+              "array",
+              "null"
+            ],
+            "items": {
+              "type": "string"
+            },
+            "description": "Omitted by older clients to preserve the current/default selection."
+          },
           "installation_id": {
             "type": "integer",
             "format": "int64",
@@ -6451,6 +6591,34 @@
           },
           "workspace_id": {
             "$ref": "#/components/schemas/String"
+          }
+        }
+      },
+      "UpsertCodeReviewIdentityRequest": {
+        "type": "object",
+        "description": "Create or update a custom code-review identity. Omit `id` to create one;\nnative identities cannot be changed through this request.",
+        "required": [
+          "name",
+          "prompt"
+        ],
+        "properties": {
+          "id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "model": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "name": {
+            "type": "string"
+          },
+          "prompt": {
+            "type": "string"
           }
         }
       },

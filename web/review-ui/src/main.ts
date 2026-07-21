@@ -22,6 +22,15 @@ interface Repository {
   mode: ReviewMode;
   model?: string;
   prompt: string;
+  identity_ids: string[];
+}
+
+interface ReviewIdentity {
+  id: string;
+  name: string;
+  prompt: string;
+  model?: string;
+  native: boolean;
 }
 
 interface ReviewJob {
@@ -41,6 +50,7 @@ interface ReviewJob {
 
 interface Dashboard {
   app: GithubAppStatus;
+  identities: ReviewIdentity[];
   repositories: Repository[];
   jobs: ReviewJob[];
 }
@@ -128,6 +138,9 @@ function renderLogin(message = ""): void {
 function render(): void {
   if (!dashboard) return renderLogin();
   const app = dashboard.app;
+  const identities = dashboard.identities;
+  const nativeIdentities = identities.filter((identity) => identity.native);
+  const customIdentities = identities.filter((identity) => !identity.native);
   root.innerHTML = `
     <header>
       <div><p class="eyebrow">trouve</p><h1>Review control room</h1></div>
@@ -163,15 +176,38 @@ function render(): void {
       </section>
     </div>
     <section class="card wide">
+      <div class="section-title"><div><p class="eyebrow">Review passes</p><h2>Identities</h2></div><span class="muted">Each selected identity reviews every changed file batch; a final editor validates and deduplicates their findings.</span></div>
+      <div class="identity-grid">
+        ${nativeIdentities.map((identity) => `<article class="identity-card"><div><strong>${escape(identity.name)}</strong><span>native</span></div><p>${escape(identity.prompt)}</p><small>Uses the repository/default model</small></article>`).join("")}
+      </div>
+      <h3>Custom identities</h3>
+      <div class="custom-identities">
+        ${customIdentities.map((identity) => `<form class="custom-identity" data-id="${escape(identity.id)}">
+          <input name="name" value="${escape(identity.name)}" aria-label="Identity name" required />
+          <select name="model" aria-label="Identity model">${modelOptions(identity.model)}</select>
+          <textarea name="prompt" rows="3" aria-label="Identity prompt" required>${escape(identity.prompt)}</textarea>
+          <div class="identity-actions"><button>Save</button><button class="ghost delete-identity" type="button">Delete</button></div>
+        </form>`).join("") || `<p class="empty">No custom identities yet.</p>`}
+      </div>
+      <form id="identity-form" class="stack identity-create">
+        <div class="split"><label>Name<input name="name" placeholder="Domain invariants" required /></label><label>Model<select name="model">${modelOptions()}</select></label></div>
+        <label>Prompt<textarea name="prompt" rows="3" placeholder="Describe this identity's focused review mandate." required></textarea></label>
+        <button>Add custom identity</button>
+      </form>
+    </section>
+    <section class="card wide">
       <div class="section-title"><div><p class="eyebrow">Policy</p><h2>Repositories</h2></div><span class="muted">Manual means GitHub reviewer requests only.</span></div>
       <div class="repo-list">
         ${dashboard.repositories.map((repo) => `
           <form class="repo" data-installation-id="${repo.installation_id}" data-repository="${escape(repo.repository)}">
-            <div class="repo-name"><strong>${escape(repo.repository)}</strong>${repo.private ? "<span>private</span>" : ""}</div>
-            <select name="mode"><option value="off" ${repo.mode === "off" ? "selected" : ""}>Off</option><option value="manual" ${repo.mode === "manual" ? "selected" : ""}>Manual</option><option value="automatic" ${repo.mode === "automatic" ? "selected" : ""}>Automatic</option></select>
-            <select name="model">${modelOptions(repo.model)}</select>
-            <input name="prompt" value="${escape(repo.prompt)}" placeholder="Extra review instructions" />
-            <button>Save</button>
+            <div class="repo-controls">
+              <div class="repo-name"><strong>${escape(repo.repository)}</strong>${repo.private ? "<span>private</span>" : ""}</div>
+              <select name="mode" aria-label="Review mode"><option value="off" ${repo.mode === "off" ? "selected" : ""}>Off</option><option value="manual" ${repo.mode === "manual" ? "selected" : ""}>Manual</option><option value="automatic" ${repo.mode === "automatic" ? "selected" : ""}>Automatic</option></select>
+              <select name="model" aria-label="Default review model">${modelOptions(repo.model)}</select>
+              <input name="prompt" value="${escape(repo.prompt)}" placeholder="Extra repository instructions" aria-label="Repository instructions" />
+              <button>Save</button>
+            </div>
+            <fieldset><legend>Review identities</legend><div class="identity-checks">${identities.map((identity) => `<label title="${escape(identity.prompt)}"><input type="checkbox" name="identity_id" value="${escape(identity.id)}" ${repo.identity_ids.includes(identity.id) ? "checked" : ""} /><span>${escape(identity.name)}</span>${identity.model ? `<small>${escape(identity.model)}</small>` : ""}</label>`).join("")}</div></fieldset>
           </form>`).join("") || `<p class="empty">No repositories discovered yet. Install the App, then poll GitHub.</p>`}
       </div>
     </section>
@@ -247,6 +283,54 @@ function bind(): void {
       alert(String(error));
     }
   };
+  document.querySelector<HTMLFormElement>("#identity-form")!.onsubmit = async (event) => {
+    event.preventDefault();
+    const form = event.currentTarget as HTMLFormElement;
+    const data = new FormData(form);
+    try {
+      await api("/code-review/identity", {
+        method: "PUT",
+        body: JSON.stringify({
+          name: data.get("name"),
+          model: String(data.get("model") || "") || null,
+          prompt: data.get("prompt"),
+        }),
+      });
+      form.reset();
+      await loadData();
+    } catch (error) {
+      alert(String(error));
+    }
+  };
+  document.querySelectorAll<HTMLFormElement>("form.custom-identity").forEach((form) => {
+    form.onsubmit = async (event) => {
+      event.preventDefault();
+      const data = new FormData(form);
+      try {
+        await api("/code-review/identity", {
+          method: "PUT",
+          body: JSON.stringify({
+            id: form.dataset.id,
+            name: data.get("name"),
+            model: String(data.get("model") || "") || null,
+            prompt: data.get("prompt"),
+          }),
+        });
+        await loadData();
+      } catch (error) {
+        alert(String(error));
+      }
+    };
+    form.querySelector<HTMLButtonElement>(".delete-identity")!.onclick = async () => {
+      if (!window.confirm("Delete this custom identity? Repositories using it will return to the core identity set when necessary.")) return;
+      try {
+        await api(`/code-review/identity/${encodeURIComponent(form.dataset.id ?? "")}`, { method: "DELETE" });
+        await loadData();
+      } catch (error) {
+        alert(String(error));
+      }
+    };
+  });
   document.querySelectorAll<HTMLFormElement>("form.repo").forEach((form) => {
     form.onsubmit = async (event) => {
       event.preventDefault();
@@ -260,6 +344,7 @@ function bind(): void {
             mode: data.get("mode"),
             model: String(data.get("model") || "") || null,
             prompt: data.get("prompt"),
+            identity_ids: data.getAll("identity_id").map(String),
           }),
         });
         await loadData();

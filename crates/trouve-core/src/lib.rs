@@ -17,6 +17,7 @@ pub mod mcp;
 pub mod modes;
 pub mod permissions;
 pub mod review;
+pub mod review_identities;
 pub mod skills;
 pub mod store;
 pub mod terminal;

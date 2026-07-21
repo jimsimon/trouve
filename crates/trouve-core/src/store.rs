@@ -135,6 +135,15 @@ CREATE TABLE IF NOT EXISTS code_review_repositories (
   mode TEXT NOT NULL DEFAULT 'off',
   model TEXT,
   prompt TEXT NOT NULL DEFAULT '',
+  identity_ids TEXT NOT NULL DEFAULT '["correctness","security","api-compatibility","testing"]',
+  updated_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS code_review_identities (
+  id TEXT PRIMARY KEY,
+  name TEXT NOT NULL,
+  prompt TEXT NOT NULL,
+  model TEXT,
+  created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS code_review_jobs (
@@ -152,6 +161,8 @@ CREATE TABLE IF NOT EXISTS code_review_jobs (
   status TEXT NOT NULL,
   model TEXT,
   prompt TEXT NOT NULL DEFAULT '',
+  identities TEXT NOT NULL DEFAULT '[]',
+  config_hash TEXT NOT NULL DEFAULT '',
   session_id TEXT,
   thread_id TEXT,
   review_url TEXT NOT NULL DEFAULT '',
@@ -184,6 +195,9 @@ const MIGRATIONS: &[&str] = &[
     "ALTER TABLE queued_prompts ADD COLUMN claimed INTEGER NOT NULL DEFAULT 0",
     "ALTER TABLE automations ADD COLUMN permission_mode TEXT NOT NULL DEFAULT 'ask'",
     "ALTER TABLE threads ADD COLUMN todos TEXT NOT NULL DEFAULT '[]'",
+    "ALTER TABLE code_review_repositories ADD COLUMN identity_ids TEXT NOT NULL DEFAULT '[\"correctness\",\"security\",\"api-compatibility\",\"testing\"]'",
+    "ALTER TABLE code_review_jobs ADD COLUMN identities TEXT NOT NULL DEFAULT '[]'",
+    "ALTER TABLE code_review_jobs ADD COLUMN config_hash TEXT NOT NULL DEFAULT ''",
     // Context-size proxy for compaction/UI: the input tokens of the turn's
     // *last* request, not the sum over its iterations (see record_usage).
     "ALTER TABLE usage ADD COLUMN context_input_tokens INTEGER NOT NULL DEFAULT 0",
@@ -312,6 +326,8 @@ fn row_to_code_review_repository(
         mode: code_review_mode_from(&mode),
         model: r.get(4)?,
         prompt: r.get(5)?,
+        identity_ids: serde_json::from_str::<Vec<String>>(&r.get::<_, String>(6)?)
+            .unwrap_or_else(|_| crate::review_identities::default_identity_ids()),
     })
 }
 
@@ -329,15 +345,20 @@ pub struct NewCodeReviewJob {
     pub trigger: String,
     pub model: Option<String>,
     pub prompt: String,
+    pub identities: Vec<trouve_protocol::CodeReviewIdentity>,
+    pub config_hash: String,
 }
 
 #[derive(Debug, Clone)]
 pub struct CodeReviewJobRecord {
     pub job: trouve_protocol::CodeReviewJob,
     pub prompt: String,
+    pub identities: Vec<trouve_protocol::CodeReviewIdentity>,
 }
 
 fn row_to_code_review_job(r: &rusqlite::Row<'_>) -> rusqlite::Result<CodeReviewJobRecord> {
+    let identities: Vec<trouve_protocol::CodeReviewIdentity> =
+        serde_json::from_str(&r.get::<_, String>(13)?).unwrap_or_default();
     Ok(CodeReviewJobRecord {
         job: trouve_protocol::CodeReviewJob {
             id: r.get(0)?,
@@ -352,20 +373,25 @@ fn row_to_code_review_job(r: &rusqlite::Row<'_>) -> rusqlite::Result<CodeReviewJ
             trigger: r.get(9)?,
             status: r.get(10)?,
             model: r.get(11)?,
-            session_id: r.get(13)?,
-            thread_id: r.get(14)?,
-            review_url: r.get(15)?,
-            error: r.get(16)?,
-            created_at: parse_datetime(r.get(17)?),
-            started_at: parse_optional_datetime(r.get(18)?),
-            completed_at: parse_optional_datetime(r.get(19)?),
+            identity_ids: identities
+                .iter()
+                .map(|identity| identity.id.clone())
+                .collect(),
+            session_id: r.get(15)?,
+            thread_id: r.get(16)?,
+            review_url: r.get(17)?,
+            error: r.get(18)?,
+            created_at: parse_datetime(r.get(19)?),
+            started_at: parse_optional_datetime(r.get(20)?),
+            completed_at: parse_optional_datetime(r.get(21)?),
         },
         prompt: r.get(12)?,
+        identities,
     })
 }
 
 const CODE_REVIEW_JOB_COLUMNS: &str = "id, installation_id, repository, pull_number, pull_title, pull_url, head_sha, \
-     base_ref, head_ref, trigger, status, model, prompt, session_id, thread_id, \
+     base_ref, head_ref, trigger, status, model, prompt, identities, config_hash, session_id, thread_id, \
      review_url, error, created_at, started_at, completed_at";
 
 pub enum UsageScope<'a> {
@@ -1362,6 +1388,90 @@ impl Store {
 
     // --- automated code review ---------------------------------------------
 
+    pub fn list_custom_code_review_identities(
+        &self,
+    ) -> Result<Vec<trouve_protocol::CodeReviewIdentity>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, name, prompt, model
+             FROM code_review_identities ORDER BY lower(name), id",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok(trouve_protocol::CodeReviewIdentity {
+                id: row.get(0)?,
+                name: row.get(1)?,
+                prompt: row.get(2)?,
+                model: row.get(3)?,
+                native: false,
+            })
+        })?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
+    }
+
+    pub fn upsert_custom_code_review_identity(
+        &self,
+        identity: &trouve_protocol::CodeReviewIdentity,
+    ) -> Result<()> {
+        let now = chrono::Utc::now().to_rfc3339();
+        self.conn.lock().unwrap().execute(
+            "INSERT INTO code_review_identities
+                    (id, name, prompt, model, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?5)
+             ON CONFLICT(id) DO UPDATE SET
+               name = excluded.name,
+               prompt = excluded.prompt,
+               model = excluded.model,
+               updated_at = excluded.updated_at",
+            params![
+                identity.id,
+                identity.name,
+                identity.prompt,
+                identity.model,
+                now,
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn delete_custom_code_review_identity(&self, id: &str) -> Result<bool> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        let deleted = tx.execute(
+            "DELETE FROM code_review_identities WHERE id = ?1",
+            params![id],
+        )?;
+        if deleted > 0 {
+            let repositories: Vec<(String, String)> = {
+                let mut stmt =
+                    tx.prepare("SELECT repository, identity_ids FROM code_review_repositories")?;
+                stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+                    .collect::<rusqlite::Result<_>>()?
+            };
+            for (repository, encoded) in repositories {
+                let mut ids: Vec<String> = serde_json::from_str(&encoded).unwrap_or_default();
+                let before = ids.len();
+                ids.retain(|identity_id| identity_id != id);
+                if ids.len() != before {
+                    if ids.is_empty() {
+                        ids = crate::review_identities::default_identity_ids();
+                    }
+                    tx.execute(
+                        "UPDATE code_review_repositories
+                         SET identity_ids = ?2, updated_at = ?3 WHERE repository = ?1",
+                        params![
+                            repository,
+                            serde_json::to_string(&ids)?,
+                            chrono::Utc::now().to_rfc3339(),
+                        ],
+                    )?;
+                }
+            }
+        }
+        tx.commit()?;
+        Ok(deleted > 0)
+    }
+
     pub fn upsert_discovered_code_review_repository(
         &self,
         installation_id: u64,
@@ -1391,7 +1501,7 @@ impl Store {
     ) -> Result<Vec<trouve_protocol::CodeReviewRepository>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT repository, installation_id, private, mode, model, prompt
+            "SELECT repository, installation_id, private, mode, model, prompt, identity_ids
              FROM code_review_repositories ORDER BY repository",
         )?;
         let rows = stmt.query_map([], row_to_code_review_repository)?;
@@ -1403,15 +1513,23 @@ impl Store {
         &self,
         request: &trouve_protocol::UpdateCodeReviewRepositoryRequest,
     ) -> Result<()> {
+        let identity_ids = request
+            .identity_ids
+            .as_ref()
+            .map(serde_json::to_string)
+            .transpose()?;
         self.conn.lock().unwrap().execute(
             "INSERT INTO code_review_repositories
-                    (repository, installation_id, private, mode, model, prompt, updated_at)
-             VALUES (?1, ?2, 0, ?3, ?4, ?5, ?6)
+                    (repository, installation_id, private, mode, model, prompt,
+                     identity_ids, updated_at)
+             VALUES (?1, ?2, 0, ?3, ?4, ?5,
+                     COALESCE(?6, '[\"correctness\",\"security\",\"api-compatibility\",\"testing\"]'), ?7)
              ON CONFLICT(repository) DO UPDATE SET
                installation_id = excluded.installation_id,
                mode = excluded.mode,
                model = excluded.model,
                prompt = excluded.prompt,
+               identity_ids = COALESCE(?6, code_review_repositories.identity_ids),
                updated_at = excluded.updated_at",
             params![
                 request.repository,
@@ -1419,6 +1537,7 @@ impl Store {
                 code_review_mode_str(request.mode),
                 request.model,
                 request.prompt,
+                identity_ids,
                 chrono::Utc::now().to_rfc3339(),
             ],
         )?;
@@ -1432,12 +1551,14 @@ impl Store {
         let id = crate::new_id("rv");
         let now = chrono::Utc::now().to_rfc3339();
         let conn = self.conn.lock().unwrap();
+        let identities = serde_json::to_string(&new_job.identities)?;
         let inserted = conn.execute(
             "INSERT OR IGNORE INTO code_review_jobs
                     (id, dedupe_key, installation_id, repository, pull_number, pull_title,
                      pull_url, head_sha, base_ref, head_ref, trigger, status, model, prompt,
-                     created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, 'queued', ?12, ?13, ?14)",
+                     identities, config_hash, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, 'queued',
+                     ?12, ?13, ?14, ?15, ?16)",
             params![
                 id,
                 new_job.dedupe_key,
@@ -1452,6 +1573,8 @@ impl Store {
                 new_job.trigger,
                 new_job.model,
                 new_job.prompt,
+                identities,
+                new_job.config_hash,
                 now,
             ],
         )?;
@@ -1474,6 +1597,7 @@ impl Store {
         pull_number: u64,
         base_ref: &str,
         head_sha: &str,
+        config_hash: &str,
     ) -> Result<Vec<String>> {
         let mut conn = self.conn.lock().unwrap();
         let tx = conn.transaction()?;
@@ -1482,11 +1606,17 @@ impl Store {
                 "SELECT id FROM code_review_jobs
                  WHERE repository = ?1 AND pull_number = ?2
                    AND status IN ('queued', 'running')
-                   AND (base_ref != ?3 OR head_sha != ?4)
+                   AND (base_ref != ?3 OR head_sha != ?4 OR config_hash != ?5)
                  ORDER BY created_at",
             )?;
             let rows = stmt.query_map(
-                params![repository, pull_number as i64, base_ref, head_sha],
+                params![
+                    repository,
+                    pull_number as i64,
+                    base_ref,
+                    head_sha,
+                    config_hash
+                ],
                 |row| row.get(0),
             )?;
             rows.collect::<rusqlite::Result<Vec<_>>>()?
@@ -1498,14 +1628,17 @@ impl Store {
                      error = ?5, completed_at = ?6
                  WHERE repository = ?1 AND pull_number = ?2
                    AND status IN ('queued', 'running')
-                   AND (base_ref != ?3 OR head_sha != ?4)",
+                   AND (base_ref != ?3 OR head_sha != ?4 OR config_hash != ?7)",
                 params![
                     repository,
                     pull_number as i64,
                     base_ref,
                     head_sha,
-                    format!("superseded by pull request revision {base_ref}..{head_sha}"),
+                    format!(
+                        "superseded by pull request revision {base_ref}..{head_sha} or review configuration"
+                    ),
                     chrono::Utc::now().to_rfc3339(),
+                    config_hash,
                 ],
             )?;
         }
@@ -2773,6 +2906,7 @@ mod tests {
                 mode: trouve_protocol::CodeReviewMode::Automatic,
                 model: Some("openai/gpt-5".into()),
                 prompt: "focus on concurrency".into(),
+                identity_ids: Some(crate::review_identities::default_identity_ids()),
             })
             .unwrap();
         let configured = store.list_code_review_repositories().unwrap().remove(0);
@@ -2814,9 +2948,15 @@ mod tests {
             trigger: "automatic".into(),
             model: configured.model,
             prompt: configured.prompt,
+            identities: crate::review_identities::native_identities()
+                .into_iter()
+                .filter(|identity| configured.identity_ids.contains(&identity.id))
+                .collect(),
+            config_hash: "config".into(),
         };
         let queued = store.enqueue_code_review_job(&new_job).unwrap().unwrap();
         assert_eq!(queued.status, "queued");
+        assert_eq!(queued.identity_ids, configured.identity_ids);
         assert!(store.enqueue_code_review_job(&new_job).unwrap().is_none());
         assert!(store.code_review_job_exists(&new_job.dedupe_key).unwrap());
         let running = store.claim_code_review_job().unwrap().unwrap();
@@ -2866,6 +3006,8 @@ mod tests {
                     trigger: "automatic".into(),
                     model: None,
                     prompt: String::new(),
+                    identities: Vec::new(),
+                    config_hash: "config".into(),
                 })
                 .unwrap()
                 .unwrap();
@@ -2905,9 +3047,55 @@ mod tests {
     }
 
     #[test]
+    fn custom_review_identities_are_durable_and_removed_from_policies() {
+        let store = Store::open_in_memory().unwrap();
+        let identity = trouve_protocol::CodeReviewIdentity {
+            id: "custom:domain".into(),
+            name: "Domain invariants".into(),
+            prompt: "Check widget state transitions.".into(),
+            model: Some("openai/gpt-5".into()),
+            native: false,
+        };
+        store.upsert_custom_code_review_identity(&identity).unwrap();
+        let identities = store.list_custom_code_review_identities().unwrap();
+        assert_eq!(identities.as_slice(), std::slice::from_ref(&identity));
+        store
+            .update_code_review_repository(&trouve_protocol::UpdateCodeReviewRepositoryRequest {
+                installation_id: 7,
+                repository: "acme/widgets".into(),
+                mode: trouve_protocol::CodeReviewMode::Automatic,
+                model: None,
+                prompt: String::new(),
+                identity_ids: Some(vec![identity.id.clone()]),
+            })
+            .unwrap();
+        let repositories = store.list_code_review_repositories().unwrap();
+        assert_eq!(
+            repositories[0].identity_ids.as_slice(),
+            std::slice::from_ref(&identity.id)
+        );
+
+        assert!(
+            store
+                .delete_custom_code_review_identity(&identity.id)
+                .unwrap()
+        );
+        assert!(
+            store
+                .list_custom_code_review_identities()
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            store.list_code_review_repositories().unwrap()[0].identity_ids,
+            crate::review_identities::default_identity_ids()
+        );
+    }
+
+    #[test]
     fn newer_pull_revision_supersedes_queued_and_running_jobs() {
         let store = Store::open_in_memory().unwrap();
-        let enqueue = |suffix: &str, base_ref: &str, head_sha: &str| {
+        let enqueue = |suffix: &str, base_ref: &str, head_sha: &str, config_hash: &str| {
             store
                 .enqueue_code_review_job(&NewCodeReviewJob {
                     dedupe_key: format!("acme/widgets#42:{suffix}"),
@@ -2922,12 +3110,14 @@ mod tests {
                     trigger: "automatic".into(),
                     model: None,
                     prompt: String::new(),
+                    identities: Vec::new(),
+                    config_hash: config_hash.into(),
                 })
                 .unwrap()
                 .unwrap()
         };
 
-        let old_head = enqueue("old-head", "base-2", "head-1");
+        let old_head = enqueue("old-head", "base-2", "head-1", "config");
         assert_eq!(
             store.claim_code_review_job().unwrap().unwrap().job.id,
             old_head.id
@@ -2937,13 +3127,18 @@ mod tests {
                 .set_code_review_job_session(&old_head.id, "se_old", "th_old")
                 .unwrap()
         );
-        let old_base = enqueue("old-base", "base-1", "head-2");
-        let current = enqueue("current", "base-2", "head-2");
+        let old_base = enqueue("old-base", "base-1", "head-2", "config");
+        let old_config = enqueue("old-config", "base-2", "head-2", "old-config");
+        let current = enqueue("current", "base-2", "head-2", "config");
 
         let mut superseded = store
-            .supersede_code_review_jobs("acme/widgets", 42, "base-2", "head-2")
+            .supersede_code_review_jobs("acme/widgets", 42, "base-2", "head-2", "config")
             .unwrap();
-        let mut expected = vec![old_head.id.clone(), old_base.id.clone()];
+        let mut expected = vec![
+            old_head.id.clone(),
+            old_base.id.clone(),
+            old_config.id.clone(),
+        ];
         superseded.sort();
         expected.sort();
         assert_eq!(superseded, expected);

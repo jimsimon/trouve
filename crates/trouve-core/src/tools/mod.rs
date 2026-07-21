@@ -136,6 +136,15 @@ pub trait ToolExecutor: Send + Sync {
     ) -> Result<PathBuf, String> {
         Err("review repository sync is unavailable in this executor".into())
     }
+    /// Read the complete base-to-head diff as per-file segments for the
+    /// headless review orchestrator. This remains behind the executor so git
+    /// access follows the same audited chokepoint as model-visible tools.
+    async fn review_repository_diff(
+        &self,
+        _request: &ReviewRepositoryDiff,
+    ) -> Result<Vec<ReviewDiffFile>, String> {
+        Err("review repository diff is unavailable in this executor".into())
+    }
     /// Release any per-worktree resources (e.g. spawned MCP server
     /// processes) when a session/worktree is going away. Default no-op.
     async fn evict_worktree(&self, _worktree: &Path) {}
@@ -150,6 +159,17 @@ pub struct ReviewRepositorySync {
     pub base_sha: String,
     pub head_sha: String,
     pub token: String,
+}
+
+pub struct ReviewRepositoryDiff {
+    pub worktree: PathBuf,
+    pub base_sha: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReviewDiffFile {
+    pub path: String,
+    pub diff: String,
 }
 
 /// Runs tools in-process against the local filesystem/shell, plus any MCP
@@ -341,6 +361,28 @@ impl ToolExecutor for LocalToolExecutor {
             ));
         }
         Ok(repository_path)
+    }
+
+    async fn review_repository_diff(
+        &self,
+        request: &ReviewRepositoryDiff,
+    ) -> Result<Vec<ReviewDiffFile>, String> {
+        let worktree = request.worktree.clone();
+        let base_sha = request.base_sha.clone();
+        tokio::task::spawn_blocking(move || {
+            let paths = crate::git::session_diff_files(&worktree, &base_sha)
+                .map_err(|error| error.to_string())?;
+            paths
+                .into_iter()
+                .map(|path| {
+                    let diff = crate::git::session_diff_path(&worktree, &base_sha, &path)
+                        .map_err(|error| error.to_string())?;
+                    Ok(ReviewDiffFile { path, diff })
+                })
+                .collect()
+        })
+        .await
+        .map_err(|error| format!("review diff task failed: {error}"))?
     }
 
     async fn evict_worktree(&self, worktree: &Path) {

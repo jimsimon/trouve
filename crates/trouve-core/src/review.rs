@@ -18,15 +18,15 @@ use sha2::{Digest, Sha256};
 use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
 use trouve_protocol::{
-    CodeReviewDashboard, CodeReviewMode, CodeReviewRepository, ConfigureGithubAppRequest,
-    CreateSessionRequest, CreateThreadRequest, Event, GithubAppStatus, PermissionMode, Scope,
-    UpdateCodeReviewRepositoryRequest,
+    CodeReviewDashboard, CodeReviewIdentity, CodeReviewMode, CodeReviewRepository,
+    ConfigureGithubAppRequest, CreateSessionRequest, CreateThreadRequest, Event, GithubAppStatus,
+    PermissionMode, Scope, UpdateCodeReviewRepositoryRequest, UpsertCodeReviewIdentityRequest,
 };
 
 use crate::config::GithubReviewAppConfig;
 use crate::engine::{Engine, EngineError};
 use crate::store::{CodeReviewJobRecord, NewCodeReviewJob};
-use crate::tools::ReviewRepositorySync;
+use crate::tools::{ReviewDiffFile, ReviewRepositoryDiff, ReviewRepositorySync};
 
 const PRIVATE_KEY_SECRET: &str = "github:review-app:private-key";
 const WEBHOOK_SECRET: &str = "github:review-app:webhook-secret";
@@ -34,6 +34,9 @@ const RECONCILE_INTERVAL_ENV: &str = "TROUVE_CODE_REVIEW_POLL_INTERVAL_SECONDS";
 const DEFAULT_RECONCILE_INTERVAL: Duration = Duration::from_secs(60);
 const JOB_IDLE_INTERVAL: Duration = Duration::from_secs(5);
 const REVIEW_TIMEOUT: Duration = Duration::from_secs(30 * 60);
+const REVIEW_BATCH_MAX_BYTES: usize = 128 * 1024;
+const REVIEW_BATCH_MAX_FILES: usize = 24;
+const MAX_CANDIDATE_FINDINGS: usize = 200;
 
 fn parse_code_review_poll_interval(value: &str) -> Option<Duration> {
     value
@@ -175,7 +178,7 @@ struct PublishedReview {
     html_url: String,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 struct ReviewOutput {
     #[serde(default)]
     summary: String,
@@ -183,7 +186,7 @@ struct ReviewOutput {
     findings: Vec<ReviewFinding>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 struct ReviewFinding {
     path: String,
     line: u64,
@@ -192,6 +195,19 @@ struct ReviewFinding {
     #[serde(default)]
     severity: String,
     body: String,
+}
+
+#[derive(Debug, Clone)]
+struct ReviewBatch {
+    paths: Vec<String>,
+    diff: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct CandidateFinding {
+    identity_id: String,
+    identity_name: String,
+    finding: ReviewFinding,
 }
 
 fn default_review_side() -> String {
@@ -422,9 +438,114 @@ impl Engine {
     pub fn code_review_dashboard(&self) -> Result<CodeReviewDashboard, EngineError> {
         Ok(CodeReviewDashboard {
             app: self.github_app_status()?,
+            identities: self.code_review_identity_catalog()?,
             repositories: self.store.list_code_review_repositories()?,
             jobs: self.store.list_code_review_jobs(100)?,
         })
+    }
+
+    fn code_review_identity_catalog(&self) -> Result<Vec<CodeReviewIdentity>, EngineError> {
+        let mut identities = crate::review_identities::native_identities();
+        identities.extend(self.store.list_custom_code_review_identities()?);
+        Ok(identities)
+    }
+
+    fn resolve_code_review_identities(
+        &self,
+        ids: &[String],
+    ) -> Result<Vec<CodeReviewIdentity>, EngineError> {
+        let catalog = self.code_review_identity_catalog()?;
+        let by_id: HashMap<_, _> = catalog
+            .into_iter()
+            .map(|identity| (identity.id.clone(), identity))
+            .collect();
+        let mut seen = std::collections::HashSet::new();
+        let mut resolved = Vec::with_capacity(ids.len());
+        for id in ids {
+            if !seen.insert(id) {
+                return Err(EngineError::BadRequest(format!(
+                    "duplicate code-review identity {id:?}"
+                )));
+            }
+            let identity = by_id.get(id).cloned().ok_or_else(|| {
+                EngineError::BadRequest(format!("unknown code-review identity {id:?}"))
+            })?;
+            resolved.push(identity);
+        }
+        Ok(resolved)
+    }
+
+    pub fn upsert_code_review_identity(
+        &self,
+        request: UpsertCodeReviewIdentityRequest,
+    ) -> Result<CodeReviewIdentity, EngineError> {
+        let name = request.name.trim();
+        let prompt = request.prompt.trim();
+        if name.is_empty() || name.len() > 100 {
+            return Err(EngineError::BadRequest(
+                "identity name must contain 1 to 100 bytes".into(),
+            ));
+        }
+        if prompt.is_empty() || prompt.len() > 16_000 {
+            return Err(EngineError::BadRequest(
+                "identity prompt must contain 1 to 16000 bytes".into(),
+            ));
+        }
+        let model = request
+            .model
+            .map(|model| model.trim().to_string())
+            .filter(|model| !model.is_empty());
+        if model.as_deref().is_some_and(|model| !model.contains('/')) {
+            return Err(EngineError::BadRequest(
+                "identity model must be provider-qualified".into(),
+            ));
+        }
+        let updating = request.id.is_some();
+        let id = request
+            .id
+            .unwrap_or_else(|| format!("custom:{}", crate::new_id("ri")));
+        if !id.starts_with("custom:") {
+            return Err(EngineError::BadRequest(
+                "native code-review identities cannot be changed".into(),
+            ));
+        }
+        if id.len() > 150 {
+            return Err(EngineError::BadRequest("identity id is too long".into()));
+        }
+        if updating
+            && !self
+                .store
+                .list_custom_code_review_identities()?
+                .iter()
+                .any(|identity| identity.id == id)
+        {
+            return Err(EngineError::NotFound(format!("code-review identity {id}")));
+        }
+        let identity = CodeReviewIdentity {
+            id,
+            name: name.into(),
+            prompt: prompt.into(),
+            model,
+            native: false,
+        };
+        self.store.upsert_custom_code_review_identity(&identity)?;
+        self.code_review.poll_wake.notify_one();
+        self.emit_code_review_updated(None)?;
+        Ok(identity)
+    }
+
+    pub fn delete_code_review_identity(&self, id: &str) -> Result<(), EngineError> {
+        if !id.starts_with("custom:") {
+            return Err(EngineError::BadRequest(
+                "native code-review identities cannot be deleted".into(),
+            ));
+        }
+        if !self.store.delete_custom_code_review_identity(id)? {
+            return Err(EngineError::NotFound(format!("code-review identity {id}")));
+        }
+        self.code_review.poll_wake.notify_one();
+        self.emit_code_review_updated(None)?;
+        Ok(())
     }
 
     pub fn update_code_review_repository(
@@ -440,7 +561,31 @@ impl Engine {
         {
             return Err(EngineError::BadRequest("model cannot be empty".into()));
         }
-        self.store.update_code_review_repository(request)?;
+        let existing = self
+            .store
+            .list_code_review_repositories()?
+            .into_iter()
+            .find(|repository| repository.repository == request.repository);
+        let identity_ids = request
+            .identity_ids
+            .clone()
+            .or_else(|| existing.map(|repository| repository.identity_ids))
+            .unwrap_or_else(crate::review_identities::default_identity_ids);
+        if request.mode != CodeReviewMode::Off && identity_ids.is_empty() {
+            return Err(EngineError::BadRequest(
+                "an enabled repository must select at least one review identity".into(),
+            ));
+        }
+        self.resolve_code_review_identities(&identity_ids)?;
+        let normalized = UpdateCodeReviewRepositoryRequest {
+            installation_id: request.installation_id,
+            repository: request.repository.clone(),
+            mode: request.mode,
+            model: request.model.clone(),
+            prompt: request.prompt.clone(),
+            identity_ids: Some(identity_ids),
+        };
+        self.store.update_code_review_repository(&normalized)?;
         let repository = self
             .store
             .list_code_review_repositories()?
@@ -569,6 +714,15 @@ impl Engine {
 
     async fn poll_code_review_repository(&self, repository: &CodeReviewRepository) -> Result<()> {
         validate_repository(&repository.repository)?;
+        let identities = self.resolve_code_review_identities(&repository.identity_ids)?;
+        let identity_config = serde_json::to_string(&identities)?;
+        let config_hash = hex::encode(Sha256::digest(
+            format!(
+                "{:?}\0{}\0{identity_config}",
+                repository.model, repository.prompt
+            )
+            .as_bytes(),
+        ));
         let api = self.installation_api(repository.installation_id).await?;
         let bot_login = self.github_app_status()?.bot_login;
         let mut pulls = Vec::new();
@@ -597,9 +751,10 @@ impl Engine {
                 pull.number,
                 &pull.base.sha,
                 &pull.head.sha,
+                &config_hash,
             )?;
-            let revision_changed = !superseded.is_empty();
-            if revision_changed {
+            let review_superseded = !superseded.is_empty();
+            if review_superseded {
                 self.code_review.cancel_superseded(&superseded);
                 for job_id in superseded {
                     self.emit_code_review_updated(Some(job_id))?;
@@ -615,11 +770,11 @@ impl Engine {
                 manual_requested,
             )?;
             // If a manually requested review is superseded while the bot is
-            // still selected, replace it for the new revision without
-            // requiring the user to toggle the review request off and on.
+            // still selected, replace it for the new revision/configuration
+            // without requiring the user to toggle the request off and on.
             let replace_manual_review = should_replace_manual_review(
                 repository.mode,
-                revision_changed,
+                review_superseded,
                 manual_requested,
                 generation,
             );
@@ -633,9 +788,6 @@ impl Engine {
             } else {
                 continue;
             };
-            let config_hash = hex::encode(Sha256::digest(
-                format!("{:?}\0{}", repository.model, repository.prompt).as_bytes(),
-            ));
             let automatic_key = format!(
                 "{}#{}:{}:{}:automatic:{config_hash}",
                 repository.repository, pull.number, pull.base.sha, pull.head.sha
@@ -673,6 +825,8 @@ impl Engine {
                 trigger: trigger.into(),
                 model: repository.model.clone(),
                 prompt: repository.prompt.clone(),
+                identities: identities.clone(),
+                config_hash: config_hash.clone(),
             })?;
             if let Some(job) = job {
                 self.emit_code_review_updated(Some(job.id))?;
@@ -928,7 +1082,7 @@ impl Engine {
                 fetch_latest: false,
             })
             .await?;
-        let thread = self.create_thread(CreateThreadRequest {
+        let coordinator = self.create_thread(CreateThreadRequest {
             session_id: session.id.clone(),
             mode: Some("review".into()),
             model: job.model.clone(),
@@ -937,7 +1091,7 @@ impl Engine {
         })?;
         if !self
             .store
-            .set_code_review_job_session(&job.id, &session.id, &thread.id)?
+            .set_code_review_job_session(&job.id, &session.id, &coordinator.id)?
         {
             if let Err(error) = self.delete_session(&session.id).await {
                 self.record_review_error(format!(
@@ -949,8 +1103,105 @@ impl Engine {
         }
         self.emit_code_review_updated(Some(job.id.clone()))?;
         ensure_review_current(superseded)?;
+        let diff_files = self
+            .executor
+            .review_repository_diff(&ReviewRepositoryDiff {
+                worktree: session.worktree_path.clone().into(),
+                base_sha: job.base_ref.clone(),
+            })
+            .await
+            .map_err(|error| anyhow!(error))?;
+        let batches = build_review_batches(&diff_files);
+        let identities = if record.identities.is_empty() {
+            self.resolve_code_review_identities(&crate::review_identities::default_identity_ids())?
+        } else {
+            record.identities.clone()
+        };
+        let mut candidates = Vec::new();
+        for identity in &identities {
+            for (batch_index, batch) in batches.iter().enumerate() {
+                ensure_review_current(superseded)?;
+                let thread = self.create_thread(CreateThreadRequest {
+                    session_id: session.id.clone(),
+                    mode: Some("review".into()),
+                    model: identity.model.clone().or_else(|| job.model.clone()),
+                    model_options: serde_json::Map::new(),
+                    permission_mode: Some(PermissionMode::Yolo),
+                })?;
+                let output = self
+                    .run_code_review_turn(
+                        job,
+                        &thread.id,
+                        identity_review_prompt(record, identity, batch, batch_index, batches.len()),
+                        superseded,
+                    )
+                    .await?;
+                let parsed = parse_review_output(&output)?;
+                candidates.extend(parsed.findings.into_iter().map(|finding| CandidateFinding {
+                    identity_id: identity.id.clone(),
+                    identity_name: identity.name.clone(),
+                    finding,
+                }));
+                if candidates.len() > MAX_CANDIDATE_FINDINGS {
+                    bail!(
+                        "review identities returned more than {MAX_CANDIDATE_FINDINGS} candidate findings"
+                    );
+                }
+            }
+        }
+        let candidates = structurally_valid_candidates(candidates, &diff_files);
+        let parsed = if candidates.is_empty() {
+            ReviewOutput {
+                summary: format!(
+                    "{} review identity/identities examined {} changed file(s); no actionable issues were confirmed.",
+                    identities.len(),
+                    diff_files.len()
+                ),
+                findings: Vec::new(),
+            }
+        } else {
+            let output = self
+                .run_code_review_turn(
+                    job,
+                    &coordinator.id,
+                    validation_prompt(record, &candidates, &diff_files)?,
+                    superseded,
+                )
+                .await?;
+            let validated = parse_review_output(&output)?;
+            ReviewOutput {
+                summary: validated.summary,
+                findings: structurally_valid_findings(validated.findings, &diff_files),
+            }
+        };
 
-        let scope = Scope::Thread(thread.id.clone());
+        let api = self.installation_api(job.installation_id).await?;
+        let (current, rate): (GithubPullRequest, _) = api
+            .get(&format!(
+                "/repos/{}/pulls/{}",
+                job.repository, job.pull_number
+            ))
+            .await?;
+        self.record_review_rate(rate);
+        if current.state != "open"
+            || current.base.sha != job.base_ref
+            || current.head.sha != job.head_sha
+        {
+            bail!("stale: pull request revision changed before the review was published");
+        }
+        let review_url = self.publish_review(&api, job, parsed).await?;
+        Ok(review_url)
+    }
+
+    async fn run_code_review_turn(
+        self: &Arc<Self>,
+        job: &trouve_protocol::CodeReviewJob,
+        thread_id: &str,
+        prompt: String,
+        superseded: &CancellationToken,
+    ) -> Result<String> {
+        ensure_review_current(superseded)?;
+        let scope = Scope::Thread(thread_id.to_string());
         let mut events = self.store.subscribe();
         let mut after = self
             .store
@@ -959,13 +1210,13 @@ impl Engine {
             .map(|event| event.cursor)
             .unwrap_or(0);
         let mut replay = VecDeque::new();
-        let accepted = self.send_message(&thread.id, review_prompt(record), Vec::new())?;
+        let accepted = self.send_message(thread_id, prompt, Vec::new())?;
         let turn = accepted.turn;
         let mut output = String::new();
         let mut cancellation_requested = false;
         loop {
             if superseded.is_cancelled() && !cancellation_requested {
-                let _ = self.cancel_turn(&thread.id);
+                let _ = self.cancel_turn(thread_id);
                 cancellation_requested = true;
             }
             let envelope = match replay.pop_front() {
@@ -976,7 +1227,7 @@ impl Engine {
                     tokio::select! {
                         received = events.recv() => received,
                         _ = superseded.cancelled() => {
-                            let _ = self.cancel_turn(&thread.id);
+                            let _ = self.cancel_turn(thread_id);
                             cancellation_requested = true;
                             continue;
                         }
@@ -1009,9 +1260,7 @@ impl Engine {
                 Event::AssistantMessage {
                     turn: event_turn,
                     content,
-                } if event_turn == turn => {
-                    output = content;
-                }
+                } if event_turn == turn => output = content,
                 Event::QuestionRequested { request_id, .. } => {
                     let _ = self.resolve_question(&request_id, None);
                 }
@@ -1021,9 +1270,7 @@ impl Engine {
                 Event::TurnFailed {
                     turn: event_turn,
                     error,
-                } if event_turn == turn => {
-                    bail!("model review failed: {error}");
-                }
+                } if event_turn == turn => bail!("model review failed: {error}"),
                 Event::TurnCancelled { turn: event_turn } if event_turn == turn => {
                     if superseded.is_cancelled() {
                         bail!("stale: review was superseded while the model was running");
@@ -1037,24 +1284,7 @@ impl Engine {
         if output.trim().is_empty() {
             bail!("model returned an empty review");
         }
-
-        let api = self.installation_api(job.installation_id).await?;
-        let (current, rate): (GithubPullRequest, _) = api
-            .get(&format!(
-                "/repos/{}/pulls/{}",
-                job.repository, job.pull_number
-            ))
-            .await?;
-        self.record_review_rate(rate);
-        if current.state != "open"
-            || current.base.sha != job.base_ref
-            || current.head.sha != job.head_sha
-        {
-            bail!("stale: pull request revision changed before the review was published");
-        }
-        let parsed = parse_review_output(&output)?;
-        let review_url = self.publish_review(&api, job, parsed).await?;
-        Ok(review_url)
+        Ok(output)
     }
 
     async fn publish_review(
@@ -1148,21 +1378,106 @@ impl Engine {
 
 fn ensure_review_current(superseded: &CancellationToken) -> Result<()> {
     if superseded.is_cancelled() {
-        bail!("stale: review was superseded by a newer pull request revision");
+        bail!("stale: review was superseded by a newer revision or review configuration");
     }
     Ok(())
 }
 
 fn should_replace_manual_review(
     mode: CodeReviewMode,
-    revision_changed: bool,
+    review_superseded: bool,
     manual_requested: bool,
     generation: Option<u64>,
 ) -> bool {
-    mode == CodeReviewMode::Manual && revision_changed && manual_requested && generation.is_none()
+    mode == CodeReviewMode::Manual && review_superseded && manual_requested && generation.is_none()
 }
 
-fn review_prompt(record: &CodeReviewJobRecord) -> String {
+fn build_review_batches(files: &[ReviewDiffFile]) -> Vec<ReviewBatch> {
+    if files.is_empty() {
+        return vec![ReviewBatch {
+            paths: Vec::new(),
+            diff: "No textual file changes were reported by git.".into(),
+        }];
+    }
+    let mut batches = Vec::new();
+    let mut current = ReviewBatch {
+        paths: Vec::new(),
+        diff: String::new(),
+    };
+    for file in files {
+        // Reserve enough room for the repeated path/fragment header so even
+        // one very large file cannot produce an oversized model request.
+        let largest_header = format!("\n=== {} (diff fragment {}) ===\n", file.path, usize::MAX);
+        let chunk_limit = REVIEW_BATCH_MAX_BYTES
+            .saturating_sub(largest_header.len() + 1)
+            .max(1);
+        let chunks = split_diff_chunks(&file.diff, chunk_limit);
+        for (index, chunk) in chunks.into_iter().enumerate() {
+            let section = format!(
+                "\n=== {} (diff fragment {}) ===\n{}\n",
+                file.path,
+                index + 1,
+                chunk
+            );
+            if !current.diff.is_empty()
+                && (current.diff.len() + section.len() > REVIEW_BATCH_MAX_BYTES
+                    || current.paths.len() >= REVIEW_BATCH_MAX_FILES)
+            {
+                batches.push(current);
+                current = ReviewBatch {
+                    paths: Vec::new(),
+                    diff: String::new(),
+                };
+            }
+            if !current.paths.contains(&file.path) {
+                current.paths.push(file.path.clone());
+            }
+            current.diff.push_str(&section);
+        }
+    }
+    if !current.diff.is_empty() {
+        batches.push(current);
+    }
+    batches
+}
+
+fn split_diff_chunks(diff: &str, limit: usize) -> Vec<&str> {
+    if diff.is_empty() {
+        return vec![diff];
+    }
+    let mut chunks = Vec::new();
+    let mut start = 0;
+    while start < diff.len() {
+        let mut end = start.saturating_add(limit).min(diff.len());
+        while end > start && !diff.is_char_boundary(end) {
+            end -= 1;
+        }
+        if end < diff.len()
+            && let Some(last_newline) = diff[start..end].rfind('\n')
+            && last_newline >= limit / 2
+        {
+            end = start + last_newline + 1;
+        }
+        if end == start {
+            end = diff[start..]
+                .char_indices()
+                .nth(1)
+                .map(|(offset, _)| start + offset)
+                .unwrap_or(diff.len());
+        }
+        chunks.push(&diff[start..end]);
+        start = end;
+    }
+    chunks
+}
+
+fn identity_review_prompt(
+    record: &CodeReviewJobRecord,
+    identity: &CodeReviewIdentity,
+    batch: &ReviewBatch,
+    batch_index: usize,
+    batch_count: usize,
+) -> String {
     let job = &record.job;
     let extra = if record.prompt.trim().is_empty() {
         String::new()
@@ -1170,21 +1485,199 @@ fn review_prompt(record: &CodeReviewJobRecord) -> String {
         format!("\nRepository-specific instructions:\n{}\n", record.prompt)
     };
     format!(
-        "Review pull request #{number} ({title}) at immutable head {head}. \
-         Compare it with base commit {base}. Start by calling git_diff with \
-         base `{base}`, then inspect relevant files. Report only actionable \
-         correctness, security, performance, or maintainability problems \
-         introduced by this diff. Do not ask questions and do not modify files.\n\
-         {extra}\nReturn JSON only, with no Markdown fence, using exactly this shape:\n\
+        "You are the `{identity_name}` review identity. Your focused mandate is:\n\
+         {identity_prompt}\n\nReview pull request #{number} ({title}) at immutable head {head}, \
+         compared with base commit {base}. This is complete diff batch {batch_number} of \
+         {batch_count}; review every supplied file or fragment. Inspect relevant unchanged \
+         code with read/search tools when needed. Report only concrete, actionable problems \
+         introduced by the change. Do not ask questions and do not modify files.\n\
+         {extra}\nChanged paths in this batch: {paths}\n\nUnified diff:\n{diff}\n\n\
+         Return JSON only, with no Markdown fence, using exactly this shape:\n\
          {{\"summary\":\"short overall assessment\",\"findings\":[{{\"path\":\"relative/file.rs\",\"line\":123,\"side\":\"RIGHT\",\"severity\":\"high|medium|low\",\"body\":\"specific problem and fix\"}}]}}\n\
          Use RIGHT for added/context lines in the new version and LEFT only \
          for removed lines. Return an empty findings array when there are no \
          actionable issues.",
+        identity_name = identity.name,
+        identity_prompt = identity.prompt,
         number = job.pull_number,
         title = job.pull_title,
         head = job.head_sha,
         base = job.base_ref,
+        batch_number = batch_index + 1,
+        batch_count = batch_count,
+        paths = batch.paths.join(", "),
+        diff = batch.diff,
     )
+}
+
+fn validation_prompt(
+    record: &CodeReviewJobRecord,
+    candidates: &[CandidateFinding],
+    files: &[ReviewDiffFile],
+) -> Result<String> {
+    let job = &record.job;
+    let candidates = serde_json::to_string_pretty(candidates)?;
+    let paths = files
+        .iter()
+        .map(|file| file.path.as_str())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let extra = if record.prompt.trim().is_empty() {
+        String::new()
+    } else {
+        format!(
+            "Repository-specific review instructions:\n{}\n\n",
+            record.prompt
+        )
+    };
+    Ok(format!(
+        "Act as the final code-review editor for pull request #{number} ({title}) at \
+         immutable revision {base}..{head}. Independently verify every candidate against \
+         the diff and repository. Remove false positives, issues not introduced by this \
+         revision, non-actionable style preferences, and duplicates. Merge overlapping \
+         findings, correct path/side/line metadata, normalize severity to high/medium/low, \
+         and retain only findings a maintainer should act on. Use git_diff with base `{base}` \
+         and its path/offset pagination when exact removed or context lines need verification; \
+         use read/search tools for surrounding code. Do not add a finding merely because an \
+         identity suggested it.\n\n{extra}Changed paths: {paths}\n\nCandidate findings:\n{candidates}\n\n\
+         Return JSON only, with no Markdown fence, using exactly this shape:\n\
+         {{\"summary\":\"concise final assessment that mentions validated coverage\",\"findings\":[{{\"path\":\"relative/file.rs\",\"line\":123,\"side\":\"RIGHT\",\"severity\":\"high|medium|low\",\"body\":\"specific verified problem and fix\"}}]}}",
+        number = job.pull_number,
+        title = job.pull_title,
+        base = job.base_ref,
+        head = job.head_sha,
+    ))
+}
+
+fn structurally_valid_candidates(
+    candidates: Vec<CandidateFinding>,
+    files: &[ReviewDiffFile],
+) -> Vec<CandidateFinding> {
+    let valid = diff_comment_lines(files);
+    let mut seen = HashSet::new();
+    candidates
+        .into_iter()
+        .filter_map(|mut candidate| {
+            normalize_finding(&mut candidate.finding, &valid)?;
+            let key = finding_key(&candidate.finding);
+            seen.insert(key).then_some(candidate)
+        })
+        .collect()
+}
+
+fn structurally_valid_findings(
+    findings: Vec<ReviewFinding>,
+    files: &[ReviewDiffFile],
+) -> Vec<ReviewFinding> {
+    let valid = diff_comment_lines(files);
+    let mut seen = HashSet::new();
+    findings
+        .into_iter()
+        .filter_map(|mut finding| {
+            normalize_finding(&mut finding, &valid)?;
+            let key = finding_key(&finding);
+            seen.insert(key).then_some(finding)
+        })
+        .collect()
+}
+
+fn finding_key(finding: &ReviewFinding) -> (String, u64, String, String) {
+    (
+        finding.path.clone(),
+        finding.line,
+        finding.side.clone(),
+        finding
+            .body
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+            .to_ascii_lowercase(),
+    )
+}
+
+fn normalize_finding(
+    finding: &mut ReviewFinding,
+    valid: &HashSet<(String, u64, bool)>,
+) -> Option<()> {
+    finding.path = finding
+        .path
+        .trim()
+        .strip_prefix("a/")
+        .or_else(|| finding.path.trim().strip_prefix("b/"))
+        .unwrap_or(finding.path.trim())
+        .to_string();
+    finding.body = finding.body.trim().chars().take(4_000).collect();
+    if finding.path.is_empty() || finding.line == 0 || finding.body.is_empty() {
+        return None;
+    }
+    let mut left = finding.side.eq_ignore_ascii_case("LEFT");
+    if !valid.contains(&(finding.path.clone(), finding.line, left)) {
+        if valid.contains(&(finding.path.clone(), finding.line, !left)) {
+            left = !left;
+        } else {
+            return None;
+        }
+    }
+    finding.side = if left { "LEFT" } else { "RIGHT" }.into();
+    finding.severity = match finding.severity.trim().to_ascii_lowercase().as_str() {
+        "high" => "high",
+        "low" => "low",
+        _ => "medium",
+    }
+    .into();
+    Some(())
+}
+
+/// (path, line, left-side). Context lines are commentable on either side;
+/// additions are RIGHT and removals are LEFT.
+fn diff_comment_lines(files: &[ReviewDiffFile]) -> HashSet<(String, u64, bool)> {
+    let mut valid = HashSet::new();
+    for file in files {
+        let mut old_line = 0;
+        let mut new_line = 0;
+        let mut in_hunk = false;
+        for line in file.diff.lines() {
+            if line.starts_with("@@ ") {
+                let mut ranges = line.split_whitespace();
+                let _marker = ranges.next();
+                old_line = ranges
+                    .next()
+                    .and_then(|range| diff_range_start(range, '-'))
+                    .unwrap_or(0);
+                new_line = ranges
+                    .next()
+                    .and_then(|range| diff_range_start(range, '+'))
+                    .unwrap_or(0);
+                in_hunk = old_line > 0 || new_line > 0;
+                continue;
+            }
+            if !in_hunk || line.starts_with("\\ No newline at end of file") {
+                continue;
+            }
+            match line.as_bytes().first().copied() {
+                Some(b'+') => {
+                    valid.insert((file.path.clone(), new_line, false));
+                    new_line += 1;
+                }
+                Some(b'-') => {
+                    valid.insert((file.path.clone(), old_line, true));
+                    old_line += 1;
+                }
+                Some(b' ') => {
+                    valid.insert((file.path.clone(), old_line, true));
+                    valid.insert((file.path.clone(), new_line, false));
+                    old_line += 1;
+                    new_line += 1;
+                }
+                _ => in_hunk = false,
+            }
+        }
+    }
+    valid
+}
+
+fn diff_range_start(range: &str, prefix: char) -> Option<u64> {
+    range.strip_prefix(prefix)?.split(',').next()?.parse().ok()
 }
 
 fn parse_review_output(output: &str) -> Result<ReviewOutput> {
@@ -1211,6 +1704,72 @@ mod tests {
             parse_review_output("```json\n{\"summary\":\"ok\",\"findings\":[]}\n```").unwrap();
         assert_eq!(review.summary, "ok");
         assert!(review.findings.is_empty());
+    }
+
+    #[test]
+    fn review_batches_cover_every_file_and_bound_large_diffs() {
+        let large = format!("{}{}", "a".repeat(REVIEW_BATCH_MAX_BYTES), "β".repeat(20));
+        let chunks = split_diff_chunks(&large, REVIEW_BATCH_MAX_BYTES);
+        assert_eq!(chunks.concat(), large);
+        assert!(
+            chunks
+                .iter()
+                .all(|chunk| chunk.len() <= REVIEW_BATCH_MAX_BYTES)
+        );
+
+        let files = vec![
+            ReviewDiffFile {
+                path: "src/large.rs".into(),
+                diff: large,
+            },
+            ReviewDiffFile {
+                path: "src/small.rs".into(),
+                diff: "+small\n".into(),
+            },
+        ];
+        let batches = build_review_batches(&files);
+        let covered: HashSet<_> = batches
+            .iter()
+            .flat_map(|batch| batch.paths.iter().map(String::as_str))
+            .collect();
+        assert_eq!(covered, HashSet::from(["src/large.rs", "src/small.rs"]));
+        assert!(batches.len() >= 2);
+        assert!(
+            batches
+                .iter()
+                .all(|batch| batch.diff.len() <= REVIEW_BATCH_MAX_BYTES)
+        );
+    }
+
+    #[test]
+    fn structural_validation_fixes_sides_and_deduplicates_candidates() {
+        let files = vec![ReviewDiffFile {
+            path: "src/lib.rs".into(),
+            diff: "diff --git a/src/lib.rs b/src/lib.rs\n--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -20,2 +2,3 @@\n context\n+added\n tail\n".into(),
+        }];
+        let candidate = |path: &str, side: &str, body: &str| CandidateFinding {
+            identity_id: "correctness".into(),
+            identity_name: "Correctness".into(),
+            finding: ReviewFinding {
+                path: path.into(),
+                line: 3,
+                side: side.into(),
+                severity: "critical".into(),
+                body: body.into(),
+            },
+        };
+        let valid = structurally_valid_candidates(
+            vec![
+                candidate("b/src/lib.rs", "LEFT", "real issue"),
+                candidate("src/lib.rs", "RIGHT", "real issue"),
+                candidate("src/other.rs", "RIGHT", "not in diff"),
+            ],
+            &files,
+        );
+        assert_eq!(valid.len(), 1);
+        assert_eq!(valid[0].finding.path, "src/lib.rs");
+        assert_eq!(valid[0].finding.side, "RIGHT");
+        assert_eq!(valid[0].finding.severity, "medium");
     }
 
     #[test]
