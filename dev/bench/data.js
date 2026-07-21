@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1784573794992,
+  "lastUpdate": 1784600697635,
   "repoUrl": "https://github.com/jimsimon/trouve",
   "entries": {
     "e2e-benchmarks": [
@@ -3935,6 +3935,54 @@ window.BENCHMARK_DATA = {
             "name": "non-git warm query",
             "value": 73.49921912,
             "range": "± 7.1",
+            "unit": "ms"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "jim.j.simon@gmail.com",
+            "name": "Jim Simon",
+            "username": "jimsimon"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "c542605c5413bb047fdc0e53f039bbcc6bd590c9",
+          "message": "Cache GitHub PR details and refresh every 30 seconds (#134)\n\n* Cache GitHub dashboard details\n\n* Refresh PR dashboards every 30 seconds\n\nReplace manual PR refresh controls with a live freshness clock while the cached account feed updates both dashboard views automatically.\n\n* Bound GitHub dashboard refreshes\n\nElide the freshness status within the available header width and time out stalled per-host dashboard requests so they release the shared cache lock.",
+          "timestamp": "2026-07-20T22:22:17-04:00",
+          "tree_id": "9da5898c0c1667c51e0b5b46e9b9292b43e8e272",
+          "url": "https://github.com/jimsimon/trouve/commit/c542605c5413bb047fdc0e53f039bbcc6bd590c9"
+        },
+        "date": 1784600696847,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "cold index + query",
+            "value": 127.75977964000002,
+            "range": "± 1045.4",
+            "unit": "ms"
+          },
+          {
+            "name": "warm query",
+            "value": 74.05719856,
+            "range": "± 2.5",
+            "unit": "ms"
+          },
+          {
+            "name": "incremental (1 file modified)",
+            "value": 85.38139960000001,
+            "range": "± 2",
+            "unit": "ms"
+          },
+          {
+            "name": "non-git warm query",
+            "value": 72.73382128,
+            "range": "± 1.5",
             "unit": "ms"
           }
         ]
