@@ -17,7 +17,7 @@ permissions:
   contents: write
 
 concurrency:
-  group: release-${{ github.ref_name }}
+  group: release-trouve-search
   cancel-in-progress: false
 
 jobs:

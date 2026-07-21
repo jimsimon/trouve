@@ -825,12 +825,15 @@ impl Engine {
                 && active_repositories
                     .contains(&(repository.installation_id, repository.repository.clone()))
         }) {
-            if let Err(error) = self.poll_code_review_repository(repository).await {
-                had_errors = true;
-                self.record_review_error(format!(
-                    "polling code review repository {} failed: {error:#}",
-                    repository.repository
-                ));
+            match self.poll_code_review_repository(repository).await {
+                Ok(repository_had_errors) => had_errors |= repository_had_errors,
+                Err(error) => {
+                    had_errors = true;
+                    self.record_review_error(format!(
+                        "polling code review repository {} failed: {error:#}",
+                        repository.repository
+                    ));
+                }
             }
         }
         {
@@ -844,7 +847,7 @@ impl Engine {
         Ok(())
     }
 
-    async fn poll_code_review_repository(&self, repository: &CodeReviewRepository) -> Result<()> {
+    async fn poll_code_review_repository(&self, repository: &CodeReviewRepository) -> Result<bool> {
         validate_repository(&repository.repository)?;
         let reviewers = apply_reviewer_overrides(
             self.resolve_code_review_reviewers(&repository.reviewer_ids)?,
@@ -878,97 +881,110 @@ impl Engine {
             }
             page += 1;
         }
+        let mut had_errors = false;
         for pull in pulls {
-            validate_sha(&pull.base.sha)?;
-            validate_sha(&pull.head.sha)?;
-            let superseded = self.store.supersede_code_review_jobs(
-                &repository.repository,
-                pull.number,
-                &pull.base.sha,
-                &pull.head.sha,
-                &config_hash,
-            )?;
-            let review_superseded = !superseded.is_empty();
-            if review_superseded {
-                self.code_review.cancel_superseded(&superseded);
-                for job_id in superseded {
-                    self.emit_code_review_updated(Some(job_id))?;
+            let pull_number = pull.number;
+            let result = (|| -> Result<()> {
+                validate_sha(&pull.base.sha)?;
+                validate_sha(&pull.head.sha)?;
+                let superseded = self.store.supersede_code_review_jobs(
+                    &repository.repository,
+                    pull.number,
+                    &pull.base.sha,
+                    &pull.head.sha,
+                    &config_hash,
+                )?;
+                let review_superseded = !superseded.is_empty();
+                if review_superseded {
+                    self.code_review.cancel_superseded(&superseded);
+                    for job_id in superseded {
+                        self.emit_code_review_updated(Some(job_id))?;
+                    }
                 }
-            }
-            let manual_requested = pull
-                .requested_reviewers
-                .iter()
-                .any(|reviewer| reviewer.login.eq_ignore_ascii_case(&bot_login));
-            let generation = self.store.code_review_manual_transition(
-                &repository.repository,
-                pull.number,
-                manual_requested,
-            )?;
-            // If a manually requested review is superseded while the bot is
-            // still selected, replace it for the new revision/configuration
-            // without requiring the user to toggle the request off and on.
-            let replace_manual_review = should_replace_manual_review(
-                repository.mode,
-                review_superseded,
-                manual_requested,
-                generation,
-            );
-            if pull.draft && generation.is_none() && !replace_manual_review {
-                continue;
-            }
-            let trigger = if generation.is_some() || replace_manual_review {
-                "manual"
-            } else if repository.mode == CodeReviewMode::Automatic {
-                "automatic"
-            } else {
-                continue;
-            };
-            let automatic_key = format!(
-                "{}#{}:{}:{}:automatic:{config_hash}",
-                repository.repository, pull.number, pull.base.sha, pull.head.sha
-            );
-            // A manual request that arrives before this automatic head was
-            // seen satisfies the automatic review too. Later re-requests get
-            // their own generation and intentionally run again.
-            let trigger_key = if let Some(generation) = generation {
-                if repository.mode == CodeReviewMode::Automatic
-                    && !self.store.code_review_job_exists(&automatic_key)?
-                {
-                    "automatic".into()
+                let manual_requested = pull
+                    .requested_reviewers
+                    .iter()
+                    .any(|reviewer| reviewer.login.eq_ignore_ascii_case(&bot_login));
+                let generation = self.store.code_review_manual_transition(
+                    &repository.repository,
+                    pull.number,
+                    manual_requested,
+                )?;
+                // If a manually requested review is superseded while the bot is
+                // still selected, replace it for the new revision/configuration
+                // without requiring the user to toggle the request off and on.
+                let replace_manual_review = should_replace_manual_review(
+                    repository.mode,
+                    review_superseded,
+                    manual_requested,
+                    generation,
+                );
+                if pull.draft && generation.is_none() && !replace_manual_review {
+                    return Ok(());
+                }
+                let trigger = if generation.is_some() || replace_manual_review {
+                    "manual"
+                } else if repository.mode == CodeReviewMode::Automatic {
+                    "automatic"
                 } else {
-                    format!("manual:{generation}")
+                    return Ok(());
+                };
+                let automatic_key = format!(
+                    "{}#{}:{}:{}:automatic:{config_hash}",
+                    repository.repository, pull.number, pull.base.sha, pull.head.sha
+                );
+                // A manual request that arrives before this automatic head was
+                // seen satisfies the automatic review too. Later re-requests get
+                // their own generation and intentionally run again.
+                let trigger_key = if let Some(generation) = generation {
+                    if repository.mode == CodeReviewMode::Automatic
+                        && !self.store.code_review_job_exists(&automatic_key)?
+                    {
+                        "automatic".into()
+                    } else {
+                        format!("manual:{generation}")
+                    }
+                } else if replace_manual_review {
+                    "manual:revision".into()
+                } else {
+                    "automatic".into()
+                };
+                let dedupe_key = format!(
+                    "{}#{}:{}:{}:{trigger_key}:{config_hash}",
+                    repository.repository, pull.number, pull.base.sha, pull.head.sha
+                );
+                let job = self.store.enqueue_code_review_job(&NewCodeReviewJob {
+                    dedupe_key,
+                    installation_id: repository.installation_id,
+                    repository: repository.repository.clone(),
+                    pull_number: pull.number,
+                    pull_title: pull.title,
+                    pull_url: pull.html_url,
+                    head_sha: pull.head.sha,
+                    base_ref: pull.base.sha,
+                    head_ref: pull.head.name,
+                    trigger: trigger.into(),
+                    model: repository.model.clone(),
+                    prompt: repository.prompt.clone(),
+                    reviewers: reviewers.clone(),
+                    config_hash: config_hash.clone(),
+                })?;
+                if let Some(job) = job {
+                    self.emit_code_review_updated(Some(job.id))?;
+                    self.code_review.job_wake.notify_one();
                 }
-            } else if replace_manual_review {
-                "manual:revision".into()
-            } else {
-                "automatic".into()
-            };
-            let dedupe_key = format!(
-                "{}#{}:{}:{}:{trigger_key}:{config_hash}",
-                repository.repository, pull.number, pull.base.sha, pull.head.sha
-            );
-            let job = self.store.enqueue_code_review_job(&NewCodeReviewJob {
-                dedupe_key,
-                installation_id: repository.installation_id,
-                repository: repository.repository.clone(),
-                pull_number: pull.number,
-                pull_title: pull.title,
-                pull_url: pull.html_url,
-                head_sha: pull.head.sha,
-                base_ref: pull.base.sha,
-                head_ref: pull.head.name,
-                trigger: trigger.into(),
-                model: repository.model.clone(),
-                prompt: repository.prompt.clone(),
-                reviewers: reviewers.clone(),
-                config_hash: config_hash.clone(),
-            })?;
-            if let Some(job) = job {
-                self.emit_code_review_updated(Some(job.id))?;
-                self.code_review.job_wake.notify_one();
+                Ok(())
+            })();
+
+            if let Err(error) = result {
+                had_errors = true;
+                self.record_review_error(format!(
+                    "processing pull request {}#{} failed: {error:#}",
+                    repository.repository, pull_number
+                ));
             }
         }
-        Ok(())
+        Ok(had_errors)
     }
 
     pub fn accept_github_review_webhook(
@@ -1110,6 +1126,26 @@ impl Engine {
         let _ = self.emit_code_review_updated(Some(job_id.clone()));
         let result =
             tokio::time::timeout(REVIEW_TIMEOUT, self.execute_code_review(&record, &cancel)).await;
+        if result.is_err() {
+            match self.store.code_review_job(&job_id) {
+                Ok(Some(current)) => {
+                    if let Some(thread_id) = current.job.thread_id
+                        && let Err(error) = self.cancel_turn(&thread_id)
+                    {
+                        tracing::warn!(
+                            job_id,
+                            thread_id,
+                            %error,
+                            "failed to cancel timed-out review thread"
+                        );
+                    }
+                }
+                Ok(None) => {}
+                Err(error) => self.record_review_error(format!(
+                    "loading timed-out review job {job_id} for cancellation: {error:#}"
+                )),
+            }
+        }
         {
             let mut running = self.code_review.running.lock().unwrap();
             if running
