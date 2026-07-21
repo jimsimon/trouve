@@ -1124,26 +1124,32 @@ impl Engine {
             }
         }
         let _ = self.emit_code_review_updated(Some(job_id.clone()));
-        let result =
-            tokio::time::timeout(REVIEW_TIMEOUT, self.execute_code_review(&record, &cancel)).await;
+        let active_thread = Mutex::new(None);
+        let result = tokio::time::timeout(
+            REVIEW_TIMEOUT,
+            self.execute_code_review(&record, &cancel, &active_thread),
+        )
+        .await;
         if result.is_err() {
-            match self.store.code_review_job(&job_id) {
-                Ok(Some(current)) => {
-                    if let Some(thread_id) = current.job.thread_id
-                        && let Err(error) = self.cancel_turn(&thread_id)
-                    {
-                        tracing::warn!(
-                            job_id,
-                            thread_id,
-                            %error,
-                            "failed to cancel timed-out review thread"
-                        );
-                    }
+            cancel.cancel();
+            let active_thread = match active_thread.lock() {
+                Ok(mut active_thread) => active_thread.take(),
+                Err(error) => {
+                    self.record_review_error(format!(
+                        "loading active thread for timed-out review job {job_id}: {error}"
+                    ));
+                    None
                 }
-                Ok(None) => {}
-                Err(error) => self.record_review_error(format!(
-                    "loading timed-out review job {job_id} for cancellation: {error:#}"
-                )),
+            };
+            if let Some(thread_id) = active_thread
+                && let Err(error) = self.cancel_turn(&thread_id)
+            {
+                tracing::warn!(
+                    job_id,
+                    thread_id,
+                    %error,
+                    "failed to cancel timed-out review thread"
+                );
             }
         }
         {
@@ -1220,6 +1226,7 @@ impl Engine {
         self: &Arc<Self>,
         record: &CodeReviewJobRecord,
         superseded: &CancellationToken,
+        active_thread: &Mutex<Option<String>>,
     ) -> Result<String> {
         let job = &record.job;
         ensure_review_current(superseded)?;
@@ -1300,11 +1307,12 @@ impl Engine {
                     permission_mode: Some(PermissionMode::Yolo),
                 })?;
                 let output = self
-                    .run_code_review_turn(
+                    .run_tracked_code_review_turn(
                         job,
                         &thread.id,
                         reviewer_prompt(record, reviewer, batch, batch_index, batches.len()),
                         superseded,
+                        active_thread,
                     )
                     .await?;
                 let parsed = parse_review_output(&output)?;
@@ -1332,11 +1340,12 @@ impl Engine {
             }
         } else {
             let output = self
-                .run_code_review_turn(
+                .run_tracked_code_review_turn(
                     job,
                     &coordinator.id,
                     validation_prompt(record, &candidates, &diff_files)?,
                     superseded,
+                    active_thread,
                 )
                 .await?;
             let validated = parse_review_output(&output)?;
@@ -1362,6 +1371,25 @@ impl Engine {
         }
         let review_url = self.publish_review(&api, job, parsed).await?;
         Ok(review_url)
+    }
+
+    async fn run_tracked_code_review_turn(
+        self: &Arc<Self>,
+        job: &trouve_protocol::CodeReviewJob,
+        thread_id: &str,
+        prompt: String,
+        superseded: &CancellationToken,
+        active_thread: &Mutex<Option<String>>,
+    ) -> Result<String> {
+        *active_thread.lock().unwrap() = Some(thread_id.to_owned());
+        let result = self
+            .run_code_review_turn(job, thread_id, prompt, superseded)
+            .await;
+        let mut active_thread = active_thread.lock().unwrap();
+        if active_thread.as_deref() == Some(thread_id) {
+            *active_thread = None;
+        }
+        result
     }
 
     async fn run_code_review_turn(

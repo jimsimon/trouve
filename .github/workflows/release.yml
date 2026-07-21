@@ -17,7 +17,7 @@ permissions:
   contents: write
 
 concurrency:
-  group: release-trouve-search
+  group: release-trouve-search-${{ github.ref_name }}
   cancel-in-progress: false
 
 jobs:
@@ -161,18 +161,6 @@ jobs:
         id: version
         shell: bash
         run: echo "value=${GITHUB_REF_NAME#trouve-search-v}" >> "$GITHUB_OUTPUT"
-      - name: Check whether this is the current release
-        id: current-release
-        shell: bash
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          latest_tag="$(gh api "repos/${GITHUB_REPOSITORY}/releases/latest" --jq .tag_name)"
-          if [ "$latest_tag" = "$GITHUB_REF_NAME" ]; then
-            echo "latest=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "latest=false" >> "$GITHUB_OUTPUT"
-          fi
       - name: Log in to GitHub Container Registry
         uses: docker/login-action@af1e73f918a031802d376d3c8bbc3fe56130a9b0 # v4
         with:
@@ -190,7 +178,6 @@ jobs:
           images: ghcr.io/${{ github.repository_owner }}/${{ matrix.image }}
           tags: |
             type=raw,value=${{ steps.version.outputs.value }}
-            type=raw,value=latest,enable=${{ steps.current-release.outputs.latest }}
             type=sha,format=long
       - name: Build and publish
         uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7
@@ -203,6 +190,25 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha,scope=${{ matrix.component }}
           cache-to: type=gha,mode=max,scope=${{ matrix.component }}
+      - name: Check whether this is the current release
+        id: current-release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          latest_tag="$(gh api "repos/${GITHUB_REPOSITORY}/releases/latest" --jq .tag_name)"
+          if [ "$latest_tag" = "$GITHUB_REF_NAME" ]; then
+            echo "latest=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "latest=false" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Publish latest tag
+        if: steps.current-release.outputs.latest == 'true'
+        shell: bash
+        env:
+          IMAGE: ghcr.io/${{ github.repository_owner }}/${{ matrix.image }}
+          VERSION: ${{ steps.version.outputs.value }}
+        run: docker buildx imagetools create --tag "${IMAGE}:latest" "${IMAGE}:${VERSION}"
 
   publish-crate:
     needs: release
