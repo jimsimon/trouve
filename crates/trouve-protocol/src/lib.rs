@@ -121,7 +121,9 @@ pub use requests::*;
 // 1.17: code-review repository/job snapshots expose semantic-router model and
 // thinking settings; enabled policies require an explicit review model so
 // unattended review never relies on the engine's built-in model (additive).
-pub const PROTOCOL_VERSION: &str = "1.17";
+// 1.18: terminal tabs — plural GET/POST /v1/sessions/{id}/terminals list and
+// create independent PTYs while the singular compatibility endpoint remains.
+pub const PROTOCOL_VERSION: &str = "1.18";
 pub const EVENT_CURSOR_HEADER: &str = "x-trouve-event-cursor";
 
 pub type WorkspaceId = String;
