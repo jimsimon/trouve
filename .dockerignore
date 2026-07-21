@@ -1,0 +1,8 @@
+.git
+target
+reference
+benchmarks/repos
+benchmarks/results
+**/node_modules
+**/dist
+*.tmp.*

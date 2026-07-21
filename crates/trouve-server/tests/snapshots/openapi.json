@@ -7,7 +7,7 @@
       "name": "MIT",
       "identifier": "MIT"
     },
-    "version": "1.0"
+    "version": "1.1"
   },
   "paths": {
     "/v1/approvals": {
@@ -433,6 +433,131 @@
             "description": ""
           },
           "404": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/code-review": {
+      "get": {
+        "tags": [],
+        "operationId": "code_review_dashboard",
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CodeReviewDashboard"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/code-review/github-app": {
+      "put": {
+        "tags": [],
+        "operationId": "configure_github_review_app",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ConfigureGithubAppRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GithubAppStatus"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/code-review/refresh": {
+      "post": {
+        "tags": [],
+        "operationId": "refresh_code_reviews",
+        "responses": {
+          "204": {
+            "description": ""
+          },
+          "400": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/code-review/repository": {
+      "put": {
+        "tags": [],
+        "operationId": "update_code_review_repository",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UpdateCodeReviewRepositoryRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CodeReviewRepository"
+                }
+              }
+            }
+          },
+          "400": {
             "description": "",
             "content": {
               "application/json": {
@@ -3423,6 +3548,176 @@
           }
         }
       },
+      "CodeReviewDashboard": {
+        "type": "object",
+        "required": [
+          "app",
+          "repositories",
+          "jobs"
+        ],
+        "properties": {
+          "app": {
+            "$ref": "#/components/schemas/GithubAppStatus"
+          },
+          "jobs": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/CodeReviewJob"
+            }
+          },
+          "repositories": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/CodeReviewRepository"
+            }
+          }
+        }
+      },
+      "CodeReviewJob": {
+        "type": "object",
+        "description": "A durable execution of one model review against one immutable PR head.",
+        "required": [
+          "id",
+          "installation_id",
+          "repository",
+          "pull_number",
+          "pull_title",
+          "pull_url",
+          "head_sha",
+          "base_ref",
+          "head_ref",
+          "trigger",
+          "status",
+          "created_at"
+        ],
+        "properties": {
+          "base_ref": {
+            "type": "string"
+          },
+          "completed_at": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time"
+          },
+          "created_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "error": {
+            "type": "string"
+          },
+          "head_ref": {
+            "type": "string"
+          },
+          "head_sha": {
+            "type": "string"
+          },
+          "id": {
+            "type": "string"
+          },
+          "installation_id": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "model": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "pull_number": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "pull_title": {
+            "type": "string"
+          },
+          "pull_url": {
+            "type": "string"
+          },
+          "repository": {
+            "type": "string"
+          },
+          "review_url": {
+            "type": "string"
+          },
+          "session_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "started_at": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time"
+          },
+          "status": {
+            "type": "string",
+            "description": "`queued`, `running`, `succeeded`, `failed`, or `stale`."
+          },
+          "thread_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "trigger": {
+            "type": "string",
+            "description": "`automatic`, `manual`, or `retry`."
+          }
+        }
+      },
+      "CodeReviewMode": {
+        "type": "string",
+        "description": "Whether an installed repository participates in automated code review.",
+        "enum": [
+          "off",
+          "manual",
+          "automatic"
+        ]
+      },
+      "CodeReviewRepository": {
+        "type": "object",
+        "description": "One repository visible to a GitHub App installation plus trouve's local\nreview policy for it.",
+        "required": [
+          "installation_id",
+          "repository"
+        ],
+        "properties": {
+          "installation_id": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "mode": {
+            "$ref": "#/components/schemas/CodeReviewMode"
+          },
+          "model": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Provider-qualified model; absent means the review mode/global default."
+          },
+          "private": {
+            "type": "boolean"
+          },
+          "prompt": {
+            "type": "string",
+            "description": "Extra repository-specific review instructions."
+          },
+          "repository": {
+            "type": "string"
+          }
+        }
+      },
       "CommandInfo": {
         "type": "object",
         "description": "One slash command / skill the vendor harness accepts in prompts (e.g.\n\"/simplify\"), surfaced by clients as prompt-box completions.",
@@ -3436,6 +3731,29 @@
           "name": {
             "type": "string",
             "description": "Name without the leading slash."
+          }
+        }
+      },
+      "ConfigureGithubAppRequest": {
+        "type": "object",
+        "description": "Configure the GitHub App used for code reviews. The server validates the\nprivate key against GitHub before replacing any stored credentials.",
+        "required": [
+          "app_id",
+          "private_key_pem"
+        ],
+        "properties": {
+          "app_id": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "private_key_pem": {
+            "type": "string",
+            "description": "PEM-encoded RSA private key downloaded from the GitHub App settings."
+          },
+          "webhook_secret": {
+            "type": "string",
+            "description": "Secret used to verify `X-Hub-Signature-256`. Empty disables webhooks\nand leaves reconciliation polling as the only trigger source."
           }
         }
       },
@@ -3475,6 +3793,13 @@
               "null"
             ],
             "description": "Base ref the session branch is created from (default: workspace HEAD)."
+          },
+          "checkout_ref": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Optional ref used to create the session branch while `base_ref`\nremains the comparison base. Automated PR reviews use this to check\nout the exact head SHA and still expose the base-to-head diff."
           },
           "fetch_latest": {
             "type": "boolean",
@@ -4462,6 +4787,27 @@
           },
           {
             "type": "object",
+            "description": "GitHub App configuration, repository policy, or a durable review job\nchanged. Clients refetch `/v1/code-review` and fold the replacement.",
+            "required": [
+              "type"
+            ],
+            "properties": {
+              "job_id": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "type": {
+                "type": "string",
+                "enum": [
+                  "code_review.updated"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
             "description": "The server's internet reachability changed (it is the one talking to\nmodel vendors, so it owns this state). While offline, `/v1/models`\nlists only models that can run without internet (local provider,\nloopback endpoints); clients gate prompt entry on having usable\nmodels and announce recovery. `ServerInfo.online` carries the same\nstate for initial fetches.",
             "required": [
               "online",
@@ -4526,6 +4872,65 @@
           },
           "path": {
             "type": "string"
+          }
+        }
+      },
+      "GithubAppStatus": {
+        "type": "object",
+        "description": "Public GitHub App state. Private keys and webhook secrets are never\nreturned by the protocol.",
+        "required": [
+          "configured"
+        ],
+        "properties": {
+          "app_id": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "minimum": 0
+          },
+          "bot_login": {
+            "type": "string"
+          },
+          "configured": {
+            "type": "boolean"
+          },
+          "installation_count": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "last_error": {
+            "type": "string"
+          },
+          "last_poll_at": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time"
+          },
+          "rate_limit_remaining": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "minimum": 0
+          },
+          "rate_limit_reset_at": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time"
+          },
+          "slug": {
+            "type": "string"
+          },
+          "webhook_configured": {
+            "type": "boolean"
           }
         }
       },
@@ -5151,6 +5556,13 @@
           },
           "head": {
             "type": "string"
+          },
+          "head_sha": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Exact pull-request head commit. Older servers omitted this field."
           },
           "host": {
             "type": "string",
@@ -5897,6 +6309,36 @@
             "type": "integer",
             "format": "int64",
             "minimum": 0
+          }
+        }
+      },
+      "UpdateCodeReviewRepositoryRequest": {
+        "type": "object",
+        "required": [
+          "installation_id",
+          "repository",
+          "mode"
+        ],
+        "properties": {
+          "installation_id": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "mode": {
+            "$ref": "#/components/schemas/CodeReviewMode"
+          },
+          "model": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "prompt": {
+            "type": "string"
+          },
+          "repository": {
+            "type": "string"
           }
         }
       },

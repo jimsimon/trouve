@@ -3731,3 +3731,55 @@ async fn offline_filters_models_and_reports_connectivity() {
     .await;
     assert!(!seen.is_empty());
 }
+
+#[tokio::test]
+async fn code_review_dashboard_and_repository_policy_round_trip() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Store::open(&tmp.path().join("db/trouve.db")).unwrap();
+    let engine = Arc::new(
+        Engine::new(store, tmp.path().join("data"), &Config::default()).with_config_dir(None),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let router = trouve_server::build_router(engine);
+    tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+    let base = format!("http://{addr}/v1/code-review");
+    let client = reqwest::Client::new();
+
+    let empty: serde_json::Value = client
+        .get(&base)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(empty["app"]["configured"], false);
+    assert_eq!(empty["repositories"], serde_json::json!([]));
+
+    let response = client
+        .put(format!("{base}/repository"))
+        .json(&serde_json::json!({
+            "installation_id": 7,
+            "repository": "acme/widgets",
+            "mode": "automatic",
+            "model": "openai/gpt-5",
+            "prompt": "focus on concurrency"
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert!(response.status().is_success());
+
+    let dashboard: serde_json::Value = client
+        .get(&base)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(dashboard["repositories"][0]["repository"], "acme/widgets");
+    assert_eq!(dashboard["repositories"][0]["mode"], "automatic");
+    assert_eq!(dashboard["repositories"][0]["model"], "openai/gpt-5");
+}

@@ -3349,6 +3349,7 @@ impl Controller {
                         workspace_id: workspace.id,
                         title: Some(trouve_client_core::title::summarize_session_title(&prompt)),
                         base_ref: self.branches.get(selection.branch_idx).cloned(),
+                        checkout_ref: None,
                         fetch_latest: selection.fetch_latest,
                     })
                     .await?;
@@ -7062,6 +7063,7 @@ mod tests {
             draft: false,
             base: "main".into(),
             head: "feature".into(),
+            head_sha: None,
             checks: Vec::new(),
             reviews: Vec::new(),
             author: "author".into(),
@@ -7292,6 +7294,7 @@ mod tests {
             draft,
             base: "main".into(),
             head: "feature".into(),
+            head_sha: None,
             checks: Vec::new(),
             reviews: Vec::new(),
             author: String::new(),

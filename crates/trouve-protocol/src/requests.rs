@@ -121,6 +121,11 @@ pub struct CreateSessionRequest {
     /// Base ref the session branch is created from (default: workspace HEAD).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub base_ref: Option<String>,
+    /// Optional ref used to create the session branch while `base_ref`
+    /// remains the comparison base. Automated PR reviews use this to check
+    /// out the exact head SHA and still expose the base-to-head diff.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checkout_ref: Option<String>,
     /// Fetch the base branch's configured upstream and start from its latest
     /// remote commit. Refs without an upstream are used as-is.
     #[serde(default = "default_true")]
@@ -417,6 +422,9 @@ pub struct PrInfo {
     pub draft: bool,
     pub base: String,
     pub head: String,
+    /// Exact pull-request head commit. Older servers omitted this field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub head_sha: Option<String>,
     pub checks: Vec<CheckRun>,
     pub reviews: Vec<PrReview>,
     /// PR author's login.
@@ -594,6 +602,127 @@ pub struct AddGithubHostRequest {
     /// Client id of an OAuth app on that instance (device flow enabled).
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub client_id: String,
+}
+
+// --- automated code review -------------------------------------------------
+
+/// Whether an installed repository participates in automated code review.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum CodeReviewMode {
+    #[default]
+    Off,
+    /// Review only when the App bot is requested through GitHub's reviewer UI.
+    Manual,
+    /// Review every new non-draft head SHA and manual re-requests.
+    Automatic,
+}
+
+/// Public GitHub App state. Private keys and webhook secrets are never
+/// returned by the protocol.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, ToSchema)]
+pub struct GithubAppStatus {
+    pub configured: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub app_id: Option<u64>,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub slug: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub bot_login: String,
+    #[serde(default)]
+    pub webhook_configured: bool,
+    #[serde(default)]
+    pub installation_count: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_poll_at: Option<chrono::DateTime<chrono::Utc>>,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub last_error: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rate_limit_remaining: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rate_limit_reset_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+/// Configure the GitHub App used for code reviews. The server validates the
+/// private key against GitHub before replacing any stored credentials.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct ConfigureGithubAppRequest {
+    pub app_id: u64,
+    /// PEM-encoded RSA private key downloaded from the GitHub App settings.
+    pub private_key_pem: String,
+    /// Secret used to verify `X-Hub-Signature-256`. Empty disables webhooks
+    /// and leaves reconciliation polling as the only trigger source.
+    #[serde(default)]
+    pub webhook_secret: String,
+}
+
+/// One repository visible to a GitHub App installation plus trouve's local
+/// review policy for it.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct CodeReviewRepository {
+    pub installation_id: u64,
+    pub repository: String,
+    #[serde(default)]
+    pub private: bool,
+    #[serde(default)]
+    pub mode: CodeReviewMode,
+    /// Provider-qualified model; absent means the review mode/global default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    /// Extra repository-specific review instructions.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub prompt: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct UpdateCodeReviewRepositoryRequest {
+    pub installation_id: u64,
+    pub repository: String,
+    pub mode: CodeReviewMode,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(default)]
+    pub prompt: String,
+}
+
+/// A durable execution of one model review against one immutable PR head.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct CodeReviewJob {
+    pub id: String,
+    pub installation_id: u64,
+    pub repository: String,
+    pub pull_number: u64,
+    pub pull_title: String,
+    pub pull_url: String,
+    pub head_sha: String,
+    pub base_ref: String,
+    pub head_ref: String,
+    /// `automatic`, `manual`, or `retry`.
+    pub trigger: String,
+    /// `queued`, `running`, `succeeded`, `failed`, or `stale`.
+    pub status: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thread_id: Option<String>,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub review_url: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub error: String,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub started_at: Option<chrono::DateTime<chrono::Utc>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completed_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct CodeReviewDashboard {
+    pub app: GithubAppStatus,
+    pub repositories: Vec<CodeReviewRepository>,
+    pub jobs: Vec<CodeReviewJob>,
 }
 
 // --- branches --------------------------------------------------------------
@@ -1047,5 +1176,6 @@ mod tests {
             serde_json::from_value(serde_json::json!({ "workspace_id": "ws_test" })).unwrap();
 
         assert!(request.fetch_latest);
+        assert!(request.checkout_ref.is_none());
     }
 }

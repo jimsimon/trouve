@@ -59,11 +59,21 @@ pub struct Config {
     /// Integrations, or by hand here.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub github_enterprise: Vec<GithubEnterpriseConfig>,
+    /// GitHub App identity used by the headless code-review service. The RSA
+    /// private key and webhook secret live in the secret store, never here.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub github_review_app: Option<GithubReviewAppConfig>,
     /// Set when the on-disk config failed to parse and we fell back to
     /// defaults. Never serialized; `save_to` refuses to persist in this
     /// state so a parse error can't pave over the user's real config.
     #[serde(skip)]
     pub load_failed: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GithubReviewAppConfig {
+    pub app_id: u64,
+    pub slug: String,
 }
 
 /// One GitHub Enterprise Server instance.

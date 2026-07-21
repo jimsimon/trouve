@@ -5,6 +5,7 @@
 //! Local mode uses [`LocalToolExecutor`]; cloud isolation later swaps in a
 //! container-backed implementation without touching the loop.
 
+mod diff;
 mod fs;
 mod glob;
 mod grep;
@@ -126,9 +127,29 @@ pub trait ToolExecutor: Send + Sync {
     /// `None` when the tool is unknown.
     fn tool_mutates(&self, name: &str) -> Option<bool>;
     async fn execute(&self, ctx: &ToolCtx, name: &str, args: &Value) -> ToolResult;
+    /// Prepare the trusted local mirror used by the headless review service.
+    /// This is intentionally part of the executor rather than review runtime
+    /// code so git/network/filesystem mutations retain one chokepoint.
+    async fn sync_review_repository(
+        &self,
+        _request: &ReviewRepositorySync,
+    ) -> Result<PathBuf, String> {
+        Err("review repository sync is unavailable in this executor".into())
+    }
     /// Release any per-worktree resources (e.g. spawned MCP server
     /// processes) when a session/worktree is going away. Default no-op.
     async fn evict_worktree(&self, _worktree: &Path) {}
+}
+
+/// Inputs for one authenticated GitHub App fetch. Tokens are passed through
+/// process environment, never embedded in a remote URL or persisted config.
+pub struct ReviewRepositorySync {
+    pub root: PathBuf,
+    pub repository: String,
+    pub pull_number: u64,
+    pub base_sha: String,
+    pub head_sha: String,
+    pub token: String,
 }
 
 /// Runs tools in-process against the local filesystem/shell, plus any MCP
@@ -161,6 +182,7 @@ impl LocalToolExecutor {
                 Arc::new(fs::EditFile),
                 Arc::new(patch::ApplyPatch),
                 Arc::new(fs::ListDir),
+                Arc::new(diff::GitDiff),
                 Arc::new(glob::Glob),
                 Arc::new(shell::Shell { jobs: jobs.clone() }),
                 Arc::new(shell::ShellOutput { jobs: jobs.clone() }),
@@ -245,6 +267,80 @@ impl ToolExecutor for LocalToolExecutor {
             Some(tool) => tool.run(ctx, args).await,
             None => ToolResult::error(format!("unknown tool: {name}")),
         }
+    }
+
+    async fn sync_review_repository(
+        &self,
+        request: &ReviewRepositorySync,
+    ) -> Result<PathBuf, String> {
+        use base64::Engine as _;
+
+        let repository_path = request.root.join(&request.repository);
+        let parent = repository_path
+            .parent()
+            .ok_or_else(|| "invalid review repository path".to_string())?;
+        std::fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+        if repository_path.exists() && !repository_path.join(".git").is_dir() {
+            return Err(format!(
+                "{} exists but is not a git repository",
+                repository_path.display()
+            ));
+        }
+
+        let auth = base64::engine::general_purpose::STANDARD
+            .encode(format!("x-access-token:{}", request.token));
+        let run = |args: Vec<String>| {
+            let repository_path = repository_path.clone();
+            let auth = auth.clone();
+            async move {
+                let output = tokio::process::Command::new("git")
+                    .args(args)
+                    .current_dir(&repository_path)
+                    .env("GIT_CONFIG_COUNT", "1")
+                    .env("GIT_CONFIG_KEY_0", "http.https://github.com/.extraheader")
+                    .env("GIT_CONFIG_VALUE_0", format!("AUTHORIZATION: basic {auth}"))
+                    .env("GIT_TERMINAL_PROMPT", "0")
+                    .output()
+                    .await
+                    .map_err(|error| format!("running git: {error}"))?;
+                if output.status.success() {
+                    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+                } else {
+                    Err(String::from_utf8_lossy(&output.stderr).trim().to_string())
+                }
+            }
+        };
+
+        if !repository_path.exists() {
+            std::fs::create_dir_all(&repository_path).map_err(|error| error.to_string())?;
+            run(vec!["init".into()]).await?;
+            run(vec![
+                "remote".into(),
+                "add".into(),
+                "origin".into(),
+                format!("https://github.com/{}.git", request.repository),
+            ])
+            .await?;
+        }
+
+        let pull_ref = format!("refs/remotes/origin/trouve-pr-{}", request.pull_number);
+        run(vec![
+            "fetch".into(),
+            "--force".into(),
+            "--no-tags".into(),
+            "origin".into(),
+            format!("+{}:refs/remotes/origin/trouve-base", request.base_sha),
+            format!("+refs/pull/{}/head:{pull_ref}", request.pull_number),
+        ])
+        .await?;
+        let actual = run(vec!["rev-parse".into(), pull_ref]).await?;
+        if actual != request.head_sha {
+            return Err(format!(
+                "pull request moved while fetching: expected {}, got {actual}",
+                request.head_sha
+            ));
+        }
+        Ok(repository_path)
     }
 
     async fn evict_worktree(&self, worktree: &Path) {

@@ -1,0 +1,24 @@
+services:
+  trouve-server:
+    build:
+      context: .
+      dockerfile: Dockerfile.server
+    restart: unless-stopped
+    environment:
+      TROUVE_ALLOW_REMOTE: "1"
+      TROUVE_AUTH_TOKEN: "${TROUVE_AUTH_TOKEN:?set TROUVE_AUTH_TOKEN in .env}"
+      TROUVE_CODE_REVIEW_POLL_INTERVAL_SECONDS: "${TROUVE_CODE_REVIEW_POLL_INTERVAL_SECONDS:-60}"
+      RUST_LOG: "${RUST_LOG:-info}"
+    volumes:
+      - trouve-data:/var/lib/trouve
+
+  review-ui:
+    build: web/review-ui
+    restart: unless-stopped
+    depends_on:
+      - trouve-server
+    ports:
+      - "${TROUVE_REVIEW_PORT:-7433}:80"
+
+volumes:
+  trouve-data:

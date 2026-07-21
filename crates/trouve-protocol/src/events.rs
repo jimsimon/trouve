@@ -312,6 +312,13 @@ pub enum Event {
         #[serde(default, skip_serializing_if = "String::is_empty")]
         error: String,
     },
+    /// GitHub App configuration, repository policy, or a durable review job
+    /// changed. Clients refetch `/v1/code-review` and fold the replacement.
+    #[serde(rename = "code_review.updated")]
+    CodeReviewUpdated {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        job_id: Option<String>,
+    },
     /// The server's internet reachability changed (it is the one talking to
     /// model vendors, so it owns this state). While offline, `/v1/models`
     /// lists only models that can run without internet (local provider,
@@ -341,6 +348,12 @@ mod tests {
         };
         let v = serde_json::to_value(&ev).unwrap();
         assert_eq!(v["type"], "assistant.delta");
+
+        let review = serde_json::to_value(Event::CodeReviewUpdated {
+            job_id: Some("rv_1".into()),
+        })
+        .unwrap();
+        assert_eq!(review["type"], "code_review.updated");
     }
 
     #[test]

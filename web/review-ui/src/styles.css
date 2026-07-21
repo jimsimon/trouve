@@ -1,0 +1,75 @@
+:root {
+  font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  color: #e8e7e3;
+  background: #0d100f;
+  font-synthesis: none;
+}
+
+* { box-sizing: border-box; }
+body { margin: 0; min-width: 320px; min-height: 100vh; background: radial-gradient(circle at 15% 0%, #19342c 0, transparent 32rem), #0d100f; }
+button, input, select, textarea { font: inherit; }
+button { border: 0; border-radius: 8px; padding: .72rem 1rem; color: #092017; background: #82e6b8; font-weight: 700; cursor: pointer; }
+button:hover { background: #a1f1ca; }
+button:disabled { opacity: .55; cursor: wait; }
+button.ghost { color: #d5d8d6; background: #252a28; }
+a { color: #91eac0; text-decoration: none; }
+a:hover { text-decoration: underline; }
+h1, h2, p { margin-top: 0; }
+h1 { margin-bottom: 0; font-size: clamp(1.7rem, 4vw, 2.6rem); letter-spacing: -.04em; }
+h2 { margin-bottom: 1rem; letter-spacing: -.025em; }
+main { width: min(1180px, calc(100% - 2rem)); margin: 0 auto; padding: 2.5rem 0 5rem; }
+header, .section-title { display: flex; align-items: center; justify-content: space-between; gap: 1rem; }
+.header-actions { display: flex; align-items: center; gap: .8rem; }
+.eyebrow { color: #82e6b8; font-size: .72rem; font-weight: 800; letter-spacing: .16em; text-transform: uppercase; margin-bottom: .35rem; }
+.lede, .muted { color: #9ca39f; }
+.card { padding: 1.4rem; border: 1px solid #2b302e; border-radius: 14px; background: rgba(21, 25, 23, .92); box-shadow: 0 18px 60px #0004; }
+.login { width: min(470px, 100%); margin: 12vh auto 0; padding: 2rem; }
+.metrics { display: grid; grid-template-columns: repeat(4, 1fr); gap: .8rem; margin: 2rem 0 .8rem; }
+.metrics article { min-height: 105px; padding: 1rem; border: 1px solid #2b302e; border-radius: 12px; background: #151917; }
+.metrics span, .metrics small { display: block; color: #8e9691; font-size: .76rem; }
+.metrics strong { display: block; margin: .7rem 0 .3rem; font-size: 1.05rem; overflow-wrap: anywhere; }
+.grid { display: grid; grid-template-columns: 1fr 1fr; gap: .8rem; }
+.wide { margin-top: .8rem; }
+.stack { display: grid; gap: .85rem; }
+.stack.compact { margin-top: 1.2rem; }
+.split { display: grid; grid-template-columns: 1fr 1fr; gap: .7rem; }
+label { display: grid; gap: .4rem; color: #bfc4c1; font-size: .82rem; font-weight: 650; }
+label small { color: #77807b; font-weight: 500; }
+input, select, textarea { width: 100%; min-width: 0; border: 1px solid #343b37; border-radius: 8px; padding: .72rem .8rem; color: #e8e7e3; background: #0d100f; outline: none; }
+input:focus, select:focus, textarea:focus { border-color: #66c99e; box-shadow: 0 0 0 3px #66c99e22; }
+textarea { resize: vertical; }
+.provider-list { display: flex; flex-wrap: wrap; gap: .5rem; }
+.provider-list span, .repo-name span { border-radius: 999px; padding: .35rem .6rem; background: #272d2a; font-size: .78rem; }
+.provider-list i { margin-left: .3rem; color: #ef9b80; font-style: normal; }
+.provider-list i.ready { color: #82e6b8; }
+.repo { display: grid; grid-template-columns: minmax(180px, 1.2fr) 130px minmax(190px, 1fr) minmax(210px, 1.3fr) auto; gap: .6rem; align-items: center; padding: .75rem 0; border-top: 1px solid #292e2b; }
+.repo-name { display: flex; align-items: center; gap: .5rem; overflow-wrap: anywhere; }
+.jobs article { display: grid; grid-template-columns: 90px 1fr auto; align-items: start; gap: .8rem; padding: 1rem 0; border-top: 1px solid #292e2b; }
+.jobs strong, .jobs small { display: block; margin-top: .22rem; }
+.jobs small { color: #818a85; }
+.job-status, .status { width: max-content; border-radius: 999px; padding: .3rem .55rem; background: #343a37; font-size: .7rem; font-weight: 800; text-transform: uppercase; letter-spacing: .05em; }
+.job-status.succeeded, .status.good { color: #8debc0; background: #173b2d; }
+.job-status.failed, .status.bad { color: #ffac98; background: #49251e; }
+.job-status.running { color: #ffe090; background: #443817; }
+.job-status.stale { color: #c3b5ef; background: #31294a; }
+.banner { margin-top: 1.2rem; padding: .8rem 1rem; border-radius: 9px; background: #49251e; }
+.error { color: #ffab96; }
+.empty { color: #747d78; padding: 1.2rem 0; }
+.review-link { white-space: nowrap; }
+
+@media (max-width: 880px) {
+  .metrics { grid-template-columns: 1fr 1fr; }
+  .grid { grid-template-columns: 1fr; }
+  .repo { grid-template-columns: 1fr 1fr; }
+  .repo-name, .repo input { grid-column: 1 / -1; }
+  .jobs article { grid-template-columns: 80px 1fr; }
+  .review-link { grid-column: 2; }
+}
+
+@media (max-width: 560px) {
+  main { width: min(100% - 1rem, 1180px); padding-top: 1rem; }
+  header, .section-title { align-items: flex-start; flex-direction: column; }
+  .metrics, .split { grid-template-columns: 1fr; }
+  .repo { grid-template-columns: 1fr; }
+  .repo-name, .repo input { grid-column: auto; }
+}

@@ -149,6 +149,14 @@ Per-harness plugin install commands:
 
 See [search-plugin](npm/search-plugin/README.md) for details.
 
+## Self-hosted pull-request reviews
+
+The harness can also run as a GitHub App-backed review bot: webhooks plus a
+reconciliation poll create read-only review sessions at immutable PR head
+SHAs, and a separate Dockerized web dashboard configures providers, models,
+and per-repository automatic/manual policy. See
+[docs/code-review.md](docs/code-review.md) for deployment and GitHub App setup.
+
 ## Ignoring files
 
 `.gitignore` files are honoured per directory (in a git repository, git's own

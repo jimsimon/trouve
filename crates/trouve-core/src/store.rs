@@ -128,6 +128,50 @@ CREATE TABLE IF NOT EXISTS automations (
   last_error TEXT NOT NULL DEFAULT '',
   created_at TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS code_review_repositories (
+  repository TEXT PRIMARY KEY,
+  installation_id INTEGER NOT NULL,
+  private INTEGER NOT NULL DEFAULT 0,
+  mode TEXT NOT NULL DEFAULT 'off',
+  model TEXT,
+  prompt TEXT NOT NULL DEFAULT '',
+  updated_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS code_review_jobs (
+  id TEXT PRIMARY KEY,
+  dedupe_key TEXT NOT NULL UNIQUE,
+  installation_id INTEGER NOT NULL,
+  repository TEXT NOT NULL,
+  pull_number INTEGER NOT NULL,
+  pull_title TEXT NOT NULL,
+  pull_url TEXT NOT NULL,
+  head_sha TEXT NOT NULL,
+  base_ref TEXT NOT NULL,
+  head_ref TEXT NOT NULL,
+  trigger TEXT NOT NULL,
+  status TEXT NOT NULL,
+  model TEXT,
+  prompt TEXT NOT NULL DEFAULT '',
+  session_id TEXT,
+  thread_id TEXT,
+  review_url TEXT NOT NULL DEFAULT '',
+  error TEXT NOT NULL DEFAULT '',
+  created_at TEXT NOT NULL,
+  started_at TEXT,
+  completed_at TEXT
+);
+CREATE INDEX IF NOT EXISTS code_review_jobs_status ON code_review_jobs (status, created_at);
+CREATE TABLE IF NOT EXISTS code_review_pr_state (
+  repository TEXT NOT NULL,
+  pull_number INTEGER NOT NULL,
+  manual_requested INTEGER NOT NULL DEFAULT 0,
+  manual_generation INTEGER NOT NULL DEFAULT 0,
+  PRIMARY KEY (repository, pull_number)
+);
+CREATE TABLE IF NOT EXISTS github_webhook_deliveries (
+  delivery_id TEXT PRIMARY KEY,
+  received_at TEXT NOT NULL
+);
 "#;
 
 /// Additive migrations for databases created before a column existed.
@@ -232,6 +276,97 @@ fn row_to_automation(r: &rusqlite::Row<'_>) -> rusqlite::Result<trouve_protocol:
         created_at: r.get(13)?,
     })
 }
+
+fn code_review_mode_from(value: &str) -> trouve_protocol::CodeReviewMode {
+    match value {
+        "manual" => trouve_protocol::CodeReviewMode::Manual,
+        "automatic" => trouve_protocol::CodeReviewMode::Automatic,
+        _ => trouve_protocol::CodeReviewMode::Off,
+    }
+}
+
+fn code_review_mode_str(value: trouve_protocol::CodeReviewMode) -> &'static str {
+    match value {
+        trouve_protocol::CodeReviewMode::Off => "off",
+        trouve_protocol::CodeReviewMode::Manual => "manual",
+        trouve_protocol::CodeReviewMode::Automatic => "automatic",
+    }
+}
+
+fn parse_datetime(value: String) -> chrono::DateTime<chrono::Utc> {
+    value.parse().unwrap_or_else(|_| chrono::Utc::now())
+}
+
+fn parse_optional_datetime(value: Option<String>) -> Option<chrono::DateTime<chrono::Utc>> {
+    value.and_then(|value| value.parse().ok())
+}
+
+fn row_to_code_review_repository(
+    r: &rusqlite::Row<'_>,
+) -> rusqlite::Result<trouve_protocol::CodeReviewRepository> {
+    let mode: String = r.get(3)?;
+    Ok(trouve_protocol::CodeReviewRepository {
+        repository: r.get(0)?,
+        installation_id: r.get::<_, i64>(1)? as u64,
+        private: r.get(2)?,
+        mode: code_review_mode_from(&mode),
+        model: r.get(4)?,
+        prompt: r.get(5)?,
+    })
+}
+
+#[derive(Debug, Clone)]
+pub struct NewCodeReviewJob {
+    pub dedupe_key: String,
+    pub installation_id: u64,
+    pub repository: String,
+    pub pull_number: u64,
+    pub pull_title: String,
+    pub pull_url: String,
+    pub head_sha: String,
+    pub base_ref: String,
+    pub head_ref: String,
+    pub trigger: String,
+    pub model: Option<String>,
+    pub prompt: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct CodeReviewJobRecord {
+    pub job: trouve_protocol::CodeReviewJob,
+    pub prompt: String,
+}
+
+fn row_to_code_review_job(r: &rusqlite::Row<'_>) -> rusqlite::Result<CodeReviewJobRecord> {
+    Ok(CodeReviewJobRecord {
+        job: trouve_protocol::CodeReviewJob {
+            id: r.get(0)?,
+            installation_id: r.get::<_, i64>(1)? as u64,
+            repository: r.get(2)?,
+            pull_number: r.get::<_, i64>(3)? as u64,
+            pull_title: r.get(4)?,
+            pull_url: r.get(5)?,
+            head_sha: r.get(6)?,
+            base_ref: r.get(7)?,
+            head_ref: r.get(8)?,
+            trigger: r.get(9)?,
+            status: r.get(10)?,
+            model: r.get(11)?,
+            session_id: r.get(13)?,
+            thread_id: r.get(14)?,
+            review_url: r.get(15)?,
+            error: r.get(16)?,
+            created_at: parse_datetime(r.get(17)?),
+            started_at: parse_optional_datetime(r.get(18)?),
+            completed_at: parse_optional_datetime(r.get(19)?),
+        },
+        prompt: r.get(12)?,
+    })
+}
+
+const CODE_REVIEW_JOB_COLUMNS: &str = "id, installation_id, repository, pull_number, pull_title, pull_url, head_sha, \
+     base_ref, head_ref, trigger, status, model, prompt, session_id, thread_id, \
+     review_url, error, created_at, started_at, completed_at";
 
 pub enum UsageScope<'a> {
     Thread(&'a str),
@@ -1223,6 +1358,269 @@ impl Store {
         let conn = self.conn.lock().unwrap();
         let n = conn.execute("DELETE FROM automations WHERE id = ?1", params![id])?;
         Ok(n > 0)
+    }
+
+    // --- automated code review ---------------------------------------------
+
+    pub fn upsert_discovered_code_review_repository(
+        &self,
+        installation_id: u64,
+        repository: &str,
+        private: bool,
+    ) -> Result<()> {
+        self.conn.lock().unwrap().execute(
+            "INSERT INTO code_review_repositories
+                    (repository, installation_id, private, mode, updated_at)
+             VALUES (?1, ?2, ?3, 'off', ?4)
+             ON CONFLICT(repository) DO UPDATE SET
+               installation_id = excluded.installation_id,
+               private = excluded.private,
+               updated_at = excluded.updated_at",
+            params![
+                repository,
+                installation_id as i64,
+                private,
+                chrono::Utc::now().to_rfc3339()
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn list_code_review_repositories(
+        &self,
+    ) -> Result<Vec<trouve_protocol::CodeReviewRepository>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT repository, installation_id, private, mode, model, prompt
+             FROM code_review_repositories ORDER BY repository",
+        )?;
+        let rows = stmt.query_map([], row_to_code_review_repository)?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
+    }
+
+    pub fn update_code_review_repository(
+        &self,
+        request: &trouve_protocol::UpdateCodeReviewRepositoryRequest,
+    ) -> Result<()> {
+        self.conn.lock().unwrap().execute(
+            "INSERT INTO code_review_repositories
+                    (repository, installation_id, private, mode, model, prompt, updated_at)
+             VALUES (?1, ?2, 0, ?3, ?4, ?5, ?6)
+             ON CONFLICT(repository) DO UPDATE SET
+               installation_id = excluded.installation_id,
+               mode = excluded.mode,
+               model = excluded.model,
+               prompt = excluded.prompt,
+               updated_at = excluded.updated_at",
+            params![
+                request.repository,
+                request.installation_id as i64,
+                code_review_mode_str(request.mode),
+                request.model,
+                request.prompt,
+                chrono::Utc::now().to_rfc3339(),
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn enqueue_code_review_job(
+        &self,
+        new_job: &NewCodeReviewJob,
+    ) -> Result<Option<trouve_protocol::CodeReviewJob>> {
+        let id = crate::new_id("rv");
+        let now = chrono::Utc::now().to_rfc3339();
+        let conn = self.conn.lock().unwrap();
+        let inserted = conn.execute(
+            "INSERT OR IGNORE INTO code_review_jobs
+                    (id, dedupe_key, installation_id, repository, pull_number, pull_title,
+                     pull_url, head_sha, base_ref, head_ref, trigger, status, model, prompt,
+                     created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, 'queued', ?12, ?13, ?14)",
+            params![
+                id,
+                new_job.dedupe_key,
+                new_job.installation_id as i64,
+                new_job.repository,
+                new_job.pull_number as i64,
+                new_job.pull_title,
+                new_job.pull_url,
+                new_job.head_sha,
+                new_job.base_ref,
+                new_job.head_ref,
+                new_job.trigger,
+                new_job.model,
+                new_job.prompt,
+                now,
+            ],
+        )?;
+        if inserted == 0 {
+            return Ok(None);
+        }
+        Ok(Some(
+            conn.query_row(
+                &format!("SELECT {CODE_REVIEW_JOB_COLUMNS} FROM code_review_jobs WHERE id = ?1"),
+                params![id],
+                row_to_code_review_job,
+            )?
+            .job,
+        ))
+    }
+
+    pub fn list_code_review_jobs(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<trouve_protocol::CodeReviewJob>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {CODE_REVIEW_JOB_COLUMNS} FROM code_review_jobs
+             ORDER BY created_at DESC LIMIT ?1"
+        ))?;
+        let rows = stmt.query_map(params![limit as i64], row_to_code_review_job)?;
+        let records = rows.collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(records.into_iter().map(|record| record.job).collect())
+    }
+
+    pub fn code_review_job(&self, id: &str) -> Result<Option<CodeReviewJobRecord>> {
+        let conn = self.conn.lock().unwrap();
+        Ok(conn
+            .query_row(
+                &format!("SELECT {CODE_REVIEW_JOB_COLUMNS} FROM code_review_jobs WHERE id = ?1"),
+                params![id],
+                row_to_code_review_job,
+            )
+            .optional()?)
+    }
+
+    pub fn code_review_job_exists(&self, dedupe_key: &str) -> Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        Ok(conn
+            .query_row(
+                "SELECT 1 FROM code_review_jobs WHERE dedupe_key = ?1",
+                params![dedupe_key],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some())
+    }
+
+    pub fn recover_code_review_jobs(&self) -> Result<()> {
+        self.conn.lock().unwrap().execute(
+            "UPDATE code_review_jobs SET status = 'queued', started_at = NULL,
+                    error = 'server restarted while review was running'
+             WHERE status = 'running'",
+            [],
+        )?;
+        Ok(())
+    }
+
+    pub fn claim_code_review_job(&self) -> Result<Option<CodeReviewJobRecord>> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        let id: Option<String> = tx
+            .query_row(
+                "SELECT id FROM code_review_jobs WHERE status = 'queued'
+                 ORDER BY created_at LIMIT 1",
+                [],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let Some(id) = id else {
+            tx.commit()?;
+            return Ok(None);
+        };
+        tx.execute(
+            "UPDATE code_review_jobs SET status = 'running', started_at = ?2, error = ''
+             WHERE id = ?1 AND status = 'queued'",
+            params![id, chrono::Utc::now().to_rfc3339()],
+        )?;
+        let record = tx.query_row(
+            &format!("SELECT {CODE_REVIEW_JOB_COLUMNS} FROM code_review_jobs WHERE id = ?1"),
+            params![id],
+            row_to_code_review_job,
+        )?;
+        tx.commit()?;
+        Ok(Some(record))
+    }
+
+    pub fn set_code_review_job_session(
+        &self,
+        id: &str,
+        session_id: &str,
+        thread_id: &str,
+    ) -> Result<()> {
+        self.conn.lock().unwrap().execute(
+            "UPDATE code_review_jobs SET session_id = ?2, thread_id = ?3 WHERE id = ?1",
+            params![id, session_id, thread_id],
+        )?;
+        Ok(())
+    }
+
+    pub fn finish_code_review_job(
+        &self,
+        id: &str,
+        status: &str,
+        review_url: &str,
+        error: &str,
+    ) -> Result<()> {
+        self.conn.lock().unwrap().execute(
+            "UPDATE code_review_jobs SET status = ?2, review_url = ?3, error = ?4,
+                    completed_at = ?5 WHERE id = ?1",
+            params![
+                id,
+                status,
+                review_url,
+                error,
+                chrono::Utc::now().to_rfc3339()
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Update the polled bot-review request latch. Returns a new generation
+    /// only on the false -> true transition, allowing a same-SHA re-request
+    /// after the previous review cleared the request.
+    pub fn code_review_manual_transition(
+        &self,
+        repository: &str,
+        pull_number: u64,
+        requested: bool,
+    ) -> Result<Option<u64>> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        let previous: Option<(bool, i64)> = tx
+            .query_row(
+                "SELECT manual_requested, manual_generation FROM code_review_pr_state
+                 WHERE repository = ?1 AND pull_number = ?2",
+                params![repository, pull_number as i64],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        let (was_requested, generation) = previous.unwrap_or((false, 0));
+        let next_generation = generation + i64::from(requested && !was_requested);
+        tx.execute(
+            "INSERT INTO code_review_pr_state
+                    (repository, pull_number, manual_requested, manual_generation)
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(repository, pull_number) DO UPDATE SET
+               manual_requested = excluded.manual_requested,
+               manual_generation = excluded.manual_generation",
+            params![repository, pull_number as i64, requested, next_generation],
+        )?;
+        tx.commit()?;
+        Ok((requested && !was_requested).then_some(next_generation as u64))
+    }
+
+    /// Claim one GitHub webhook delivery. Duplicate delivery ids are ignored,
+    /// which makes GitHub's at-least-once delivery safe to retry.
+    pub fn claim_github_webhook_delivery(&self, delivery_id: &str) -> Result<bool> {
+        let inserted = self.conn.lock().unwrap().execute(
+            "INSERT OR IGNORE INTO github_webhook_deliveries (delivery_id, received_at)
+             VALUES (?1, ?2)",
+            params![delivery_id, chrono::Utc::now().to_rfc3339()],
+        )?;
+        Ok(inserted > 0)
     }
 
     // --- provider transcript --------------------------------------------------
@@ -2288,5 +2686,84 @@ mod tests {
         let reopened = store.list_workspaces().unwrap();
         assert_eq!(reopened.len(), 1);
         assert_eq!(reopened[0].id, workspace.id);
+    }
+
+    #[test]
+    fn code_review_policy_queue_and_manual_generations_are_durable() {
+        let store = Store::open_in_memory().unwrap();
+        store
+            .upsert_discovered_code_review_repository(7, "acme/widgets", true)
+            .unwrap();
+        let discovered = store.list_code_review_repositories().unwrap();
+        assert_eq!(discovered.len(), 1);
+        assert_eq!(discovered[0].mode, trouve_protocol::CodeReviewMode::Off);
+        assert!(discovered[0].private);
+
+        store
+            .update_code_review_repository(&trouve_protocol::UpdateCodeReviewRepositoryRequest {
+                installation_id: 7,
+                repository: "acme/widgets".into(),
+                mode: trouve_protocol::CodeReviewMode::Automatic,
+                model: Some("openai/gpt-5".into()),
+                prompt: "focus on concurrency".into(),
+            })
+            .unwrap();
+        let configured = store.list_code_review_repositories().unwrap().remove(0);
+        assert_eq!(configured.mode, trouve_protocol::CodeReviewMode::Automatic);
+        assert_eq!(configured.model.as_deref(), Some("openai/gpt-5"));
+
+        assert_eq!(
+            store
+                .code_review_manual_transition("acme/widgets", 42, true)
+                .unwrap(),
+            Some(1)
+        );
+        assert_eq!(
+            store
+                .code_review_manual_transition("acme/widgets", 42, true)
+                .unwrap(),
+            None
+        );
+        store
+            .code_review_manual_transition("acme/widgets", 42, false)
+            .unwrap();
+        assert_eq!(
+            store
+                .code_review_manual_transition("acme/widgets", 42, true)
+                .unwrap(),
+            Some(2)
+        );
+
+        let new_job = NewCodeReviewJob {
+            dedupe_key: "acme/widgets#42:head:automatic:config".into(),
+            installation_id: 7,
+            repository: "acme/widgets".into(),
+            pull_number: 42,
+            pull_title: "Ship widgets".into(),
+            pull_url: "https://github.com/acme/widgets/pull/42".into(),
+            head_sha: "1111111111111111111111111111111111111111".into(),
+            base_ref: "0000000000000000000000000000000000000000".into(),
+            head_ref: "ship".into(),
+            trigger: "automatic".into(),
+            model: configured.model,
+            prompt: configured.prompt,
+        };
+        let queued = store.enqueue_code_review_job(&new_job).unwrap().unwrap();
+        assert_eq!(queued.status, "queued");
+        assert!(store.enqueue_code_review_job(&new_job).unwrap().is_none());
+        assert!(store.code_review_job_exists(&new_job.dedupe_key).unwrap());
+        let running = store.claim_code_review_job().unwrap().unwrap();
+        assert_eq!(running.job.id, queued.id);
+        assert_eq!(running.job.status, "running");
+        store
+            .finish_code_review_job(&queued.id, "succeeded", "https://review", "")
+            .unwrap();
+        assert_eq!(
+            store.list_code_review_jobs(10).unwrap()[0].status,
+            "succeeded"
+        );
+
+        assert!(store.claim_github_webhook_delivery("delivery-1").unwrap());
+        assert!(!store.claim_github_webhook_delivery("delivery-1").unwrap());
     }
 }
