@@ -86,6 +86,11 @@ export struct ModelHealthItem {
     tone: int,
 }
 
+export struct TermTabItem {
+    label: string,
+    exited: bool,
+}
+
 // One pull request in the Pull Requests tab. Checks and reviews come
 // pre-rendered as multi-line text (one entry per line).
 export struct PrItem {
@@ -1849,14 +1854,43 @@ export component AppWindow inherits Window {
     in property <[[TermSpan]]> term-lines;
     in property <int> term-cursor-row: -1;
     in property <int> term-cursor-col: -1;
+    in property <int> term-cursor-shape: 0;
+    in property <bool> term-cursor-blinking: true;
     in property <int> term-scrollback: 0;
     // Non-empty while there's something to say ("shell exited", errors).
     in property <string> term-status: "";
+    in property <bool> term-clipboard-request: false;
     in property <bool> term-attached: false;
+    in property <[TermTabItem]> term-tabs;
+    in property <int> term-active-tab: -1;
+    in property <int> term-mouse-mode: 0;
+    in property <int> term-search-start-row: -1;
+    in property <int> term-search-start-col: 0;
+    in property <int> term-search-end-row: -1;
+    in property <int> term-search-end-col: 0;
+    in property <int> term-selection-start-row: -1;
+    in property <int> term-selection-start-col: 0;
+    in property <int> term-selection-end-row: -1;
+    in property <int> term-selection-end-col: 0;
+    in property <int> term-selection-seq: 0;
+    in property <string> term-clipboard-text: "";
+    in property <int> term-clipboard-seq: 0;
+    in property <int> term-bell-seq: 0;
+    in property <string> term-accessible-text: "";
     callback term-key(/* text */ string, /* ctrl */ bool, /* alt */ bool, /* shift */ bool);
     callback term-paste(string);
+    callback term-copy(/* start row */ int, /* start col */ int, /* end row */ int, /* end col */ int);
+    callback term-clipboard-decision(bool);
+    callback term-search(string, /* older */ bool);
+    callback term-unit-selection(int, int, /* line */ bool);
+    callback term-open-link(int, int);
+    callback term-mouse(kind: int, button: int, row: int, col: int,
+                        ctrl: bool, alt: bool, shift: bool);
     callback term-wheel(/* lines, + = history */ int);
     callback term-resized(/* cols */ int, /* rows */ int);
+    callback term-new-tab();
+    callback term-tab-picked(int);
+    callback term-close-tab(int);
     callback term-restart();
 
     in property <[FileItem]> file-entries;
@@ -5066,11 +5100,39 @@ export component AppWindow inherits Window {
                                 horizontal-stretch: 1;
                                 overflow: elide;
                             }
+                            term-search-box := LineEdit {
+                                width: Theme.fs(145px);
+                                height: Theme.fs(28px);
+                                placeholder-text: "Find in terminal…";
+                                font-size: Theme.fs(11px);
+                                accepted => { root.term-search(self.text, true); }
+                                edited => {
+                                    if (self.text == "") { root.term-search("", true); }
+                                }
+                            }
+                            Button {
+                                text: "↑";
+                                enabled: term-search-box.text != "";
+                                clicked => { root.term-search(term-search-box.text, true); }
+                            }
+                            Button {
+                                text: "↓";
+                                enabled: term-search-box.text != "";
+                                clicked => { root.term-search(term-search-box.text, false); }
+                            }
                             if root.term-status != "": Text {
                                 text: root.term-status;
                                 color: Theme.c.warn;
                                 font-size: Theme.fs(12px);
                                 vertical-alignment: center;
+                            }
+                            if root.term-clipboard-request: Button {
+                                text: "Allow copy";
+                                clicked => { root.term-clipboard-decision(true); }
+                            }
+                            if root.term-clipboard-request: Button {
+                                text: "Deny";
+                                clicked => { root.term-clipboard-decision(false); }
                             }
                             Button {
                                 text: "⟳ Restart";
@@ -5079,11 +5141,96 @@ export component AppWindow inherits Window {
                             }
                         }
 
+                        Rectangle {
+                            height: Theme.fs(30px);
+                            clip: true;
+                            background: Theme.c.control-bg;
+                            border-radius: 5px;
+                            accessible-role: tab-list;
+                            accessible-label: "Terminal tabs";
+                            HorizontalLayout {
+                                alignment: start;
+                                spacing: 2px;
+                                for terminal-tab[idx] in root.term-tabs: tab-box := Rectangle {
+                                    horizontal-stretch: 1;
+                                    min-width: Theme.fs(36px);
+                                    max-width: Theme.fs(132px);
+                                    height: 100%;
+                                    background: idx == root.term-active-tab
+                                        ? Theme.c.accent-bg : tab-pick.has-hover
+                                            ? Theme.c.hover-bg : transparent;
+                                    border-radius: 4px;
+                                    accessible-role: tab;
+                                    accessible-label: terminal-tab.label
+                                        + (terminal-tab.exited ? ", shell exited" : "");
+                                    accessible-action-default => { root.term-tab-picked(idx); }
+                                    tab-pick := TouchArea {
+                                        mouse-cursor: pointer;
+                                        clicked => { root.term-tab-picked(idx); }
+                                    }
+                                    Text {
+                                        x: 9px;
+                                        width: parent.width - Theme.fs(34px);
+                                        height: 100%;
+                                        text: (terminal-tab.exited ? "● " : "") + terminal-tab.label;
+                                        color: terminal-tab.exited ? Theme.c.text-soft
+                                            : idx == root.term-active-tab
+                                                ? Theme.c.accent-tint : Theme.c.text-mid;
+                                        font-size: Theme.fs(11px);
+                                        vertical-alignment: center;
+                                        overflow: elide;
+                                    }
+                                    close-tab := Rectangle {
+                                        x: parent.width - Theme.fs(27px);
+                                        y: Theme.fs(4px);
+                                        width: Theme.fs(22px);
+                                        height: parent.height - Theme.fs(8px);
+                                        border-radius: 3px;
+                                        background: close-tab-ta.has-hover ? Theme.c.hover-bg : transparent;
+                                        accessible-role: button;
+                                        accessible-label: "Close " + terminal-tab.label;
+                                        accessible-action-default => { root.term-close-tab(idx); }
+                                        Text {
+                                            text: "×";
+                                            color: Theme.c.text-soft;
+                                            font-size: Theme.fs(14px);
+                                            horizontal-alignment: center;
+                                            vertical-alignment: center;
+                                        }
+                                        close-tab-ta := TouchArea {
+                                            mouse-cursor: pointer;
+                                            clicked => { root.term-close-tab(idx); }
+                                        }
+                                    }
+                                }
+                                new-tab := Rectangle {
+                                    width: Theme.fs(30px);
+                                    height: 100%;
+                                    border-radius: 4px;
+                                    background: new-tab-ta.has-hover ? Theme.c.hover-bg : transparent;
+                                    accessible-role: button;
+                                    accessible-label: "New terminal tab";
+                                    accessible-action-default => { root.term-new-tab(); }
+                                    Text {
+                                        text: "+";
+                                        color: Theme.c.text-mid;
+                                        font-size: Theme.fs(16px);
+                                        horizontal-alignment: center;
+                                        vertical-alignment: center;
+                                    }
+                                    new-tab-ta := TouchArea {
+                                        mouse-cursor: pointer;
+                                        clicked => { root.term-new-tab(); }
+                                    }
+                                }
+                            }
+                        }
+
                         if !root.term-attached: VerticalLayout {
                             alignment: center;
                             vertical-stretch: 1;
                             Text {
-                                text: "Open a session to get a shell in its worktree.";
+                                text: "Create a terminal tab to start a shell in this session.";
                                 color: Theme.c.text-soft;
                                 font-size: Theme.fs(12px);
                                 horizontal-alignment: center;
@@ -5098,14 +5245,41 @@ export component AppWindow inherits Window {
                             grid-lines: root.term-lines;
                             cursor-row: root.term-cursor-row;
                             cursor-col: root.term-cursor-col;
+                            cursor-shape: root.term-cursor-shape;
+                            cursor-blinking: root.term-cursor-blinking;
                             scrollback-lines: root.term-scrollback;
                             grid-font-size: Theme.fs(13px);
                             background: Theme.c.code-bg;
                             grid-foreground: Theme.c.code-fg;
+                            clipboard-text: root.term-clipboard-text;
+                            clipboard-seq: root.term-clipboard-seq;
+                            bell-seq: root.term-bell-seq;
+                            accessible-text: root.term-accessible-text;
+                            mouse-mode: root.term-mouse-mode;
+                            show-touch-toolbar: self.width < Theme.fs(520px);
+                            search-start-row: root.term-search-start-row;
+                            search-start-col: root.term-search-start-col;
+                            search-end-row: root.term-search-end-row;
+                            search-end-col: root.term-search-end-col;
+                            host-selection-start-row: root.term-selection-start-row;
+                            host-selection-start-col: root.term-selection-start-col;
+                            host-selection-end-row: root.term-selection-end-row;
+                            host-selection-end-col: root.term-selection-end-col;
+                            host-selection-seq: root.term-selection-seq;
                             key-pressed(text, ctrl, alt, shift) => {
                                 root.term-key(text, ctrl, alt, shift);
                             }
                             paste-text(text) => { root.term-paste(text); }
+                            copy-requested(start-row, start-col, end-row, end-col) => {
+                                root.term-copy(start-row, start-col, end-row, end-col);
+                            }
+                            mouse-event(kind, button, row, col, ctrl, alt, shift) => {
+                                root.term-mouse(kind, button, row, col, ctrl, alt, shift);
+                            }
+                            unit-selection-requested(row, col, line) => {
+                                root.term-unit-selection(row, col, line);
+                            }
+                            link-requested(row, col) => { root.term-open-link(row, col); }
                             wheel(lines) => { root.term-wheel(lines); }
                             grid-resized(cols, rows) => { root.term-resized(cols, rows); }
                         }

@@ -756,14 +756,15 @@ fn main() -> anyhow::Result<()> {
         });
     }
     {
-        // shift is folded into the key text by Slint already; Ctrl+Shift+V
-        // (paste) never reaches this callback.
+        // Ctrl+Shift+V / Command+V are handled by the widget's clipboard
+        // bridge and never reach this callback.
         let tx = tx.clone();
-        window.on_term_key(move |text, ctrl, alt, _shift| {
+        window.on_term_key(move |text, ctrl, alt, shift| {
             let _ = tx.send(UiCommand::TermKey {
                 text: text.to_string(),
                 ctrl,
                 alt,
+                shift,
             });
         });
     }
@@ -771,6 +772,72 @@ fn main() -> anyhow::Result<()> {
         let tx = tx.clone();
         window.on_term_paste(move |text| {
             let _ = tx.send(UiCommand::TermPaste(text.to_string()));
+        });
+    }
+    {
+        let tx = tx.clone();
+        window.on_term_copy(move |start_row, start_col, end_row, end_col| {
+            let point = |row: i32, col: i32| {
+                (
+                    row.clamp(0, u16::MAX as i32) as u16,
+                    col.clamp(0, u16::MAX as i32) as u16,
+                )
+            };
+            let _ = tx.send(UiCommand::TermCopy {
+                start: point(start_row, start_col),
+                end: point(end_row, end_col),
+            });
+        });
+    }
+    {
+        let tx = tx.clone();
+        window.on_term_clipboard_decision(move |approved| {
+            let _ = tx.send(UiCommand::TermClipboardDecision(approved));
+        });
+    }
+    {
+        let tx = tx.clone();
+        window.on_term_search(move |query, older| {
+            let _ = tx.send(UiCommand::TermSearch {
+                query: query.to_string(),
+                older,
+            });
+        });
+    }
+    {
+        let tx = tx.clone();
+        window.on_term_unit_selection(move |row, col, line| {
+            let cell = |value: i32| value.clamp(0, u16::MAX as i32) as u16;
+            let _ = tx.send(UiCommand::TermUnitSelection {
+                row: cell(row),
+                col: cell(col),
+                line,
+            });
+        });
+    }
+    {
+        let tx = tx.clone();
+        window.on_term_open_link(move |row, col| {
+            let cell = |value: i32| value.clamp(0, u16::MAX as i32) as u16;
+            let _ = tx.send(UiCommand::TermOpenLink {
+                row: cell(row),
+                col: cell(col),
+            });
+        });
+    }
+    {
+        let tx = tx.clone();
+        window.on_term_mouse(move |kind, button, row, col, ctrl, alt, shift| {
+            let cell = |value: i32| value.clamp(0, u16::MAX as i32) as u16;
+            let _ = tx.send(UiCommand::TermMouse {
+                kind,
+                button,
+                row: cell(row),
+                col: cell(col),
+                ctrl,
+                alt,
+                shift,
+            });
         });
     }
     {
@@ -786,6 +853,24 @@ fn main() -> anyhow::Result<()> {
                 cols: cols.clamp(2, 500) as u16,
                 rows: rows.clamp(2, 500) as u16,
             });
+        });
+    }
+    {
+        let tx = tx.clone();
+        window.on_term_new_tab(move || {
+            let _ = tx.send(UiCommand::TermNewTab);
+        });
+    }
+    {
+        let tx = tx.clone();
+        window.on_term_tab_picked(move |index| {
+            let _ = tx.send(UiCommand::TermTabPicked(index.max(0) as usize));
+        });
+    }
+    {
+        let tx = tx.clone();
+        window.on_term_close_tab(move |index| {
+            let _ = tx.send(UiCommand::TermCloseTab(index.max(0) as usize));
         });
     }
     {

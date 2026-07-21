@@ -575,6 +575,26 @@ impl ProtocolClient {
         .await
     }
 
+    /// List all terminal tabs currently owned by a session.
+    pub async fn list_terminals(&self, session_id: &str) -> Result<Vec<TerminalInfo>> {
+        self.get_json(&format!("/sessions/{session_id}/terminals"))
+            .await
+    }
+
+    /// Create a new, independent terminal tab for a session.
+    pub async fn create_terminal(
+        &self,
+        session_id: &str,
+        cols: u16,
+        rows: u16,
+    ) -> Result<TerminalInfo> {
+        self.post_json(
+            &format!("/sessions/{session_id}/terminals"),
+            &OpenTerminalRequest { cols, rows },
+        )
+        .await
+    }
+
     /// Write raw bytes (already key-encoded) to the terminal's PTY.
     pub async fn terminal_input(&self, terminal_id: &str, bytes: &[u8]) -> Result<()> {
         use base64::Engine as _;
@@ -610,7 +630,7 @@ impl ProtocolClient {
         Ok(())
     }
 
-    /// Kill the terminal's shell (the next open starts a fresh one).
+    /// Kill one terminal tab's shell.
     pub async fn kill_terminal(&self, terminal_id: &str) -> Result<()> {
         self.delete(&format!("/terminals/{terminal_id}")).await
     }

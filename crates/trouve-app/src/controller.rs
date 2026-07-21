@@ -479,9 +479,43 @@ pub enum UiCommand {
         text: String,
         ctrl: bool,
         alt: bool,
+        shift: bool,
     },
     /// Clipboard text pasted into the terminal.
     TermPaste(String),
+    /// Copy a visible terminal cell range to the system clipboard.
+    TermCopy {
+        start: (u16, u16),
+        end: (u16, u16),
+    },
+    /// Resolve an OSC 52 request to place terminal-provided text on the
+    /// platform clipboard. It is never granted without this explicit click.
+    TermClipboardDecision(bool),
+    /// Search the active terminal's visible screen and retained scrollback.
+    TermSearch {
+        query: String,
+        older: bool,
+    },
+    TermUnitSelection {
+        row: u16,
+        col: u16,
+        line: bool,
+    },
+    TermOpenLink {
+        row: u16,
+        col: u16,
+    },
+    /// Pointer input while a full-screen terminal application has enabled
+    /// xterm mouse tracking.
+    TermMouse {
+        kind: i32,
+        button: i32,
+        row: u16,
+        col: u16,
+        ctrl: bool,
+        alt: bool,
+        shift: bool,
+    },
     /// Mouse wheel over the terminal (+ = towards history), in lines.
     TermWheel(i32),
     /// The grid re-measured to a new cell size.
@@ -489,6 +523,12 @@ pub enum UiCommand {
         cols: u16,
         rows: u16,
     },
+    /// Create and focus another independent shell tab.
+    TermNewTab,
+    /// Focus an existing terminal tab.
+    TermTabPicked(usize),
+    /// Close one terminal tab and kill only its shell.
+    TermCloseTab(usize),
     /// Kill the shell and start a fresh one.
     TermRestart,
     /// Internal: output bytes arrived for a terminal (end offset included).
@@ -804,10 +844,9 @@ struct Controller {
 
     /// Which right-panel tab is showing (terminal attaches lazily on 4).
     right_tab: i32,
-    /// Attached terminals by session id. Screen state lives client-side;
-    /// followers keep feeding backgrounded sessions so switching back is
-    /// instant.
-    terms: HashMap<String, TermState>,
+    /// Attached terminal tabs by session id. Screen state lives client-side;
+    /// followers keep feeding backgrounded tabs so switching is instant.
+    terms: HashMap<String, TermSessionState>,
     /// Terminal output can arrive in tiny PTY chunks; cap full-grid model
     /// rebuilds to roughly one per display frame.
     last_term_render: Option<std::time::Instant>,
@@ -826,13 +865,36 @@ struct RateSample {
     rate: f64,
 }
 
-/// Client-side state of one session's terminal.
+/// Client-side terminal tabs belonging to one session.
+struct TermSessionState {
+    tabs: Vec<TermState>,
+    active: usize,
+}
+
+impl TermSessionState {
+    fn active(&self) -> Option<&TermState> {
+        self.tabs.get(self.active)
+    }
+
+    fn active_mut(&mut self) -> Option<&mut TermState> {
+        self.tabs.get_mut(self.active)
+    }
+}
+
+/// Client-side state of one terminal tab.
 struct TermState {
     terminal_id: String,
+    title: String,
     grid: slint_terminal::GridState,
     /// Bytes consumed from the output stream (resume offset).
     offset: u64,
     exited: bool,
+    notice: String,
+    pending_clipboard: Option<String>,
+    search_query: String,
+    search_match: Option<slint_terminal::SearchMatch>,
+    cursor_shape: i32,
+    cursor_blinking: bool,
 }
 
 /// One visible row of the Files tree.
@@ -1441,6 +1503,23 @@ impl Controller {
             self.save_workspace_order();
         }
         self.sessions = self.client.list_sessions().await?;
+        // Archived/deleted sessions and sessions in closed workspaces have no
+        // live backend PTYs. Discard their cached grids as well so reopening
+        // them attaches to fresh tabs instead of reviving an exited view.
+        let open_workspaces: HashSet<String> = self
+            .workspaces
+            .iter()
+            .map(|workspace| workspace.id.clone())
+            .collect();
+        let terminal_sessions: HashSet<String> = self
+            .sessions
+            .iter()
+            .filter(|session| !session.archived && open_workspaces.contains(&session.workspace_id))
+            .map(|session| session.id.clone())
+            .collect();
+        let terminal_state_count = self.terms.len();
+        self.terms.retain(|id, _| terminal_sessions.contains(id));
+        let terminal_state_changed = self.terms.len() != terminal_state_count;
         self.busy_sessions = self
             .sessions
             .iter()
@@ -1475,6 +1554,9 @@ impl Controller {
             self.current_thread = None;
         }
         self.push_nav();
+        if terminal_state_changed {
+            self.push_term();
+        }
         // A session waiting on an agent can block on an approval/question in
         // any thread. Watch all threads of active background sessions so the
         // sidebar can surface that state without requiring the user to open
@@ -2488,9 +2570,9 @@ impl Controller {
 
     // --- terminal tab -----------------------------------------------------
 
-    /// The current session's attached, still-running terminal.
+    /// The current session's active, still-running terminal tab.
     fn term_attached(&self) -> Option<(String, &TermState)> {
-        let state = self.terms.get(&self.current_session_id()?)?;
+        let state = self.terms.get(&self.current_session_id()?)?.active()?;
         if state.exited {
             return None;
         }
@@ -2499,44 +2581,70 @@ impl Controller {
 
     fn current_term_mut(&mut self) -> Option<&mut TermState> {
         let session_id = self.current_session_id()?;
-        self.terms.get_mut(&session_id)
+        self.terms.get_mut(&session_id)?.active_mut()
     }
 
-    /// Attach the current session's terminal: reuse the running attachment,
-    /// otherwise open (or re-open after exit) server-side and start a
-    /// follower task streaming output back as [`UiCommand::TermOutput`].
+    /// Attach every existing terminal tab for the current session. The first
+    /// visit creates a shell when the server has none; later visits preserve
+    /// each tab's independent screen and scrollback.
     async fn ensure_terminal(&mut self) {
         let Some(session_id) = self.current_session_id() else {
             self.push_term();
             return;
         };
-        if self.terms.get(&session_id).is_some_and(|s| !s.exited) {
+        if self
+            .terms
+            .get(&session_id)
+            .is_some_and(|session| !session.tabs.is_empty())
+        {
             self.push_term();
             return;
         }
         let (cols, rows) = self.term_view;
-        let info = match self.client.open_terminal(&session_id, cols, rows).await {
-            Ok(info) => info,
+        let mut infos = match self.client.list_terminals(&session_id).await {
+            Ok(infos) => infos,
             Err(e) => {
                 self.error(&format!("terminal: {e:#}"));
                 return;
             }
         };
-        // Size the screen model like the view; the server PTY follows on
-        // the next resize event if it disagrees.
-        let mut state = TermState {
-            terminal_id: info.id.clone(),
-            grid: slint_terminal::GridState::new(rows, cols, TERM_SCROLLBACK),
-            offset: 0,
-            exited: info.exited,
-        };
-        if (info.cols, info.rows) != (cols, rows) {
-            let _ = self.client.terminal_resize(&info.id, cols, rows).await;
+        if infos.is_empty() {
+            match self.client.create_terminal(&session_id, cols, rows).await {
+                Ok(info) => infos.push(info),
+                Err(e) => {
+                    self.error(&format!("terminal: {e:#}"));
+                    return;
+                }
+            }
         }
-        state.grid.resize(rows, cols);
-        self.terms.insert(session_id.clone(), state);
-        self.push_term();
 
+        let mut tabs = Vec::with_capacity(infos.len());
+        for (index, info) in infos.into_iter().enumerate() {
+            if !info.exited && (info.cols, info.rows) != (cols, rows) {
+                let _ = self.client.terminal_resize(&info.id, cols, rows).await;
+            }
+            self.start_terminal_follower(session_id.clone(), info.id.clone());
+            tabs.push(TermState {
+                terminal_id: info.id,
+                title: format!("Terminal {}", index + 1),
+                grid: slint_terminal::GridState::new(rows, cols, TERM_SCROLLBACK),
+                offset: 0,
+                exited: info.exited,
+                notice: String::new(),
+                pending_clipboard: None,
+                search_query: String::new(),
+                search_match: None,
+                cursor_shape: 0,
+                cursor_blinking: true,
+            });
+        }
+        self.terms
+            .insert(session_id, TermSessionState { tabs, active: 0 });
+        self.push_term();
+    }
+
+    /// Start (or resume) the output follower for one terminal tab.
+    fn start_terminal_follower(&self, session_id: String, terminal_id: String) {
         // Follower: replays the backlog, then streams live output until the
         // shell exits or the terminal is killed. A dropped/lagged stream
         // reconnects from the last offset (the server replays its backlog).
@@ -2544,7 +2652,6 @@ impl Controller {
         // on the controller.
         let client = self.client.clone();
         let tx = self.tx.clone();
-        let terminal_id = info.id.clone();
         tokio::spawn(async move {
             let mut after = 0u64;
             loop {
@@ -2584,30 +2691,125 @@ impl Controller {
         });
     }
 
+    /// Create, attach, and focus a new terminal tab in the current session.
+    async fn create_terminal_tab(&mut self) -> Result<()> {
+        let Some(session_id) = self.current_session_id() else {
+            return Ok(());
+        };
+        let (cols, rows) = self.term_view;
+        let info = self.client.create_terminal(&session_id, cols, rows).await?;
+        self.start_terminal_follower(session_id.clone(), info.id.clone());
+        let session = self
+            .terms
+            .entry(session_id)
+            .or_insert_with(|| TermSessionState {
+                tabs: Vec::new(),
+                active: 0,
+            });
+        let index = session.tabs.len();
+        session.tabs.push(TermState {
+            terminal_id: info.id,
+            title: format!("Terminal {}", index + 1),
+            grid: slint_terminal::GridState::new(rows, cols, TERM_SCROLLBACK),
+            offset: 0,
+            exited: info.exited,
+            notice: String::new(),
+            pending_clipboard: None,
+            search_query: String::new(),
+            search_match: None,
+            cursor_shape: 0,
+            cursor_blinking: true,
+        });
+        session.active = index;
+        self.push_term();
+        Ok(())
+    }
+
     /// Render the current session's terminal screen into the UI (or the
     /// detached placeholder when there is none).
     fn push_term(&mut self) {
-        let Some(state) = self
+        let Some(session) = self
             .current_session_id()
             .and_then(|sid| self.terms.get(&sid))
         else {
-            ui::set_term(&self.ui, Vec::new(), None, 0, String::new(), false);
+            ui::set_term(
+                &self.ui,
+                ui::TerminalUiState {
+                    tabs: Vec::new(),
+                    active_tab: -1,
+                    mouse_mode: 0,
+                    search_match: None,
+                    cursor_shape: 0,
+                    cursor_blinking: true,
+                    rows: Vec::new(),
+                    cursor: None,
+                    scrollback: 0,
+                    status: String::new(),
+                    accessible_text: String::new(),
+                    clipboard_request: false,
+                    attached: false,
+                },
+            );
+            return;
+        };
+        let tabs = session
+            .tabs
+            .iter()
+            .map(|tab| (tab.title.clone(), tab.exited))
+            .collect();
+        let Some(state) = session.active() else {
+            ui::set_term(
+                &self.ui,
+                ui::TerminalUiState {
+                    tabs,
+                    active_tab: -1,
+                    mouse_mode: 0,
+                    search_match: None,
+                    cursor_shape: 0,
+                    cursor_blinking: true,
+                    rows: Vec::new(),
+                    cursor: None,
+                    scrollback: 0,
+                    status: String::new(),
+                    accessible_text: String::new(),
+                    clipboard_request: false,
+                    attached: false,
+                },
+            );
             return;
         };
         let (fg, bg) = render::term_colors();
         let rows = state.grid.rows(fg, bg);
-        let status = if state.exited {
+        let status = if state.pending_clipboard.is_some() {
+            "terminal wants to copy text".to_string()
+        } else if state.exited {
             "shell exited".to_string()
         } else {
-            String::new()
+            state.notice.clone()
         };
         ui::set_term(
             &self.ui,
-            rows,
-            state.grid.cursor(),
-            state.grid.scrollback_offset(),
-            status,
-            true,
+            ui::TerminalUiState {
+                tabs,
+                active_tab: session.active as i32,
+                mouse_mode: match state.grid.mouse_mode() {
+                    slint_terminal::MouseMode::None => 0,
+                    slint_terminal::MouseMode::Press => 1,
+                    slint_terminal::MouseMode::PressRelease => 2,
+                    slint_terminal::MouseMode::ButtonMotion => 3,
+                    slint_terminal::MouseMode::AnyMotion => 4,
+                },
+                search_match: state.search_match.map(|found| (found.start, found.end)),
+                cursor_shape: state.cursor_shape,
+                cursor_blinking: state.cursor_blinking,
+                rows,
+                cursor: state.grid.cursor(),
+                scrollback: state.grid.scrollback_offset(),
+                status,
+                accessible_text: state.grid.contents(),
+                clipboard_request: state.pending_clipboard.is_some(),
+                attached: true,
+            },
         );
     }
 
@@ -4712,10 +4914,21 @@ impl Controller {
                     self.ensure_terminal().await;
                 }
             }
-            UiCommand::TermKey { text, ctrl, alt } => {
+            UiCommand::TermKey {
+                text,
+                ctrl,
+                alt,
+                shift,
+            } => {
                 let Some((id, bytes)) = self.term_attached().and_then(|(id, state)| {
-                    slint_terminal::encode_key(&text, ctrl, alt, state.grid.application_cursor())
-                        .map(|b| (id, b))
+                    slint_terminal::encode_key(
+                        &text,
+                        ctrl,
+                        alt,
+                        shift,
+                        state.grid.application_cursor(),
+                    )
+                    .map(|b| (id, b))
                 }) else {
                     return Ok(());
                 };
@@ -4724,6 +4937,7 @@ impl Controller {
                     && state.grid.scrollback_offset() > 0
                 {
                     state.grid.scroll_to_live();
+                    state.search_match = None;
                     self.push_term();
                 }
                 if let Err(e) = self.client.terminal_input(&id, &bytes).await {
@@ -4742,9 +4956,126 @@ impl Controller {
                     self.error(&format!("terminal paste: {e:#}"));
                 }
             }
+            UiCommand::TermCopy { start, end } => {
+                let Some(text) = self
+                    .current_term_mut()
+                    .map(|state| state.grid.selection_text(start, end))
+                    .filter(|text| !text.is_empty())
+                else {
+                    return Ok(());
+                };
+                ui::copy_term_text(&self.ui, text);
+            }
+            UiCommand::TermClipboardDecision(approved) => {
+                let text = self
+                    .current_term_mut()
+                    .and_then(|state| state.pending_clipboard.take());
+                if approved && let Some(text) = text {
+                    ui::copy_term_text(&self.ui, text);
+                }
+                self.push_term();
+            }
+            UiCommand::TermSearch { query, older } => {
+                if let Some(state) = self.current_term_mut() {
+                    if query.is_empty() {
+                        state.search_query.clear();
+                        state.search_match = None;
+                        state.notice.clear();
+                    } else {
+                        let skip_current =
+                            state.search_query == query && state.search_match.is_some();
+                        state.search_query = query.clone();
+                        state.search_match = state.grid.search(
+                            &query,
+                            if older {
+                                slint_terminal::SearchDirection::Older
+                            } else {
+                                slint_terminal::SearchDirection::Newer
+                            },
+                            skip_current,
+                        );
+                        state.notice = if state.search_match.is_some() {
+                            format!("match · history {}", state.grid.scrollback_offset())
+                        } else {
+                            "no matches".into()
+                        };
+                    }
+                    self.push_term();
+                }
+            }
+            UiCommand::TermUnitSelection { row, col, line } => {
+                if let Some(range) = self.current_term_mut().and_then(|state| {
+                    state.grid.selection_unit(
+                        row,
+                        col,
+                        if line {
+                            slint_terminal::SelectionUnit::Line
+                        } else {
+                            slint_terminal::SelectionUnit::Word
+                        },
+                    )
+                }) {
+                    ui::set_term_selection(&self.ui, range.0, range.1);
+                }
+            }
+            UiCommand::TermOpenLink { row, col } => {
+                if let Some(url) = self
+                    .current_term_mut()
+                    .and_then(|state| state.grid.url_at(row, col))
+                    .filter(|url| is_web_url(url))
+                    && let Err(e) = open::that_detached(&url)
+                {
+                    self.error(&format!("could not open {url}: {e}"));
+                }
+            }
+            UiCommand::TermMouse {
+                kind,
+                button,
+                row,
+                col,
+                ctrl,
+                alt,
+                shift,
+            } => {
+                let Some((id, bytes)) = self.term_attached().and_then(|(id, state)| {
+                    let kind = match kind {
+                        0 => slint_terminal::MouseEventKind::Press,
+                        1 => slint_terminal::MouseEventKind::Release,
+                        2 => slint_terminal::MouseEventKind::Move,
+                        3 => slint_terminal::MouseEventKind::WheelUp,
+                        4 => slint_terminal::MouseEventKind::WheelDown,
+                        _ => return None,
+                    };
+                    let button = match button {
+                        1 => slint_terminal::MouseButton::Left,
+                        2 => slint_terminal::MouseButton::Middle,
+                        3 => slint_terminal::MouseButton::Right,
+                        _ => slint_terminal::MouseButton::None,
+                    };
+                    let (rows, cols) = state.grid.size();
+                    slint_terminal::encode_mouse(
+                        kind,
+                        button,
+                        row.min(rows.saturating_sub(1)),
+                        col.min(cols.saturating_sub(1)),
+                        shift,
+                        alt,
+                        ctrl,
+                        state.grid.mouse_mode(),
+                        state.grid.mouse_encoding(),
+                    )
+                    .map(|bytes| (id, bytes))
+                }) else {
+                    return Ok(());
+                };
+                if let Err(e) = self.client.terminal_input(&id, &bytes).await {
+                    self.error(&format!("terminal mouse input: {e:#}"));
+                }
+            }
             UiCommand::TermWheel(lines) => {
                 if let Some(state) = self.current_term_mut() {
                     state.grid.scroll_lines(lines);
+                    state.search_match = None;
                     self.push_term();
                 }
             }
@@ -4752,7 +5083,9 @@ impl Controller {
                 self.term_view = (cols, rows);
                 let Some((id, state)) = self
                     .current_session_id()
-                    .and_then(|sid| self.terms.get_mut(&sid).map(|s| (s.terminal_id.clone(), s)))
+                    .and_then(|sid| self.terms.get_mut(&sid))
+                    .and_then(|session| session.active_mut())
+                    .map(|state| (state.terminal_id.clone(), state))
                 else {
                     return Ok(());
                 };
@@ -4764,15 +5097,85 @@ impl Controller {
                     }
                 }
             }
+            UiCommand::TermNewTab => {
+                self.create_terminal_tab().await?;
+            }
+            UiCommand::TermTabPicked(index) => {
+                let Some(session_id) = self.current_session_id() else {
+                    return Ok(());
+                };
+                let (cols, rows) = self.term_view;
+                let id = self.terms.get_mut(&session_id).and_then(|session| {
+                    if index >= session.tabs.len() {
+                        return None;
+                    }
+                    session.active = index;
+                    let state = session.active_mut()?;
+                    state.grid.resize(rows, cols);
+                    (!state.exited).then(|| state.terminal_id.clone())
+                });
+                self.push_term();
+                if let Some(id) = id
+                    && let Err(e) = self.client.terminal_resize(&id, cols, rows).await
+                {
+                    tracing::warn!("terminal resize: {e:#}");
+                }
+            }
+            UiCommand::TermCloseTab(index) => {
+                let Some(session_id) = self.current_session_id() else {
+                    return Ok(());
+                };
+                let removed = self.terms.get_mut(&session_id).and_then(|session| {
+                    if index >= session.tabs.len() {
+                        return None;
+                    }
+                    let removed = session.tabs.remove(index);
+                    if session.tabs.is_empty() {
+                        session.active = 0;
+                    } else if session.active > index {
+                        session.active -= 1;
+                    } else if session.active >= session.tabs.len() {
+                        session.active = session.tabs.len() - 1;
+                    }
+                    Some(removed.terminal_id)
+                });
+                if let Some(id) = removed {
+                    let _ = self.client.kill_terminal(&id).await;
+                    self.push_term();
+                }
+            }
             UiCommand::TermRestart => {
                 let Some(session_id) = self.current_session_id() else {
                     return Ok(());
                 };
-                if let Some(state) = self.terms.remove(&session_id) {
-                    // Kill server-side; the follower ends with the stream.
-                    let _ = self.client.kill_terminal(&state.terminal_id).await;
+                let Some((index, old_id)) = self.terms.get(&session_id).and_then(|session| {
+                    session
+                        .active()
+                        .map(|state| (session.active, state.terminal_id.clone()))
+                }) else {
+                    self.create_terminal_tab().await?;
+                    return Ok(());
+                };
+                let _ = self.client.kill_terminal(&old_id).await;
+                let (cols, rows) = self.term_view;
+                let info = self.client.create_terminal(&session_id, cols, rows).await?;
+                self.start_terminal_follower(session_id.clone(), info.id.clone());
+                if let Some(session) = self.terms.get_mut(&session_id) {
+                    session.tabs[index] = TermState {
+                        terminal_id: info.id,
+                        title: session.tabs[index].title.clone(),
+                        grid: slint_terminal::GridState::new(rows, cols, TERM_SCROLLBACK),
+                        offset: 0,
+                        exited: info.exited,
+                        notice: String::new(),
+                        pending_clipboard: None,
+                        search_query: String::new(),
+                        search_match: None,
+                        cursor_shape: 0,
+                        cursor_blinking: true,
+                    };
                 }
-                self.ensure_terminal().await;
+                self.push_term();
             }
             UiCommand::TermOutput {
                 session_id,
@@ -4780,15 +5183,70 @@ impl Controller {
                 offset,
                 bytes,
             } => {
-                let visible = self.current_session_id().as_deref() == Some(session_id.as_str());
+                let visible_session =
+                    self.current_session_id().as_deref() == Some(session_id.as_str());
                 // Guard against a stale follower racing a restart.
                 let mut applied = false;
-                if let Some(state) = self.terms.get_mut(&session_id)
-                    && state.terminal_id == terminal_id
+                let mut visible = false;
+                let mut replies = Vec::new();
+                let mut rang_bell = false;
+                if let Some(session) = self.terms.get_mut(&session_id)
+                    && let Some((index, state)) = session
+                        .tabs
+                        .iter_mut()
+                        .enumerate()
+                        .find(|(_, state)| state.terminal_id == terminal_id)
                 {
+                    state.search_match = None;
                     state.grid.process(&bytes);
+                    for event in state.grid.drain_events() {
+                        match event {
+                            slint_terminal::TerminalEvent::Bell => rang_bell = true,
+                            slint_terminal::TerminalEvent::Title(title) => {
+                                if !title.is_empty() {
+                                    state.title = title;
+                                }
+                            }
+                            slint_terminal::TerminalEvent::Resize { rows, cols } => {
+                                state.notice =
+                                    format!("shell requested {cols}×{rows}; panel size is fixed");
+                            }
+                            slint_terminal::TerminalEvent::ClipboardCopy { data, .. } => {
+                                use base64::Engine as _;
+                                state.pending_clipboard = base64::engine::general_purpose::STANDARD
+                                    .decode(data)
+                                    .ok()
+                                    .and_then(|bytes| String::from_utf8(bytes).ok());
+                                if state.pending_clipboard.is_none() {
+                                    state.notice = "blocked invalid clipboard request".into();
+                                }
+                            }
+                            slint_terminal::TerminalEvent::ClipboardPaste { .. } => {
+                                state.notice = "blocked terminal clipboard read".into();
+                            }
+                            slint_terminal::TerminalEvent::CursorStyle { shape, blinking } => {
+                                state.cursor_shape = match shape {
+                                    slint_terminal::CursorShape::Block => 0,
+                                    slint_terminal::CursorShape::Underline => 1,
+                                    slint_terminal::CursorShape::Bar => 2,
+                                };
+                                state.cursor_blinking = blinking;
+                            }
+                            slint_terminal::TerminalEvent::Hyperlink { .. } => {}
+                            slint_terminal::TerminalEvent::Reply(bytes) => replies.push(bytes),
+                        }
+                    }
                     state.offset = offset;
                     applied = true;
+                    visible = visible_session && session.active == index;
+                }
+                for reply in replies {
+                    if let Err(e) = self.client.terminal_input(&terminal_id, &reply).await {
+                        tracing::debug!("terminal query reply failed: {e:#}");
+                    }
+                }
+                if rang_bell && visible {
+                    ui::ring_term_bell(&self.ui);
                 }
                 if applied && visible {
                     let now = std::time::Instant::now();
@@ -4827,6 +5285,7 @@ impl Controller {
                     let current = self
                         .terms
                         .get(&session_id)
+                        .and_then(TermSessionState::active)
                         .is_some_and(|state| state.terminal_id == terminal_id);
                     if visible && current {
                         self.push_term();
@@ -4838,13 +5297,20 @@ impl Controller {
                 session_id,
                 terminal_id,
             } => {
-                let visible = self.current_session_id().as_deref() == Some(session_id.as_str());
+                let visible_session =
+                    self.current_session_id().as_deref() == Some(session_id.as_str());
                 let mut applied = false;
-                if let Some(state) = self.terms.get_mut(&session_id)
-                    && state.terminal_id == terminal_id
+                let mut visible = false;
+                if let Some(session) = self.terms.get_mut(&session_id)
+                    && let Some((index, state)) = session
+                        .tabs
+                        .iter_mut()
+                        .enumerate()
+                        .find(|(_, state)| state.terminal_id == terminal_id)
                 {
                     state.exited = true;
                     applied = true;
+                    visible = visible_session && session.active == index;
                 }
                 if applied && visible {
                     self.term_render_pending = None;
@@ -6310,6 +6776,10 @@ fn open_in_browser(url: &str) {
     crate::opener::open(url);
 }
 
+fn is_web_url(url: &str) -> bool {
+    url.starts_with("https://") || url.starts_with("http://")
+}
+
 /// One line per check run: status glyph, name, conclusion.
 fn format_checks(checks: &[trouve_protocol::CheckRun]) -> String {
     checks
@@ -6964,8 +7434,9 @@ mod tests {
     use super::{
         SubscriptionRefresh, SubscriptionRefreshState, approval_pill, attention_badge, check_pill,
         classify_pr, download_progress, format_pr_dashboard_refresh_status, human_age, human_rate,
-        merge_pill, model_health_view, pr_badge, project_session_prs, reconcile_pr_group_order,
-        reconcile_workspace_order, reorder_id, should_open_chat_at_tail, thinking_property,
+        is_web_url, merge_pill, model_health_view, pr_badge, project_session_prs,
+        reconcile_pr_group_order, reconcile_workspace_order, reorder_id, should_open_chat_at_tail,
+        thinking_property,
     };
     use chrono::{Duration, TimeZone, Utc};
     use trouve_protocol::{
@@ -6980,6 +7451,15 @@ mod tests {
                 path: format!("/{id}"),
             })
             .collect()
+    }
+
+    #[test]
+    fn terminal_links_only_allow_web_schemes() {
+        assert!(is_web_url("https://example.com/docs"));
+        assert!(is_web_url("http://localhost:8080"));
+        assert!(!is_web_url("file:///tmp/secret"));
+        assert!(!is_web_url("javascript:alert(1)"));
+        assert!(!is_web_url("ssh://example.com"));
     }
 
     #[test]

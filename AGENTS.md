@@ -33,9 +33,12 @@ These are load-bearing. Do not violate them without a new ADR.
    the server in-process (ADR 0008), but only through its one bootstrap
    entry point (`trouve_server::bind_local`) — it still talks to it over
    loopback HTTP + SSE and never touches engine internals.
-2. **One event log.** Server→client state flows through the append-only,
-   persisted, cursor-addressed event log. New UI-visible state means a new
-   event type, not a side channel.
+2. **One durable event log.** Durable server→client state flows through the
+   append-only, persisted, cursor-addressed event log. New durable UI-visible
+   state means a new event type, not a side channel. Explicitly ephemeral
+   transports such as integrated PTY instances and their byte streams may use
+   request/SSE endpoints and are not reconstructed after server restart (ADR
+   0012).
 3. **Every side effect goes through `ToolExecutor`.** File edits, shell,
    git, MCP calls — one chokepoint for permissions, audit, and (later)
    sandboxed executors. Never spawn a process or write a file from the agent

@@ -3037,8 +3037,25 @@ impl Engine {
 
     // --- integrated terminal --------------------------------------------
 
-    /// The session's interactive terminal, spawning a shell in its worktree
-    /// if none is live. Ephemeral (not persisted, not in the event log).
+    fn ensure_terminal_session_available(&self, session: &Session) -> Result<(), EngineError> {
+        if session.archived {
+            return Err(EngineError::Conflict(format!(
+                "session {} is archived",
+                session.id
+            )));
+        }
+        if self.store.open_workspace(&session.workspace_id)?.is_none() {
+            return Err(EngineError::Conflict(format!(
+                "workspace {} is closed",
+                session.workspace_id
+            )));
+        }
+        Ok(())
+    }
+
+    /// The session's default interactive terminal, spawning a shell in its
+    /// worktree if none is live. Ephemeral (not persisted, not in the event
+    /// log). Kept for compatibility with the original singular endpoint.
     pub fn open_terminal(
         &self,
         session_id: &str,
@@ -3046,9 +3063,40 @@ impl Engine {
         rows: u16,
     ) -> Result<trouve_protocol::TerminalInfo, EngineError> {
         let session = self.get_session(session_id)?;
+        self.ensure_terminal_session_available(&session)?;
         let terminal = self
             .terminals
-            .open(session_id, Path::new(&session.worktree_path), cols, rows)
+            .open_default(session_id, Path::new(&session.worktree_path), cols, rows)
+            .map_err(EngineError::Internal)?;
+        Ok(terminal_info(&terminal))
+    }
+
+    /// All ephemeral terminals belonging to a session, in creation order.
+    pub fn list_terminals(
+        &self,
+        session_id: &str,
+    ) -> Result<Vec<trouve_protocol::TerminalInfo>, EngineError> {
+        self.get_session(session_id)?;
+        Ok(self
+            .terminals
+            .list_session(session_id)
+            .iter()
+            .map(|terminal| terminal_info(terminal))
+            .collect())
+    }
+
+    /// Spawn another independent interactive terminal in the session worktree.
+    pub fn create_terminal(
+        &self,
+        session_id: &str,
+        cols: u16,
+        rows: u16,
+    ) -> Result<trouve_protocol::TerminalInfo, EngineError> {
+        let session = self.get_session(session_id)?;
+        self.ensure_terminal_session_available(&session)?;
+        let terminal = self
+            .terminals
+            .create(session_id, Path::new(&session.worktree_path), cols, rows)
             .map_err(EngineError::Internal)?;
         Ok(terminal_info(&terminal))
     }
@@ -3074,7 +3122,7 @@ impl Engine {
         terminal.resize(cols, rows).map_err(EngineError::Internal)
     }
 
-    /// Kill a terminal (the next open spawns a fresh shell).
+    /// Kill one terminal without disturbing the session's other terminals.
     pub fn terminal_kill(&self, terminal_id: &str) -> Result<(), EngineError> {
         // get() first so unknown ids surface as 404 rather than a no-op.
         self.terminals
@@ -3134,6 +3182,11 @@ impl Engine {
         let path_str = canonical.to_string_lossy().to_string();
         if let Some(existing) = self.store.workspace_by_path(&path_str)? {
             if self.store.set_workspace_closed(&existing.id, false)? {
+                for session in self.store.list_sessions(Some(&existing.id))? {
+                    if !session.archived {
+                        self.terminals.reopen_session(&session.id);
+                    }
+                }
                 self.store.append_event(
                     Scope::Server,
                     Event::WorkspaceRegistered {
@@ -3256,6 +3309,9 @@ impl Engine {
             return Err(EngineError::NotFound(format!("workspace {id}")));
         }
         if self.store.set_workspace_closed(id, true)? {
+            for session in self.store.list_sessions(Some(id))? {
+                self.terminals.remove_session(&session.id);
+            }
             self.store.append_event(
                 Scope::Server,
                 Event::WorkspaceClosed {
@@ -3432,21 +3488,38 @@ impl Engine {
         {
             return Err(EngineError::BadRequest("title cannot be empty".into()));
         }
-        self.store
-            .update_session(id, req.title.as_deref(), req.archived)?;
-        self.store.append_event(
-            Scope::Server,
-            Event::SessionUpdated {
-                session_id: id.to_string(),
-                workspace_id: session.workspace_id.clone(),
-            },
-        )?;
-        if self.index_hooks
-            && req.archived == Some(true)
-            && !session.archived
-            && let Some(ws) = self.store.workspace(&session.workspace_id)?
+        let newly_archived = req.archived == Some(true) && !session.archived;
+        let newly_unarchived = req.archived == Some(false) && session.archived;
         {
-            crate::tools::gc_index_store_in_background(PathBuf::from(&ws.path));
+            // Serialize mutation against delete's marker. Besides preserving
+            // the session row, this prevents an unarchive from reopening the
+            // terminal manager while deletion is tearing the session down.
+            let deleting = self.deleting_sessions.lock().unwrap();
+            if deleting.contains(id) {
+                return Err(EngineError::Conflict(format!(
+                    "session {id} is being deleted"
+                )));
+            }
+            self.store
+                .update_session(id, req.title.as_deref(), req.archived)?;
+            if newly_archived {
+                self.terminals.remove_session(id);
+            } else if newly_unarchived {
+                self.terminals.reopen_session(id);
+            }
+            self.store.append_event(
+                Scope::Server,
+                Event::SessionUpdated {
+                    session_id: id.to_string(),
+                    workspace_id: session.workspace_id.clone(),
+                },
+            )?;
+            if self.index_hooks
+                && newly_archived
+                && let Some(ws) = self.store.workspace(&session.workspace_id)?
+            {
+                crate::tools::gc_index_store_in_background(PathBuf::from(&ws.path));
+            }
         }
         self.get_session(id)
     }
@@ -3484,9 +3557,15 @@ impl Engine {
             // filesystem work. A database error must leave the session and
             // its worktree consistently intact.
             let attachment_paths = self.store.session_attachment_paths(id)?;
-            self.store.delete_session(id)?;
-
             self.terminals.remove_session(id);
+            if let Err(error) = self.store.delete_session(id) {
+                // Restore terminal access when the database transaction left
+                // a live, unarchived session behind.
+                if !session.archived {
+                    self.terminals.reopen_session(id);
+                }
+                return Err(error.into());
+            }
             self.executor
                 .evict_worktree(Path::new(&session.worktree_path))
                 .await;
@@ -7615,6 +7694,86 @@ mod tests {
             "o",
             "r"
         ));
+    }
+
+    #[test]
+    fn archive_and_workspace_close_tear_down_terminals_until_reopened() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(
+            std::process::Command::new("git")
+                .args(["init", "-b", "main"])
+                .arg(dir.path())
+                .output()
+                .unwrap()
+                .status
+                .success()
+        );
+        let store = Store::open_in_memory().unwrap();
+        let engine = Engine::new(store, dir.path().to_path_buf(), &Config::default());
+        let workspace = engine
+            .register_workspace(
+                dir.path().to_str().unwrap(),
+                Some("terminal archive".into()),
+            )
+            .unwrap();
+        let workspace_id = workspace.id.clone();
+        let session = Session {
+            id: "se_terminal_archive".into(),
+            workspace_id: workspace_id.clone(),
+            title: "terminal archive".into(),
+            branch: "trouve/terminal-archive".into(),
+            worktree_path: workspace.path,
+            base_ref: "main".into(),
+            archived: false,
+            active: false,
+            created_at: chrono::Utc::now(),
+        };
+        engine.store.insert_session(&session).unwrap();
+
+        engine.open_terminal(&session.id, 80, 24).unwrap();
+        engine.create_terminal(&session.id, 80, 24).unwrap();
+        assert_eq!(engine.list_terminals(&session.id).unwrap().len(), 2);
+
+        let archived = engine
+            .update_session(
+                &session.id,
+                &UpdateSessionRequest {
+                    title: None,
+                    archived: Some(true),
+                },
+            )
+            .unwrap();
+        assert!(archived.archived);
+        assert!(engine.list_terminals(&session.id).unwrap().is_empty());
+        assert!(matches!(
+            engine.create_terminal(&session.id, 80, 24),
+            Err(EngineError::Conflict(_))
+        ));
+
+        let unarchived = engine
+            .update_session(
+                &session.id,
+                &UpdateSessionRequest {
+                    title: None,
+                    archived: Some(false),
+                },
+            )
+            .unwrap();
+        assert!(!unarchived.archived);
+        assert!(engine.create_terminal(&session.id, 80, 24).is_ok());
+
+        engine.close_workspace(&workspace_id).unwrap();
+        assert!(engine.list_terminals(&session.id).unwrap().is_empty());
+        assert!(matches!(
+            engine.create_terminal(&session.id, 80, 24),
+            Err(EngineError::Conflict(_))
+        ));
+
+        let reopened = engine
+            .register_workspace(dir.path().to_str().unwrap(), None)
+            .unwrap();
+        assert_eq!(reopened.id, workspace_id);
+        assert!(engine.create_terminal(&session.id, 80, 24).is_ok());
     }
 
     #[test]
