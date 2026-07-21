@@ -207,6 +207,8 @@ export component PullRequestsScreen inherits Rectangle {
     in-out property <int> project-index: 0;
     // Error/progress line ("" = nothing to say).
     in property <string> status: "";
+    // Live client-side clock for the automatic account refresh.
+    in property <string> refresh-status: "";
     // The GitHub integration has auth (mirrors the session PR tab's gate).
     in property <bool> configured: true;
     in property <bool> has-workspaces: true;
@@ -218,7 +220,6 @@ export component PullRequestsScreen inherits Rectangle {
     in-out property <string> reorder-focus-key: "";
 
     callback close();
-    callback refresh();
     callback filter-picked(/* project index; 0 = all */ int);
     callback group-toggled(/* group key */ string);
     // Group ordering. Drag payloads stay opaque in Slint and are
@@ -326,10 +327,14 @@ export component PullRequestsScreen inherits Rectangle {
                                 selected => { root.filter-picked(self.current-index); }
                                 width: Theme.fs(220px);
                             }
-                            Rectangle { horizontal-stretch: 1; }
-                            Button {
-                                text: "⟳ Refresh";
-                                clicked => { root.refresh(); }
+                            if root.refresh-status != "": Text {
+                                text: root.refresh-status;
+                                color: Theme.c.text-soft;
+                                font-size: Theme.fs(11px);
+                                horizontal-alignment: right;
+                                vertical-alignment: center;
+                                overflow: elide;
+                                horizontal-stretch: 1;
                             }
                         }
 

@@ -32,6 +32,10 @@ const MAX_ITERATIONS: usize = 32;
 /// model's context window.
 const COMPACTION_THRESHOLD: f64 = 0.8;
 
+/// End-to-end budget for refreshing one GitHub host. This bounds how long a
+/// stalled GraphQL request can retain the shared dashboard-cache lock.
+const GITHUB_DASHBOARD_REFRESH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
 #[derive(Debug, thiserror::Error)]
 pub enum EngineError {
     #[error("not found: {0}")]
@@ -152,6 +156,11 @@ pub struct Engine {
     /// a turn runs; `cancel_turn` trips one to interrupt the turn's provider
     /// stream, tool calls, and approval waits at the next await point.
     turn_cancels: Mutex<std::collections::HashMap<String, tokio_util::sync::CancellationToken>>,
+    /// Per-host incremental PR snapshots. Holding this asynchronous lock also
+    /// coalesces refresh requests from multiple connected clients into one
+    /// upstream GitHub poll.
+    github_dashboard_caches:
+        tokio::sync::Mutex<HashMap<String, crate::github::GitHubDashboardCache>>,
     config: Mutex<Config>,
     /// Where provider configuration changes are persisted. `None` disables
     /// persistence (tests).
@@ -449,6 +458,7 @@ impl Engine {
             active_threads: Mutex::new(std::collections::HashMap::new()),
             deleting_sessions: Mutex::new(std::collections::HashSet::new()),
             turn_cancels: Mutex::new(std::collections::HashMap::new()),
+            github_dashboard_caches: tokio::sync::Mutex::new(HashMap::new()),
             config: Mutex::new(config.clone()),
             // No write-back by default: only a caller that loaded `config`
             // from disk should enable persisting to that file (see
@@ -3158,6 +3168,13 @@ impl Engine {
 
     /// Refresh the account-centric PR feed on every signed-in GitHub instance.
     pub async fn refresh_github_prs(&self) -> Result<(), EngineError> {
+        let mut dashboard_caches = match self.github_dashboard_caches.try_lock() {
+            Ok(caches) => caches,
+            Err(_) => {
+                tracing::debug!("coalescing concurrent GitHub dashboard refresh");
+                return Ok(());
+            }
+        };
         let merged_since = chrono::Utc::now() - chrono::Duration::hours(24);
         let workspaces = self.store.list_workspaces()?;
         let workspace_repositories = tokio::task::spawn_blocking(move || {
@@ -3173,16 +3190,36 @@ impl Engine {
         .await
         .map_err(|error| EngineError::Internal(anyhow!(error)))?;
         let mut failures = Vec::new();
-        for (host, _) in self.github_hosts() {
+        let github_hosts = self.github_hosts();
+        let known_hosts = github_hosts
+            .iter()
+            .map(|(host, _)| host.clone())
+            .collect::<HashSet<_>>();
+        dashboard_caches.retain(|host, _| known_hosts.contains(host));
+        for (host, _) in github_hosts {
             let Some(token) = self.github_token(&host) else {
+                dashboard_caches.remove(&host);
                 continue;
             };
             let account =
                 crate::github::GitHubAccount::new(&token, &host).map_err(EngineError::Internal)?;
-            let (viewer, mut prs) = match account.dashboard_prs(merged_since).await {
-                Ok(result) => result,
-                Err(error) => {
+            let cache = dashboard_caches.entry(host.clone()).or_default();
+            let refresh = tokio::time::timeout(
+                GITHUB_DASHBOARD_REFRESH_TIMEOUT,
+                account.dashboard_prs(merged_since, cache),
+            )
+            .await;
+            let (viewer, mut prs) = match refresh {
+                Ok(Ok(result)) => result,
+                Ok(Err(error)) => {
                     failures.push(format!("{host}: {error:#}"));
+                    continue;
+                }
+                Err(_) => {
+                    failures.push(format!(
+                        "{host}: GitHub dashboard refresh timed out after {}s",
+                        GITHUB_DASHBOARD_REFRESH_TIMEOUT.as_secs()
+                    ));
                     continue;
                 }
             };
