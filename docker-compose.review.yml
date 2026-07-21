@@ -1,6 +1,6 @@
 services:
   trouve-server:
-    image: ghcr.io/jimsimon/trouve-server:latest
+    image: ghcr.io/jimsimon/trouve-server:${TROUVE_VERSION:?set TROUVE_VERSION in .env}
     build:
       context: .
       dockerfile: Dockerfile.server
@@ -25,7 +25,7 @@ services:
       start_period: 10s
 
   review-ui:
-    image: ghcr.io/jimsimon/trouve-review-ui:latest
+    image: ghcr.io/jimsimon/trouve-review-ui:${TROUVE_VERSION:?set TROUVE_VERSION in .env}
     build: web/review-ui
     restart: unless-stopped
     depends_on:

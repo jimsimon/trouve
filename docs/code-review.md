@@ -16,6 +16,7 @@ Create a `.env` beside `docker-compose.review.yml` with a long random token:
 
 ```dotenv
 TROUVE_AUTH_TOKEN=replace-with-at-least-32-random-bytes
+TROUVE_VERSION=2.1.0
 TROUVE_REVIEW_PORT=7433
 TROUVE_CODE_REVIEW_POLL_INTERVAL_SECONDS=60
 ```
@@ -28,11 +29,11 @@ docker compose -f docker-compose.review.yml up -d
 ```
 
 Images are published with each `trouve-search-vX.Y.Z` GitHub release to GitHub
-Container Registry as `ghcr.io/jimsimon/trouve-server:latest` and
-`ghcr.io/jimsimon/trouve-review-ui:latest`. Each release also publishes the
-release version (for example, `2.1.0`) and an immutable commit-SHA tag. To build
-both images from the current checkout instead, use the same Compose file with
-the `--build` flag.
+Container Registry. Set `TROUVE_VERSION` to that release's version (for example,
+`2.1.0`) so Compose deploys matching server and UI images. Each release also
+publishes `latest` for convenience and an immutable commit-SHA tag. To build both
+images from the current checkout instead, use the same Compose file with the
+`--build` flag.
 
 Open `http://your-server:7433`, enter `TROUVE_AUTH_TOKEN`, and add at least
 one model provider. The token is kept in browser session storage, so closing
@@ -104,10 +105,18 @@ server and consumes no GitHub requests.
 
 Back up the `trouve-data` Docker volume. It contains configuration, secrets,
 the SQLite job/event log, managed repositories, and review sessions. Upgrade
-with:
+by changing `TROUVE_VERSION` in `.env`, then run:
 
 ```bash
 git pull
 docker compose -f docker-compose.review.yml pull
 docker compose -f docker-compose.review.yml up -d
+```
+
+The release container runs as UID/GID 10001. If a pre-release root-running
+image created the existing volume, migrate its ownership once before upgrading:
+
+```bash
+docker compose -f docker-compose.review.yml run --rm --user root \
+  --entrypoint chown trouve-server -R 10001:10001 /var/lib/trouve
 ```

@@ -165,8 +165,8 @@ function render(): void {
     <section class="card wide">
       <div class="section-title"><div><p class="eyebrow">Policy</p><h2>Repositories</h2></div><span class="muted">Manual means GitHub reviewer requests only.</span></div>
       <div class="repo-list">
-        ${dashboard.repositories.map((repo, index) => `
-          <form class="repo" data-index="${index}">
+        ${dashboard.repositories.map((repo) => `
+          <form class="repo" data-installation-id="${repo.installation_id}" data-repository="${escape(repo.repository)}">
             <div class="repo-name"><strong>${escape(repo.repository)}</strong>${repo.private ? "<span>private</span>" : ""}</div>
             <select name="mode"><option value="off" ${repo.mode === "off" ? "selected" : ""}>Off</option><option value="manual" ${repo.mode === "manual" ? "selected" : ""}>Manual</option><option value="automatic" ${repo.mode === "automatic" ? "selected" : ""}>Automatic</option></select>
             <select name="model">${modelOptions(repo.model)}</select>
@@ -250,14 +250,13 @@ function bind(): void {
   document.querySelectorAll<HTMLFormElement>("form.repo").forEach((form) => {
     form.onsubmit = async (event) => {
       event.preventDefault();
-      const repository = dashboard!.repositories[Number(form.dataset.index)];
       const data = new FormData(form);
       try {
         await api("/code-review/repository", {
           method: "PUT",
           body: JSON.stringify({
-            installation_id: repository.installation_id,
-            repository: repository.repository,
+            installation_id: Number(form.dataset.installationId),
+            repository: form.dataset.repository,
             mode: data.get("mode"),
             model: String(data.get("model") || "") || null,
             prompt: data.get("prompt"),

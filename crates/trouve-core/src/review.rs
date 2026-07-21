@@ -4,7 +4,7 @@
 //! an installed GitHub App, reconciles webhooks with inexpensive polling,
 //! and turns each immutable PR head into a normal trouve review session.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -741,6 +741,7 @@ impl Engine {
         let worker_engine = self.clone();
         tokio::spawn(async move {
             loop {
+                worker_engine.retry_code_review_cleanup().await;
                 match worker_engine.store.claim_code_review_job() {
                     Ok(Some(record)) => worker_engine.run_code_review_job(record).await,
                     Ok(None) => {
@@ -778,13 +779,50 @@ impl Engine {
                 ),
             ),
         };
-        if let Err(finish_error) =
+        let finished = if let Err(finish_error) =
             self.store
                 .finish_code_review_job(&job_id, status, &review_url, &error)
         {
             self.record_review_error(format!("finishing review job: {finish_error:#}"));
+            false
+        } else {
+            true
+        };
+        if finished && status == "succeeded" {
+            self.retry_code_review_cleanup().await;
         }
         let _ = self.emit_code_review_updated(Some(job_id));
+    }
+
+    async fn retry_code_review_cleanup(&self) {
+        let pending = match self.store.pending_code_review_job_cleanups() {
+            Ok(pending) => pending,
+            Err(error) => {
+                self.record_review_error(format!(
+                    "listing completed review sessions for cleanup: {error:#}"
+                ));
+                return;
+            }
+        };
+        for (job_id, session_id) in pending {
+            match self.delete_session(&session_id).await {
+                Ok(()) | Err(EngineError::NotFound(_)) => {
+                    if let Err(error) = self
+                        .store
+                        .complete_code_review_job_cleanup(&job_id, &session_id)
+                    {
+                        self.record_review_error(format!(
+                            "recording cleanup of review job {job_id}: {error:#}"
+                        ));
+                    }
+                }
+                Err(error) => {
+                    self.record_review_error(format!(
+                        "cleaning up successful review job {job_id}: {error}"
+                    ));
+                }
+            }
+        }
     }
 
     async fn execute_code_review(self: &Arc<Self>, record: &CodeReviewJobRecord) -> Result<String> {
@@ -829,28 +867,45 @@ impl Engine {
             .set_code_review_job_session(&job.id, &session.id, &thread.id)?;
         self.emit_code_review_updated(Some(job.id.clone()))?;
 
+        let scope = Scope::Thread(thread.id.clone());
         let mut events = self.store.subscribe();
+        let mut after = self
+            .store
+            .events_after(&scope, 0)?
+            .last()
+            .map(|event| event.cursor)
+            .unwrap_or(0);
+        let mut replay = VecDeque::new();
         let accepted = self.send_message(&thread.id, review_prompt(record), Vec::new())?;
         let turn = accepted.turn;
         let mut output = String::new();
         loop {
-            let envelope = match events.recv().await {
-                Ok(envelope) => envelope,
-                Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
-                    tracing::warn!(
-                        job_id = %job.id,
-                        skipped,
-                        "review event receiver lagged; continuing from the latest event"
-                    );
-                    continue;
-                }
-                Err(tokio::sync::broadcast::error::RecvError::Closed) => {
-                    bail!("review event stream closed");
-                }
+            let envelope = match replay.pop_front() {
+                Some(envelope) => envelope,
+                None => match events.recv().await {
+                    Ok(envelope) => envelope,
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                        tracing::warn!(
+                            job_id = %job.id,
+                            skipped,
+                            "review event receiver lagged; replaying persisted events"
+                        );
+                        replay = VecDeque::from(
+                            self.store
+                                .events_after(&scope, after)
+                                .context("replaying review events after receiver lag")?,
+                        );
+                        continue;
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                        bail!("review event stream closed");
+                    }
+                },
             };
-            if envelope.scope != Scope::Thread(thread.id.clone()) {
+            if envelope.scope != scope || envelope.cursor <= after {
                 continue;
             }
+            after = envelope.cursor;
             match envelope.event {
                 Event::AssistantMessage {
                     turn: event_turn,
@@ -893,9 +948,6 @@ impl Engine {
         }
         let parsed = parse_review_output(&output)?;
         let review_url = self.publish_review(&api, job, parsed).await?;
-        self.delete_session(&session.id)
-            .await
-            .context("cleaning up successful review session")?;
         Ok(review_url)
     }
 

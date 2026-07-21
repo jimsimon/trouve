@@ -1566,9 +1566,7 @@ impl Store {
     ) -> Result<()> {
         self.conn.lock().unwrap().execute(
             "UPDATE code_review_jobs SET status = ?2, review_url = ?3, error = ?4,
-                    completed_at = ?5,
-                    session_id = CASE WHEN ?2 = 'succeeded' THEN NULL ELSE session_id END,
-                    thread_id = CASE WHEN ?2 = 'succeeded' THEN NULL ELSE thread_id END
+                    completed_at = ?5
              WHERE id = ?1",
             params![
                 id,
@@ -1577,6 +1575,26 @@ impl Store {
                 error,
                 chrono::Utc::now().to_rfc3339()
             ],
+        )?;
+        Ok(())
+    }
+
+    pub fn pending_code_review_job_cleanups(&self) -> Result<Vec<(String, String)>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, session_id FROM code_review_jobs
+             WHERE status = 'succeeded' AND session_id IS NOT NULL
+             ORDER BY completed_at",
+        )?;
+        let rows = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    pub fn complete_code_review_job_cleanup(&self, id: &str, session_id: &str) -> Result<()> {
+        self.conn.lock().unwrap().execute(
+            "UPDATE code_review_jobs SET session_id = NULL, thread_id = NULL
+             WHERE id = ?1 AND status = 'succeeded' AND session_id = ?2",
+            params![id, session_id],
         )?;
         Ok(())
     }
@@ -2766,8 +2784,19 @@ mod tests {
             .unwrap();
         let completed = store.list_code_review_jobs(10).unwrap().remove(0);
         assert_eq!(completed.status, "succeeded");
+        assert_eq!(completed.session_id.as_deref(), Some("se_review"));
+        assert_eq!(completed.thread_id.as_deref(), Some("th_review"));
+        assert_eq!(
+            store.pending_code_review_job_cleanups().unwrap(),
+            vec![(queued.id.clone(), "se_review".into())]
+        );
+        store
+            .complete_code_review_job_cleanup(&queued.id, "se_review")
+            .unwrap();
+        let completed = store.list_code_review_jobs(10).unwrap().remove(0);
         assert!(completed.session_id.is_none());
         assert!(completed.thread_id.is_none());
+        assert!(store.pending_code_review_job_cleanups().unwrap().is_empty());
 
         assert!(store.claim_github_webhook_delivery("delivery-1").unwrap());
         assert!(!store.claim_github_webhook_delivery("delivery-1").unwrap());
