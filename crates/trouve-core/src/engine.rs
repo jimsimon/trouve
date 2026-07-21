@@ -4,7 +4,9 @@
 //! reported exclusively through the event log. Worktree mutations are
 //! serialized per session (threads share the session worktree, ADR 0003).
 
-use std::collections::{HashMap, HashSet};
+mod routing;
+
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Instant;
@@ -28,6 +30,11 @@ use crate::{context, git, modes, new_id};
 
 /// Safety valve: maximum provider round-trips within a single turn.
 const MAX_ITERATIONS: usize = 32;
+/// A cold catalog can contain many routes whose credentials or quotas have
+/// never been exercised. Bound the discovery blast radius of one turn; the
+/// persistent circuit breaker skips failures on the next turn so another
+/// batch can be tried without hammering the same providers again.
+const MAX_ROUTE_ATTEMPTS_PER_TURN: usize = 4;
 
 /// Keep backend persistence efficient without making live SSE output feel
 /// buffered. Bursts flush by count; sparse output flushes by this deadline.
@@ -49,6 +56,322 @@ const SESSION_TITLE_TIMEOUT: std::time::Duration = std::time::Duration::from_sec
 const MODEL_CATALOG_VALIDATION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 #[cfg(test)]
 const MODEL_CATALOG_VALIDATION_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// A currently runnable provider-specific route for one picker model.
+#[derive(Clone)]
+struct ModelCandidate {
+    provider_id: String,
+    provider_model: String,
+    info: trouve_protocol::ModelInfo,
+    executor: ModelExecutor,
+    /// Local runtimes and loopback endpoints keep their provider prefix so a
+    /// downloaded model cannot silently merge with a hosted model that has
+    /// the same account-visible id.
+    provider_qualified: bool,
+}
+
+#[derive(Clone)]
+enum ModelExecutor {
+    Native(Arc<dyn Provider>),
+    Backend(Arc<dyn AgentBackend>),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RouteFailureKind {
+    Capacity,
+    Authentication,
+    Unavailable,
+}
+
+impl RouteFailureKind {
+    fn cooldown(self) -> (i64, i64) {
+        match self {
+            // Quotas and rate limits usually need a real reset window.
+            Self::Capacity => (5 * 60, 6 * 60 * 60),
+            // A credential/endpoint edit clears this immediately; otherwise
+            // avoid repeatedly exercising a known-bad configuration.
+            Self::Authentication => (60 * 60, 24 * 60 * 60),
+            // Transport/vendor outages get a shorter exponential backoff.
+            Self::Unavailable => (30, 30 * 60),
+        }
+    }
+
+    fn failover_reason(self) -> &'static str {
+        match self {
+            Self::Capacity => "capacity_failover",
+            Self::Authentication | Self::Unavailable => "route_failover",
+        }
+    }
+}
+
+#[derive(Debug)]
+struct RouteAttemptFailure {
+    kind: RouteFailureKind,
+    message: String,
+    safe_to_retry: bool,
+}
+
+enum RouteAttemptResult {
+    Completed,
+    Cancelled,
+    Failed(RouteAttemptFailure),
+}
+
+struct TurnAccounting {
+    usage: Usage,
+    context_input_tokens: u64,
+    native_cost_known: bool,
+}
+
+impl Default for TurnAccounting {
+    fn default() -> Self {
+        Self {
+            usage: Usage::default(),
+            context_input_tokens: 0,
+            native_cost_known: true,
+        }
+    }
+}
+
+impl TurnAccounting {
+    fn add_native(
+        &mut self,
+        catalog: &trouve_providers::models_dev::ModelsDevCatalog,
+        route: &ModelCandidate,
+        usage: &Usage,
+    ) {
+        self.usage.input_tokens += usage.input_tokens;
+        self.usage.output_tokens += usage.output_tokens;
+        self.usage.cached_input_tokens += usage.cached_input_tokens;
+        match catalog.cost_usd(
+            &route.info,
+            usage.input_tokens,
+            usage.cached_input_tokens,
+            usage.output_tokens,
+        ) {
+            Some(cost) => {
+                self.usage.cost_usd = Some(self.usage.cost_usd.unwrap_or(0.0) + cost);
+            }
+            None => self.native_cost_known = false,
+        }
+        if usage.context_window.is_some() {
+            self.usage.context_window = usage.context_window;
+        }
+        self.context_input_tokens = usage.input_tokens + usage.cached_input_tokens;
+    }
+
+    fn add_backend(&mut self, usage: &Usage) {
+        self.usage.input_tokens += usage.input_tokens;
+        self.usage.output_tokens += usage.output_tokens;
+        self.usage.cached_input_tokens += usage.cached_input_tokens;
+        if let Some(cost) = usage.cost_usd {
+            self.usage.cost_usd = Some(self.usage.cost_usd.unwrap_or(0.0) + cost);
+        }
+        if usage.context_window.is_some() {
+            self.usage.context_window = usage.context_window;
+        }
+        self.context_input_tokens = usage.input_tokens + usage.cached_input_tokens;
+    }
+
+    fn finalize_cost(&mut self) {
+        if !self.native_cost_known {
+            self.usage.cost_usd = None;
+        }
+    }
+}
+
+impl ModelCandidate {
+    fn selection_id(&self) -> String {
+        model_selection_id(&self.provider_model, &self.info.id, self.provider_qualified)
+    }
+}
+
+fn model_selection_id(
+    provider_model: &str,
+    qualified_id: &str,
+    provider_qualified: bool,
+) -> String {
+    if provider_qualified {
+        return qualified_id.to_string();
+    }
+    neutral_model_id(provider_model).unwrap_or_else(|| qualified_id.to_string())
+}
+
+/// Conservative cross-provider identity. models.dev has already normalized
+/// public provider and vendor-backend ids before candidates reach the engine;
+/// generic choices and namespaced transport ids still must not merge merely
+/// because their spelling happens to match.
+fn neutral_model_id(provider_model: &str) -> Option<String> {
+    let id = provider_model.trim();
+    if id.is_empty() || id.contains('/') {
+        return None;
+    }
+    if matches!(
+        id.to_ascii_lowercase().as_str(),
+        "auto" | "automatic" | "default" | "latest"
+    ) {
+        return None;
+    }
+    Some(id.to_string())
+}
+
+fn model_name_for_provider<'a>(provider_id: &str, qualified_id: &'a str) -> &'a str {
+    qualified_id
+        .strip_prefix(provider_id)
+        .and_then(|rest| rest.strip_prefix('/'))
+        .unwrap_or(qualified_id)
+}
+
+fn fallback_model_info(qualified_id: &str, provider_model: &str) -> trouve_protocol::ModelInfo {
+    trouve_protocol::ModelInfo {
+        id: qualified_id.to_string(),
+        display_name: provider_model.to_string(),
+        context_window: 0,
+        supports_tools: true,
+        input_price_per_mtok: None,
+        output_price_per_mtok: None,
+        options_schema: serde_json::json!({"type": "object", "properties": {}}),
+    }
+}
+
+fn thinking_schema(model: &trouve_protocol::ModelInfo) -> Option<(Vec<String>, Option<String>)> {
+    thinking_option_property(model).map(|(_, property, values)| {
+        (
+            values
+                .iter()
+                .filter_map(|value| value.as_str().map(String::from))
+                .collect(),
+            property["default"].as_str().map(String::from),
+        )
+    })
+}
+
+/// Only advertise options that can be translated for every route. Thinking
+/// is canonicalized to `thinking_level`; the selected provider's schema maps
+/// it to its native key immediately before execution.
+fn routed_options_schema(models: &[&trouve_protocol::ModelInfo]) -> serde_json::Value {
+    let mut properties = models
+        .first()
+        .and_then(|model| model.options_schema["properties"].as_object())
+        .cloned()
+        .unwrap_or_default();
+    properties.retain(|key, value| {
+        !THINKING_OPTION_KEYS.contains(&key.as_str())
+            && models.iter().skip(1).all(|model| {
+                model.options_schema["properties"]
+                    .get(key)
+                    .is_some_and(|candidate| candidate == value)
+            })
+    });
+
+    let mut schemas = models.iter().map(|model| thinking_schema(model));
+    if let Some(Some((mut common_levels, first_default))) = schemas.next() {
+        let mut shared_default = first_default;
+        let shared_by_every_route = schemas.all(|schema| {
+            let Some((values, default)) = schema else {
+                return false;
+            };
+            common_levels.retain(|value| values.contains(value));
+            if default != shared_default {
+                shared_default = None;
+            }
+            true
+        });
+        if shared_by_every_route && common_levels.len() > 1 {
+            let default = shared_default
+                .filter(|value| common_levels.contains(value))
+                .or_else(|| {
+                    common_levels
+                        .iter()
+                        .find(|value| value.as_str() == "medium")
+                        .cloned()
+                })
+                .unwrap_or_else(|| common_levels[0].clone());
+            properties.insert(
+                "thinking_level".into(),
+                serde_json::json!({
+                    "type": "string",
+                    "enum": common_levels,
+                    "default": default,
+                    "description": "How much thinking the model does before answering"
+                }),
+            );
+        }
+    }
+
+    serde_json::json!({"type": "object", "properties": properties})
+}
+
+fn common_price(
+    candidates: &[ModelCandidate],
+    get: impl Fn(&trouve_protocol::ModelInfo) -> Option<f64>,
+) -> Option<f64> {
+    let first = get(&candidates.first()?.info)?;
+    candidates
+        .iter()
+        .all(|candidate| get(&candidate.info) == Some(first))
+        .then_some(first)
+}
+
+fn subscription_health_rank(health: &trouve_protocol::SubscriptionHealth) -> (u8, i64) {
+    match health.status.as_str() {
+        "ok" => match health
+            .windows
+            .iter()
+            .map(|window| window.used_percent.max(0))
+            .max()
+        {
+            Some(used) if used >= 100 => (3, used),
+            Some(used) => (0, used),
+            None => (1, 0),
+        },
+        "unavailable" => (2, 0),
+        _ => (1, 0),
+    }
+}
+
+fn native_attempt_failure(error: trouve_providers::ProviderError) -> RouteAttemptFailure {
+    let kind = if error.is_capacity_exhausted() {
+        RouteFailureKind::Capacity
+    } else if matches!(&error, trouve_providers::ProviderError::Auth(_)) {
+        RouteFailureKind::Authentication
+    } else {
+        RouteFailureKind::Unavailable
+    };
+    RouteAttemptFailure {
+        kind,
+        message: format!("provider error: {error}"),
+        // Native model requests cannot execute tools while their response is
+        // in flight. Earlier completed tools are already in the shared
+        // transcript/worktree, so another route can safely continue.
+        safe_to_retry: true,
+    }
+}
+
+fn backend_attempt_failure(
+    error: trouve_agents::BackendError,
+    side_effect_started: bool,
+) -> RouteAttemptFailure {
+    let capacity = error.is_capacity_exhausted();
+    let kind = if capacity {
+        RouteFailureKind::Capacity
+    } else if matches!(
+        &error,
+        trouve_agents::BackendError::Auth(_) | trouve_agents::BackendError::NotInstalled(_)
+    ) {
+        RouteFailureKind::Authentication
+    } else {
+        RouteFailureKind::Unavailable
+    };
+    RouteAttemptFailure {
+        kind,
+        message: format!("backend error: {error}"),
+        // A generic vendor error after it started a tool has an ambiguous
+        // side-effect outcome. A classified capacity failure is safe because
+        // the persisted transcript and worktree remain the handoff boundary.
+        safe_to_retry: capacity || !side_effect_started,
+    }
+}
 
 const TURN_CONCURRENCY_ENV: &str = "TROUVE_TURN_CONCURRENCY";
 const DEFAULT_TURN_CONCURRENCY: usize = 26;
@@ -106,7 +429,6 @@ struct TurnScheduler {
 
 struct TurnCapacityGuard {
     _permits: Vec<tokio::sync::OwnedSemaphorePermit>,
-    wait_ms: u64,
 }
 
 impl TurnScheduler {
@@ -151,8 +473,28 @@ impl TurnScheduler {
             .clone()
     }
 
-    async fn acquire(&self, model: &str, background: bool) -> Result<TurnCapacityGuard> {
-        let started = Instant::now();
+    async fn acquire_global(&self, background: bool) -> Result<TurnCapacityGuard> {
+        let mut permits = Vec::with_capacity(if background { 2 } else { 1 });
+        if background {
+            permits.push(
+                self.background
+                    .clone()
+                    .acquire_owned()
+                    .await
+                    .map_err(|_| anyhow!("background turn scheduler closed"))?,
+            );
+        }
+        permits.push(
+            self.all
+                .clone()
+                .acquire_owned()
+                .await
+                .map_err(|_| anyhow!("turn scheduler closed"))?,
+        );
+        Ok(TurnCapacityGuard { _permits: permits })
+    }
+
+    async fn acquire_provider(&self, model: &str, background: bool) -> Result<TurnCapacityGuard> {
         let provider = self.provider(model);
         let cooldown = provider
             .backoff
@@ -163,15 +505,8 @@ impl TurnScheduler {
         if let Some(cooldown) = cooldown {
             tokio::time::sleep(cooldown).await;
         }
-        let mut permits = Vec::with_capacity(if background { 4 } else { 2 });
+        let mut permits = Vec::with_capacity(if background { 2 } else { 1 });
         if background {
-            permits.push(
-                self.background
-                    .clone()
-                    .acquire_owned()
-                    .await
-                    .map_err(|_| anyhow!("background turn scheduler closed"))?,
-            );
             permits.push(
                 provider
                     .background
@@ -182,13 +517,6 @@ impl TurnScheduler {
             );
         }
         permits.push(
-            self.all
-                .clone()
-                .acquire_owned()
-                .await
-                .map_err(|_| anyhow!("turn scheduler closed"))?,
-        );
-        permits.push(
             provider
                 .all
                 .clone()
@@ -196,10 +524,7 @@ impl TurnScheduler {
                 .await
                 .map_err(|_| anyhow!("provider turn scheduler closed"))?,
         );
-        Ok(TurnCapacityGuard {
-            _permits: permits,
-            wait_ms: started.elapsed().as_millis().try_into().unwrap_or(u64::MAX),
-        })
+        Ok(TurnCapacityGuard { _permits: permits })
     }
 
     fn record_outcome(&self, model: &str, error: Option<&str>) {
@@ -251,6 +576,18 @@ fn validate_thinking_level(level: Option<&str>) -> Result<(), EngineError> {
     if level.is_some_and(|value| value.trim().is_empty()) {
         return Err(EngineError::BadRequest(
             "default_thinking_level must not be empty".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_model_selection(model: &str) -> Result<(), EngineError> {
+    if model.trim().is_empty() {
+        return Err(EngineError::BadRequest("model must not be empty".into()));
+    }
+    if model.trim() != model {
+        return Err(EngineError::BadRequest(
+            "model must not have surrounding whitespace".into(),
         ));
     }
     Ok(())
@@ -796,7 +1133,7 @@ impl Engine {
                 config
                     .default_model
                     .clone()
-                    .unwrap_or_else(|| "openai/gpt-4.1-mini".into()),
+                    .unwrap_or_else(|| "gpt-4.1-mini".into()),
             ),
             default_thinking_level: RwLock::new(config.default_thinking_level.clone()),
             default_permission_mode: RwLock::new(
@@ -1004,6 +1341,83 @@ impl Engine {
     /// degrading to static/fallback catalogs of models every turn would
     /// fail on; clients gate prompt entry on this list being non-empty.
     pub async fn list_models(&self) -> Vec<trouve_protocol::ModelInfo> {
+        let mut models: Vec<_> = self
+            .available_model_candidates()
+            .await
+            .into_iter()
+            .map(|candidate| candidate.info)
+            .collect();
+        models.sort_by(|a, b| a.id.cmp(&b.id));
+        models
+    }
+
+    /// Provider-neutral catalog for current clients. The provider-qualified
+    /// `/models` catalog remains intact for compatibility and explicit route
+    /// pinning.
+    pub async fn list_model_routes(&self) -> Vec<trouve_protocol::RoutedModelInfo> {
+        let mut grouped = BTreeMap::<String, Vec<ModelCandidate>>::new();
+        for candidate in self.available_model_candidates().await {
+            grouped
+                .entry(candidate.selection_id())
+                .or_default()
+                .push(candidate);
+        }
+
+        grouped
+            .into_iter()
+            .map(|(id, mut candidates)| {
+                candidates.sort_by(|a, b| {
+                    a.provider_id
+                        .cmp(&b.provider_id)
+                        .then_with(|| a.provider_model.cmp(&b.provider_model))
+                });
+                let first = &candidates[0].info;
+                let display_name = if candidates
+                    .iter()
+                    .all(|candidate| candidate.info.display_name == first.display_name)
+                {
+                    first.display_name.clone()
+                } else {
+                    id.clone()
+                };
+                let context_window = candidates
+                    .iter()
+                    .map(|candidate| candidate.info.context_window)
+                    .filter(|window| *window > 0)
+                    .min()
+                    .unwrap_or(0);
+                trouve_protocol::RoutedModelInfo {
+                    id,
+                    display_name,
+                    context_window,
+                    supports_tools: candidates
+                        .iter()
+                        .all(|candidate| candidate.info.supports_tools),
+                    input_price_per_mtok: common_price(&candidates, |model| {
+                        model.input_price_per_mtok
+                    }),
+                    output_price_per_mtok: common_price(&candidates, |model| {
+                        model.output_price_per_mtok
+                    }),
+                    options_schema: routed_options_schema(
+                        &candidates
+                            .iter()
+                            .map(|candidate| &candidate.info)
+                            .collect::<Vec<_>>(),
+                    ),
+                    routes: candidates
+                        .iter()
+                        .map(|candidate| trouve_protocol::ModelRouteInfo {
+                            provider_id: candidate.provider_id.clone(),
+                            provider_model: candidate.provider_model.clone(),
+                        })
+                        .collect(),
+                }
+            })
+            .collect()
+    }
+
+    async fn available_model_candidates(&self) -> Vec<ModelCandidate> {
         let online = self.is_online();
         // A model-list request is an explicit synchronization point. Refresh
         // here rather than mutating UI-visible metadata silently from the
@@ -1025,29 +1439,197 @@ impl Engine {
             .unwrap()
             .iter()
             .filter(|(id, _)| online || offline_capable.contains(id.as_str()))
-            .map(|(_, p)| p.clone())
+            .map(|(id, provider)| (id.clone(), provider.clone()))
             .collect();
-        let provider_lists =
-            futures::future::join_all(providers.iter().map(|p| p.list_models())).await;
-        let mut models: Vec<_> = provider_lists.into_iter().flatten().collect();
+        let provider_lists = futures::future::join_all(providers.into_iter().map(
+            |(provider_id, provider)| async move {
+                let models = provider.list_models().await;
+                (provider_id, provider, models)
+            },
+        ))
+        .await;
+        let mut candidates = Vec::new();
+        let provider_qualified = self.offline_capable_provider_ids();
+        for (provider_id, provider, models) in provider_lists {
+            candidates.extend(models.into_iter().map(|info| ModelCandidate {
+                provider_model: model_name_for_provider(&provider_id, &info.id).to_string(),
+                provider_qualified: provider_qualified.contains(&provider_id),
+                provider_id: provider_id.clone(),
+                info,
+                executor: ModelExecutor::Native(provider.clone()),
+            }));
+        }
+
         let ready: Vec<_> = if online {
             self.backends
                 .read()
                 .unwrap()
-                .values()
-                .filter(|b| {
-                    let status = b.status();
+                .iter()
+                .filter(|(_, backend)| {
+                    let status = backend.status();
                     status.installed && status.has_credentials
                 })
-                .cloned()
+                .map(|(id, backend)| (id.clone(), backend.clone()))
                 .collect()
         } else {
             Vec::new() // vendor backends all need their cloud
         };
-        let listings = futures::future::join_all(ready.iter().map(|b| b.list_models())).await;
-        models.extend(listings.into_iter().flatten());
-        models.sort_by(|a, b| a.id.cmp(&b.id));
-        models
+        let listings =
+            futures::future::join_all(ready.into_iter().map(|(provider_id, backend)| async move {
+                let models = backend.list_models().await;
+                (provider_id, backend, models)
+            }))
+            .await;
+        for (provider_id, backend, models) in listings {
+            candidates.extend(models.into_iter().map(|info| ModelCandidate {
+                provider_model: model_name_for_provider(&provider_id, &info.id).to_string(),
+                provider_qualified: false,
+                provider_id: provider_id.clone(),
+                info,
+                executor: ModelExecutor::Backend(backend.clone()),
+            }));
+        }
+        candidates
+    }
+
+    /// Resolve a provider-neutral id to runnable routes, applying open
+    /// circuits, reported exhaustion, user preference, live subscription
+    /// headroom, and learned success. A provider-qualified id is an explicit
+    /// pin and resolves to that route only.
+    async fn resolve_model_candidates(
+        &self,
+        model: &str,
+    ) -> Result<Vec<ModelCandidate>, EngineError> {
+        let all = self.available_model_candidates().await;
+        if let Some(candidate) = all.iter().find(|candidate| candidate.info.id == model) {
+            return Ok(vec![candidate.clone()]);
+        }
+        // Preserve the legacy provider-qualified escape hatch even for
+        // injected/custom providers that can run arbitrary model names and
+        // therefore publish no finite catalog.
+        if let Some((provider_id, provider_model)) = model.split_once('/') {
+            if let Some(provider) = self.providers.read().unwrap().get(provider_id).cloned() {
+                return Ok(vec![ModelCandidate {
+                    provider_id: provider_id.to_string(),
+                    provider_model: provider_model.to_string(),
+                    info: fallback_model_info(model, provider_model),
+                    executor: ModelExecutor::Native(provider),
+                    provider_qualified: self.offline_capable_provider_ids().contains(provider_id),
+                }]);
+            }
+            if let Some(backend) = self.backends.read().unwrap().get(provider_id).cloned() {
+                return Ok(vec![ModelCandidate {
+                    provider_id: provider_id.to_string(),
+                    provider_model: provider_model.to_string(),
+                    info: fallback_model_info(model, provider_model),
+                    executor: ModelExecutor::Backend(backend),
+                    provider_qualified: false,
+                }]);
+            }
+        }
+        let candidates: Vec<_> = all
+            .into_iter()
+            .filter(|candidate| candidate.selection_id() == model)
+            .collect();
+        if candidates.is_empty() {
+            return Err(EngineError::BadRequest(format!(
+                "model {model} has no available provider route"
+            )));
+        }
+        self.rank_model_candidates(candidates).await
+    }
+
+    async fn rank_model_candidates(
+        &self,
+        mut candidates: Vec<ModelCandidate>,
+    ) -> Result<Vec<ModelCandidate>, EngineError> {
+        let learned = self.store.route_health().map_err(EngineError::Internal)?;
+        let now = chrono::Utc::now().timestamp();
+        let cooling = |candidate: &ModelCandidate| {
+            learned
+                .get(&(
+                    candidate.provider_id.clone(),
+                    candidate.provider_model.clone(),
+                ))
+                .and_then(|health| health.retry_after)
+                .is_some_and(|retry_after| retry_after > now)
+        };
+        if candidates.iter().all(&cooling) {
+            let retry_after = candidates
+                .iter()
+                .filter_map(|candidate| {
+                    learned
+                        .get(&(
+                            candidate.provider_id.clone(),
+                            candidate.provider_model.clone(),
+                        ))
+                        .and_then(|health| health.retry_after)
+                })
+                .min()
+                .unwrap_or(now);
+            return Err(EngineError::Conflict(format!(
+                "all routes for this model are cooling down; retry in {} seconds",
+                retry_after.saturating_sub(now).max(1)
+            )));
+        }
+        // Do not keep open circuits as tail fallbacks. If every fresh route
+        // fails, the next turn re-ranks from persisted state and advances to
+        // routes that were not exercised yet.
+        candidates.retain(|candidate| !cooling(candidate));
+
+        let provider_order = self.config.lock().unwrap().provider_order.clone();
+        let preference: HashMap<&str, usize> = provider_order
+            .iter()
+            .enumerate()
+            .map(|(index, provider)| (provider.as_str(), index))
+            .collect();
+        let mut scored = futures::future::join_all(candidates.into_iter().map(|candidate| async {
+            let rank = match &candidate.executor {
+                ModelExecutor::Native(_) => (1u8, 0i64),
+                ModelExecutor::Backend(backend) => match tokio::time::timeout(
+                    std::time::Duration::from_secs(5),
+                    backend.subscription_health(),
+                )
+                .await
+                {
+                    Ok(Some(health)) => subscription_health_rank(&health),
+                    _ => (1, 0),
+                },
+            };
+            let preferred = preference.get(candidate.provider_id.as_str()).copied();
+            let route = learned.get(&(
+                candidate.provider_id.clone(),
+                candidate.provider_model.clone(),
+            ));
+            let last_success = route.and_then(|health| health.last_success_at);
+            let score = (
+                u8::from(rank.0 >= 2),
+                u8::from(preferred.is_none()),
+                preferred.unwrap_or(usize::MAX),
+                rank.0,
+                rank.1,
+                u8::from(last_success.is_none()),
+                last_success.map(|timestamp| -timestamp).unwrap_or(i64::MAX),
+            );
+            (score, rank, candidate)
+        }))
+        .await;
+        if scored.iter().all(|(_, rank, _)| rank.0 >= 3) {
+            return Err(EngineError::Conflict(
+                "every route for this model reports exhausted capacity".into(),
+            ));
+        }
+        scored.retain(|(_, rank, _)| rank.0 < 3);
+        scored.sort_by(|(score_a, _, a), (score_b, _, b)| {
+            score_a
+                .cmp(score_b)
+                .then_with(|| a.provider_id.cmp(&b.provider_id))
+                .then_with(|| a.provider_model.cmp(&b.provider_model))
+        });
+        Ok(scored
+            .into_iter()
+            .map(|(_, _, candidate)| candidate)
+            .collect())
     }
 
     /// Provider ids that keep working without internet: the built-in local
@@ -1123,8 +1705,21 @@ impl Engine {
             }
         }
         infos.sort_by(|a, b| a.id.cmp(&b.id));
+        let configured_ids: HashSet<&str> = infos.iter().map(|info| info.id.as_str()).collect();
+        let mut provider_order = Vec::with_capacity(infos.len());
+        for id in &config.provider_order {
+            if configured_ids.contains(id.as_str()) && !provider_order.contains(id) {
+                provider_order.push(id.clone());
+            }
+        }
+        for info in &infos {
+            if !provider_order.contains(&info.id) {
+                provider_order.push(info.id.clone());
+            }
+        }
         ProvidersResponse {
             providers: infos,
+            provider_order,
             default_model: self.default_model.read().unwrap().clone(),
             default_thinking_level: self.default_thinking_level.read().unwrap().clone(),
             default_permission_mode: *self.default_permission_mode.read().unwrap(),
@@ -1268,8 +1863,16 @@ impl Engine {
                     entry.query_params = req.query_params.clone();
                 }
             }
+            if !config.provider_order.is_empty()
+                && !config.provider_order.iter().any(|provider| provider == id)
+            {
+                config.provider_order.push(id.to_string());
+            }
             self.persist_config(&config);
         }
+        self.store
+            .clear_route_health(id)
+            .map_err(EngineError::Internal)?;
         self.reload_providers();
         let config = self.config.lock().unwrap();
         let registry = self.providers.read().unwrap();
@@ -1302,6 +1905,7 @@ impl Engine {
                 .providers
                 .remove(id)
                 .ok_or_else(|| EngineError::NotFound(format!("provider {id}")))?;
+            config.provider_order.retain(|provider| provider != id);
             self.persist_config(&config);
             removed.secret_names
         };
@@ -1316,7 +1920,41 @@ impl Engine {
                 .secrets
                 .delete(&trouve_providers::secrets::provider_secret(id, &name));
         }
+        self.store
+            .clear_route_health(id)
+            .map_err(EngineError::Internal)?;
         self.reload_providers();
+        Ok(())
+    }
+
+    /// Replace the explicit provider preference prefix. Omitted providers
+    /// remain routable after the listed entries.
+    pub fn set_provider_order(&self, provider_ids: &[String]) -> Result<(), EngineError> {
+        let known: HashSet<String> = self
+            .providers
+            .read()
+            .unwrap()
+            .keys()
+            .chain(self.backends.read().unwrap().keys())
+            .cloned()
+            .chain(self.config.lock().unwrap().providers.keys().cloned())
+            .collect();
+        let mut seen = HashSet::new();
+        for id in provider_ids {
+            if !known.contains(id) {
+                return Err(EngineError::BadRequest(format!(
+                    "provider order contains unknown provider {id}"
+                )));
+            }
+            if !seen.insert(id) {
+                return Err(EngineError::BadRequest(format!(
+                    "provider order contains duplicate provider {id}"
+                )));
+            }
+        }
+        let mut config = self.config.lock().unwrap();
+        config.provider_order = provider_ids.to_vec();
+        self.persist_config(&config);
         Ok(())
     }
 
@@ -2581,17 +3219,14 @@ impl Engine {
         self.logins.lock().unwrap().insert(id.to_string(), state);
     }
 
-    /// Set the default model for new threads (provider-qualified).
+    /// Set the default model for new threads. Provider-qualified values pin
+    /// one route; provider-neutral values are selected dynamically.
     pub fn set_default_model(
         &self,
         model: &str,
         thinking_level: Option<&str>,
     ) -> Result<(), EngineError> {
-        if !model.contains('/') {
-            return Err(EngineError::BadRequest(format!(
-                "model must be provider-qualified (e.g. openai/gpt-4.1-mini): {model}"
-            )));
-        }
+        validate_model_selection(model)?;
         validate_thinking_level(thinking_level)?;
         {
             let mut config = self.config.lock().unwrap();
@@ -2841,12 +3476,8 @@ impl Engine {
             .config_dir
             .as_deref()
             .ok_or_else(|| EngineError::BadRequest("no config dir".into()))?;
-        if let Some(model) = req.default_model.as_deref()
-            && !model.contains('/')
-        {
-            return Err(EngineError::BadRequest(format!(
-                "default_model must be provider-qualified (\"provider/model\"), got {model}"
-            )));
+        if let Some(model) = req.default_model.as_deref() {
+            validate_model_selection(model)?;
         }
         validate_thinking_level(req.default_thinking_level.as_deref())?;
         let mode = AgentMode {
@@ -4297,6 +4928,7 @@ impl Engine {
             .model
             .or_else(|| mode.default_model.clone())
             .unwrap_or_else(|| self.default_model.read().unwrap().clone());
+        validate_model_selection(&model)?;
         let mut model_options = req.model_options;
         let global_thinking_level = self.default_thinking_level.read().unwrap().clone();
         // `thinking_level` is the canonical inherited key. Before a turn it
@@ -4371,12 +5003,8 @@ impl Engine {
             modes::find_mode(&all_modes, mode_id)
                 .ok_or_else(|| EngineError::BadRequest(format!("unknown mode: {mode_id}")))?;
         }
-        if let Some(model) = req.model.as_deref()
-            && !model.contains('/')
-        {
-            return Err(EngineError::BadRequest(format!(
-                "model must be provider-qualified (e.g. openai/gpt-4.1-mini): {model}"
-            )));
+        if let Some(model) = req.model.as_deref() {
+            validate_model_selection(model)?;
         }
         self.store.update_thread(
             id,
@@ -4420,6 +5048,33 @@ impl Engine {
         &self,
         model: &str,
     ) -> Result<trouve_protocol::ModelInfo, EngineError> {
+        if !model.contains('/') {
+            let routes =
+                tokio::time::timeout(MODEL_CATALOG_VALIDATION_TIMEOUT, self.list_model_routes())
+                    .await
+                    .map_err(|_| {
+                        EngineError::BadRequest(format!(
+                            "timed out loading model metadata for {model}"
+                        ))
+                    })?;
+            return routes
+                .into_iter()
+                .find(|candidate| candidate.id == model)
+                .map(|candidate| trouve_protocol::ModelInfo {
+                    id: candidate.id,
+                    display_name: candidate.display_name,
+                    context_window: candidate.context_window,
+                    supports_tools: candidate.supports_tools,
+                    input_price_per_mtok: candidate.input_price_per_mtok,
+                    output_price_per_mtok: candidate.output_price_per_mtok,
+                    options_schema: candidate.options_schema,
+                })
+                .ok_or_else(|| {
+                    EngineError::BadRequest(format!(
+                        "model {model} has no available provider route"
+                    ))
+                });
+        }
         if let Some((_, backend, _)) = self.backend_for(model) {
             let models =
                 tokio::time::timeout(MODEL_CATALOG_VALIDATION_TIMEOUT, backend.list_models())
@@ -4879,10 +5534,14 @@ impl Engine {
             let cancel = first_cancel
                 .take()
                 .unwrap_or_else(|| self.register_cancel(&thread.id));
-            let result =
-                std::panic::AssertUnwindSafe(self.run_turn(&thread, turn, &prompt, cancel.clone()))
-                    .catch_unwind()
-                    .await;
+            let result = std::panic::AssertUnwindSafe(self.run_routed_turn(
+                &thread,
+                turn,
+                &prompt,
+                cancel.clone(),
+            ))
+            .catch_unwind()
+            .await;
             let result = match result {
                 Ok(result) => result,
                 Err(_) => {
@@ -4908,9 +5567,6 @@ impl Engine {
                     return Ok(());
                 }
             };
-            let outcome_error = result.as_ref().err().map(ToString::to_string);
-            self.turn_scheduler
-                .record_outcome(&thread.model, outcome_error.as_deref());
             let cancelled = cancel.is_cancelled();
             if let Err(e) = result {
                 tracing::error!("turn {turn} of {} failed: {e}", thread.id);
@@ -5102,475 +5758,6 @@ impl Engine {
         Ok(())
     }
 
-    async fn run_turn(
-        self: &Arc<Self>,
-        thread: &Thread,
-        turn: u64,
-        prompt: &trouve_protocol::QueuedPrompt,
-        cancel: tokio_util::sync::CancellationToken,
-    ) -> Result<()> {
-        let content = prompt.content.clone();
-        let attachments = prompt.attachments.clone();
-        let tools_enabled = self.store.queued_prompt_tools_enabled(&prompt.id)?;
-        let session = self
-            .store
-            .session(&thread.session_id)?
-            .context("session vanished")?;
-        let ws = self
-            .store
-            .workspace(&session.workspace_id)?
-            .context("workspace vanished")?;
-        let scope = Scope::Thread(thread.id.clone());
-        let worktree = PathBuf::from(&session.worktree_path);
-        let ctx = ToolCtx {
-            worktree: worktree.clone(),
-            thread_id: thread.id.clone(),
-            todos: Arc::new(Mutex::new(thread.todos.clone())),
-            config_dir: self.config_dir.clone(),
-            workspace_root: Some(PathBuf::from(&ws.path)),
-        };
-
-        let all_modes = modes::resolve_modes(self.config_dir.as_deref(), Some(Path::new(&ws.path)));
-        let mode = modes::find_mode(&all_modes, &thread.mode)
-            .cloned()
-            .unwrap_or_else(modes::fallback_mode);
-        let background = self.store.is_code_review_thread(&thread.id)?;
-        let turn_capacity = self
-            .turn_scheduler
-            .acquire(&thread.model, background)
-            .await?;
-        if background {
-            self.store
-                .set_code_review_task_provider_wait(&thread.id, turn_capacity.wait_ms)?;
-        }
-        self.store.append_event(
-            scope.clone(),
-            Event::TurnCapacityAcquired {
-                turn,
-                wait_ms: turn_capacity.wait_ms,
-                background,
-            },
-        )?;
-
-        // Serialize worktree mutations across the session's threads while
-        // allowing ordinary read-only siblings (review, plan, question) to
-        // run together. Agent-spawned read-only children retain their
-        // lock-free exception so they can inspect while a writing parent
-        // holds the write guard; that pre-existing trade-off is what makes
-        // spawn_thread fan-out usable from code mode.
-        let concurrent_child = mode.read_only && self.store.spawn_parent(&thread.id)?.is_some();
-        let lock = self.session_lock(&session.id);
-        let _read_guard;
-        let _write_guard;
-        if concurrent_child {
-            _read_guard = None;
-            _write_guard = None;
-        } else if mode.read_only {
-            _read_guard = Some(lock.read().await);
-            _write_guard = None;
-        } else {
-            _read_guard = None;
-            _write_guard = Some(lock.write().await);
-        }
-        let _turn_capacity = turn_capacity;
-
-        // External agent backend? The vendor harness owns the loop; we
-        // stream its events and bridge approvals. (Session lock stays held.)
-        if let Some((backend_id, backend, model_name)) = self.backend_for(&thread.model) {
-            return self
-                .run_backend_turn(
-                    &session,
-                    thread,
-                    turn,
-                    &mode,
-                    &backend_id,
-                    backend,
-                    model_name,
-                    content,
-                    attachments,
-                    concurrent_child,
-                    cancel,
-                    &prompt.id,
-                    tools_enabled,
-                )
-                .await;
-        }
-
-        let (provider, model_name) = self
-            .resolve_provider(&thread.model)
-            .map_err(|e| anyhow!(e.to_string()))?;
-        let mut model_options = self.store.thread_model_options(&thread.id)?;
-        let model_catalog = provider.list_models().await;
-        normalize_thinking_option(
-            &mut model_options,
-            model_catalog.iter().find(|m| m.id == thread.model),
-        );
-
-        self.store.append_event(
-            scope.clone(),
-            Event::TurnStarted {
-                turn,
-                mode: mode.id.clone(),
-                model: thread.model.clone(),
-            },
-        )?;
-        // Show the prompt in the UI before any slow pre-turn work:
-        // compaction below can block for a while (its model probe may even
-        // spawn the local llama-server and load a model).
-        self.store.append_event(
-            scope.clone(),
-            Event::UserMessage {
-                turn,
-                content: content.clone(),
-                attachments: attachments.clone(),
-            },
-        )?;
-
-        // Compact the transcript when it nears the model's context window,
-        // before this turn's user message joins it (the stored transcript —
-        // the event above is display-only).
-        if let Err(e) = self
-            .maybe_compact(thread, turn, &provider, &model_name)
-            .await
-        {
-            // Compaction is best-effort; the turn proceeds with full history.
-            tracing::warn!("compaction failed for {}: {e}", thread.id);
-        }
-        // Native providers speak text-only; every attachment (images
-        // included) becomes a path reference the model's file tools can
-        // follow. Copy them into the worktree first: the file tools reject
-        // absolute paths (the sandbox), so a data-dir path the model can't
-        // open is useless — a worktree-relative copy is reachable.
-        let resolved = self.resolve_attachments(&attachments);
-        let materialized = materialize_attachments(&worktree, &resolved);
-        let content = annotate_attachments(content, &materialized);
-        self.store
-            .append_message(&thread.id, &serde_json::to_value(Message::User(content))?)?;
-        if !self.store.finish_queued_prompt(&prompt.id)? {
-            bail!("queued prompt {} vanished before turn start", prompt.id);
-        }
-        self.emit_queue(&thread.id)?;
-
-        // Tool policy: empty allowed_tools = all registered tools. Engine-
-        // served tools are added only when tools_enabled is true; tool-free
-        // JSON-repair turns receive no tools.
-        let mut specs: Vec<ToolSpec> = if tools_enabled {
-            self.executor
-                .specs(&ctx)
-                .await
-                .into_iter()
-                .filter(|s| mode.allowed_tools.is_empty() || mode.allowed_tools.contains(&s.name))
-                .collect()
-        } else {
-            Vec::new()
-        };
-        if tools_enabled {
-            specs.push(ask_question_spec());
-            specs.push(search_transcript_spec());
-        }
-        // Spawn tools are for top-level agents only: children don't get to
-        // spawn grandchildren (also enforced at execution). They also respect
-        // the mode's tool policy, so restrictive/read-only modes that don't
-        // list them can't create branches or child agents.
-        let spawn_allowed = |name: &str| {
-            mode.allowed_tools.is_empty() || mode.allowed_tools.iter().any(|t| t == name)
-        };
-        if tools_enabled && self.store.spawn_parent(&thread.id)?.is_none() {
-            if spawn_allowed("spawn_thread") {
-                specs.push(spawn_thread_spec());
-            }
-            if spawn_allowed("spawn_session") {
-                specs.push(spawn_session_spec());
-            }
-            if spawn_allowed("spawn_thread") || spawn_allowed("spawn_session") {
-                specs.push(spawn_output_spec());
-            }
-        }
-
-        let system = context::system_prompt(&mode, self.config_dir.as_deref(), Path::new(&ws.path));
-        let live_models = provider.list_models().await;
-        let known_models = provider.models();
-        let pricing_model = live_models
-            .iter()
-            .chain(known_models.iter())
-            .find(|m| m.id == thread.model)
-            .cloned();
-        let mut usage_total = Usage::default();
-        let mut accumulate_usage = |usage: &Usage| {
-            let cost = usage.cost_usd.or_else(|| {
-                pricing_model.as_ref().and_then(|model| {
-                    self.model_catalog.cost_usd(
-                        model,
-                        usage.input_tokens,
-                        usage.cached_input_tokens,
-                        usage.output_tokens,
-                    )
-                })
-            });
-            usage_total.input_tokens += usage.input_tokens;
-            usage_total.output_tokens += usage.output_tokens;
-            usage_total.cached_input_tokens += usage.cached_input_tokens;
-            if let Some(cost) = cost {
-                usage_total.cost_usd = Some(usage_total.cost_usd.unwrap_or(0.0) + cost);
-            }
-        };
-        // The last request's input size — the context-size proxy for
-        // compaction. Summing per-iteration inputs (usage_total) would
-        // over-count a multi-tool turn many-fold; the final request carries
-        // the whole transcript, so its input is what "context size" means.
-        let mut context_input_tokens = 0u64;
-        // Becomes false when the loop ends because the model stopped calling
-        // tools (or was cancelled); stays true only if we exhaust the
-        // iteration budget mid-work, which we then surface to the user.
-        let mut hit_iteration_limit = true;
-
-        for _iteration in 0..MAX_ITERATIONS {
-            if cancel.is_cancelled() {
-                hit_iteration_limit = false;
-                break;
-            }
-            // Rebuild the transcript each iteration; the store is the truth.
-            let mut messages = vec![Message::System(system.clone())];
-            for payload in self.store.messages(&thread.id)? {
-                messages.push(serde_json::from_value(payload)?);
-            }
-            // Repair any tool_calls left without results by a crash/restart
-            // mid-turn (and drop empty assistant turns); providers reject a
-            // dangling tool_use/tool_call, which would wedge the thread.
-            let messages = sanitize_transcript(messages);
-
-            let mut stream = provider
-                .stream_chat(&model_name, &messages, &specs, &model_options)
-                .await
-                .map_err(|e| anyhow!("provider error: {e}"))?;
-            stream = trouve_providers::coalesce_event_stream(stream);
-
-            let mut text = String::new();
-            let mut tool_calls = Vec::new();
-            // Provider-native reasoning blocks (Anthropic signed thinking) to
-            // persist and replay verbatim — Anthropic rejects a follow-up
-            // tool-use turn whose thinking blocks aren't preserved.
-            let mut reasoning: Vec<serde_json::Value> = Vec::new();
-            loop {
-                let ev = tokio::select! {
-                    biased;
-                    _ = cancel.cancelled() => break,
-                    ev = stream.next() => match ev {
-                        Some(ev) => ev,
-                        None => break,
-                    },
-                };
-                match ev.map_err(|e| anyhow!("provider stream error: {e}"))? {
-                    ProviderEvent::TextDelta(delta) => {
-                        text.push_str(&delta);
-                        self.store.append_event(
-                            scope.clone(),
-                            Event::AssistantDelta { turn, text: delta },
-                        )?;
-                    }
-                    // Display-only; never joins the provider transcript.
-                    ProviderEvent::ThinkingDelta(delta) => {
-                        self.store.append_event(
-                            scope.clone(),
-                            Event::AssistantThinking { turn, text: delta },
-                        )?;
-                    }
-                    // Kept out of the UI (already streamed as ThinkingDelta);
-                    // carried in the transcript for replay only.
-                    ProviderEvent::Reasoning(block) => reasoning.push(block),
-                    ProviderEvent::ToolCall(call) => tool_calls.push(call),
-                    ProviderEvent::Completed { usage } => {
-                        accumulate_usage(&usage);
-                        context_input_tokens = usage.input_tokens + usage.cached_input_tokens;
-                    }
-                }
-            }
-
-            // Interrupted mid-stream: keep any streamed text for display, but
-            // drop the (unexecuted) tool calls so we don't strand tool_use
-            // without results, and stop the turn.
-            if cancel.is_cancelled() {
-                if !text.is_empty() {
-                    self.store.append_event(
-                        scope.clone(),
-                        Event::AssistantMessage {
-                            turn,
-                            content: text.clone(),
-                        },
-                    )?;
-                    self.store.append_message(
-                        &thread.id,
-                        &serde_json::to_value(Message::Assistant {
-                            content: text,
-                            tool_calls: Vec::new(),
-                            reasoning,
-                        })?,
-                    )?;
-                }
-                hit_iteration_limit = false;
-                break;
-            }
-
-            if !text.is_empty() {
-                self.store.append_event(
-                    scope.clone(),
-                    Event::AssistantMessage {
-                        turn,
-                        content: text.clone(),
-                    },
-                )?;
-            }
-            // Skip a fully-empty assistant message (no text, no tool calls —
-            // e.g. a thinking-only or empty provider response): it serializes
-            // to an empty content block that Anthropic rejects on the next
-            // request, wedging the thread.
-            if !tools_enabled && !tool_calls.is_empty() {
-                tracing::warn!(
-                    thread_id = %thread.id,
-                    turn,
-                    "provider requested a tool during a tool-free turn; ignoring the request"
-                );
-                tool_calls.clear();
-            }
-            if !text.is_empty() || !tool_calls.is_empty() {
-                self.store.append_message(
-                    &thread.id,
-                    &serde_json::to_value(Message::Assistant {
-                        content: text,
-                        tool_calls: tool_calls.clone(),
-                        reasoning,
-                    })?,
-                )?;
-            }
-
-            if tool_calls.is_empty() {
-                hit_iteration_limit = false;
-                break;
-            }
-
-            for call in tool_calls {
-                let (result_content, images) = self
-                    .handle_tool_call(&session, thread, turn, &mode, &ctx, &call, &cancel)
-                    .await?;
-                self.store.append_message(
-                    &thread.id,
-                    &serde_json::to_value(Message::ToolResult {
-                        call_id: call.id.clone(),
-                        content: result_content,
-                        images,
-                    })?,
-                )?;
-            }
-        }
-
-        // Truncated mid-work at the iteration budget: make one final
-        // tool-free provider pass over the last tool results so the user gets
-        // a truthful model-authored progress report rather than a completed
-        // turn whose transcript ends at a tool result.
-        if hit_iteration_limit {
-            let mut messages = vec![Message::System(system.clone())];
-            for payload in self.store.messages(&thread.id)? {
-                messages.push(serde_json::from_value(payload)?);
-            }
-            let mut messages = sanitize_transcript(messages);
-            messages.push(Message::User(format!(
-                "You reached the hard {MAX_ITERATIONS}-step limit for this turn. Do not call any \
-                 more tools. Give the user a concise progress report based on the tool results \
-                 above, clearly identify unfinished work, and ask them to continue in a new turn."
-            )));
-            let mut final_text = String::new();
-            let mut final_reasoning = Vec::new();
-            match provider
-                .stream_chat(&model_name, &messages, &[], &model_options)
-                .await
-            {
-                Ok(stream) => {
-                    let mut stream = trouve_providers::coalesce_event_stream(stream);
-                    while let Some(event) = stream.next().await {
-                        match event {
-                            Ok(ProviderEvent::TextDelta(delta)) => {
-                                final_text.push_str(&delta);
-                                self.store.append_event(
-                                    scope.clone(),
-                                    Event::AssistantDelta { turn, text: delta },
-                                )?;
-                            }
-                            Ok(ProviderEvent::ThinkingDelta(delta)) => {
-                                self.store.append_event(
-                                    scope.clone(),
-                                    Event::AssistantThinking { turn, text: delta },
-                                )?;
-                            }
-                            Ok(ProviderEvent::Reasoning(block)) => final_reasoning.push(block),
-                            Ok(ProviderEvent::Completed { usage }) => {
-                                accumulate_usage(&usage);
-                                context_input_tokens =
-                                    usage.input_tokens + usage.cached_input_tokens;
-                            }
-                            // Tools are deliberately unavailable on this
-                            // final pass. Ignore a non-conforming provider's
-                            // request and fall back to the explicit note.
-                            Ok(ProviderEvent::ToolCall(_)) => {}
-                            Err(e) => {
-                                tracing::warn!("iteration-limit summary failed: {e}");
-                                break;
-                            }
-                        }
-                    }
-                }
-                Err(e) => tracing::warn!("iteration-limit summary failed: {e}"),
-            }
-            if final_text.trim().is_empty() {
-                final_text = format!(
-                    "Reached the {MAX_ITERATIONS}-step limit for one turn and stopped mid-task. \
-                     Send another message to continue."
-                );
-            }
-            self.store.append_event(
-                scope.clone(),
-                Event::AssistantMessage {
-                    turn,
-                    content: final_text.clone(),
-                },
-            )?;
-            self.store.append_message(
-                &thread.id,
-                &serde_json::to_value(Message::Assistant {
-                    content: final_text,
-                    tool_calls: Vec::new(),
-                    reasoning: final_reasoning,
-                })?,
-            )?;
-        }
-
-        self.store.record_usage(
-            &session.id,
-            &thread.id,
-            turn,
-            &usage_total,
-            context_input_tokens,
-        )?;
-
-        // Snapshot the worktree when the turn changed it. Lock-free child
-        // turns never snapshot: they can't write, so any dirt is the
-        // parent's in-flight work — not theirs to checkpoint.
-        let checkpoint_id = if concurrent_child {
-            None
-        } else {
-            self.maybe_checkpoint(&session, thread, turn).await?
-        };
-        self.store.append_event(
-            scope,
-            Event::TurnCompleted {
-                turn,
-                usage: usage_total,
-                checkpoint_id,
-            },
-        )?;
-        Ok(())
-    }
-
-    /// Resolve a provider-qualified model id to a registered agent backend.
     fn backend_for(&self, model: &str) -> Option<(String, Arc<dyn AgentBackend>, String)> {
         let (backend_id, model_name) = model.split_once('/')?;
         let backend = self.backends.read().unwrap().get(backend_id).cloned()?;
@@ -5584,10 +5771,9 @@ impl Engine {
     /// and question tools; its approvals stay native app-server RPCs.
     fn mcp_bridge_for(
         &self,
-        model: &str,
+        backend_id: &str,
         thread_id: &str,
     ) -> Option<trouve_agents::McpBridgeConfig> {
-        let backend_id = model.split_once('/')?.0;
         let (kind, bridge_tools) = {
             let config = self.config.lock().unwrap();
             let pc = config.providers.get(backend_id)?;
@@ -5994,479 +6180,6 @@ impl Engine {
             .collect())
     }
 
-    /// Run one turn through an external agent backend. The vendor harness
-    /// plans, calls tools, and edits the worktree; we persist its events,
-    /// gate its approval requests through our permission layer, and keep the
-    /// checkpoint/usage flow identical to native turns. Compaction and the
-    /// system prompt are the vendor's job (the mode prompt rides along as
-    /// appended instructions); the local transcript is kept for rendering
-    /// and history, not as the model's context.
-    #[allow(clippy::too_many_arguments)]
-    async fn run_backend_turn(
-        &self,
-        session: &Session,
-        thread: &Thread,
-        turn: u64,
-        mode: &AgentMode,
-        backend_id: &str,
-        backend: Arc<dyn AgentBackend>,
-        model_name: String,
-        content: String,
-        attachments: Vec<trouve_protocol::Attachment>,
-        concurrent_child: bool,
-        cancel: tokio_util::sync::CancellationToken,
-        queued_prompt_id: &str,
-        tools_enabled: bool,
-    ) -> Result<()> {
-        let scope = Scope::Thread(thread.id.clone());
-        // Vendor sessions are per (thread, backend): each vendor keeps its
-        // own history, and switching models away and back resumes it.
-        // Vendors can't read our transcript, so whatever part of the
-        // thread's past this one hasn't seen — everything for a vendor
-        // joining mid-conversation, the interleaved turns other models ran
-        // for a resumed one — is handed off as a digest in the prompt.
-        // A vendor session retains the tools it was created with. Tool-free
-        // repair turns therefore start fresh; their prompt carries the
-        // malformed output explicitly, so they do not need vendor history.
-        let (resume, handoff, seen_after) = if tools_enabled {
-            let resume = self.store.backend_session(&thread.id, backend_id)?;
-            let payloads = self.store.messages(&thread.id)?;
-            let unseen = match &resume {
-                // A compaction can shrink the transcript below the watermark;
-                // handing off the fresh summary again covers that.
-                Some((_, seen)) => payloads.get(*seen as usize..).unwrap_or(&payloads),
-                None => &payloads[..],
-            };
-            let messages: Vec<Message> = unseen
-                .iter()
-                .filter_map(|p| serde_json::from_value(p.clone()).ok())
-                .collect();
-            let handoff = render_history_digest(&messages, resume.is_some());
-            // After this turn the vendor has seen everything up to and
-            // including its own reply (appended below on completion).
-            let seen_after = payloads.len() as u64 + 2;
-            (resume, handoff, seen_after)
-        } else {
-            (None, None, 0)
-        };
-        let vendor_session = resume.map(|(id, _)| id);
-        self.store.append_event(
-            scope.clone(),
-            Event::TurnStarted {
-                turn,
-                mode: mode.id.clone(),
-                model: thread.model.clone(),
-            },
-        )?;
-        self.store.append_event(
-            scope.clone(),
-            Event::UserMessage {
-                turn,
-                content: content.clone(),
-                attachments: attachments.clone(),
-            },
-        )?;
-        // Images go to the vendor protocol as native image inputs; other
-        // files become path references in the prompt text (vendor agents
-        // run on this filesystem and can read them with their tools).
-        let resolved = self.resolve_attachments(&attachments);
-        let (images, files): (Vec<_>, Vec<_>) = resolved
-            .into_iter()
-            .partition(|(a, _)| a.mime.starts_with("image/"));
-        let content = annotate_attachments(content, &files);
-        let turn_attachments: Vec<trouve_agents::TurnAttachment> = images
-            .into_iter()
-            .map(|(a, path)| trouve_agents::TurnAttachment {
-                name: a.name,
-                mime: a.mime,
-                path,
-            })
-            .collect();
-        self.store.append_message(
-            &thread.id,
-            &serde_json::to_value(Message::User(content.clone()))?,
-        )?;
-        if !self.store.finish_queued_prompt(queued_prompt_id)? {
-            bail!("queued prompt {queued_prompt_id} vanished before turn start");
-        }
-        self.emit_queue(&thread.id)?;
-
-        let permission = if mode.read_only {
-            BackendPermission::ReadOnly
-        } else {
-            match thread.permission_mode {
-                trouve_protocol::PermissionMode::Yolo => BackendPermission::Yolo,
-                _ => BackendPermission::Ask,
-            }
-        };
-
-        let mcp_bridge = tools_enabled
-            .then(|| self.mcp_bridge_for(&thread.model, &thread.id))
-            .flatten();
-        // Vendor agents get the mode prompt plus, when the bridge serves
-        // trouve's search tools, guidance to prefer them over built-ins
-        // (MCP instructions alone are too weak a signal).
-        let mut instructions = mode.system_prompt.trim().to_string();
-        if mcp_bridge.is_some() {
-            if !instructions.is_empty() {
-                instructions.push_str("\n\n");
-            }
-            instructions.push_str(crate::tools::VENDOR_SEARCH_GUIDANCE);
-        }
-        // The digest decorates only the prompt sent to the vendor; the
-        // stored transcript keeps the user's words alone.
-        let prompt = match &handoff {
-            Some(digest) => format!("{digest}\n\n{content}"),
-            None => content,
-        };
-        let mut model_options = self.store.thread_model_options(&thread.id)?;
-        let model_catalog = backend.list_models().await;
-        normalize_thinking_option(
-            &mut model_options,
-            model_catalog.iter().find(|m| m.id == thread.model),
-        );
-        let backend_turn = BackendTurn {
-            thread_id: thread.id.clone(),
-            worktree: PathBuf::from(&session.worktree_path),
-            session: vendor_session,
-            model: model_name,
-            model_options,
-            prompt,
-            attachments: turn_attachments,
-            instructions: (!instructions.is_empty()).then_some(instructions),
-            permission,
-            tool_free: !tools_enabled,
-            mcp_bridge,
-            mcp_servers: if tools_enabled {
-                self.mcp_servers_for(session)?
-            } else {
-                Vec::new()
-            },
-        };
-
-        let mut stream = backend
-            .run_turn(backend_turn)
-            .await
-            .map_err(|e| anyhow!("backend error: {e}"))?;
-
-        // `text` records the whole turn for the transcript; `segment` is the
-        // current streamed block, flushed (finalized) at each tool boundary
-        // so tool cards interleave with the text in the order they happened
-        // instead of all text merging into one leading bubble.
-        let mut text = String::new();
-        let mut segment = String::new();
-        let mut usage_total = Usage::default();
-        // Vendor-native todo tools are reported as ordinary tool events.
-        // Remember their names until completion so their result can update
-        // the same persisted snapshot as trouve's bridged/native tool.
-        let mut tool_calls = HashMap::<String, (String, serde_json::Value)>::new();
-        // Creation tools sometimes stream their final PR URL before the
-        // completion payload. Buffer output only for calls whose request is
-        // demonstrably creating a PR; list/view output must never associate
-        // every PR it happens to mention with this session.
-        let mut github_creation_output = HashMap::<String, String>::new();
-        // A vendor may use any GitHub client instead of trouve's create-PR
-        // endpoint. Turn repository-specific PR references in its output into
-        // the same durable session event, independent of the tool name.
-        let github_repository = self.github_repository_for_session(session).ok();
-        let mut recorded_prs = if github_repository.is_some() {
-            self.recorded_session_pr_numbers(&session.id)?
-        } else {
-            HashSet::new()
-        };
-        let mut persisted = Vec::new();
-        let mut persist_deadline = None;
-        let mut seen_tool_cards = HashSet::new();
-        loop {
-            let flush_at = persist_deadline.unwrap_or_else(Instant::now);
-            let ev = tokio::select! {
-                biased;
-                // Cancellation drops the backend stream, whose Drop kills the
-                // vendor process (kill_on_drop). We stop consuming and finish
-                // the turn with whatever streamed so far.
-                _ = cancel.cancelled() => break,
-                _ = tokio::time::sleep_until(flush_at.into()), if persist_deadline.is_some() => {
-                    flush_backend_event_batch(&self.store, &scope, &mut persisted).await?;
-                    persist_deadline = None;
-                    continue;
-                }
-                ev = stream.next() => match ev {
-                    Some(ev) => ev,
-                    None => break,
-                },
-            };
-            let event = match ev {
-                Ok(event) => event,
-                Err(error) => {
-                    flush_backend_event_batch(&self.store, &scope, &mut persisted).await?;
-                    return Err(anyhow!("backend stream error: {error}"));
-                }
-            };
-            match event {
-                BackendEvent::SessionStarted { session_id } => {
-                    if tools_enabled {
-                        flush_backend_event_batch(&self.store, &scope, &mut persisted).await?;
-                        self.store
-                            .set_backend_session(&thread.id, backend_id, &session_id)?;
-                    }
-                }
-                BackendEvent::TextDelta(delta) => {
-                    text.push_str(&delta);
-                    segment.push_str(&delta);
-                    persisted.push(Event::AssistantDelta { turn, text: delta });
-                }
-                BackendEvent::ThinkingDelta(delta) => {
-                    // Thinking is a block boundary like a tool call:
-                    // finalize the streamed text so far so post-thinking
-                    // text starts a new bubble in the right order.
-                    if !segment.is_empty() {
-                        persisted.push(Event::AssistantMessage {
-                            turn,
-                            content: std::mem::take(&mut segment),
-                        });
-                    }
-                    persisted.push(Event::AssistantThinking { turn, text: delta });
-                }
-                BackendEvent::ToolStarted {
-                    call_id,
-                    tool,
-                    mut args,
-                } => {
-                    if !tools_enabled {
-                        flush_backend_event_batch(&self.store, &scope, &mut persisted).await?;
-                        bail!("backend requested tool {tool} during a tool-free turn");
-                    }
-                    tool_calls.insert(call_id.clone(), (tool.clone(), args.clone()));
-                    if !segment.is_empty() {
-                        persisted.push(Event::AssistantMessage {
-                            turn,
-                            content: std::mem::take(&mut segment),
-                        });
-                    }
-                    // Snippet edits carry no position; the worktree file is
-                    // still un-edited at announcement time, so resolve line
-                    // hints now for the UI's diff gutter.
-                    annotate_edit_lines(Path::new(&session.worktree_path), &mut args);
-                    if seen_tool_cards.insert(call_id.clone())
-                        && !self.tool_card_exists(&thread.id, turn, &call_id)
-                    {
-                        persisted.push(Event::ToolRequested {
-                            turn,
-                            call_id: call_id.clone(),
-                            tool,
-                            args,
-                            requires_approval: false,
-                        });
-                    }
-                    persisted.push(Event::ToolStarted { call_id });
-                }
-                BackendEvent::ToolOutput { call_id, chunk } => {
-                    if let Some((_, owner, repo)) = &github_repository
-                        && let Some((tool, args)) = tool_calls.get(&call_id)
-                        && requests_pull_request_creation(tool, args, owner, repo)
-                    {
-                        github_creation_output
-                            .entry(call_id.clone())
-                            .or_default()
-                            .push_str(&chunk);
-                    }
-                    persisted.push(Event::ToolOutput { call_id, chunk });
-                }
-                BackendEvent::CommandsUpdated { commands } => {
-                    persisted.push(Event::CommandsUpdated { commands });
-                }
-                BackendEvent::ToolCompleted {
-                    call_id,
-                    ok,
-                    result,
-                } => {
-                    flush_backend_event_batch(&self.store, &scope, &mut persisted).await?;
-                    let status = if ok {
-                        ToolStatus::Ok
-                    } else {
-                        ToolStatus::Error
-                    };
-                    let todos = match tool_calls.get(&call_id) {
-                        Some((tool, args)) => self.persist_todos_from_result(
-                            &thread.id,
-                            tool,
-                            status,
-                            &result,
-                            Some(args),
-                        )?,
-                        None => None,
-                    };
-                    if ok
-                        && let Some(repository @ (host, owner, repo)) = &github_repository
-                        && let Some((tool, args)) = tool_calls.get(&call_id)
-                        && requests_pull_request_creation(tool, args, owner, repo)
-                    {
-                        let mut numbers = pr_numbers_in_value(args, host, owner, repo);
-                        numbers.extend(pr_numbers_in_value(&result, host, owner, repo));
-                        if let Some(output) = github_creation_output.remove(&call_id) {
-                            numbers.extend(crate::github::pr_numbers_in_text(
-                                &output, host, owner, repo,
-                            ));
-                        }
-                        self.record_session_pr_numbers(
-                            &session.id,
-                            repository,
-                            numbers,
-                            &mut recorded_prs,
-                        )?;
-                    } else {
-                        github_creation_output.remove(&call_id);
-                    }
-                    persisted.push(Event::ToolCompleted {
-                        call_id,
-                        status,
-                        result,
-                    });
-                    if let Some(todos) = todos {
-                        persisted.push(Event::TodosUpdated { todos });
-                    }
-                }
-                BackendEvent::ApprovalNeeded {
-                    call_id,
-                    tool,
-                    args,
-                    responder,
-                } => {
-                    if !tools_enabled {
-                        flush_backend_event_batch(&self.store, &scope, &mut persisted).await?;
-                        bail!("backend requested approval for {tool} during a tool-free turn");
-                    }
-                    if !segment.is_empty() {
-                        persisted.push(Event::AssistantMessage {
-                            turn,
-                            content: std::mem::take(&mut segment),
-                        });
-                    }
-                    flush_backend_event_batch(&self.store, &scope, &mut persisted).await?;
-                    let approved = self
-                        .gate_backend_approval(session, thread, turn, mode, &call_id, &tool, &args)
-                        .await?;
-                    let _ = responder.send(approved);
-                }
-                BackendEvent::QuestionsNeeded {
-                    request_id,
-                    title,
-                    questions,
-                    responder,
-                } => {
-                    if !segment.is_empty() {
-                        persisted.push(Event::AssistantMessage {
-                            turn,
-                            content: std::mem::take(&mut segment),
-                        });
-                    }
-                    flush_backend_event_batch(&self.store, &scope, &mut persisted).await?;
-                    let answers = self
-                        .ask_user_questions(&thread.id, turn, &request_id, title, questions)
-                        .await?;
-                    let _ = responder.send(answers);
-                }
-                BackendEvent::Completed { usage } => {
-                    usage_total.input_tokens += usage.input_tokens;
-                    usage_total.output_tokens += usage.output_tokens;
-                    usage_total.cached_input_tokens += usage.cached_input_tokens;
-                    if let Some(cost) = usage.cost_usd {
-                        usage_total.cost_usd = Some(usage_total.cost_usd.unwrap_or(0.0) + cost);
-                    }
-                    if usage.context_window.is_some() {
-                        usage_total.context_window = usage.context_window;
-                    }
-                }
-            }
-            if persisted.is_empty() {
-                persist_deadline = None;
-            } else if persisted.len() >= BACKEND_EVENT_BATCH_MAX {
-                flush_backend_event_batch(&self.store, &scope, &mut persisted).await?;
-                persist_deadline = None;
-            } else if persist_deadline.is_none() {
-                persist_deadline = Some(Instant::now() + BACKEND_EVENT_BATCH_WINDOW);
-            }
-        }
-        // Drop the backend stream promptly so a cancelled turn kills the
-        // vendor process now rather than at end of scope.
-        drop(stream);
-        flush_backend_event_batch(&self.store, &scope, &mut persisted).await?;
-
-        if cancel.is_cancelled() {
-            if !segment.is_empty() {
-                self.store.append_event(
-                    scope.clone(),
-                    Event::AssistantMessage {
-                        turn,
-                        content: segment,
-                    },
-                )?;
-            }
-            if !text.is_empty() {
-                self.store.append_message(
-                    &thread.id,
-                    &serde_json::to_value(Message::Assistant {
-                        content: text,
-                        tool_calls: Vec::new(),
-                        reasoning: Vec::new(),
-                    })?,
-                )?;
-            }
-            return Ok(());
-        }
-
-        if !segment.is_empty() {
-            self.store.append_event(
-                scope.clone(),
-                Event::AssistantMessage {
-                    turn,
-                    content: segment,
-                },
-            )?;
-        }
-        self.store.append_message(
-            &thread.id,
-            &serde_json::to_value(Message::Assistant {
-                content: text,
-                tool_calls: Vec::new(),
-                reasoning: Vec::new(),
-            })?,
-        )?;
-        if tools_enabled {
-            self.store
-                .mark_backend_seen(&thread.id, backend_id, seen_after)?;
-        }
-
-        // Vendors report one usage per turn, so the totals already reflect
-        // the last (only) request — use them as the context-size proxy.
-        let context_input_tokens = usage_total.input_tokens + usage_total.cached_input_tokens;
-        self.store.record_usage(
-            &session.id,
-            &thread.id,
-            turn,
-            &usage_total,
-            context_input_tokens,
-        )?;
-        // Lock-free children (read-only spawned agents) never checkpoint:
-        // they hold no session lock, so `git add`/write-tree here would race
-        // the parent's concurrent turn and snapshot its half-finished work as
-        // the child's checkpoint. Matches the native path (invariant 4).
-        let checkpoint_id = if concurrent_child {
-            None
-        } else {
-            self.maybe_checkpoint(session, thread, turn).await?
-        };
-        self.store.append_event(
-            scope,
-            Event::TurnCompleted {
-                turn,
-                usage: usage_total,
-                checkpoint_id,
-            },
-        )?;
-        Ok(())
-    }
-
     /// Gate one backend approval request through trouve's permission layer:
     /// allow-list hits auto-approve, read-only modes deny, otherwise ask the
     /// user through the ApprovalHub (same endpoints as native tool calls).
@@ -6583,6 +6296,7 @@ impl Engine {
         turn: u64,
         provider: &Arc<dyn Provider>,
         model_name: &str,
+        context_window: u64,
     ) -> Result<()> {
         // The live listing knows gateway models (kilocode, openrouter, ...)
         // the static catalog doesn't; it is cached, so this is cheap. Never
@@ -6590,13 +6304,16 @@ impl Engine {
         // than surfacing that the provider omitted the required metadata.
         let live = provider.list_models().await;
         let known = provider.models();
-        let Some(context_window) = live
+        let reported_context_window = live
             .iter()
             .chain(known.iter())
             .find(|m| m.id == thread.model)
             .map(|m| m.context_window)
-            .filter(|w| *w > 0)
-        else {
+            .filter(|w| *w > 0);
+        let context_window = (context_window > 0)
+            .then_some(context_window)
+            .or(reported_context_window);
+        let Some(context_window) = context_window else {
             if self
                 .compaction_warnings
                 .lock()
@@ -6997,9 +6714,6 @@ impl Engine {
             .and_then(serde_json::Value::as_str)
             .unwrap_or(&thread.model)
             .to_string();
-        if !child_model.contains('/') {
-            bail!("model must be provider-qualified (e.g. openai/gpt-4.1-mini): {child_model}");
-        }
         // Same model: the parent's option choices (thinking level, …) carry
         // over. A different model validates its own options; start clean.
         let model_options = if child_model == thread.model {
@@ -8784,6 +8498,147 @@ mod tests {
         let cleared = store.latest_github_pr_snapshot(HOST).unwrap().unwrap();
         assert!(cleared.viewer.is_empty());
         assert!(cleared.prs.is_empty());
+    }
+
+    #[test]
+    fn neutral_ids_merge_only_stable_unnamespaced_names() {
+        assert_eq!(
+            neutral_model_id("gpt-5.6-sol").as_deref(),
+            Some("gpt-5.6-sol")
+        );
+        assert_eq!(
+            neutral_model_id("qwen2.5-coder:7b").as_deref(),
+            Some("qwen2.5-coder:7b")
+        );
+        assert_eq!(neutral_model_id("default"), None);
+        assert_eq!(neutral_model_id("AUTO"), None);
+        assert_eq!(neutral_model_id("openai/gpt-5.6-sol"), None);
+    }
+
+    #[test]
+    fn picker_keeps_local_and_transport_owned_models_provider_qualified() {
+        assert_eq!(
+            model_selection_id("qwen2.5-coder:7b", "local/qwen2.5-coder:7b", true),
+            "local/qwen2.5-coder:7b"
+        );
+        assert_eq!(
+            model_selection_id("qwen2.5-coder:7b", "openrouter/qwen2.5-coder:7b", false),
+            "qwen2.5-coder:7b"
+        );
+        assert_eq!(
+            model_selection_id("default", "cursor/default", false),
+            "cursor/default"
+        );
+    }
+
+    #[test]
+    fn models_dev_normalizes_hosted_routes_to_one_picker_id() {
+        let catalog = trouve_providers::models_dev::ModelsDevCatalog::embedded();
+        let api = catalog
+            .model(
+                "openai",
+                "openai",
+                "gpt-5.6-sol",
+                trouve_providers::models_dev::OptionsDialect::OpenAi,
+            )
+            .unwrap();
+        let codex = catalog
+            .model(
+                "openai",
+                "codex",
+                "gpt-5.6-sol",
+                trouve_providers::models_dev::OptionsDialect::CodexCli,
+            )
+            .unwrap();
+
+        assert_eq!(
+            model_selection_id(model_name_for_provider("openai", &api.id), &api.id, false),
+            "gpt-5.6-sol"
+        );
+        assert_eq!(
+            model_selection_id(
+                model_name_for_provider("codex", &codex.id),
+                &codex.id,
+                false
+            ),
+            "gpt-5.6-sol"
+        );
+        assert_eq!(api.display_name, codex.display_name);
+        assert_eq!(api.context_window, codex.context_window);
+    }
+
+    #[test]
+    fn subscription_routes_rank_known_headroom_before_unknown_capacity() {
+        let health = |status: &str, windows: &[i64]| trouve_protocol::SubscriptionHealth {
+            provider_id: "test".into(),
+            status: status.into(),
+            plan: String::new(),
+            windows: windows
+                .iter()
+                .map(|used_percent| trouve_protocol::SubscriptionWindow {
+                    label: "window".into(),
+                    used_percent: *used_percent,
+                    resets: String::new(),
+                })
+                .collect(),
+            credits: String::new(),
+            note: String::new(),
+        };
+
+        assert_eq!(subscription_health_rank(&health("ok", &[10, 40])), (0, 40));
+        assert_eq!(subscription_health_rank(&health("ok", &[])), (1, 0));
+        assert_eq!(
+            subscription_health_rank(&health("unavailable", &[])),
+            (2, 0)
+        );
+        assert_eq!(subscription_health_rank(&health("ok", &[100])), (3, 100));
+    }
+
+    #[test]
+    fn routed_schema_keeps_only_options_shared_by_every_provider() {
+        let model = |id: &str, thinking_key: &str, default: &str, provider_only: bool| {
+            let mut properties = serde_json::Map::from_iter([
+                (
+                    thinking_key.to_string(),
+                    serde_json::json!({
+                        "type": "string",
+                        "enum": ["low", "medium", "high"],
+                        "default": default
+                    }),
+                ),
+                (
+                    "fast".into(),
+                    serde_json::json!({"type": "boolean", "default": false}),
+                ),
+            ]);
+            if provider_only {
+                properties.insert(
+                    "provider_only".into(),
+                    serde_json::json!({"type": "boolean"}),
+                );
+            }
+            trouve_protocol::ModelInfo {
+                id: id.into(),
+                display_name: id.into(),
+                context_window: 100_000,
+                supports_tools: true,
+                input_price_per_mtok: None,
+                output_price_per_mtok: None,
+                options_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": properties
+                }),
+            }
+        };
+        let codex = model("codex/shared", "reasoning_effort", "high", true);
+        let cursor = model("cursor/shared", "thinking_level", "low", false);
+        let schema = routed_options_schema(&[&codex, &cursor]);
+
+        assert!(schema.pointer("/properties/fast").is_some());
+        assert!(schema.pointer("/properties/thinking_level").is_some());
+        assert_eq!(schema["properties"]["thinking_level"]["default"], "medium");
+        assert!(schema.pointer("/properties/reasoning_effort").is_none());
+        assert!(schema.pointer("/properties/provider_only").is_none());
     }
 
     #[test]

@@ -138,7 +138,9 @@ pub use requests::*;
 // 2.0: persona routing becomes persona selection with Manual/Additive/
 // Automatic policies; Automatic replaces Thorough's run-everything semantics
 // with fully routed selection (breaking).
-pub const PROTOCOL_VERSION: &str = "2.0";
+// 2.1: provider-neutral model routes, preferred provider ordering, and
+// model.route_selected handoff events (all additive).
+pub const PROTOCOL_VERSION: &str = "2.1";
 pub const EVENT_CURSOR_HEADER: &str = "x-trouve-event-cursor";
 
 pub type WorkspaceId = String;

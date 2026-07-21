@@ -1601,6 +1601,7 @@ export component AppWindow inherits Window {
     in property <[ProviderItem]> settings-subscription-providers;
     in property <[ProviderItem]> settings-api-providers;
     in property <[ProviderItem]> settings-local-providers;
+    in property <[string]> settings-provider-order;
     in property <[CliItem]> settings-clis;
     in property <[KnownProviderItem]> settings-known-providers;
     in property <[string]> settings-known-provider-names;
@@ -1667,6 +1668,7 @@ export component AppWindow inherits Window {
     callback provider-deleted(string);
     callback provider-login(/* id */ string, /* kind */ string);
     callback provider-login-response(/* id */ string, /* response */ string);
+    callback provider-priority-moved(/* id */ string, /* offset */ int);
     callback default-model-picked(int, string);
     callback default-permission-picked(int);
     callback mode-saved(string, string, string, string, bool, int, int, string);
@@ -5637,6 +5639,7 @@ export component AppWindow inherits Window {
         subscription-providers: root.settings-subscription-providers;
         api-providers: root.settings-api-providers;
         local-providers: root.settings-local-providers;
+        provider-order: root.settings-provider-order;
         clis: root.settings-clis;
         known-providers: root.settings-known-providers;
         known-provider-names: root.settings-known-provider-names;
@@ -5717,6 +5720,9 @@ export component AppWindow inherits Window {
         provider-login(id, kind) => { root.provider-login(id, kind); }
         provider-login-response(id, response) => {
             root.provider-login-response(id, response);
+        }
+        provider-priority-moved(id, offset) => {
+            root.provider-priority-moved(id, offset);
         }
         default-model-picked(i, thinking) => { root.default-model-picked(i, thinking); }
         default-permission-picked(i) => { root.default-permission-picked(i); }

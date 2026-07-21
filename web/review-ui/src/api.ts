@@ -165,7 +165,7 @@ export const configureApp = (body: {
 export const refreshReviews = (): Promise<void> =>
   api("/code-review/refresh", { method: "POST", body: "{}" });
 export const getProviders = (): Promise<ProvidersResponse> => api("/providers");
-export const getModels = (): Promise<Model[]> => api("/models");
+export const getModels = (): Promise<Model[]> => api("/model-routes");
 export const getModeInfos = (): Promise<ModeInfo[]> => api("/mode-infos");
 export const saveMode = (mode: ModeInfo["mode"]): Promise<void> =>
   api(`/modes/${encodeURIComponent(mode.id)}`, {

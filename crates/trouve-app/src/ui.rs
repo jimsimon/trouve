@@ -1295,6 +1295,7 @@ pub fn set_file_view(ui: &Ui, name: String, content: String, lines: Vec<Vec<(Str
 pub struct ProviderSettingsView {
     pub configured: Vec<trouve_protocol::ProviderInfo>,
     pub known: Vec<trouve_protocol::KnownProvider>,
+    pub provider_order: Vec<String>,
 }
 
 pub fn set_settings_data(
@@ -1307,7 +1308,11 @@ pub fn set_settings_data(
     default_permission_index: i32,
 ) {
     let _ = ui.upgrade_in_event_loop(move |ui| {
-        let ProviderSettingsView { configured, known } = providers;
+        let ProviderSettingsView {
+            configured,
+            known,
+            provider_order,
+        } = providers;
         let items: Vec<ProviderItem> = configured
             .into_iter()
             .map(|provider| {
@@ -1354,6 +1359,7 @@ pub fn set_settings_data(
         ui.set_settings_subscription_providers(ModelRc::new(VecModel::from(subscription)));
         ui.set_settings_api_providers(ModelRc::new(VecModel::from(api)));
         ui.set_settings_local_providers(ModelRc::new(VecModel::from(local)));
+        ui.set_settings_provider_order(string_model(provider_order));
         ui.set_settings_models(string_model(models));
         let thinking_items: Vec<crate::ThinkingItem> = thinking
             .into_iter()

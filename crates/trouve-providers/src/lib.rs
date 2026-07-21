@@ -102,6 +102,39 @@ pub enum ProviderError {
     Auth(String),
 }
 
+impl ProviderError {
+    /// Whether the provider positively reported exhausted request capacity.
+    /// This deliberately excludes generic transport failures: retrying those
+    /// through another provider could replay a side effect whose outcome is
+    /// unknown.
+    pub fn is_capacity_exhausted(&self) -> bool {
+        match self {
+            Self::Api(message) | Self::Request(message) => capacity_message(message),
+            Self::Auth(_) => false,
+        }
+    }
+}
+
+fn capacity_message(message: &str) -> bool {
+    let message = message.to_ascii_lowercase();
+    [
+        "429",
+        "too many requests",
+        "rate limit",
+        "rate_limit",
+        "quota exceeded",
+        "quota_exceeded",
+        "insufficient_quota",
+        "resource_exhausted",
+        "capacity exhausted",
+        "capacity_exhausted",
+        "usage limit",
+        "usage_limit",
+    ]
+    .iter()
+    .any(|signal| message.contains(signal))
+}
+
 pub type EventStream = BoxStream<'static, Result<ProviderEvent, ProviderError>>;
 
 const PROVIDER_DELTA_WINDOW: std::time::Duration = std::time::Duration::from_millis(16);
