@@ -729,15 +729,28 @@ impl Engine {
             Err(_) => return Ok(()),
         };
         let api = Self::app_api(config.app_id, &private_key)?;
+        let mut had_errors = false;
         let mut installations = Vec::new();
+        let mut installations_complete = true;
         let mut installation_page = 1;
         loop {
-            let (page, rate): (Vec<Installation>, _) = api
+            let response = api
                 .get(&format!(
                     "/app/installations?per_page=100&page={installation_page}"
                 ))
                 .await
-                .context("listing GitHub App installations")?;
+                .context("listing GitHub App installations");
+            let (page, rate): (Vec<Installation>, _) = match response {
+                Ok(response) => response,
+                Err(error) => {
+                    had_errors = true;
+                    installations_complete = false;
+                    self.record_review_error(format!(
+                        "listing GitHub App installations failed: {error:#}"
+                    ));
+                    break;
+                }
+            };
             self.record_review_rate(rate);
             let count = page.len();
             installations.extend(page);
@@ -746,31 +759,58 @@ impl Engine {
             }
             installation_page += 1;
         }
-        {
+        if installations_complete {
             let mut state = self.code_review.state.lock().unwrap();
             state.installation_count = installations.len() as u64;
         }
 
         let mut active_repositories = HashSet::new();
         for installation in installations {
-            let installation_api = self.installation_api(installation.id).await?;
+            let installation_api = match self.installation_api(installation.id).await {
+                Ok(api) => api,
+                Err(error) => {
+                    had_errors = true;
+                    self.record_review_error(format!(
+                        "authenticating GitHub App installation {} failed: {error:#}",
+                        installation.id
+                    ));
+                    continue;
+                }
+            };
             let mut page = 1;
             loop {
-                let (repositories, rate): (InstallationRepositories, _) = installation_api
+                let response = installation_api
                     .get(&format!(
                         "/installation/repositories?per_page=100&page={page}"
                     ))
                     .await
-                    .context("listing installation repositories")?;
+                    .context("listing installation repositories");
+                let (repositories, rate): (InstallationRepositories, _) = match response {
+                    Ok(response) => response,
+                    Err(error) => {
+                        had_errors = true;
+                        self.record_review_error(format!(
+                            "listing repositories for GitHub App installation {} failed: {error:#}",
+                            installation.id
+                        ));
+                        break;
+                    }
+                };
                 self.record_review_rate(rate);
                 let count = repositories.repositories.len();
                 for repository in repositories.repositories {
                     active_repositories.insert((installation.id, repository.full_name.clone()));
-                    self.store.upsert_discovered_code_review_repository(
+                    if let Err(error) = self.store.upsert_discovered_code_review_repository(
                         installation.id,
                         &repository.full_name,
                         repository.private,
-                    )?;
+                    ) {
+                        had_errors = true;
+                        self.record_review_error(format!(
+                            "recording repository {} for GitHub App installation {} failed: {error:#}",
+                            repository.full_name, installation.id
+                        ));
+                    }
                 }
                 if count < 100 {
                     break;
@@ -780,14 +820,13 @@ impl Engine {
         }
 
         let repositories = self.store.list_code_review_repositories()?;
-        let mut repository_failed = false;
         for repository in repositories.iter().filter(|repository| {
             repository.mode != CodeReviewMode::Off
                 && active_repositories
                     .contains(&(repository.installation_id, repository.repository.clone()))
         }) {
             if let Err(error) = self.poll_code_review_repository(repository).await {
-                repository_failed = true;
+                had_errors = true;
                 self.record_review_error(format!(
                     "polling code review repository {} failed: {error:#}",
                     repository.repository
@@ -797,7 +836,7 @@ impl Engine {
         {
             let mut state = self.code_review.state.lock().unwrap();
             state.last_poll_at = Some(Utc::now());
-            if !repository_failed {
+            if !had_errors {
                 state.last_error.clear();
             }
         }

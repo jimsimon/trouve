@@ -3867,6 +3867,10 @@ async fn code_review_dashboard_and_repository_policy_round_trip() {
         .await
         .unwrap();
     assert_eq!(
+        dashboard["repositories"][0]["reviewer_ids"],
+        serde_json::json!(["correctness"])
+    );
+    assert_eq!(
         dashboard["repositories"][0]["reviewer_overrides"]
             .as_array()
             .unwrap()
