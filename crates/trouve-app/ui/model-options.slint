@@ -1,0 +1,132 @@
+// Schema-driven model option controls shared by chat setup, the composer,
+// and automations. Rust turns JSON Schema properties into these plain rows;
+// the widgets never need model- or provider-specific knowledge.
+
+import { CheckBox, ComboBox, LineEdit } from "std-widgets.slint";
+import { Theme } from "theme.slint";
+
+export struct ModelOptionItem {
+    key: string,
+    label: string,
+    description: string,
+    // 0 enum/choice, 1 boolean, 2 free-form scalar.
+    kind: int,
+    choices: [string],
+    selected-index: int,
+    bool-value: bool,
+    text-value: string,
+    hint: string,
+}
+
+// Full-width controls used in setup forms.
+export component ModelOptionsForm inherits VerticalLayout {
+    in property <[ModelOptionItem]> options;
+    in property <bool> interactive: true;
+    callback choice-changed(/* option */ int, /* choice */ int);
+    callback bool-changed(/* option */ int, bool);
+    callback text-changed(/* option */ int, string);
+
+    spacing: 8px;
+
+    for option[index] in root.options: VerticalLayout {
+        spacing: 4px;
+        HorizontalLayout {
+            spacing: 8px;
+            Text {
+                text: option.label;
+                color: Theme.c.text-mid;
+                font-size: Theme.fs(12px);
+                font-weight: 700;
+                vertical-alignment: center;
+                horizontal-stretch: 1;
+            }
+            if option.kind == 1: CheckBox {
+                text: option.bool-value ? "On" : "Off";
+                checked: option.bool-value;
+                enabled: root.interactive;
+                toggled => { root.bool-changed(index, self.checked); }
+            }
+        }
+        if option.kind == 0: ComboBox {
+            height: Theme.fs(30px);
+            vertical-stretch: 0;
+            model: option.choices;
+            current-index: option.selected-index;
+            enabled: root.interactive;
+            selected => { root.choice-changed(index, self.current-index); }
+        }
+        if option.kind == 2: LineEdit {
+            height: Theme.fs(30px);
+            vertical-stretch: 0;
+            text: option.text-value;
+            placeholder-text: option.hint;
+            enabled: root.interactive;
+            edited => { root.text-changed(index, self.text); }
+        }
+        if option.description != "": Text {
+            text: option.description;
+            color: Theme.c.text-dim;
+            font-size: Theme.fs(10px);
+            wrap: word-wrap;
+        }
+    }
+}
+
+// Compact controls used in the horizontally scrolling composer bar.
+export component ModelOptionsBar inherits HorizontalLayout {
+    in property <[ModelOptionItem]> options;
+    in property <bool> interactive: true;
+    callback choice-changed(/* option */ int, /* choice */ int);
+    callback bool-changed(/* option */ int, bool);
+    callback text-changed(/* option */ int, string);
+
+    spacing: 8px;
+    vertical-stretch: 0;
+
+    for option[index] in root.options: VerticalLayout {
+        spacing: 2px;
+        Text {
+            text: option.label;
+            color: Theme.c.text-faint;
+            font-size: Theme.fs(10px);
+            overflow: elide;
+        }
+        if option.kind == 0: ComboBox {
+            width: 120px;
+            height: Theme.fs(30px);
+            vertical-stretch: 0;
+            model: option.choices;
+            current-index: option.selected-index;
+            enabled: root.interactive;
+            selected => { root.choice-changed(index, self.current-index); }
+        }
+        if option.kind == 1: Rectangle {
+            width: 44px;
+            height: Theme.fs(30px);
+            background: option.bool-value ? Theme.c.accent-bg : Theme.c.control-bg;
+            border-radius: 6px;
+            border-width: 1px;
+            border-color: option.bool-value ? Theme.c.primary-border : Theme.c.border;
+            TouchArea {
+                enabled: root.interactive;
+                clicked => { root.bool-changed(index, !option.bool-value); }
+            }
+            Text {
+                text: option.bool-value ? "On" : "Off";
+                color: option.bool-value ? Theme.c.text-accent-soft : Theme.c.text-soft;
+                font-size: Theme.fs(12px);
+                horizontal-alignment: center;
+                vertical-alignment: center;
+            }
+        }
+        if option.kind == 2: LineEdit {
+            width: 100px;
+            height: Theme.fs(30px);
+            vertical-stretch: 0;
+            text: option.text-value;
+            placeholder-text: option.hint;
+            enabled: root.interactive;
+            edited => { root.text-changed(index, self.text); }
+        }
+    }
+}

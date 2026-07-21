@@ -11,7 +11,7 @@ mod winstate;
 
 slint::include_modules!();
 
-use controller::UiCommand;
+use controller::{ModelOptionInput, ModelOptionTarget, UiCommand};
 use slint::{ComponentHandle, Model};
 
 /// Indices into `items` fuzzy-matching `query`, best score first (stable by
@@ -520,14 +520,13 @@ fn main() -> anyhow::Result<()> {
     {
         let tx = tx.clone();
         window.on_start_new_chat(
-            move |ws, branch, fetch_latest, mode, model, thinking, permission, prompt| {
+            move |ws, branch, fetch_latest, mode, model, permission, prompt| {
                 let _ = tx.send(UiCommand::StartNewChat {
                     workspace_idx: ws.max(0) as usize,
                     branch_idx: branch.max(0) as usize,
                     fetch_latest,
                     mode_idx: mode.max(0) as usize,
                     model_idx: model.max(0) as usize,
-                    thinking_idx: thinking.max(0) as usize,
                     permission_idx: permission.max(0) as usize,
                     prompt: prompt.to_string(),
                 });
@@ -709,8 +708,32 @@ fn main() -> anyhow::Result<()> {
     }
     {
         let tx = tx.clone();
-        window.on_composer_thinking_changed(move |i| {
-            let _ = tx.send(UiCommand::ComposerThinkingChanged(i.max(0) as usize));
+        window.on_nc_model_option_choice_changed(move |option, choice| {
+            let _ = tx.send(UiCommand::ModelOptionChanged {
+                target: ModelOptionTarget::NewChat,
+                option: option.max(0) as usize,
+                input: ModelOptionInput::Choice(choice.max(0) as usize),
+            });
+        });
+    }
+    {
+        let tx = tx.clone();
+        window.on_nc_model_option_bool_changed(move |option, value| {
+            let _ = tx.send(UiCommand::ModelOptionChanged {
+                target: ModelOptionTarget::NewChat,
+                option: option.max(0) as usize,
+                input: ModelOptionInput::Boolean(value),
+            });
+        });
+    }
+    {
+        let tx = tx.clone();
+        window.on_nc_model_option_text_changed(move |option, value| {
+            let _ = tx.send(UiCommand::ModelOptionChanged {
+                target: ModelOptionTarget::NewChat,
+                option: option.max(0) as usize,
+                input: ModelOptionInput::Text(value.to_string()),
+            });
         });
     }
     {
@@ -721,14 +744,32 @@ fn main() -> anyhow::Result<()> {
     }
     {
         let tx = tx.clone();
-        window.on_composer_context_changed(move |i| {
-            let _ = tx.send(UiCommand::ComposerContextChanged(i.max(0) as usize));
+        window.on_composer_model_option_choice_changed(move |option, choice| {
+            let _ = tx.send(UiCommand::ModelOptionChanged {
+                target: ModelOptionTarget::Composer,
+                option: option.max(0) as usize,
+                input: ModelOptionInput::Choice(choice.max(0) as usize),
+            });
         });
     }
     {
         let tx = tx.clone();
-        window.on_composer_fast_toggled(move |on| {
-            let _ = tx.send(UiCommand::ComposerFastToggled(on));
+        window.on_composer_model_option_bool_changed(move |option, value| {
+            let _ = tx.send(UiCommand::ModelOptionChanged {
+                target: ModelOptionTarget::Composer,
+                option: option.max(0) as usize,
+                input: ModelOptionInput::Boolean(value),
+            });
+        });
+    }
+    {
+        let tx = tx.clone();
+        window.on_composer_model_option_text_changed(move |option, value| {
+            let _ = tx.send(UiCommand::ModelOptionChanged {
+                target: ModelOptionTarget::Composer,
+                option: option.max(0) as usize,
+                input: ModelOptionInput::Text(value.to_string()),
+            });
         });
     }
     {
@@ -1219,6 +1260,51 @@ fn main() -> anyhow::Result<()> {
     }
     {
         let tx = tx.clone();
+        window.on_automation_form_opened(move |id, model| {
+            let _ = tx.send(UiCommand::AutomationFormOpened(
+                id.to_string(),
+                model.max(0) as usize,
+            ));
+        });
+    }
+    {
+        let tx = tx.clone();
+        window.on_automation_model_changed(move |model| {
+            let _ = tx.send(UiCommand::AutomationModelChanged(model.max(0) as usize));
+        });
+    }
+    {
+        let tx = tx.clone();
+        window.on_automation_model_option_choice_changed(move |option, choice| {
+            let _ = tx.send(UiCommand::ModelOptionChanged {
+                target: ModelOptionTarget::Automation,
+                option: option.max(0) as usize,
+                input: ModelOptionInput::Choice(choice.max(0) as usize),
+            });
+        });
+    }
+    {
+        let tx = tx.clone();
+        window.on_automation_model_option_bool_changed(move |option, value| {
+            let _ = tx.send(UiCommand::ModelOptionChanged {
+                target: ModelOptionTarget::Automation,
+                option: option.max(0) as usize,
+                input: ModelOptionInput::Boolean(value),
+            });
+        });
+    }
+    {
+        let tx = tx.clone();
+        window.on_automation_model_option_text_changed(move |option, value| {
+            let _ = tx.send(UiCommand::ModelOptionChanged {
+                target: ModelOptionTarget::Automation,
+                option: option.max(0) as usize,
+                input: ModelOptionInput::Text(value.to_string()),
+            });
+        });
+    }
+    {
+        let tx = tx.clone();
         window.on_automation_saved(
             move |id,
                   name,
@@ -1228,6 +1314,8 @@ fn main() -> anyhow::Result<()> {
                   minute,
                   time,
                   days,
+                  mode,
+                  model,
                   permission_index,
                   enabled| {
                 let _ = tx.send(UiCommand::SaveAutomation {
@@ -1239,6 +1327,8 @@ fn main() -> anyhow::Result<()> {
                     minute: minute.to_string(),
                     time: time.to_string(),
                     days: days.to_string(),
+                    mode_idx: mode.max(0) as usize,
+                    model_idx: model.max(0) as usize,
                     permission_index,
                     enabled,
                 });

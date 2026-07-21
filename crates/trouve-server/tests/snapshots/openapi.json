@@ -7,7 +7,7 @@
       "name": "MIT",
       "identifier": "MIT"
     },
-    "version": "1.0"
+    "version": "1.1"
   },
   "paths": {
     "/v1/approvals": {
@@ -3186,6 +3186,14 @@
             ],
             "description": "Model for the runs (None = the mode's default)."
           },
+          "model_options": {
+            "type": "object",
+            "description": "Model-specific values selected from the model's `options_schema`.",
+            "additionalProperties": {},
+            "propertyNames": {
+              "type": "string"
+            }
+          },
           "name": {
             "type": "string"
           },
@@ -5993,6 +6001,14 @@
               "string",
               "null"
             ]
+          },
+          "model_options": {
+            "type": "object",
+            "description": "Model-specific values selected from the model's `options_schema`.",
+            "additionalProperties": {},
+            "propertyNames": {
+              "type": "string"
+            }
           },
           "name": {
             "type": "string"

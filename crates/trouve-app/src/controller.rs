@@ -33,6 +33,20 @@ const TODOS_TAB: i32 = 5;
 /// API pressure from the per-PR enrichment requests.
 const PR_DASH_REFRESH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ModelOptionTarget {
+    Composer,
+    NewChat,
+    Automation,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ModelOptionInput {
+    Choice(usize),
+    Boolean(bool),
+    Text(String),
+}
+
 fn same_pull_request(left: &trouve_protocol::PrInfo, right: &trouve_protocol::PrInfo) -> bool {
     left.number == right.number
         && left.host.eq_ignore_ascii_case(&right.host)
@@ -144,9 +158,13 @@ pub enum UiCommand {
         fetch_latest: bool,
         mode_idx: usize,
         model_idx: usize,
-        thinking_idx: usize,
         permission_idx: usize,
         prompt: String,
+    },
+    ModelOptionChanged {
+        target: ModelOptionTarget,
+        option: usize,
+        input: ModelOptionInput,
     },
 
     // Chat screen.
@@ -226,10 +244,7 @@ pub enum UiCommand {
     ToggleCard(String),
     ComposerModeChanged(usize),
     ComposerModelChanged(usize),
-    ComposerThinkingChanged(usize),
     ComposerPermissionChanged(usize),
-    ComposerContextChanged(usize),
-    ComposerFastToggled(bool),
 
     // Right column.
     /// The right panel switched tabs (terminal attaches lazily on visit).
@@ -377,6 +392,8 @@ pub enum UiCommand {
     /// Internal: the automations fetch finished.
     AutomationsLoaded(Result<Vec<trouve_protocol::Automation>, String>),
     AutomationTemplatesLoaded(Vec<trouve_protocol::AutomationTemplate>),
+    AutomationFormOpened(String, usize),
+    AutomationModelChanged(usize),
     /// Create (id "") or update an automation from the form fields.
     SaveAutomation {
         id: String,
@@ -391,6 +408,8 @@ pub enum UiCommand {
         time: String,
         /// Comma-separated Monday-first day indices (weekly).
         days: String,
+        mode_idx: usize,
+        model_idx: usize,
         /// 0 Ask, 1 Allow-list, 2 Yolo.
         permission_index: i32,
         enabled: bool,
@@ -523,7 +542,6 @@ struct NewChatSelection {
     fetch_latest: bool,
     mode_idx: usize,
     model_idx: usize,
-    thinking_idx: usize,
     permission_idx: usize,
 }
 
@@ -737,6 +755,9 @@ struct Controller {
     /// custom / workspace) — drives the settings Modes & Models section.
     mode_origins: Vec<String>,
     models: Vec<ModelInfo>,
+    /// Global model default, used to initialize setup forms that do not yet
+    /// have a thread whose resolved model can be inspected.
+    default_model: String,
     /// Global thinking default, kept with the catalogs so switching a live
     /// thread's mode can apply the same inheritance as thread creation.
     default_thinking_level: Option<String>,
@@ -747,16 +768,11 @@ struct Controller {
     /// Shared freshness and response-generation gate for every subscription
     /// refresh trigger.
     subscription_refresh: SubscriptionRefreshState,
-    /// Thinking dropdown state for the current thread's model: the schema
-    /// property the values belong to and the raw value tokens (parallel to
-    /// the displayed labels).
-    thinking_key: Option<String>,
-    thinking_values: Vec<String>,
-    /// Context-size dropdown values (schema property "context"), when the
-    /// current model offers a choice (e.g. cursor's 300k/1M).
-    context_values: Vec<String>,
-    new_chat_thinking_key: Option<String>,
-    new_chat_thinking_values: Vec<String>,
+    /// Draft values for forms that do not have a persisted thread yet.
+    new_chat_model_options: serde_json::Map<String, serde_json::Value>,
+    new_chat_model_index: Option<usize>,
+    automation_draft_options: serde_json::Map<String, serde_json::Value>,
+    automation_model_index: Option<usize>,
 
     new_chat: Option<NewChat>,
     branches: Vec<String>,
@@ -906,14 +922,14 @@ pub async fn run(
         modes: Vec::new(),
         mode_origins: Vec::new(),
         models: Vec::new(),
+        default_model: String::new(),
         default_thinking_level: None,
         subscription_health: Vec::new(),
         subscription_refresh: SubscriptionRefreshState::default(),
-        thinking_key: None,
-        thinking_values: Vec::new(),
-        context_values: Vec::new(),
-        new_chat_thinking_key: None,
-        new_chat_thinking_values: Vec::new(),
+        new_chat_model_options: serde_json::Map::new(),
+        new_chat_model_index: None,
+        automation_draft_options: serde_json::Map::new(),
+        automation_model_index: None,
         new_chat: None,
         branches: Vec::new(),
         diff_files: Vec::new(),
@@ -1196,6 +1212,7 @@ impl Controller {
         self.mode_origins = infos.into_iter().map(|i| i.origin).collect();
         self.models = self.client.list_models().await.unwrap_or_default();
         if let Ok(providers) = self.client.list_providers().await {
+            self.default_model = providers.default_model;
             self.default_thinking_level = providers.default_thinking_level;
         }
         let mode_names = self
@@ -1402,6 +1419,15 @@ impl Controller {
             .and_then(|id| self.models.iter().position(|m| m.id == id))
             .map(|i| i as i32)
             .unwrap_or(-1)
+    }
+
+    fn default_model_index_for_mode(&self, mode_index: usize) -> usize {
+        let configured = self
+            .modes
+            .get(mode_index)
+            .and_then(|mode| mode.default_model.as_deref())
+            .or((!self.default_model.is_empty()).then_some(self.default_model.as_str()));
+        usize::try_from(self.model_index_of(configured)).unwrap_or(0)
     }
 
     async fn reload_sessions(&mut self) -> Result<()> {
@@ -2099,92 +2125,102 @@ impl Controller {
         self.push_model_knobs();
     }
 
-    /// Model knobs (thinking dropdown, fast toggle) come from the current
-    /// model's options schema; selections from the thread's stored options.
-    fn push_model_knobs(&mut self) {
+    /// Render every supported scalar property from the current model's
+    /// options schema, using the thread's persisted values when present.
+    fn push_model_knobs(&self) {
         let thread = self.current_thread.and_then(|i| self.threads.get(i));
         let info = thread.and_then(|t| self.models.iter().find(|m| m.id == t.model));
-
-        let thinking = info.and_then(|m| thinking_property(&m.options_schema));
-        let (key, values, default) = match thinking {
-            Some(t) => (Some(t.0), t.1, t.2),
-            None => (None, Vec::new(), None),
-        };
-        let current = key
-            .as_deref()
-            .and_then(|k| thread?.model_options.get(k)?.as_str().map(String::from))
-            .or_else(|| {
-                thread?
-                    .model_options
-                    .get("thinking_level")?
-                    .as_str()
-                    .map(String::from)
-            })
-            .filter(|current| values.iter().any(|value| value == current))
-            .or(default);
-        let index = current
-            .and_then(|c| values.iter().position(|v| *v == c))
-            .map(|i| i as i32)
-            .unwrap_or(-1);
-
-        let context = info.and_then(|m| context_property(&m.options_schema));
-        let (context_values, context_default) = context.unwrap_or_default();
-        let context_current = thread
-            .and_then(|t| t.model_options.get("context"))
-            .and_then(|v| v.as_str().map(String::from))
-            .or(context_default);
-        let context_index = context_current
-            .and_then(|c| context_values.iter().position(|v| *v == c))
-            .map(|i| i as i32)
-            .unwrap_or(-1);
-
-        let fast_visible = info
-            .map(|m| m.options_schema.pointer("/properties/fast").is_some())
-            .unwrap_or(false);
-        let fast_default = info
-            .and_then(|m| m.options_schema.pointer("/properties/fast/default"))
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false);
-        let fast_checked = thread
-            .and_then(|t| t.model_options.get("fast"))
-            .and_then(|v| v.as_bool())
-            .unwrap_or(fast_default);
-
-        self.thinking_key = key;
-        self.thinking_values = values.clone();
-        self.context_values = context_values.clone();
-        ui::set_model_knobs(
-            &self.ui,
-            values.iter().map(|v| level_label(v)).collect(),
-            index,
-            context_values.iter().map(|v| context_label(v)).collect(),
-            context_index,
-            fast_visible,
-            fast_checked,
-        );
+        let empty = serde_json::Map::new();
+        let options = thread.map(|thread| &thread.model_options).unwrap_or(&empty);
+        let views = info
+            .map(|model| model_option_views(&model.options_schema, options))
+            .unwrap_or_default();
+        ui::set_model_options(&self.ui, views);
     }
 
     fn push_new_chat_knobs(&mut self, model_index: usize) {
-        let thinking = self
-            .models
-            .get(model_index)
-            .and_then(|model| thinking_property(&model.options_schema));
-        let (key, values, default) = match thinking {
-            Some((key, values, default)) => (Some(key), values, default),
-            None => (None, Vec::new(), None),
+        self.new_chat_model_index = Some(model_index);
+        self.new_chat_model_options.clear();
+        self.render_new_chat_model_options();
+    }
+
+    fn render_new_chat_model_options(&self) {
+        let views = self
+            .new_chat_model_index
+            .and_then(|index| self.models.get(index))
+            .map(|model| model_option_views(&model.options_schema, &self.new_chat_model_options))
+            .unwrap_or_default();
+        ui::set_new_chat_model_options(&self.ui, views);
+    }
+
+    fn set_automation_model_options(
+        &mut self,
+        model_index: usize,
+        options: serde_json::Map<String, serde_json::Value>,
+    ) {
+        self.automation_model_index = Some(model_index);
+        self.automation_draft_options = options;
+        self.render_automation_model_options();
+    }
+
+    fn render_automation_model_options(&self) {
+        let views = self
+            .automation_model_index
+            .and_then(|index| self.models.get(index))
+            .map(|model| model_option_views(&model.options_schema, &self.automation_draft_options))
+            .unwrap_or_default();
+        ui::set_automation_model_options(&self.ui, views);
+    }
+
+    fn model_option_spec(
+        &self,
+        target: ModelOptionTarget,
+        index: usize,
+    ) -> Option<ModelOptionSpec> {
+        let model = match target {
+            ModelOptionTarget::Composer => {
+                let thread = self.current_thread.and_then(|i| self.threads.get(i))?;
+                self.models.iter().find(|model| model.id == thread.model)?
+            }
+            ModelOptionTarget::NewChat => self.models.get(self.new_chat_model_index?)?,
+            ModelOptionTarget::Automation => self.models.get(self.automation_model_index?)?,
         };
-        let selected = default
-            .as_ref()
-            .and_then(|value| values.iter().position(|candidate| candidate == value))
-            .map(|index| index as i32)
-            .unwrap_or_else(|| if values.is_empty() { -1 } else { 0 });
-        self.new_chat_thinking_key = key;
-        self.new_chat_thinking_values = values.clone();
-        ui::set_new_chat_knobs(
-            &self.ui,
-            values.iter().map(|value| level_label(value)).collect(),
-            selected,
-        );
+        model_option_specs(&model.options_schema)
+            .get(index)
+            .cloned()
+    }
+
+    async fn change_model_option(
+        &mut self,
+        target: ModelOptionTarget,
+        index: usize,
+        input: ModelOptionInput,
+    ) {
+        let Some(spec) = self.model_option_spec(target, index) else {
+            return;
+        };
+        match target {
+            ModelOptionTarget::Composer => {
+                let mut options = self.current_model_options();
+                if apply_model_option_input(&mut options, &spec, input) {
+                    self.update_current_thread(UpdateThreadRequest {
+                        model_options: Some(options),
+                        ..Default::default()
+                    })
+                    .await;
+                }
+            }
+            ModelOptionTarget::NewChat => {
+                if apply_model_option_input(&mut self.new_chat_model_options, &spec, input) {
+                    self.render_new_chat_model_options();
+                }
+            }
+            ModelOptionTarget::Automation => {
+                if apply_model_option_input(&mut self.automation_draft_options, &spec, input) {
+                    self.render_automation_model_options();
+                }
+            }
+        }
     }
 
     /// Start following the current thread's event stream (idempotent).
@@ -3171,6 +3207,8 @@ impl Controller {
     /// or None to default to the current session's / home workspace.
     async fn open_new_session_screen(&mut self, workspace: Option<usize>) -> Result<()> {
         self.new_chat = Some(NewChat::Session);
+        let mode_index = default_mode_index(&self.modes).max(0) as usize;
+        let model_index = self.default_model_index_for_mode(mode_index);
         let ws_index = workspace
             .filter(|i| *i < self.workspaces.len())
             .unwrap_or_else(|| {
@@ -3192,10 +3230,10 @@ impl Controller {
             ws_index as i32,
             Vec::new(),
             -1,
-            default_mode_index(&self.modes),
-            0,
+            mode_index as i32,
+            model_index as i32,
         );
-        self.push_new_chat_knobs(0);
+        self.push_new_chat_knobs(model_index);
         ui::set_center_screen(&self.ui, 1);
         self.load_branches(ws_index).await;
         Ok(())
@@ -3210,16 +3248,18 @@ impl Controller {
             return; // Already on the provisional tab.
         }
         self.new_chat = Some(NewChat::Thread);
+        let mode_index = default_mode_index(&self.modes).max(0) as usize;
+        let model_index = self.default_model_index_for_mode(mode_index);
         ui::set_new_chat(
             &self.ui,
             Vec::new(),
             -1,
             Vec::new(),
             -1,
-            default_mode_index(&self.modes),
-            0,
+            mode_index as i32,
+            model_index as i32,
         );
-        self.push_new_chat_knobs(0);
+        self.push_new_chat_knobs(model_index);
         self.push_threads();
         ui::set_center_screen(&self.ui, 2);
     }
@@ -3257,15 +3297,7 @@ impl Controller {
     }
 
     async fn start_new_chat(&mut self, selection: NewChatSelection, prompt: String) -> Result<()> {
-        let mut model_options = serde_json::Map::new();
-        if let (Some(key), Some(value)) = (
-            self.new_chat_thinking_key.clone(),
-            self.new_chat_thinking_values
-                .get(selection.thinking_idx)
-                .cloned(),
-        ) {
-            model_options.insert(key, serde_json::Value::String(value));
-        }
+        let model_options = self.new_chat_model_options.clone();
         let permission_mode = match selection.permission_idx {
             1 => Some(PermissionMode::Ask),
             2 => Some(PermissionMode::AllowList),
@@ -3761,6 +3793,16 @@ impl Controller {
             .automations
             .iter()
             .map(|a| {
+                let mode_index = a
+                    .mode
+                    .as_deref()
+                    .and_then(|id| self.modes.iter().position(|mode| mode.id == id))
+                    .unwrap_or_else(|| default_mode_index(&self.modes).max(0) as usize);
+                let model_index = a
+                    .model
+                    .as_deref()
+                    .and_then(|id| self.models.iter().position(|model| model.id == id))
+                    .unwrap_or_else(|| self.default_model_index_for_mode(mode_index));
                 let ws_name = self
                     .workspaces
                     .iter()
@@ -3794,7 +3836,14 @@ impl Controller {
                 ui::AutomationView {
                     id: a.id.clone(),
                     name: a.name.clone(),
-                    schedule_line: format!("{} · {ws_name}", schedule_summary(&a.schedule)),
+                    schedule_line: format!(
+                        "{} · {ws_name} · {}",
+                        schedule_summary(&a.schedule),
+                        self.models
+                            .get(model_index)
+                            .map(|model| short_model(&model.id))
+                            .unwrap_or_else(|| "default model".into())
+                    ),
                     next_line,
                     last_line,
                     last_failed: !a.last_error.is_empty() && !awaiting_approval,
@@ -3802,6 +3851,8 @@ impl Controller {
                     prompt: a.prompt.clone(),
                     workspace_index: ids.iter().position(|id| *id == a.workspace_id).unwrap_or(0)
                         as i32,
+                    mode_index: mode_index as i32,
+                    model_index: model_index as i32,
                     kind: a.schedule.kind.clone(),
                     minute_text: a.schedule.minute.to_string(),
                     permission_index: match a.permission_mode {
@@ -3818,7 +3869,9 @@ impl Controller {
                 }
             })
             .collect();
-        ui::set_automations(&self.ui, rows, names, ids);
+        let default_mode = default_mode_index(&self.modes).max(0);
+        let default_model = self.default_model_index_for_mode(default_mode as usize) as i32;
+        ui::set_automations(&self.ui, rows, names, ids, default_mode, default_model);
     }
 
     /// Render the cached template catalog into the screen.
@@ -4042,10 +4095,8 @@ impl Controller {
                 | UiCommand::QueueSendNowAt(_)
                 | UiCommand::ComposerModeChanged(_)
                 | UiCommand::ComposerModelChanged(_)
-                | UiCommand::ComposerThinkingChanged(_)
                 | UiCommand::ComposerPermissionChanged(_)
-                | UiCommand::ComposerContextChanged(_)
-                | UiCommand::ComposerFastToggled(_) => {
+                | UiCommand::ModelOptionChanged { .. } => {
                     self.error(&format!("Can't do that right now — {reason}."));
                     return Ok(());
                 }
@@ -4243,16 +4294,18 @@ impl Controller {
                 // Refresh the new-session pickers only when that screen is
                 // up ("+ Open" also lands here with the chat view showing).
                 if matches!(self.new_chat, Some(NewChat::Session)) {
+                    let mode_index = default_mode_index(&self.modes).max(0) as usize;
+                    let model_index = self.default_model_index_for_mode(mode_index);
                     ui::set_new_chat(
                         &self.ui,
                         self.workspaces.iter().map(|w| w.name.clone()).collect(),
                         index as i32,
                         Vec::new(),
                         -1,
-                        default_mode_index(&self.modes),
-                        0,
+                        mode_index as i32,
+                        model_index as i32,
                     );
-                    self.push_new_chat_knobs(0);
+                    self.push_new_chat_knobs(model_index);
                     self.load_branches(index).await;
                 }
             }
@@ -4262,7 +4315,6 @@ impl Controller {
                 fetch_latest,
                 mode_idx,
                 model_idx,
-                thinking_idx,
                 permission_idx,
                 prompt,
             } => {
@@ -4273,7 +4325,6 @@ impl Controller {
                         fetch_latest,
                         mode_idx,
                         model_idx,
-                        thinking_idx,
                         permission_idx,
                     },
                     prompt,
@@ -4281,6 +4332,11 @@ impl Controller {
                 .await?
             }
             UiCommand::NewChatModelChanged(i) => self.push_new_chat_knobs(i),
+            UiCommand::ModelOptionChanged {
+                target,
+                option,
+                input,
+            } => self.change_model_option(target, option, input).await,
             UiCommand::SelectThread(i) => {
                 self.open_thread_index(i, false);
                 // i == threads.len() is the provisional tab itself: no-op.
@@ -4608,19 +4664,6 @@ impl Controller {
                 })
                 .await;
             }
-            UiCommand::ComposerThinkingChanged(i) => {
-                let key = self.thinking_key.clone();
-                let token = self.thinking_values.get(i).cloned();
-                if let (Some(key), Some(token)) = (key, token) {
-                    let mut options = self.current_model_options();
-                    options.insert(key, serde_json::Value::String(token));
-                    self.update_current_thread(UpdateThreadRequest {
-                        model_options: Some(options),
-                        ..Default::default()
-                    })
-                    .await;
-                }
-            }
             UiCommand::ComposerPermissionChanged(i) => {
                 if let Some(permission_mode) = permission_mode_of(i as i32) {
                     self.update_current_thread(UpdateThreadRequest {
@@ -4629,26 +4672,6 @@ impl Controller {
                     })
                     .await;
                 }
-            }
-            UiCommand::ComposerContextChanged(i) => {
-                if let Some(token) = self.context_values.get(i).cloned() {
-                    let mut options = self.current_model_options();
-                    options.insert("context".into(), serde_json::Value::String(token));
-                    self.update_current_thread(UpdateThreadRequest {
-                        model_options: Some(options),
-                        ..Default::default()
-                    })
-                    .await;
-                }
-            }
-            UiCommand::ComposerFastToggled(on) => {
-                let mut options = self.current_model_options();
-                options.insert("fast".into(), serde_json::Value::Bool(on));
-                self.update_current_thread(UpdateThreadRequest {
-                    model_options: Some(options),
-                    ..Default::default()
-                })
-                .await;
             }
             UiCommand::RightTabChanged(tab) => {
                 self.right_tab = if tab == TODOS_TAB
@@ -5650,6 +5673,18 @@ impl Controller {
                 self.automation_templates = templates;
                 self.push_automation_templates();
             }
+            UiCommand::AutomationFormOpened(id, model_index) => {
+                let options = self
+                    .automations
+                    .iter()
+                    .find(|automation| automation.id == id)
+                    .map(|automation| automation.model_options.clone())
+                    .unwrap_or_default();
+                self.set_automation_model_options(model_index, options);
+            }
+            UiCommand::AutomationModelChanged(model_index) => {
+                self.set_automation_model_options(model_index, serde_json::Map::new());
+            }
             UiCommand::SaveAutomation {
                 id,
                 name,
@@ -5659,6 +5694,8 @@ impl Controller {
                 minute,
                 time,
                 days,
+                mode_idx,
+                model_idx,
                 permission_index,
                 enabled,
             } => {
@@ -5674,8 +5711,9 @@ impl Controller {
                     name,
                     prompt,
                     workspace_id,
-                    mode: None,
-                    model: None,
+                    mode: self.modes.get(mode_idx).map(|mode| mode.id.clone()),
+                    model: self.models.get(model_idx).map(|model| model.id.clone()),
+                    model_options: self.automation_draft_options.clone(),
                     permission_mode: match permission_index {
                         1 => PermissionMode::AllowList,
                         2 => PermissionMode::Yolo,
@@ -5716,6 +5754,7 @@ impl Controller {
                     workspace_id: automation.workspace_id.clone(),
                     mode: automation.mode.clone(),
                     model: automation.model.clone(),
+                    model_options: automation.model_options.clone(),
                     permission_mode: automation.permission_mode,
                     schedule: automation.schedule.clone(),
                     enabled,
@@ -6148,6 +6187,321 @@ fn short_model(model: &str) -> String {
     model.rsplit('/').next().unwrap_or(model).to_string()
 }
 
+#[derive(Debug, Clone, PartialEq)]
+enum ModelOptionKind {
+    Choice {
+        values: Vec<serde_json::Value>,
+        labels: Vec<String>,
+    },
+    Boolean,
+    Text(ModelOptionScalar),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ModelOptionScalar {
+    String,
+    Number,
+    Integer,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct ModelOptionSpec {
+    key: String,
+    label: String,
+    description: String,
+    kind: ModelOptionKind,
+    default: Option<serde_json::Value>,
+    hint: String,
+}
+
+/// The scalar subset of JSON Schema that can be edited safely in compact
+/// setup/composer controls. Object/array properties are intentionally
+/// skipped until the catalog provides a dedicated editor for them.
+fn model_option_specs(schema: &serde_json::Value) -> Vec<ModelOptionSpec> {
+    let Some(properties) = schema.get("properties").and_then(|value| value.as_object()) else {
+        return Vec::new();
+    };
+    properties
+        .iter()
+        .filter_map(|(key, property)| {
+            if property.get("readOnly").and_then(|value| value.as_bool()) == Some(true) {
+                return None;
+            }
+            if property.get("const").is_some()
+                || property
+                    .get("enum")
+                    .and_then(|value| value.as_array())
+                    .is_some_and(|values| values.len() <= 1)
+            {
+                return None;
+            }
+            let kind = choice_option(property)
+                .or_else(|| {
+                    let scalar = schema_scalar_type(property)?;
+                    Some(match scalar {
+                        ModelOptionScalar::String => ModelOptionKind::Text(scalar),
+                        ModelOptionScalar::Number | ModelOptionScalar::Integer => {
+                            ModelOptionKind::Text(scalar)
+                        }
+                    })
+                })
+                .or_else(|| {
+                    schema_has_type(property, "boolean").then_some(ModelOptionKind::Boolean)
+                })?;
+            // Boolean must be detected before the scalar fallback above.
+            let kind = if schema_has_type(property, "boolean") {
+                ModelOptionKind::Boolean
+            } else {
+                kind
+            };
+            Some(ModelOptionSpec {
+                key: key.clone(),
+                label: property
+                    .get("title")
+                    .and_then(|value| value.as_str())
+                    .map(String::from)
+                    .unwrap_or_else(|| option_label(key)),
+                description: property
+                    .get("description")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or_default()
+                    .to_string(),
+                default: property.get("default").cloned(),
+                hint: option_hint(property),
+                kind,
+            })
+        })
+        .collect()
+}
+
+fn choice_option(property: &serde_json::Value) -> Option<ModelOptionKind> {
+    let values = property.get("enum").and_then(|value| value.as_array());
+    if let Some(values) = values.filter(|values| values.len() > 1) {
+        let values = values.clone();
+        let labels = property
+            .get("x-enumNames")
+            .or_else(|| property.get("enumNames"))
+            .and_then(|value| value.as_array())
+            .filter(|labels| labels.len() == values.len())
+            .map(|labels| {
+                labels
+                    .iter()
+                    .map(|label| label.as_str().unwrap_or_default().to_string())
+                    .collect()
+            })
+            .unwrap_or_else(|| values.iter().map(model_option_value_label).collect());
+        return Some(ModelOptionKind::Choice { values, labels });
+    }
+    let choices = property.get("oneOf")?.as_array()?;
+    let mut values = Vec::new();
+    let mut labels = Vec::new();
+    for choice in choices {
+        let value = choice.get("const")?.clone();
+        labels.push(
+            choice
+                .get("title")
+                .and_then(|title| title.as_str())
+                .map(String::from)
+                .unwrap_or_else(|| model_option_value_label(&value)),
+        );
+        values.push(value);
+    }
+    (values.len() > 1).then_some(ModelOptionKind::Choice { values, labels })
+}
+
+fn schema_scalar_type(property: &serde_json::Value) -> Option<ModelOptionScalar> {
+    let value_type = property.get("type")?;
+    let name = value_type.as_str().or_else(|| {
+        value_type
+            .as_array()?
+            .iter()
+            .filter_map(|value| value.as_str())
+            .find(|name| *name != "null")
+    })?;
+    match name {
+        "string" => Some(ModelOptionScalar::String),
+        "number" => Some(ModelOptionScalar::Number),
+        "integer" => Some(ModelOptionScalar::Integer),
+        _ => None,
+    }
+}
+
+fn schema_has_type(property: &serde_json::Value, expected: &str) -> bool {
+    property.get("type").is_some_and(|value_type| {
+        value_type.as_str() == Some(expected)
+            || value_type
+                .as_array()
+                .is_some_and(|types| types.iter().any(|name| name.as_str() == Some(expected)))
+    })
+}
+
+fn option_hint(property: &serde_json::Value) -> String {
+    if let Some(example) = property
+        .get("examples")
+        .and_then(|value| value.as_array())
+        .and_then(|values| values.first())
+    {
+        return scalar_option_text(example);
+    }
+    let minimum = property.get("minimum").map(scalar_option_text);
+    let maximum = property.get("maximum").map(scalar_option_text);
+    match (minimum, maximum) {
+        (Some(minimum), Some(maximum)) => format!("{minimum} – {maximum}"),
+        (Some(minimum), None) => format!("at least {minimum}"),
+        (None, Some(maximum)) => format!("at most {maximum}"),
+        (None, None) => "value".into(),
+    }
+}
+
+fn option_label(key: &str) -> String {
+    match key {
+        "thinking_level" => "Thinking".into(),
+        "reasoning_effort" => "Reasoning effort".into(),
+        _ => humanize_option_token(key),
+    }
+}
+
+fn humanize_option_token(token: &str) -> String {
+    let words = token.replace(['_', '-'], " ");
+    let mut chars = words.chars();
+    match chars.next() {
+        Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
+        None => String::new(),
+    }
+}
+
+fn model_option_value_label(value: &serde_json::Value) -> String {
+    match value {
+        serde_json::Value::Bool(true) => "On".into(),
+        serde_json::Value::Bool(false) => "Off".into(),
+        serde_json::Value::String(value)
+            if value
+                .strip_suffix(['k', 'm'])
+                .is_some_and(|number| number.parse::<f64>().is_ok()) =>
+        {
+            context_label(value)
+        }
+        serde_json::Value::String(value) => {
+            let known = level_label(value);
+            if known == *value {
+                humanize_option_token(value)
+            } else {
+                known
+            }
+        }
+        other => scalar_option_text(other),
+    }
+}
+
+fn scalar_option_text(value: &serde_json::Value) -> String {
+    value
+        .as_str()
+        .map(String::from)
+        .unwrap_or_else(|| value.to_string())
+}
+
+fn stored_model_option<'a>(
+    options: &'a serde_json::Map<String, serde_json::Value>,
+    key: &str,
+) -> Option<&'a serde_json::Value> {
+    options.get(key).or_else(|| {
+        matches!(key, "reasoning_effort" | "effort" | "reasoning")
+            .then(|| options.get("thinking_level"))
+            .flatten()
+    })
+}
+
+fn model_option_views(
+    schema: &serde_json::Value,
+    options: &serde_json::Map<String, serde_json::Value>,
+) -> Vec<ui::ModelOptionView> {
+    model_option_specs(schema)
+        .into_iter()
+        .map(|spec| {
+            let current = stored_model_option(options, &spec.key).or(spec.default.as_ref());
+            let (kind, choices, selected_index, bool_value, text_value) = match &spec.kind {
+                ModelOptionKind::Choice { values, labels } => (
+                    0,
+                    labels.clone(),
+                    current
+                        .and_then(|current| values.iter().position(|value| value == current))
+                        .map(|index| index as i32)
+                        .unwrap_or(-1),
+                    false,
+                    String::new(),
+                ),
+                ModelOptionKind::Boolean => (
+                    1,
+                    Vec::new(),
+                    -1,
+                    current.and_then(|value| value.as_bool()).unwrap_or(false),
+                    String::new(),
+                ),
+                ModelOptionKind::Text(_) => (
+                    2,
+                    Vec::new(),
+                    -1,
+                    false,
+                    current.map(scalar_option_text).unwrap_or_default(),
+                ),
+            };
+            ui::ModelOptionView {
+                key: spec.key,
+                label: spec.label,
+                description: spec.description,
+                kind,
+                choices,
+                selected_index,
+                bool_value,
+                text_value,
+                hint: spec.hint,
+            }
+        })
+        .collect()
+}
+
+fn apply_model_option_input(
+    options: &mut serde_json::Map<String, serde_json::Value>,
+    spec: &ModelOptionSpec,
+    input: ModelOptionInput,
+) -> bool {
+    let value = match (&spec.kind, input) {
+        (ModelOptionKind::Choice { values, .. }, ModelOptionInput::Choice(index)) => {
+            values.get(index).cloned()
+        }
+        (ModelOptionKind::Boolean, ModelOptionInput::Boolean(value)) => {
+            Some(serde_json::Value::Bool(value))
+        }
+        (ModelOptionKind::Text(_), ModelOptionInput::Text(value)) if value.trim().is_empty() => {
+            return options.remove(&spec.key).is_some();
+        }
+        (ModelOptionKind::Text(ModelOptionScalar::String), ModelOptionInput::Text(value)) => {
+            Some(serde_json::Value::String(value))
+        }
+        (ModelOptionKind::Text(ModelOptionScalar::Number), ModelOptionInput::Text(value)) => value
+            .trim()
+            .parse::<f64>()
+            .ok()
+            .and_then(serde_json::Number::from_f64)
+            .map(serde_json::Value::Number),
+        (ModelOptionKind::Text(ModelOptionScalar::Integer), ModelOptionInput::Text(value)) => value
+            .trim()
+            .parse::<i64>()
+            .ok()
+            .map(serde_json::Number::from)
+            .map(serde_json::Value::Number),
+        _ => None,
+    };
+    let Some(value) = value else {
+        return false;
+    };
+    if options.get(&spec.key) == Some(&value) {
+        return false;
+    }
+    options.insert(spec.key.clone(), value);
+    true
+}
+
 /// The thinking-style enum in a model's options schema, if any: property
 /// name, value tokens, and the schema default. Providers name the knob
 /// differently (anthropic: thinking_level, codex: reasoning_effort,
@@ -6164,18 +6518,6 @@ fn thinking_property(schema: &serde_json::Value) -> Option<(String, Vec<String>,
             let default = prop["default"].as_str().map(String::from);
             return Some((key.into(), values, default));
         }
-    }
-    None
-}
-
-/// The context-size enum in a model's options schema, if any (cursor models
-/// with a 300k/1M choice): value tokens and the schema default.
-fn context_property(schema: &serde_json::Value) -> Option<(Vec<String>, Option<String>)> {
-    let prop = schema.pointer("/properties/context")?;
-    let values = enum_values(prop)?;
-    if values.len() > 1 {
-        let default = prop["default"].as_str().map(String::from);
-        return Some((values, default));
     }
     None
 }
@@ -6911,10 +7253,12 @@ fn should_open_chat_at_tail(force_tail: bool, turn_running: bool, has_queue: boo
 #[cfg(test)]
 mod tests {
     use super::{
-        SubscriptionRefresh, SubscriptionRefreshState, approval_pill, attention_badge, check_pill,
-        classify_pr, download_progress, human_age, human_rate, merge_pill, model_health_view,
-        pr_badge, project_session_prs, reconcile_pr_group_order, reconcile_workspace_order,
-        reorder_id, should_open_chat_at_tail, thinking_property,
+        ModelOptionInput, ModelOptionKind, ModelOptionScalar, SubscriptionRefresh,
+        SubscriptionRefreshState, apply_model_option_input, approval_pill, attention_badge,
+        check_pill, classify_pr, download_progress, human_age, human_rate, merge_pill,
+        model_health_view, model_option_specs, model_option_views, pr_badge, project_session_prs,
+        reconcile_pr_group_order, reconcile_workspace_order, reorder_id, should_open_chat_at_tail,
+        thinking_property,
     };
     use chrono::{Duration, TimeZone, Utc};
     use trouve_protocol::{
@@ -7300,6 +7644,68 @@ mod tests {
             }))
             .is_none()
         );
+    }
+
+    #[test]
+    fn model_options_are_derived_from_scalar_json_schema_properties() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "reasoning_effort": {
+                    "type": "string",
+                    "enum": ["low", "medium", "high"],
+                    "default": "medium",
+                    "description": "How much reasoning to use"
+                },
+                "fast": {"type": "boolean", "default": false},
+                "temperature": {
+                    "type": "number",
+                    "minimum": 0,
+                    "maximum": 1
+                },
+                "provider_config": {"type": "object"}
+            }
+        });
+        let specs = model_option_specs(&schema);
+        assert_eq!(specs.len(), 3);
+        let spec = |key: &str| specs.iter().find(|spec| spec.key == key).unwrap();
+        assert!(matches!(spec("fast").kind, ModelOptionKind::Boolean));
+        assert!(matches!(
+            spec("reasoning_effort").kind,
+            ModelOptionKind::Choice { .. }
+        ));
+        assert!(matches!(
+            spec("temperature").kind,
+            ModelOptionKind::Text(ModelOptionScalar::Number)
+        ));
+
+        let mut selected = serde_json::Map::new();
+        let views = model_option_views(&schema, &selected);
+        let view = |key: &str| views.iter().find(|view| view.key == key).unwrap();
+        assert_eq!(view("fast").label, "Fast");
+        assert!(!view("fast").bool_value);
+        assert_eq!(view("reasoning_effort").selected_index, 1);
+        assert_eq!(view("reasoning_effort").choices, ["Low", "Medium", "High"]);
+        assert_eq!(view("temperature").hint, "0 – 1");
+
+        assert!(apply_model_option_input(
+            &mut selected,
+            spec("fast"),
+            ModelOptionInput::Boolean(true)
+        ));
+        assert!(apply_model_option_input(
+            &mut selected,
+            spec("reasoning_effort"),
+            ModelOptionInput::Choice(2)
+        ));
+        assert!(apply_model_option_input(
+            &mut selected,
+            spec("temperature"),
+            ModelOptionInput::Text("0.4".into())
+        ));
+        assert_eq!(selected["fast"], serde_json::json!(true));
+        assert_eq!(selected["reasoning_effort"], serde_json::json!("high"));
+        assert_eq!(selected["temperature"], serde_json::json!(0.4));
     }
 
     #[test]

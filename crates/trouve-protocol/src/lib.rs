@@ -78,7 +78,9 @@ pub use requests::*;
 // account-centric, multi-instance feed (breaking route/event replacement),
 // and DELETE /v1/workspaces/{id} closes a workspace without deleting its
 // sessions while workspace.closed records the state change.
-pub const PROTOCOL_VERSION: &str = "1.0";
+// 1.1: automations persist model_options and apply them to every run
+// (additive; omitted values preserve the model's defaults).
+pub const PROTOCOL_VERSION: &str = "1.1";
 
 pub type WorkspaceId = String;
 pub type SessionId = String;

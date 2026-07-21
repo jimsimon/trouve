@@ -7,7 +7,8 @@ use slint::{Model, ModelRc, SharedString, VecModel};
 use crate::render::ChatRowData;
 use crate::{
     AppWindow, ChatRow, ChatTableCell, CliItem, DiffRow, FileItem, KnownProviderItem,
-    ModelHealthItem, NavRow, ProviderItem, QOption, QPair, TextSegment, ThreadTabItem, TodoUiItem,
+    ModelHealthItem, ModelOptionItem, NavRow, ProviderItem, QOption, QPair, TextSegment,
+    ThreadTabItem, TodoUiItem,
 };
 
 type Ui = slint::Weak<AppWindow>;
@@ -132,31 +133,55 @@ pub fn set_connectivity_notice(ui: &Ui, text: String) {
     });
 }
 
-/// Model knobs for the current thread: thinking-level labels + selection,
-/// and the fast toggle. Empty options hide the dropdown.
-pub fn set_model_knobs(
-    ui: &Ui,
-    thinking_options: Vec<String>,
-    thinking_index: i32,
-    context_options: Vec<String>,
-    context_index: i32,
-    fast_visible: bool,
-    fast_checked: bool,
-) {
+/// Plain-data mirror of the schema-driven `ModelOptionItem` Slint struct.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ModelOptionView {
+    pub key: String,
+    pub label: String,
+    pub description: String,
+    /// 0 enum/choice, 1 boolean, 2 free-form scalar.
+    pub kind: i32,
+    pub choices: Vec<String>,
+    pub selected_index: i32,
+    pub bool_value: bool,
+    pub text_value: String,
+    pub hint: String,
+}
+
+fn model_option_model(options: Vec<ModelOptionView>) -> ModelRc<ModelOptionItem> {
+    ModelRc::new(VecModel::from(
+        options
+            .into_iter()
+            .map(|option| ModelOptionItem {
+                key: option.key.into(),
+                label: option.label.into(),
+                description: option.description.into(),
+                kind: option.kind,
+                choices: string_model(option.choices),
+                selected_index: option.selected_index,
+                bool_value: option.bool_value,
+                text_value: option.text_value.into(),
+                hint: option.hint.into(),
+            })
+            .collect::<Vec<_>>(),
+    ))
+}
+
+pub fn set_model_options(ui: &Ui, options: Vec<ModelOptionView>) {
     let _ = ui.upgrade_in_event_loop(move |ui| {
-        ui.set_thinking_options(string_model(thinking_options));
-        ui.set_thinking_index(thinking_index);
-        ui.set_context_options(string_model(context_options));
-        ui.set_context_index(context_index);
-        ui.set_fast_visible(fast_visible);
-        ui.set_fast_checked(fast_checked);
+        ui.set_model_options(model_option_model(options));
     });
 }
 
-pub fn set_new_chat_knobs(ui: &Ui, thinking_options: Vec<String>, thinking_index: i32) {
+pub fn set_new_chat_model_options(ui: &Ui, options: Vec<ModelOptionView>) {
     let _ = ui.upgrade_in_event_loop(move |ui| {
-        ui.set_nc_thinking_options(string_model(thinking_options));
-        ui.set_nc_thinking_index(thinking_index);
+        ui.set_nc_model_options(model_option_model(options));
+    });
+}
+
+pub fn set_automation_model_options(ui: &Ui, options: Vec<ModelOptionView>) {
+    let _ = ui.upgrade_in_event_loop(move |ui| {
+        ui.set_automation_model_options(model_option_model(options));
     });
 }
 
@@ -1352,6 +1377,8 @@ pub struct AutomationView {
     pub enabled: bool,
     pub prompt: String,
     pub workspace_index: i32,
+    pub mode_index: i32,
+    pub model_index: i32,
     pub kind: String,
     pub minute_text: String,
     pub permission_index: i32,
@@ -1366,6 +1393,8 @@ pub fn set_automations(
     rows: Vec<AutomationView>,
     workspace_names: Vec<String>,
     workspace_ids: Vec<String>,
+    default_mode_index: i32,
+    default_model_index: i32,
 ) {
     let _ = ui.upgrade_in_event_loop(move |ui| {
         let items: Vec<crate::AutomationItem> = rows
@@ -1380,6 +1409,8 @@ pub fn set_automations(
                 enabled: a.enabled,
                 prompt: SharedString::from(a.prompt.as_str()),
                 workspace_index: a.workspace_index,
+                mode_index: a.mode_index,
+                model_index: a.model_index,
                 kind: SharedString::from(a.kind.as_str()),
                 minute_text: SharedString::from(a.minute_text.as_str()),
                 permission_index: a.permission_index,
@@ -1400,6 +1431,8 @@ pub fn set_automations(
                 .map(SharedString::from)
                 .collect::<Vec<_>>(),
         )));
+        ui.set_automation_default_mode_index(default_mode_index);
+        ui.set_automation_default_model_index(default_model_index);
     });
 }
 

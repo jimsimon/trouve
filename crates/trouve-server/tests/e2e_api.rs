@@ -2704,6 +2704,7 @@ async fn automation_records_the_turn_outcome_not_just_dispatch() {
             "prompt": "run",
             "workspace_id": workspace["id"],
             "permission_mode": "yolo",
+            "model_options": {"fast": true, "temperature": 0.4},
             "schedule": {"kind": "daily", "time": "09:00"},
             "enabled": false
         }))
@@ -2714,6 +2715,7 @@ async fn automation_records_the_turn_outcome_not_just_dispatch() {
         .await
         .unwrap();
     assert_eq!(automation["permission_mode"], "yolo");
+    assert_eq!(automation["model_options"]["fast"], true);
     let automation_id = automation["id"].as_str().unwrap();
     let resp = client
         .post(format!("{base}/automations/{automation_id}/run"))
@@ -2763,6 +2765,7 @@ async fn automation_records_the_turn_outcome_not_just_dispatch() {
         .unwrap();
     assert_eq!(threads.len(), 1);
     assert_eq!(threads[0]["permission_mode"], "yolo");
+    assert_eq!(threads[0]["model_options"], automation["model_options"]);
 }
 
 /// GitHub Enterprise hosts: the integration always lists github.com
