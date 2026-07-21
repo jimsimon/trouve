@@ -331,6 +331,56 @@ async fn full_turn_with_approval_checkpoint_and_undo() {
     );
     assert!(commands.iter().any(|command| command["name"] == "terminal"));
 
+    // Built-in skills default on, can be disabled globally, and disappear
+    // from existing thread catalogs immediately without hiding core commands.
+    let skills: serde_json::Value = client
+        .get(format!("{base}/config/skills"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(skills["builtin_skills_enabled"], true);
+    let catalog_seq = catalog_events
+        .iter()
+        .find(|event| event["type"] == "thread.command_catalog_updated")
+        .unwrap()["cursor"]
+        .as_u64()
+        .unwrap();
+    let response = client
+        .put(format!("{base}/config/skills"))
+        .json(&serde_json::json!({"builtin_skills_enabled": false}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), reqwest::StatusCode::NO_CONTENT);
+    let updated_catalog = wait_for_event(
+        &client,
+        &format!("{events_url}?after={catalog_seq}"),
+        |event| event["type"] == "thread.command_catalog_updated",
+    )
+    .await;
+    let commands = updated_catalog
+        .iter()
+        .find(|event| event["type"] == "thread.command_catalog_updated")
+        .unwrap()["commands"]
+        .as_array()
+        .unwrap();
+    assert!(commands.iter().any(|command| command["name"] == "status"));
+    assert!(
+        commands
+            .iter()
+            .all(|command| command["name"] != "code-review")
+    );
+    let missing_builtin = client
+        .post(format!("{base}/threads/{thread_id}/messages"))
+        .json(&serde_json::json!({"content": "/skill code-review"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(missing_builtin.status(), reqwest::StatusCode::BAD_REQUEST);
+
     let status: serde_json::Value = client
         .post(format!("{base}/threads/{thread_id}/commands"))
         .json(&serde_json::json!({"name": "status", "arguments": ""}))
@@ -1082,6 +1132,30 @@ async fn session_and_thread_updates_and_provider_config() {
         .await
         .unwrap();
     assert_eq!(providers["default_model"], "scripted/test-model");
+
+    // The Skills settings endpoint persists the enabled-by-default global
+    // built-in layer without affecting provider configuration.
+    let resp = client
+        .put(format!("{base}/config/skills"))
+        .json(&serde_json::json!({"builtin_skills_enabled": false}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 204);
+    let skills: serde_json::Value = client
+        .get(format!("{base}/config/skills"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(skills["builtin_skills_enabled"], false);
+    assert!(
+        std::fs::read_to_string(&config_file)
+            .unwrap()
+            .contains("builtin_skills_enabled = false")
+    );
 
     let resp = client
         .delete(format!("{base}/providers/openrouter"))

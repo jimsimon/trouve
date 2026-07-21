@@ -98,6 +98,10 @@ be identical when they are not user-visible.
 - Trouve carries a deliberately small built-in skill baseline. User and
   workspace skills override it by stable name, allowing local policy without
   making the selected provider a second skill source.
+- The built-in layer is enabled by default and can be disabled globally in
+  Settings → Skills (`builtin_skills_enabled = false` in `config.toml`). The
+  switch removes built-ins from prompts, completion catalogs, explicit
+  invocation, and `load_skill`; it does not disable user or workspace skills.
 
 ## Alternatives rejected
 

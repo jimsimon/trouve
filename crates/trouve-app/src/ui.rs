@@ -969,6 +969,10 @@ pub fn set_settings_section(ui: &Ui, section: i32) {
     let _ = ui.upgrade_in_event_loop(move |ui| ui.set_settings_section(section));
 }
 
+pub fn set_builtin_skills_enabled(ui: &Ui, enabled: bool) {
+    let _ = ui.upgrade_in_event_loop(move |ui| ui.set_settings_builtin_skills_enabled(enabled));
+}
+
 pub fn set_diff(ui: &Ui, rows: Vec<slint_diff_view::RowData>, raw: String) {
     let _ = ui.upgrade_in_event_loop(move |ui| {
         let items: Vec<DiffRow> = rows
@@ -1103,10 +1107,22 @@ pub fn set_file_view(ui: &Ui, name: String, content: String, lines: Vec<Vec<(Str
 
 // --- settings screen ---------------------------------------------------------
 
+/// Plain-data provider row passed from the controller to the settings UI.
+pub struct ProviderSettingsView {
+    pub id: String,
+    pub kind: String,
+    pub base_url: String,
+    pub has_credentials: bool,
+    pub auth: String,
+    pub category: String,
+    pub experimental: bool,
+    pub capability_mode: String,
+}
+
 /// Provider settings rows, including category and capability authority.
 pub fn set_settings_data(
     ui: &Ui,
-    providers: Vec<(String, String, String, bool, String, String, bool, String)>,
+    providers: Vec<ProviderSettingsView>,
     models: Vec<String>,
     thinking: Vec<ModelThinkingView>,
     default_model_index: i32,
@@ -1116,29 +1132,16 @@ pub fn set_settings_data(
     let _ = ui.upgrade_in_event_loop(move |ui| {
         let items: Vec<ProviderItem> = providers
             .into_iter()
-            .map(
-                |(
-                    id,
-                    kind,
-                    base_url,
-                    has_credentials,
-                    auth,
-                    category,
-                    experimental,
-                    capability_mode,
-                )| {
-                    ProviderItem {
-                        id: id.into(),
-                        kind: kind.into(),
-                        base_url: base_url.into(),
-                        has_credentials,
-                        auth: auth.into(),
-                        category: category.into(),
-                        experimental,
-                        capability_mode: capability_mode.into(),
-                    }
-                },
-            )
+            .map(|provider| ProviderItem {
+                id: provider.id.into(),
+                kind: provider.kind.into(),
+                base_url: provider.base_url.into(),
+                has_credentials: provider.has_credentials,
+                auth: provider.auth.into(),
+                category: provider.category.into(),
+                experimental: provider.experimental,
+                capability_mode: provider.capability_mode.into(),
+            })
             .collect();
         let subscription: Vec<ProviderItem> = items
             .iter()

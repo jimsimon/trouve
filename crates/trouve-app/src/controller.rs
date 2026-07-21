@@ -291,6 +291,9 @@ pub enum UiCommand {
     SetDefaultModel(usize, Option<String>),
     /// Set the global default permission mode (0 ask/1 allow-list/2 yolo).
     SetDefaultPermission(i32),
+    /// Enable or disable Trouve's compiled-in skills globally. User and
+    /// workspace skills remain available.
+    BuiltinSkillsToggled(bool),
     /// Create/update a user-level mode (a built-in id customizes it).
     /// Fields: id, display name, system prompt, comma-separated allowed
     /// tools, read-only, permission index (-1 global default/0 ask/
@@ -3448,6 +3451,14 @@ impl Controller {
     // --- settings --------------------------------------------------------------
 
     async fn refresh_settings(&mut self) {
+        match self.client.skills_settings().await {
+            Ok(settings) => {
+                ui::set_builtin_skills_enabled(&self.ui, settings.builtin_skills_enabled)
+            }
+            Err(e) => {
+                ui::set_settings_status(&self.ui, format!("failed to load skill settings: {e:#}"));
+            }
+        }
         if let Ok(gh) = self.client.github_integration().await {
             self.apply_github_integration(gh);
             self.push_github_integration();
@@ -3501,24 +3512,22 @@ impl Controller {
             providers
                 .providers
                 .into_iter()
-                .map(|p| {
-                    (
-                        p.id,
-                        p.kind,
-                        p.base_url.unwrap_or_default(),
-                        p.has_credentials,
-                        p.auth,
-                        p.category,
-                        p.experimental,
-                        match p.capability_mode {
-                            trouve_protocol::ProviderCapabilityMode::Authoritative => {
-                                "authoritative".to_string()
-                            }
-                            trouve_protocol::ProviderCapabilityMode::Compatibility => {
-                                "compatibility".to_string()
-                            }
-                        },
-                    )
+                .map(|p| ui::ProviderSettingsView {
+                    id: p.id,
+                    kind: p.kind,
+                    base_url: p.base_url.unwrap_or_default(),
+                    has_credentials: p.has_credentials,
+                    auth: p.auth,
+                    category: p.category,
+                    experimental: p.experimental,
+                    capability_mode: match p.capability_mode {
+                        trouve_protocol::ProviderCapabilityMode::Authoritative => {
+                            "authoritative".to_string()
+                        }
+                        trouve_protocol::ProviderCapabilityMode::Compatibility => {
+                            "compatibility".to_string()
+                        }
+                    },
                 })
                 .collect(),
             model_ids.clone(),
@@ -5113,7 +5122,7 @@ impl Controller {
                 }
             }
             UiCommand::OpenIntegrationsSettings => {
-                ui::set_settings_section(&self.ui, 3);
+                ui::set_settings_section(&self.ui, 4);
                 self.refresh_settings().await;
                 self.refresh_mcp();
                 self.refresh_subscriptions(SubscriptionRefresh::IfStale);
@@ -5447,6 +5456,23 @@ impl Controller {
                         Err(e) => {
                             ui::set_settings_status(&self.ui, format!("{e:#}"));
                         }
+                    }
+                }
+            }
+            UiCommand::BuiltinSkillsToggled(enabled) => {
+                match self.client.set_builtin_skills_enabled(enabled).await {
+                    Ok(()) => ui::set_settings_status(
+                        &self.ui,
+                        if enabled {
+                            "Trouve built-in skills enabled".into()
+                        } else {
+                            "Trouve built-in skills disabled; user and workspace skills remain enabled"
+                                .into()
+                        },
+                    ),
+                    Err(e) => {
+                        ui::set_settings_status(&self.ui, format!("saving skill settings: {e:#}"));
+                        self.refresh_settings().await;
                     }
                 }
             }
@@ -7090,8 +7116,8 @@ mod tests {
         SubscriptionRefresh, SubscriptionRefreshState, approval_pill, attention_badge, check_pill,
         classify_pr, download_progress, format_pr_dashboard_refresh_status, human_age, human_rate,
         merge_pill, model_health_view, model_picker_label, pr_badge, project_session_prs,
-        reconcile_pr_group_order, reconcile_workspace_order, reorder_id, session_title,
-        should_open_chat_at_tail, thinking_property,
+        reconcile_pr_group_order, reconcile_workspace_order, reorder_id, should_open_chat_at_tail,
+        thinking_property,
     };
     use chrono::{Duration, TimeZone, Utc};
     use trouve_protocol::{

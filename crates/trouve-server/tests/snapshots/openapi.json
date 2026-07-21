@@ -7,7 +7,7 @@
       "name": "MIT",
       "identifier": "MIT"
     },
-    "version": "1.4"
+    "version": "1.5"
   },
   "paths": {
     "/v1/approvals": {
@@ -700,6 +700,53 @@
             "description": ""
           },
           "400": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/config/skills": {
+      "get": {
+        "tags": [],
+        "operationId": "get_skills_settings",
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SkillsSettings"
+                }
+              }
+            }
+          }
+        }
+      },
+      "put": {
+        "tags": [],
+        "operationId": "set_skills_settings",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SetSkillsSettingsRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "204": {
+            "description": ""
+          },
+          "500": {
             "description": "",
             "content": {
               "application/json": {
@@ -6472,6 +6519,27 @@
         ],
         "properties": {
           "enabled": {
+            "type": "boolean"
+          }
+        }
+      },
+      "SetSkillsSettingsRequest": {
+        "type": "object",
+        "description": "Update the global skill settings persisted in `config.toml`.",
+        "required": [
+          "builtin_skills_enabled"
+        ],
+        "properties": {
+          "builtin_skills_enabled": {
+            "type": "boolean"
+          }
+        }
+      },
+      "SkillsSettings": {
+        "type": "object",
+        "description": "Global skill settings. Built-in skills are enabled by default; user and\nworkspace skills are independent of this switch.",
+        "properties": {
+          "builtin_skills_enabled": {
             "type": "boolean"
           }
         }

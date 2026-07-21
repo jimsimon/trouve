@@ -545,6 +545,20 @@ impl ProtocolClient {
         .await
     }
 
+    pub async fn skills_settings(&self) -> Result<trouve_protocol::SkillsSettings> {
+        self.get_json("/config/skills").await
+    }
+
+    pub async fn set_builtin_skills_enabled(&self, enabled: bool) -> Result<()> {
+        self.put_empty(
+            "/config/skills",
+            &trouve_protocol::SetSkillsSettingsRequest {
+                builtin_skills_enabled: enabled,
+            },
+        )
+        .await
+    }
+
     pub async fn session_diff(&self, session_id: &str) -> Result<SessionDiff> {
         self.get_json(&format!("/sessions/{session_id}/diff")).await
     }

@@ -2247,6 +2247,43 @@ impl Engine {
         Ok(())
     }
 
+    /// Current global skill settings. Built-in skills default to enabled;
+    /// user and workspace skills are not governed by this switch.
+    pub fn skills_settings(&self) -> trouve_protocol::SkillsSettings {
+        trouve_protocol::SkillsSettings {
+            builtin_skills_enabled: self.builtin_skills_enabled(),
+        }
+    }
+
+    /// Enable or disable Trouve's compiled-in skills. The resolved command
+    /// catalog is republished for every existing thread immediately. Future
+    /// prompt construction and skill lookups use the new value; an already
+    /// running turn may retain instructions injected when it started.
+    pub fn set_builtin_skills_enabled(&self, enabled: bool) -> Result<(), EngineError> {
+        {
+            let mut config = self.config.lock().unwrap();
+            if config.builtin_skills_enabled() == enabled {
+                return Ok(());
+            }
+            config.builtin_skills_enabled = Some(enabled);
+            self.persist_config(&config);
+        }
+
+        for session in self.store.list_sessions(None)? {
+            let Some(workspace) = self.store.workspace(&session.workspace_id)? else {
+                continue;
+            };
+            for thread in self.store.list_threads(&session.id)? {
+                self.emit_command_catalog(&thread.id, Path::new(&workspace.path))?;
+            }
+        }
+        Ok(())
+    }
+
+    fn builtin_skills_enabled(&self) -> bool {
+        self.config.lock().unwrap().builtin_skills_enabled()
+    }
+
     pub(crate) fn persist_config(&self, config: &Config) {
         if let Some(path) = &self.config_file
             && let Err(e) = config.save_to(path)
@@ -3690,6 +3727,7 @@ impl Engine {
         crate::commands::catalog(crate::skills::command_catalog(
             self.config_dir.as_deref(),
             Some(workspace_root),
+            self.builtin_skills_enabled(),
         ))
     }
 
@@ -3807,8 +3845,11 @@ impl Engine {
                 )
             }
             "skills" => {
-                let skills =
-                    crate::skills::discover(self.config_dir.as_deref(), Some(workspace_root));
+                let skills = crate::skills::discover(
+                    self.config_dir.as_deref(),
+                    Some(workspace_root),
+                    self.builtin_skills_enabled(),
+                );
                 if arguments.is_empty() {
                     let mut output = String::from(
                         "## Available skills\n\n| Skill | Origin | Invocation | Description |\n| --- | --- | --- | --- |\n",
@@ -4096,8 +4137,12 @@ impl Engine {
                 let mode = modes::find_mode(&all_modes, &thread.mode)
                     .cloned()
                     .unwrap_or_else(modes::fallback_mode);
-                let instructions =
-                    context::system_prompt(&mode, self.config_dir.as_deref(), workspace_root);
+                let instructions = context::system_prompt(
+                    &mode,
+                    self.config_dir.as_deref(),
+                    workspace_root,
+                    self.builtin_skills_enabled(),
+                );
                 (
                     format!(
                         "## Effective instructions\n\n````text\n{}\n````",
@@ -4391,6 +4436,7 @@ impl Engine {
                 self.config_dir.as_deref(),
                 Some(Path::new(&workspace.path)),
                 &content,
+                self.builtin_skills_enabled(),
             )
             .map_err(|error| EngineError::BadRequest(error.to_string()))?;
         }
@@ -4805,6 +4851,7 @@ impl Engine {
             todos: Arc::new(Mutex::new(thread.todos.clone())),
             config_dir: self.config_dir.clone(),
             workspace_root: Some(PathBuf::from(&ws.path)),
+            builtin_skills_enabled: self.builtin_skills_enabled(),
         };
 
         let all_modes = modes::resolve_modes(self.config_dir.as_deref(), Some(Path::new(&ws.path)));
@@ -4819,6 +4866,7 @@ impl Engine {
             self.config_dir.as_deref(),
             Some(Path::new(&ws.path)),
             &content,
+            self.builtin_skills_enabled(),
         )?
         .unwrap_or_else(|| content.clone());
 
@@ -4941,7 +4989,12 @@ impl Engine {
             }
         }
 
-        let system = context::system_prompt(&mode, self.config_dir.as_deref(), Path::new(&ws.path));
+        let system = context::system_prompt(
+            &mode,
+            self.config_dir.as_deref(),
+            Path::new(&ws.path),
+            self.builtin_skills_enabled(),
+        );
         let mut usage_total = Usage::default();
         // The last request's input size — the context-size proxy for
         // compaction. Summing per-iteration inputs (usage_total) would
@@ -5603,6 +5656,7 @@ impl Engine {
             todos: Arc::new(Mutex::new(thread.todos.clone())),
             config_dir: self.config_dir.clone(),
             workspace_root: Some(PathBuf::from(&ws.path)),
+            builtin_skills_enabled: self.builtin_skills_enabled(),
         };
         Ok((session, thread, mode, ctx))
     }
@@ -5735,8 +5789,12 @@ impl Engine {
         // Vendor agents get the mode prompt plus, when the bridge serves
         // trouve's search tools, guidance to prefer them over built-ins
         // (MCP instructions alone are too weak a signal).
-        let mut instructions =
-            context::system_prompt(mode, self.config_dir.as_deref(), Path::new(&workspace.path));
+        let mut instructions = context::system_prompt(
+            mode,
+            self.config_dir.as_deref(),
+            Path::new(&workspace.path),
+            self.builtin_skills_enabled(),
+        );
         if mcp_bridge.is_some() {
             if !instructions.is_empty() {
                 instructions.push_str("\n\n");

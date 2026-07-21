@@ -1502,9 +1502,10 @@ export component AppWindow inherits Window {
     in property <[ModeItem]> settings-mode-items;
     in property <[string]> settings-mode-model-names;
     in property <string> settings-status: "";
+    in-out property <bool> settings-builtin-skills-enabled: true;
     in-out property <int> settings-preset-index: 0;
     // Which settings section shows when the screen opens (0 providers …
-    // 3 integrations); the controller sets it before flipping center-screen.
+    // 8 about); the controller sets it before flipping center-screen.
     in-out property <int> settings-section: 0;
     in property <[GithubHostItem]> settings-github-hosts;
     callback github-host-added(/* host */ string, /* client-id */ string);
@@ -1537,6 +1538,7 @@ export component AppWindow inherits Window {
     callback default-model-picked(int, string);
     callback default-permission-picked(int);
     callback mode-saved(string, string, string, string, bool, int, int, string);
+    callback builtin-skills-toggled(bool);
     callback mode-deleted(string);
     callback mode-model-picked(string, int);
     callback mode-thinking-picked(string, string);
@@ -5259,6 +5261,7 @@ export component AppWindow inherits Window {
         mode-items: root.settings-mode-items;
         mode-model-names: root.settings-mode-model-names;
         settings-status: root.settings-status;
+        builtin-skills-enabled <=> root.settings-builtin-skills-enabled;
         preset-index <=> root.settings-preset-index;
         section <=> root.settings-section;
         github-hosts: root.settings-github-hosts;
@@ -5300,6 +5303,7 @@ export component AppWindow inherits Window {
         provider-login(id) => { root.provider-login(id); }
         default-model-picked(i, thinking) => { root.default-model-picked(i, thinking); }
         default-permission-picked(i) => { root.default-permission-picked(i); }
+        builtin-skills-toggled(enabled) => { root.builtin-skills-toggled(enabled); }
         mode-saved(id, name, prompt, tools, ro, perm, model, thinking) => {
             root.mode-saved(id, name, prompt, tools, ro, perm, model, thinking);
         }

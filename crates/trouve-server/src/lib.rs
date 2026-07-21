@@ -30,11 +30,12 @@ use trouve_protocol::{
     PrInfo, ProviderInfo, ProvidersResponse, QueuedPrompt, RegisterWorkspaceRequest,
     ReorderQueueRequest, ResolveApprovalRequest, ResolveQuestionRequest, ReviewerProfile, Scope,
     SendMessageRequest, ServerInfo, Session, SessionDiff, SetDefaultModelRequest,
-    SetDefaultPermissionModeRequest, SetLocalEnabledRequest, SubscriptionHealth, TerminalInfo,
-    TerminalInputRequest, TerminalResizeRequest, Thread, TurnAccepted,
-    UpdateCodeReviewRepositoryRequest, UpdateQueuedPromptRequest, UpdateSessionRequest,
-    UpdateThreadRequest, UpsertAutomationRequest, UpsertMcpServerRequest, UpsertModeRequest,
-    UpsertProviderRequest, UpsertReviewerProfileRequest, UsageSummary, Workspace,
+    SetDefaultPermissionModeRequest, SetLocalEnabledRequest, SetSkillsSettingsRequest,
+    SkillsSettings, SubscriptionHealth, TerminalInfo, TerminalInputRequest, TerminalResizeRequest,
+    Thread, TurnAccepted, UpdateCodeReviewRepositoryRequest, UpdateQueuedPromptRequest,
+    UpdateSessionRequest, UpdateThreadRequest, UpsertAutomationRequest, UpsertMcpServerRequest,
+    UpsertModeRequest, UpsertProviderRequest, UpsertReviewerProfileRequest, UsageSummary,
+    Workspace,
 };
 use utoipa::OpenApi;
 
@@ -135,6 +136,8 @@ impl IntoResponse for ApiError {
         restart_local_server,
         set_default_model,
         set_default_permission_mode,
+        get_skills_settings,
+        set_skills_settings,
         thread_usage,
         session_usage,
         session_mcp_servers,
@@ -215,6 +218,8 @@ impl IntoResponse for ApiError {
         UpsertProviderRequest,
         SetDefaultModelRequest,
         SetDefaultPermissionModeRequest,
+        SkillsSettings,
+        SetSkillsSettingsRequest,
         UsageSummary,
         SessionDiff,
         DirEntry,
@@ -601,6 +606,10 @@ pub fn build_router(engine: Arc<Engine>) -> Router {
         .route(
             "/v1/config/default-permission-mode",
             axum::routing::put(set_default_permission_mode),
+        )
+        .route(
+            "/v1/config/skills",
+            get(get_skills_settings).put(set_skills_settings),
         )
         .route("/v1/threads", post(create_thread).get(list_threads))
         .route("/v1/threads/{id}", get(get_thread).patch(update_thread))
@@ -1367,6 +1376,23 @@ async fn set_default_permission_mode(
     Json(req): Json<SetDefaultPermissionModeRequest>,
 ) -> Result<StatusCode, ApiError> {
     engine.set_default_permission_mode(req.permission_mode)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+#[utoipa::path(get, path = "/v1/config/skills",
+    responses((status = 200, body = SkillsSettings)))]
+async fn get_skills_settings(State(engine): State<Arc<Engine>>) -> Json<SkillsSettings> {
+    Json(engine.skills_settings())
+}
+
+#[utoipa::path(put, path = "/v1/config/skills",
+    request_body = SetSkillsSettingsRequest,
+    responses((status = 204), (status = 500, body = ErrorBody)))]
+async fn set_skills_settings(
+    State(engine): State<Arc<Engine>>,
+    Json(req): Json<SetSkillsSettingsRequest>,
+) -> Result<StatusCode, ApiError> {
+    engine.set_builtin_skills_enabled(req.builtin_skills_enabled)?;
     Ok(StatusCode::NO_CONTENT)
 }
 

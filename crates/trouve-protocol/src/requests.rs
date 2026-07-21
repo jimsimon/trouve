@@ -926,6 +926,20 @@ pub struct SetDefaultPermissionModeRequest {
     pub permission_mode: PermissionMode,
 }
 
+/// Global skill settings. Built-in skills are enabled by default; user and
+/// workspace skills are independent of this switch.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct SkillsSettings {
+    #[serde(default = "default_true")]
+    pub builtin_skills_enabled: bool,
+}
+
+/// Update the global skill settings persisted in `config.toml`.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct SetSkillsSettingsRequest {
+    pub builtin_skills_enabled: bool,
+}
+
 /// A well-known provider preset: clients offer these for one-click setup
 /// instead of hand-typed base URLs.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]

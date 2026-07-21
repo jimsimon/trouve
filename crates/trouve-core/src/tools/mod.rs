@@ -28,7 +28,7 @@ use trouve_providers::ToolSpec;
 
 /// Execution context: everything a tool may touch. All paths resolve inside
 /// the session worktree.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct ToolCtx {
     pub worktree: PathBuf,
     /// Stable owner for thread-scoped tool artifacts. Empty only in isolated
@@ -42,6 +42,22 @@ pub struct ToolCtx {
     /// Registered workspace repo root: its `.agents/.mcp.json` applies even
     /// before it is committed to the session branch.
     pub workspace_root: Option<PathBuf>,
+    /// Snapshot of the global built-in skill setting for this turn. User and
+    /// workspace skills are always available.
+    pub builtin_skills_enabled: bool,
+}
+
+impl Default for ToolCtx {
+    fn default() -> Self {
+        Self {
+            worktree: PathBuf::new(),
+            thread_id: String::new(),
+            todos: Arc::new(Mutex::new(Vec::new())),
+            config_dir: None,
+            workspace_root: None,
+            builtin_skills_enabled: true,
+        }
+    }
 }
 
 impl ToolCtx {

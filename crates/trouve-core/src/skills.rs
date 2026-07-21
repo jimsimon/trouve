@@ -225,17 +225,25 @@ fn load_dir(dir: &Path, origin: &'static str, out: &mut BTreeMap<String, Skill>)
     }
 }
 
-/// Discover all skills visible to a thread.
-pub fn discover(config_dir: Option<&Path>, workspace_root: Option<&Path>) -> Vec<Skill> {
+/// Discover all skills visible to a thread. The built-in layer can be
+/// disabled independently; user and workspace layers still resolve with
+/// their normal precedence.
+pub fn discover(
+    config_dir: Option<&Path>,
+    workspace_root: Option<&Path>,
+    include_builtins: bool,
+) -> Vec<Skill> {
     let mut skills = BTreeMap::new();
-    for builtin in BUILTIN_SKILLS {
-        if let Some(skill) = skill_from_text(
-            builtin.directory,
-            builtin.text,
-            "builtin",
-            SkillSource::BuiltIn(builtin.text),
-        ) {
-            skills.insert(skill.name.clone(), skill);
+    if include_builtins {
+        for builtin in BUILTIN_SKILLS {
+            if let Some(skill) = skill_from_text(
+                builtin.directory,
+                builtin.text,
+                "builtin",
+                SkillSource::BuiltIn(builtin.text),
+            ) {
+                skills.insert(skill.name.clone(), skill);
+            }
         }
     }
     if let Some(dir) = config_dir {
@@ -258,11 +266,12 @@ pub fn load(
     config_dir: Option<&Path>,
     workspace_root: Option<&Path>,
     name: &str,
+    include_builtins: bool,
 ) -> Result<(Skill, String)> {
     if name.trim().is_empty() {
         bail!("skill name must not be empty");
     }
-    let skill = discover(config_dir, workspace_root)
+    let skill = discover(config_dir, workspace_root, include_builtins)
         .into_iter()
         .find(|skill| skill.name == name)
         .ok_or_else(|| anyhow::anyhow!("unknown skill: {name}"))?;
@@ -303,8 +312,9 @@ pub fn load(
 pub fn command_catalog(
     config_dir: Option<&Path>,
     workspace_root: Option<&Path>,
+    include_builtins: bool,
 ) -> Vec<CommandInfo> {
-    discover(config_dir, workspace_root)
+    discover(config_dir, workspace_root, include_builtins)
         .into_iter()
         .filter(|skill| skill.user_invocable)
         .map(|skill| CommandInfo {
@@ -328,6 +338,7 @@ pub fn expand_invocation(
     config_dir: Option<&Path>,
     workspace_root: Option<&Path>,
     input: &str,
+    include_builtins: bool,
 ) -> Result<Option<String>> {
     let Some(after_slash) = input.trim().strip_prefix('/') else {
         return Ok(None);
@@ -352,7 +363,7 @@ pub fn expand_invocation(
     } else {
         (command, remainder, false)
     };
-    let Some(skill) = discover(config_dir, workspace_root)
+    let Some(skill) = discover(config_dir, workspace_root, include_builtins)
         .into_iter()
         .find(|skill| skill.name == name)
     else {
@@ -364,7 +375,7 @@ pub fn expand_invocation(
     if !skill.user_invocable {
         bail!("skill {name} is not user-invocable");
     }
-    let (skill, instructions) = load(config_dir, workspace_root, name)?;
+    let (skill, instructions) = load(config_dir, workspace_root, name, include_builtins)?;
     let request = if request.is_empty() {
         "Apply the explicitly invoked skill to the current task."
     } else {
@@ -427,14 +438,15 @@ mod tests {
             "# Review\n\nHow to review PRs here.",
         );
 
-        let skills = discover(Some(&cfg), Some(&repo));
+        let skills = discover(Some(&cfg), Some(&repo), true);
         assert_eq!(skills.len(), BUILTIN_SKILLS.len() + 2);
         let deploy = skills.iter().find(|s| s.name == "deploy").unwrap();
         assert_eq!(deploy.description, "Repo deploy skill");
         assert_eq!(deploy.origin, "workspace");
+        let workspace_skill_root = repo.join(".agents").canonicalize().unwrap();
         assert!(matches!(
             &deploy.source,
-            SkillSource::File(path) if path.starts_with(repo.join(".agents"))
+            SkillSource::File(path) if path.starts_with(&workspace_skill_root)
         ));
         let review = skills.iter().find(|s| s.name == "review").unwrap();
         assert_eq!(review.description, "How to review PRs here.");
@@ -468,11 +480,11 @@ mod tests {
             "---\nname: release\ndescription: Ship it\n---\n\nDo the release.",
         );
 
-        let (skill, content) = load(Some(&cfg), None, "release").unwrap();
+        let (skill, content) = load(Some(&cfg), None, "release", true).unwrap();
         assert_eq!(skill.name, "release");
         assert!(content.contains("Do the release."));
-        assert!(load(Some(&cfg), None, "../release").is_err());
-        assert!(load(Some(&cfg), None, "/tmp/SKILL.md").is_err());
+        assert!(load(Some(&cfg), None, "../release", true).is_err());
+        assert!(load(Some(&cfg), None, "/tmp/SKILL.md", true).is_err());
     }
 
     #[test]
@@ -493,7 +505,7 @@ mod tests {
             ),
         );
 
-        let catalog = command_catalog(Some(&cfg), None);
+        let catalog = command_catalog(Some(&cfg), None, true);
         let command = catalog
             .iter()
             .find(|command| command.name == "plugin:review")
@@ -516,11 +528,11 @@ mod tests {
         std::os::unix::fs::symlink(&outside, skill_dir.join("SKILL.md")).unwrap();
 
         assert!(
-            discover(Some(&cfg), None)
+            discover(Some(&cfg), None, true)
                 .iter()
                 .all(|skill| skill.name != "leak")
         );
-        assert!(load(Some(&cfg), None, "leak").is_err());
+        assert!(load(Some(&cfg), None, "leak", true).is_err());
     }
 
     #[test]
@@ -533,7 +545,7 @@ mod tests {
             "---\nname: review\ndescription: Review changes\n---\n\nInspect the diff first.",
         );
 
-        let catalog = command_catalog(None, Some(&repo));
+        let catalog = command_catalog(None, Some(&repo), true);
         let review = catalog
             .iter()
             .find(|command| command.name == "review")
@@ -541,32 +553,32 @@ mod tests {
         assert_eq!(review.description, "Review changes");
         assert_eq!(review.kind, CommandKind::Prompt);
         assert_eq!(review.usage, "/review");
-        let expanded = expand_invocation(None, Some(&repo), "/review focus on safety")
+        let expanded = expand_invocation(None, Some(&repo), "/review focus on safety", true)
             .unwrap()
             .unwrap();
         assert!(expanded.contains("Inspect the diff first."));
         assert!(expanded.contains("focus on safety"));
         assert_eq!(
-            expand_invocation(None, Some(&repo), "/vendor-command").unwrap(),
+            expand_invocation(None, Some(&repo), "/vendor-command", true).unwrap(),
             None
         );
-        let generic = expand_invocation(None, Some(&repo), "/skill review focus on tests")
+        let generic = expand_invocation(None, Some(&repo), "/skill review focus on tests", true)
             .unwrap()
             .unwrap();
         assert!(generic.contains("Inspect the diff first."));
         assert!(generic.contains("focus on tests"));
         assert!(
-            expand_invocation(None, Some(&repo), "  /review padded  ")
+            expand_invocation(None, Some(&repo), "  /review padded  ", true)
                 .unwrap()
                 .unwrap()
                 .contains("padded")
         );
-        assert!(expand_invocation(None, Some(&repo), "/skill missing").is_err());
+        assert!(expand_invocation(None, Some(&repo), "/skill missing", true).is_err());
     }
 
     #[test]
     fn builtins_are_loadable_and_explicit_only_skills_are_not_advertised() {
-        let skills = discover(None, None);
+        let skills = discover(None, None, true);
         let names: Vec<_> = skills.iter().map(|skill| skill.name.as_str()).collect();
         assert_eq!(
             names,
@@ -579,13 +591,13 @@ mod tests {
                 "verify",
             ]
         );
-        let (_, text) = load(None, None, "code-review").unwrap();
+        let (_, text) = load(None, None, "code-review", true).unwrap();
         assert!(text.contains("Report findings first"));
         let prompt = prompt_section(&skills).unwrap();
         assert!(prompt.contains("code-review"));
         assert!(!prompt.contains("**simplify**"));
         assert!(
-            command_catalog(None, None)
+            command_catalog(None, None, true)
                 .iter()
                 .any(|command| command.name == "simplify")
         );
@@ -600,16 +612,51 @@ mod tests {
             ".agents/skills/background",
             "---\nname: background\ndescription: Background guidance\nuser-invocable: false\n---\nbody",
         );
-        let skill = discover(None, Some(&repo))
+        let skill = discover(None, Some(&repo), true)
             .into_iter()
             .find(|skill| skill.name == "background")
             .unwrap();
         assert!(!skill.user_invocable);
         assert!(
-            command_catalog(None, Some(&repo))
+            command_catalog(None, Some(&repo), true)
                 .iter()
                 .all(|command| command.name != "background")
         );
-        assert!(expand_invocation(None, Some(&repo), "/background").is_err());
+        assert!(expand_invocation(None, Some(&repo), "/background", true).is_err());
+    }
+
+    #[test]
+    fn disabling_builtins_preserves_user_and_workspace_layers() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = tmp.path().join("cfg");
+        let repo = tmp.path().join("repo");
+        write_skill(
+            &cfg,
+            "skills/code-review",
+            "---\nname: code-review\ndescription: User review\n---\nUser rules.",
+        );
+        write_skill(
+            &repo,
+            ".agents/skills/release",
+            "---\nname: release\ndescription: Workspace release\n---\nRelease rules.",
+        );
+
+        let skills = discover(Some(&cfg), Some(&repo), false);
+        assert_eq!(skills.len(), 2);
+        assert_eq!(
+            skills
+                .iter()
+                .find(|skill| skill.name == "code-review")
+                .unwrap()
+                .origin,
+            "user"
+        );
+        assert!(skills.iter().any(|skill| skill.name == "release"));
+        assert!(load(None, None, "code-review", false).is_err());
+        assert!(
+            command_catalog(Some(&cfg), Some(&repo), false)
+                .iter()
+                .all(|command| command.name != "debug")
+        );
     }
 }

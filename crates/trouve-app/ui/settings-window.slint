@@ -317,6 +317,7 @@ export component SettingsScreen inherits Rectangle {
     // Allow list / Yolo (index i maps to permission-index i - 1).
     property <[string]> mode-permission-names: ["Global default", "Ask", "Allow list", "Yolo"];
     in property <string> settings-status: "";
+    in-out property <bool> builtin-skills-enabled: true;
 
     // Provider form state (prefilled by "Edit" or a preset).
     in-out property <string> form-id: "";
@@ -381,6 +382,7 @@ export component SettingsScreen inherits Rectangle {
     callback default-model-picked(/* model-index */ int, /* thinking-level */ string);
     // 0 ask, 1 allow-list, 2 yolo.
     callback default-permission-picked(int);
+    callback builtin-skills-toggled(bool);
     // Mode CRUD. mode-deleted covers both "Remove" (custom modes) and
     // "Reset to defaults" (customized built-ins) — both drop the user file.
     callback mode-saved(/* id */ string, /* display-name */ string,
@@ -504,12 +506,12 @@ export component SettingsScreen inherits Rectangle {
     property <int> mode-form-thinking-model-index: root.mode-form-model >= 0
         ? root.mode-form-model : root.default-model-index;
 
-    // Side-nav selection: 0 providers, 1 modes & models, 2 mcp servers,
-    // 3 integrations, 4 appearance, 5 notifications, 6 about. in-out so
-    // the app can open straight to a section (e.g. the
-    // PR tab's "set up GitHub" button).
+    // Side-nav selection: 0 providers, 1 modes & models, 2 skills,
+    // 3 mcp servers, 4 integrations, 5 appearance, 6 notifications,
+    // 7 about. in-out so the app can open straight to a section (e.g. the
+    // PR tab's "set up GitHub" button). Local models remain a Providers tab.
     in-out property <int> section: 0;
-    property <[string]> section-names: ["Providers", "Modes & Models", "MCP Servers", "Integrations", "Appearance", "Notifications", "About"];
+    property <[string]> section-names: ["Providers", "Modes & Models", "Skills", "MCP Servers", "Integrations", "Appearance", "Notifications", "About"];
 
     VerticalLayout {
         // Header: title + a way back to wherever the user came from.
@@ -1412,6 +1414,59 @@ export component SettingsScreen inherits Rectangle {
                             }
                         }
 
+                        // ---------------- skills ----------------
+                        if root.section == 2: VerticalLayout {
+                            spacing: 12px;
+
+                            Text {
+                                text: "Skills";
+                                color: Theme.c.text-hi;
+                                font-size: Theme.fs(16px);
+                                font-weight: 700;
+                            }
+                            Text {
+                                text: "Skills are reusable instruction workflows shared across API, local, and subscription providers. Trouve resolves user and workspace skills independently of its built-in baseline.";
+                                color: Theme.c.text-soft;
+                                font-size: Theme.fs(11px);
+                                wrap: word-wrap;
+                            }
+
+                            ToggleRow {
+                                on <=> root.builtin-skills-enabled;
+                                label: "Enable Trouve's built-in skills — advertise them to models, include their slash completions, and allow them to be loaded or explicitly invoked.";
+                                toggled(on) => { root.builtin-skills-toggled(on); }
+                            }
+
+                            Rectangle {
+                                background: Theme.c.surface;
+                                border-radius: 6px;
+                                details := VerticalLayout {
+                                    padding: 12px;
+                                    spacing: 6px;
+                                    Text {
+                                        text: "User and workspace skills stay enabled";
+                                        color: Theme.c.text-hi;
+                                        font-size: Theme.fs(13px);
+                                        font-weight: 700;
+                                    }
+                                    Text {
+                                        text: "Turning off built-ins does not hide skills from ~/.config/trouve/skills or .agents/skills. Existing slash catalogs update immediately; a turn already in progress may retain built-in instructions injected when it started.";
+                                        color: Theme.c.text-soft;
+                                        font-size: Theme.fs(11px);
+                                        wrap: word-wrap;
+                                    }
+                                }
+                                height: details.preferred-height;
+                            }
+
+                            if root.settings-status != "": Text {
+                                text: root.settings-status;
+                                color: Theme.c.accent-tint;
+                                font-size: Theme.fs(12px);
+                                wrap: word-wrap;
+                            }
+                        }
+
                         // ---------------- local models (Providers → Local) ----------------
                         if root.section == 0 && root.provider-tab == 2: VerticalLayout {
                             spacing: 12px;
@@ -1784,7 +1839,7 @@ export component SettingsScreen inherits Rectangle {
                         }
 
                         // ---------------- mcp servers ----------------
-                        if root.section == 2: VerticalLayout {
+                        if root.section == 3: VerticalLayout {
                             spacing: 12px;
 
                             HorizontalLayout {
@@ -2081,7 +2136,7 @@ export component SettingsScreen inherits Rectangle {
                         }
 
                         // ---------------- integrations ----------------
-                        if root.section == 3: VerticalLayout {
+                        if root.section == 4: VerticalLayout {
                             spacing: 12px;
 
                             Text {
@@ -2213,7 +2268,7 @@ export component SettingsScreen inherits Rectangle {
                         }
 
                         // ---------------- appearance ----------------
-                        if root.section == 4: VerticalLayout {
+                        if root.section == 5: VerticalLayout {
                             spacing: 12px;
 
                             Text {
@@ -2293,7 +2348,7 @@ export component SettingsScreen inherits Rectangle {
                         }
 
                         // ---------------- notifications ----------------
-                        if root.section == 5: VerticalLayout {
+                        if root.section == 6: VerticalLayout {
                             spacing: 12px;
 
                             Text {
@@ -2351,7 +2406,7 @@ export component SettingsScreen inherits Rectangle {
                         }
 
                         // ---------------- about ----------------
-                        if root.section == 6: VerticalLayout {
+                        if root.section == 7: VerticalLayout {
                             spacing: 12px;
 
                             Text {

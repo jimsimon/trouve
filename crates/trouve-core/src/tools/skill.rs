@@ -43,6 +43,7 @@ impl Tool for LoadSkill {
             ctx.config_dir.as_deref(),
             ctx.workspace_root.as_deref(),
             name,
+            ctx.builtin_skills_enabled,
         ) {
             Ok((skill, instructions)) => ToolResult::ok(json!({
                 "name": skill.name,
@@ -75,6 +76,8 @@ mod tests {
             worktree,
             config_dir: None,
             workspace_root: Some(repo),
+            builtin_skills_enabled: true,
+            ..ToolCtx::default()
         };
 
         let result = LoadSkill.run(&ctx, &json!({"name": "review"})).await;
@@ -86,5 +89,30 @@ mod tests {
                 .unwrap()
                 .contains("Check the diff.")
         );
+    }
+
+    #[tokio::test]
+    async fn disabled_builtins_cannot_be_loaded_but_workspace_skills_can() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(repo.join(".agents/skills/review")).unwrap();
+        std::fs::write(
+            repo.join(".agents/skills/review/SKILL.md"),
+            "---\nname: review\ndescription: Review changes\n---\n\nReview it.",
+        )
+        .unwrap();
+        let ctx = ToolCtx {
+            worktree: tmp.path().to_path_buf(),
+            config_dir: None,
+            workspace_root: Some(repo),
+            builtin_skills_enabled: false,
+            ..ToolCtx::default()
+        };
+
+        let builtin = LoadSkill.run(&ctx, &json!({"name": "code-review"})).await;
+        assert_eq!(builtin.status, trouve_protocol::ToolStatus::Error);
+
+        let workspace = LoadSkill.run(&ctx, &json!({"name": "review"})).await;
+        assert_eq!(workspace.status, trouve_protocol::ToolStatus::Ok);
     }
 }

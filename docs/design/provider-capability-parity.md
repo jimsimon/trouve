@@ -217,6 +217,13 @@ matter includes `name`, `description`, `argument-hint`,
 `disable-model-invocation`, and `user-invocable`. All selected built-ins are
 instruction-only so they work with the current canonical tool set.
 
+The built-in layer is enabled by default. Settings → Skills controls the
+global `builtin_skills_enabled` option. Disabling it removes compiled-in
+skills from every provider's model prompt, slash catalog, explicit invocation,
+and `load_skill` lookup while preserving user and workspace skills. Existing
+thread catalogs are republished immediately; turns already in progress may
+retain built-in instructions injected when they started.
+
 The following vendor-native categories are deliberately not built in yet:
 
 - vendor documentation assistants (`openai-docs`, `claude-api`), because
