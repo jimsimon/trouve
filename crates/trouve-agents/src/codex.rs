@@ -16,16 +16,17 @@
 //!   `item/commandExecution/requestApproval`, `item/fileChange/requestApproval`
 //!   answered with `{ decision: "accept" | "decline" }`
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::process::Stdio;
 use std::sync::Arc;
+use std::sync::Mutex as StdMutex;
 use std::sync::atomic::{AtomicI64, Ordering};
 
 use futures::StreamExt;
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin};
-use tokio::sync::{Mutex, mpsc, oneshot};
+use tokio::sync::{Mutex, oneshot};
 use trouve_protocol::{ModelInfo, Usage};
 use trouve_providers::codex::completed_reasoning_text;
 
@@ -415,7 +416,7 @@ fn thread_id_of(result: &Value) -> Result<String, BackendError> {
 fn turn_stream(
     server: Arc<AppServer>,
     codex_thread_id: String,
-    mut route: mpsc::Receiver<ServerMsg>,
+    mut route: RouteReceiver,
     fresh_session: bool,
     model_name: String,
     observed_windows: Arc<std::sync::Mutex<HashMap<String, u64>>>,
@@ -626,7 +627,7 @@ fn turn_stream(
             };
             let _ = tx.send(Err(BackendError::Protocol(reason.into()))).await;
         }
-        server.unsubscribe(&codex_thread_id).await;
+        server.unsubscribe(&codex_thread_id, route.mailbox()).await;
     })
 }
 
@@ -774,9 +775,225 @@ enum ServerMsg {
 }
 
 type Pending = Arc<Mutex<HashMap<i64, oneshot::Sender<Result<Value, String>>>>>;
-type Routes = Arc<Mutex<HashMap<String, mpsc::Sender<ServerMsg>>>>;
+type Routes = Arc<Mutex<HashMap<String, Arc<RouteMailbox>>>>;
 type Buffered = Arc<Mutex<HashMap<String, Vec<ServerMsg>>>>;
-const ROUTE_CAPACITY: usize = 256;
+const ROUTE_CAPACITY: usize = 1024;
+const ROUTE_BYTE_CAPACITY: usize = 4 * 1024 * 1024;
+
+#[derive(Default)]
+struct RouteStats {
+    messages: u64,
+    waits: u64,
+    peak_messages: usize,
+    peak_bytes: usize,
+}
+
+#[derive(Default)]
+struct RouteMailboxState {
+    queue: VecDeque<(ServerMsg, usize)>,
+    bytes: usize,
+    closed: bool,
+    receiver_closed: bool,
+    logged: bool,
+    stats: RouteStats,
+}
+
+/// A per-turn, count-and-byte-bounded mailbox. Unlike a plain bounded mpsc,
+/// saturation applies backpressure instead of deleting the route (and with it
+/// the eventual `turn/completed` notification).
+struct RouteMailbox {
+    thread_id: String,
+    state: StdMutex<RouteMailboxState>,
+    data: tokio::sync::Notify,
+    space: tokio::sync::Notify,
+}
+
+enum RouteEnqueue {
+    Sent,
+    Closed,
+    Wait,
+}
+
+enum RouteDequeue {
+    Message(ServerMsg),
+    Closed,
+    Wait,
+}
+
+impl RouteMailbox {
+    fn new(thread_id: String) -> Self {
+        Self {
+            thread_id,
+            state: StdMutex::new(RouteMailboxState::default()),
+            data: tokio::sync::Notify::new(),
+            space: tokio::sync::Notify::new(),
+        }
+    }
+
+    fn try_send(&self, msg: &mut Option<ServerMsg>, bytes: usize, delta: bool) -> RouteEnqueue {
+        let mut state = self.state.lock().unwrap();
+        if state.closed || state.receiver_closed {
+            return RouteEnqueue::Closed;
+        }
+        let has_item_capacity = state.queue.len() < ROUTE_CAPACITY;
+        let has_byte_capacity = state.bytes.saturating_add(bytes) <= ROUTE_BYTE_CAPACITY;
+        let single_oversize = state.queue.is_empty() && bytes > ROUTE_BYTE_CAPACITY;
+        if (has_item_capacity && has_byte_capacity) || single_oversize {
+            state
+                .queue
+                .push_back((msg.take().expect("message remains while enqueueing"), bytes));
+            state.bytes += bytes;
+            state.stats.messages += 1;
+            state.stats.peak_messages = state.stats.peak_messages.max(state.queue.len());
+            state.stats.peak_bytes = state.stats.peak_bytes.max(state.bytes);
+            return RouteEnqueue::Sent;
+        }
+
+        state.stats.waits += 1;
+        if state.stats.waits == 1 || state.stats.waits.is_power_of_two() {
+            let limit = match (has_item_capacity, has_byte_capacity) {
+                (false, false) => "messages+bytes",
+                (false, true) => "messages",
+                (true, false) => "bytes",
+                (true, true) => unreachable!("capacity branch returned above"),
+            };
+            tracing::warn!(
+                thread_id = self.thread_id,
+                delta,
+                limit,
+                queued_messages = state.queue.len(),
+                queued_bytes = state.bytes,
+                max_messages = ROUTE_CAPACITY,
+                max_bytes = ROUTE_BYTE_CAPACITY,
+                waits = state.stats.waits,
+                "codex route mailbox applying backpressure"
+            );
+        }
+        RouteEnqueue::Wait
+    }
+
+    fn try_recv(&self) -> RouteDequeue {
+        let mut state = self.state.lock().unwrap();
+        if let Some((msg, bytes)) = state.queue.pop_front() {
+            state.bytes = state.bytes.saturating_sub(bytes);
+            return RouteDequeue::Message(msg);
+        }
+        if state.closed {
+            RouteDequeue::Closed
+        } else {
+            RouteDequeue::Wait
+        }
+    }
+
+    async fn send(&self, msg: ServerMsg) -> Result<(), ()> {
+        let bytes = msg.approx_bytes();
+        let delta = msg.is_delta();
+        let mut msg = Some(msg);
+        loop {
+            let space = self.space.notified();
+            match self.try_send(&mut msg, bytes, delta) {
+                RouteEnqueue::Sent => {
+                    self.data.notify_one();
+                    return Ok(());
+                }
+                RouteEnqueue::Closed => return Err(()),
+                RouteEnqueue::Wait => space.await,
+            }
+        }
+    }
+
+    fn close(&self, reason: &'static str) {
+        let mut state = self.state.lock().unwrap();
+        state.closed = true;
+        if !state.logged {
+            state.logged = true;
+            tracing::debug!(
+                thread_id = self.thread_id,
+                reason,
+                messages = state.stats.messages,
+                waits = state.stats.waits,
+                peak_messages = state.stats.peak_messages,
+                peak_bytes = state.stats.peak_bytes,
+                "codex route mailbox closed"
+            );
+        }
+        drop(state);
+        self.data.notify_waiters();
+        self.space.notify_waiters();
+    }
+}
+
+struct RouteReceiver {
+    mailbox: Arc<RouteMailbox>,
+}
+
+impl RouteReceiver {
+    fn new(mailbox: Arc<RouteMailbox>) -> Self {
+        Self { mailbox }
+    }
+
+    fn mailbox(&self) -> &Arc<RouteMailbox> {
+        &self.mailbox
+    }
+
+    async fn recv(&mut self) -> Option<ServerMsg> {
+        loop {
+            let data = self.mailbox.data.notified();
+            match self.mailbox.try_recv() {
+                RouteDequeue::Message(msg) => {
+                    self.mailbox.space.notify_waiters();
+                    return Some(msg);
+                }
+                RouteDequeue::Closed => return None,
+                RouteDequeue::Wait => data.await,
+            }
+        }
+    }
+}
+
+impl Drop for RouteReceiver {
+    fn drop(&mut self) {
+        let mut state = self.mailbox.state.lock().unwrap();
+        state.receiver_closed = true;
+        state.queue.clear();
+        state.bytes = 0;
+        drop(state);
+        self.mailbox.space.notify_waiters();
+    }
+}
+
+impl ServerMsg {
+    fn method(&self) -> &str {
+        match self {
+            Self::Notification { method, .. } | Self::Request { method, .. } => method,
+        }
+    }
+
+    fn params(&self) -> &Value {
+        match self {
+            Self::Notification { params, .. } | Self::Request { params, .. } => params,
+        }
+    }
+
+    fn is_delta(&self) -> bool {
+        matches!(
+            self.method(),
+            "item/agentMessage/delta"
+                | "item/reasoning/summaryTextDelta"
+                | "item/reasoning/textDelta"
+                | "item/commandExecution/outputDelta"
+                | "thread/tokenUsage/updated"
+        )
+    }
+
+    fn approx_bytes(&self) -> usize {
+        let id_bytes = match self {
+            Self::Request { id, .. } => id.to_string().len(),
+            Self::Notification { .. } => 0,
+        };
+        self.method().len() + self.params().to_string().len() + id_bytes
+    }
+}
 
 async fn close_transport(
     pending: &Pending,
@@ -788,7 +1005,15 @@ async fn close_transport(
     // transport while its abandoned waiters are being drained.
     closed.store(true, Ordering::Relaxed);
     pending.lock().await.clear();
-    routes.lock().await.clear();
+    let mailboxes: Vec<_> = routes
+        .lock()
+        .await
+        .drain()
+        .map(|(_, route)| route)
+        .collect();
+    for mailbox in mailboxes {
+        mailbox.close("app-server transport closed");
+    }
     buffered.lock().await.clear();
 }
 
@@ -844,35 +1069,27 @@ async fn read_stdout<R: AsyncRead + Unpin>(
                 routes.get(&thread_id).cloned()
             };
             match routed {
-                Some(tx) => match tx.try_send(m) {
-                    Ok(()) => {
+                Some(mailbox) => {
+                    if mailbox.send(m).await.is_ok() {
                         failed_routes.remove(&thread_id);
-                    }
-                    Err(error) => {
-                        // The stdout reader is shared by every Codex turn. A
-                        // stalled route must fail independently rather than
-                        // applying backpressure that wedges all turns and
-                        // prevents this task from ever observing EOF.
+                    } else {
                         tracing::warn!(
-                            "codex: dropping {thread_id} event route: {}",
-                            match error {
-                                mpsc::error::TrySendError::Full(_) => "route buffer is full",
-                                mpsc::error::TrySendError::Closed(_) => "route receiver is closed",
-                            }
+                            thread_id,
+                            "codex route receiver closed while the app-server was still emitting"
                         );
                         let mut routes = routes.lock().await;
                         if routes
                             .get(&thread_id)
-                            .is_some_and(|active| active.same_channel(&tx))
+                            .is_some_and(|active| Arc::ptr_eq(active, &mailbox))
                         {
                             routes.remove(&thread_id);
                         }
-                        // Do not reinterpret later events from this failed
+                        // Do not reinterpret later events from this abandoned
                         // turn as pre-subscription events. A future route for
                         // the same thread clears this marker on delivery.
                         failed_routes.insert(thread_id);
                     }
-                },
+                }
                 // No subscriber yet: buffer for a thread id we've seen named
                 // (skip the empty catch-all) so nothing emitted between
                 // thread/start and subscribe is lost.
@@ -993,24 +1210,43 @@ impl AppServer {
         stdin.flush().await.map_err(BackendError::Io)
     }
 
-    async fn subscribe(&self, thread_id: &str) -> mpsc::Receiver<ServerMsg> {
-        let (tx, rx) = mpsc::channel(ROUTE_CAPACITY);
-        self.routes
+    async fn subscribe(&self, thread_id: &str) -> RouteReceiver {
+        let mailbox = Arc::new(RouteMailbox::new(thread_id.to_string()));
+        if let Some(previous) = self
+            .routes
             .lock()
             .await
-            .insert(thread_id.to_string(), tx.clone());
+            .insert(thread_id.to_string(), Arc::clone(&mailbox))
+        {
+            previous.close("route replaced");
+        }
         // Flush anything the reader buffered for this thread before we
         // subscribed (notifications emitted right after thread/start).
         if let Some(msgs) = self.buffered.lock().await.remove(thread_id) {
             for m in msgs {
-                let _ = tx.send(m).await;
+                if mailbox.send(m).await.is_err() {
+                    break;
+                }
             }
         }
-        rx
+        RouteReceiver::new(mailbox)
     }
 
-    async fn unsubscribe(&self, thread_id: &str) {
-        self.routes.lock().await.remove(thread_id);
+    async fn unsubscribe(&self, thread_id: &str, mailbox: &Arc<RouteMailbox>) {
+        let removed = {
+            let mut routes = self.routes.lock().await;
+            if routes
+                .get(thread_id)
+                .is_some_and(|active| Arc::ptr_eq(active, mailbox))
+            {
+                routes.remove(thread_id)
+            } else {
+                None
+            }
+        };
+        if let Some(mailbox) = removed {
+            mailbox.close("turn unsubscribed");
+        }
         self.buffered.lock().await.remove(thread_id);
     }
 }
@@ -1096,8 +1332,9 @@ mod tests {
         let closed = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let (request_tx, request_rx) = oneshot::channel();
         pending.lock().await.insert(1, request_tx);
-        let (route_tx, mut route_rx) = mpsc::channel(1);
-        routes.lock().await.insert("thread-1".into(), route_tx);
+        let mailbox = Arc::new(RouteMailbox::new("thread-1".into()));
+        let mut route_rx = RouteReceiver::new(Arc::clone(&mailbox));
+        routes.lock().await.insert("thread-1".into(), mailbox);
 
         let (mut writer, reader) = tokio::io::duplex(16);
         let task = tokio::spawn(read_stdout(
@@ -1129,22 +1366,20 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn full_turn_route_does_not_block_stdout_eof_cleanup() {
-        let deadline = std::time::Duration::from_secs(1);
+    async fn saturated_turn_route_backpressures_without_dropping_messages() {
+        let deadline = std::time::Duration::from_secs(5);
         let pending: Pending = Arc::new(Mutex::new(HashMap::new()));
         let routes: Routes = Arc::new(Mutex::new(HashMap::new()));
         let buffered: Buffered = Arc::new(Mutex::new(HashMap::new()));
         let closed = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let (route_tx, mut route_rx) = mpsc::channel(1);
-        route_tx
-            .try_send(ServerMsg::Notification {
-                method: "already/queued".into(),
-                params: json!({}),
-            })
-            .unwrap();
-        routes.lock().await.insert("thread-1".into(), route_tx);
+        let mailbox = Arc::new(RouteMailbox::new("thread-1".into()));
+        let mut route_rx = RouteReceiver::new(Arc::clone(&mailbox));
+        routes
+            .lock()
+            .await
+            .insert("thread-1".into(), Arc::clone(&mailbox));
 
-        let (mut writer, reader) = tokio::io::duplex(256);
+        let (mut writer, reader) = tokio::io::duplex(256 * 1024);
         let task = tokio::spawn(read_stdout(
             reader,
             pending.clone(),
@@ -1152,17 +1387,64 @@ mod tests {
             buffered.clone(),
             closed.clone(),
         ));
-        writer
-            .write_all(
-                br#"{"jsonrpc":"2.0","method":"item/agentMessage/delta","params":{"threadId":"thread-1","delta":"blocked"}}
-"#,
-            )
+        const MESSAGES: usize = 10_000;
+        let producer = tokio::spawn(async move {
+            for i in 0..MESSAGES {
+                let line = json!({
+                    "jsonrpc": "2.0",
+                    "method": "item/agentMessage/delta",
+                    "params": { "threadId": "thread-1", "delta": i.to_string() },
+                });
+                writer.write_all(line.to_string().as_bytes()).await.unwrap();
+                writer.write_all(b"\n").await.unwrap();
+            }
+            let completed = json!({
+                "jsonrpc": "2.0",
+                "method": "turn/completed",
+                "params": {
+                    "threadId": "thread-1",
+                    "turn": { "status": "completed" },
+                },
+            });
+            writer
+                .write_all(completed.to_string().as_bytes())
+                .await
+                .unwrap();
+            writer.write_all(b"\n").await.unwrap();
+            writer.shutdown().await.unwrap();
+        });
+
+        tokio::time::timeout(deadline, async {
+            loop {
+                if mailbox.state.lock().unwrap().queue.len() == ROUTE_CAPACITY {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("test producer should saturate the route");
+
+        for expected in 0..MESSAGES {
+            let message = tokio::time::timeout(deadline, route_rx.recv())
+                .await
+                .expect("route should keep making progress")
+                .expect("route must remain open until stdout EOF");
+            assert_eq!(message.method(), "item/agentMessage/delta");
+            assert_eq!(message.params()["delta"], expected.to_string());
+            if expected % 64 == 0 {
+                tokio::task::yield_now().await;
+            }
+        }
+        let completed = tokio::time::timeout(deadline, route_rx.recv())
             .await
-            .unwrap();
-        writer.shutdown().await.unwrap();
+            .expect("terminal message should keep making progress")
+            .expect("terminal message must not be dropped");
+        assert_eq!(completed.method(), "turn/completed");
+        producer.await.unwrap();
         tokio::time::timeout(deadline, task)
             .await
-            .expect("route backpressure must not block EOF cleanup")
+            .expect("reader should observe EOF after draining backpressure")
             .unwrap();
 
         assert!(closed.load(Ordering::Relaxed));
@@ -1171,15 +1453,14 @@ mod tests {
         assert!(
             tokio::time::timeout(deadline, route_rx.recv())
                 .await
-                .expect("pre-existing route event should remain available")
-                .is_some()
-        );
-        assert!(
-            tokio::time::timeout(deadline, route_rx.recv())
-                .await
-                .expect("saturated route should close")
+                .expect("closed route should resolve")
                 .is_none()
         );
+        let state = mailbox.state.lock().unwrap();
+        let stats = &state.stats;
+        assert!(stats.waits > 0);
+        assert!(stats.peak_messages <= ROUTE_CAPACITY);
+        assert!(stats.peak_bytes <= ROUTE_BYTE_CAPACITY);
     }
 
     #[test]

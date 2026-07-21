@@ -16,6 +16,7 @@ pub mod openai_compat;
 pub mod secrets;
 pub(crate) mod sse;
 
+use futures::StreamExt;
 use futures::stream::BoxStream;
 use serde::{Deserialize, Serialize};
 use trouve_protocol::Usage;
@@ -100,6 +101,88 @@ pub enum ProviderError {
 
 pub type EventStream = BoxStream<'static, Result<ProviderEvent, ProviderError>>;
 
+const PROVIDER_DELTA_WINDOW: std::time::Duration = std::time::Duration::from_millis(16);
+const PROVIDER_DELTA_MAX_BYTES: usize = 64 * 1024;
+
+struct CoalescingProviderStream {
+    stream: EventStream,
+    pending: Option<Result<ProviderEvent, ProviderError>>,
+}
+
+/// Normalize transport-selected text chunking for every native provider.
+/// Adjacent text/thinking fragments are losslessly concatenated for a short
+/// window; control events keep their order and are never combined.
+pub fn coalesce_event_stream(stream: EventStream) -> EventStream {
+    Box::pin(futures::stream::unfold(
+        CoalescingProviderStream {
+            stream,
+            pending: None,
+        },
+        |mut state| async move {
+            let mut event = match state.pending.take() {
+                Some(event) => event,
+                None => state.stream.next().await?,
+            };
+            let mut fragments = 1_u64;
+            let started = std::time::Instant::now();
+            if provider_event_delta_len(&event).is_some_and(|len| len < PROVIDER_DELTA_MAX_BYTES) {
+                let deadline = tokio::time::Instant::now() + PROVIDER_DELTA_WINDOW;
+                loop {
+                    let next = match tokio::time::timeout_at(deadline, state.stream.next()).await {
+                        Ok(Some(next)) => next,
+                        Ok(None) | Err(_) => break,
+                    };
+                    match merge_provider_event(&mut event, next) {
+                        Ok(()) => fragments += 1,
+                        Err(next) => {
+                            state.pending = Some(next);
+                            break;
+                        }
+                    }
+                }
+            }
+            if fragments > 1 {
+                tracing::trace!(
+                    input_fragments = fragments,
+                    output_events = 1,
+                    output_bytes = provider_event_delta_len(&event).unwrap_or_default(),
+                    elapsed_us = started.elapsed().as_micros(),
+                    "native provider deltas coalesced"
+                );
+            }
+            Some((event, state))
+        },
+    ))
+}
+
+fn provider_event_delta_len(event: &Result<ProviderEvent, ProviderError>) -> Option<usize> {
+    match event {
+        Ok(ProviderEvent::TextDelta(text) | ProviderEvent::ThinkingDelta(text)) => Some(text.len()),
+        _ => None,
+    }
+}
+
+fn merge_provider_event(
+    existing: &mut Result<ProviderEvent, ProviderError>,
+    incoming: Result<ProviderEvent, ProviderError>,
+) -> Result<(), Result<ProviderEvent, ProviderError>> {
+    match (&mut *existing, incoming) {
+        (Ok(ProviderEvent::TextDelta(current)), Ok(ProviderEvent::TextDelta(next)))
+            if current.len().saturating_add(next.len()) <= PROVIDER_DELTA_MAX_BYTES =>
+        {
+            current.push_str(&next);
+            Ok(())
+        }
+        (Ok(ProviderEvent::ThinkingDelta(current)), Ok(ProviderEvent::ThinkingDelta(next)))
+            if current.len().saturating_add(next.len()) <= PROVIDER_DELTA_MAX_BYTES =>
+        {
+            current.push_str(&next);
+            Ok(())
+        }
+        (_, incoming) => Err(incoming),
+    }
+}
+
 #[async_trait::async_trait]
 pub trait Provider: Send + Sync {
     /// Stable identifier used as the prefix of model ids ("openai/gpt-4.1").
@@ -127,4 +210,26 @@ pub trait Provider: Send + Sync {
         tools: &[ToolSpec],
         options: &serde_json::Map<String, serde_json::Value>,
     ) -> Result<EventStream, ProviderError>;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn native_provider_deltas_are_coalesced_without_crossing_boundaries() {
+        let source: EventStream = Box::pin(futures::stream::iter(vec![
+            Ok(ProviderEvent::TextDelta("a".into())),
+            Ok(ProviderEvent::TextDelta("b".into())),
+            Ok(ProviderEvent::ThinkingDelta("c".into())),
+            Ok(ProviderEvent::ThinkingDelta("d".into())),
+            Ok(ProviderEvent::Completed {
+                usage: Usage::default(),
+            }),
+        ]));
+        let events: Vec<_> = coalesce_event_stream(source).collect().await;
+        assert!(matches!(&events[0], Ok(ProviderEvent::TextDelta(text)) if text == "ab"));
+        assert!(matches!(&events[1], Ok(ProviderEvent::ThinkingDelta(text)) if text == "cd"));
+        assert!(matches!(&events[2], Ok(ProviderEvent::Completed { .. })));
+    }
 }

@@ -15,7 +15,10 @@ pub mod cursor;
 pub mod install;
 mod login;
 
+use std::collections::VecDeque;
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use futures::future::BoxFuture;
 use futures::stream::BoxStream;
@@ -275,16 +278,353 @@ pub(crate) fn binary_on_path(command: &str) -> bool {
     std::env::split_paths(&path).any(|dir| dir.join(command).is_file())
 }
 
-/// Spawn a task producing events into a channel and expose it as a stream.
+const BACKEND_STREAM_CAPACITY: usize = 64;
+const BACKEND_BUFFER_MAX_ITEMS: usize = 1024;
+const BACKEND_BUFFER_MAX_BYTES: usize = 4 * 1024 * 1024;
+const COALESCED_CHUNK_MAX_BYTES: usize = 64 * 1024;
+const TEXT_COALESCE_WINDOW: Duration = Duration::from_millis(16);
+const TOOL_OUTPUT_COALESCE_WINDOW: Duration = Duration::from_millis(50);
+
+/// Provider-neutral sender for vendor backend events. Delta boundaries are a
+/// transport detail, so adjacent text, thinking, and same-call tool-output
+/// fragments are combined before they reach core. Control events retain their
+/// exact order and backpressure behind earlier deltas instead of being lost.
+pub(crate) struct BackendEventSender {
+    buffer: Arc<BackendEventBuffer>,
+}
+
+struct BufferedBackendEvent {
+    item: Result<BackendEvent, BackendError>,
+    bytes: usize,
+    ready_at: Instant,
+}
+
+#[derive(Default)]
+struct BackendBufferStats {
+    input_events: u64,
+    emitted_events: u64,
+    coalesced_events: u64,
+    waits: u64,
+    peak_items: usize,
+    peak_bytes: usize,
+}
+
+#[derive(Default)]
+struct BackendEventBufferState {
+    queue: VecDeque<BufferedBackendEvent>,
+    bytes: usize,
+    input_closed: bool,
+    output_closed: bool,
+    stats: BackendBufferStats,
+}
+
+struct BackendEventBuffer {
+    state: Mutex<BackendEventBufferState>,
+    data: tokio::sync::Notify,
+    space: tokio::sync::Notify,
+}
+
+enum BackendEnqueue {
+    Sent,
+    Closed,
+    Wait,
+}
+
+impl BackendEventBuffer {
+    fn new() -> Self {
+        Self {
+            state: Mutex::new(BackendEventBufferState::default()),
+            data: tokio::sync::Notify::new(),
+            space: tokio::sync::Notify::new(),
+        }
+    }
+
+    fn close_input(&self) {
+        self.state.lock().unwrap().input_closed = true;
+        self.data.notify_waiters();
+    }
+
+    fn close_output(&self) {
+        let mut state = self.state.lock().unwrap();
+        state.output_closed = true;
+        state.queue.clear();
+        state.bytes = 0;
+        drop(state);
+        self.space.notify_waiters();
+    }
+
+    fn try_enqueue(
+        &self,
+        item: &mut Option<Result<BackendEvent, BackendError>>,
+        counted: &mut bool,
+    ) -> BackendEnqueue {
+        let mut state = self.state.lock().unwrap();
+        if state.output_closed {
+            return BackendEnqueue::Closed;
+        }
+        if !*counted {
+            state.stats.input_events += 1;
+            *counted = true;
+        }
+
+        let pending = item.as_ref().expect("event remains while enqueueing");
+        let bytes = backend_event_size(pending);
+        let window = backend_event_window(pending);
+        let has_byte_capacity = state.bytes.saturating_add(bytes) <= BACKEND_BUFFER_MAX_BYTES;
+
+        // Merging does not consume another item slot, so permit it even when
+        // the count limit is reached. The byte check is conservative for
+        // same-call tool output because it counts the repeated call id.
+        if has_byte_capacity && let Some(back) = state.queue.back_mut() {
+            let incoming = item.take().expect("event remains while enqueueing");
+            match merge_backend_event(&mut back.item, incoming) {
+                BackendMerge::Merged(added) => {
+                    back.bytes += added;
+                    state.bytes += added;
+                    state.stats.coalesced_events += 1;
+                    state.stats.peak_bytes = state.stats.peak_bytes.max(state.bytes);
+                    return BackendEnqueue::Sent;
+                }
+                BackendMerge::Separate(incoming) => *item = Some(incoming),
+            }
+        }
+
+        let has_item_capacity = state.queue.len() < BACKEND_BUFFER_MAX_ITEMS;
+        let single_oversize = state.queue.is_empty() && bytes > BACKEND_BUFFER_MAX_BYTES;
+        if (has_item_capacity && has_byte_capacity) || single_oversize {
+            state.queue.push_back(BufferedBackendEvent {
+                item: item.take().expect("event remains while enqueueing"),
+                bytes,
+                ready_at: Instant::now() + window.unwrap_or(Duration::ZERO),
+            });
+            state.bytes += bytes;
+            state.stats.peak_items = state.stats.peak_items.max(state.queue.len());
+            state.stats.peak_bytes = state.stats.peak_bytes.max(state.bytes);
+            return BackendEnqueue::Sent;
+        }
+
+        state.stats.waits += 1;
+        if state.stats.waits == 1 || state.stats.waits.is_power_of_two() {
+            let limit = match (has_item_capacity, has_byte_capacity) {
+                (false, false) => "items+bytes",
+                (false, true) => "items",
+                (true, false) => "bytes",
+                (true, true) => unreachable!("capacity branch returned above"),
+            };
+            tracing::warn!(
+                limit,
+                buffered_items = state.queue.len(),
+                buffered_bytes = state.bytes,
+                max_items = BACKEND_BUFFER_MAX_ITEMS,
+                max_bytes = BACKEND_BUFFER_MAX_BYTES,
+                waits = state.stats.waits,
+                "backend event coalescer applying backpressure"
+            );
+        }
+        BackendEnqueue::Wait
+    }
+}
+
+impl BackendEventSender {
+    pub(crate) async fn send(&self, item: Result<BackendEvent, BackendError>) -> Result<(), ()> {
+        let mut item = Some(item);
+        let mut counted = false;
+        loop {
+            // Register before inspecting state so a concurrent dequeue cannot
+            // race between the capacity check and waiting for its wakeup.
+            let space = self.buffer.space.notified();
+            match self.buffer.try_enqueue(&mut item, &mut counted) {
+                BackendEnqueue::Sent => {
+                    self.buffer.data.notify_one();
+                    return Ok(());
+                }
+                BackendEnqueue::Closed => return Err(()),
+                BackendEnqueue::Wait => space.await,
+            }
+        }
+    }
+}
+
+impl Drop for BackendEventSender {
+    fn drop(&mut self) {
+        self.buffer.close_input();
+    }
+}
+
+enum BackendMerge {
+    Merged(usize),
+    Separate(Result<BackendEvent, BackendError>),
+}
+
+fn merge_backend_event(
+    existing: &mut Result<BackendEvent, BackendError>,
+    incoming: Result<BackendEvent, BackendError>,
+) -> BackendMerge {
+    match (&mut *existing, incoming) {
+        (Ok(BackendEvent::TextDelta(current)), Ok(BackendEvent::TextDelta(next)))
+            if current.len().saturating_add(next.len()) <= COALESCED_CHUNK_MAX_BYTES =>
+        {
+            let added = next.len();
+            current.push_str(&next);
+            BackendMerge::Merged(added)
+        }
+        (Ok(BackendEvent::ThinkingDelta(current)), Ok(BackendEvent::ThinkingDelta(next)))
+            if current.len().saturating_add(next.len()) <= COALESCED_CHUNK_MAX_BYTES =>
+        {
+            let added = next.len();
+            current.push_str(&next);
+            BackendMerge::Merged(added)
+        }
+        (
+            Ok(BackendEvent::ToolOutput {
+                call_id: current_id,
+                chunk: current,
+            }),
+            Ok(BackendEvent::ToolOutput {
+                call_id: next_id,
+                chunk: next,
+            }),
+        ) if current_id == &next_id
+            && current.len().saturating_add(next.len()) <= COALESCED_CHUNK_MAX_BYTES =>
+        {
+            let added = next.len();
+            current.push_str(&next);
+            BackendMerge::Merged(added)
+        }
+        (_, incoming) => BackendMerge::Separate(incoming),
+    }
+}
+
+fn backend_event_window(event: &Result<BackendEvent, BackendError>) -> Option<Duration> {
+    match event {
+        Ok(BackendEvent::TextDelta(text) | BackendEvent::ThinkingDelta(text))
+            if text.len() < COALESCED_CHUNK_MAX_BYTES =>
+        {
+            Some(TEXT_COALESCE_WINDOW)
+        }
+        Ok(BackendEvent::ToolOutput { chunk, .. }) if chunk.len() < COALESCED_CHUNK_MAX_BYTES => {
+            Some(TOOL_OUTPUT_COALESCE_WINDOW)
+        }
+        _ => None,
+    }
+}
+
+fn backend_event_size(event: &Result<BackendEvent, BackendError>) -> usize {
+    match event {
+        Ok(BackendEvent::SessionStarted { session_id }) => session_id.len(),
+        Ok(BackendEvent::TextDelta(text) | BackendEvent::ThinkingDelta(text)) => text.len(),
+        Ok(BackendEvent::ToolStarted {
+            call_id,
+            tool,
+            args,
+        }) => call_id.len() + tool.len() + args.to_string().len(),
+        Ok(BackendEvent::ToolOutput { call_id, chunk }) => call_id.len() + chunk.len(),
+        Ok(BackendEvent::ToolCompleted {
+            call_id, result, ..
+        }) => call_id.len() + result.to_string().len(),
+        Ok(BackendEvent::ApprovalNeeded {
+            call_id,
+            tool,
+            args,
+            ..
+        }) => call_id.len() + tool.len() + args.to_string().len(),
+        Ok(BackendEvent::QuestionsNeeded {
+            request_id,
+            title,
+            questions,
+            ..
+        }) => {
+            request_id.len()
+                + title.as_ref().map_or(0, String::len)
+                + serde_json::to_string(questions).map_or(0, |json| json.len())
+        }
+        Ok(BackendEvent::CommandsUpdated { commands }) => {
+            serde_json::to_string(commands).map_or(0, |json| json.len())
+        }
+        Ok(BackendEvent::Completed { .. }) => std::mem::size_of::<Usage>(),
+        Err(error) => error.to_string().len(),
+    }
+}
+
+async fn pump_backend_events(
+    buffer: Arc<BackendEventBuffer>,
+    tx: tokio::sync::mpsc::Sender<Result<BackendEvent, BackendError>>,
+) {
+    enum Action {
+        Send(Result<BackendEvent, BackendError>),
+        Wait,
+        WaitUntil(Instant),
+        Done,
+    }
+
+    loop {
+        let notified = buffer.data.notified();
+        let action = {
+            let mut state = buffer.state.lock().unwrap();
+            let now = Instant::now();
+            match state.queue.front() {
+                Some(front) if state.queue.len() > 1 || front.ready_at <= now => {
+                    let event = state.queue.pop_front().expect("front exists");
+                    state.bytes = state.bytes.saturating_sub(event.bytes);
+                    state.stats.emitted_events += 1;
+                    Action::Send(event.item)
+                }
+                Some(front) => Action::WaitUntil(front.ready_at),
+                None if state.input_closed => Action::Done,
+                None => Action::Wait,
+            }
+        };
+
+        match action {
+            Action::Send(item) => {
+                buffer.space.notify_waiters();
+                if tx.send(item).await.is_err() {
+                    buffer.close_output();
+                    break;
+                }
+            }
+            Action::Wait => notified.await,
+            Action::WaitUntil(deadline) => {
+                tokio::select! {
+                    _ = notified => {}
+                    _ = tokio::time::sleep_until(deadline.into()) => {}
+                }
+            }
+            Action::Done => break,
+        }
+    }
+
+    let state = buffer.state.lock().unwrap();
+    tracing::debug!(
+        input_events = state.stats.input_events,
+        emitted_events = state.stats.emitted_events,
+        coalesced_events = state.stats.coalesced_events,
+        peak_items = state.stats.peak_items,
+        peak_bytes = state.stats.peak_bytes,
+        waits = state.stats.waits,
+        "backend event stream drained"
+    );
+}
+
+/// Spawn a task producing events and expose a provider-neutral coalesced
+/// stream. The intermediate buffer is count-and-byte-bounded, retains all
+/// events, and combines only transport-fragment deltas whose concatenation is
+/// semantically identical. One indivisible event larger than the byte budget
+/// is admitted only while the queue is otherwise empty.
 pub(crate) fn async_stream<F, Fut>(
     f: F,
 ) -> impl futures::Stream<Item = Result<BackendEvent, BackendError>>
 where
-    F: FnOnce(tokio::sync::mpsc::Sender<Result<BackendEvent, BackendError>>) -> Fut,
+    F: FnOnce(BackendEventSender) -> Fut,
     Fut: std::future::Future<Output = ()> + Send + 'static,
 {
-    let (tx, mut rx) = tokio::sync::mpsc::channel(64);
-    tokio::spawn(f(tx));
+    let buffer = Arc::new(BackendEventBuffer::new());
+    let sender = BackendEventSender {
+        buffer: Arc::clone(&buffer),
+    };
+    let (tx, mut rx) = tokio::sync::mpsc::channel(BACKEND_STREAM_CAPACITY);
+    tokio::spawn(pump_backend_events(buffer, tx));
+    tokio::spawn(f(sender));
     futures::stream::poll_fn(move |cx| rx.poll_recv(cx))
 }
 
@@ -324,5 +664,101 @@ pub(crate) fn model(backend_id: &str, name: &str, display: &str, context_window:
         input_price_per_mtok: None,
         output_price_per_mtok: None,
         options_schema: empty_schema(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use futures::StreamExt;
+
+    use super::*;
+
+    #[tokio::test]
+    async fn coalesces_delta_kinds_without_reordering_controls() {
+        let stream = async_stream(|tx| async move {
+            for event in [
+                BackendEvent::TextDelta("a".into()),
+                BackendEvent::TextDelta("b".into()),
+                BackendEvent::ThinkingDelta("c".into()),
+                BackendEvent::ThinkingDelta("d".into()),
+                BackendEvent::ToolOutput {
+                    call_id: "one".into(),
+                    chunk: "e".into(),
+                },
+                BackendEvent::ToolOutput {
+                    call_id: "one".into(),
+                    chunk: "f".into(),
+                },
+                BackendEvent::ToolOutput {
+                    call_id: "two".into(),
+                    chunk: "g".into(),
+                },
+                BackendEvent::Completed {
+                    usage: Usage::default(),
+                },
+            ] {
+                tx.send(Ok(event)).await.unwrap();
+            }
+        });
+        futures::pin_mut!(stream);
+
+        let mut events = Vec::new();
+        while let Some(event) = stream.next().await {
+            events.push(event.unwrap());
+        }
+        assert!(matches!(&events[0], BackendEvent::TextDelta(text) if text == "ab"));
+        assert!(matches!(&events[1], BackendEvent::ThinkingDelta(text) if text == "cd"));
+        assert!(matches!(
+            &events[2],
+            BackendEvent::ToolOutput { call_id, chunk } if call_id == "one" && chunk == "ef"
+        ));
+        assert!(matches!(
+            &events[3],
+            BackendEvent::ToolOutput { call_id, chunk } if call_id == "two" && chunk == "g"
+        ));
+        assert!(matches!(&events[4], BackendEvent::Completed { .. }));
+    }
+
+    #[tokio::test]
+    async fn concurrent_slow_consumers_preserve_large_delta_bursts() {
+        const STREAMS: usize = 5;
+        const DELTAS: usize = 10_000;
+        const DELTA_BYTES: usize = 1024;
+        let consumers = (0..STREAMS).map(|stream_id| async move {
+            let stream = async_stream(move |tx| async move {
+                let chunk = "x".repeat(DELTA_BYTES);
+                let call_id = format!("call-{stream_id}");
+                for _ in 0..DELTAS {
+                    tx.send(Ok(BackendEvent::ToolOutput {
+                        call_id: call_id.clone(),
+                        chunk: chunk.clone(),
+                    }))
+                    .await
+                    .unwrap();
+                }
+                tx.send(Ok(BackendEvent::Completed {
+                    usage: Usage::default(),
+                }))
+                .await
+                .unwrap();
+            });
+            futures::pin_mut!(stream);
+            let mut output = String::new();
+            let mut completed = false;
+            while let Some(event) = stream.next().await {
+                match event.unwrap() {
+                    BackendEvent::ToolOutput { call_id, chunk } => {
+                        assert_eq!(call_id, format!("call-{stream_id}"));
+                        output.push_str(&chunk);
+                        tokio::time::sleep(Duration::from_millis(1)).await;
+                    }
+                    BackendEvent::Completed { .. } => completed = true,
+                    other => panic!("unexpected event: {other:?}"),
+                }
+            }
+            assert!(completed);
+            assert_eq!(output, "x".repeat(DELTAS * DELTA_BYTES));
+        });
+        futures::future::join_all(consumers).await;
     }
 }
