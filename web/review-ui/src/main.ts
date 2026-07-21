@@ -147,7 +147,7 @@ function render(): void {
         <form id="app-form" class="stack">
           <label>App ID<input name="app_id" inputmode="numeric" value="${app.app_id ?? ""}" required /></label>
           <label>Private key (.pem)<textarea name="private_key_pem" rows="5" placeholder="-----BEGIN RSA PRIVATE KEY-----" required></textarea></label>
-          <label>Webhook secret<input name="webhook_secret" type="password" required /></label>
+          <label>Webhook secret <small>(optional; leave empty for polling only)</small><input name="webhook_secret" type="password" /></label>
           <button>${app.configured ? "Replace credentials" : "Connect GitHub App"}</button>
         </form>
       </section>
@@ -271,13 +271,28 @@ function bind(): void {
   });
 }
 
-async function loadData(): Promise<void> {
+function hasEditableFocus(): boolean {
+  const active = document.activeElement;
+  return active instanceof HTMLElement
+    && active.matches("input, textarea, select, [contenteditable='true']");
+}
+
+function handleLoadError(error: unknown): void {
+  dashboard = null;
+  if (timer) {
+    window.clearInterval(timer);
+    timer = undefined;
+  }
+  renderLogin(error instanceof Error ? error.message : String(error));
+}
+
+async function loadData(renderDashboard = true): Promise<void> {
   [dashboard, providers, models] = await Promise.all([
     api<Dashboard>("/code-review"),
     api<{ providers: Provider[] }>("/providers").then((value) => value.providers),
     api<Model[]>("/models"),
   ]);
-  render();
+  if (renderDashboard) render();
 }
 
 async function load(): Promise<void> {
@@ -285,10 +300,11 @@ async function load(): Promise<void> {
   try {
     await loadData();
     if (timer) window.clearInterval(timer);
-    timer = window.setInterval(() => void loadData().catch(() => undefined), 15_000);
+    timer = window.setInterval(() => {
+      void loadData(!hasEditableFocus()).catch(handleLoadError);
+    }, 15_000);
   } catch (error) {
-    dashboard = null;
-    renderLogin(error instanceof Error ? error.message : String(error));
+    handleLoadError(error);
   }
 }
 

@@ -834,7 +834,20 @@ impl Engine {
         let turn = accepted.turn;
         let mut output = String::new();
         loop {
-            let envelope = events.recv().await.context("review event stream closed")?;
+            let envelope = match events.recv().await {
+                Ok(envelope) => envelope,
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                    tracing::warn!(
+                        job_id = %job.id,
+                        skipped,
+                        "review event receiver lagged; continuing from the latest event"
+                    );
+                    continue;
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                    bail!("review event stream closed");
+                }
+            };
             if envelope.scope != Scope::Thread(thread.id.clone()) {
                 continue;
             }
@@ -880,13 +893,9 @@ impl Engine {
         }
         let parsed = parse_review_output(&output)?;
         let review_url = self.publish_review(&api, job, parsed).await?;
-        let _ = self.update_session(
-            &session.id,
-            &trouve_protocol::UpdateSessionRequest {
-                title: None,
-                archived: Some(true),
-            },
-        );
+        self.delete_session(&session.id)
+            .await
+            .context("cleaning up successful review session")?;
         Ok(review_url)
     }
 

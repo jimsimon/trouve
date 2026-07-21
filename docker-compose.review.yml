@@ -12,15 +12,27 @@ services:
       RUST_LOG: "${RUST_LOG:-info}"
     volumes:
       - trouve-data:/var/lib/trouve
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - >-
+          curl --fail --silent --show-error
+          --header "Authorization: Bearer $$TROUVE_AUTH_TOKEN"
+          http://127.0.0.1:7433/v1/info >/dev/null
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 10s
 
   review-ui:
     image: ghcr.io/jimsimon/trouve-review-ui:latest
     build: web/review-ui
     restart: unless-stopped
     depends_on:
-      - trouve-server
+      trouve-server:
+        condition: service_healthy
     ports:
-      - "${TROUVE_REVIEW_PORT:-7433}:80"
+      - "${TROUVE_REVIEW_PORT:-7433}:8080"
 
 volumes:
   trouve-data:

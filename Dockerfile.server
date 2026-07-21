@@ -1,13 +1,18 @@
-FROM rust:1.92-bookworm AS build
+FROM rust:1.95-bookworm AS build
 WORKDIR /src
 COPY . .
 RUN cargo build --locked --release -p trouve-server
 
 FROM debian:bookworm-slim
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates git \
-    && rm -rf /var/lib/apt/lists/*
+    && apt-get install -y --no-install-recommends ca-certificates curl git \
+    && rm -rf /var/lib/apt/lists/* \
+    && groupadd --system --gid 10001 trouve \
+    && useradd --system --uid 10001 --gid trouve --home-dir /var/lib/trouve \
+        --no-create-home --shell /usr/sbin/nologin trouve \
+    && install -d --owner trouve --group trouve /var/lib/trouve
 COPY --from=build /src/target/release/trouve-server /usr/local/bin/trouve-server
 ENV TROUVE_DATA_DIR=/var/lib/trouve
 EXPOSE 7433
+USER trouve
 ENTRYPOINT ["trouve-server", "--addr", "0.0.0.0:7433"]

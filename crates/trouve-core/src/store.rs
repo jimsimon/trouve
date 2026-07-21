@@ -1566,7 +1566,10 @@ impl Store {
     ) -> Result<()> {
         self.conn.lock().unwrap().execute(
             "UPDATE code_review_jobs SET status = ?2, review_url = ?3, error = ?4,
-                    completed_at = ?5 WHERE id = ?1",
+                    completed_at = ?5,
+                    session_id = CASE WHEN ?2 = 'succeeded' THEN NULL ELSE session_id END,
+                    thread_id = CASE WHEN ?2 = 'succeeded' THEN NULL ELSE thread_id END
+             WHERE id = ?1",
             params![
                 id,
                 status,
@@ -2756,12 +2759,15 @@ mod tests {
         assert_eq!(running.job.id, queued.id);
         assert_eq!(running.job.status, "running");
         store
+            .set_code_review_job_session(&queued.id, "se_review", "th_review")
+            .unwrap();
+        store
             .finish_code_review_job(&queued.id, "succeeded", "https://review", "")
             .unwrap();
-        assert_eq!(
-            store.list_code_review_jobs(10).unwrap()[0].status,
-            "succeeded"
-        );
+        let completed = store.list_code_review_jobs(10).unwrap().remove(0);
+        assert_eq!(completed.status, "succeeded");
+        assert!(completed.session_id.is_none());
+        assert!(completed.thread_id.is_none());
 
         assert!(store.claim_github_webhook_delivery("delivery-1").unwrap());
         assert!(!store.claim_github_webhook_delivery("delivery-1").unwrap());
