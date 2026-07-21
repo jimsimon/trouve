@@ -16,12 +16,14 @@ are protocol changes.
   rowid). Cursors are opaque to clients except for ordering and resumption.
 - Events are **immutable**. Corrections are new events (e.g.
   `message.aborted`), never rewrites.
-- Streaming deltas are events like everything else. High-frequency deltas
-  (`assistant.delta`) are persisted so that replay reproduces the exact
-  transcript; they are small and SQLite handles the write rate comfortably.
-  A future compaction pass may fold deltas older than the last checkpoint
-  into their final `assistant.message` — clients must not depend on deltas
-  being retained forever, only on the folded form being equivalent.
+- Streaming deltas are events like everything else. Adjacent transport
+  fragments (`assistant.delta`, thinking, and same-call `tool.output`) may be
+  losslessly concatenated for a short bounded window before persistence;
+  chunk boundaries and per-fragment timestamps are not semantic. Replay must
+  reproduce the exact concatenated content and control-event ordering. A
+  future compaction pass may fold deltas older than the last checkpoint into
+  their final message/output — clients must not depend on deltas being
+  retained forever, only on the folded form being equivalent.
 
 ## Scopes
 
@@ -117,9 +119,13 @@ The cursor is globally unique (single AUTOINCREMENT) which trivially
 guarantees per-scope monotonicity; per-scope density is *not* guaranteed and
 clients must not assume consecutive cursors.
 
-Writes go through a single `EventLog::append` chokepoint that (1) inserts the
-row and (2) publishes to in-process subscribers — in that order, so a
-subscriber can never observe an event that would not survive a crash.
+Writes go through a single event-writer chokepoint. Callers may submit one
+event or an ordered same-scope batch. The writer assigns cursors, commits the
+transaction, and only then publishes envelopes to in-process subscribers and
+acknowledges the caller. A subscriber can therefore never observe an event
+that would not survive a crash. Live adapter mailboxes are bounded by count
+and bytes; saturation backpressures producers rather than removing a turn's
+route.
 
 ## Retention & privacy
 

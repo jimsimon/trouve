@@ -256,19 +256,43 @@ pub struct Store {
     append_tx: std::sync::mpsc::Sender<AppendRequest>,
 }
 
-/// One caller's event, in flight to the writer thread.
-struct AppendRequest {
+/// One serialized event, in flight to the writer thread.
+struct PendingEvent {
     scope: Scope,
     ts: chrono::DateTime<chrono::Utc>,
-    /// Serialized on the caller's thread so an unserializable event fails
+    /// Serialized on the caller's task so an unserializable event fails
     /// there instead of poisoning a whole batch.
     payload: String,
     event: Event,
-    reply: std::sync::mpsc::SyncSender<Result<EventEnvelope>>,
 }
 
-/// Upper bound on events committed per writer transaction. Bounds how long
-/// the earliest waiter in a batch can be held behind later arrivals.
+/// One caller's event batch, in flight to the writer thread.
+struct AppendRequest {
+    events: Vec<PendingEvent>,
+    reply: AppendReply,
+}
+
+enum AppendReply {
+    Sync(std::sync::mpsc::SyncSender<Result<Vec<EventEnvelope>>>),
+    Async(tokio::sync::oneshot::Sender<Result<Vec<EventEnvelope>>>),
+}
+
+impl AppendReply {
+    fn send(self, result: Result<Vec<EventEnvelope>>) {
+        match self {
+            Self::Sync(tx) => {
+                let _ = tx.send(result);
+            }
+            Self::Async(tx) => {
+                let _ = tx.send(result);
+            }
+        }
+    }
+}
+
+/// Upper bound on events combined across callers in one writer transaction.
+/// A single caller's atomic batch may be larger. This bounds how long the
+/// earliest waiter can be held behind later arrivals.
 const APPEND_BATCH_MAX: usize = 256;
 
 /// Event types intentionally removed by a protocol major-version bump. Their
@@ -318,37 +342,79 @@ fn spawn_event_writer(
     std::thread::Builder::new()
         .name("trouve-event-writer".into())
         .spawn(move || {
-            while let Ok(first) = rx.recv() {
-                let mut batch = vec![first];
-                while batch.len() < APPEND_BATCH_MAX
-                    && let Ok(req) = rx.try_recv()
-                {
-                    batch.push(req);
+            let mut deferred = None;
+            loop {
+                let first = match deferred.take() {
+                    Some(request) => request,
+                    None => match rx.recv() {
+                        Ok(request) => request,
+                        Err(_) => break,
+                    },
+                };
+                let mut event_count = first.events.len();
+                let mut requests = vec![first];
+                while event_count < APPEND_BATCH_MAX {
+                    let Ok(request) = rx.try_recv() else {
+                        break;
+                    };
+                    if event_count.saturating_add(request.events.len()) > APPEND_BATCH_MAX {
+                        deferred = Some(request);
+                        break;
+                    }
+                    event_count += request.events.len();
+                    requests.push(request);
                 }
+                let started = std::time::Instant::now();
                 let inserted = {
                     let mut conn = conn.lock().unwrap();
-                    insert_event_batch(&mut conn, &batch)
+                    insert_event_batch(
+                        &mut conn,
+                        requests.iter().flat_map(|request| request.events.iter()),
+                        event_count,
+                    )
                 };
+                let elapsed = started.elapsed();
+                if elapsed >= std::time::Duration::from_millis(20) {
+                    tracing::warn!(
+                        event_count,
+                        request_count = requests.len(),
+                        elapsed_ms = elapsed.as_millis(),
+                        "slow event-log batch commit"
+                    );
+                } else {
+                    tracing::trace!(
+                        event_count,
+                        request_count = requests.len(),
+                        elapsed_us = elapsed.as_micros(),
+                        "event-log batch committed"
+                    );
+                }
                 match inserted {
                     Ok(cursors) => {
-                        for (req, cursor) in batch.into_iter().zip(cursors) {
-                            let envelope = EventEnvelope {
-                                cursor,
-                                scope: req.scope,
-                                ts: req.ts,
-                                event: req.event,
-                            };
-                            // Nobody listening is fine; a caller that gave up
-                            // waiting is too.
-                            let _ = events_tx.send(envelope.clone());
-                            let _ = req.reply.send(Ok(envelope));
+                        let mut cursors = cursors.into_iter();
+                        for request in requests {
+                            let mut envelopes = Vec::with_capacity(request.events.len());
+                            for event in request.events {
+                                let envelope = EventEnvelope {
+                                    cursor: cursors.next().expect("one cursor per inserted event"),
+                                    scope: event.scope,
+                                    ts: event.ts,
+                                    event: event.event,
+                                };
+                                // Nobody listening is fine; a caller that gave
+                                // up waiting is too.
+                                let _ = events_tx.send(envelope.clone());
+                                envelopes.push(envelope);
+                            }
+                            request.reply.send(Ok(envelopes));
                         }
                     }
                     Err(e) => {
                         // The transaction rolled back: every waiter's event
                         // was equally not persisted.
-                        for req in batch {
-                            let _ = req.reply.send(Err(anyhow::anyhow!("appending event: {e}")));
+                        let message = format!("appending event batch: {e}");
+                        for request in requests {
+                            request.reply.send(Err(anyhow::anyhow!(message.clone())));
                         }
                     }
                 }
@@ -360,21 +426,40 @@ fn spawn_event_writer(
 
 /// Insert a batch in queue order under one transaction, returning the
 /// assigned cursors. All-or-nothing: on error the transaction rolls back.
-fn insert_event_batch(conn: &mut Connection, batch: &[AppendRequest]) -> Result<Vec<u64>> {
+fn insert_event_batch<'a>(
+    conn: &mut Connection,
+    batch: impl IntoIterator<Item = &'a PendingEvent>,
+    event_count: usize,
+) -> Result<Vec<u64>> {
     let tx = conn.transaction()?;
-    let mut cursors = Vec::with_capacity(batch.len());
+    let mut cursors = Vec::with_capacity(event_count);
     {
         let mut stmt = tx.prepare_cached(
             "INSERT INTO events (scope_kind, scope_id, ts, payload) VALUES (?1, ?2, ?3, ?4)",
         )?;
-        for req in batch {
-            let (kind, id) = scope_cols(&req.scope);
-            stmt.execute(params![kind, id, req.ts.to_rfc3339(), req.payload])?;
+        for event in batch {
+            let (kind, id) = scope_cols(&event.scope);
+            stmt.execute(params![kind, id, event.ts.to_rfc3339(), event.payload])?;
             cursors.push(tx.last_insert_rowid() as u64);
         }
     }
     tx.commit()?;
     Ok(cursors)
+}
+
+fn serialize_events(scope: Scope, events: Vec<Event>) -> Result<Vec<PendingEvent>> {
+    let now = chrono::Utc::now();
+    events
+        .into_iter()
+        .map(|event| {
+            Ok(PendingEvent {
+                scope: scope.clone(),
+                ts: now,
+                payload: serde_json::to_string(&event)?,
+                event,
+            })
+        })
+        .collect()
 }
 
 impl Store {
@@ -433,19 +518,40 @@ impl Store {
     /// other on the connection mutex. This call still waits for durability:
     /// it returns once the batch containing this event has committed.
     pub fn append_event(&self, scope: Scope, event: Event) -> Result<EventEnvelope> {
-        let payload = serde_json::to_string(&event)?;
         let (reply, reply_rx) = std::sync::mpsc::sync_channel(1);
         self.append_tx
             .send(AppendRequest {
-                scope,
-                ts: chrono::Utc::now(),
-                payload,
-                event,
-                reply,
+                events: serialize_events(scope, vec![event])?,
+                reply: AppendReply::Sync(reply),
+            })
+            .map_err(|_| anyhow::anyhow!("event writer thread has exited"))?;
+        let mut envelopes = reply_rx
+            .recv()
+            .map_err(|_| anyhow::anyhow!("event writer thread has exited"))??;
+        Ok(envelopes.pop().expect("single append returns one event"))
+    }
+
+    /// Persist a same-scope batch without blocking a Tokio worker thread.
+    /// The writer commits and publishes the whole batch in input order before
+    /// resolving this future, preserving the same durability contract as
+    /// [`Self::append_event`].
+    pub async fn append_events_async(
+        &self,
+        scope: Scope,
+        events: Vec<Event>,
+    ) -> Result<Vec<EventEnvelope>> {
+        if events.is_empty() {
+            return Ok(Vec::new());
+        }
+        let (reply, reply_rx) = tokio::sync::oneshot::channel();
+        self.append_tx
+            .send(AppendRequest {
+                events: serialize_events(scope, events)?,
+                reply: AppendReply::Async(reply),
             })
             .map_err(|_| anyhow::anyhow!("event writer thread has exited"))?;
         reply_rx
-            .recv()
+            .await
             .map_err(|_| anyhow::anyhow!("event writer thread has exited"))?
     }
 
@@ -1671,6 +1777,94 @@ mod tests {
                 .events_after(&Scope::Thread(format!("th_{t}")), 0)
                 .unwrap();
             assert_eq!(events.len(), 50);
+        }
+    }
+
+    #[tokio::test]
+    async fn concurrent_async_batches_survive_slow_commit_with_exact_content_and_completion() {
+        const WRITERS: usize = 5;
+        const EVENTS_PER_WRITER: usize = 50;
+        let store = Store::open_in_memory().unwrap();
+        let mut live = store.subscribe();
+
+        // Hold the connection while every async caller queues its batch. This
+        // models a slow fsync/commit without adding a production-only delay.
+        let conn = Arc::clone(&store.conn);
+        let (locked_tx, locked_rx) = std::sync::mpsc::sync_channel(1);
+        let (release_tx, release_rx) = std::sync::mpsc::sync_channel(1);
+        let blocker = std::thread::spawn(move || {
+            let guard = conn.lock().unwrap();
+            locked_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+            drop(guard);
+        });
+        locked_rx.recv().unwrap();
+
+        let writers: Vec<_> = (0..WRITERS)
+            .map(|writer| {
+                let store = store.clone();
+                tokio::spawn(async move {
+                    let mut events: Vec<_> = (0..EVENTS_PER_WRITER)
+                        .map(|event| Event::AssistantDelta {
+                            turn: 1,
+                            text: format!("{writer}:{event}"),
+                        })
+                        .collect();
+                    events.push(Event::TurnCompleted {
+                        turn: 1,
+                        usage: trouve_protocol::Usage::default(),
+                        checkpoint_id: None,
+                    });
+                    store
+                        .append_events_async(Scope::Thread(format!("th_{writer}")), events)
+                        .await
+                        .unwrap()
+                })
+            })
+            .collect();
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        release_tx.send(()).unwrap();
+        blocker.join().unwrap();
+
+        for writer in writers {
+            let envelopes = writer.await.unwrap();
+            assert_eq!(envelopes.len(), EVENTS_PER_WRITER + 1);
+            assert!(
+                envelopes
+                    .windows(2)
+                    .all(|pair| pair[0].cursor < pair[1].cursor)
+            );
+        }
+
+        let mut last = 0;
+        for _ in 0..WRITERS * (EVENTS_PER_WRITER + 1) {
+            let envelope = live.recv().await.unwrap();
+            assert!(
+                envelope.cursor > last,
+                "broadcasts must follow cursor order"
+            );
+            last = envelope.cursor;
+        }
+        for writer in 0..WRITERS {
+            let persisted = store
+                .events_after(&Scope::Thread(format!("th_{writer}")), 0)
+                .unwrap();
+            assert_eq!(persisted.len(), EVENTS_PER_WRITER + 1);
+            let text: String = persisted
+                .iter()
+                .filter_map(|envelope| match &envelope.event {
+                    Event::AssistantDelta { text, .. } => Some(text.as_str()),
+                    _ => None,
+                })
+                .collect();
+            let expected: String = (0..EVENTS_PER_WRITER)
+                .map(|event| format!("{writer}:{event}"))
+                .collect();
+            assert_eq!(text, expected);
+            assert!(matches!(
+                persisted.last().map(|envelope| &envelope.event),
+                Some(Event::TurnCompleted { turn: 1, .. })
+            ));
         }
     }
 
