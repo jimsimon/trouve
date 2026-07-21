@@ -3790,7 +3790,20 @@ async fn code_review_dashboard_and_repository_policy_round_trip() {
             "mode": "automatic",
             "model": "openai/gpt-5",
             "prompt": "focus on concurrency",
-            "reviewer_ids": ["correctness", custom_id]
+            "reviewer_ids": ["correctness", custom_id],
+            "reviewer_overrides": [
+                {
+                    "reviewer_id": "correctness",
+                    "model": "anthropic/claude",
+                    "prompt_mode": "append",
+                    "prompt": "Focus on widget lifecycle boundaries."
+                },
+                {
+                    "reviewer_id": custom_id,
+                    "prompt_mode": "replace",
+                    "prompt": "Apply the repository's widget state machine."
+                }
+            ]
         }))
         .send()
         .await
@@ -3812,6 +3825,14 @@ async fn code_review_dashboard_and_repository_policy_round_trip() {
         dashboard["repositories"][0]["reviewer_ids"],
         serde_json::json!(["correctness", custom_id])
     );
+    assert_eq!(
+        dashboard["repositories"][0]["reviewer_overrides"][0]["model"],
+        "anthropic/claude"
+    );
+    assert_eq!(
+        dashboard["repositories"][0]["reviewer_overrides"][1]["prompt_mode"],
+        "replace"
+    );
 
     let deleted = client
         .delete(format!("{base}/reviewer/{custom_id}"))
@@ -3819,4 +3840,20 @@ async fn code_review_dashboard_and_repository_policy_round_trip() {
         .await
         .unwrap();
     assert_eq!(deleted.status(), reqwest::StatusCode::NO_CONTENT);
+
+    let dashboard: serde_json::Value = client
+        .get(&base)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        dashboard["repositories"][0]["reviewer_overrides"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
 }

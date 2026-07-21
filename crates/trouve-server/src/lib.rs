@@ -236,6 +236,8 @@ impl IntoResponse for ApiError {
         UpsertAutomationRequest,
         CodeReviewDashboard,
         ReviewerProfile,
+        trouve_protocol::ReviewerOverride,
+        trouve_protocol::ReviewerPromptMode,
         CodeReviewRepository,
         trouve_protocol::CodeReviewJob,
         trouve_protocol::CodeReviewMode,

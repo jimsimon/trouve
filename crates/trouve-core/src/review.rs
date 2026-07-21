@@ -20,7 +20,8 @@ use tokio_util::sync::CancellationToken;
 use trouve_protocol::{
     CodeReviewDashboard, CodeReviewMode, CodeReviewRepository, ConfigureGithubAppRequest,
     CreateSessionRequest, CreateThreadRequest, Event, GithubAppStatus, PermissionMode,
-    ReviewerProfile, Scope, UpdateCodeReviewRepositoryRequest, UpsertReviewerProfileRequest,
+    ReviewerOverride, ReviewerProfile, ReviewerPromptMode, Scope,
+    UpdateCodeReviewRepositoryRequest, UpsertReviewerProfileRequest,
 };
 
 use crate::config::GithubReviewAppConfig;
@@ -476,6 +477,72 @@ impl Engine {
         Ok(resolved)
     }
 
+    fn normalize_reviewer_overrides(
+        &self,
+        overrides: &[ReviewerOverride],
+    ) -> Result<Vec<ReviewerOverride>, EngineError> {
+        let catalog = self.code_review_reviewer_catalog()?;
+        let known: HashSet<_> = catalog
+            .iter()
+            .map(|reviewer| reviewer.id.as_str())
+            .collect();
+        let mut seen = HashSet::new();
+        let mut normalized = Vec::new();
+        for reviewer_override in overrides {
+            if !known.contains(reviewer_override.reviewer_id.as_str()) {
+                return Err(EngineError::BadRequest(format!(
+                    "unknown reviewer id {:?}",
+                    reviewer_override.reviewer_id
+                )));
+            }
+            if !seen.insert(reviewer_override.reviewer_id.as_str()) {
+                return Err(EngineError::BadRequest(format!(
+                    "duplicate reviewer override {:?}",
+                    reviewer_override.reviewer_id
+                )));
+            }
+            let model = reviewer_override
+                .model
+                .as_deref()
+                .map(str::trim)
+                .filter(|model| !model.is_empty())
+                .map(str::to_string);
+            if model.as_deref().is_some_and(|model| !model.contains('/')) {
+                return Err(EngineError::BadRequest(format!(
+                    "model override for reviewer {:?} must be provider-qualified",
+                    reviewer_override.reviewer_id
+                )));
+            }
+            let prompt = reviewer_override.prompt.trim();
+            if prompt.len() > 16_000 {
+                return Err(EngineError::BadRequest(format!(
+                    "prompt override for reviewer {:?} is longer than 16000 bytes",
+                    reviewer_override.reviewer_id
+                )));
+            }
+            if reviewer_override.prompt_mode != ReviewerPromptMode::Inherit && prompt.is_empty() {
+                return Err(EngineError::BadRequest(format!(
+                    "prompt override for reviewer {:?} cannot be empty",
+                    reviewer_override.reviewer_id
+                )));
+            }
+            if model.is_none() && reviewer_override.prompt_mode == ReviewerPromptMode::Inherit {
+                continue;
+            }
+            normalized.push(ReviewerOverride {
+                reviewer_id: reviewer_override.reviewer_id.clone(),
+                model,
+                prompt_mode: reviewer_override.prompt_mode,
+                prompt: if reviewer_override.prompt_mode == ReviewerPromptMode::Inherit {
+                    String::new()
+                } else {
+                    prompt.to_string()
+                },
+            });
+        }
+        Ok(normalized)
+    }
+
     pub fn upsert_reviewer_profile(
         &self,
         request: UpsertReviewerProfileRequest,
@@ -570,7 +637,11 @@ impl Engine {
         let reviewer_ids = request
             .reviewer_ids
             .clone()
-            .or_else(|| existing.map(|repository| repository.reviewer_ids))
+            .or_else(|| {
+                existing
+                    .as_ref()
+                    .map(|repository| repository.reviewer_ids.clone())
+            })
             .unwrap_or_else(crate::reviewers::default_reviewer_ids);
         if request.mode != CodeReviewMode::Off && reviewer_ids.is_empty() {
             return Err(EngineError::BadRequest(
@@ -578,6 +649,17 @@ impl Engine {
             ));
         }
         self.resolve_code_review_reviewers(&reviewer_ids)?;
+        let reviewer_overrides = request
+            .reviewer_overrides
+            .as_ref()
+            .cloned()
+            .or_else(|| {
+                existing
+                    .as_ref()
+                    .map(|repository| repository.reviewer_overrides.clone())
+            })
+            .unwrap_or_default();
+        let reviewer_overrides = self.normalize_reviewer_overrides(&reviewer_overrides)?;
         let normalized = UpdateCodeReviewRepositoryRequest {
             installation_id: request.installation_id,
             repository: request.repository.clone(),
@@ -585,6 +667,7 @@ impl Engine {
             model: request.model.clone(),
             prompt: request.prompt.clone(),
             reviewer_ids: Some(reviewer_ids),
+            reviewer_overrides: Some(reviewer_overrides),
         };
         self.store.update_code_review_repository(&normalized)?;
         let repository = self
@@ -715,7 +798,10 @@ impl Engine {
 
     async fn poll_code_review_repository(&self, repository: &CodeReviewRepository) -> Result<()> {
         validate_repository(&repository.repository)?;
-        let reviewers = self.resolve_code_review_reviewers(&repository.reviewer_ids)?;
+        let reviewers = apply_reviewer_overrides(
+            self.resolve_code_review_reviewers(&repository.reviewer_ids)?,
+            &repository.reviewer_overrides,
+        );
         let reviewer_config = serde_json::to_string(&reviewers)?;
         let config_hash = hex::encode(Sha256::digest(
             format!(
@@ -1377,6 +1463,41 @@ impl Engine {
     }
 }
 
+fn apply_reviewer_overrides(
+    reviewers: Vec<ReviewerProfile>,
+    overrides: &[ReviewerOverride],
+) -> Vec<ReviewerProfile> {
+    let overrides: HashMap<_, _> = overrides
+        .iter()
+        .map(|reviewer_override| (reviewer_override.reviewer_id.as_str(), reviewer_override))
+        .collect();
+    reviewers
+        .into_iter()
+        .map(|mut reviewer| {
+            let Some(reviewer_override) = overrides.get(reviewer.id.as_str()) else {
+                return reviewer;
+            };
+            if let Some(model) = &reviewer_override.model {
+                reviewer.model = Some(model.clone());
+            }
+            match reviewer_override.prompt_mode {
+                ReviewerPromptMode::Inherit => {}
+                ReviewerPromptMode::Append => {
+                    reviewer.prompt = format!(
+                        "{}\n\nRepository-specific reviewer instructions:\n{}",
+                        reviewer.prompt.trim(),
+                        reviewer_override.prompt
+                    );
+                }
+                ReviewerPromptMode::Replace => {
+                    reviewer.prompt = reviewer_override.prompt.clone();
+                }
+            }
+            reviewer
+        })
+        .collect()
+}
+
 fn ensure_review_current(superseded: &CancellationToken) -> Result<()> {
     if superseded.is_cancelled() {
         bail!("stale: review was superseded by a newer revision or review configuration");
@@ -1705,6 +1826,41 @@ mod tests {
             parse_review_output("```json\n{\"summary\":\"ok\",\"findings\":[]}\n```").unwrap();
         assert_eq!(review.summary, "ok");
         assert!(review.findings.is_empty());
+    }
+
+    #[test]
+    fn reviewer_overrides_append_or_replace_prompts_and_models() {
+        let reviewer = ReviewerProfile {
+            id: "security".into(),
+            name: "Security".into(),
+            prompt: "Check trust boundaries.".into(),
+            model: Some("openai/base".into()),
+            built_in: true,
+        };
+        let appended = apply_reviewer_overrides(
+            vec![reviewer.clone()],
+            &[ReviewerOverride {
+                reviewer_id: "security".into(),
+                model: Some("anthropic/reviewer".into()),
+                prompt_mode: ReviewerPromptMode::Append,
+                prompt: "Focus on tenant isolation.".into(),
+            }],
+        );
+        assert_eq!(appended[0].model.as_deref(), Some("anthropic/reviewer"));
+        assert!(appended[0].prompt.starts_with(&reviewer.prompt));
+        assert!(appended[0].prompt.ends_with("Focus on tenant isolation."));
+
+        let replaced = apply_reviewer_overrides(
+            vec![reviewer],
+            &[ReviewerOverride {
+                reviewer_id: "security".into(),
+                model: None,
+                prompt_mode: ReviewerPromptMode::Replace,
+                prompt: "Review only authorization changes.".into(),
+            }],
+        );
+        assert_eq!(replaced[0].model.as_deref(), Some("openai/base"));
+        assert_eq!(replaced[0].prompt, "Review only authorization changes.");
     }
 
     #[test]

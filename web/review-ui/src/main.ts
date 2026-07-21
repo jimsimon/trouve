@@ -1,6 +1,7 @@
 import "./styles.css";
 
 type ReviewMode = "off" | "manual" | "automatic";
+type ReviewerPromptMode = "inherit" | "append" | "replace";
 
 interface GithubAppStatus {
   configured: boolean;
@@ -23,6 +24,7 @@ interface Repository {
   model?: string;
   prompt: string;
   reviewer_ids: string[];
+  reviewer_overrides?: ReviewerOverride[];
 }
 
 interface ReviewerProfile {
@@ -31,6 +33,13 @@ interface ReviewerProfile {
   prompt: string;
   model?: string;
   built_in: boolean;
+}
+
+interface ReviewerOverride {
+  reviewer_id: string;
+  model?: string;
+  prompt_mode: ReviewerPromptMode;
+  prompt: string;
 }
 
 interface ReviewJob {
@@ -103,12 +112,12 @@ function time(value?: string): string {
   return value ? new Date(value).toLocaleString() : "Never";
 }
 
-function modelOptions(selected?: string): string {
+function modelOptions(selected?: string, inheritedLabel = "Use review/default model"): string {
   const choices = selected && !models.some((model) => model.id === selected)
     ? [{ id: selected, display_name: selected }, ...models]
     : models;
   return [
-    `<option value="" ${selected ? "" : "selected"}>Use review/default model</option>`,
+    `<option value="" ${selected ? "" : "selected"}>${escape(inheritedLabel)}</option>`,
     ...choices.map(
       (model) => `<option value="${escape(model.id)}" ${model.id === selected ? "selected" : ""}>${escape(model.display_name)} · ${escape(model.id)}</option>`,
     ),
@@ -207,7 +216,18 @@ function render(): void {
               <input name="prompt" value="${escape(repo.prompt)}" placeholder="Extra repository instructions" aria-label="Repository instructions" />
               <button>Save</button>
             </div>
-            <fieldset><legend>Reviewers</legend><div class="reviewer-checks">${reviewers.map((reviewer) => `<label title="${escape(reviewer.prompt)}"><input type="checkbox" name="reviewer_id" value="${escape(reviewer.id)}" ${repo.reviewer_ids.includes(reviewer.id) ? "checked" : ""} /><span>${escape(reviewer.name)}</span>${reviewer.model ? `<small>${escape(reviewer.model)}</small>` : ""}</label>`).join("")}</div></fieldset>
+            <fieldset><legend>Reviewers</legend><div class="reviewer-policies">${reviewers.map((reviewer) => {
+              const reviewerOverride = repo.reviewer_overrides?.find((item) => item.reviewer_id === reviewer.id);
+              const promptMode = reviewerOverride?.prompt_mode ?? "inherit";
+              return `<article class="reviewer-policy" data-reviewer-id="${escape(reviewer.id)}">
+                <label class="reviewer-toggle" title="${escape(reviewer.prompt)}"><input type="checkbox" name="reviewer_id" value="${escape(reviewer.id)}" ${repo.reviewer_ids.includes(reviewer.id) ? "checked" : ""} /><span><strong>${escape(reviewer.name)}</strong><small>${reviewer.model ? escape(reviewer.model) : "repository/default model"}</small></span></label>
+                <div class="reviewer-override-controls">
+                  <select data-reviewer-model aria-label="${escape(reviewer.name)} model override">${modelOptions(reviewerOverride?.model, "Inherit reviewer model")}</select>
+                  <select data-prompt-mode aria-label="${escape(reviewer.name)} prompt behavior"><option value="inherit" ${promptMode === "inherit" ? "selected" : ""}>Use profile prompt</option><option value="append" ${promptMode === "append" ? "selected" : ""}>Add to profile prompt</option><option value="replace" ${promptMode === "replace" ? "selected" : ""}>Replace profile prompt</option></select>
+                  <textarea data-reviewer-prompt rows="2" aria-label="${escape(reviewer.name)} repository prompt" placeholder="Repository-specific instructions for this reviewer">${escape(reviewerOverride?.prompt ?? "")}</textarea>
+                </div>
+              </article>`;
+            }).join("")}</div></fieldset>
           </form>`).join("") || `<p class="empty">No repositories discovered yet. Install the App, then poll GitHub.</p>`}
       </div>
     </section>
@@ -332,9 +352,25 @@ function bind(): void {
     };
   });
   document.querySelectorAll<HTMLFormElement>("form.repo").forEach((form) => {
+    form.querySelectorAll<HTMLSelectElement>("[data-prompt-mode]").forEach((select) => {
+      const textarea = select.closest<HTMLElement>(".reviewer-policy")!
+        .querySelector<HTMLTextAreaElement>("[data-reviewer-prompt]")!;
+      const syncPromptMode = () => {
+        textarea.disabled = select.value === "inherit";
+      };
+      select.onchange = syncPromptMode;
+      syncPromptMode();
+    });
     form.onsubmit = async (event) => {
       event.preventDefault();
       const data = new FormData(form);
+      const reviewerOverrides = Array.from(form.querySelectorAll<HTMLElement>(".reviewer-policy")).flatMap((row) => {
+        const model = row.querySelector<HTMLSelectElement>("[data-reviewer-model]")!.value;
+        const promptMode = row.querySelector<HTMLSelectElement>("[data-prompt-mode]")!.value as ReviewerPromptMode;
+        const prompt = row.querySelector<HTMLTextAreaElement>("[data-reviewer-prompt]")!.value;
+        if (!model && promptMode === "inherit") return [];
+        return [{ reviewer_id: row.dataset.reviewerId ?? "", model: model || null, prompt_mode: promptMode, prompt }];
+      });
       try {
         await api("/code-review/repository", {
           method: "PUT",
@@ -345,6 +381,7 @@ function bind(): void {
             model: String(data.get("model") || "") || null,
             prompt: data.get("prompt"),
             reviewer_ids: data.getAll("reviewer_id").map(String),
+            reviewer_overrides: reviewerOverrides,
           }),
         });
         await loadData();

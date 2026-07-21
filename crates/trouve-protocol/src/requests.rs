@@ -681,6 +681,29 @@ pub struct UpsertReviewerProfileRequest {
     pub model: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ReviewerPromptMode {
+    #[default]
+    Inherit,
+    Append,
+    Replace,
+}
+
+/// Repository-specific changes layered over a reusable reviewer profile.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
+pub struct ReviewerOverride {
+    pub reviewer_id: String,
+    /// Provider-qualified model. Absent means inherit the profile, which in
+    /// turn may inherit the repository/default model.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(default)]
+    pub prompt_mode: ReviewerPromptMode,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub prompt: String,
+}
+
 /// One repository visible to a GitHub App installation plus trouve's local
 /// review policy for it.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -700,6 +723,10 @@ pub struct CodeReviewRepository {
     /// Ordered reviewer profiles run for each revision.
     #[serde(default)]
     pub reviewer_ids: Vec<String>,
+    /// Per-reviewer repository overrides. Entries may be retained while a
+    /// reviewer is disabled so re-enabling it restores its configuration.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub reviewer_overrides: Vec<ReviewerOverride>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -714,6 +741,9 @@ pub struct UpdateCodeReviewRepositoryRequest {
     /// Omitted by older clients to preserve the current/default selection.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reviewer_ids: Option<Vec<String>>,
+    /// Omitted by older clients to preserve existing reviewer overrides.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reviewer_overrides: Option<Vec<ReviewerOverride>>,
 }
 
 /// A durable execution of one model review against one immutable PR head.

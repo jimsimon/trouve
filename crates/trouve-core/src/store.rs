@@ -138,6 +138,7 @@ CREATE TABLE IF NOT EXISTS code_review_repositories (
   model TEXT,
   prompt TEXT NOT NULL DEFAULT '',
   identity_ids TEXT NOT NULL DEFAULT '["correctness","security","api-compatibility","testing"]',
+  reviewer_overrides TEXT NOT NULL DEFAULT '[]',
   updated_at TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS code_review_identities (
@@ -198,6 +199,7 @@ const MIGRATIONS: &[&str] = &[
     "ALTER TABLE automations ADD COLUMN permission_mode TEXT NOT NULL DEFAULT 'ask'",
     "ALTER TABLE threads ADD COLUMN todos TEXT NOT NULL DEFAULT '[]'",
     "ALTER TABLE code_review_repositories ADD COLUMN identity_ids TEXT NOT NULL DEFAULT '[\"correctness\",\"security\",\"api-compatibility\",\"testing\"]'",
+    "ALTER TABLE code_review_repositories ADD COLUMN reviewer_overrides TEXT NOT NULL DEFAULT '[]'",
     "ALTER TABLE code_review_jobs ADD COLUMN identities TEXT NOT NULL DEFAULT '[]'",
     "ALTER TABLE code_review_jobs ADD COLUMN config_hash TEXT NOT NULL DEFAULT ''",
     // Context-size proxy for compaction/UI: the input tokens of the turn's
@@ -330,6 +332,10 @@ fn row_to_code_review_repository(
         prompt: r.get(5)?,
         reviewer_ids: serde_json::from_str::<Vec<String>>(&r.get::<_, String>(6)?)
             .unwrap_or_else(|_| crate::reviewers::default_reviewer_ids()),
+        reviewer_overrides: serde_json::from_str::<Vec<trouve_protocol::ReviewerOverride>>(
+            &r.get::<_, String>(7)?,
+        )
+        .unwrap_or_default(),
     })
 }
 
@@ -1442,26 +1448,34 @@ impl Store {
             params![id],
         )?;
         if deleted > 0 {
-            let repositories: Vec<(String, String)> = {
-                let mut stmt =
-                    tx.prepare("SELECT repository, identity_ids FROM code_review_repositories")?;
-                stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+            let repositories: Vec<(String, String, String)> = {
+                let mut stmt = tx.prepare(
+                    "SELECT repository, identity_ids, reviewer_overrides
+                     FROM code_review_repositories",
+                )?;
+                stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
                     .collect::<rusqlite::Result<_>>()?
             };
-            for (repository, encoded) in repositories {
-                let mut ids: Vec<String> = serde_json::from_str(&encoded).unwrap_or_default();
-                let before = ids.len();
+            for (repository, encoded_ids, encoded_overrides) in repositories {
+                let mut ids: Vec<String> = serde_json::from_str(&encoded_ids).unwrap_or_default();
+                let mut overrides: Vec<trouve_protocol::ReviewerOverride> =
+                    serde_json::from_str(&encoded_overrides).unwrap_or_default();
+                let before_ids = ids.len();
+                let before_overrides = overrides.len();
                 ids.retain(|reviewer_id| reviewer_id != id);
-                if ids.len() != before {
+                overrides.retain(|reviewer_override| reviewer_override.reviewer_id != id);
+                if ids.len() != before_ids || overrides.len() != before_overrides {
                     if ids.is_empty() {
                         ids = crate::reviewers::default_reviewer_ids();
                     }
                     tx.execute(
                         "UPDATE code_review_repositories
-                         SET identity_ids = ?2, updated_at = ?3 WHERE repository = ?1",
+                         SET identity_ids = ?2, reviewer_overrides = ?3, updated_at = ?4
+                         WHERE repository = ?1",
                         params![
                             repository,
                             serde_json::to_string(&ids)?,
+                            serde_json::to_string(&overrides)?,
                             chrono::Utc::now().to_rfc3339(),
                         ],
                     )?;
@@ -1501,7 +1515,8 @@ impl Store {
     ) -> Result<Vec<trouve_protocol::CodeReviewRepository>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT repository, installation_id, private, mode, model, prompt, identity_ids
+            "SELECT repository, installation_id, private, mode, model, prompt,
+                    identity_ids, reviewer_overrides
              FROM code_review_repositories ORDER BY repository",
         )?;
         let rows = stmt.query_map([], row_to_code_review_repository)?;
@@ -1518,18 +1533,25 @@ impl Store {
             .as_ref()
             .map(serde_json::to_string)
             .transpose()?;
+        let reviewer_overrides = request
+            .reviewer_overrides
+            .as_ref()
+            .map(serde_json::to_string)
+            .transpose()?;
         self.conn.lock().unwrap().execute(
             "INSERT INTO code_review_repositories
                     (repository, installation_id, private, mode, model, prompt,
-                     identity_ids, updated_at)
+                     identity_ids, reviewer_overrides, updated_at)
              VALUES (?1, ?2, 0, ?3, ?4, ?5,
-                     COALESCE(?6, '[\"correctness\",\"security\",\"api-compatibility\",\"testing\"]'), ?7)
+                     COALESCE(?6, '[\"correctness\",\"security\",\"api-compatibility\",\"testing\"]'),
+                     COALESCE(?7, '[]'), ?8)
              ON CONFLICT(repository) DO UPDATE SET
                installation_id = excluded.installation_id,
                mode = excluded.mode,
                model = excluded.model,
                prompt = excluded.prompt,
                identity_ids = COALESCE(?6, code_review_repositories.identity_ids),
+               reviewer_overrides = COALESCE(?7, code_review_repositories.reviewer_overrides),
                updated_at = excluded.updated_at",
             params![
                 request.repository,
@@ -1538,6 +1560,7 @@ impl Store {
                 request.model,
                 request.prompt,
                 reviewer_ids,
+                reviewer_overrides,
                 chrono::Utc::now().to_rfc3339(),
             ],
         )?;
@@ -2907,11 +2930,18 @@ mod tests {
                 model: Some("openai/gpt-5".into()),
                 prompt: "focus on concurrency".into(),
                 reviewer_ids: Some(crate::reviewers::default_reviewer_ids()),
+                reviewer_overrides: Some(vec![trouve_protocol::ReviewerOverride {
+                    reviewer_id: "security".into(),
+                    model: Some("anthropic/security".into()),
+                    prompt_mode: trouve_protocol::ReviewerPromptMode::Append,
+                    prompt: "Focus on tenant boundaries.".into(),
+                }]),
             })
             .unwrap();
         let configured = store.list_code_review_repositories().unwrap().remove(0);
         assert_eq!(configured.mode, trouve_protocol::CodeReviewMode::Automatic);
         assert_eq!(configured.model.as_deref(), Some("openai/gpt-5"));
+        assert_eq!(configured.reviewer_overrides.len(), 1);
 
         assert_eq!(
             store
@@ -3067,6 +3097,12 @@ mod tests {
                 model: None,
                 prompt: String::new(),
                 reviewer_ids: Some(vec![reviewer.id.clone()]),
+                reviewer_overrides: Some(vec![trouve_protocol::ReviewerOverride {
+                    reviewer_id: reviewer.id.clone(),
+                    model: Some("anthropic/domain".into()),
+                    prompt_mode: trouve_protocol::ReviewerPromptMode::Replace,
+                    prompt: "Use repository-specific invariants.".into(),
+                }]),
             })
             .unwrap();
         let repositories = store.list_code_review_repositories().unwrap();
@@ -3074,12 +3110,18 @@ mod tests {
             repositories[0].reviewer_ids.as_slice(),
             std::slice::from_ref(&reviewer.id)
         );
+        assert_eq!(repositories[0].reviewer_overrides.len(), 1);
 
         assert!(store.delete_custom_reviewer_profile(&reviewer.id).unwrap());
         assert!(store.list_custom_reviewer_profiles().unwrap().is_empty());
         assert_eq!(
             store.list_code_review_repositories().unwrap()[0].reviewer_ids,
             crate::reviewers::default_reviewer_ids()
+        );
+        assert!(
+            store.list_code_review_repositories().unwrap()[0]
+                .reviewer_overrides
+                .is_empty()
         );
     }
 

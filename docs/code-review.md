@@ -118,7 +118,7 @@ After creating it:
    GitHub webhook secret when webhooks are enabled.
 5. Click **Poll now**. The installed repositories will appear with review
    mode **Off**.
-6. Choose a model, select its reviewers, and set each repository to
+6. Choose a default model, select its reviewers, and set each repository to
    **Manual** or **Automatic**.
 
 `Manual` runs only when the bot is selected (or re-requested) through
@@ -142,6 +142,14 @@ default). Custom reviewer profiles are reusable across repositories and contain
 a name, focused prompt, and optional model override. Create and manage them in
 the dashboard's **Reviewers** section, then enable them on each repository.
 
+Repository policies can refine each reviewer without changing its reusable
+profile. The checkbox enables or disables that reviewer for the repository. A
+model override can select a different model for that reviewer; otherwise it
+inherits the profile model, then the repository or server default. Prompt
+behavior can inherit the profile prompt, append repository-specific
+instructions to it, or replace it for that repository. Overrides remain saved
+when a reviewer is temporarily disabled.
+
 ## Runtime behavior
 
 A reconciliation poll runs at startup and every 60 seconds by default. It can
@@ -158,7 +166,7 @@ creates an isolated trouve session at that head. The complete diff is enumerated
 by changed path and divided into bounded per-file batches; every selected
 reviewer receives every batch in the built-in read-only review mode, including
 files beyond the model-facing aggregate diff limit. Reviewer profiles and models
-are snapshotted with the durable job.
+are snapshotted with the durable job after repository overrides are applied.
 
 Candidate findings are first checked against actual commentable diff lines. A
 separate final editor pass then verifies them against the repository, removes
@@ -166,11 +174,12 @@ false positives and findings not introduced by the revision, merges semantic
 duplicates, corrects line metadata, and produces the published summary. The
 result is checked against diff lines again before it is sent to GitHub.
 
-When either commit or the selected review configuration changes, queued reviews
-for the old revision/configuration are marked stale and an in-flight model turn
-is cancelled before the replacement is queued. Before publishing, trouve reads
-the PR again and marks the job stale if either commit moved. Inline findings
-that GitHub still rejects are preserved in a summary-only fallback review.
+When either commit or the effective review configuration changes—including
+reviewer selection, model overrides, or prompt overrides—queued reviews for the
+old revision/configuration are marked stale and an in-flight model turn is
+cancelled before the replacement is queued. Before publishing, trouve reads the
+PR again and marks the job stale if either commit moved. Inline findings that
+GitHub still rejects are preserved in a summary-only fallback review.
 
 The dashboard displays the most recently observed installation rate-limit
 remainder and reset time. Its 15-second UI refresh only talks to the local

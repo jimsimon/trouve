@@ -57,10 +57,15 @@ textarea { resize: vertical; }
 .repo-name { display: flex; align-items: center; gap: .5rem; overflow-wrap: anywhere; }
 .repo fieldset { margin: .8rem 0 0; padding: .75rem; border: 1px solid #2d3430; border-radius: 10px; }
 .repo legend { padding: 0 .35rem; color: #8e9691; font-size: .75rem; font-weight: 700; }
-.reviewer-checks { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: .45rem; }
-.reviewer-checks label { display: grid; grid-template-columns: auto 1fr; align-items: center; gap: .15rem .45rem; padding: .5rem; border-radius: 8px; background: #111512; cursor: pointer; }
-.reviewer-checks input { width: auto; grid-row: 1 / span 2; }
-.reviewer-checks small { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.reviewer-policies { display: grid; gap: .5rem; }
+.reviewer-policy { display: grid; grid-template-columns: minmax(180px, .7fr) minmax(0, 2fr); gap: .6rem; align-items: start; padding: .65rem; border-radius: 8px; background: #111512; }
+.reviewer-toggle { display: flex; align-items: flex-start; gap: .5rem; cursor: pointer; }
+.reviewer-toggle input { width: auto; margin-top: .2rem; }
+.reviewer-toggle span, .reviewer-toggle small { display: block; min-width: 0; }
+.reviewer-toggle small { margin-top: .2rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.reviewer-override-controls { display: grid; grid-template-columns: 1fr 1fr; gap: .45rem; }
+.reviewer-override-controls textarea { grid-column: 1 / -1; }
+.reviewer-override-controls textarea:disabled { opacity: .5; cursor: not-allowed; }
 .jobs article { display: grid; grid-template-columns: 90px 1fr auto; align-items: start; gap: .8rem; padding: 1rem 0; border-top: 1px solid #292e2b; }
 .jobs strong, .jobs small { display: block; margin-top: .22rem; }
 .jobs small { color: #818a85; }
@@ -82,7 +87,7 @@ textarea { resize: vertical; }
   .custom-reviewer textarea, .custom-reviewer .reviewer-actions { grid-column: 1 / -1; }
   .repo-controls { grid-template-columns: 1fr 1fr; }
   .repo-name, .repo-controls > input { grid-column: 1 / -1; }
-  .reviewer-checks { grid-template-columns: 1fr 1fr; }
+  .reviewer-policy { grid-template-columns: 1fr; }
   .jobs article { grid-template-columns: 80px 1fr; }
   .review-link { grid-column: 2; }
 }
@@ -90,6 +95,7 @@ textarea { resize: vertical; }
 @media (max-width: 560px) {
   main { width: min(100% - 1rem, 1180px); padding-top: 1rem; }
   header, .section-title { align-items: flex-start; flex-direction: column; }
-  .metrics, .split, .reviewer-grid, .custom-reviewer, .repo-controls, .reviewer-checks { grid-template-columns: 1fr; }
+  .metrics, .split, .reviewer-grid, .custom-reviewer, .repo-controls, .reviewer-override-controls { grid-template-columns: 1fr; }
   .custom-reviewer textarea, .custom-reviewer .reviewer-actions, .repo-name, .repo-controls > input { grid-column: auto; }
+  .reviewer-override-controls textarea { grid-column: auto; }
 }

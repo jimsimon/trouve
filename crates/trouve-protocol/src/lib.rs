@@ -83,7 +83,9 @@ pub use requests::*;
 // checkout refs (all additive).
 // 1.2: reusable built-in/custom reviewer profiles, per-repository reviewer
 // selection, and profile snapshots on durable review jobs (all additive).
-pub const PROTOCOL_VERSION: &str = "1.2";
+// 1.3: per-repository reviewer model overrides and inherit/append/replace
+// prompt policies (additive).
+pub const PROTOCOL_VERSION: &str = "1.3";
 
 pub type WorkspaceId = String;
 pub type SessionId = String;
