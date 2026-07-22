@@ -42,6 +42,22 @@ jobs:
         if: github.ref == 'refs/heads/main'
         run: cargo build --release
 
+  # Release builds include Windows-only dependencies and trait impls that the
+  # Linux/macOS jobs cannot type-check. Keep this compile-only to catch those
+  # platform regressions without duplicating the full workspace test suite.
+  windows-check:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: windows-check
+      - name: Check Windows desktop app
+        run: cargo check --package trouve-app --target x86_64-pc-windows-msvc
+
   # Opt-in tests: model-backed trouve-search coverage plus loopback protocol
   # client coverage. These crates hold every #[ignore]d test in the workspace
   # (enforced by the "ignored tests" check in lint.yml); neither pulls in the

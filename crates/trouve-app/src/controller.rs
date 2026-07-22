@@ -5748,7 +5748,7 @@ impl Controller {
                         time: time.trim().to_string(),
                         days: days
                             .split(',')
-                            .filter_map(|d| d.trim().parse().ok())
+                            .filter_map(|d| d.trim().parse::<u8>().ok())
                             .collect(),
                     },
                     enabled,
