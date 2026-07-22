@@ -85,7 +85,15 @@ pub use requests::*;
 // selection, and profile snapshots on durable review jobs (all additive).
 // 1.3: per-repository reviewer model overrides and inherit/append/replace
 // prompt policies (additive).
-pub const PROTOCOL_VERSION: &str = "1.3";
+// 1.4: thread.command_catalog_updated publishes Trouve's provider-neutral
+// command and skill completions; thread.commands_updated remains for replay.
+// ProviderInfo.capability_mode discloses authoritative vs mixed vendor tool
+// surfaces. Typed prompt/action commands, POST /v1/threads/{id}/commands,
+// navigation hints, and replayable thread.command_executed output are also
+// additive in this version.
+// 1.5: GET/PUT /v1/config/skills controls the enabled-by-default built-in
+// skill catalog and injection independently of user/workspace skills.
+pub const PROTOCOL_VERSION: &str = "1.5";
 
 pub type WorkspaceId = String;
 pub type SessionId = String;

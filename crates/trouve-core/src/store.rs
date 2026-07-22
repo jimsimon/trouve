@@ -1916,6 +1916,30 @@ impl Store {
         .transpose()
     }
 
+    /// Exact-key variant for capability-isolated backend namespaces. Unlike
+    /// `backend_session`, this never adopts a pre-keyed legacy row whose tool
+    /// surface is unknown.
+    pub fn backend_session_exact(
+        &self,
+        thread_id: &str,
+        backend: &str,
+    ) -> Result<Option<(String, u64)>> {
+        let conn = self.conn.lock().unwrap();
+        let row = conn
+            .query_row(
+                "SELECT backend_session_id, seen_messages FROM backend_sessions
+                 WHERE thread_id = ?1 AND backend = ?2",
+                params![thread_id, backend],
+                |r| Ok((r.get(0)?, r.get::<_, i64>(1)?)),
+            )
+            .optional()?;
+        row.map(|(id, seen)| {
+            let seen = u64::try_from(seen).context("backend seen_messages was negative")?;
+            Ok((id, seen))
+        })
+        .transpose()
+    }
+
     pub fn set_backend_session(
         &self,
         thread_id: &str,
@@ -2506,6 +2530,13 @@ mod tests {
         assert_eq!(
             store.backend_session("th_legacy", "cursor").unwrap(),
             Some(("old-sess".into(), 0))
+        );
+        assert_eq!(
+            store
+                .backend_session_exact("th_legacy", "cursor#trouve-tools-v1")
+                .unwrap(),
+            None,
+            "authoritative namespaces must not adopt an ambiguous legacy session"
         );
         store
             .set_backend_session("th_legacy", "cursor", "new-sess")

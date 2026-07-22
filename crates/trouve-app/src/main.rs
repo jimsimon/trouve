@@ -980,6 +980,12 @@ fn main() -> anyhow::Result<()> {
     }
     {
         let tx = tx.clone();
+        window.on_builtin_skills_toggled(move |enabled| {
+            let _ = tx.send(UiCommand::BuiltinSkillsToggled(enabled));
+        });
+    }
+    {
+        let tx = tx.clone();
         window.on_mode_saved(
             move |id, display, prompt, tools, read_only, perm, model, thinking| {
                 let thinking = (!thinking.is_empty()).then(|| thinking.to_string());

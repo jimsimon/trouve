@@ -51,6 +51,12 @@ These are load-bearing. Do not violate them without a new ADR.
    control flow.
 7. **Widget crates stay generic.** `slint-*` crates take plain data (text,
    spans, hunks), not trouve protocol types.
+8. **Trouve owns the agent capability surface.** Commands, skills, tool
+   semantics, permissions, audit events, and presentation are provider-
+   independent (ADR 0012). Provider adapters may expose model-optimized tool
+   dialects, but every operation resolves to a canonical Trouve capability
+   and every side effect still crosses `ToolExecutor`. Vendor capabilities
+   must not be a second authoritative surface.
 
 ## Conventions
 

@@ -1,5 +1,5 @@
-//! Streamable-HTTP MCP endpoint bridging external vendor agents (Claude
-//! Code, Codex) back into trouve — the successor to the old spawned
+//! Streamable-HTTP MCP endpoint bridging external vendor agents (Claude,
+//! Codex, and Cursor) back into trouve — the successor to the old spawned
 //! `mcp-bridge` subprocess.
 //!
 //! The engine points vendor agents at
@@ -30,7 +30,7 @@ const MCP_PROTOCOL_VERSION: &str = "2025-03-26";
 /// own built-ins, but trouve's native semantic search and the interactive
 /// question tool (harness features the vendor has no equivalent of) are
 /// always offered.
-const ALWAYS_BRIDGED: &[&str] = &["search", "find_related", "ask_question"];
+const ALWAYS_BRIDGED: &[&str] = &["search", "find_related", "ask_question", "load_skill"];
 
 #[derive(serde::Deserialize)]
 pub(crate) struct McpQuery {
@@ -45,6 +45,14 @@ pub(crate) struct McpQuery {
 
 fn default_approval() -> u8 {
     1
+}
+
+fn tool_available_for_bridge(name: &str, bridge_tools: bool, serve_approval: bool) -> bool {
+    if name == "approval_prompt" {
+        serve_approval
+    } else {
+        bridge_tools || ALWAYS_BRIDGED.contains(&name)
+    }
 }
 
 pub(crate) async fn mcp_endpoint(
@@ -76,10 +84,16 @@ pub(crate) async fn mcp_endpoint(
         })),
         "ping" => Ok(json!({})),
         "tools/list" => tools_list(&engine, &thread_id, q.tools == 1, q.approval != 0).await,
-        "tools/call" if msg["params"]["name"] == "approval_prompt" => {
+        "tools/call"
+            if msg["params"]["name"] == "approval_prompt"
+                && tool_available_for_bridge("approval_prompt", q.tools == 1, q.approval != 0) =>
+        {
             approval_prompt(&engine, &thread_id, &msg["params"]).await
         }
-        "tools/call" => tools_call(&engine, &thread_id, &msg["params"]).await,
+        "tools/call" if msg["params"]["name"] == "approval_prompt" => {
+            Err("approval_prompt is disabled for this bridge".into())
+        }
+        "tools/call" => tools_call(&engine, &thread_id, &msg["params"], q.tools == 1).await,
         _ => Err(format!("method not supported: {method}")),
     };
     let response = match result {
@@ -124,7 +138,7 @@ async fn tools_list(
         Ok(specs) => tools.extend(
             specs
                 .iter()
-                .filter(|s| bridge_tools || ALWAYS_BRIDGED.contains(&s.name.as_str()))
+                .filter(|s| tool_available_for_bridge(&s.name, bridge_tools, serve_approval))
                 .map(|s| {
                     json!({
                         "name": s.name,
@@ -133,6 +147,11 @@ async fn tools_list(
                     })
                 }),
         ),
+        Err(e) if bridge_tools => {
+            return Err(format!(
+                "authoritative tool catalog unavailable for {thread_id}: {e}"
+            ));
+        }
         Err(e) => tracing::warn!("mcp bridge: tool specs unavailable for {thread_id}: {e}"),
     }
     Ok(json!({ "tools": tools }))
@@ -168,19 +187,46 @@ async fn tools_call(
     engine: &Arc<Engine>,
     thread_id: &str,
     params: &Value,
+    bridge_tools: bool,
 ) -> Result<Value, String> {
     let name = params["name"].as_str().unwrap_or_default();
+    if !tool_available_for_bridge(name, bridge_tools, false) {
+        return Err(format!("tool {name:?} is disabled for this bridge"));
+    }
     let arguments = params.get("arguments").cloned().unwrap_or(json!({}));
     match engine.bridged_tool_call(thread_id, name, &arguments).await {
-        Ok(content) => Ok(json!({
-            "content": [ { "type": "text", "text": content } ],
-            "isError": false,
-        })),
+        Ok((content, images)) => {
+            let mut blocks = vec![json!({ "type": "text", "text": content })];
+            blocks.extend(images.into_iter().map(|image| {
+                json!({
+                    "type": "image",
+                    "data": image.data,
+                    "mimeType": image.mime,
+                })
+            }));
+            Ok(json!({ "content": blocks, "isError": false }))
+        }
         // Errors surface as tool results (isError) so the agent can react
         // instead of the whole turn failing.
         Err(e) => Ok(json!({
             "content": [ { "type": "text", "text": format!("tool call failed: {e}") } ],
             "isError": true,
         })),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bridge_flags_gate_calls_not_only_tool_discovery() {
+        for name in ALWAYS_BRIDGED {
+            assert!(tool_available_for_bridge(name, false, false));
+        }
+        assert!(!tool_available_for_bridge("shell", false, false));
+        assert!(tool_available_for_bridge("shell", true, false));
+        assert!(!tool_available_for_bridge("approval_prompt", true, false));
+        assert!(tool_available_for_bridge("approval_prompt", false, true));
     }
 }

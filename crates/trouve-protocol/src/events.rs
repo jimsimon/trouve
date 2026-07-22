@@ -74,14 +74,33 @@ pub struct QuestionAnswer {
     pub other_text: Option<String>,
 }
 
-/// One slash command / skill the vendor harness accepts in prompts (e.g.
-/// "/simplify"), surfaced by clients as prompt-box completions.
+/// One slash command or skill accepted by Trouve, surfaced by clients as a
+/// prompt-box completion.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 pub struct CommandInfo {
     /// Name without the leading slash.
     pub name: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub description: String,
+    /// Whether submitting this command starts a model turn or executes a
+    /// deterministic Trouve action.
+    #[serde(default)]
+    pub kind: CommandKind,
+    /// User-facing invocation syntax, including the leading slash.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub usage: String,
+}
+
+/// How a slash command is dispatched by clients.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum CommandKind {
+    /// Send the invocation as a prompt (skills and other model workflows).
+    #[default]
+    Prompt,
+    /// Execute through Trouve's typed command endpoint without involving a
+    /// model provider.
+    Action,
 }
 
 /// Token/cost usage for a turn.
@@ -202,8 +221,23 @@ pub enum Event {
         answers: Option<Vec<QuestionAnswer>>,
     },
 
-    /// The slash commands / skills the vendor harness currently accepts in
-    /// prompts. Replaces any previously announced list for the thread.
+    /// Trouve's authoritative slash-command and skill catalog for this
+    /// thread. Replaces any previously announced catalog.
+    #[serde(rename = "thread.command_catalog_updated")]
+    CommandCatalogUpdated { commands: Vec<CommandInfo> },
+
+    /// A deterministic Trouve command completed. The output is persisted so
+    /// replay and every client render the same command history.
+    #[serde(rename = "thread.command_executed")]
+    CommandExecuted {
+        name: String,
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        arguments: String,
+        output: String,
+    },
+
+    /// Legacy vendor-reported slash commands / skills. Kept for replay of
+    /// existing event logs; new turns publish CommandCatalogUpdated instead.
     #[serde(rename = "thread.commands_updated")]
     CommandsUpdated { commands: Vec<CommandInfo> },
 
@@ -375,6 +409,44 @@ mod tests {
             }
             _ => panic!("wrong event variant"),
         }
+    }
+
+    #[test]
+    fn command_catalog_has_its_own_wire_event() {
+        let ev = Event::CommandCatalogUpdated {
+            commands: vec![CommandInfo {
+                name: "review".into(),
+                description: "Review the current changes".into(),
+                kind: CommandKind::Prompt,
+                usage: "/review [request]".into(),
+            }],
+        };
+        let v = serde_json::to_value(&ev).unwrap();
+        assert_eq!(v["type"], "thread.command_catalog_updated");
+        assert_eq!(v["commands"][0]["name"], "review");
+    }
+
+    #[test]
+    fn old_command_info_defaults_to_prompt() {
+        let command: CommandInfo = serde_json::from_value(serde_json::json!({
+            "name": "review",
+            "description": "Review changes"
+        }))
+        .unwrap();
+        assert_eq!(command.kind, CommandKind::Prompt);
+        assert!(command.usage.is_empty());
+    }
+
+    #[test]
+    fn command_execution_has_a_stable_wire_event() {
+        let event = Event::CommandExecuted {
+            name: "status".into(),
+            arguments: String::new(),
+            output: "Ready".into(),
+        };
+        let value = serde_json::to_value(event).unwrap();
+        assert_eq!(value["type"], "thread.command_executed");
+        assert_eq!(value["name"], "status");
     }
 
     #[test]

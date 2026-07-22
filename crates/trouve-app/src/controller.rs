@@ -15,9 +15,10 @@ use tokio::sync::mpsc;
 use trouve_client_core::client::ProtocolClient;
 use trouve_client_core::viewmodel::ThreadViewModel;
 use trouve_protocol::{
-    AddLocalModelRequest, AgentMode, ApprovalDecision, CreateSessionRequest, CreateThreadRequest,
-    DirEntry, EventEnvelope, ModelInfo, PermissionMode, Session, Thread, TodoStatus,
-    UpdateSessionRequest, UpdateThreadRequest, UpsertModeRequest, UpsertProviderRequest, Workspace,
+    AddLocalModelRequest, AgentMode, ApprovalDecision, CommandAction, CommandKind,
+    CreateSessionRequest, CreateThreadRequest, DirEntry, EventEnvelope, ModelInfo, PermissionMode,
+    Session, Thread, TodoStatus, UpdateSessionRequest, UpdateThreadRequest, UpsertModeRequest,
+    UpsertProviderRequest, Workspace,
 };
 
 use crate::render;
@@ -290,6 +291,9 @@ pub enum UiCommand {
     SetDefaultModel(usize, Option<String>),
     /// Set the global default permission mode (0 ask/1 allow-list/2 yolo).
     SetDefaultPermission(i32),
+    /// Enable or disable Trouve's compiled-in skills globally. User and
+    /// workspace skills remain available.
+    BuiltinSkillsToggled(bool),
     /// Create/update a user-level mode (a built-in id customizes it).
     /// Fields: id, display name, system prompt, comma-separated allowed
     /// tools, read-only, permission index (-1 global default/0 ask/
@@ -1225,9 +1229,21 @@ impl Controller {
         self.modes = infos.iter().map(|i| i.mode.clone()).collect();
         self.mode_origins = infos.into_iter().map(|i| i.origin).collect();
         self.models = self.client.list_models().await.unwrap_or_default();
-        if let Ok(providers) = self.client.list_providers().await {
-            self.default_thinking_level = providers.default_thinking_level;
-        }
+        let compatibility_providers: HashSet<String> = match self.client.list_providers().await {
+            Ok(response) => {
+                self.default_thinking_level = response.default_thinking_level;
+                response
+                    .providers
+                    .into_iter()
+                    .filter(|provider| {
+                        provider.capability_mode
+                            == trouve_protocol::ProviderCapabilityMode::Compatibility
+                    })
+                    .map(|provider| provider.id)
+                    .collect()
+            }
+            Err(_) => HashSet::new(),
+        };
         let mode_names = self
             .modes
             .iter()
@@ -1236,7 +1252,10 @@ impl Controller {
         ui::set_pickers(
             &self.ui,
             mode_names,
-            self.models.iter().map(|m| m.id.clone()).collect(),
+            self.models
+                .iter()
+                .map(|m| model_picker_label(&m.id, &compatibility_providers))
+                .collect(),
         );
         self.push_model_health();
         // Each mode's default model, so mode pickers can jump the model
@@ -1312,16 +1331,20 @@ impl Controller {
         }
         let blocked = self.connectivity_blocked();
         let warning = if blocked {
-            "You're offline and no local models are available — prompts are \
-             disabled until the connection returns. To work offline in the \
-             future, set up a model under Settings → Local Models."
+            "You're offline and no local models are available — model prompts \
+             are unavailable until the connection returns, but Trouve slash \
+             commands still work. To work offline in the future, set up a \
+             model under Settings → Local Models."
         } else if self.offline {
             "You're offline — only local models are available until the \
              connection returns."
         } else {
             ""
         };
-        ui::set_connectivity(&self.ui, blocked, warning.into(), false);
+        // Keep the composer available while only model connectivity is
+        // missing: Trouve-owned action commands still work. The command
+        // dispatcher rejects ordinary prompts until a model is runnable.
+        ui::set_connectivity(&self.ui, false, warning.into(), false);
     }
 
     /// Show a transient connectivity notice that clears itself after a few
@@ -1836,6 +1859,44 @@ impl Controller {
             .map(|t| t.id.clone())
     }
 
+    /// Parse a slash invocation only when the current thread's authoritative
+    /// catalog marks it as a deterministic Trouve action.
+    fn action_invocation(&self, text: &str) -> Option<(String, String)> {
+        let invocation = text.trim().strip_prefix('/')?;
+        let name_end = invocation
+            .find(char::is_whitespace)
+            .unwrap_or(invocation.len());
+        let name = &invocation[..name_end];
+        let thread_id = self.current_thread_id()?;
+        self.vms
+            .get(&thread_id)?
+            .commands
+            .iter()
+            .find(|command| command.name == name && command.kind == CommandKind::Action)?;
+        Some((name.to_string(), invocation[name_end..].trim().to_string()))
+    }
+
+    async fn apply_command_action(&mut self, action: CommandAction) -> Result<()> {
+        match action {
+            CommandAction::None => {}
+            CommandAction::SwitchThread { thread_id } => {
+                let Some(session_index) = self.current_session else {
+                    return Ok(());
+                };
+                if let Some(session_id) = self.current_session_id() {
+                    self.resume.session_threads.insert(session_id, thread_id);
+                }
+                self.reload_session(session_index).await?;
+            }
+            CommandAction::OpenTerminal => {
+                self.right_tab = TERMINAL_TAB;
+                ui::set_right_tab(&self.ui, TERMINAL_TAB);
+                self.ensure_terminal().await;
+            }
+        }
+        Ok(())
+    }
+
     /// The question request behind a wizard row: its request id and the
     /// questions it poses.
     fn question_at(&self, row: usize) -> Option<(String, Vec<trouve_protocol::Question>)> {
@@ -1884,10 +1945,20 @@ impl Controller {
     }
 
     async fn select_session(&mut self, index: usize) -> Result<()> {
+        self.select_session_with_reload(index, false).await
+    }
+
+    async fn reload_session(&mut self, index: usize) -> Result<()> {
+        self.select_session_with_reload(index, true).await
+    }
+
+    async fn select_session_with_reload(&mut self, index: usize, force_reload: bool) -> Result<()> {
         if index >= self.sessions.len() {
             return Ok(());
         }
-        if self.current_session_id().as_deref() == Some(self.sessions[index].id.as_str()) {
+        if !force_reload
+            && self.current_session_id().as_deref() == Some(self.sessions[index].id.as_str())
+        {
             if self.unread_sessions.remove(&self.sessions[index].id)
                 | self.error_sessions.remove(&self.sessions[index].id)
             {
@@ -2430,7 +2501,14 @@ impl Controller {
             &self.ui,
             vm.commands
                 .iter()
-                .map(|c| (c.name.clone(), c.description.clone()))
+                .map(|command| {
+                    let detail = if command.usage.is_empty() {
+                        command.description.clone()
+                    } else {
+                        format!("{} — {}", command.usage, command.description)
+                    };
+                    (command.name.clone(), detail)
+                })
                 .collect(),
         );
         ui::set_chat(&self.ui, rows, thread_id, scroll);
@@ -3383,6 +3461,14 @@ impl Controller {
     // --- settings --------------------------------------------------------------
 
     async fn refresh_settings(&mut self) {
+        match self.client.skills_settings().await {
+            Ok(settings) => {
+                ui::set_builtin_skills_enabled(&self.ui, settings.builtin_skills_enabled)
+            }
+            Err(e) => {
+                ui::set_settings_status(&self.ui, format!("failed to load skill settings: {e:#}"));
+            }
+        }
         if let Ok(gh) = self.client.github_integration().await {
             self.apply_github_integration(gh);
             self.push_github_integration();
@@ -3436,16 +3522,22 @@ impl Controller {
             providers
                 .providers
                 .into_iter()
-                .map(|p| {
-                    (
-                        p.id,
-                        p.kind,
-                        p.base_url.unwrap_or_default(),
-                        p.has_credentials,
-                        p.auth,
-                        p.category,
-                        p.experimental,
-                    )
+                .map(|p| ui::ProviderSettingsView {
+                    id: p.id,
+                    kind: p.kind,
+                    base_url: p.base_url.unwrap_or_default(),
+                    has_credentials: p.has_credentials,
+                    auth: p.auth,
+                    category: p.category,
+                    experimental: p.experimental,
+                    capability_mode: match p.capability_mode {
+                        trouve_protocol::ProviderCapabilityMode::Authoritative => {
+                            "authoritative".to_string()
+                        }
+                        trouve_protocol::ProviderCapabilityMode::Compatibility => {
+                            "compatibility".to_string()
+                        }
+                    },
                 })
                 .collect(),
             model_ids.clone(),
@@ -4078,8 +4170,13 @@ impl Controller {
                 "you're offline with no local models"
             };
             match &command {
-                UiCommand::SendMessage(_)
-                | UiCommand::StartNewChat { .. }
+                UiCommand::SendMessage(text)
+                    if self.server_unreachable || self.action_invocation(text).is_none() =>
+                {
+                    self.error(&format!("Can't do that right now — {reason}."));
+                    return Ok(());
+                }
+                UiCommand::StartNewChat { .. }
                 | UiCommand::QueueEdit { .. }
                 | UiCommand::QueueDelete(_)
                 | UiCommand::QueueMove { .. }
@@ -4359,6 +4456,39 @@ impl Controller {
             }
             UiCommand::SendMessage(text) => {
                 if let Some(thread_id) = self.current_thread_id() {
+                    if let Some((name, arguments)) = self.action_invocation(&text) {
+                        if !self.pending_attachments.is_empty() {
+                            self.error(
+                                "Attachments cannot be sent with a Trouve action command; remove them or send a model prompt.",
+                            );
+                            return Ok(());
+                        }
+                        let result = self
+                            .client
+                            .execute_command(&thread_id, &name, &arguments)
+                            .await?;
+                        let refresh_thread =
+                            matches!(result.name.as_str(), "mode" | "model" | "permissions");
+                        let refresh_session = result.name == "rename";
+                        let refresh_diff = matches!(result.name.as_str(), "undo" | "redo");
+                        self.apply_command_action(result.action).await?;
+                        if refresh_thread
+                            && let (Some(session_index), Some(thread_id)) =
+                                (self.current_session, self.current_thread_id())
+                        {
+                            if let Some(session_id) = self.current_session_id() {
+                                self.resume.session_threads.insert(session_id, thread_id);
+                            }
+                            self.reload_session(session_index).await?;
+                        }
+                        if refresh_session {
+                            self.reload_sessions().await?;
+                        }
+                        if refresh_diff {
+                            self.refresh_diff().await?;
+                        }
+                        return Ok(());
+                    }
                     let uploads = std::mem::take(&mut self.pending_attachments);
                     self.push_attachments();
                     if let Err(e) = self
@@ -5002,7 +5132,7 @@ impl Controller {
                 }
             }
             UiCommand::OpenIntegrationsSettings => {
-                ui::set_settings_section(&self.ui, 3);
+                ui::set_settings_section(&self.ui, 4);
                 self.refresh_settings().await;
                 self.refresh_mcp();
                 self.refresh_subscriptions(SubscriptionRefresh::IfStale);
@@ -5336,6 +5466,23 @@ impl Controller {
                         Err(e) => {
                             ui::set_settings_status(&self.ui, format!("{e:#}"));
                         }
+                    }
+                }
+            }
+            UiCommand::BuiltinSkillsToggled(enabled) => {
+                match self.client.set_builtin_skills_enabled(enabled).await {
+                    Ok(()) => ui::set_settings_status(
+                        &self.ui,
+                        if enabled {
+                            "Trouve built-in skills enabled".into()
+                        } else {
+                            "Trouve built-in skills disabled; user and workspace skills remain enabled"
+                                .into()
+                        },
+                    ),
+                    Err(e) => {
+                        ui::set_settings_status(&self.ui, format!("saving skill settings: {e:#}"));
+                        self.refresh_settings().await;
                     }
                 }
             }
@@ -6627,6 +6774,18 @@ fn render_command_line(command: &str, args: &[String]) -> String {
         .join(" ")
 }
 
+/// Keep the model's stable id visible while disclosing providers whose
+/// native tools cannot yet be suppressed. Selection still uses the aligned
+/// `ModelInfo` list, so this label is presentation-only.
+fn model_picker_label(model_id: &str, compatibility_providers: &HashSet<String>) -> String {
+    let provider_id = model_id.split_once('/').map_or(model_id, |(id, _)| id);
+    if compatibility_providers.contains(provider_id) {
+        format!("{model_id}  ⚠ mixed tools")
+    } else {
+        model_id.to_string()
+    }
+}
+
 /// Split the MCP form's command line and KEY=VALUE env block.
 #[allow(clippy::type_complexity)]
 fn parse_mcp_form(
@@ -6961,11 +7120,14 @@ fn should_open_chat_at_tail(force_tail: bool, turn_running: bool, has_queue: boo
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashSet;
+
     use super::{
         SubscriptionRefresh, SubscriptionRefreshState, approval_pill, attention_badge, check_pill,
         classify_pr, download_progress, format_pr_dashboard_refresh_status, human_age, human_rate,
-        merge_pill, model_health_view, pr_badge, project_session_prs, reconcile_pr_group_order,
-        reconcile_workspace_order, reorder_id, should_open_chat_at_tail, thinking_property,
+        merge_pill, model_health_view, model_picker_label, pr_badge, project_session_prs,
+        reconcile_pr_group_order, reconcile_workspace_order, reorder_id, should_open_chat_at_tail,
+        thinking_property,
     };
     use chrono::{Duration, TimeZone, Utc};
     use trouve_protocol::{
@@ -7474,6 +7636,19 @@ mod tests {
                     SubscriptionRefresh::IfStale
                 )
                 .is_some()
+        );
+    }
+
+    #[test]
+    fn model_picker_discloses_compatibility_providers() {
+        let providers = HashSet::from(["cursor".to_string()]);
+        assert_eq!(
+            model_picker_label("cursor/auto", &providers),
+            "cursor/auto  ⚠ mixed tools"
+        );
+        assert_eq!(
+            model_picker_label("codex/gpt-5.4", &providers),
+            "codex/gpt-5.4"
         );
     }
 }

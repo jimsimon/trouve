@@ -48,6 +48,11 @@ pub struct Config {
     /// active. Unset means enabled.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub local_enabled: Option<bool>,
+    /// Whether Trouve's compiled-in skills are exposed to agents and slash
+    /// command completion. Unset means enabled. User and workspace skills
+    /// remain available when this is disabled.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub builtin_skills_enabled: Option<bool>,
     /// Client id of a GitHub OAuth app (with device flow enabled) for
     /// "Sign in with GitHub" on github.com. Unset uses the built-in shared
     /// Trouve app (`github::DEFAULT_CLIENT_ID`); set it to route sign-in
@@ -115,9 +120,10 @@ pub struct ProviderConfig {
     /// stub binaries.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub command: Option<String>,
-    /// Claude Code only: disable the vendor's built-in tools and bridge
-    /// trouve's ToolExecutor in over MCP (full trouve tool/permission
-    /// fidelity), served from the engine's embedded HTTP MCP endpoint.
+    /// Whether a CLI-backed provider should use Trouve's full tool surface.
+    /// Defaults to true for Claude and Codex. Setting false opts into the
+    /// vendor's compatibility surface. Cursor can bridge the tools but cannot
+    /// yet suppress its built-ins, so it remains non-authoritative either way.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_bridge: Option<bool>,
 }
@@ -141,6 +147,13 @@ fn default_kind() -> String {
 }
 
 impl Config {
+    /// Built-in skills are an enabled-by-default capability. Keeping the
+    /// stored value optional preserves the default for existing configs
+    /// without rewriting them merely because another setting changed.
+    pub fn builtin_skills_enabled(&self) -> bool {
+        self.builtin_skills_enabled.unwrap_or(true)
+    }
+
     pub fn load() -> Self {
         Self::load_from(&config_path())
     }
@@ -232,5 +245,26 @@ mod tests {
         assert_eq!(cfg.default_model.as_deref(), Some("openai/gpt"));
         assert_eq!(cfg.default_thinking_level.as_deref(), Some("high"));
         cfg.save_to(&path).unwrap();
+    }
+
+    #[test]
+    fn builtin_skills_default_on_and_round_trip_when_disabled() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("config.toml");
+
+        let default = Config::default();
+        assert!(default.builtin_skills_enabled());
+
+        let mut disabled = default;
+        disabled.builtin_skills_enabled = Some(false);
+        disabled.save_to(&path).unwrap();
+
+        let loaded = Config::load_from(&path);
+        assert!(!loaded.builtin_skills_enabled());
+        assert!(
+            std::fs::read_to_string(path)
+                .unwrap()
+                .contains("builtin_skills_enabled = false")
+        );
     }
 }
