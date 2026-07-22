@@ -112,6 +112,17 @@ pub struct Workspace {
 
 // --- sessions ------------------------------------------------------------
 
+/// The collaboration shape hosted by a session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionKind {
+    /// A user working with one or more independent threads.
+    #[default]
+    Solo,
+    /// A durable, role-based group of agents collaborating on one goal.
+    Team,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct CreateSessionRequest {
     pub workspace_id: WorkspaceId,
@@ -142,6 +153,12 @@ pub struct Session {
     /// Absolute path of the session worktree.
     pub worktree_path: String,
     pub base_ref: String,
+    /// Solo chat or role-based agent team.
+    #[serde(default)]
+    pub kind: SessionKind,
+    /// Number of agents in a team session; zero for solo sessions.
+    #[serde(default)]
+    pub team_member_count: u32,
     /// Archived sessions are hidden from default listings but keep their
     /// worktree and history.
     #[serde(default)]
@@ -151,6 +168,150 @@ pub struct Session {
     #[serde(default)]
     pub active: bool,
     pub created_at: chrono::DateTime<chrono::Utc>,
+}
+
+// --- teams ---------------------------------------------------------------
+
+/// Lifecycle state for a team session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum TeamStatus {
+    #[default]
+    Active,
+    Paused,
+    Completed,
+    Cancelled,
+}
+
+/// Current scheduling state for one team member.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum TeamMemberState {
+    #[default]
+    Idle,
+    Queued,
+    Running,
+    Failed,
+}
+
+/// Author category for a message in the shared team timeline.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum TeamAuthorKind {
+    Human,
+    Agent,
+    System,
+}
+
+/// A resolved teammate mention. Handles are display data; ids are stable.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct TeamMention {
+    pub member_id: String,
+    pub handle: String,
+}
+
+/// One role-backed agent in a team session.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct TeamMember {
+    pub id: String,
+    pub session_id: SessionId,
+    /// Unique, mentionable handle without the leading `@`.
+    pub handle: String,
+    pub display_name: String,
+    pub role: String,
+    pub thread_id: ThreadId,
+    pub mode: String,
+    pub model: String,
+    pub state: TeamMemberState,
+    /// Aggregate usage for this member's backing thread.
+    #[serde(default)]
+    pub usage: crate::Usage,
+}
+
+/// A canonical entry in the shared team timeline.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct TeamMessage {
+    pub id: String,
+    pub session_id: SessionId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub author_member_id: Option<String>,
+    pub author_handle: String,
+    pub author_kind: TeamAuthorKind,
+    pub content: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub mentions: Vec<TeamMention>,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+}
+
+/// Current durable snapshot of a team session.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct Team {
+    pub session_id: SessionId,
+    /// Latest session event included in this snapshot. Clients resume the
+    /// session stream strictly after this cursor.
+    #[serde(default)]
+    pub snapshot_cursor: u64,
+    pub goal: String,
+    pub status: TeamStatus,
+    pub orchestrator_member_id: String,
+    pub members: Vec<TeamMember>,
+    pub messages: Vec<TeamMessage>,
+    pub max_turns: u64,
+    pub turns_used: u64,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+}
+
+/// One role in a server-provided team template.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct TeamTemplateMember {
+    pub handle: String,
+    pub display_name: String,
+    pub role: String,
+    pub mode: String,
+}
+
+/// A discoverable starting configuration for a team.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct TeamTemplate {
+    pub id: String,
+    pub name: String,
+    pub description: String,
+    pub members: Vec<TeamTemplateMember>,
+}
+
+/// Create a role-based team and enqueue its goal for the orchestrator.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct CreateTeamRequest {
+    pub workspace_id: WorkspaceId,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub base_ref: Option<String>,
+    /// Fetch the base branch's configured upstream before creating the team
+    /// session. Refs without an upstream are used as-is.
+    #[serde(default = "default_true")]
+    pub fetch_latest: bool,
+    pub goal: String,
+    /// Server-provided template id; defaults to `software_delivery`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub template_id: Option<String>,
+    /// Optional model override applied to every initial member.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    /// Model-specific options applied to every initial member.
+    #[serde(default, skip_serializing_if = "serde_json::Map::is_empty")]
+    pub model_options: serde_json::Map<String, serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub permission_mode: Option<PermissionMode>,
+    /// Safety budget across automatically delivered team turns.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_turns: Option<u64>,
+}
+
+/// Post a human-authored message to a team timeline.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct PostTeamMessageRequest {
+    pub content: String,
 }
 
 /// Partial session update (rename / archive). Omitted fields are unchanged.

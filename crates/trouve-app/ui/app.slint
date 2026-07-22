@@ -38,6 +38,9 @@ export struct NavRow {
     kind: int,
     title: string,
     subtitle: string,
+    // 0 solo, 1 team; team-count backs the compact session pill.
+    session-kind: int,
+    team-count: int,
     // Stable workspace identity and position (kind 0 only).
     workspace-id: string,
     workspace-position: int,
@@ -61,6 +64,18 @@ export struct NavRow {
     attention-tooltip: string,
     // Workspace headers: this workspace shows its archived sessions.
     show-archived: bool,
+    // Workspace session-kind filter: 0 all, 1 solo, 2 teams.
+    session-filter: int,
+}
+
+export struct TeamAgentItem {
+    thread-id: string,
+    handle: string,
+    name: string,
+    role: string,
+    model: string,
+    status: string,
+    usage: string,
 }
 
 export struct ThreadTabItem {
@@ -1034,6 +1049,7 @@ component PromptBox inherits Rectangle {
 // worktree, so the form renders inside the session's tab strip).
 component NewChatForm inherits VerticalLayout {
     in property <bool> session-form;
+    in-out property <bool> team-form: false;
     in property <[string]> workspaces;
     in-out property <int> workspace-index;
     in property <[string]> branches;
@@ -1059,7 +1075,7 @@ component NewChatForm inherits VerticalLayout {
     in property <bool> blocked-severe;
     in property <string> offline-warning;
     in property <string> online-notice;
-    callback start(int, int, bool, int, int, int, int, string);
+    callback start(int, int, bool, int, int, int, int, bool, string);
     callback cancel();
     callback workspace-changed(int);
     callback register-workspace(string);
@@ -1077,14 +1093,18 @@ component NewChatForm inherits VerticalLayout {
     alignment: center;
 
     Text {
-        text: root.session-form ? "New session" : "New thread";
+        text: root.session-form
+            ? (root.team-form ? "New agent team" : "New session")
+            : "New thread";
         color: Theme.c.text-hi;
         font-size: Theme.fs(22px);
         font-weight: 700;
     }
     Text {
         text: root.session-form
-            ? "Pick where to work, what to branch from, and how the agent should run."
+            ? (root.team-form
+                ? "Give a role-based team a shared goal. Its agents coordinate through @mentions."
+                : "Pick where to work, what to branch from, and how the agent should run.")
             : "Threads share the session worktree; pick the agent setup for this one.";
         color: Theme.c.text-dim;
         font-size: Theme.fs(13px);
@@ -1128,6 +1148,46 @@ component NewChatForm inherits VerticalLayout {
 
     if root.session-form: VerticalLayout {
         spacing: 6px;
+        Text { text: "Chat type"; color: Theme.c.text-mid; font-size: Theme.fs(12px); font-weight: 700; }
+        HorizontalLayout {
+            spacing: 6px;
+            Rectangle {
+                horizontal-stretch: 1;
+                height: Theme.fs(32px);
+                border-radius: 6px;
+                border-width: 1px;
+                border-color: !root.team-form ? Theme.c.primary-border : Theme.c.border;
+                background: !root.team-form ? Theme.c.accent-bg : Theme.c.control-bg;
+                TouchArea { clicked => { root.team-form = false; } }
+                Text {
+                    text: "Solo";
+                    color: Theme.c.text-hi;
+                    font-size: Theme.fs(12px);
+                    horizontal-alignment: center;
+                    vertical-alignment: center;
+                }
+            }
+            Rectangle {
+                horizontal-stretch: 1;
+                height: Theme.fs(32px);
+                border-radius: 6px;
+                border-width: 1px;
+                border-color: root.team-form ? Theme.c.primary-border : Theme.c.border;
+                background: root.team-form ? Theme.c.accent-bg : Theme.c.control-bg;
+                TouchArea { clicked => { root.team-form = true; } }
+                Text {
+                    text: "Agent team";
+                    color: Theme.c.text-hi;
+                    font-size: Theme.fs(12px);
+                    horizontal-alignment: center;
+                    vertical-alignment: center;
+                }
+            }
+        }
+    }
+
+    if root.session-form: VerticalLayout {
+        spacing: 6px;
         Text { text: "Base branch"; color: Theme.c.text-mid; font-size: Theme.fs(12px); font-weight: 700; }
         ComboBox {
             height: Theme.fs(30px);
@@ -1145,7 +1205,7 @@ component NewChatForm inherits VerticalLayout {
 
     HorizontalLayout {
         spacing: 12px;
-        VerticalLayout {
+        if !root.team-form: VerticalLayout {
             spacing: 6px;
             horizontal-stretch: 1;
             Text { text: "Agent mode"; color: Theme.c.text-mid; font-size: Theme.fs(12px); font-weight: 700; }
@@ -1231,20 +1291,22 @@ component NewChatForm inherits VerticalLayout {
 
     VerticalLayout {
         spacing: 6px;
-        Text { text: "First message"; color: Theme.c.text-mid; font-size: Theme.fs(12px); font-weight: 700; }
+        Text { text: root.team-form ? "Team goal" : "First message"; color: Theme.c.text-mid; font-size: Theme.fs(12px); font-weight: 700; }
         prompt-edit := PromptBox {
             paste-image-attempted => { root.paste-image-attempted() }
             placeholder: root.blocked && root.blocked-severe
                 ? "Server unavailable — prompts are disabled"
                 : root.blocked
                 ? "Offline — prompts are disabled"
+                : root.team-form
+                ? "What should the team accomplish?  (Shift+Enter for a new line)"
                 : "What should the agent do?  (Shift+Enter for a new line)";
             enabled: !root.blocked;
             submitted(text) => {
                 if (!root.blocked && (!root.session-form || root.workspace-index >= 0)) {
                     root.start(root.workspace-index, root.branch-index,
                         root.use-latest-remote, root.mode-index, root.model-index, root.thinking-index,
-                        root.permission-index, text);
+                        root.permission-index, root.team-form, text);
                     self.text = "";
                 }
             }
@@ -1275,14 +1337,16 @@ component NewChatForm inherits VerticalLayout {
             clicked => { root.attach-file(); }
         }
         Button {
-            text: root.session-form ? "Start session" : "Start thread";
+            text: root.session-form
+                ? (root.team-form ? "Start team" : "Start session")
+                : "Start thread";
             primary: true;
             enabled: (prompt-edit.text != "" || root.attachments.length > 0) && !root.blocked
                 && (!root.session-form || root.workspace-index >= 0);
             clicked => {
                 root.start(root.workspace-index, root.branch-index,
                     root.use-latest-remote, root.mode-index, root.model-index, root.thinking-index,
-                    root.permission-index, prompt-edit.text);
+                    root.permission-index, root.team-form, prompt-edit.text);
                 prompt-edit.text = "";
             }
         }
@@ -1423,6 +1487,7 @@ export component AppWindow inherits Window {
     // Session-list filters (controller owns the state).
     // Per-workspace: the row is the workspace header the funnel lives on.
     callback archived-filter-toggled(/* nav row */ int);
+    callback session-kind-filter-picked(/* nav row */ int, /* 0 all, 1 solo, 2 teams */ int);
 
     // Rename/delete modal state (UI-local; -1 = closed).
     in-out property <int> rename-row: -1;
@@ -1632,9 +1697,10 @@ export component AppWindow inherits Window {
     in property <int> file-sel-from: -1;
     in property <int> file-sel-to: -1;
     in property <int> file-sel-seq: 0;
-    // Right-panel view (0 diff, 1 files, 2 pull requests, 3 mcp,
-    // 4 terminal, 5 conditional todos); the controller flips it when a chat
-    // click opens a file, and watches it to lazily attach the terminal.
+    // Right-panel tab (0 diff, 1 files, 2 pull requests, 3 mcp,
+    // 4 terminal, 5 agents for team sessions, 6 conditional todos); the
+    // controller flips it when a chat click opens a file and lazily attaches
+    // the terminal.
     in-out property <int> right-tab: 0;
     callback right-tab-changed(int);
     changed right-tab => { root.right-tab-changed(root.right-tab); }
@@ -1814,8 +1880,21 @@ export component AppWindow inherits Window {
     callback register-workspace-path(string);
     callback start-new-chat(/* ws */ int, /* branch */ int, /* fetch */ bool, /* mode */ int,
                             /* model */ int, /* thinking */ int,
-                            /* permission */ int, /* prompt */ string);
+                            /* permission */ int, /* team */ bool, /* prompt */ string);
+    in-out property <bool> nc-team: false;
     callback cancel-new-chat();
+
+    // --- team session ---------------------------------------------------------
+    in property <bool> team-session: false;
+    in property <bool> team-viewing: false;
+    in property <string> team-goal: "";
+    // 0 active, 1 paused, 2 completed, 3 cancelled.
+    in property <int> team-status: 0;
+    in property <int> team-turns: 0;
+    in property <int> team-max-turns: 0;
+    in property <[TeamAgentItem]> team-agents;
+    callback team-status-action(/* 0 pause/resume, 1 complete, 2 cancel */ int);
+    callback team-agent-opened(/* backing thread id */ string);
 
     // --- right column -------------------------------------------------------
     in property <[DiffRow]> diff-rows;
@@ -2338,7 +2417,7 @@ export component AppWindow inherits Window {
                             x: parent.width - 190px;
                             y: 32px;
                             width: 180px;
-                            height: Theme.fs(24px) + Theme.fs(60px) + 16px;
+                            height: Theme.fs(24px) + 5 * Theme.fs(30px) + 16px;
                             Rectangle {
                                 background: Theme.c.popup-bg;
                                 border-radius: 6px;
@@ -2354,6 +2433,35 @@ export component AppWindow inherits Window {
                                             color: Theme.c.text-soft;
                                             font-size: Theme.fs(11px);
                                             vertical-alignment: center;
+                                        }
+                                    }
+                                    for option[i] in ["All sessions", "Solo", "Teams"]: Rectangle {
+                                        height: Theme.fs(30px);
+                                        background: kind-filter-ta.has-hover
+                                            ? Theme.c.accent-bg : transparent;
+                                        border-radius: 4px;
+                                        kind-filter-ta := TouchArea {
+                                            clicked => {
+                                                root.session-kind-filter-picked(idx, i);
+                                            }
+                                        }
+                                        HorizontalLayout {
+                                            padding-left: 8px;
+                                            padding-right: 8px;
+                                            Text {
+                                                text: option;
+                                                color: Theme.c.text;
+                                                font-size: Theme.fs(12px);
+                                                vertical-alignment: center;
+                                                horizontal-stretch: 1;
+                                            }
+                                            Text {
+                                                text: row.session-filter == i ? "●" : "○";
+                                                color: row.session-filter == i
+                                                    ? Theme.c.accent : Theme.c.text-soft;
+                                                font-size: Theme.fs(11px);
+                                                vertical-alignment: center;
+                                            }
                                         }
                                     }
                                     Rectangle {
@@ -2520,7 +2628,9 @@ export component AppWindow inherits Window {
                                 border-radius: 5px;
                                 icon: "⋯";
                                 icon-size: Theme.fs(16px);
-                                tip: "Workspace actions";
+                                icon-color: row.show-archived || row.session-filter != 0
+                                    ? Theme.c.accent : Theme.c.text-soft;
+                                tip: "Workspace actions and session filters";
                                 clicked => { filter-menu.show(); }
                             }
                             IconButton {
@@ -2614,11 +2724,33 @@ export component AppWindow inherits Window {
                                 padding-top: 8px;
                                 spacing: 2px;
                                 horizontal-stretch: 1;
-                                Text {
-                                    text: row.title;
-                                    color: row.archived ? Theme.c.text-soft : Theme.c.text-hi;
-                                    font-size: Theme.fs(13px);
-                                    overflow: elide;
+                                HorizontalLayout {
+                                    spacing: 6px;
+                                    Text {
+                                        text: row.title;
+                                        color: row.archived ? Theme.c.text-soft : Theme.c.text-hi;
+                                        font-size: Theme.fs(13px);
+                                        overflow: elide;
+                                        horizontal-stretch: 1;
+                                    }
+                                    if row.session-kind == 1: Rectangle {
+                                        width: team-pill-text.preferred-width + 12px;
+                                        height: Theme.fs(18px);
+                                        border-radius: 9px;
+                                        background: Theme.c.hover-strong;
+                                        border-width: 1px;
+                                        border-color: Theme.c.border;
+                                        team-pill-text := Text {
+                                            width: 100%;
+                                            height: 100%;
+                                            text: "Team · " + row.team-count;
+                                            color: Theme.c.text-mid;
+                                            font-size: Theme.fs(10px);
+                                            font-weight: 700;
+                                            horizontal-alignment: center;
+                                            vertical-alignment: center;
+                                        }
+                                    }
                                 }
                                 Text {
                                     text: row.subtitle;
@@ -2769,7 +2901,7 @@ export component AppWindow inherits Window {
                             }
                         }
                     }
-                    IconButton {
+                    if !root.team-session: IconButton {
                         width: 30px;
                         height: Theme.fs(30px);
                         border-radius: 6px;
@@ -2813,6 +2945,7 @@ export component AppWindow inherits Window {
                     width: 100%;
                     height: 100%;
                     session-form: false;
+                    team-form: false;
                     modes: root.modes;
                     mode-model-indices: root.mode-model-indices;
                     mode-index <=> root.nc-mode-index;
@@ -2832,8 +2965,8 @@ export component AppWindow inherits Window {
                     attach-file => { root.attach-file(); }
                     attachment-removed(i) => { root.attachment-removed(i); }
                     paste-image-attempted => { root.paste-image-attempted() }
-                    start(ws, br, fetch, mode, model, thinking, permission, prompt) => {
-                        root.start-new-chat(ws, br, fetch, mode, model, thinking, permission, prompt);
+                    start(ws, br, fetch, mode, model, thinking, permission, team, prompt) => {
+                        root.start-new-chat(ws, br, fetch, mode, model, thinking, permission, team, prompt);
                     }
                     cancel => { root.cancel-new-chat(); }
                     model-filter(q) => { root.model-filter-changed(q); }
@@ -3823,7 +3956,7 @@ export component AppWindow inherits Window {
                 // Only the chat list above stretches; the composer sticks
                 // to its preferred height. Removed (not just hidden) while
                 // the new-thread form is up so it doesn't reserve space.
-                if root.center-screen == 0: VerticalLayout {
+                if root.center-screen == 0 && (!root.team-session || root.team-viewing): VerticalLayout {
                     spacing: 6px;
                     vertical-stretch: 0;
 
@@ -3837,7 +3970,7 @@ export component AppWindow inherits Window {
                     // Queued prompts: waiting their turn behind the running
                     // one. Edit in place, reorder with the arrows, delete,
                     // or — when the thread is idle — kick the queue off.
-                    if root.queue-prompts.length > 0: Rectangle {
+                    if !root.team-viewing && root.queue-prompts.length > 0: Rectangle {
                         vertical-stretch: 0;
                         background: Theme.c.surface;
                         border-radius: 8px;
@@ -4100,7 +4233,7 @@ export component AppWindow inherits Window {
                     // Files staged for the next prompt: one removable chip
                     // each. Kept above the input so pasting a screenshot has
                     // visible, undoable feedback before sending.
-                    if root.composer-attachments.length > 0: Flickable {
+                    if !root.team-viewing && root.composer-attachments.length > 0: Flickable {
                         height: Theme.fs(26px);
                         viewport-height: self.height;
                         HorizontalLayout {
@@ -4152,6 +4285,8 @@ export component AppWindow inherits Window {
                             ? "Server unavailable — prompts are disabled"
                             : root.connectivity-blocked
                             ? "Offline — prompts are disabled"
+                            : root.team-viewing
+                            ? "Message the team… use @handles to address agents"
                             : "Message the agent…  (Shift+Enter for a new line)";
                         enabled: root.composer-enabled && !root.connectivity-blocked;
                         completion-active: root.slash-active && !root.slash-suppressed;
@@ -4216,7 +4351,7 @@ export component AppWindow inherits Window {
                     composer-controls := HorizontalLayout {
                     spacing: 8px;
                     vertical-stretch: 0;
-                    VerticalLayout {
+                    if !root.team-viewing: VerticalLayout {
                         spacing: 2px;
                         Text { text: "Mode"; color: Theme.c.text-faint; font-size: Theme.fs(10px); }
                         DropUpPicker {
@@ -4228,7 +4363,7 @@ export component AppWindow inherits Window {
                             changed(i) => { root.composer-mode-changed(i); }
                         }
                     }
-                    VerticalLayout {
+                    if !root.team-viewing: VerticalLayout {
                         spacing: 2px;
                         Text { text: "Model"; color: Theme.c.text-faint; font-size: Theme.fs(10px); }
                         SearchPicker {
@@ -4243,7 +4378,8 @@ export component AppWindow inherits Window {
                             filter-edited(q) => { root.model-filter-changed(q); }
                         }
                     }
-                    if root.model-index >= 0 && root.model-index < root.model-health.length
+                    if !root.team-viewing
+                        && root.model-index >= 0 && root.model-index < root.model-health.length
                         && root.model-health[root.model-index].summary != "": VerticalLayout {
                         spacing: 2px;
                         Text { text: "Subscription"; color: Theme.c.text-faint; font-size: Theme.fs(10px); }
@@ -4253,7 +4389,7 @@ export component AppWindow inherits Window {
                             tone: root.model-health[root.model-index].tone;
                         }
                     }
-                    if root.thinking-options.length > 0: VerticalLayout {
+                    if !root.team-viewing && root.thinking-options.length > 0: VerticalLayout {
                         spacing: 2px;
                         Text { text: "Thinking"; color: Theme.c.text-faint; font-size: Theme.fs(10px); }
                         DropUpPicker {
@@ -4265,7 +4401,7 @@ export component AppWindow inherits Window {
                             changed(i) => { root.composer-thinking-changed(i); }
                         }
                     }
-                    VerticalLayout {
+                    if !root.team-viewing: VerticalLayout {
                         spacing: 2px;
                         Text {
                             text: "Permissions";
@@ -4296,7 +4432,7 @@ export component AppWindow inherits Window {
                             }
                         }
                     }
-                    if root.context-options.length > 0: VerticalLayout {
+                    if !root.team-viewing && root.context-options.length > 0: VerticalLayout {
                         spacing: 2px;
                         Text { text: "Context"; color: Theme.c.text-faint; font-size: Theme.fs(10px); }
                         DropUpPicker {
@@ -4308,7 +4444,7 @@ export component AppWindow inherits Window {
                             changed(i) => { root.composer-context-changed(i); }
                         }
                     }
-                    if root.fast-visible: VerticalLayout {
+                    if !root.team-viewing && root.fast-visible: VerticalLayout {
                         spacing: 2px;
                         Text { text: "Fast"; color: Theme.c.text-faint; font-size: Theme.fs(10px); }
                         Rectangle {
@@ -4335,7 +4471,7 @@ export component AppWindow inherits Window {
                         }
                     }
                     Rectangle { horizontal-stretch: 1; }
-                    VerticalLayout {
+                    if !root.team-viewing: VerticalLayout {
                         spacing: 2px;
                         Text { text: " "; font-size: Theme.fs(10px); }
                         IconButton {
@@ -4349,7 +4485,7 @@ export component AppWindow inherits Window {
                         }
                     }
                     // Context usage dial; indeterminate while compacting.
-                    VerticalLayout {
+                    if !root.team-viewing: VerticalLayout {
                         spacing: 2px;
                         Text { text: " "; font-size: Theme.fs(10px); }
                     dial := Rectangle {
@@ -4390,7 +4526,7 @@ export component AppWindow inherits Window {
                         }
                     }
                     }
-                    Text {
+                    if !root.team-viewing: Text {
                         text: root.usage-text;
                         color: Theme.c.text-soft;
                         font-size: Theme.fs(11px);
@@ -4408,6 +4544,7 @@ export component AppWindow inherits Window {
             // ----- new-session screen (no session context to keep) -----
             if root.center-screen == 1: NewChatForm {
                 session-form: true;
+                team-form <=> root.nc-team;
                 workspaces: root.nc-workspaces;
                 workspace-index <=> root.nc-workspace-index;
                 branches: root.nc-branches;
@@ -4433,8 +4570,8 @@ export component AppWindow inherits Window {
                 attach-file => { root.attach-file(); }
                 attachment-removed(i) => { root.attachment-removed(i); }
                 paste-image-attempted => { root.paste-image-attempted() }
-                start(ws, br, fetch, mode, model, thinking, permission, prompt) => {
-                    root.start-new-chat(ws, br, fetch, mode, model, thinking, permission, prompt);
+                start(ws, br, fetch, mode, model, thinking, permission, team, prompt) => {
+                    root.start-new-chat(ws, br, fetch, mode, model, thinking, permission, team, prompt);
                 }
                 cancel => { root.cancel-new-chat(); }
                 workspace-changed(i) => { root.nc-workspace-changed(i); }
@@ -4467,14 +4604,14 @@ export component AppWindow inherits Window {
                         padding-right: 6px;
                         Rectangle { horizontal-stretch: 1; }
                         PillButton {
-                            label: root.right-tab == 5 ? "← Diff" : "Todos  " + root.todo-progress;
-                            primary: root.right-tab == 5;
-                            clicked => { root.right-tab = root.right-tab == 5 ? 0 : 5; }
+                            label: root.right-tab == 6 ? "← Diff" : "Todos  " + root.todo-progress;
+                            primary: root.right-tab == 6;
+                            clicked => { root.right-tab = root.right-tab == 6 ? 0 : 6; }
                         }
                     }
                 }
 
-            if root.right-tab != 5: TabWidget {
+            if root.right-tab != 6: TabWidget {
                 vertical-stretch: 1;
                 current-index <=> root.right-tab;
                 Tab {
@@ -5111,8 +5248,165 @@ export component AppWindow inherits Window {
                         }
                     }
                 }
+                Tab {
+                    // Slint's built-in TabWidget has a static child list; an
+                    // empty title collapses this to its 32px minimum slot for
+                    // solo sessions, while team sessions expose Agents.
+                    title: root.team-session ? "Agents" : "";
+                    VerticalLayout {
+                        visible: root.team-session;
+                        padding: 10px;
+                        spacing: 10px;
+
+                        HorizontalLayout {
+                            spacing: 8px;
+                            Text {
+                                text: "Active team";
+                                color: Theme.c.text-hi;
+                                font-size: Theme.fs(14px);
+                                font-weight: 700;
+                                vertical-alignment: center;
+                                horizontal-stretch: 1;
+                            }
+                            Rectangle {
+                                width: team-status-label.preferred-width + 16px;
+                                height: Theme.fs(22px);
+                                border-radius: 11px;
+                                background: root.team-status == 0 ? Theme.c.diff-add-bg
+                                    : root.team-status == 1 ? Theme.c.warn-bg
+                                    : root.team-status == 2 ? Theme.c.accent-bg
+                                    : Theme.c.err-bg;
+                                team-status-label := Text {
+                                    width: 100%;
+                                    height: 100%;
+                                    text: root.team-status == 0 ? "Active"
+                                        : root.team-status == 1 ? "Paused"
+                                        : root.team-status == 2 ? "Completed" : "Cancelled";
+                                    color: root.team-status == 0 ? Theme.c.ok
+                                        : root.team-status == 1 ? Theme.c.warn
+                                        : root.team-status == 2 ? Theme.c.accent-tint
+                                        : Theme.c.err-soft;
+                                    font-size: Theme.fs(10px);
+                                    font-weight: 700;
+                                    horizontal-alignment: center;
+                                    vertical-alignment: center;
+                                }
+                            }
+                        }
+                        Text {
+                            text: root.team-goal;
+                            color: Theme.c.text-mid;
+                            font-size: Theme.fs(12px);
+                            wrap: word-wrap;
+                            max-height: 84px;
+                            overflow: elide;
+                        }
+                        Text {
+                            text: root.team-turns + " of " + root.team-max-turns
+                                + " automatic turns used";
+                            color: Theme.c.text-soft;
+                            font-size: Theme.fs(11px);
+                        }
+                        HorizontalLayout {
+                            spacing: 6px;
+                            Button {
+                                text: root.team-status == 1 && root.team-turns >= root.team-max-turns
+                                    ? "Budget exhausted"
+                                    : root.team-status == 1 ? "Resume" : "Pause";
+                                enabled: root.team-status == 0
+                                    || (root.team-status == 1
+                                        && root.team-turns < root.team-max-turns);
+                                clicked => { root.team-status-action(0); }
+                            }
+                            Button {
+                                text: "Complete";
+                                enabled: root.team-status == 0 || root.team-status == 1;
+                                clicked => { root.team-status-action(1); }
+                            }
+                            Button {
+                                text: "Cancel";
+                                enabled: root.team-status == 0 || root.team-status == 1;
+                                clicked => { root.team-status-action(2); }
+                            }
+                            Rectangle { horizontal-stretch: 1; }
+                        }
+                        Rectangle { height: 1px; background: Theme.c.border; }
+                        Text {
+                            text: "Roster";
+                            color: Theme.c.text-mid;
+                            font-size: Theme.fs(12px);
+                            font-weight: 700;
+                        }
+                        ScrollKeys {
+                            vertical-stretch: 1;
+                            target-y <=> team-roster.viewport-y;
+                            page: team-roster.visible-height;
+                            total: team-roster.viewport-height;
+                        team-roster := ListView {
+                            for agent in root.team-agents: Rectangle {
+                                height: agent-card.preferred-height + 16px;
+                                background: agent-ta.has-hover ? Theme.c.hover-bg : Theme.c.surface;
+                                border-radius: 7px;
+                                border-width: 1px;
+                                border-color: agent.status == "Failed" ? Theme.c.err : Theme.c.border;
+                                agent-ta := TouchArea {
+                                    clicked => { root.team-agent-opened(agent.thread-id); }
+                                }
+                                agent-card := VerticalLayout {
+                                    padding: 8px;
+                                    spacing: 4px;
+                                    HorizontalLayout {
+                                        spacing: 7px;
+                                        Text {
+                                            text: agent.handle;
+                                            color: Theme.c.accent;
+                                            font-size: Theme.fs(12px);
+                                            font-weight: 700;
+                                            vertical-alignment: center;
+                                        }
+                                        Text {
+                                            text: agent.name;
+                                            color: Theme.c.text-hi;
+                                            font-size: Theme.fs(12px);
+                                            vertical-alignment: center;
+                                            horizontal-stretch: 1;
+                                            overflow: elide;
+                                        }
+                                        Text {
+                                            text: agent.status;
+                                            color: agent.status == "Running" ? Theme.c.ok
+                                                : agent.status == "Failed" ? Theme.c.err
+                                                : agent.status == "Queued" ? Theme.c.warn
+                                                : Theme.c.text-soft;
+                                            font-size: Theme.fs(10px);
+                                            vertical-alignment: center;
+                                        }
+                                    }
+                                    Text {
+                                        text: agent.role;
+                                        color: Theme.c.text-mid;
+                                        font-size: Theme.fs(11px);
+                                        wrap: word-wrap;
+                                    }
+                                    Text {
+                                        text: agent.model + " · " + agent.usage;
+                                        color: Theme.c.text-soft;
+                                        font-size: Theme.fs(10px);
+                                        overflow: elide;
+                                    }
+                                    Text {
+                                        text: "Open transcript →";
+                                        color: Theme.c.accent;
+                                        font-size: Theme.fs(10px);
+                                    }
+                                }
+                            }
+                        }
+                        }
+                    }
+                }
             }
-                if root.right-tab == 5 && root.todos.length > 0: VerticalLayout {
+                if root.right-tab == 6 && root.todos.length > 0: VerticalLayout {
                         vertical-stretch: 1;
                         padding: 10px;
                         spacing: 8px;

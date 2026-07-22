@@ -13,22 +13,25 @@ use std::collections::{HashMap, HashSet};
 use anyhow::{Context, Result};
 use tokio::sync::mpsc;
 use trouve_client_core::client::ProtocolClient;
+use trouve_client_core::team_viewmodel::TeamViewModel;
 use trouve_client_core::viewmodel::ThreadViewModel;
 use trouve_protocol::{
-    AddLocalModelRequest, AgentMode, ApprovalDecision, CreateSessionRequest, CreateThreadRequest,
-    DirEntry, EventEnvelope, ModelInfo, PermissionMode, Session, Thread, TodoStatus,
-    UpdateSessionRequest, UpdateThreadRequest, UpsertModeRequest, UpsertProviderRequest, Workspace,
+    AddLocalModelRequest, AgentMode, ApprovalDecision, CreateSessionRequest, CreateTeamRequest,
+    CreateThreadRequest, DirEntry, EventEnvelope, ModelInfo, PermissionMode, Session, SessionKind,
+    TeamStatus, Thread, TodoStatus, UpdateSessionRequest, UpdateThreadRequest, UpsertModeRequest,
+    UpsertProviderRequest, Workspace,
 };
 
 use crate::render;
 use crate::ui::{self, NavRowData};
 
-/// Right-panel tab index of the integrated terminal (see app.slint's
-/// TabWidget order: Diff, Files, Pull Requests, MCP, Terminal).
+/// Right-panel tab indices (see app.slint's TabWidget order: Diff, Files,
+/// Pull Requests, MCP, Terminal, and the team-only Agents inspector).
 const TERMINAL_TAB: i32 = 4;
-/// Conditional Todos panel. It sits above the stable inspection TabWidget,
-/// so showing or hiding it never changes the indices above.
-const TODOS_TAB: i32 = 5;
+const AGENTS_TAB: i32 = 5;
+/// Conditional Todos panel. It sits outside the stable inspection TabWidget,
+/// after its team-only Agents slot, so showing it does not renumber tabs.
+const TODOS_TAB: i32 = 6;
 /// Fingerprint caching keeps unchanged PRs out of the detail query, making a
 /// 30-second account refresh sustainable while preserving a useful reserve.
 const PR_DASH_REFRESH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
@@ -116,6 +119,11 @@ pub enum UiCommand {
     CloseWorkspace {
         row: usize,
     },
+    /// All / Solo / Teams filter for one workspace's session list.
+    SetSessionKindFilter {
+        row: usize,
+        filter: i32,
+    },
     /// Quit once all running agent turns complete.
     QuitWhenIdle,
     /// Disarm a previously requested deferred quit.
@@ -171,6 +179,7 @@ pub enum UiCommand {
         model_idx: usize,
         thinking_idx: usize,
         permission_idx: usize,
+        team: bool,
         prompt: String,
     },
 
@@ -187,6 +196,8 @@ pub enum UiCommand {
     },
     SendMessage(String),
     CancelTurn,
+    TeamStatusAction(i32),
+    OpenTeamAgent(String),
     /// The "@" mention popup opened (or is filtering): refresh the worktree
     /// path list feeding it. Throttled per session by the controller.
     RefreshAtFiles,
@@ -519,6 +530,8 @@ pub enum UiCommand {
     /// Internal: threads were discovered for an active background session,
     /// so their streams can feed attention and unread-work badges.
     SessionThreadsLoaded(String, Result<Vec<Thread>, String>),
+    /// Internal: a session-scope team event arrived.
+    TeamEvent(String, Box<EventEnvelope>),
 }
 
 /// What a left-nav row maps back to.
@@ -548,6 +561,41 @@ struct NewChatSelection {
     model_idx: usize,
     thinking_idx: usize,
     permission_idx: usize,
+    team: bool,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+enum SessionKindFilter {
+    #[default]
+    All,
+    Solo,
+    Teams,
+}
+
+impl SessionKindFilter {
+    fn from_int(value: i32) -> Self {
+        match value {
+            1 => Self::Solo,
+            2 => Self::Teams,
+            _ => Self::All,
+        }
+    }
+
+    fn as_int(self) -> i32 {
+        match self {
+            Self::All => 0,
+            Self::Solo => 1,
+            Self::Teams => 2,
+        }
+    }
+
+    fn includes(self, session: &Session) -> bool {
+        match self {
+            Self::All => true,
+            Self::Solo => session.kind == SessionKind::Solo,
+            Self::Teams => session.kind == SessionKind::Team,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -617,6 +665,7 @@ struct Controller {
     /// Session-list filter: workspaces showing their archived sessions
     /// (each workspace header's funnel menu toggles its own entry).
     show_archived: HashSet<String>,
+    session_kind_filters: HashMap<String, SessionKindFilter>,
     /// Quit once every agent turn finishes (armed from the quit dialog).
     /// Shared with the UI callback so cancellation takes effect before its
     /// command can race a final session-activity event in this queue.
@@ -624,6 +673,11 @@ struct Controller {
 
     threads: Vec<Thread>,
     current_thread: Option<usize>,
+    /// Team sessions open on their canonical timeline; member transcript tabs
+    /// remain one click away for debugging.
+    team_viewing: bool,
+    team_vms: HashMap<String, TeamViewModel>,
+    team_followers: HashMap<String, tokio::task::JoinHandle<()>>,
 
     /// GitHub integration state (None until the first fetch answers).
     /// Any GitHub host (github.com or enterprise) has working auth —
@@ -879,9 +933,13 @@ pub async fn run(
         archived_expanded: HashSet::new(),
         collapsed_workspaces: HashSet::new(),
         show_archived: HashSet::new(),
+        session_kind_filters: HashMap::new(),
         quit_when_idle,
         threads: Vec::new(),
         current_thread: None,
+        team_viewing: false,
+        team_vms: HashMap::new(),
+        team_followers: HashMap::new(),
         github_configured: false,
         github_hosts: Vec::new(),
         download_rates: HashMap::new(),
@@ -1455,6 +1513,18 @@ impl Controller {
         self.unread_sessions.retain(|id| session_ids.contains(id));
         self.error_sessions.retain(|id| session_ids.contains(id));
         self.watched_sessions.retain(|id| session_ids.contains(id));
+        self.team_vms.retain(|id, _| session_ids.contains(id));
+        let stale_team_followers: Vec<String> = self
+            .team_followers
+            .keys()
+            .filter(|id| !session_ids.contains(*id))
+            .cloned()
+            .collect();
+        for id in stale_team_followers {
+            if let Some(task) = self.team_followers.remove(&id) {
+                task.abort();
+            }
+        }
         let stale_threads: Vec<String> = self
             .thread_sessions
             .iter()
@@ -1473,6 +1543,8 @@ impl Controller {
         if self.current_session.is_none() {
             self.threads.clear();
             self.current_thread = None;
+            self.team_viewing = false;
+            ui::set_team(&self.ui, None);
         }
         self.push_nav();
         // A session waiting on an agent can block on an approval/question in
@@ -1542,6 +1614,12 @@ impl Controller {
             kind: 1,
             title: session.title.clone(),
             subtitle: session.branch.clone(),
+            session_kind: if session.kind == SessionKind::Team {
+                1
+            } else {
+                0
+            },
+            team_count: session.team_member_count as i32,
             session_index: index as i32,
             selected: self.current_session == Some(index),
             archived,
@@ -1619,13 +1697,16 @@ impl Controller {
         let focused = self
             .window_focused
             .load(std::sync::atomic::Ordering::Relaxed);
-        let viewed = focused && self.current_thread_id().as_deref() == Some(thread_id);
-        if viewed {
-            return false;
-        }
         let Some(session_id) = self.thread_sessions.get(thread_id).cloned() else {
             return false;
         };
+        let viewed = focused
+            && (self.current_thread_id().as_deref() == Some(thread_id)
+                || (self.team_viewing
+                    && self.current_session_id().as_deref() == Some(&session_id)));
+        if viewed {
+            return false;
+        }
         let unread_changed = self.unread_sessions.insert(session_id.clone());
         let error_changed = failed && self.error_sessions.insert(session_id);
         unread_changed || error_changed
@@ -1643,6 +1724,11 @@ impl Controller {
             let ws = &self.workspaces[wi];
             let expanded = !self.collapsed_workspaces.contains(&ws.id);
             let show_archived = self.show_archived.contains(&ws.id);
+            let session_filter = self
+                .session_kind_filters
+                .get(&ws.id)
+                .copied()
+                .unwrap_or_default();
             rows.push(NavRowData {
                 kind: 0,
                 title: ws.name.clone(),
@@ -1651,6 +1737,7 @@ impl Controller {
                 workspace_count,
                 expanded,
                 show_archived,
+                session_filter: session_filter.as_int(),
                 ..Default::default()
             });
             nav.push(NavEntry::Workspace(wi));
@@ -1661,6 +1748,9 @@ impl Controller {
             let mut archived_count = 0;
             for (i, session) in self.sessions.iter().enumerate() {
                 if session.workspace_id != ws.id {
+                    continue;
+                }
+                if !session_filter.includes(session) {
                     continue;
                 }
                 if session.archived {
@@ -1681,7 +1771,10 @@ impl Controller {
                 nav.push(NavEntry::ArchivedToggle(ws.id.clone()));
                 if expanded {
                     for (i, session) in self.sessions.iter().enumerate() {
-                        if session.workspace_id != ws.id || !session.archived {
+                        if session.workspace_id != ws.id
+                            || !session.archived
+                            || !session_filter.includes(session)
+                        {
                             continue;
                         }
                         rows.push(self.session_nav_row(i, true));
@@ -1753,7 +1846,10 @@ impl Controller {
         let focused = self
             .window_focused
             .load(std::sync::atomic::Ordering::Relaxed);
-        let visible = self.current_thread_id().as_deref() == Some(thread_id);
+        let visible = self.current_thread_id().as_deref() == Some(thread_id)
+            || (self.team_viewing
+                && self.thread_sessions.get(thread_id).map(String::as_str)
+                    == self.current_session_id().as_deref());
         if focused && visible {
             return;
         }
@@ -1901,6 +1997,23 @@ impl Controller {
         self.close_new_chat();
         self.push_nav();
         let session_id = self.sessions[index].id.clone();
+        let is_team = self.sessions[index].kind == SessionKind::Team;
+        if is_team {
+            let team = self.client.get_team(&session_id).await?;
+            self.team_vms
+                .insert(session_id.clone(), TeamViewModel::from_team(team.clone()));
+            self.team_viewing = true;
+            self.at_files_fetched = None;
+            ui::set_team(&self.ui, Some(team));
+            self.follow_team(session_id.clone());
+        } else {
+            self.team_viewing = false;
+            ui::set_team(&self.ui, None);
+            if self.right_tab == AGENTS_TAB {
+                self.right_tab = 0;
+                ui::set_right_tab(&self.ui, 0);
+            }
+        }
         self.threads = self.client.list_threads(&session_id).await?;
         for t in &self.threads {
             self.thread_sessions
@@ -2005,6 +2118,10 @@ impl Controller {
     }
 
     fn push_threads(&self) {
+        let is_team = self
+            .current_session
+            .and_then(|index| self.sessions.get(index))
+            .is_some_and(|session| session.kind == SessionKind::Team);
         let mut tabs: Vec<(String, String, String)> = self
             .threads
             .iter()
@@ -2035,12 +2152,25 @@ impl Controller {
                 )
             })
             .collect();
+        if is_team {
+            let session_id = self.current_session_id().unwrap_or_default();
+            tabs.insert(
+                0,
+                (format!("team:{session_id}"), "Team".into(), String::new()),
+            );
+        }
         // The new-thread form lives in a provisional tab so the previous
         // tab stays one click away; `current_thread` is untouched
         // underneath, making cancel a pure UI dismissal.
-        let selected = if matches!(self.new_chat, Some(NewChat::Thread)) {
+        let selected = if matches!(self.new_chat, Some(NewChat::Thread)) && !is_team {
             tabs.push((String::new(), "New Thread".into(), String::new()));
             (tabs.len() - 1) as i32
+        } else if is_team && self.team_viewing {
+            0
+        } else if is_team {
+            self.current_thread
+                .map(|index| index as i32 + 1)
+                .unwrap_or(0)
         } else {
             self.current_thread.map(|i| i as i32).unwrap_or(-1)
         };
@@ -2051,11 +2181,14 @@ impl Controller {
     /// surfaces. Selecting a thread with no todos removes the conditional
     /// right-side tab; if it was selected, fall back to Diff first.
     fn push_todos(&mut self) {
-        let todos = self
-            .current_thread
-            .and_then(|i| self.threads.get(i))
-            .map(|thread| thread.todos.clone())
-            .unwrap_or_default();
+        let todos = if self.team_viewing {
+            Vec::new()
+        } else {
+            self.current_thread
+                .and_then(|i| self.threads.get(i))
+                .map(|thread| thread.todos.clone())
+                .unwrap_or_default()
+        };
         if todos.is_empty() && self.right_tab == TODOS_TAB {
             self.right_tab = 0;
             ui::set_right_tab(&self.ui, 0);
@@ -2342,6 +2475,46 @@ impl Controller {
         self.follower_tasks.insert(follower_id, task);
     }
 
+    /// Follow the session-scope stream that carries canonical team messages
+    /// and roster/status changes. Team traffic is much lower-volume than
+    /// token deltas, so each envelope can go straight through the command
+    /// loop without replay batching.
+    fn follow_team(&mut self, session_id: String) {
+        if self.team_followers.contains_key(&session_id) {
+            return;
+        }
+        let client = self.client.clone();
+        let tx = self.tx.clone();
+        let initial_cursor = self
+            .team_vms
+            .get(&session_id)
+            .map(|vm| vm.cursor)
+            .unwrap_or_default();
+        let key = session_id.clone();
+        let task = tokio::spawn(async move {
+            let mut after = initial_cursor;
+            loop {
+                let id = session_id.clone();
+                let event_tx = tx.clone();
+                match client
+                    .follow_session_events(&session_id, after, |envelope| {
+                        after = after.max(envelope.cursor);
+                        let _ = event_tx.send(UiCommand::TeamEvent(id.clone(), Box::new(envelope)));
+                        std::ops::ControlFlow::Continue(())
+                    })
+                    .await
+                {
+                    Ok(last) => after = after.max(last),
+                    Err(error) => {
+                        tracing::warn!("team event stream for {session_id} reconnecting: {error:#}")
+                    }
+                }
+                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+            }
+        });
+        self.team_followers.insert(key, task);
+    }
+
     /// Refresh the composer's "@"-mention path list for the open session, at
     /// most once per TTL (the popup pings on every keystroke, and renders
     /// ping here too — the walk is a full worktree scan, so throttle it).
@@ -2360,11 +2533,29 @@ impl Controller {
             return;
         }
         self.at_files_fetched = Some((session_id.clone(), std::time::Instant::now()));
+        let team_handles: Vec<String> = if self.team_viewing {
+            self.team_vms
+                .get(&session_id)
+                .and_then(|vm| vm.team.as_ref())
+                .map(|team| {
+                    team.members
+                        .iter()
+                        .map(|member| member.handle.clone())
+                        .collect()
+                })
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
         let client = self.client.clone();
         let ui = self.ui.clone();
         tokio::spawn(async move {
             match client.session_paths(&session_id).await {
-                Ok(paths) => ui::set_at_files(&ui, paths),
+                Ok(paths) => {
+                    let mut choices = team_handles;
+                    choices.extend(paths);
+                    ui::set_at_files(&ui, choices);
+                }
                 Err(e) => tracing::warn!("worktree path list for @-mentions failed: {e:#}"),
             }
         });
@@ -2374,6 +2565,33 @@ impl Controller {
     /// the end — wanted when content arrives or threads switch, jarring for
     /// in-place toggles (tool details, raw view).
     fn render_chat(&mut self, scroll: bool) {
+        if self.team_viewing
+            && let Some(session_id) = self.current_session_id()
+            && let Some(team) = self
+                .team_vms
+                .get(&session_id)
+                .and_then(|vm| vm.team.as_ref())
+        {
+            let view_key = format!("team:{session_id}");
+            let collapsed: HashSet<String> = self
+                .collapsed_cards
+                .iter()
+                .filter(|(key, _)| *key == view_key)
+                .map(|(_, card)| card.clone())
+                .collect();
+            let (rows, call_ids) = render::team_chat_rows(team, &collapsed);
+            self.row_call_ids = call_ids;
+            ui::set_slash_commands(&self.ui, Vec::new());
+            ui::set_chat(&self.ui, rows, view_key, scroll);
+            ui::set_composer_enabled(
+                &self.ui,
+                !matches!(team.status, TeamStatus::Completed | TeamStatus::Cancelled),
+            );
+            ui::set_team_viewing(&self.ui, true);
+            self.refresh_at_files();
+            return;
+        }
+        ui::set_team_viewing(&self.ui, false);
         let Some(thread_id) = self.current_thread_id() else {
             self.row_call_ids.clear();
             ui::set_chat(&self.ui, Vec::new(), String::new(), false);
@@ -2434,13 +2652,21 @@ impl Controller {
                 .collect(),
         );
         ui::set_chat(&self.ui, rows, thread_id, scroll);
-        ui::set_composer_enabled(&self.ui, true);
+        let member_transcript = self
+            .current_session
+            .and_then(|index| self.sessions.get(index))
+            .is_some_and(|session| session.kind == SessionKind::Team);
+        ui::set_composer_enabled(&self.ui, !member_transcript);
     }
 
     /// Push the current thread's prompt queue to the composer's queue panel.
     /// "Send now" shows when the thread is idle: queues never auto-run
     /// after a restart or a failed turn — resuming is the user's call.
     fn push_queue(&mut self) {
+        if self.team_viewing {
+            ui::set_queue(&self.ui, Vec::new(), Vec::new(), false);
+            return;
+        }
         let Some(thread_id) = self.current_thread_id() else {
             ui::set_queue(&self.ui, Vec::new(), Vec::new(), false);
             return;
@@ -3253,6 +3479,14 @@ impl Controller {
             self.error("select a session first (threads share its worktree)");
             return;
         }
+        if self
+            .current_session
+            .and_then(|index| self.sessions.get(index))
+            .is_some_and(|session| session.kind == SessionKind::Team)
+        {
+            self.error("team members are managed from the Agents tab");
+            return;
+        }
         if matches!(self.new_chat, Some(NewChat::Thread)) {
             return; // Already on the provisional tab.
         }
@@ -3343,6 +3577,41 @@ impl Controller {
                     .get(selection.workspace_idx)
                     .context("no workspace selected")?
                     .clone();
+                if selection.team {
+                    if !self.pending_attachments.is_empty() {
+                        self.error("team goals do not support attachments yet");
+                        return Ok(());
+                    }
+                    let created = self
+                        .client
+                        .create_team(&CreateTeamRequest {
+                            workspace_id: workspace.id,
+                            title: Some(trouve_client_core::title::summarize_session_title(
+                                &prompt,
+                            )),
+                            base_ref: self.branches.get(selection.branch_idx).cloned(),
+                            fetch_latest: selection.fetch_latest,
+                            goal: prompt,
+                            template_id: None,
+                            model: self
+                                .models
+                                .get(selection.model_idx)
+                                .map(|model| model.id.clone()),
+                            model_options,
+                            permission_mode,
+                            max_turns: None,
+                        })
+                        .await?;
+                    self.close_new_chat();
+                    self.reload_sessions().await?;
+                    let index = self
+                        .sessions
+                        .iter()
+                        .position(|session| session.id == created.session_id)
+                        .unwrap_or(0);
+                    self.select_session(index).await?;
+                    return Ok(());
+                }
                 let session = self
                     .client
                     .create_session(&CreateSessionRequest {
@@ -4191,6 +4460,19 @@ impl Controller {
                     self.sync_home_workspace();
                 }
             }
+            UiCommand::SetSessionKindFilter { row, filter } => {
+                if let Some(NavEntry::Workspace(wi)) = self.nav.get(row)
+                    && let Some(ws) = self.workspaces.get(*wi)
+                {
+                    let filter = SessionKindFilter::from_int(filter);
+                    if filter == SessionKindFilter::All {
+                        self.session_kind_filters.remove(&ws.id);
+                    } else {
+                        self.session_kind_filters.insert(ws.id.clone(), filter);
+                    }
+                    self.push_nav();
+                }
+            }
             UiCommand::SessionDelete { row } => {
                 if let Some(i) = self.nav_session(row) {
                     let id = self.sessions[i].id.clone();
@@ -4310,6 +4592,7 @@ impl Controller {
                 model_idx,
                 thinking_idx,
                 permission_idx,
+                team,
                 prompt,
             } => {
                 self.start_new_chat(
@@ -4321,6 +4604,7 @@ impl Controller {
                         model_idx,
                         thinking_idx,
                         permission_idx,
+                        team,
                     },
                     prompt,
                 )
@@ -4328,8 +4612,30 @@ impl Controller {
             }
             UiCommand::NewChatModelChanged(i) => self.push_new_chat_knobs(i),
             UiCommand::SelectThread(i) => {
-                self.open_thread_index(i, false);
-                // i == threads.len() is the provisional tab itself: no-op.
+                let is_team = self
+                    .current_session
+                    .and_then(|index| self.sessions.get(index))
+                    .is_some_and(|session| session.kind == SessionKind::Team);
+                if is_team && i == 0 {
+                    self.team_viewing = true;
+                    self.push_threads();
+                    self.render_chat(true);
+                    self.push_queue();
+                    self.push_todos();
+                    self.refresh_at_files();
+                } else {
+                    let thread_index = if is_team { i.saturating_sub(1) } else { i };
+                    if thread_index >= self.threads.len() {
+                        return Ok(());
+                    }
+                    if self.team_viewing {
+                        // Force the shared team timeline -> backing transcript
+                        // transition even when this was the last open member.
+                        self.current_thread = None;
+                    }
+                    self.team_viewing = false;
+                    self.open_thread_index(thread_index, false);
+                }
             }
             UiCommand::ChatPositionChanged {
                 thread_id,
@@ -4358,7 +4664,19 @@ impl Controller {
                 }
             }
             UiCommand::SendMessage(text) => {
-                if let Some(thread_id) = self.current_thread_id() {
+                if self.team_viewing {
+                    if !self.pending_attachments.is_empty() {
+                        self.error("team timeline attachments are not supported yet");
+                    } else if let Some(session_id) = self.current_session_id() {
+                        self.client.post_team_message(&session_id, &text).await?;
+                    }
+                } else if self
+                    .current_session
+                    .and_then(|index| self.sessions.get(index))
+                    .is_some_and(|session| session.kind == SessionKind::Team)
+                {
+                    self.error("member transcripts are read-only; message the shared Team tab");
+                } else if let Some(thread_id) = self.current_thread_id() {
                     let uploads = std::mem::take(&mut self.pending_attachments);
                     self.push_attachments();
                     if let Err(e) = self
@@ -4377,6 +4695,37 @@ impl Controller {
             UiCommand::CancelTurn => {
                 if let Some(thread_id) = self.current_thread_id() {
                     self.client.cancel_turn(&thread_id).await?;
+                }
+            }
+            UiCommand::TeamStatusAction(action) => {
+                if let Some(session_id) = self.current_session_id()
+                    && let Some(team) = self
+                        .team_vms
+                        .get(&session_id)
+                        .and_then(|vm| vm.team.as_ref())
+                {
+                    let status = match action {
+                        0 if team.status == TeamStatus::Paused => TeamStatus::Active,
+                        0 => TeamStatus::Paused,
+                        1 => TeamStatus::Completed,
+                        _ => TeamStatus::Cancelled,
+                    };
+                    let team = self.client.set_team_status(&session_id, status).await?;
+                    self.team_vms
+                        .insert(session_id, TeamViewModel::from_team(team.clone()));
+                    ui::set_team(&self.ui, Some(team));
+                    self.render_chat(false);
+                }
+            }
+            UiCommand::OpenTeamAgent(thread_id) => {
+                if let Some(index) = self
+                    .threads
+                    .iter()
+                    .position(|thread| thread.id == thread_id)
+                {
+                    self.current_thread = None;
+                    self.team_viewing = false;
+                    self.open_thread_index(index, false);
                 }
             }
             UiCommand::RefreshAtFiles => self.refresh_at_files(),
@@ -4604,8 +4953,14 @@ impl Controller {
                 }
             }
             UiCommand::ToggleCard(card_key) => {
-                if let Some(thread_id) = self.current_thread_id() {
-                    let key = (thread_id, card_key);
+                let view_key = if self.team_viewing {
+                    self.current_session_id()
+                        .map(|session_id| format!("team:{session_id}"))
+                } else {
+                    self.current_thread_id()
+                };
+                if let Some(view_key) = view_key {
+                    let key = (view_key, card_key);
                     if !self.collapsed_cards.remove(&key) {
                         self.collapsed_cards.insert(key);
                     }
@@ -4697,11 +5052,20 @@ impl Controller {
                 .await;
             }
             UiCommand::RightTabChanged(tab) => {
+                let team_session = self
+                    .current_session
+                    .and_then(|index| self.sessions.get(index))
+                    .is_some_and(|session| session.kind == SessionKind::Team);
+                if tab == AGENTS_TAB && !team_session {
+                    ui::set_right_tab(&self.ui, self.right_tab);
+                    return Ok(());
+                }
                 self.right_tab = if tab == TODOS_TAB
-                    && self
-                        .current_thread
-                        .and_then(|i| self.threads.get(i))
-                        .is_none_or(|thread| thread.todos.is_empty())
+                    && (self.team_viewing
+                        || self
+                            .current_thread
+                            .and_then(|i| self.threads.get(i))
+                            .is_none_or(|thread| thread.todos.is_empty()))
                 {
                     ui::set_right_tab(&self.ui, 0);
                     0
@@ -6056,6 +6420,23 @@ impl Controller {
                 }
                 self.push_agents_running();
             }
+            UiCommand::TeamEvent(session_id, envelope) => {
+                let team = {
+                    let Some(vm) = self.team_vms.get_mut(&session_id) else {
+                        return Ok(());
+                    };
+                    vm.apply(&envelope);
+                    vm.team.clone()
+                };
+                if self.current_session_id().as_deref() == Some(&session_id) {
+                    if let Some(team) = team {
+                        ui::set_team(&self.ui, Some(team));
+                    }
+                    if self.team_viewing {
+                        self.render_chat(true);
+                    }
+                }
+            }
             UiCommand::NotifyPrefsChanged(prefs) => self.notify = prefs,
             UiCommand::WindowFocusChanged(focused) => {
                 if focused
@@ -6093,6 +6474,14 @@ impl Controller {
                     // Notifications point at newest actionable state
                     // (approval/question/completion), so they always reveal
                     // the tail even when this is already the open thread.
+                    let is_team = self
+                        .current_session
+                        .and_then(|index| self.sessions.get(index))
+                        .is_some_and(|session| session.kind == SessionKind::Team);
+                    if is_team && self.team_viewing {
+                        self.current_thread = None;
+                        self.team_viewing = false;
+                    }
                     self.open_thread_index(i, true);
                 }
             }
@@ -6962,14 +7351,16 @@ fn should_open_chat_at_tail(force_tail: bool, turn_running: bool, has_queue: boo
 #[cfg(test)]
 mod tests {
     use super::{
-        SubscriptionRefresh, SubscriptionRefreshState, approval_pill, attention_badge, check_pill,
-        classify_pr, download_progress, format_pr_dashboard_refresh_status, human_age, human_rate,
-        merge_pill, model_health_view, pr_badge, project_session_prs, reconcile_pr_group_order,
-        reconcile_workspace_order, reorder_id, should_open_chat_at_tail, thinking_property,
+        SessionKindFilter, SubscriptionRefresh, SubscriptionRefreshState, approval_pill,
+        attention_badge, check_pill, classify_pr, download_progress,
+        format_pr_dashboard_refresh_status, human_age, human_rate, merge_pill, model_health_view,
+        pr_badge, project_session_prs, reconcile_pr_group_order, reconcile_workspace_order,
+        reorder_id, should_open_chat_at_tail, thinking_property,
     };
     use chrono::{Duration, TimeZone, Utc};
     use trouve_protocol::{
-        CheckRun, PrInfo, PrReview, Session, SubscriptionHealth, SubscriptionWindow, Workspace,
+        CheckRun, PrInfo, PrReview, Session, SessionKind, SubscriptionHealth, SubscriptionWindow,
+        Workspace,
     };
 
     fn workspaces(ids: &[&str]) -> Vec<Workspace> {
@@ -6980,6 +7371,34 @@ mod tests {
                 path: format!("/{id}"),
             })
             .collect()
+    }
+
+    fn session(kind: SessionKind) -> Session {
+        Session {
+            id: "se_test".into(),
+            workspace_id: "ws_test".into(),
+            title: "test".into(),
+            branch: "trouve/test".into(),
+            worktree_path: "/tmp/test".into(),
+            base_ref: "main".into(),
+            kind,
+            team_member_count: u32::from(kind == SessionKind::Team) * 4,
+            archived: false,
+            active: false,
+            created_at: Utc::now(),
+        }
+    }
+
+    #[test]
+    fn session_kind_filters_include_only_the_requested_shape() {
+        let solo = session(SessionKind::Solo);
+        let team = session(SessionKind::Team);
+        assert!(SessionKindFilter::All.includes(&solo));
+        assert!(SessionKindFilter::All.includes(&team));
+        assert!(SessionKindFilter::Solo.includes(&solo));
+        assert!(!SessionKindFilter::Solo.includes(&team));
+        assert!(SessionKindFilter::Teams.includes(&team));
+        assert!(!SessionKindFilter::Teams.includes(&solo));
     }
 
     #[test]
@@ -7084,6 +7503,8 @@ mod tests {
             branch: "trouve/session".into(),
             worktree_path: "/tmp/session".into(),
             base_ref: "main".into(),
+            kind: SessionKind::Solo,
+            team_member_count: 0,
             archived: false,
             active: false,
             created_at: Utc::now(),

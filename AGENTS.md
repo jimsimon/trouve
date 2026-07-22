@@ -51,6 +51,10 @@ These are load-bearing. Do not violate them without a new ADR.
    control flow.
 7. **Widget crates stay generic.** `slint-*` crates take plain data (text,
    spans, hunks), not trouve protocol types.
+8. **Team coordination is server-owned and durable.** Team roles map to
+   persistent threads; canonical messages, mentions, and deliveries use the
+   session event log and thread prompt queues. Clients and provider backends
+   never coordinate agents through side channels.
 
 ## Conventions
 

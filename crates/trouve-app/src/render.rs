@@ -103,6 +103,62 @@ pub struct WizardState {
 /// Synthetic option id for the wizard's trailing free-form choice.
 pub const OTHER_ID: &str = "__other__";
 
+/// Render the canonical shared team timeline with the same markdown cards as
+/// ordinary chat while preserving each member's handle and role attribution.
+pub fn team_chat_rows(
+    team: &trouve_protocol::Team,
+    collapsed: &HashSet<String>,
+) -> (Vec<ChatRowData>, Vec<Option<String>>) {
+    let mut rows = Vec::new();
+    let mut call_ids = Vec::new();
+    for message in &team.messages {
+        if !rows.is_empty() {
+            rows.push(ChatRowData {
+                kind: 8,
+                ..Default::default()
+            });
+            call_ids.push(None);
+        }
+        let key = format!("team:{}", message.id);
+        let open = !collapsed.contains(&key);
+        let mut body = Vec::new();
+        if open {
+            push_blocks(&mut body, &message.content);
+            if message.author_kind == trouve_protocol::TeamAuthorKind::Human {
+                for (row, _) in &mut body {
+                    row.tone = 1;
+                }
+            }
+        }
+        let member = message
+            .author_member_id
+            .as_deref()
+            .and_then(|id| team.members.iter().find(|member| member.id == id));
+        let (title, subtitle) = match message.author_kind {
+            trouve_protocol::TeamAuthorKind::Human => ("You".into(), String::new()),
+            trouve_protocol::TeamAuthorKind::Agent => (
+                format!("@{}", message.author_handle),
+                member
+                    .map(|member| format!("{} · {}", member.display_name, member.mode))
+                    .unwrap_or_default(),
+            ),
+            trouve_protocol::TeamAuthorKind::System => ("Team".into(), "system".into()),
+        };
+        let header = ChatRowData {
+            tool_name: title,
+            subtitle,
+            text: preview(&message.content),
+            detail: plain_text(&message.content),
+            expanded: open,
+            card_key: key,
+            meta: message.created_at.format("%H:%M").to_string(),
+            ..Default::default()
+        };
+        push_card(&mut rows, &mut call_ids, header, body);
+    }
+    (rows, call_ids)
+}
+
 impl WizardState {
     pub fn new(question_count: usize) -> Self {
         Self {
