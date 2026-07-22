@@ -3938,8 +3938,13 @@ impl Controller {
             }
             // Workspace lifecycle is server-scoped so another app instance
             // can keep its sidebar in sync with opens and closes here.
-            Event::WorkspaceRegistered { .. } if self.reload_sessions().await.is_ok() => {
-                self.sync_home_workspace();
+            // Keep the side-effecting reload in the arm body rather than a
+            // match guard, even though Clippy can collapse this shape.
+            #[allow(clippy::collapsible_match)]
+            Event::WorkspaceRegistered { .. } => {
+                if self.reload_sessions().await.is_ok() {
+                    self.sync_home_workspace();
+                }
             }
             Event::WorkspaceClosed { workspace_id } => {
                 self.close_current_session_if_in_workspace(workspace_id);
@@ -6384,45 +6389,52 @@ fn attention_badge(approvals: usize, questions: usize) -> (i32, String) {
     }
 }
 
-/// Pull-request badge kind + detail. A single PR inherits its status color;
-/// multiple PRs intentionally collapse to the neutral kind while the tooltip
-/// preserves each individual status.
+/// Pull-request badge kind + detail. Open PRs are green only when GitHub's
+/// detailed merge state says the merge button is ready; every other open
+/// state is conservatively yellow. With multiple open PRs, all must be ready.
 fn pr_badge(prs: &[trouve_protocol::PrInfo]) -> (i32, String) {
     if prs.is_empty() {
         return (0, String::new());
     }
-    let state = |pr: &trouve_protocol::PrInfo| {
-        if pr.draft {
-            "Draft"
-        } else {
-            match pr.state.as_str() {
-                "open" => "Open",
-                "merged" => "Merged",
-                "closed" => "Closed",
-                _ => "Pull request",
-            }
-        }
-    };
     let lines = prs
         .iter()
-        .map(|pr| format!("#{} · {}", pr.number, state(pr)))
+        .map(|pr| format!("#{} · {}", pr.number, pr_badge_status(pr).1))
         .collect::<Vec<_>>()
         .join("\n");
-    if prs.len() > 1 {
-        return (5, format!("{} pull requests\n{lines}", prs.len()));
-    }
-    let pr = &prs[0];
-    let kind = if pr.draft {
-        2
-    } else {
-        match pr.state.as_str() {
-            "open" => 1,
-            "merged" => 3,
-            "closed" => 4,
-            _ => 5,
+
+    let mut open = prs.iter().filter(|pr| pr.state == "open").peekable();
+    let kind = if open.peek().is_some() {
+        if open.all(|pr| pr_badge_status(pr).0 == 1) {
+            1
+        } else {
+            2
         }
+    } else {
+        pr_badge_status(&prs[0]).0
     };
-    (kind, format!("Pull request\n{lines}"))
+    let heading = if prs.len() == 1 {
+        "Pull request".to_string()
+    } else {
+        format!("{} pull requests", prs.len())
+    };
+    (kind, format!("{heading}\n{lines}"))
+}
+
+fn pr_badge_status(pr: &trouve_protocol::PrInfo) -> (i32, &'static str) {
+    match pr.state.as_str() {
+        "merged" => (3, "Merged"),
+        "closed" => (4, "Closed"),
+        "open"
+            if !pr.draft
+                && pr.merge_state_status.as_deref().is_some_and(|status| {
+                    status.eq_ignore_ascii_case("clean") || status.eq_ignore_ascii_case("has_hooks")
+                }) =>
+        {
+            (1, "Ready to merge")
+        }
+        "open" if pr.draft => (2, "Unable to merge · Draft"),
+        _ => (2, "Unable to merge"),
+    }
 }
 
 fn format_reviews(reviews: &[trouve_protocol::PrReview]) -> String {
@@ -7076,6 +7088,7 @@ mod tests {
             comments: 0,
             last_comment_at: None,
             mergeable: None,
+            merge_state_status: None,
             merged_at: None,
         }
     }
@@ -7307,20 +7320,33 @@ mod tests {
             comments: 0,
             last_comment_at: None,
             mergeable: None,
+            merge_state_status: None,
             merged_at: None,
         }
     }
 
     #[test]
-    fn pr_badges_color_single_status_and_neutralize_multiple() {
+    fn pr_badges_follow_github_merge_readiness_and_terminal_state() {
         assert_eq!(pr_badge(&[]).0, 0);
-        assert_eq!(pr_badge(&[nav_pr(1, "open", false)]).0, 1);
+        assert_eq!(pr_badge(&[nav_pr(1, "open", false)]).0, 2);
+
+        let mut ready = nav_pr(2, "open", false);
+        ready.merge_state_status = Some("clean".into());
+        let (kind, tip) = pr_badge(&[ready.clone()]);
+        assert_eq!(kind, 1);
+        assert!(tip.contains("#2 · Ready to merge"));
+
+        let mut hooked = nav_pr(3, "open", false);
+        hooked.merge_state_status = Some("HAS_HOOKS".into());
+        assert_eq!(pr_badge(&[ready.clone(), hooked]).0, 1);
+
         assert_eq!(pr_badge(&[nav_pr(2, "open", true)]).0, 2);
         assert_eq!(pr_badge(&[nav_pr(3, "merged", false)]).0, 3);
         assert_eq!(pr_badge(&[nav_pr(4, "closed", false)]).0, 4);
-        let (kind, tip) = pr_badge(&[nav_pr(5, "open", false), nav_pr(4, "merged", false)]);
-        assert_eq!(kind, 5);
-        assert!(tip.contains("#5 · Open"));
+
+        let (kind, tip) = pr_badge(&[ready, nav_pr(5, "open", false), nav_pr(4, "merged", false)]);
+        assert_eq!(kind, 2);
+        assert!(tip.contains("#5 · Unable to merge"));
         assert!(tip.contains("#4 · Merged"));
     }
 

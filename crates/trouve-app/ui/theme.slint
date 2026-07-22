@@ -62,7 +62,7 @@ export struct ThemePalette {
     accent-veil: color,
     user-bg: color,
     user-border: color,
-    // Status: success / error / warning.
+    // Status: success / error / warning / merged.
     ok: color,
     ok-dim: color,
     agent-bg: color,
@@ -76,6 +76,7 @@ export struct ThemePalette {
     warn: color,
     warn-bg: color,
     warn-border: color,
+    merged: color,
 }
 
 export global Theme {
@@ -138,6 +139,7 @@ export global Theme {
         warn: #e5c07b,
         warn-bg: #262117,
         warn-border: #5a4d2e,
+        merged: #b69df8,
     };
 
     // Base font scale: 1.0 = the design's 13px body text. All font sizes

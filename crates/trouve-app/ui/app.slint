@@ -53,7 +53,7 @@ export struct NavRow {
     unread: bool,
     // A failed turn landed while the session was not being viewed.
     error: bool,
-    // 0 none, 1 open, 2 draft, 3 merged, 4 closed, 5 multiple.
+    // 0 none, 1 ready to merge, 2 unable to merge, 3 merged, 4 closed.
     pr-kind: int,
     pr-tooltip: string,
     // 0 none, 1 approval, 2 question, 3 both.
@@ -2600,8 +2600,8 @@ export component AppWindow inherits Window {
                                     icon-image: @image-url("assets/git-merge.svg");
                                     icon-size: Theme.fs(18px);
                                     icon-color: row.pr-kind == 1 ? Theme.c.ok
-                                        : row.pr-kind == 2 ? Theme.c.text-dim
-                                        : row.pr-kind == 3 ? Theme.c.accent
+                                        : row.pr-kind == 2 ? Theme.c.warn
+                                        : row.pr-kind == 3 ? Theme.c.merged
                                         : row.pr-kind == 4 ? Theme.c.err
                                         : Theme.c.text-mid;
                                     hover-icon-color: self.icon-color;

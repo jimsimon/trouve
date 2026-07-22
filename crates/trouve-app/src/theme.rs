@@ -75,6 +75,7 @@ pub struct Pal {
     pub warn: u32,
     pub warn_bg: u32,
     pub warn_border: u32,
+    pub merged: u32,
 }
 
 pub struct ThemeDef {
@@ -146,6 +147,7 @@ const DARK: Pal = Pal {
     warn: 0xffe5c07b,
     warn_bg: 0xff262117,
     warn_border: 0xff5a4d2e,
+    merged: 0xffb69df8,
 };
 
 const LIGHT: Pal = Pal {
@@ -206,6 +208,7 @@ const LIGHT: Pal = Pal {
     warn: 0xff7a5500,
     warn_bg: 0xfffdf3d9,
     warn_border: 0xffd9b45c,
+    merged: 0xff6f42c1,
 };
 
 /// High-contrast dark: near-black surfaces, near-white text, brighter
@@ -268,6 +271,7 @@ const HC_DARK: Pal = Pal {
     warn: 0xffefd08c,
     warn_bg: 0xff1c1810,
     warn_border: 0xff7a683e,
+    merged: 0xffd2b8ff,
 };
 
 /// Colorblind-safe dark (deuteranopia/protanopia): success is sky blue and
@@ -420,6 +424,7 @@ pub fn apply(ui: &crate::AppWindow, appearance: &crate::winstate::Appearance) {
         warn: c(p.warn),
         warn_bg: c(p.warn_bg),
         warn_border: c(p.warn_border),
+        merged: c(p.merged),
     });
     theme.set_scale(appearance.font_size as f32 / 13.0);
     theme.set_font_family(appearance.font_family.as_str().into());
@@ -579,6 +584,8 @@ mod tests {
             (|p| p.warn, |p| p.warn_bg, 4.5, "warn/warn-bg"),
             (|p| p.text_hi, |p| p.warn_bg, 4.5, "text-hi/warn-bg"),
             (|p| p.text, |p| p.warn_bg, 4.5, "text/warn-bg"),
+            (|p| p.merged, |p| p.sidebar_bg, 3.0, "merged/sidebar-bg"),
+            (|p| p.merged, |p| p.hover_bg, 3.0, "merged/hover-bg"),
             // Diff text on diff row tints.
             (|p| p.text, |p| p.diff_add_bg, 4.5, "text/diff-add-bg"),
             (|p| p.text, |p| p.diff_del_bg, 4.5, "text/diff-del-bg"),

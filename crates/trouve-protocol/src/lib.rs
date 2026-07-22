@@ -85,7 +85,9 @@ pub use requests::*;
 // selection, and profile snapshots on durable review jobs (all additive).
 // 1.3: per-repository reviewer model overrides and inherit/append/replace
 // prompt policies (additive).
-pub const PROTOCOL_VERSION: &str = "1.3";
+// 1.4: PrInfo gains GitHub's optional `merge_state_status` so clients can
+// distinguish PRs that are ready to merge from open-but-blocked PRs.
+pub const PROTOCOL_VERSION: &str = "1.4";
 
 pub type WorkspaceId = String;
 pub type SessionId = String;
