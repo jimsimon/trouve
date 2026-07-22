@@ -126,8 +126,8 @@ fn normalize_thinking_option(
 }
 
 pub struct Engine {
-    store: Store,
-    data_dir: PathBuf,
+    pub(crate) store: Store,
+    pub(crate) data_dir: PathBuf,
     config_dir: Option<PathBuf>,
     providers: RwLock<HashMap<String, Arc<dyn Provider>>>,
     /// Providers registered programmatically (`with_provider`); preserved
@@ -139,7 +139,7 @@ pub struct Engine {
     /// Backends registered programmatically (`with_backend`); preserved
     /// across config-driven registry reloads.
     injected_backends: Mutex<HashMap<String, Arc<dyn AgentBackend>>>,
-    executor: Arc<dyn ToolExecutor>,
+    pub(crate) executor: Arc<dyn ToolExecutor>,
     approvals: Arc<ApprovalHub>,
     questions: Arc<QuestionHub>,
     session_locks: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
@@ -161,7 +161,7 @@ pub struct Engine {
     /// upstream GitHub poll.
     github_dashboard_caches:
         tokio::sync::Mutex<HashMap<String, crate::github::GitHubDashboardCache>>,
-    config: Mutex<Config>,
+    pub(crate) config: Mutex<Config>,
     /// Where provider configuration changes are persisted. `None` disables
     /// persistence (tests).
     config_file: Option<PathBuf>,
@@ -173,7 +173,8 @@ pub struct Engine {
     /// Global default permission mode for new threads, used by modes that
     /// don't set one of their own.
     default_permission_mode: RwLock<trouve_protocol::PermissionMode>,
-    secrets: Arc<dyn trouve_providers::secrets::SecretStore>,
+    pub(crate) secrets: Arc<dyn trouve_providers::secrets::SecretStore>,
+    pub(crate) code_review: crate::review::CodeReviewRuntime,
     /// In-flight OAuth logins, keyed by provider id.
     logins: Mutex<HashMap<String, LoginState>>,
     /// In-flight managed vendor-CLI installs, keyed by CLI id.
@@ -477,6 +478,7 @@ impl Engine {
                 config.default_permission_mode.unwrap_or_default(),
             ),
             secrets,
+            code_review: crate::review::CodeReviewRuntime::default(),
             logins: Mutex::new(HashMap::new()),
             cli_installs: Mutex::new(HashMap::new()),
             local_manager,
@@ -1578,6 +1580,7 @@ impl Engine {
                     chrono::Local::now().format("%b %d %H:%M")
                 )),
                 base_ref: None,
+                checkout_ref: None,
                 fetch_latest: true,
             })
             .await?;
@@ -2140,7 +2143,7 @@ impl Engine {
         Ok(())
     }
 
-    fn persist_config(&self, config: &Config) {
+    pub(crate) fn persist_config(&self, config: &Config) {
         if let Some(path) = &self.config_file
             && let Err(e) = config.save_to(path)
         {
@@ -3310,6 +3313,7 @@ impl Engine {
             let branch = branch.clone();
             let selected_base = base_ref.clone();
             let fetch_latest = req.fetch_latest;
+            let checkout_ref = req.checkout_ref.clone();
             tokio::task::spawn_blocking(move || -> Result<String> {
                 let mut session_base = selected_base.clone();
                 let worktree_base = if fetch_latest {
@@ -3323,7 +3327,8 @@ impl Engine {
                 } else {
                     selected_base
                 };
-                git::create_worktree(&repo, &worktree_path, &branch, &worktree_base)?;
+                let checkout_ref = checkout_ref.as_deref().unwrap_or(&worktree_base);
+                git::create_worktree(&repo, &worktree_path, &branch, checkout_ref)?;
                 Ok(session_base)
             })
             .await
@@ -4004,6 +4009,9 @@ impl Engine {
                 return Err(e.into());
             }
         };
+        // Register cancellation before returning from dispatch so an
+        // immediate cancel cannot race the spawned turn task.
+        let cancel = self.register_cancel(thread_id);
         let engine = self.clone();
         tokio::spawn(async move {
             let thread_id = thread.id.clone();
@@ -4012,9 +4020,10 @@ impl Engine {
             // token) are always released and the UI unsticks — tokio would
             // otherwise swallow the panic and leave the thread wedged as
             // "active" with no TurnFailed event.
-            let drained = std::panic::AssertUnwindSafe(engine.drain_queue(thread, turn, prompt))
-                .catch_unwind()
-                .await;
+            let drained =
+                std::panic::AssertUnwindSafe(engine.drain_queue(thread, turn, prompt, cancel))
+                    .catch_unwind()
+                    .await;
             if drained.is_err() {
                 tracing::error!("turn dispatcher for {thread_id} panicked");
                 let _ = engine.store.release_queued_prompt(&prompt_id);
@@ -4041,12 +4050,16 @@ impl Engine {
         thread: Thread,
         turn: u64,
         prompt: trouve_protocol::QueuedPrompt,
+        first_cancel: tokio_util::sync::CancellationToken,
     ) {
         let mut thread = thread;
         let mut turn = turn;
         let mut prompt = prompt;
+        let mut first_cancel = Some(first_cancel);
         loop {
-            let cancel = self.register_cancel(&thread.id);
+            let cancel = first_cancel
+                .take()
+                .unwrap_or_else(|| self.register_cancel(&thread.id));
             let result = self.run_turn(&thread, turn, &prompt, cancel.clone()).await;
             let cancelled = cancel.is_cancelled();
             self.clear_cancel(&thread.id);
@@ -6013,6 +6026,7 @@ impl Engine {
                     workspace_id: session.workspace_id.clone(),
                     title: Some(title),
                     base_ref: Some(base_ref.clone()),
+                    checkout_ref: None,
                     fetch_latest: true,
                 })
                 .await

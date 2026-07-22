@@ -6,3 +6,4 @@ __pycache__/
 /benchmarks/repos
 /benchmarks/results
 node_modules/
+dist/

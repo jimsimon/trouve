@@ -1,0 +1,38 @@
+services:
+  trouve-server:
+    image: ghcr.io/jimsimon/trouve-server:${TROUVE_VERSION:?set TROUVE_VERSION in .env}
+    build:
+      context: .
+      dockerfile: Dockerfile.server
+    restart: unless-stopped
+    environment:
+      TROUVE_ALLOW_REMOTE: "1"
+      TROUVE_AUTH_TOKEN: "${TROUVE_AUTH_TOKEN:?set TROUVE_AUTH_TOKEN in .env}"
+      TROUVE_CODE_REVIEW_POLL_INTERVAL_SECONDS: "${TROUVE_CODE_REVIEW_POLL_INTERVAL_SECONDS:-60}"
+      RUST_LOG: "${RUST_LOG:-info}"
+    volumes:
+      - trouve-data:/var/lib/trouve
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - >-
+          curl --fail --silent --show-error
+          --header "Authorization: Bearer $$TROUVE_AUTH_TOKEN"
+          http://127.0.0.1:7433/v1/info >/dev/null
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 10s
+
+  review-ui:
+    image: ghcr.io/jimsimon/trouve-review-ui:${TROUVE_VERSION:?set TROUVE_VERSION in .env}
+    build: web/review-ui
+    restart: unless-stopped
+    depends_on:
+      trouve-server:
+        condition: service_healthy
+    ports:
+      - "${TROUVE_REVIEW_PORT:-7433}:8080"
+
+volumes:
+  trouve-data:

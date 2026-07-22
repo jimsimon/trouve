@@ -3588,6 +3588,16 @@ async fn secured_router_enforces_token_and_loopback_host() {
         .unwrap();
     assert_eq!(resp.status(), reqwest::StatusCode::FORBIDDEN);
 
+    // GitHub's public webhook route bypasses bearer and loopback-host checks;
+    // its handler still rejects unauthenticated payloads before processing.
+    let resp = client
+        .post(format!("http://{addr}/github/webhooks"))
+        .header(reqwest::header::HOST, "hooks.example.com")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::BAD_REQUEST);
+
     let initialize = serde_json::json!({
         "jsonrpc": "2.0",
         "id": 1,
@@ -3730,4 +3740,141 @@ async fn offline_filters_models_and_reports_connectivity() {
     })
     .await;
     assert!(!seen.is_empty());
+}
+
+#[tokio::test]
+async fn code_review_dashboard_and_repository_policy_round_trip() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Store::open(&tmp.path().join("db/trouve.db")).unwrap();
+    let engine = Arc::new(
+        Engine::new(store, tmp.path().join("data"), &Config::default()).with_config_dir(None),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let router = trouve_server::build_router(engine);
+    tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+    let base = format!("http://{addr}/v1/code-review");
+    let client = reqwest::Client::new();
+
+    let empty: serde_json::Value = client
+        .get(&base)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(empty["app"]["configured"], false);
+    assert_eq!(empty["repositories"], serde_json::json!([]));
+    assert!(empty["reviewers"].as_array().unwrap().len() >= 12);
+    assert!(
+        empty["reviewers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|reviewer| reviewer["id"] == "correctness" && reviewer["built_in"] == true)
+    );
+
+    let custom: serde_json::Value = client
+        .put(format!("{base}/reviewer"))
+        .json(&serde_json::json!({
+            "name": "Widget invariants",
+            "prompt": "Check every widget state transition.",
+            "model": "openai/gpt-5"
+        }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let custom_id = custom["id"].as_str().unwrap();
+    assert!(custom_id.starts_with("custom:"));
+    assert_eq!(custom["built_in"], false);
+
+    let response = client
+        .put(format!("{base}/repository"))
+        .json(&serde_json::json!({
+            "installation_id": 7,
+            "repository": "acme/widgets",
+            "mode": "automatic",
+            "model": "openai/gpt-5",
+            "prompt": "focus on concurrency",
+            "reviewer_ids": ["correctness", custom_id],
+            "reviewer_overrides": [
+                {
+                    "reviewer_id": "correctness",
+                    "model": "anthropic/claude",
+                    "prompt_mode": "append",
+                    "prompt": "Focus on widget lifecycle boundaries."
+                },
+                {
+                    "reviewer_id": custom_id,
+                    "prompt_mode": "replace",
+                    "prompt": "Apply the repository's widget state machine."
+                }
+            ]
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert!(response.status().is_success());
+
+    let dashboard: serde_json::Value = client
+        .get(&base)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(dashboard["repositories"][0]["repository"], "acme/widgets");
+    assert_eq!(dashboard["repositories"][0]["mode"], "automatic");
+    assert_eq!(dashboard["repositories"][0]["model"], "openai/gpt-5");
+    assert_eq!(
+        dashboard["repositories"][0]["reviewer_ids"],
+        serde_json::json!(["correctness", custom_id])
+    );
+    assert_eq!(
+        dashboard["repositories"][0]["reviewer_overrides"][0]["model"],
+        "anthropic/claude"
+    );
+    assert_eq!(
+        dashboard["repositories"][0]["reviewer_overrides"][1]["prompt_mode"],
+        "replace"
+    );
+
+    let deleted = client
+        .delete(format!("{base}/reviewer/{custom_id}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(deleted.status(), reqwest::StatusCode::NO_CONTENT);
+
+    let built_in = client
+        .delete(format!("{base}/reviewer/correctness"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(built_in.status(), reqwest::StatusCode::BAD_REQUEST);
+
+    let dashboard: serde_json::Value = client
+        .get(&base)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        dashboard["repositories"][0]["reviewer_ids"],
+        serde_json::json!(["correctness"])
+    );
+    assert_eq!(
+        dashboard["repositories"][0]["reviewer_overrides"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
 }

@@ -1020,6 +1020,7 @@ impl GraphqlPullRequest {
             draft: self.is_draft,
             base: self.base_ref_name,
             head: self.head_ref_name,
+            head_sha: self.head_ref_oid,
             checks,
             reviews,
             author: self.author.map(|author| author.login).unwrap_or_default(),
@@ -1270,6 +1271,7 @@ impl GitHub {
             draft: pr.draft.unwrap_or(false),
             base: pr.base.ref_field,
             head: pr.head.ref_field,
+            head_sha: Some(pr.head.sha),
             checks,
             reviews,
             author: pr.user.map(|u| u.login).unwrap_or_default(),
@@ -1407,6 +1409,7 @@ mod tests {
             "isDraft": false,
             "baseRefName": "main",
             "headRefName": "ship-widgets",
+            "headRefOid": "abc123",
             "author": { "login": "alice" },
             "mergeable": "CONFLICTING",
             "mergedAt": null,
@@ -1459,6 +1462,7 @@ mod tests {
         assert_eq!(info.repository, "acme/widgets");
         assert_eq!(info.number, 42);
         assert_eq!(info.state, "open");
+        assert_eq!(info.head_sha.as_deref(), Some("abc123"));
         assert_eq!(info.author, "alice");
         assert_eq!(info.requested_reviewers, ["bob"]);
         assert_eq!(info.comments, 4);
@@ -1533,6 +1537,7 @@ mod tests {
                     draft: false,
                     base: "main".into(),
                     head: "ship-widgets".into(),
+                    head_sha: pending.head_ref_oid.clone(),
                     checks: Vec::new(),
                     reviews: Vec::new(),
                     author: "alice".into(),

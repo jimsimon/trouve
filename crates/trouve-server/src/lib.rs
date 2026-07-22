@@ -22,16 +22,19 @@ use trouve_core::Engine;
 use trouve_core::engine::EngineError;
 use trouve_protocol::{
     AddLocalModelRequest, AgentMode, Automation, BranchList, CliInfo, CliInstallStatus, CliList,
-    CreatePrRequest, CreateSessionRequest, CreateThreadRequest, DirEntry, ErrorBody, FileContent,
+    CodeReviewDashboard, CodeReviewRepository, ConfigureGithubAppRequest, CreatePrRequest,
+    CreateSessionRequest, CreateThreadRequest, DirEntry, ErrorBody, FileContent, GithubAppStatus,
     GithubIntegration, GithubPrList, KnownProvider, LocalSearchResult, LocalStatus, LoginStarted,
     LoginStatus, McpLogs, McpServerInfo, MergePrRequest, ModeInfo, ModelInfo, OpenTerminalRequest,
     PROTOCOL_VERSION, PrInfo, ProviderInfo, ProvidersResponse, QueuedPrompt,
     RegisterWorkspaceRequest, ReorderQueueRequest, ResolveApprovalRequest, ResolveQuestionRequest,
-    Scope, SendMessageRequest, ServerInfo, Session, SessionDiff, SetDefaultModelRequest,
-    SetDefaultPermissionModeRequest, SetLocalEnabledRequest, SubscriptionHealth, TerminalInfo,
-    TerminalInputRequest, TerminalResizeRequest, Thread, TurnAccepted, UpdateQueuedPromptRequest,
+    ReviewerProfile, Scope, SendMessageRequest, ServerInfo, Session, SessionDiff,
+    SetDefaultModelRequest, SetDefaultPermissionModeRequest, SetLocalEnabledRequest,
+    SubscriptionHealth, TerminalInfo, TerminalInputRequest, TerminalResizeRequest, Thread,
+    TurnAccepted, UpdateCodeReviewRepositoryRequest, UpdateQueuedPromptRequest,
     UpdateSessionRequest, UpdateThreadRequest, UpsertAutomationRequest, UpsertMcpServerRequest,
-    UpsertModeRequest, UpsertProviderRequest, UsageSummary, Workspace,
+    UpsertModeRequest, UpsertProviderRequest, UpsertReviewerProfileRequest, UsageSummary,
+    Workspace,
 };
 use utoipa::OpenApi;
 
@@ -161,6 +164,12 @@ impl IntoResponse for ApiError {
         update_automation,
         delete_automation,
         run_automation,
+        code_review_dashboard,
+        configure_github_review_app,
+        upsert_reviewer_profile,
+        delete_reviewer_profile,
+        update_code_review_repository,
+        refresh_code_reviews,
     ),
     components(schemas(
         ServerInfo,
@@ -225,6 +234,17 @@ impl IntoResponse for ApiError {
         trouve_protocol::AutomationSchedule,
         trouve_protocol::AutomationTemplate,
         UpsertAutomationRequest,
+        CodeReviewDashboard,
+        ReviewerProfile,
+        trouve_protocol::ReviewerOverride,
+        trouve_protocol::ReviewerPromptMode,
+        CodeReviewRepository,
+        trouve_protocol::CodeReviewJob,
+        trouve_protocol::CodeReviewMode,
+        GithubAppStatus,
+        ConfigureGithubAppRequest,
+        UpsertReviewerProfileRequest,
+        UpdateCodeReviewRepositoryRequest,
         ErrorBody,
         trouve_protocol::EventEnvelope,
         trouve_protocol::Event,
@@ -398,7 +418,8 @@ async fn enforce_security(
     request: axum::extract::Request,
     next: axum::middleware::Next,
 ) -> Response {
-    if security.require_loopback_host && !host_is_loopback(request.headers()) {
+    let webhook = request.uri().path() == "/github/webhooks";
+    if !webhook && security.require_loopback_host && !host_is_loopback(request.headers()) {
         return (
             StatusCode::FORBIDDEN,
             "host not allowed (set TROUVE_ALLOW_REMOTE to serve non-loopback hosts)",
@@ -419,7 +440,7 @@ async fn enforce_security(
                     .into_response();
             }
         }
-    } else if let Some(expected) = security.token.as_deref() {
+    } else if !webhook && let Some(expected) = security.token.as_deref() {
         let provided = request
             .headers()
             .get(axum::http::header::AUTHORIZATION)
@@ -533,6 +554,27 @@ pub fn build_router(engine: Arc<Engine>) -> Router {
             axum::routing::put(update_automation).delete(delete_automation),
         )
         .route("/v1/automations/{id}/run", post(run_automation))
+        .route("/v1/code-review", get(code_review_dashboard))
+        .route(
+            "/v1/code-review/github-app",
+            axum::routing::put(configure_github_review_app),
+        )
+        .route(
+            "/v1/code-review/reviewer",
+            axum::routing::put(upsert_reviewer_profile),
+        )
+        .route(
+            "/v1/code-review/reviewer/{id}",
+            axum::routing::delete(delete_reviewer_profile),
+        )
+        .route(
+            "/v1/code-review/repository",
+            axum::routing::put(update_code_review_repository),
+        )
+        .route("/v1/code-review/refresh", post(refresh_code_reviews))
+        // GitHub cannot attach trouve's bearer token. This one public route
+        // is authenticated in its handler with the configured HMAC secret.
+        .route("/github/webhooks", post(github_review_webhook))
         .route("/v1/local", get(local_status))
         .route("/v1/local/enabled", axum::routing::put(set_local_enabled))
         .route("/v1/local/search", get(search_local_models))
@@ -637,6 +679,7 @@ pub async fn serve_listener(
     engine.init_connectivity().await;
     engine.start_connectivity_monitor();
     engine.start_automation_scheduler();
+    engine.start_code_review_service();
     let router = build_secured_router(engine, security);
     tracing::info!(
         "trouve-server listening on http://{}",
@@ -656,6 +699,82 @@ async fn info(State(engine): State<Arc<Engine>>) -> Json<ServerInfo> {
         protocol_version: PROTOCOL_VERSION.into(),
         online: engine.is_online(),
     })
+}
+
+#[utoipa::path(get, path = "/v1/code-review",
+    responses((status = 200, body = CodeReviewDashboard), (status = 500, body = ErrorBody)))]
+async fn code_review_dashboard(
+    State(engine): State<Arc<Engine>>,
+) -> Result<Json<CodeReviewDashboard>, ApiError> {
+    Ok(Json(engine.code_review_dashboard()?))
+}
+
+#[utoipa::path(put, path = "/v1/code-review/github-app",
+    request_body = ConfigureGithubAppRequest,
+    responses((status = 200, body = GithubAppStatus), (status = 400, body = ErrorBody)))]
+async fn configure_github_review_app(
+    State(engine): State<Arc<Engine>>,
+    Json(request): Json<ConfigureGithubAppRequest>,
+) -> Result<Json<GithubAppStatus>, ApiError> {
+    Ok(Json(engine.configure_github_review_app(request).await?))
+}
+
+#[utoipa::path(put, path = "/v1/code-review/reviewer",
+    request_body = UpsertReviewerProfileRequest,
+    responses((status = 200, body = ReviewerProfile), (status = 400, body = ErrorBody)))]
+async fn upsert_reviewer_profile(
+    State(engine): State<Arc<Engine>>,
+    Json(request): Json<UpsertReviewerProfileRequest>,
+) -> Result<Json<ReviewerProfile>, ApiError> {
+    Ok(Json(engine.upsert_reviewer_profile(request)?))
+}
+
+#[utoipa::path(delete, path = "/v1/code-review/reviewer/{id}",
+    params(("id" = String, Path, description = "Custom reviewer profile id")),
+    responses((status = 204), (status = 400, body = ErrorBody), (status = 404, body = ErrorBody)))]
+async fn delete_reviewer_profile(
+    State(engine): State<Arc<Engine>>,
+    Path(id): Path<String>,
+) -> Result<StatusCode, ApiError> {
+    engine.delete_reviewer_profile(&id)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+#[utoipa::path(put, path = "/v1/code-review/repository",
+    request_body = UpdateCodeReviewRepositoryRequest,
+    responses((status = 200, body = CodeReviewRepository), (status = 400, body = ErrorBody)))]
+async fn update_code_review_repository(
+    State(engine): State<Arc<Engine>>,
+    Json(request): Json<UpdateCodeReviewRepositoryRequest>,
+) -> Result<Json<CodeReviewRepository>, ApiError> {
+    Ok(Json(engine.update_code_review_repository(&request)?))
+}
+
+#[utoipa::path(post, path = "/v1/code-review/refresh",
+    responses((status = 204), (status = 400, body = ErrorBody)))]
+async fn refresh_code_reviews(State(engine): State<Arc<Engine>>) -> Result<StatusCode, ApiError> {
+    engine.refresh_code_reviews().await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn github_review_webhook(
+    State(engine): State<Arc<Engine>>,
+    headers: HeaderMap,
+    body: axum::body::Bytes,
+) -> Result<StatusCode, ApiError> {
+    let header = |name: &'static str| {
+        headers
+            .get(name)
+            .and_then(|value| value.to_str().ok())
+            .ok_or_else(|| EngineError::BadRequest(format!("missing {name}")))
+    };
+    engine.accept_github_review_webhook(
+        header("x-github-event")?,
+        header("x-github-delivery")?,
+        header("x-hub-signature-256")?,
+        &body,
+    )?;
+    Ok(StatusCode::ACCEPTED)
 }
 
 async fn openapi() -> Json<serde_json::Value> {

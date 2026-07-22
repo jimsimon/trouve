@@ -78,7 +78,14 @@ pub use requests::*;
 // account-centric, multi-instance feed (breaking route/event replacement),
 // and DELETE /v1/workspaces/{id} closes a workspace without deleting its
 // sessions while workspace.closed records the state change.
-pub const PROTOCOL_VERSION: &str = "1.0";
+// 1.1: GitHub App-backed code review configuration, repositories, durable
+// jobs, code_review.updated events, PR head SHAs, and separate session
+// checkout refs (all additive).
+// 1.2: reusable built-in/custom reviewer profiles, per-repository reviewer
+// selection, and profile snapshots on durable review jobs (all additive).
+// 1.3: per-repository reviewer model overrides and inherit/append/replace
+// prompt policies (additive).
+pub const PROTOCOL_VERSION: &str = "1.3";
 
 pub type WorkspaceId = String;
 pub type SessionId = String;

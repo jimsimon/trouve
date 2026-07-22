@@ -24,6 +24,24 @@ fn git(dir: &Path, args: &[&str]) -> Result<String> {
     git_result(dir, args, out.status, out.stdout, out.stderr)
 }
 
+fn git_untrimmed(dir: &Path, args: &[&str]) -> Result<String> {
+    let out = Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(args)
+        .output()
+        .with_context(|| format!("running git {args:?} in {}", dir.display()))?;
+    if !out.status.success() {
+        bail!(
+            "git {} failed in {}: {}",
+            args.join(" "),
+            dir.display(),
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
 fn git_with_timeout(dir: &Path, args: &[&str], timeout: Duration) -> Result<String> {
     let mut command = Command::new("git");
     command
@@ -322,6 +340,38 @@ pub fn session_diff(worktree: &Path, base_ref: &str) -> Result<String> {
     git(worktree, &["diff", "--end-of-options", base_ref])
 }
 
+/// Every changed path in git's deterministic diff order. NUL framing keeps
+/// whitespace and newlines in filenames unambiguous.
+pub fn session_diff_files(worktree: &Path, base_ref: &str) -> Result<Vec<String>> {
+    ensure_safe_ref(base_ref)?;
+    let output = git_untrimmed(
+        worktree,
+        &["diff", "--name-only", "-z", "--end-of-options", base_ref],
+    )?;
+    Ok(output
+        .split('\0')
+        .filter(|path| !path.is_empty())
+        .map(str::to_string)
+        .collect())
+}
+
+/// Unified diff for exactly one changed path.
+pub fn session_diff_path(worktree: &Path, base_ref: &str, path: &str) -> Result<String> {
+    ensure_safe_ref(base_ref)?;
+    if path.is_empty()
+        || Path::new(path).is_absolute()
+        || Path::new(path)
+            .components()
+            .any(|part| matches!(part, std::path::Component::ParentDir))
+    {
+        bail!("invalid repository-relative diff path: {path:?}");
+    }
+    git(
+        worktree,
+        &["diff", "--end-of-options", base_ref, "--", path],
+    )
+}
+
 /// URL of the named remote (usually "origin"), if configured.
 pub fn remote_url(worktree: &Path, remote: &str) -> Option<String> {
     git(worktree, &["remote", "get-url", remote])
@@ -489,6 +539,24 @@ mod tests {
             Some("feature/x")
         );
         assert_eq!(remote_branch_name(tmp.path(), "feature/x"), None);
+    }
+
+    #[test]
+    fn review_diff_lists_and_reads_every_changed_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        init_repo(tmp.path());
+        let base = run(tmp.path(), &["rev-parse", "HEAD"]);
+        std::fs::write(tmp.path().join("a.txt"), "one\ntwo\n").unwrap();
+        std::fs::write(tmp.path().join("space name.txt"), "added\n").unwrap();
+        run(tmp.path(), &["add", "-A"]);
+
+        let files = session_diff_files(tmp.path(), &base).unwrap();
+        assert_eq!(files, ["a.txt", "space name.txt"]);
+        let first = session_diff_path(tmp.path(), &base, &files[0]).unwrap();
+        let second = session_diff_path(tmp.path(), &base, &files[1]).unwrap();
+        assert!(first.contains("+two"));
+        assert!(second.contains("+added"));
+        assert!(session_diff_path(tmp.path(), &base, "../outside").is_err());
     }
 
     #[test]
