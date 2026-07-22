@@ -142,6 +142,8 @@ impl IntoResponse for ApiError {
         session_paths,
         session_file,
         open_terminal,
+        list_terminals,
+        create_terminal,
         kill_terminal,
         terminal_input,
         terminal_resize,
@@ -494,6 +496,10 @@ pub fn build_router(engine: Arc<Engine>) -> Router {
         .route("/v1/sessions/{id}/paths", get(session_paths))
         .route("/v1/sessions/{id}/file", get(session_file))
         .route("/v1/sessions/{id}/terminal", post(open_terminal))
+        .route(
+            "/v1/sessions/{id}/terminals",
+            get(list_terminals).post(create_terminal),
+        )
         .route("/v1/terminals/{id}", axum::routing::delete(kill_terminal))
         .route("/v1/terminals/{id}/input", post(terminal_input))
         .route("/v1/terminals/{id}/resize", post(terminal_resize))
@@ -1491,6 +1497,26 @@ async fn open_terminal(
     Json(req): Json<OpenTerminalRequest>,
 ) -> Result<Json<TerminalInfo>, ApiError> {
     Ok(Json(engine.open_terminal(&id, req.cols, req.rows)?))
+}
+
+#[utoipa::path(get, path = "/v1/sessions/{id}/terminals", params(("id" = String, Path,)),
+    responses((status = 200, body = [TerminalInfo]), (status = 404, body = ErrorBody)))]
+async fn list_terminals(
+    State(engine): State<Arc<Engine>>,
+    Path(id): Path<String>,
+) -> Result<Json<Vec<TerminalInfo>>, ApiError> {
+    Ok(Json(engine.list_terminals(&id)?))
+}
+
+#[utoipa::path(post, path = "/v1/sessions/{id}/terminals", params(("id" = String, Path,)),
+    request_body = OpenTerminalRequest,
+    responses((status = 200, body = TerminalInfo), (status = 404, body = ErrorBody)))]
+async fn create_terminal(
+    State(engine): State<Arc<Engine>>,
+    Path(id): Path<String>,
+    Json(req): Json<OpenTerminalRequest>,
+) -> Result<Json<TerminalInfo>, ApiError> {
+    Ok(Json(engine.create_terminal(&id, req.cols, req.rows)?))
 }
 
 #[utoipa::path(delete, path = "/v1/terminals/{id}", params(("id" = String, Path,)),

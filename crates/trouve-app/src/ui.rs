@@ -995,16 +995,26 @@ pub fn set_diff(ui: &Ui, rows: Vec<slint_diff_view::RowData>, raw: String) {
 /// Push the terminal screen: styled rows (resolved RGB spans from the
 /// vt100 grid), cursor cell (None = hidden), scrollback offset in lines,
 /// a status note ("shell exited"), and whether a terminal is attached.
-pub fn set_term(
-    ui: &Ui,
-    rows: Vec<Vec<slint_terminal::GridSpan>>,
-    cursor: Option<(u16, u16)>,
-    scrollback: usize,
-    status: String,
-    attached: bool,
-) {
+pub struct TerminalUiState {
+    pub tabs: Vec<(String, bool)>,
+    pub active_tab: i32,
+    pub mouse_mode: i32,
+    pub search_match: Option<((u16, u16), (u16, u16))>,
+    pub cursor_shape: i32,
+    pub cursor_blinking: bool,
+    pub rows: Vec<Vec<slint_terminal::GridSpan>>,
+    pub cursor: Option<(u16, u16)>,
+    pub scrollback: usize,
+    pub status: String,
+    pub accessible_text: String,
+    pub clipboard_request: bool,
+    pub attached: bool,
+}
+
+pub fn set_term(ui: &Ui, state: TerminalUiState) {
     let _ = ui.upgrade_in_event_loop(move |ui| {
-        let lines: Vec<ModelRc<crate::TermSpan>> = rows
+        let lines: Vec<ModelRc<crate::TermSpan>> = state
+            .rows
             .into_iter()
             .map(|spans| {
                 let spans: Vec<crate::TermSpan> = spans
@@ -1013,6 +1023,10 @@ pub fn set_term(
                         text: SharedString::from(s.text.as_str()),
                         fg: slint::Color::from_argb_encoded(0xff00_0000 | s.fg),
                         bg: slint::Color::from_argb_encoded(0xff00_0000 | s.bg),
+                        bold: s.bold,
+                        dim: s.dim,
+                        italic: s.italic,
+                        underline: s.underline,
                         has_bg: s.has_bg,
                     })
                     .collect();
@@ -1020,14 +1034,73 @@ pub fn set_term(
             })
             .collect();
         ui.set_term_lines(ModelRc::new(VecModel::from(lines)));
-        let (row, col) = cursor
+        let tabs = state
+            .tabs
+            .into_iter()
+            .map(|(label, exited)| crate::TermTabItem {
+                label: SharedString::from(label),
+                exited,
+            })
+            .collect::<Vec<_>>();
+        ui.set_term_tabs(ModelRc::new(VecModel::from(tabs)));
+        ui.set_term_active_tab(state.active_tab);
+        ui.set_term_mouse_mode(state.mouse_mode);
+        ui.set_term_cursor_shape(state.cursor_shape);
+        ui.set_term_cursor_blinking(state.cursor_blinking);
+        let (start_row, start_col, end_row, end_col) = state
+            .search_match
+            .map(|(start, end)| {
+                (
+                    i32::from(start.0),
+                    i32::from(start.1),
+                    i32::from(end.0),
+                    i32::from(end.1),
+                )
+            })
+            .unwrap_or((-1, 0, -1, 0));
+        ui.set_term_search_start_row(start_row);
+        ui.set_term_search_start_col(start_col);
+        ui.set_term_search_end_row(end_row);
+        ui.set_term_search_end_col(end_col);
+        let (row, col) = state
+            .cursor
             .map(|(r, c)| (r as i32, c as i32))
             .unwrap_or((-1, -1));
         ui.set_term_cursor_row(row);
         ui.set_term_cursor_col(col);
-        ui.set_term_scrollback(scrollback as i32);
-        ui.set_term_status(SharedString::from(status.as_str()));
-        ui.set_term_attached(attached);
+        ui.set_term_scrollback(state.scrollback as i32);
+        ui.set_term_status(SharedString::from(state.status.as_str()));
+        ui.set_term_accessible_text(SharedString::from(state.accessible_text));
+        ui.set_term_clipboard_request(state.clipboard_request);
+        ui.set_term_attached(state.attached);
+    });
+}
+
+/// Hand selected terminal text back to the grid's hidden `TextInput`, which
+/// owns the platform clipboard operation. The sequence makes repeated copies
+/// of identical text observable to Slint.
+pub fn copy_term_text(ui: &Ui, text: String) {
+    let _ = ui.upgrade_in_event_loop(move |ui| {
+        ui.set_term_clipboard_text(SharedString::from(text));
+        ui.set_term_clipboard_seq(ui.get_term_clipboard_seq().wrapping_add(1));
+    });
+}
+
+/// Trigger the terminal widget's short visual-bell flash.
+pub fn ring_term_bell(ui: &Ui) {
+    let _ = ui.upgrade_in_event_loop(|ui| {
+        ui.set_term_bell_seq(ui.get_term_bell_seq().wrapping_add(1));
+    });
+}
+
+/// Apply a host-computed word/logical-line selection to the terminal grid.
+pub fn set_term_selection(ui: &Ui, start: (u16, u16), end: (u16, u16)) {
+    let _ = ui.upgrade_in_event_loop(move |ui| {
+        ui.set_term_selection_start_row(i32::from(start.0));
+        ui.set_term_selection_start_col(i32::from(start.1));
+        ui.set_term_selection_end_row(i32::from(end.0));
+        ui.set_term_selection_end_col(i32::from(end.1));
+        ui.set_term_selection_seq(ui.get_term_selection_seq().wrapping_add(1));
     });
 }
 

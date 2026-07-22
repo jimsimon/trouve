@@ -351,14 +351,14 @@ pub struct FileContent {
 
 // --- integrated terminal -----------------------------------------------------
 //
-// A session has at most one interactive shell, spawned in its worktree.
+// A session may own multiple interactive shells, each spawned in its worktree.
 // Output is an ephemeral byte stream (SSE of base64 chunks addressed by
 // byte offset), like the diff/files endpoints — not part of the event log.
 
-/// Open (or re-attach to) the session's terminal.
+/// Initial dimensions for a newly created terminal. The singular compatibility
+/// endpoint ignores these values when it re-attaches to a live terminal.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct OpenTerminalRequest {
-    /// Initial grid size; ignored when re-attaching to a live terminal.
     pub cols: u16,
     pub rows: u16,
 }

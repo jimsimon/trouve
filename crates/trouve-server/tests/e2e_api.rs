@@ -2527,6 +2527,59 @@ async fn terminal_shell_in_session_worktree() {
         .unwrap();
     assert_eq!(again["id"], *term_id);
 
+    // The plural API creates and lists independent terminal tabs without
+    // changing the singular endpoint's default-terminal behavior.
+    let listed: Vec<serde_json::Value> = client
+        .get(format!("{base}/sessions/{session_id}/terminals"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(listed.len(), 1);
+    let second: serde_json::Value = client
+        .post(format!("{base}/sessions/{session_id}/terminals"))
+        .json(&serde_json::json!({"cols": 90, "rows": 25}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let second_id = second["id"].as_str().unwrap();
+    assert_ne!(second_id, term_id);
+    let listed: Vec<serde_json::Value> = client
+        .get(format!("{base}/sessions/{session_id}/terminals"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(listed.len(), 2);
+    assert_eq!(listed[0]["id"], *term_id);
+    assert_eq!(listed[1]["id"], *second_id);
+    assert_eq!(
+        client
+            .delete(format!("{base}/terminals/{second_id}"))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        204
+    );
+    let listed: Vec<serde_json::Value> = client
+        .get(format!("{base}/sessions/{session_id}/terminals"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0]["id"], *term_id);
+
     // The shell starts in the worktree: `ls` shows the checked-out README.
     let resp = client
         .post(format!("{base}/terminals/{term_id}/input"))

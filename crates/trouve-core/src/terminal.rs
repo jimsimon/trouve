@@ -1,5 +1,5 @@
-//! Integrated terminal: one interactive shell per session, spawned in the
-//! session's worktree over a PTY.
+//! Integrated terminals: zero or more interactive shells per session,
+//! spawned in the session's worktree over independent PTYs.
 //!
 //! The manager keeps a capped backlog of raw output per terminal (so a
 //! client attaching later replays the screen history) plus a broadcast
@@ -25,11 +25,18 @@ const BACKLOG_CAP: usize = 512 * 1024;
 #[derive(Default)]
 pub struct TerminalManager {
     terminals: Mutex<HashMap<String, Arc<Terminal>>>,
-    /// session id → terminal id (one live terminal per session).
-    by_session: Mutex<HashMap<String, String>>,
-    /// Serializes `open` so two concurrent opens for one session can't both
-    /// spawn a shell (the loser's would leak, running, forever).
+    /// Session id → terminal ids, in creation order.
+    by_session: Mutex<HashMap<String, Vec<String>>>,
+    /// Sessions whose terminals were torn down by archive/delete/workspace
+    /// close. Keeping this tombstone closes the race where a request reads
+    /// the session just before teardown and otherwise spawns a late shell.
+    closed_sessions: Mutex<std::collections::HashSet<String>>,
+    /// Serializes shell spawns and the compatibility open-or-attach path.
     open_lock: Mutex<()>,
+    /// Once shutdown begins, no new shells may be spawned. Reader threads
+    /// retain their own `Arc<Terminal>`, so manager drop must actively kill
+    /// children rather than relying on the terminal values being dropped.
+    shutting_down: AtomicBool,
 }
 
 pub struct Terminal {
@@ -101,26 +108,57 @@ impl Terminal {
 }
 
 impl TerminalManager {
-    /// The session's live terminal, spawning one (a login-ish shell in the
-    /// worktree) if there is none or the previous shell exited.
-    pub fn open(
+    /// The session's default live terminal, spawning one if none is live.
+    /// This preserves the original single-terminal endpoint semantics.
+    pub fn open_default(
         &self,
         session_id: &str,
         worktree: &Path,
         cols: u16,
         rows: u16,
     ) -> Result<Arc<Terminal>> {
-        // Serialize the check-and-spawn: without this, two concurrent opens
-        // both miss the existing terminal, both spawn a shell, and the second
-        // overwrites by_session — leaking the first's running shell.
         let _open = self.open_lock.lock().unwrap();
-        if let Some(existing) = self.for_session(session_id) {
-            if !existing.exited() {
-                return Ok(existing);
-            }
-            self.remove(&existing.id);
+        self.ensure_open(session_id)?;
+        if let Some(existing) = self
+            .list_session(session_id)
+            .into_iter()
+            .find(|terminal| !terminal.exited())
+        {
+            return Ok(existing);
         }
+        self.spawn(session_id, worktree, cols, rows)
+    }
 
+    /// Spawn a new independent terminal for a session.
+    pub fn create(
+        &self,
+        session_id: &str,
+        worktree: &Path,
+        cols: u16,
+        rows: u16,
+    ) -> Result<Arc<Terminal>> {
+        let _open = self.open_lock.lock().unwrap();
+        self.ensure_open(session_id)?;
+        self.spawn(session_id, worktree, cols, rows)
+    }
+
+    fn ensure_open(&self, session_id: &str) -> Result<()> {
+        if self.shutting_down.load(Ordering::Acquire) {
+            return Err(anyhow!("terminal manager is shutting down"));
+        }
+        if self.closed_sessions.lock().unwrap().contains(session_id) {
+            return Err(anyhow!("terminal session {session_id} is closed"));
+        }
+        Ok(())
+    }
+
+    fn spawn(
+        &self,
+        session_id: &str,
+        worktree: &Path,
+        cols: u16,
+        rows: u16,
+    ) -> Result<Arc<Terminal>> {
         let pty = native_pty_system();
         let pair = pty
             .openpty(PtySize {
@@ -173,7 +211,9 @@ impl TerminalManager {
         self.by_session
             .lock()
             .unwrap()
-            .insert(session_id.to_string(), terminal.id.clone());
+            .entry(session_id.to_string())
+            .or_default()
+            .push(terminal.id.clone());
 
         // Blocking reader thread: PTY reads have no async story; the thread
         // exits when the shell does (read returns 0/Err).
@@ -223,8 +263,22 @@ impl TerminalManager {
     }
 
     pub fn for_session(&self, session_id: &str) -> Option<Arc<Terminal>> {
-        let id = self.by_session.lock().unwrap().get(session_id).cloned()?;
-        self.terminals.lock().unwrap().get(&id).cloned()
+        self.list_session(session_id).into_iter().next()
+    }
+
+    /// All terminals belonging to a session, in creation order.
+    pub fn list_session(&self, session_id: &str) -> Vec<Arc<Terminal>> {
+        let ids = self
+            .by_session
+            .lock()
+            .unwrap()
+            .get(session_id)
+            .cloned()
+            .unwrap_or_default();
+        let terminals = self.terminals.lock().unwrap();
+        ids.into_iter()
+            .filter_map(|id| terminals.get(&id).cloned())
+            .collect()
     }
 
     /// Kill and forget a terminal (explicit close or restart).
@@ -233,20 +287,65 @@ impl TerminalManager {
         if let Some(terminal) = removed {
             terminal.kill();
             let mut by_session = self.by_session.lock().unwrap();
-            if by_session.get(&terminal.session_id) == Some(&terminal.id) {
+            if let Some(ids) = by_session.get_mut(&terminal.session_id) {
+                ids.retain(|id| id != &terminal.id);
+            }
+            if by_session
+                .get(&terminal.session_id)
+                .is_some_and(Vec::is_empty)
+            {
                 by_session.remove(&terminal.session_id);
             }
         }
     }
 
-    /// Kill the session's terminal, if any (session delete/archive).
+    /// Kill all of the session's terminals and prevent a racing request from
+    /// spawning another one. An unarchived session must be reopened
+    /// explicitly with [`Self::reopen_session`].
     pub fn remove_session(&self, session_id: &str) {
-        // NB: bind before the if-let — the guard would otherwise live for
-        // the body, deadlocking with remove()'s own by_session lock.
-        let id = self.by_session.lock().unwrap().get(session_id).cloned();
-        if let Some(id) = id {
+        let _open = self.open_lock.lock().unwrap();
+        self.closed_sessions
+            .lock()
+            .unwrap()
+            .insert(session_id.to_string());
+        let ids = self
+            .by_session
+            .lock()
+            .unwrap()
+            .get(session_id)
+            .cloned()
+            .unwrap_or_default();
+        for id in ids {
             self.remove(&id);
         }
+    }
+
+    /// Allow terminals to be created again after a session is unarchived.
+    pub fn reopen_session(&self, session_id: &str) {
+        let _open = self.open_lock.lock().unwrap();
+        self.closed_sessions.lock().unwrap().remove(session_id);
+    }
+
+    /// Permanently stop this manager and kill every registered shell.
+    /// Idempotent so explicit server shutdown and `Drop` can both call it.
+    pub fn shutdown(&self) {
+        self.shutting_down.store(true, Ordering::Release);
+        let _open = self.open_lock.lock().unwrap();
+        let terminals = {
+            let mut terminals = self.terminals.lock().unwrap();
+            std::mem::take(&mut *terminals)
+        };
+        self.by_session.lock().unwrap().clear();
+        self.closed_sessions.lock().unwrap().clear();
+        for terminal in terminals.into_values() {
+            terminal.kill();
+        }
+    }
+}
+
+impl Drop for TerminalManager {
+    fn drop(&mut self) {
+        self.shutdown();
     }
 }
 
@@ -269,11 +368,11 @@ mod tests {
     async fn shell_roundtrip_backlog_and_live() {
         let mgr = TerminalManager::default();
         let dir = tempfile::tempdir().unwrap();
-        let term = mgr.open("s1", dir.path(), 80, 24).unwrap();
+        let term = mgr.open_default("s1", dir.path(), 80, 24).unwrap();
         assert!(!term.exited());
 
         // Re-open returns the same live terminal.
-        let again = mgr.open("s1", dir.path(), 80, 24).unwrap();
+        let again = mgr.open_default("s1", dir.path(), 80, 24).unwrap();
         assert_eq!(again.id, term.id);
 
         term.write(b"printf 'marker-%s' 42\rexit\r").unwrap();
@@ -297,9 +396,56 @@ mod tests {
         assert!(offset > 0);
 
         // A dead terminal is replaced on the next open.
-        let fresh = mgr.open("s1", dir.path(), 80, 24).unwrap();
+        let fresh = mgr.open_default("s1", dir.path(), 80, 24).unwrap();
         assert_ne!(fresh.id, term.id);
+
+        let second = mgr.create("s1", dir.path(), 80, 24).unwrap();
+        assert_ne!(fresh.id, second.id);
+        assert_eq!(mgr.list_session("s1").len(), 3);
+        mgr.remove(&second.id);
+        assert_eq!(mgr.list_session("s1").len(), 2);
         mgr.remove_session("s1");
         assert!(mgr.for_session("s1").is_none());
+        assert!(mgr.create("s1", dir.path(), 80, 24).is_err());
+        mgr.reopen_session("s1");
+        assert!(mgr.create("s1", dir.path(), 80, 24).is_ok());
+    }
+
+    #[test]
+    fn shutdown_kills_shells_and_rejects_new_ones() {
+        let mgr = TerminalManager::default();
+        let dir = tempfile::tempdir().unwrap();
+        let term = mgr.create("s1", dir.path(), 80, 24).unwrap();
+
+        mgr.shutdown();
+
+        assert!(mgr.for_session("s1").is_none());
+        assert!(mgr.create("s2", dir.path(), 80, 24).is_err());
+        for _ in 0..100 {
+            if term.exited() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(term.exited());
+    }
+
+    #[test]
+    fn drop_kills_shell_held_by_reader_thread() {
+        let dir = tempfile::tempdir().unwrap();
+        let term = {
+            let mgr = TerminalManager::default();
+            let term = mgr.create("s1", dir.path(), 80, 24).unwrap();
+            drop(mgr);
+            term
+        };
+
+        for _ in 0..100 {
+            if term.exited() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(term.exited());
     }
 }
