@@ -1702,6 +1702,9 @@ export component AppWindow inherits Window {
     // paused by a failed turn never auto-run — a crash may have cut the
     // previous turn short, so resuming is the user's call.
     in property <[string]> queue-prompts;
+    // Single-line display text derived from queue-prompts. Keep the original
+    // model intact because the inline editor must retain embedded newlines.
+    in property <[string]> queue-previews;
     // Per-row attachment badge ("📎2"; empty hides it). Parallel to
     // queue-prompts so the editable row text stays pristine.
     in property <[string]> queue-badges;
@@ -3867,6 +3870,10 @@ export component AppWindow inherits Window {
                                 spacing: 4px;
                                 Rectangle {
                                     height: Theme.fs(24px);
+                                    // Queue previews have a fixed one-line
+                                    // slot. Clipping is a defensive boundary
+                                    // against text ever escaping into chat.
+                                    clip: true;
                                     border-radius: 4px;
                                     // Dragged row reads as "lifted"; the slot
                                     // it would land in gets a soft highlight.
@@ -3924,7 +3931,8 @@ export component AppWindow inherits Window {
                                         vertical-alignment: center;
                                     }
                                     Text {
-                                        text: qtext;
+                                        text: qi < root.queue-previews.length
+                                            ? root.queue-previews[qi] : "";
                                         color: Theme.c.text-mid;
                                         font-size: Theme.fs(12px);
                                         overflow: elide;
