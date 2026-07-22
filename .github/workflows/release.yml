@@ -247,7 +247,7 @@ jobs:
       # Attaches to the existing release when one was published from the UI;
       # creates the release when the run came from a pushed tag.
       - name: Create or update GitHub Release
-        uses: softprops/action-gh-release@c12583777ecdfd3be55c69cf75464299dc01057e # v3
+        uses: softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228 # v3
         with:
           tag_name: ${{ env.RELEASE_TAG }}
           files: artifacts/*
