@@ -33,6 +33,8 @@ jobs:
           RUSTDOCFLAGS: -D warnings
       - name: versions in sync
         run: python3 scripts/sync_versions.py --check
+      - name: benchmark gate tests
+        run: python3 -m unittest benchmarks/test_compare_benchmarks.py
       # The test-with-model job in test.yml runs ignored tests from these two
       # crates, so an #[ignore]d test anywhere else would silently never run.
       # Keep them there, or widen that job's scope on purpose.
