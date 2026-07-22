@@ -1886,7 +1886,7 @@ impl Controller {
                 if let Some(session_id) = self.current_session_id() {
                     self.resume.session_threads.insert(session_id, thread_id);
                 }
-                self.select_session(session_index).await?;
+                self.reload_session(session_index).await?;
             }
             CommandAction::OpenTerminal => {
                 self.right_tab = TERMINAL_TAB;
@@ -1945,10 +1945,20 @@ impl Controller {
     }
 
     async fn select_session(&mut self, index: usize) -> Result<()> {
+        self.select_session_with_reload(index, false).await
+    }
+
+    async fn reload_session(&mut self, index: usize) -> Result<()> {
+        self.select_session_with_reload(index, true).await
+    }
+
+    async fn select_session_with_reload(&mut self, index: usize, force_reload: bool) -> Result<()> {
         if index >= self.sessions.len() {
             return Ok(());
         }
-        if self.current_session_id().as_deref() == Some(self.sessions[index].id.as_str()) {
+        if !force_reload
+            && self.current_session_id().as_deref() == Some(self.sessions[index].id.as_str())
+        {
             if self.unread_sessions.remove(&self.sessions[index].id)
                 | self.error_sessions.remove(&self.sessions[index].id)
             {
@@ -4469,7 +4479,7 @@ impl Controller {
                             if let Some(session_id) = self.current_session_id() {
                                 self.resume.session_threads.insert(session_id, thread_id);
                             }
-                            self.select_session(session_index).await?;
+                            self.reload_session(session_index).await?;
                         }
                         if refresh_session {
                             self.reload_sessions().await?;

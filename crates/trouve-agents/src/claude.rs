@@ -53,7 +53,7 @@ pub struct ClaudeBackend {
     id: String,
     command: String,
     pool: Arc<Pool>,
-    authority_probe: tokio::sync::OnceCell<Result<(), String>>,
+    authority_probe: tokio::sync::OnceCell<()>,
 }
 
 impl ClaudeBackend {
@@ -326,10 +326,10 @@ impl AgentBackend for ClaudeBackend {
         if authoritative
             && let Err(message) = self
                 .authority_probe
-                .get_or_init(|| certify_authoritative_cli(&self.command))
+                .get_or_try_init(|| certify_authoritative_cli(&self.command))
                 .await
         {
-            return Err(BackendError::Protocol(message.clone()));
+            return Err(BackendError::Protocol(message));
         }
         self.start_reaper();
         let proc_ = self.proc_for(&turn).await?;

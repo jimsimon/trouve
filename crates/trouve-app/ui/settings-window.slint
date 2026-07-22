@@ -212,33 +212,16 @@ component DownloadBar inherits Rectangle {
     }
 }
 
-// An On/Off pill with a wrapping description beside it (the style the
-// Appearance section's "Reduce motion" established).
+// A keyboard-accessible On/Off switch with a wrapping description beside it.
 component ToggleRow inherits HorizontalLayout {
     in-out property <bool> on;
     in property <string> label;
     callback toggled(bool);
     spacing: 10px;
-    Rectangle {
-        width: 44px;
-        height: Theme.fs(26px);
-        background: root.on ? Theme.c.accent-bg : Theme.c.control-bg;
-        border-radius: 6px;
-        border-width: 1px;
-        border-color: root.on ? Theme.c.primary-border : Theme.c.border;
-        TouchArea {
-            clicked => {
-                root.on = !root.on;
-                root.toggled(root.on);
-            }
-        }
-        Text {
-            text: root.on ? "On" : "Off";
-            color: root.on ? Theme.c.text-hi : Theme.c.text-soft;
-            font-size: Theme.fs(12px);
-            horizontal-alignment: center;
-            vertical-alignment: center;
-        }
+    Switch {
+        checked <=> root.on;
+        text: root.on ? "On" : "Off";
+        toggled => { root.toggled(self.checked); }
     }
     Text {
         text: root.label;

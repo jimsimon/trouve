@@ -4174,7 +4174,11 @@ impl Engine {
                     CommandAction::OpenTerminal,
                 )
             }
-            _ => unreachable!("action command registry and executor diverged"),
+            _ => {
+                return Err(EngineError::Internal(anyhow!(
+                    "action command registry and executor diverged: /{name}"
+                )));
+            }
         };
 
         let output = truncate_command_output(output);

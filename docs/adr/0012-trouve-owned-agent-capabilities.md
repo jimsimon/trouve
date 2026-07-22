@@ -1,4 +1,4 @@
-# 0009 — Trouve owns the agent capability surface
+# 0012 — Trouve owns the agent capability surface
 
 Status: Accepted (2026-07).
 
