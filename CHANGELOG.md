@@ -4,10 +4,85 @@ All notable changes to this project are documented in this file. The format
 is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this
 project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [2.1.0] - 2026-07-22
+
+This is the first release of the trouve AI coding harness and its GitHub
+App-backed code review service, deployable on your own infrastructure. It
+grows trouve from a code-search tool into a protocol-first agent platform with
+a native desktop client, while keeping `trouve-search` available as the same
+standalone CLI, library, MCP server, and agent plugin.
 
 ### Added
 
+- **trouve AI coding harness**: a Rust agent engine, HTTP + SSE server, shared
+  client layer, and native Slint desktop app. Sessions own isolated git
+  worktrees; threads share the session worktree while retaining durable
+  per-thread conversations, queues, modes, models, and todo state. Per-turn
+  hidden-ref checkpoints provide session undo and redo. The desktop app embeds
+  the server in-process but continues to use the authenticated loopback
+  protocol boundary.
+- **Agent and model integrations**: run Claude Code, Codex, and Cursor through
+  their native protocols with managed CLI installs, login flows, live model
+  discovery, and persistent or resumable vendor sessions. Direct API
+  providers and OpenAI-compatible endpoints are supported alongside managed
+  local `llama.cpp` models, with mid-thread model changes, configurable
+  thinking, context and fast-mode controls, and subscription-health views for
+  Claude, Codex, Cursor, and Kimi.
+- **Coding tools and delegation**: agents can read and edit files, apply
+  patches, inspect diffs, search code and transcripts, glob, fetch web pages,
+  run foreground or background shell jobs, maintain todos, and recover from
+  compacted context. Parent agents can delegate work to child threads or
+  fully isolated child sessions, then collect their output. Side effects pass
+  through Ask, Allow list, or Yolo permission gates; local execution is not
+  OS-sandboxed, and Yolo deliberately skips approval prompts.
+- **Native desktop workflow**: streaming chat and reasoning, Markdown tables
+  and syntax highlighting, file and diff inspection, an interactive PTY
+  terminal, file and image attachments, `@` file mentions, `/skill`
+  completion, editable queued prompts, desktop notifications, workspace
+  reordering, and restored window, session, and scroll state. Modes, model
+  defaults, permission policies, providers, integrations, MCP servers, and
+  vendor CLIs are configurable in Settings.
+- **Automations**: schedule scoped agent prompts, start them on demand, pause
+  or resume them, choose their model and permission mode, and create common
+  workflows from built-in templates. Runs create normal durable sessions and
+  record their outcomes.
+- **GitHub pull request workspace**: OAuth sign-in for GitHub.com and
+  self-hosted GitHub Enterprise instances, an account-wide PR dashboard with
+  actionable review/check/merge groups, project filters, session association,
+  and PR actions. Shared GraphQL-backed snapshots refresh every 30 seconds and
+  feed the dashboard, session status, and per-session PR panel without
+  repeatedly fetching unchanged details.
+- **GitHub App code review service**: a separately authenticated GitHub App can
+  review selected repositories in manual or automatic mode. Signed webhooks
+  provide a fast path while durable polling reconciles missed events; every
+  job is deduplicated, runs read-only in an isolated session at the exact PR
+  head, and is cancelled or marked stale when the revision or effective
+  policy changes.
+- **Focused, verified reviews**: built-in reviewer profiles cover
+  correctness, security, reliability, performance, concurrency, API
+  compatibility, data integrity, testing, maintainability, dependencies,
+  accessibility, and operations. Repositories can select reviewers and
+  override their prompts or models, while reusable custom profiles add
+  project-specific expertise. A final editor pass verifies findings against
+  the repository and commentable diff lines before publishing inline comments
+  and a summary under the App's bot identity.
+- **Code review operations**: a standalone web dashboard configures the
+  GitHub App, providers, models, reviewers, and repository policies and shows
+  durable job history and GitHub rate limits. Docker Compose deployment,
+  backup and upgrade guidance, and multi-architecture `trouve-server` and
+  `trouve-review-ui` images are included.
+- **Shared search daemon**: on Unix, concurrent `trouve-search` MCP sessions
+  with matching configuration now share one background embedding model and
+  in-memory index cache. The daemon starts on demand, exits after 15 idle
+  minutes, and falls back to in-process serving if it cannot be reached;
+  `TROUVE_DAEMON=0` opts out. Windows keeps the existing in-process behavior.
+- **Offline and reconnect handling**: the server reports internet reachability
+  and filters remote models while offline, leaving local models available.
+  The desktop app gates unavailable actions, explains connectivity state,
+  reconnects and resynchronizes automatically, and announces recovery.
+- **Reusable Slint widgets**: independently usable `trouve-slint-*` crates
+  provide code, diff, streaming Markdown, and terminal views without exposing
+  trouve protocol types in their public APIs.
 - **Global default permissions**: Settings → Modes & Models gains a "Global
   default permissions" picker (Ask / Allow list / Yolo) that applies to new
   threads whose mode doesn't set its own permission mode. Per-mode default
@@ -20,8 +95,36 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `PUT /v1/config/default-permission-mode`, and `GET /v1/providers` reports
   it alongside the default model.
 
+### Changed
+
+- **Cargo workspace and release tags**: the repository is now a monorepo for
+  `trouve-search`, the harness, and reusable UI crates. Crates are versioned
+  independently and new search releases use crate-prefixed tags such as
+  `trouve-search-v2.1.0`; the bare `vX.Y.Z` tags are retained as legacy tags.
+  The workspace uses Rust edition 2024 and requires Rust 1.92 to build.
+- **GitHub authentication**: account PR discovery now uses OAuth exclusively
+  and unifies data from GitHub.com and configured Enterprise instances. The
+  review service deliberately uses separate GitHub App installation tokens,
+  so its repository access and rate limits remain isolated from desktop OAuth.
+
 ### Fixed
 
+- **Concurrent event ingestion**: event-log appends are batched through a
+  dedicated writer thread, preserving commit-before-publish and cursor order
+  while preventing high-volume streaming from overflowing vendor-agent event
+  routes across concurrent sessions.
+- **Agent turn reliability**: fixed Codex approval responses, approvals that
+  arrive before their tool card, waiter cleanup after app-server exits, Git
+  writes in mutable modes, completed reasoning summaries, and subscription
+  limit reporting. Tool activity and reasoning now remain visible without
+  duplicate or retired replay events.
+- **Desktop state and input handling**: stabilized session switching and chat
+  scroll restoration, kept prompt drafts, queues, and todos scoped to their
+  thread, preserved queued editor text during stream updates, fixed deferred
+  quit and opener cleanup, and made session activity indicators consistent.
+- **Wayland image paste**: clipboard images copied by Spectacle and similar
+  tools are accepted when they are exposed through Wayland's data-control
+  protocol.
 - **Screen artifacts in the desktop app**: the app now prefers Slint's Skia
   renderer over the default FemtoVG renderer, whose glyph atlas corrupts on
   some Linux drivers — flashing garbage across the window while typing or
@@ -246,6 +349,7 @@ semble ([BENCHMARKS.md](BENCHMARKS.md)):
 - Incremental reindex (1 file touched): 0.86 s vs ~3 min (212x)
 - Warm query: 0.55 s vs 7.2 s (13x)
 
+[2.1.0]: https://github.com/jimsimon/trouve/releases/tag/trouve-search-v2.1.0
 [2.0.0]: https://github.com/jimsimon/trouve/releases/tag/v2.0.0
 [1.1.0]: https://github.com/jimsimon/trouve/releases/tag/v1.1.0
 [1.0.0]: https://github.com/jimsimon/trouve/releases/tag/v1.0.0
