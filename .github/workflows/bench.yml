@@ -1,11 +1,9 @@
 name: Bench
 
-# Benchmarks with regression gating: every run is compared against the
-# baseline from the last push to main, and the job fails when a benchmark
-# regresses past the alert threshold. Baselines live on the gh-pages branch
-# (dev/bench/data.js, one dashboard for both suites), so history persists
-# and is browsable via GitHub Pages. PRs only compare; pushes to main append
-# to the data and push it.
+# Run the candidate once and screen it against the median of recent successful
+# main runs. A suspected regression (or insufficient history) is confirmed by
+# benchmarking the exact base revision on the same runner before the job fails.
+# Results are retained as workflow artifacts; GitHub Pages is not involved.
 
 on:
   push:
@@ -13,13 +11,15 @@ on:
   pull_request:
 
 env:
+  CARGO_INCREMENTAL: "0"
   CARGO_TERM_COLOR: always
+  # Dense-query benchmarks use Rayon. Fixing the worker count removes runner
+  # CPU-count variance without disabling the parallel code path.
+  RAYON_NUM_THREADS: "2"
 
-# Push benchmark data to the gh-pages branch. Only main runs push; PR runs
-# use persist-credentials: false checkouts so benchmarked code never sees a
-# token, and fork PRs get a read-only token regardless.
 permissions:
-  contents: write
+  actions: read
+  contents: read
 
 concurrency:
   group: bench-${{ github.ref }}
@@ -31,30 +31,108 @@ jobs:
   micro:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - name: Check out candidate
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
+          repository: ${{ github.event.pull_request.head.repo.full_name || github.repository }}
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
-      - name: Run criterion benchmarks
+      - name: Run candidate criterion benchmarks
         # Clear stale criterion state (rust-cache persists ./target) so the
         # converter only sees estimates from this run.
-        run: rm -rf target/criterion && cargo bench --package trouve-search --bench index_and_search
-      - name: Convert criterion estimates to benchmark JSON
-        run: python3 benchmarks/to_gha_bench.py --criterion target/criterion > micro.json
-      - name: Compare against baseline
-        uses: benchmark-action/github-action-benchmark@52576c92bccf6ac60c8223ec7eb2565637cae9ba # v1.22.1
+        run: |
+          rm -rf target/criterion
+          cargo bench --package trouve-search --bench index_and_search
+      - name: Convert candidate estimates to benchmark JSON
+        run: |
+          mkdir -p bench-results/micro
+          python3 benchmarks/to_gha_bench.py \
+            --criterion target/criterion > bench-results/micro/head.json
+      - name: Download recent main baselines
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p benchmark-history
+          if ! gh run list \
+              --repo "$GITHUB_REPOSITORY" \
+              --workflow bench.yml \
+              --branch main \
+              --status success \
+              --limit 10 \
+              --json databaseId \
+              --jq '.[].databaseId' > benchmark-run-ids; then
+            echo "Unable to list historical runs; base confirmation will be used."
+            : > benchmark-run-ids
+          fi
+          while IFS= read -r run_id; do
+            gh run download "$run_id" \
+              --repo "$GITHUB_REPOSITORY" \
+              --name micro-benchmark-results \
+              --dir "benchmark-history/$run_id" 2>/dev/null || true
+          done < benchmark-run-ids
+      - name: Screen candidate against recent main median
+        id: history
+        run: |
+          shopt -s nullglob
+          baselines=(benchmark-history/*/head.json)
+          set +e
+          python3 benchmarks/compare_benchmarks.py \
+            --candidate bench-results/micro/head.json \
+            --baseline "${baselines[@]}" \
+            --threshold 1.5 \
+            --minimum-baselines 3 \
+            --title "Micro: candidate vs recent main median" \
+            --summary "$GITHUB_STEP_SUMMARY"
+          status=$?
+          set -e
+          if [ "$status" -eq 0 ]; then
+            echo "needs_base=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "needs_base=true" >> "$GITHUB_OUTPUT"
+            echo "Historical screen was inconclusive; confirming against the base revision."
+          fi
+      - name: Check out base revision
+        if: steps.history.outputs.needs_base == 'true'
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
-          name: micro-benchmarks
-          tool: customSmallerIsBetter
-          output-file-path: micro.json
-          github-token: ${{ secrets.GITHUB_TOKEN }}
-          fail-on-alert: true
-          alert-threshold: "150%"
-          summary-always: true
-          save-data-file: ${{ github.ref == 'refs/heads/main' }}
-          auto-push: ${{ github.ref == 'refs/heads/main' }}
-          max-items-in-chart: 200
+          repository: ${{ github.repository }}
+          ref: ${{ github.event.pull_request.base.sha || github.event.before }}
+          path: benchmark-base
+          persist-credentials: false
+      - name: Run base criterion benchmarks
+        if: steps.history.outputs.needs_base == 'true'
+        working-directory: benchmark-base
+        env:
+          CARGO_TARGET_DIR: ${{ github.workspace }}/target
+        run: |
+          cargo clean --package trouve-search
+          rm -rf "$CARGO_TARGET_DIR/criterion"
+          cargo bench --package trouve-search --bench index_and_search
+      - name: Convert base estimates to benchmark JSON
+        if: steps.history.outputs.needs_base == 'true'
+        run: |
+          python3 benchmarks/to_gha_bench.py \
+            --criterion target/criterion > bench-results/micro/base.json
+      - name: Confirm candidate against base revision
+        if: steps.history.outputs.needs_base == 'true'
+        run: |
+          python3 benchmarks/compare_benchmarks.py \
+            --candidate bench-results/micro/head.json \
+            --baseline bench-results/micro/base.json \
+            --threshold 1.5 \
+            --minimum-baselines 1 \
+            --title "Micro: candidate vs base revision" \
+            --summary "$GITHUB_STEP_SUMMARY"
+      - name: Upload benchmark results
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: micro-benchmark-results
+          path: bench-results/micro
+          if-no-files-found: warn
+          retention-days: 90
 
   # End-to-end CLI benchmarks on a pinned flask checkout: cold index, warm
   # query, incremental reindex, and the non-git (filesystem manifest) warm
@@ -63,8 +141,11 @@ jobs:
   e2e:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - name: Check out candidate
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
+          repository: ${{ github.event.pull_request.head.repo.full_name || github.repository }}
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
@@ -75,20 +156,89 @@ jobs:
         with:
           path: ~/.cache/huggingface
           key: hf-potion-code-16m
-      - name: Build release binary
+      - name: Build candidate release binary
         run: cargo build --release --package trouve-search
-      - name: Run end-to-end benchmarks
-        run: benchmarks/run_ci_bench.sh bench-out
-      - name: Compare against baseline
-        uses: benchmark-action/github-action-benchmark@52576c92bccf6ac60c8223ec7eb2565637cae9ba # v1.22.1
+      - name: Run candidate end-to-end benchmarks
+        run: benchmarks/run_ci_bench.sh bench-results/e2e/head
+      - name: Download recent main baselines
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p benchmark-history
+          if ! gh run list \
+              --repo "$GITHUB_REPOSITORY" \
+              --workflow bench.yml \
+              --branch main \
+              --status success \
+              --limit 10 \
+              --json databaseId \
+              --jq '.[].databaseId' > benchmark-run-ids; then
+            echo "Unable to list historical runs; base confirmation will be used."
+            : > benchmark-run-ids
+          fi
+          while IFS= read -r run_id; do
+            gh run download "$run_id" \
+              --repo "$GITHUB_REPOSITORY" \
+              --name e2e-benchmark-results \
+              --dir "benchmark-history/$run_id" 2>/dev/null || true
+          done < benchmark-run-ids
+      - name: Screen candidate against recent main median
+        id: history
+        run: |
+          shopt -s nullglob
+          baselines=(benchmark-history/*/head/e2e.json)
+          set +e
+          python3 benchmarks/compare_benchmarks.py \
+            --candidate bench-results/e2e/head/e2e.json \
+            --baseline "${baselines[@]}" \
+            --threshold 1.75 \
+            --minimum-baselines 3 \
+            --title "End-to-end: candidate vs recent main median" \
+            --summary "$GITHUB_STEP_SUMMARY"
+          status=$?
+          set -e
+          if [ "$status" -eq 0 ]; then
+            echo "needs_base=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "needs_base=true" >> "$GITHUB_OUTPUT"
+            echo "Historical screen was inconclusive; confirming against the base revision."
+          fi
+      - name: Check out base revision
+        if: steps.history.outputs.needs_base == 'true'
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
-          name: e2e-benchmarks
-          tool: customSmallerIsBetter
-          output-file-path: bench-out/e2e.json
-          github-token: ${{ secrets.GITHUB_TOKEN }}
-          fail-on-alert: true
-          alert-threshold: "175%"
-          summary-always: true
-          save-data-file: ${{ github.ref == 'refs/heads/main' }}
-          auto-push: ${{ github.ref == 'refs/heads/main' }}
-          max-items-in-chart: 200
+          repository: ${{ github.repository }}
+          ref: ${{ github.event.pull_request.base.sha || github.event.before }}
+          path: benchmark-base
+          persist-credentials: false
+      - name: Build base release binary
+        if: steps.history.outputs.needs_base == 'true'
+        working-directory: benchmark-base
+        env:
+          CARGO_TARGET_DIR: ${{ github.workspace }}/target
+        run: |
+          cargo clean --package trouve-search
+          cargo build --release --package trouve-search
+      - name: Run base end-to-end benchmarks
+        if: steps.history.outputs.needs_base == 'true'
+        # The base build replaces the shared target/release binary. Running
+        # the candidate's script keeps the benchmark procedure identical.
+        run: benchmarks/run_ci_bench.sh bench-results/e2e/base
+      - name: Confirm candidate against base revision
+        if: steps.history.outputs.needs_base == 'true'
+        run: |
+          python3 benchmarks/compare_benchmarks.py \
+            --candidate bench-results/e2e/head/e2e.json \
+            --baseline bench-results/e2e/base/e2e.json \
+            --threshold 1.75 \
+            --minimum-baselines 1 \
+            --title "End-to-end: candidate vs base revision" \
+            --summary "$GITHUB_STEP_SUMMARY"
+      - name: Upload benchmark results
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: e2e-benchmark-results
+          path: bench-results/e2e
+          if-no-files-found: warn
+          retention-days: 90

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Convert benchmark results to github-action-benchmark JSON.
+"""Convert benchmark results to the benchmark gate's common JSON format.
 
 Emits the `customSmallerIsBetter` format from either criterion output
 directories (``--criterion target/criterion``) or hyperfine JSON exports
@@ -67,8 +67,8 @@ def main() -> int:
     if not entries:
         print("no benchmark results found", file=sys.stderr)
         return 1
-    # github-action-benchmark keys history series by name; duplicates would
-    # silently collapse into one series, so fail loudly instead.
+    # The comparison gate keys history series by name, so fail loudly instead
+    # of silently collapsing duplicate entries.
     names = [e["name"] for e in entries]
     duplicates = {n for n in names if names.count(n) > 1}
     if duplicates:

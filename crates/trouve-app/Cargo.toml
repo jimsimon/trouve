@@ -34,10 +34,10 @@ trouve-protocol.workspace = true
 trouve-server.workspace = true
 # Plain-data helpers (diff parsing, markdown blocks, highlight segments,
 # terminal screen state + key encoding).
-slint-code-view = { path = "../slint-code-view" }
-slint-diff-view = { path = "../slint-diff-view" }
-slint-markdown = { path = "../slint-markdown" }
-slint-terminal = { path = "../slint-terminal" }
+trouve-slint-code-view = { path = "../trouve-slint-code-view" }
+trouve-slint-diff-view = { path = "../trouve-slint-diff-view" }
+trouve-slint-markdown = { path = "../trouve-slint-markdown" }
+trouve-slint-terminal = { path = "../trouve-slint-terminal" }
 # Syntax highlighting for the file viewer.
 syntect = { version = "5", default-features = false, features = ["default-fancy"] }
 rfd = { version = "0.17.2", default-features = false, features = ["xdg-portal", "pollster"] }

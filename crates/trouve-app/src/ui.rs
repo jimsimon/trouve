@@ -969,7 +969,7 @@ pub fn set_settings_section(ui: &Ui, section: i32) {
     let _ = ui.upgrade_in_event_loop(move |ui| ui.set_settings_section(section));
 }
 
-pub fn set_diff(ui: &Ui, rows: Vec<slint_diff_view::RowData>, raw: String) {
+pub fn set_diff(ui: &Ui, rows: Vec<trouve_slint_diff_view::RowData>, raw: String) {
     let _ = ui.upgrade_in_event_loop(move |ui| {
         let items: Vec<DiffRow> = rows
             .into_iter()
@@ -982,7 +982,7 @@ pub fn set_diff(ui: &Ui, rows: Vec<slint_diff_view::RowData>, raw: String) {
                 collapsed: r.collapsed,
             })
             .collect();
-        let file_texts: Vec<SharedString> = slint_diff_view::split_file_diffs(&raw)
+        let file_texts: Vec<SharedString> = trouve_slint_diff_view::split_file_diffs(&raw)
             .into_iter()
             .map(|s| SharedString::from(s.as_str()))
             .collect();
@@ -997,7 +997,7 @@ pub fn set_diff(ui: &Ui, rows: Vec<slint_diff_view::RowData>, raw: String) {
 /// a status note ("shell exited"), and whether a terminal is attached.
 pub fn set_term(
     ui: &Ui,
-    rows: Vec<Vec<slint_terminal::GridSpan>>,
+    rows: Vec<Vec<trouve_slint_terminal::GridSpan>>,
     cursor: Option<(u16, u16)>,
     scrollback: usize,
     status: String,
