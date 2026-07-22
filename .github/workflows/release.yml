@@ -1,21 +1,31 @@
 name: Release
 
 # Every first-party artifact uses the root workspace version, and repository
-# releases use `vX.Y.Z`. The workflow may publish only the distributable
-# subset (search packages plus review containers), but all workspace package
+# releases use `vX.Y.Z`. The workflow publishes the desktop and server
+# binaries, search packages, and review containers; all workspace package
 # versions advance together.
 on:
   push:
     tags: ["v[0-9]+.[0-9]+.[0-9]+*"]
+  # A manual run can repair the binary assets on an existing release without
+  # republishing immutable crates, npm packages, or container images.
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing vX.Y.Z release tag to rebuild
+        required: true
+        type: string
 
 env:
   CARGO_TERM_COLOR: always
+  RELEASE_TAG: ${{ github.event.inputs.tag || github.ref_name }}
 
 permissions:
-  contents: write
+  # Build and verification jobs only need to read repository contents.
+  contents: read
 
 concurrency:
-  group: release-${{ github.ref_name }}
+  group: release-${{ github.event.inputs.tag || github.ref_name }}
   cancel-in-progress: false
 
 jobs:
@@ -27,17 +37,21 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
+          ref: ${{ env.RELEASE_TAG }}
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
+        with:
+          python-version: "3.11.9"
       - name: Manifests in sync and tag matches workspace version
         run: |
           python3 scripts/sync_versions.py --check
           workspace="$(python3 -c "import tomllib; print(tomllib.load(open('Cargo.toml', 'rb'))['workspace']['package']['version'])")"
-          tag="${GITHUB_REF_NAME#v}"
-          if [ "$tag" != "$workspace" ]; then
-            echo "Tag v$tag does not match workspace version $workspace" >&2
+          if [ "$RELEASE_TAG" != "v$workspace" ]; then
+            echo "Tag $RELEASE_TAG does not match workspace version $workspace" >&2
             exit 1
           fi
 
-  build:
+  build_binaries:
+    name: Build headless binaries (${{ matrix.target }})
     needs: verify-versions
     strategy:
       fail-fast: false
@@ -73,66 +87,177 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
+          ref: ${{ env.RELEASE_TAG }}
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
-          key: ${{ matrix.target }}
+          key: release-binaries-${{ matrix.target }}
       - name: Install cross
         if: matrix.cross
-        uses: taiki-e/install-action@v2
+        uses: taiki-e/install-action@c44f6b046f1c29ae5918b1e0bfdbb2f1813836fd # v2
         with:
           tool: cross
-      - name: Build
+      - name: Build trouve-server
+        run: ${{ matrix.cross && 'cross' || 'cargo' }} build --release --package trouve-server --target ${{ matrix.target }}
+      # Manual runs backfill only missing binaries. Existing search assets
+      # stay byte-for-byte unchanged.
+      - name: Build trouve-search
+        if: github.event_name == 'push'
         run: ${{ matrix.cross && 'cross' || 'cargo' }} build --release --package trouve-search --target ${{ matrix.target }}
-      # Search artifact names keep the historical
-      # `trouve-search-vX.Y.Z-<target>` shape.
-      - name: Package (unix)
+      - name: Package trouve-server (unix)
         if: runner.os != 'Windows'
-        env:
-          REF_NAME: ${{ github.ref_name }}
         run: |
           cd target/${{ matrix.target }}/release
-          tar czf "trouve-search-${REF_NAME}-${{ matrix.target }}.tar.gz" trouve-search
-      - name: Package (windows)
+          tar czf "trouve-server-${RELEASE_TAG}-${{ matrix.target }}.tar.gz" trouve-server
+      - name: Package trouve-server (windows)
         if: runner.os == 'Windows'
         shell: pwsh
-        env:
-          REF_NAME: ${{ github.ref_name }}
         run: |
           cd target/${{ matrix.target }}/release
-          Compress-Archive -Path trouve-search.exe -DestinationPath "trouve-search-$env:REF_NAME-${{ matrix.target }}.zip"
-      - uses: actions/upload-artifact@v7
+          Compress-Archive -Path trouve-server.exe -DestinationPath "trouve-server-$env:RELEASE_TAG-${{ matrix.target }}.zip"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: trouve-server-${{ matrix.target }}
+          path: |
+            target/${{ matrix.target }}/release/trouve-server-${{ env.RELEASE_TAG }}-${{ matrix.target }}.tar.gz
+            target/${{ matrix.target }}/release/trouve-server-${{ env.RELEASE_TAG }}-${{ matrix.target }}.zip
+          if-no-files-found: error
+      # Search artifact names keep the historical
+      # `trouve-search-vX.Y.Z-<target>` shape.
+      - name: Package trouve-search (unix)
+        if: github.event_name == 'push' && runner.os != 'Windows'
+        run: |
+          cd target/${{ matrix.target }}/release
+          tar czf "trouve-search-${RELEASE_TAG}-${{ matrix.target }}.tar.gz" trouve-search
+      - name: Package trouve-search (windows)
+        if: github.event_name == 'push' && runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          cd target/${{ matrix.target }}/release
+          Compress-Archive -Path trouve-search.exe -DestinationPath "trouve-search-$env:RELEASE_TAG-${{ matrix.target }}.zip"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: github.event_name == 'push'
         with:
           name: trouve-search-${{ matrix.target }}
           path: |
-            target/${{ matrix.target }}/release/trouve-search-*.tar.gz
-            target/${{ matrix.target }}/release/trouve-search-*.zip
+            target/${{ matrix.target }}/release/trouve-search-${{ env.RELEASE_TAG }}-${{ matrix.target }}.tar.gz
+            target/${{ matrix.target }}/release/trouve-search-${{ env.RELEASE_TAG }}-${{ matrix.target }}.zip
+          if-no-files-found: error
+
+  build_app:
+    name: Build trouve (${{ matrix.target }})
+    needs: verify-versions
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # The desktop app uses system GUI libraries on Linux, so it ships
+          # for glibc rather than the static search-only musl targets.
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-24.04-arm
+          # Apple's toolchain supports cross-compiling x64 from the native
+          # arm64 runner.
+          - target: aarch64-apple-darwin
+            os: macos-latest
+          - target: x86_64-apple-darwin
+            os: macos-latest
+          # Both Windows targets build on matching native hardware.
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+          - target: aarch64-pc-windows-msvc
+            os: windows-11-arm
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+          ref: ${{ env.RELEASE_TAG }}
+      - name: Install Linux native build dependencies
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libfontconfig1-dev libdbus-1-dev
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          key: release-app-${{ matrix.target }}
+      - name: Build
+        run: cargo build --release --package trouve-app --target ${{ matrix.target }}
+      - name: Package trouve (unix)
+        if: runner.os != 'Windows'
+        run: |
+          cd target/${{ matrix.target }}/release
+          tar czf "trouve-${RELEASE_TAG}-${{ matrix.target }}.tar.gz" trouve
+      - name: Package trouve (windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          cd target/${{ matrix.target }}/release
+          Compress-Archive -Path trouve.exe -DestinationPath "trouve-$env:RELEASE_TAG-${{ matrix.target }}.zip"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: trouve-${{ matrix.target }}
+          path: |
+            target/${{ matrix.target }}/release/trouve-${{ env.RELEASE_TAG }}-${{ matrix.target }}.tar.gz
+            target/${{ matrix.target }}/release/trouve-${{ env.RELEASE_TAG }}-${{ matrix.target }}.zip
+          if-no-files-found: error
 
   release:
-    needs: build
+    needs: [build_binaries, build_app]
     runs-on: ubuntu-latest
+    permissions:
+      # softprops/action-gh-release uploads assets to the repository release.
+      contents: write
     steps:
-      - uses: actions/download-artifact@v8
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
           path: artifacts
           merge-multiple: true
+      - name: Download existing search assets for backfill checksums
+        if: github.event_name == 'workflow_dispatch'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          search_asset_count="$(gh release view "$RELEASE_TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --json assets \
+            --jq '[.assets[].name | select(startswith("trouve-search-"))] | length')"
+          if [ "$search_asset_count" -gt 0 ]; then
+            gh release download "$RELEASE_TAG" \
+              --repo "$GITHUB_REPOSITORY" \
+              --dir existing-artifacts \
+              --pattern 'trouve-search-*'
+          fi
       - name: Generate checksums
         run: |
-          cd artifacts
-          sha256sum * > SHA256SUMS
+          checksum_file="$(mktemp)"
+          (
+            cd artifacts
+            sha256sum *
+            if [ -d ../existing-artifacts ]; then
+              cd ../existing-artifacts
+              sha256sum *
+            fi
+          ) | sort -k2 > "$checksum_file"
+          mv "$checksum_file" artifacts/SHA256SUMS
       # Attaches to the existing release when one was published from the UI;
       # creates the release when the run came from a pushed tag.
       - name: Create or update GitHub Release
-        uses: softprops/action-gh-release@v3
+        uses: softprops/action-gh-release@c12583777ecdfd3be55c69cf75464299dc01057e # v3
         with:
-          tag_name: ${{ github.ref_name }}
+          tag_name: ${{ env.RELEASE_TAG }}
           files: artifacts/*
-          generate_release_notes: true
+          # Existing release notes are user-authored state. Manual backfills
+          # only attach assets; tag-triggered releases still generate notes.
+          generate_release_notes: ${{ github.event_name == 'push' }}
 
   publish-containers:
     needs: release
+    if: github.event_name == 'push'
     runs-on: ${{ matrix.runner }}
     permissions:
       # Checkout reads repository contents; image publication writes GHCR packages.
@@ -179,7 +304,7 @@ jobs:
       - name: Resolve release version
         id: version
         shell: bash
-        run: echo "value=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+        run: echo "value=${RELEASE_TAG#v}" >> "$GITHUB_OUTPUT"
       - name: Log in to GitHub Container Registry
         uses: docker/login-action@af1e73f918a031802d376d3c8bbc3fe56130a9b0 # v4
         with:
@@ -232,9 +357,8 @@ jobs:
           IMAGE: ${{ matrix.image }}
           IMAGE_PREFIX: ghcr.io/${{ github.repository_owner }}
           SHA_TAG: sha-${{ github.sha }}
-          VERSION: ${{ github.ref_name }}
         run: |
-          version="${VERSION#v}"
+          version="${RELEASE_TAG#v}"
           for tag in "$version" "$SHA_TAG"; do
             docker buildx imagetools create \
               --tag "${IMAGE_PREFIX}/${IMAGE}:${tag}" \
@@ -269,13 +393,12 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           IMAGE_PREFIX: ghcr.io/${{ github.repository_owner }}
-          VERSION: ${{ github.ref_name }}
         run: |
           latest_tag="$(gh api "repos/${GITHUB_REPOSITORY}/releases/latest" --jq .tag_name)"
-          if [ "$latest_tag" != "$GITHUB_REF_NAME" ]; then
+          if [ "$latest_tag" != "$RELEASE_TAG" ]; then
             exit 0
           fi
-          version="${VERSION#v}"
+          version="${RELEASE_TAG#v}"
           for image in trouve-server trouve-review-ui; do
             docker buildx imagetools create \
               --tag "${IMAGE_PREFIX}/${image}:latest" \
@@ -284,6 +407,7 @@ jobs:
 
   publish-crate:
     needs: release
+    if: github.event_name == 'push'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
@@ -298,6 +422,7 @@ jobs:
   # Publish platform packages, @trouve-ai/search-core, then search-plugin.
   publish-npm:
     needs: release
+    if: github.event_name == 'push'
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -309,7 +434,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
-      - uses: actions/download-artifact@v8
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
           path: artifacts
           merge-multiple: true
