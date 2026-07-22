@@ -763,6 +763,33 @@ component CopyButton inherits Rectangle {
     }
 }
 
+// Keep the wrapping text inside a component so its height-for-width layout
+// information survives use in a repeater. A bare repeated Rectangle only
+// reports its unconstrained (single-line) preferred height to the row.
+component TableGridCell inherits Rectangle {
+    in property <styled-text> text;
+    in property <int> alignment;
+    in property <bool> header;
+    in property <color> default-color: Theme.c.text;
+    callback link-clicked(string);
+
+    background: root.header ? Theme.c.surface : Theme.c.inset-bg;
+
+    VerticalLayout {
+        padding: 6px;
+
+        cell-text := StyledText {
+            text: root.text;
+            default-color: root.default-color;
+            link-color: Theme.c.accent;
+            default-font-size: Theme.fs(13px);
+            horizontal-alignment: root.alignment == 3 ? right
+                : root.alignment == 2 ? center : left;
+            link-clicked(url) => { root.link-clicked(url); }
+        }
+    }
+}
+
 // Shared table grid for chat markdown and rendered file previews. Callers
 // supply the text tint; grid structure and surface colors stay identical.
 component TableGrid inherits Rectangle {
@@ -781,25 +808,14 @@ component TableGrid inherits Rectangle {
         for table-row[table-row-index] in root.rows: row-layout := HorizontalLayout {
             spacing: 1px;
 
-            for cell in table-row: Rectangle {
+            for cell in table-row: cell-background := TableGridCell {
                 min-width: (row-layout.width - 1px * (table-row.length - 1)) / table-row.length;
                 max-width: self.min-width;
-                background: table-row-index == 0
-                    ? Theme.c.surface : Theme.c.inset-bg;
-
-                VerticalLayout {
-                    padding: 6px;
-
-                    StyledText {
-                        text: cell.text;
-                        default-color: root.default-color;
-                        link-color: Theme.c.accent;
-                        default-font-size: Theme.fs(13px);
-                        horizontal-alignment: cell.alignment == 3 ? right
-                            : cell.alignment == 2 ? center : left;
-                        link-clicked(url) => { root.link-clicked(url); }
-                    }
-                }
+                text: cell.text;
+                alignment: cell.alignment;
+                header: table-row-index == 0;
+                default-color: root.default-color;
+                link-clicked(url) => { root.link-clicked(url); }
             }
         }
     }
