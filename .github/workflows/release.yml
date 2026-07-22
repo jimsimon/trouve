@@ -135,6 +135,7 @@ jobs:
     needs: release
     runs-on: ${{ matrix.runner }}
     permissions:
+      # Checkout reads repository contents; image publication writes GHCR packages.
       contents: read
       packages: write
     strategy:
@@ -211,7 +212,7 @@ jobs:
     needs: publish-containers
     runs-on: ubuntu-latest
     permissions:
-      contents: read
+      # Required to read architecture images and publish manifests in GHCR.
       packages: write
     strategy:
       matrix:
