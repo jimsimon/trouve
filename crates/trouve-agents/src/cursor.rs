@@ -200,7 +200,7 @@ impl AgentBackend for CursorBackend {
     fn models(&self) -> Vec<ModelInfo> {
         // Minimal offline fallback; `list_models` asks the vendor for the
         // real catalog (per-account, with per-model config options).
-        vec![model(&self.id, "default", "Cursor Auto", 200_000)]
+        vec![model(&self.id, "default", "Cursor Auto", 0)]
     }
 
     async fn list_models(&self) -> Vec<ModelInfo> {
@@ -1055,7 +1055,7 @@ fn parse_acp_models(backend_id: &str, result: &Value) -> Vec<ModelInfo> {
             properties.insert(opt_id.to_string(), prop);
         }
 
-        let mut info = model(backend_id, id, display, context_window.unwrap_or(200_000));
+        let mut info = model(backend_id, id, display, context_window.unwrap_or(0));
         info.options_schema = json!({
             "type": "object",
             "properties": properties,
@@ -1705,7 +1705,7 @@ mod tests {
         );
 
         let composer = &models[2];
-        assert_eq!(composer.context_window, 200_000); // no context option
+        assert_eq!(composer.context_window, 0); // no context option
         assert_eq!(
             composer.options_schema.pointer("/properties/fast/default"),
             Some(&json!(true))

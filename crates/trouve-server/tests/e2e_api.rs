@@ -822,7 +822,8 @@ async fn session_and_thread_updates_and_provider_config() {
     assert_eq!(patched["mode"], "plan");
     assert_eq!(patched["model"], "scripted/test-model");
 
-    // Known-provider presets: static catalog with prefill data.
+    // Known-provider presets: models.dev catalog data plus Trouve's local and
+    // subscription-CLI integrations.
     let known: serde_json::Value = client
         .get(format!("{base}/providers/known"))
         .send()
@@ -832,7 +833,7 @@ async fn session_and_thread_updates_and_provider_config() {
         .await
         .unwrap();
     let known = known.as_array().unwrap();
-    assert!(known.len() >= 10);
+    assert!(known.len() >= 145);
     let openrouter = known
         .iter()
         .find(|k| k["id"] == "openrouter")
@@ -887,14 +888,7 @@ async fn session_and_thread_updates_and_provider_config() {
     assert_eq!(cursor_api["auth"], "api-key");
     assert_eq!(cursor_api["category"], "api");
     assert_eq!(cursor_api["api_key_env"], "CURSOR_API_KEY");
-    // The direct-Codex client is flagged experimental (undocumented endpoint).
-    let codex_api = known
-        .iter()
-        .find(|k| k["id"] == "codex-api")
-        .expect("codex-api preset");
-    assert_eq!(codex_api["kind"], "codex-responses");
-    assert_eq!(codex_api["auth"], "cli");
-    assert_eq!(codex_api["experimental"], true);
+    assert!(known.iter().all(|k| k["id"] != "codex-api"));
 
     // Login endpoints exist but reject providers without manual OAuth config.
     let resp = client

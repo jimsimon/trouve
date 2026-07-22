@@ -7,7 +7,8 @@ use slint::{Model, ModelRc, SharedString, VecModel};
 use crate::render::ChatRowData;
 use crate::{
     AppWindow, ChatRow, ChatTableCell, CliItem, DiffRow, FileItem, KnownProviderItem,
-    ModelHealthItem, NavRow, ProviderItem, QOption, QPair, TextSegment, ThreadTabItem, TodoUiItem,
+    ModelHealthItem, NavRow, ProviderConfigFieldItem, ProviderItem, QOption, QPair, TextSegment,
+    ThreadTabItem, TodoUiItem,
 };
 
 type Ui = slint::Weak<AppWindow>;
@@ -629,11 +630,12 @@ pub fn set_branches(ui: &Ui, branches: Vec<String>, branch_index: i32) {
     });
 }
 
-/// Context dial state: fill in 0..=1, busy flag, tooltip stats.
-pub fn set_context(ui: &Ui, fill: f32, compacting: bool, tooltip: String) {
+/// Context dial state: fill in 0..=1, busy flag, unavailable warning, stats.
+pub fn set_context(ui: &Ui, fill: f32, compacting: bool, unavailable: bool, tooltip: String) {
     let _ = ui.upgrade_in_event_loop(move |ui| {
         ui.set_context_fill(fill);
         ui.set_context_compacting(compacting);
+        ui.set_context_unavailable(unavailable);
         ui.set_context_tooltip(SharedString::from(tooltip.as_str()));
     });
 }
@@ -1528,6 +1530,19 @@ pub fn set_known_providers(ui: &Ui, mut known: Vec<trouve_protocol::KnownProvide
                 auth: k.auth.into(),
                 category: k.category.into(),
                 experimental: k.experimental,
+                config_fields: ModelRc::new(VecModel::from(
+                    k.config_fields
+                        .into_iter()
+                        .map(|field| ProviderConfigFieldItem {
+                            id: field.id.into(),
+                            label: field.label.into(),
+                            description: field.description.into(),
+                            required: field.required,
+                            secret: field.secret,
+                            value: field.default_value.unwrap_or_default().into(),
+                        })
+                        .collect::<Vec<_>>(),
+                )),
             })
             .collect();
         let category_items = |category: &str| {

@@ -808,15 +808,19 @@ pub struct BranchList {
 pub struct ProviderInfo {
     /// Stable identifier, e.g. "openai" or "openrouter".
     pub id: String,
-    /// "openai-compat" or "anthropic".
+    /// Provider transport family.
     pub kind: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub base_url: Option<String>,
-    /// Whether usable credentials were resolved (key, env, OAuth, or a
-    /// logged-in vendor CLI).
+    /// Non-secret values used to expand the provider's endpoint and request
+    /// templates. Secret values are intentionally never returned.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub settings: std::collections::BTreeMap<String, String>,
+    /// Whether credentials are configured or delegated to a cloud credential
+    /// chain. Native cloud credentials are validated on first request.
     pub has_credentials: bool,
-    /// "api-key", "oauth", "cli" (vendor CLI holds the subscription auth),
-    /// or "none" — drives which credential UI to show.
+    /// "api-key", "oauth", "cli", "aws", "gcp", or "none" — drives which
+    /// credential UI to show.
     pub auth: String,
     /// Presentation/billing category: "subscription", "api", or "local".
     /// This is independent of `auth`: a subscription such as Kimi Code can
@@ -848,12 +852,30 @@ pub struct ProvidersResponse {
 /// store, never to the config file.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, ToSchema)]
 pub struct UpsertProviderRequest {
-    /// "openai-compat" or "anthropic".
+    /// Transport family, such as "openai-compat", "anthropic",
+    /// "azure-openai", "amazon-bedrock", "google-vertex", or
+    /// "google-vertex-anthropic".
     pub kind: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub base_url: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub api_key: Option<String>,
+    /// Non-secret `${NAME}` template values.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub settings: std::collections::BTreeMap<String, String>,
+    /// Named secrets to store. Omitted entries retain their existing value;
+    /// these values are write-only and never appear in provider responses.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub secret_values: std::collections::BTreeMap<String, String>,
+    /// Additional HTTP header templates for compatible transports. Values
+    /// may reference `${API_KEY}`, settings, named secrets, or environment
+    /// variables.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub headers: std::collections::BTreeMap<String, String>,
+    /// Additional query-parameter templates, with the same expansion rules
+    /// as `headers`.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub query_params: std::collections::BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -877,11 +899,30 @@ pub struct SetDefaultPermissionModeRequest {
 /// A well-known provider preset: clients offer these for one-click setup
 /// instead of hand-typed base URLs.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct ProviderConfigField {
+    /// Placeholder name used in templates and in `UpsertProviderRequest`.
+    pub id: String,
+    pub label: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub description: String,
+    /// Conventional environment-variable fallback.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub env: Option<String>,
+    #[serde(default)]
+    pub required: bool,
+    /// Secret fields are written to the secret store and never returned.
+    #[serde(default)]
+    pub secret: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub default_value: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct KnownProvider {
     /// Suggested provider id, e.g. "openrouter".
     pub id: String,
     pub display_name: String,
-    /// Wire protocol: "openai-compat" or "anthropic".
+    /// Provider transport family.
     pub kind: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub base_url: Option<String>,
@@ -889,9 +930,19 @@ pub struct KnownProvider {
     /// exists (empty for keyless local providers like Ollama).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub api_key_env: Option<String>,
+    /// Provider-specific setup fields rendered by clients. Their values fill
+    /// placeholders in `base_url`, headers, and query parameters.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub config_fields: Vec<ProviderConfigField>,
+    /// Safe templates only; no credential values are returned here.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub headers: std::collections::BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub query_params: std::collections::BTreeMap<String, String>,
     /// How the provider authenticates: "api-key", "oauth" (subscription
-    /// login), "cli" (the vendor's own CLI holds subscription auth), or
-    /// "none" (keyless local endpoints).
+    /// login), "cli" (the vendor's own CLI holds subscription auth), "aws"
+    /// or "gcp" (ambient cloud credential chains), or "none" (keyless local
+    /// endpoints).
     pub auth: String,
     /// Presentation/billing category: "subscription", "api", or "local".
     #[serde(default = "default_provider_category")]

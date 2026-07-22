@@ -2,28 +2,40 @@
 
 use futures::StreamExt;
 use serde_json::{Map, Value, json};
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 use trouve_protocol::Usage;
 
 use crate::auth::TokenSource;
+use crate::models_dev::{ModelsDevCatalog, OptionsDialect};
 use crate::{
     EventStream, Message, Provider, ProviderError, ProviderEvent, ToolCallRequest, ToolSpec,
     catalog,
 };
 
 const ANTHROPIC_VERSION: &str = "2023-06-01";
-const DEFAULT_MAX_TOKENS: u64 = 8192;
+const FALLBACK_MAX_TOKENS: u64 = 8192;
 
 pub struct AnthropicProvider {
     id: String,
     base_url: String,
     token: Arc<dyn TokenSource>,
     client: reqwest::Client,
+    catalog: Arc<ModelsDevCatalog>,
+    catalog_provider: Option<String>,
     /// Subscription (OAuth) tokens authenticate with `Authorization: Bearer`
     /// plus the oauth beta header instead of `x-api-key`.
     oauth_bearer: bool,
+    /// GCP access token for Anthropic's Vertex `streamRawPredict` route.
+    vertex_bearer: bool,
+    default_auth: bool,
+    headers: BTreeMap<String, String>,
+    query_params: BTreeMap<String, String>,
     /// Live `/v1/models` result, cached for [`MODELS_TTL`].
     models_cache: tokio::sync::Mutex<Option<(std::time::Instant, Vec<trouve_protocol::ModelInfo>)>>,
+    /// Model-specific maximum output from the same API. ModelInfo does not
+    /// expose output limits, but Messages requires us to send max_tokens.
+    output_limits: tokio::sync::Mutex<HashMap<String, u64>>,
 }
 
 /// How long a fetched model list stays fresh.
@@ -43,30 +55,81 @@ impl AnthropicProvider {
                 .to_string(),
             token,
             client: reqwest::Client::new(),
+            catalog: Arc::new(ModelsDevCatalog::embedded()),
+            catalog_provider: None,
             oauth_bearer: false,
+            vertex_bearer: false,
+            default_auth: true,
+            headers: BTreeMap::new(),
+            query_params: BTreeMap::new(),
             models_cache: tokio::sync::Mutex::new(None),
+            output_limits: tokio::sync::Mutex::new(HashMap::new()),
         }
     }
 
+    pub fn with_catalog(mut self, catalog: Arc<ModelsDevCatalog>) -> Self {
+        self.catalog = catalog;
+        self
+    }
+
+    pub fn with_catalog_provider(mut self, provider: impl Into<String>) -> Self {
+        self.catalog_provider = Some(provider.into());
+        self
+    }
+
+    pub fn with_http_options(
+        mut self,
+        default_auth: bool,
+        headers: BTreeMap<String, String>,
+        query_params: BTreeMap<String, String>,
+    ) -> Self {
+        self.default_auth = default_auth;
+        self.headers = headers;
+        self.query_params = query_params;
+        self
+    }
+
+    fn catalog_provider_id(&self) -> Option<String> {
+        self.catalog_provider.clone().or_else(|| {
+            self.catalog
+                .provider_for_endpoint(&self.id, &self.base_url, "anthropic")
+        })
+    }
+
     /// Add auth headers (API key or OAuth bearer) to a request.
-    fn authed(&self, req: reqwest::RequestBuilder, key: &str) -> reqwest::RequestBuilder {
-        let req = req.header("anthropic-version", ANTHROPIC_VERSION);
-        if self.oauth_bearer {
-            req.bearer_auth(key)
-                .header("anthropic-beta", "oauth-2025-04-20")
-        } else {
-            req.header("x-api-key", key)
+    fn authed(&self, mut req: reqwest::RequestBuilder, key: &str) -> reqwest::RequestBuilder {
+        req = req.header("anthropic-version", ANTHROPIC_VERSION);
+        if self.vertex_bearer {
+            req = req.bearer_auth(key);
+        } else if self.default_auth && self.oauth_bearer {
+            req = req
+                .bearer_auth(key)
+                .header("anthropic-beta", "oauth-2025-04-20");
+        } else if self.default_auth {
+            req = req.header("x-api-key", key);
         }
+        for (name, value) in &self.headers {
+            req = req.header(name.as_str(), value.as_str());
+        }
+        if !self.query_params.is_empty() {
+            req = req.query(&self.query_params);
+        }
+        req
     }
 
     /// Fetch the account's model list from `/v1/models`, keeping the static
     /// catalog's pricing where ids match (the API doesn't report pricing).
     async fn fetch_models(&self) -> Result<Vec<trouve_protocol::ModelInfo>, ProviderError> {
+        if self.vertex_bearer {
+            return Err(ProviderError::Api(
+                "Vertex AI does not expose Anthropic's Models API".into(),
+            ));
+        }
         let key = self.token.bearer().await?;
         let resp = self
             .authed(
                 self.client
-                    .get(format!("{}/v1/models?limit=100", self.base_url)),
+                    .get(format!("{}/v1/models?limit=1000", self.base_url)),
                 &key,
             )
             .send()
@@ -79,45 +142,82 @@ impl AnthropicProvider {
             .json()
             .await
             .map_err(|e| ProviderError::Request(e.to_string()))?;
-        let known = catalog::anthropic_models(&self.id);
-        let Some(data) = body["data"].as_array() else {
-            return Ok(Vec::new());
-        };
-        Ok(data
-            .iter()
-            .filter_map(|entry| {
-                let name = entry["id"].as_str()?;
-                let known = known.iter().find(|k| k.id.ends_with(&format!("/{name}")));
-                let window = entry["max_input_tokens"]
-                    .as_u64()
-                    .filter(|w| *w > 0)
-                    .or(known.map(|k| k.context_window))
-                    .unwrap_or(200_000);
-                let thinking = entry
-                    .pointer("/capabilities/thinking/supported")
-                    .and_then(Value::as_bool)
-                    // Older API versions omit capabilities; assume thinking.
-                    .unwrap_or(true);
-                Some(trouve_protocol::ModelInfo {
-                    id: format!("{}/{name}", self.id),
-                    display_name: entry["display_name"].as_str().unwrap_or(name).to_string(),
-                    context_window: window,
-                    supports_tools: true,
-                    input_price_per_mtok: known.and_then(|k| k.input_price_per_mtok),
-                    output_price_per_mtok: known.and_then(|k| k.output_price_per_mtok),
-                    options_schema: if thinking {
-                        catalog::anthropic_thinking_schema()
-                    } else {
-                        serde_json::json!({"type": "object", "properties": {}})
-                    },
-                })
-            })
-            .collect())
+        let limits = parse_output_limits(&body);
+        if !limits.is_empty() {
+            self.output_limits.lock().await.extend(limits);
+        }
+        let catalog_provider = self.catalog_provider_id();
+        Ok(parse_model_list(
+            &self.id,
+            &body,
+            catalog_provider.as_deref(),
+            &self.catalog,
+        ))
+    }
+
+    /// Resolve the model's required Messages `max_tokens` cap. The normal
+    /// model-list refresh populates this cache; direct/headless use lazily
+    /// retrieves just the selected model.
+    async fn output_limit(&self, model: &str, key: &str) -> Option<u64> {
+        if let Some(limit) = self.output_limits.lock().await.get(model).copied() {
+            return Some(limit);
+        }
+        let fetched = async {
+            if self.vertex_bearer {
+                return None;
+            }
+            let resp = self
+                .authed(
+                    self.client
+                        .get(format!("{}/v1/models/{model}", self.base_url)),
+                    key,
+                )
+                .send()
+                .await
+                .ok()?
+                .error_for_status()
+                .ok()?;
+            let body: Value = resp.json().await.ok()?;
+            body["max_tokens"].as_u64().filter(|n| *n > 0)
+        }
+        .await;
+        let limit = fetched.or_else(|| {
+            self.catalog_provider_id()
+                .and_then(|provider| self.catalog.output_limit(&provider, model))
+        })?;
+        self.output_limits
+            .lock()
+            .await
+            .insert(model.to_string(), limit);
+        Some(limit)
     }
 
     pub fn with_oauth_bearer(mut self) -> Self {
         self.oauth_bearer = true;
         self
+    }
+
+    /// Use Anthropic's Messages schema through Vertex AI's
+    /// `streamRawPredict` route and GCP bearer authentication.
+    pub fn with_vertex_bearer(mut self) -> Self {
+        self.vertex_bearer = true;
+        self.default_auth = false;
+        self
+    }
+
+    fn request_url(&self, model: &str, body: &mut Value) -> Result<String, ProviderError> {
+        if !self.vertex_bearer {
+            return Ok(format!("{}/v1/messages", self.base_url));
+        }
+        body.as_object_mut().unwrap().remove("model");
+        body["anthropic_version"] = json!("vertex-2023-10-16");
+        let mut url = reqwest::Url::parse(&self.base_url)
+            .map_err(|error| ProviderError::Request(error.to_string()))?;
+        url.path_segments_mut()
+            .map_err(|_| ProviderError::Request("Vertex endpoint cannot be a base URL".into()))?
+            .push("models")
+            .push(&format!("{model}:streamRawPredict"));
+        Ok(url.to_string())
     }
 
     /// Split provider-agnostic messages into Anthropic's system string plus
@@ -204,6 +304,140 @@ impl AnthropicProvider {
     }
 }
 
+/// Map the Models API's per-model capability records into the schemas clients
+/// render. Older API versions omitted `capabilities`; only that case uses the
+/// curated model fallback rather than inventing levels for a partial record.
+fn parse_model_list(
+    provider_id: &str,
+    body: &Value,
+    catalog_provider_id: Option<&str>,
+    models_dev: &ModelsDevCatalog,
+) -> Vec<trouve_protocol::ModelInfo> {
+    let Some(data) = body["data"].as_array() else {
+        return Vec::new();
+    };
+    data.iter()
+        .filter_map(|entry| {
+            let name = entry["id"].as_str()?;
+            let known = catalog_provider_id.and_then(|catalog_provider| {
+                models_dev.model(
+                    catalog_provider,
+                    provider_id,
+                    name,
+                    OptionsDialect::Anthropic,
+                )
+            });
+            let window = entry["max_input_tokens"]
+                .as_u64()
+                .filter(|w| *w > 0)
+                .or_else(|| known.as_ref().map(|model| model.context_window))
+                .unwrap_or(0);
+            Some(trouve_protocol::ModelInfo {
+                id: format!("{provider_id}/{name}"),
+                display_name: entry["display_name"].as_str().unwrap_or(name).to_string(),
+                context_window: window,
+                supports_tools: true,
+                input_price_per_mtok: known.as_ref().and_then(|model| model.input_price_per_mtok),
+                output_price_per_mtok: known.as_ref().and_then(|model| model.output_price_per_mtok),
+                options_schema: model_options_schema(
+                    name,
+                    entry.get("capabilities"),
+                    catalog_provider_id,
+                    models_dev,
+                ),
+            })
+        })
+        .collect()
+}
+
+fn parse_output_limits(body: &Value) -> HashMap<String, u64> {
+    body["data"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|entry| {
+            Some((
+                entry["id"].as_str()?.to_string(),
+                entry["max_tokens"].as_u64().filter(|n| *n > 0)?,
+            ))
+        })
+        .collect()
+}
+
+fn model_options_schema(
+    model: &str,
+    capabilities: Option<&Value>,
+    catalog_provider_id: Option<&str>,
+    models_dev: &ModelsDevCatalog,
+) -> Value {
+    let catalog_schema = || {
+        catalog_provider_id
+            .and_then(|provider| {
+                models_dev.model(provider, provider, model, OptionsDialect::Anthropic)
+            })
+            .map(|model| model.options_schema)
+            .unwrap_or_else(catalog::anthropic_plain_schema)
+    };
+    let Some(capabilities) = capabilities else {
+        return catalog_schema();
+    };
+
+    let effort = &capabilities["effort"];
+    if effort["supported"].as_bool() == Some(true) {
+        let levels: Vec<&str> = effort
+            .as_object()
+            .into_iter()
+            .flatten()
+            .filter(|(level, value)| {
+                level.as_str() != "supported" && value["supported"].as_bool() == Some(true)
+            })
+            .map(|(level, _)| level.as_str())
+            .collect();
+        if !levels.is_empty() {
+            return catalog::anthropic_effort_schema(&levels);
+        }
+    }
+
+    match capabilities
+        .pointer("/thinking/supported")
+        .and_then(Value::as_bool)
+    {
+        Some(true) => catalog_schema(),
+        Some(false) | None => catalog::anthropic_plain_schema(),
+    }
+}
+
+fn apply_model_options(body: &mut Value, options: &Map<String, Value>) {
+    for (key, value) in options {
+        match key.as_str() {
+            // Compatibility for threads saved before numeric budgets were
+            // exposed directly.
+            "thinking_level" => match value.as_str() {
+                Some("on") => body["thinking"] = json!({"type": "adaptive"}),
+                Some("off") => {
+                    body.as_object_mut().unwrap().remove("thinking");
+                    body.as_object_mut().unwrap().remove("output_config");
+                }
+                level => {
+                    if let Some(budget) = level.and_then(catalog::thinking_budget_tokens) {
+                        body["thinking"] = json!({"type": "enabled", "budget_tokens": budget});
+                    }
+                }
+            },
+            "thinking_budget_tokens" => {
+                body["thinking"] = json!({"type": "enabled", "budget_tokens": value});
+            }
+            // Anthropic's effort control is nested and applies to adaptive
+            // thinking. A top-level `effort` field is rejected by Messages.
+            "effort" => {
+                body["thinking"] = json!({"type": "adaptive"});
+                body["output_config"] = json!({"effort": value});
+            }
+            _ => body[key.as_str()] = value.clone(),
+        }
+    }
+}
+
 #[async_trait::async_trait]
 impl Provider for AnthropicProvider {
     fn id(&self) -> &str {
@@ -211,7 +445,12 @@ impl Provider for AnthropicProvider {
     }
 
     fn models(&self) -> Vec<trouve_protocol::ModelInfo> {
-        catalog::anthropic_models(&self.id)
+        self.catalog_provider_id()
+            .map(|provider| {
+                self.catalog
+                    .provider_models(&provider, &self.id, OptionsDialect::Anthropic)
+            })
+            .unwrap_or_default()
     }
 
     async fn list_models(&self) -> Vec<trouve_protocol::ModelInfo> {
@@ -228,7 +467,7 @@ impl Provider for AnthropicProvider {
             }
             Ok(_) => self.models(),
             Err(e) => {
-                tracing::debug!("anthropic model list failed: {e}; using static catalog");
+                tracing::debug!("anthropic model list failed: {e}; using models.dev cache");
                 self.models()
             }
         }
@@ -241,10 +480,13 @@ impl Provider for AnthropicProvider {
         tools: &[ToolSpec],
         options: &Map<String, Value>,
     ) -> Result<EventStream, ProviderError> {
+        let key = self.token.bearer().await?;
+        let reported_output_limit = self.output_limit(model, &key).await;
+        let max_tokens = reported_output_limit.unwrap_or(FALLBACK_MAX_TOKENS);
         let (system, wire) = Self::wire_messages(messages);
         let mut body = json!({
             "model": model,
-            "max_tokens": DEFAULT_MAX_TOKENS,
+            "max_tokens": max_tokens,
             "messages": wire,
             "stream": true,
         });
@@ -265,38 +507,30 @@ impl Provider for AnthropicProvider {
                     .collect(),
             );
         }
-        for (k, v) in options {
-            // Map trouve's generic option names onto Anthropic's shapes.
-            match k.as_str() {
-                "thinking_level" => {
-                    if let Some(budget) = v.as_str().and_then(catalog::thinking_budget_tokens) {
-                        body["thinking"] = json!({"type": "enabled", "budget_tokens": budget});
-                    }
-                }
-                "thinking_budget_tokens" => {
-                    body["thinking"] = json!({"type": "enabled", "budget_tokens": v});
-                }
-                _ => body[k.as_str()] = v.clone(),
-            }
-        }
+        apply_model_options(&mut body, options);
         // API constraints with thinking enabled: max_tokens must exceed the
         // budget, and temperature must stay at its default.
         if let Some(budget) = body
             .pointer("/thinking/budget_tokens")
             .and_then(Value::as_u64)
         {
-            let max = body["max_tokens"].as_u64().unwrap_or(DEFAULT_MAX_TOKENS);
+            let max = body["max_tokens"].as_u64().unwrap_or(max_tokens);
             if max <= budget {
-                body["max_tokens"] = json!(budget + DEFAULT_MAX_TOKENS);
+                if reported_output_limit.is_some() {
+                    return Err(ProviderError::Request(format!(
+                        "thinking budget {budget} must be smaller than model {model}'s {max}-token output limit"
+                    )));
+                }
+                body["max_tokens"] = json!(budget + FALLBACK_MAX_TOKENS);
             }
+        }
+        if body.get("thinking").is_some() {
             body.as_object_mut().unwrap().remove("temperature");
         }
 
-        let key = self.token.bearer().await?;
-        let req = self.authed(
-            self.client.post(format!("{}/v1/messages", self.base_url)),
-            &key,
-        );
+        let request_url = self.request_url(model, &mut body)?;
+
+        let req = self.authed(self.client.post(request_url), &key);
         let resp = req
             .json(&body)
             .send()
@@ -356,10 +590,18 @@ fn sse_to_events(
                 };
                 match v["type"].as_str().unwrap_or("") {
                     "message_start" => {
-                        usage.input_tokens = v
+                        let ordinary = v
                             .pointer("/message/usage/input_tokens")
                             .and_then(Value::as_u64)
                             .unwrap_or(0);
+                        let cache_write = v
+                            .pointer("/message/usage/cache_creation_input_tokens")
+                            .and_then(Value::as_u64)
+                            .unwrap_or(0);
+                        // Normalize to uncached input + cache reads. Cache
+                        // creation still belongs in the active context and
+                        // is conservatively priced as ordinary input.
+                        usage.input_tokens = ordinary.saturating_add(cache_write);
                         usage.cached_input_tokens = v
                             .pointer("/message/usage/cache_read_input_tokens")
                             .and_then(Value::as_u64)
@@ -504,6 +746,102 @@ fn sse_to_events(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn model_list_uses_reported_effort_levels() {
+        let catalog = ModelsDevCatalog::embedded();
+        let body = json!({
+            "data": [{
+                "id": "claude-fable-5",
+                "display_name": "Claude Fable 5",
+                "max_input_tokens": 1_000_000,
+                "max_tokens": 128_000,
+                "capabilities": {
+                    "effort": {
+                        "supported": true,
+                        "low": {"supported": true},
+                        "medium": {"supported": true},
+                        "high": {"supported": true},
+                        "xhigh": {"supported": false},
+                        "max": {"supported": true}
+                    },
+                    "thinking": {
+                        "supported": true,
+                        "types": {"adaptive": {"supported": true}}
+                    }
+                }
+            }]
+        });
+        let models = parse_model_list("anthropic", &body, Some("anthropic"), &catalog);
+        let schema = &models[0].options_schema;
+        assert_eq!(
+            schema.pointer("/properties/effort/enum").unwrap(),
+            &json!(["low", "medium", "high", "max"])
+        );
+        assert!(schema.pointer("/properties/thinking_level").is_none());
+        assert_eq!(parse_output_limits(&body)["claude-fable-5"], 128_000);
+    }
+
+    #[test]
+    fn model_list_does_not_invent_thinking_when_unsupported() {
+        let catalog = ModelsDevCatalog::embedded();
+        let body = json!({
+            "data": [{
+                "id": "claude-no-thinking",
+                "capabilities": {
+                    "effort": {"supported": false},
+                    "thinking": {"supported": false}
+                }
+            }]
+        });
+        let models = parse_model_list("anthropic", &body, Some("anthropic"), &catalog);
+        let properties = models[0].options_schema["properties"].as_object().unwrap();
+        assert_eq!(properties.len(), 1);
+        assert!(properties.contains_key("temperature"));
+    }
+
+    #[test]
+    fn old_model_records_use_models_dev_fallback() {
+        let catalog = ModelsDevCatalog::embedded();
+        let body = json!({"data": [{"id": "claude-fable-5"}]});
+        let models = parse_model_list("anthropic", &body, Some("anthropic"), &catalog);
+        assert_eq!(
+            models[0]
+                .options_schema
+                .pointer("/properties/effort/enum")
+                .unwrap(),
+            &json!(["low", "medium", "high", "xhigh", "max"])
+        );
+    }
+
+    #[test]
+    fn effort_enables_adaptive_thinking_in_output_config() {
+        let mut body = json!({"temperature": 0.4});
+        let options = Map::from_iter([("effort".into(), json!("xhigh"))]);
+        apply_model_options(&mut body, &options);
+        assert_eq!(body["thinking"], json!({"type": "adaptive"}));
+        assert_eq!(body["output_config"], json!({"effort": "xhigh"}));
+    }
+
+    #[test]
+    fn vertex_route_moves_the_model_to_stream_raw_predict() {
+        let provider = AnthropicProvider::new(
+            "google-vertex-anthropic",
+            Some(
+                "https://us-east5-aiplatform.googleapis.com/v1/projects/test/locations/us-east5/publishers/anthropic"
+                    .into(),
+            ),
+            Arc::new(crate::auth::StaticToken("test".into())),
+        )
+        .with_vertex_bearer();
+        let mut body = json!({"model": "claude-sonnet-4-6", "stream": true});
+        let url = provider
+            .request_url("claude-sonnet-4-6@default", &mut body)
+            .unwrap();
+        assert!(url.ends_with("/models/claude-sonnet-4-6@default:streamRawPredict"));
+        assert!(body.get("model").is_none());
+        assert_eq!(body["anthropic_version"], "vertex-2023-10-16");
+    }
 
     #[test]
     fn tool_results_merge_into_one_user_message() {
