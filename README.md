@@ -113,10 +113,10 @@ server, as before.
 How to choose:
 
 - **If your agent has a plugin route, prefer it.** Plugins are versioned in
-  lockstep with the crate, install/uninstall as one unit, and are the only
-  routes with session-start index warming. For OpenCode and Kilo Code the
-  plugin also avoids MCP entirely: tools are native, and the shared daemon
-  keeps indexes cached across calls and across sessions with the same
+  lockstep with the repository release, install/uninstall as one unit, and
+  are the only routes with session-start index warming. For OpenCode and Kilo
+  Code the plugin also avoids MCP entirely: tools are native, and the shared
+  daemon keeps indexes cached across calls and across sessions with the same
   configuration.
 - **For OpenCode without npm, use the native tool file**: copy
   [`src/agents/opencode-tool.ts`](src/agents/opencode-tool.ts) to
@@ -231,14 +231,12 @@ python3 crates/trouve-search/tests/parity/run_parity.py --binary target/release/
 ./benchmarks/run_benchmarks.sh    # hyperfine comparison vs Python semble
 ```
 
-trouve-search's distribution artifacts version together: the crate version in
-`crates/trouve-search/Cargo.toml` is the single source of truth, and every
-published plugin/package manifest must match it exactly (enforced in CI).
-Releases are tagged per crate (`trouve-search-vX.Y.Z`). After bumping the
-crate version, run:
+Every first-party Cargo crate, Node package, plugin, and release artifact uses
+the version in root `[workspace.package]` (enforced in CI). Repository releases
+use `vX.Y.Z` tags. After changing the root version, run:
 
 ```bash
-python3 scripts/sync_versions.py  # rewrite all plugin manifests to match
+python3 scripts/sync_versions.py  # synchronize manifests, pins, and lockfiles
 ```
 
 ## Acknowledgements

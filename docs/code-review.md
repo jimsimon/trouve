@@ -16,7 +16,7 @@ Create a `.env` beside `docker-compose.review.yml` with a long random token:
 
 ```dotenv
 TROUVE_AUTH_TOKEN=replace-with-at-least-32-random-bytes
-TROUVE_VERSION=2.1.0
+TROUVE_VERSION=3.0.0
 TROUVE_REVIEW_PORT=7433
 TROUVE_CODE_REVIEW_POLL_INTERVAL_SECONDS=60
 ```
@@ -39,7 +39,7 @@ docker compose -f docker-compose.review.yml pull
 docker compose -f docker-compose.review.yml up -d
 ```
 
-Images are published with each `trouve-search-vX.Y.Z` GitHub release to GitHub
+Images are published with each `vX.Y.Z` GitHub release to GitHub
 Container Registry. The shared version makes Compose deploy matching server and
 UI images. Each release also publishes `latest` for convenience and an immutable
 commit-SHA tag.

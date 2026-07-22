@@ -4,13 +4,15 @@ All notable changes to this project are documented in this file. The format
 is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this
 project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [2.1.0] - 2026-07-22
+## [3.0.0] - 2026-07-22
 
 This is the first release of the trouve AI coding harness and its GitHub
 App-backed code review service, deployable on your own infrastructure. It
 grows trouve from a code-search tool into a protocol-first agent platform with
 a native desktop client, while keeping `trouve-search` available as the same
-standalone CLI, library, MCP server, and agent plugin.
+standalone CLI, library, MCP server, and agent plugin. The major version also
+establishes one lockstep version for every first-party artifact and includes
+the breaking removal of remote git URL indexing.
 
 ### Added
 
@@ -98,10 +100,11 @@ standalone CLI, library, MCP server, and agent plugin.
 ### Changed
 
 - **Cargo workspace and release tags**: the repository is now a monorepo for
-  `trouve-search`, the harness, and reusable UI crates. Crates are versioned
-  independently and new search releases use crate-prefixed tags such as
-  `trouve-search-v2.1.0`; the bare `vX.Y.Z` tags are retained as legacy tags.
-  The workspace uses Rust edition 2024 and requires Rust 1.92 to build.
+  `trouve-search`, the harness, and reusable UI crates. All Cargo crates, Node
+  packages, plugins, internal package pins, lockfile records, containers, and
+  release artifacts now share root `[workspace.package].version`; repository
+  releases use `vX.Y.Z` tags. The workspace uses Rust edition 2024 and requires
+  Rust 1.92 to build.
 - **GitHub authentication**: account PR discovery now uses OAuth exclusively
   and unifies data from GitHub.com and configured Enterprise instances. The
   review service deliberately uses separate GitHub App installation tokens,
@@ -349,7 +352,7 @@ semble ([BENCHMARKS.md](BENCHMARKS.md)):
 - Incremental reindex (1 file touched): 0.86 s vs ~3 min (212x)
 - Warm query: 0.55 s vs 7.2 s (13x)
 
-[2.1.0]: https://github.com/jimsimon/trouve/releases/tag/trouve-search-v2.1.0
+[3.0.0]: https://github.com/jimsimon/trouve/releases/tag/v3.0.0
 [2.0.0]: https://github.com/jimsimon/trouve/releases/tag/v2.0.0
 [1.1.0]: https://github.com/jimsimon/trouve/releases/tag/v1.1.0
 [1.0.0]: https://github.com/jimsimon/trouve/releases/tag/v1.0.0

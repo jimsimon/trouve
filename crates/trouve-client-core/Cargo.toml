@@ -1,6 +1,6 @@
 [package]
 name = "trouve-client-core"
-version = "0.1.0"
+version.workspace = true
 edition.workspace = true
 description = "Shared client logic for trouve UIs: typed protocol client, event stream, and view models."
 license.workspace = true

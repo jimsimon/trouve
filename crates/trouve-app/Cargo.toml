@@ -1,6 +1,6 @@
 [package]
 name = "trouve-app"
-version = "0.1.0"
+version.workspace = true
 edition.workspace = true
 description = "trouve desktop client: Slint UI over the trouve protocol."
 license.workspace = true
@@ -34,10 +34,10 @@ trouve-protocol.workspace = true
 trouve-server.workspace = true
 # Plain-data helpers (diff parsing, markdown blocks, highlight segments,
 # terminal screen state + key encoding).
-trouve-slint-code-view = { path = "../trouve-slint-code-view" }
-trouve-slint-diff-view = { path = "../trouve-slint-diff-view" }
-trouve-slint-markdown = { path = "../trouve-slint-markdown" }
-trouve-slint-terminal = { path = "../trouve-slint-terminal" }
+trouve-slint-code-view.workspace = true
+trouve-slint-diff-view.workspace = true
+trouve-slint-markdown.workspace = true
+trouve-slint-terminal.workspace = true
 # Syntax highlighting for the file viewer.
 syntect = { version = "5", default-features = false, features = ["default-fancy"] }
 rfd = { version = "0.17.2", default-features = false, features = ["xdg-portal", "pollster"] }

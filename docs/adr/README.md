@@ -10,7 +10,7 @@ sequentially.
 
 | ADR | Title | Status |
 | --- | --- | --- |
-| [0001](0001-monorepo-cargo-workspace.md) | Single Cargo workspace monorepo | Accepted |
+| [0001](0001-monorepo-cargo-workspace.md) | Single Cargo workspace monorepo | Superseded by 0012 |
 | [0002](0002-protocol-first-client-server-split.md) | Protocol-first client/server split (OpenAPI + SSE event log) | Accepted |
 | [0003](0003-worktree-per-session.md) | Git worktree per session; threads share the session worktree | Accepted |
 | [0004](0004-no-os-sandbox-permission-modes.md) | No OS sandbox in local mode; ToolExecutor chokepoint + permission modes | Accepted |
@@ -21,3 +21,4 @@ sequentially.
 | [0009](0009-thread-owned-todo-snapshots.md) | Thread-owned todo snapshots | Accepted |
 | [0010](0010-account-centric-multi-instance-github.md) | Account-centric, multi-instance GitHub integration | Accepted |
 | [0011](0011-github-app-backed-code-review-service.md) | GitHub App-backed code review service | Accepted |
+| [0012](0012-single-version-monorepo-release-train.md) | Single-version monorepo release train | Accepted |

@@ -30,9 +30,10 @@ on-disk index store, so mixing CLI use with any of the above costs nothing.
 
 ## 1. Plugin
 
-Plugins are versioned in lockstep with the crate, install/uninstall as one
-unit, and are the only routes with session-start index warming. Details and
-options are in the [search-plugin README](npm/search-plugin/README.md).
+Plugins are versioned in lockstep with the repository release,
+install/uninstall as one unit, and are the only routes with session-start
+index warming. Details and options are in the
+[search-plugin README](npm/search-plugin/README.md).
 
 - **[OpenCode](https://opencode.ai)** — add to your opencode config:
 

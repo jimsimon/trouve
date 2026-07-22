@@ -11,6 +11,8 @@ Keep every Cargo and Node package visibly owned by trouve and update all referen
 
 - Name every new Cargo package `trouve-<purpose>`.
 - Name its directory `crates/trouve-<purpose>` so the directory matches the package.
+- Inherit the release version with `version.workspace = true`; never give a
+  workspace crate an independent package version.
 - Keep `trouve-app` as the existing main application package. Do not use the app exception to create another unprefixed package.
 - Let Rust normalize package hyphens to underscores in source imports: package `trouve-example` becomes crate path `trouve_example`.
 - Reject names that could imply first-party ownership by another project, including names beginning with `slint-`.
@@ -18,6 +20,8 @@ Keep every Cargo and Node package visibly owned by trouve and update all referen
 ## Name Node packages
 
 - Name every Node package `@trouve-ai/<purpose>`, including private applications that are not published to npm.
+- Set its `version` to root `[workspace.package].version`, including for
+  private workspace roots and web applications.
 - Keep the package scope in the root `name` and `packages[""].name` fields of a colocated `package-lock.json`.
 - Keep npm workspace package entries in shared lockfiles under the `@trouve-ai/` scope.
 - Do not rename Docker or GHCR images solely to match the npm scope; container image identifiers are not Node package names.
@@ -29,6 +33,8 @@ Keep every Cargo and Node package visibly owned by trouve and update all referen
 3. Update path dependencies, workspace dependencies, feature references, package-selection commands, imports, examples, documentation, and lockfile entries.
 4. Search exhaustively for the old package name, old directory path, and old underscore-normalized Rust crate name when renaming.
 5. Preserve the architectural boundaries in `AGENTS.md`; a naming change must not introduce trouve-specific public types into generic widget crates.
+6. Run `python3 scripts/sync_versions.py` so every first-party manifest,
+   internal dependency pin, and lockfile record matches the workspace version.
 
 ## Verify the invariant
 
@@ -36,6 +42,7 @@ Run the bundled check after refreshing Cargo metadata and Node lockfiles:
 
 ```bash
 python3 .agents/skills/create-trouve-crate/scripts/check_crate_names.py
+python3 scripts/sync_versions.py --check
 ```
 
 Then run the relevant package build plus the repository-required formatting, tests, and clippy checks from `AGENTS.md`. Do not finish while an unprefixed Cargo crate, unscoped Node package, or stale local lockfile package name remains.
