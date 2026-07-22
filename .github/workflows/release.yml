@@ -21,7 +21,8 @@ env:
   RELEASE_TAG: ${{ github.event.inputs.tag || github.ref_name }}
 
 permissions:
-  contents: write
+  # Build and verification jobs only need to read repository contents.
+  contents: read
 
 concurrency:
   group: release-${{ github.event.inputs.tag || github.ref_name }}
@@ -37,6 +38,9 @@ jobs:
         with:
           persist-credentials: false
           ref: ${{ env.RELEASE_TAG }}
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
+        with:
+          python-version: "3.11.9"
       - name: Manifests in sync and tag matches workspace version
         run: |
           python3 scripts/sync_versions.py --check
@@ -87,12 +91,12 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
           key: release-binaries-${{ matrix.target }}
       - name: Install cross
         if: matrix.cross
-        uses: taiki-e/install-action@v2
+        uses: taiki-e/install-action@c44f6b046f1c29ae5918b1e0bfdbb2f1813836fd # v2
         with:
           tool: cross
       - name: Build trouve-server
@@ -113,7 +117,7 @@ jobs:
         run: |
           cd target/${{ matrix.target }}/release
           Compress-Archive -Path trouve-server.exe -DestinationPath "trouve-server-$env:RELEASE_TAG-${{ matrix.target }}.zip"
-      - uses: actions/upload-artifact@v7
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: trouve-server-${{ matrix.target }}
           path: |
@@ -133,7 +137,7 @@ jobs:
         run: |
           cd target/${{ matrix.target }}/release
           Compress-Archive -Path trouve-search.exe -DestinationPath "trouve-search-$env:RELEASE_TAG-${{ matrix.target }}.zip"
-      - uses: actions/upload-artifact@v7
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         if: github.event_name == 'push'
         with:
           name: trouve-search-${{ matrix.target }}
@@ -178,7 +182,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
           key: release-app-${{ matrix.target }}
       - name: Build
@@ -194,7 +198,7 @@ jobs:
         run: |
           cd target/${{ matrix.target }}/release
           Compress-Archive -Path trouve.exe -DestinationPath "trouve-$env:RELEASE_TAG-${{ matrix.target }}.zip"
-      - uses: actions/upload-artifact@v7
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: trouve-${{ matrix.target }}
           path: |
@@ -205,8 +209,11 @@ jobs:
   release:
     needs: [build_binaries, build_app]
     runs-on: ubuntu-latest
+    permissions:
+      # softprops/action-gh-release uploads assets to the repository release.
+      contents: write
     steps:
-      - uses: actions/download-artifact@v8
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
           path: artifacts
           merge-multiple: true
@@ -215,10 +222,16 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release download "$RELEASE_TAG" \
+          search_asset_count="$(gh release view "$RELEASE_TAG" \
             --repo "$GITHUB_REPOSITORY" \
-            --dir existing-artifacts \
-            --pattern 'trouve-search-*'
+            --json assets \
+            --jq '[.assets[].name | select(startswith("trouve-search-"))] | length')"
+          if [ "$search_asset_count" -gt 0 ]; then
+            gh release download "$RELEASE_TAG" \
+              --repo "$GITHUB_REPOSITORY" \
+              --dir existing-artifacts \
+              --pattern 'trouve-search-*'
+          fi
       - name: Generate checksums
         run: |
           checksum_file="$(mktemp)"
@@ -234,7 +247,7 @@ jobs:
       # Attaches to the existing release when one was published from the UI;
       # creates the release when the run came from a pushed tag.
       - name: Create or update GitHub Release
-        uses: softprops/action-gh-release@v3
+        uses: softprops/action-gh-release@c12583777ecdfd3be55c69cf75464299dc01057e # v3
         with:
           tag_name: ${{ env.RELEASE_TAG }}
           files: artifacts/*
@@ -421,7 +434,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
-      - uses: actions/download-artifact@v8
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
           path: artifacts
           merge-multiple: true
