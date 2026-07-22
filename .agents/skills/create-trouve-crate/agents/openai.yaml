@@ -1,4 +1,4 @@
 interface:
-  display_name: "Create Trouve Crate"
-  short_description: "Enforce trouve- crate naming"
-  default_prompt: "Use $create-trouve-crate to add a correctly named Cargo crate to this workspace."
+  display_name: "Create Trouve Package"
+  short_description: "Enforce Cargo and npm package naming"
+  default_prompt: "Use $create-trouve-crate to add a correctly named Cargo crate or Node package to this workspace."

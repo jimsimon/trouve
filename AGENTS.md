@@ -54,9 +54,11 @@ These are load-bearing. Do not violate them without a new ADR.
 
 ## Conventions
 
-- Every Cargo package and crate directory we create is prefixed `trouve-`.
-  Keep `trouve-app` as the main application package. Use the
-  `create-trouve-crate` skill whenever adding or renaming a workspace crate.
+- Every Cargo package and crate directory we create is prefixed `trouve-`,
+  and every Node package is scoped under `@trouve-ai/`, including private
+  apps. Keep `trouve-app` as the main application package. Use the
+  `create-trouve-crate` skill whenever adding or renaming a workspace crate
+  or Node package.
 - Rust edition/lints come from the workspace; run `cargo fmt --all` and
   `cargo clippy --all-targets -- -D warnings` before finishing.
 - Tests: `cargo test --workspace` must stay offline-safe. Model-downloading
