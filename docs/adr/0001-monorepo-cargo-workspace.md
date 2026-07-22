@@ -1,6 +1,6 @@
 # ADR 0001: Single Cargo workspace monorepo
 
-Status: Accepted (2026-07)
+Status: Superseded by 0012
 
 ## Context
 

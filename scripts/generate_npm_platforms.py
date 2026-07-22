@@ -4,26 +4,16 @@
 from __future__ import annotations
 
 import json
-import sys
-import tomllib
 from pathlib import Path
+
+from sync_versions import workspace_version
 
 ROOT = Path(__file__).resolve().parent.parent
 PLATFORMS = ROOT / "npm" / "platforms.json"
 
 
-def crate_version() -> str:
-    manifest_path = ROOT / "crates" / "trouve-search" / "Cargo.toml"
-    with manifest_path.open("rb") as f:
-        manifest = tomllib.load(f)
-    version = manifest.get("package", {}).get("version")
-    if not isinstance(version, str) or not version:
-        sys.exit(f"{manifest_path} has no package.version field")
-    return version
-
-
 def main() -> None:
-    version = crate_version()
+    version = workspace_version(ROOT)
     platforms = json.loads(PLATFORMS.read_text(encoding="utf-8"))
     for entry in platforms:
         dir_name = entry["dir"]
@@ -51,7 +41,9 @@ def main() -> None:
             "scripts": {
                 # Refuse to publish a platform package whose binary was
                 # never staged (scripts/stage_npm_binaries.py).
-                "prepublishOnly": f"node -e \"require('fs').accessSync('bin/{binary}')\"",
+                "prepublishOnly": (
+                    f"node -e \"require('fs').accessSync('bin/{binary}')\""
+                ),
             },
         }
         if "libc" in entry:

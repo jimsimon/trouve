@@ -8,7 +8,7 @@ on. Decisions live in `docs/adr/` — check there before re-litigating one.
 ## Layout
 
 - `crates/trouve-search` — code search library + CLI (published to crates.io
-  and npm; its version drives `scripts/sync_versions.py`).
+  and npm; the root workspace version drives `scripts/sync_versions.py`).
 - `crates/trouve-protocol` — protocol types + OpenAPI schema. No logic.
 - `crates/trouve-core` — sessions, threads, worktrees, event log,
   checkpoints, agent loop, tools, permissions.
@@ -51,6 +51,10 @@ These are load-bearing. Do not violate them without a new ADR.
    control flow.
 7. **Widget crates stay generic.** `trouve-slint-*` crates take plain data (text,
    spans, hunks), not trouve protocol types.
+8. **One workspace version.** Every first-party Cargo crate, Node package,
+   plugin manifest, internal package pin, and release artifact uses root
+   `[workspace.package].version`. Repository releases use `vX.Y.Z` tags (ADR
+   0012). Protocol and storage-format compatibility versions remain separate.
 
 ## Conventions
 
@@ -63,8 +67,10 @@ These are load-bearing. Do not violate them without a new ADR.
   `cargo clippy --all-targets -- -D warnings` before finishing.
 - Tests: `cargo test --workspace` must stay offline-safe. Model-downloading
   and network tests are `#[ignore]` behind env flags (`TROUVE_E2E=1`).
-- Releases are tagged per crate (`trouve-search-v1.2.3`). After bumping
-  `crates/trouve-search/Cargo.toml`, run `python3 scripts/sync_versions.py`.
+- Releases are tagged repository-wide (`v1.2.3`). Edit only root
+  `[workspace.package].version`, then run `python3 scripts/sync_versions.py`.
+  Use the `sync-trouve-versions` skill for releases, version changes, and new
+  version-bearing artifacts.
 - Commit style: imperative, concise subject; explain *why* in the body when
   it isn't obvious.
 - Licensing: workspace code is MIT. Slint is used under its Royalty-Free

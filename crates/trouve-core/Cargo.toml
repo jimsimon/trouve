@@ -1,6 +1,6 @@
 [package]
 name = "trouve-core"
-version = "0.1.0"
+version.workspace = true
 edition.workspace = true
 description = "Core engine of the trouve AI coding harness: sessions, worktrees, event log, checkpoints, tools, and the agent loop."
 license.workspace = true

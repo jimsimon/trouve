@@ -1,6 +1,6 @@
 [package]
 name = "trouve-slint-terminal"
-version = "0.1.0"
+version.workspace = true
 edition.workspace = true
 description = "Terminal scrollback view component for Slint: virtualized monospace output with basic ANSI color support."
 license.workspace = true

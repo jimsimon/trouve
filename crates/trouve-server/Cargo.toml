@@ -1,6 +1,6 @@
 [package]
 name = "trouve-server"
-version = "0.1.0"
+version.workspace = true
 edition.workspace = true
 description = "Headless HTTP/SSE server exposing the trouve AI coding harness protocol."
 license.workspace = true
