@@ -133,22 +133,44 @@ jobs:
 
   publish-containers:
     needs: release
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.runner }}
     permissions:
       contents: read
       packages: write
     strategy:
       fail-fast: false
+      # Build on matching native hardware; the manifest job below joins the
+      # architecture-specific images under the public version and SHA tags.
       matrix:
         include:
           - component: server
             context: .
             dockerfile: Dockerfile.server
             image: trouve-server
+            runner: ubuntu-latest
+            platform: linux/amd64
+            arch: amd64
+          - component: server
+            context: .
+            dockerfile: Dockerfile.server
+            image: trouve-server
+            runner: ubuntu-24.04-arm
+            platform: linux/arm64
+            arch: arm64
           - component: review-ui
             context: web/review-ui
             dockerfile: web/review-ui/Dockerfile
             image: trouve-review-ui
+            runner: ubuntu-latest
+            platform: linux/amd64
+            arch: amd64
+          - component: review-ui
+            context: web/review-ui
+            dockerfile: web/review-ui/Dockerfile
+            image: trouve-review-ui
+            runner: ubuntu-24.04-arm
+            platform: linux/arm64
+            arch: arm64
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
@@ -163,8 +185,6 @@ jobs:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-      - name: Set up QEMU
-        uses: docker/setup-qemu-action@96fe6ef7f33517b61c61be40b68a1882f3264fb8 # v4
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4
       - name: Generate image metadata
@@ -173,26 +193,60 @@ jobs:
         with:
           images: ghcr.io/${{ github.repository_owner }}/${{ matrix.image }}
           tags: |
-            type=raw,value=${{ steps.version.outputs.value }}
-            type=sha,format=long
+            type=raw,value=${{ steps.version.outputs.value }}-${{ matrix.arch }}
+            type=raw,value=sha-${{ github.sha }}-${{ matrix.arch }}
       - name: Build and publish
         uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7
         with:
           context: ${{ matrix.context }}
           file: ${{ matrix.dockerfile }}
-          platforms: linux/amd64,linux/arm64
+          platforms: ${{ matrix.platform }}
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
-          cache-from: type=gha,scope=${{ matrix.component }}
-          cache-to: type=gha,mode=max,scope=${{ matrix.component }}
+          cache-from: type=gha,scope=${{ matrix.component }}-${{ matrix.arch }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.component }}-${{ matrix.arch }}
+
+  publish-container-manifests:
+    needs: publish-containers
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      matrix:
+        image: [trouve-server, trouve-review-ui]
+    steps:
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@af1e73f918a031802d376d3c8bbc3fe56130a9b0 # v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4
+      - name: Publish multi-platform manifests
+        shell: bash
+        env:
+          IMAGE: ${{ matrix.image }}
+          IMAGE_PREFIX: ghcr.io/${{ github.repository_owner }}
+          SHA_TAG: sha-${{ github.sha }}
+          VERSION: ${{ github.ref_name }}
+        run: |
+          version="${VERSION#v}"
+          for tag in "$version" "$SHA_TAG"; do
+            docker buildx imagetools create \
+              --tag "${IMAGE_PREFIX}/${IMAGE}:${tag}" \
+              "${IMAGE_PREFIX}/${IMAGE}:${tag}-amd64" \
+              "${IMAGE_PREFIX}/${IMAGE}:${tag}-arm64"
+          done
 
   # Mutable tags reconcile separately from release-scoped immutable builds.
   # GitHub may coalesce pending jobs in this shared group; that is safe because
-  # every publisher starts after both versioned images exist and revalidates
-  # releases/latest while holding the global publisher slot.
+  # every publisher starts after both multi-platform versioned images exist and
+  # revalidates releases/latest while holding the global publisher slot.
   publish-latest-containers:
-    needs: publish-containers
+    needs: publish-container-manifests
     runs-on: ubuntu-latest
     concurrency:
       group: release-latest-containers
