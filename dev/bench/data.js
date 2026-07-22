@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1784612251445,
+  "lastUpdate": 1784680222272,
   "repoUrl": "https://github.com/jimsimon/trouve",
   "entries": {
     "e2e-benchmarks": [
@@ -4031,6 +4031,54 @@ window.BENCHMARK_DATA = {
             "name": "non-git warm query",
             "value": 67.94318238,
             "range": "± 1.4",
+            "unit": "ms"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "jim.j.simon@gmail.com",
+            "name": "Jim Simon",
+            "username": "jimsimon"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "9bb2f698bb803c5ffd84a7a3ac6bbb0ce16a2a4f",
+          "message": "Add GitHub App code review service (#145)\n\n* Add GitHub App code review service\n\n* Publish review service images to GHCR\n\n* Align container images with releases\n\n* Address code review feedback\n\n* Address follow-up review feedback\n\n* Clarify code review deployment setup\n\n* Fix parity CI dependency\n\n* Address terminal review cleanup feedback\n\n* Cancel superseded code reviews\n\n* Add multi-identity code reviews\n\nReview every changed file in bounded batches, run configurable native or custom focused identities, and validate and deduplicate findings before publishing.\n\n* Rename review identities to reviewers\n\nUse Reviewer Profile for configuration while presenting built-in and custom reviewers consistently across the API, dashboard, and documentation.\n\n* Add per-repository reviewer overrides\n\n* Address code review reliability feedback\n\n* Isolate code review reconciliation failures\n\n* Isolate review jobs and release publication\n\n* Track active code review turns\n\n* Serialize latest container publication",
+          "timestamp": "2026-07-21T20:27:59-04:00",
+          "tree_id": "f91365529b367dd640598322f82009add2319cd5",
+          "url": "https://github.com/jimsimon/trouve/commit/9bb2f698bb803c5ffd84a7a3ac6bbb0ce16a2a4f"
+        },
+        "date": 1784680221095,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "cold index + query",
+            "value": 119.94809384000001,
+            "range": "± 83",
+            "unit": "ms"
+          },
+          {
+            "name": "warm query",
+            "value": 50.35328166,
+            "range": "± 3.8",
+            "unit": "ms"
+          },
+          {
+            "name": "incremental (1 file modified)",
+            "value": 69.12539708000001,
+            "range": "± 15.5",
+            "unit": "ms"
+          },
+          {
+            "name": "non-git warm query",
+            "value": 54.12302624,
+            "range": "± 1.6",
             "unit": "ms"
           }
         ]
