@@ -358,11 +358,43 @@ fn to_widget_block(b: &Block) -> MarkdownBlock {
     }
 }
 
+/// Byte length of the largest prefix ending at a complete blank line outside
+/// a fenced code block. Parsing state is reset there, so blocks before it can
+/// be retained unchanged while streamed text continues to arrive.
+fn stable_prefix_len(text: &str) -> usize {
+    let mut offset = 0;
+    let mut stable = 0;
+    let mut code_ticks = None;
+
+    for raw_line in text.split_inclusive('\n') {
+        offset += raw_line.len();
+        let line = raw_line.strip_suffix('\n').unwrap_or(raw_line);
+        if let Some(ticks) = code_ticks {
+            let trimmed = line.trim();
+            if trimmed.len() >= ticks && trimmed.bytes().all(|byte| byte == b'`') {
+                code_ticks = None;
+            }
+            continue;
+        }
+
+        let trimmed = line.trim_start();
+        if let Some((ticks, _)) = split_fence(trimmed) {
+            code_ticks = Some(ticks);
+        } else if trimmed.is_empty() {
+            stable = offset;
+        }
+    }
+
+    stable
+}
+
 /// Live block model for a streaming message.
 pub struct StreamingMarkdown {
     text: String,
     blocks: Vec<Block>,
     model: Rc<VecModel<MarkdownBlock>>,
+    stable_text_len: usize,
+    stable_block_count: usize,
 }
 
 impl Default for StreamingMarkdown {
@@ -377,6 +409,8 @@ impl StreamingMarkdown {
             text: String::new(),
             blocks: Vec::new(),
             model: Rc::new(VecModel::default()),
+            stable_text_len: 0,
+            stable_block_count: 0,
         }
     }
 
@@ -393,35 +427,41 @@ impl StreamingMarkdown {
     /// were touched — appends normally touch only the trailing block.
     pub fn push(&mut self, delta: &str) -> usize {
         self.text.push_str(delta);
-        let new_blocks = parse_blocks(&self.text);
+        let tail = &self.text[self.stable_text_len..];
+        let newly_stable_len = stable_prefix_len(tail);
+        let mut new_tail = parse_blocks(&tail[..newly_stable_len]);
+        let newly_stable_blocks = new_tail.len();
+        new_tail.extend(parse_blocks(&tail[newly_stable_len..]));
 
-        // First index where old and new disagree; everything before it is
-        // untouched (stable prefix).
-        let mut same = 0;
-        while same < self.blocks.len()
-            && same < new_blocks.len()
-            && self.blocks[same] == new_blocks[same]
-        {
-            same += 1;
-        }
+        let old_tail = self.blocks.split_off(self.stable_block_count);
+        let same_tail = old_tail
+            .iter()
+            .zip(&new_tail)
+            .take_while(|(old, new)| old == new)
+            .count();
+        let same = self.stable_block_count + same_tail;
+        self.blocks.extend(new_tail);
+
         let mut touched = 0;
         // Update rows that changed in place.
-        let in_place = new_blocks.len().min(self.model.row_count());
-        for (i, block) in new_blocks.iter().enumerate().take(in_place).skip(same) {
-            self.model.set_row_data(i, to_widget_block(block));
+        let in_place = self.blocks.len().min(self.model.row_count());
+        for i in same..in_place {
+            self.model.set_row_data(i, to_widget_block(&self.blocks[i]));
             touched += 1;
         }
         // Append new rows.
-        for block in new_blocks.iter().skip(self.model.row_count()) {
+        for block in self.blocks.iter().skip(self.model.row_count()) {
             self.model.push(to_widget_block(block));
             touched += 1;
         }
         // Remove surplus rows (rare: a paragraph merged into a fence).
-        while self.model.row_count() > new_blocks.len() {
+        while self.model.row_count() > self.blocks.len() {
             self.model.remove(self.model.row_count() - 1);
             touched += 1;
         }
-        self.blocks = new_blocks;
+
+        self.stable_text_len += newly_stable_len;
+        self.stable_block_count += newly_stable_blocks;
         touched
     }
 }
@@ -597,8 +637,12 @@ mod tests {
         let mut streaming = StreamingMarkdown::new();
         // Feed in small chunks.
         let mut max_touched_after_warmup = 0;
+        let mut streamed_text = String::new();
         for (i, chunk) in full.as_bytes().chunks(7).enumerate() {
-            let touched = streaming.push(std::str::from_utf8(chunk).unwrap_or(""));
+            let chunk = std::str::from_utf8(chunk).unwrap_or("");
+            streamed_text.push_str(chunk);
+            let touched = streaming.push(chunk);
+            assert_eq!(streaming.blocks, parse_blocks(&streamed_text));
             if i > 3 {
                 max_touched_after_warmup = max_touched_after_warmup.max(touched);
             }
@@ -611,5 +655,20 @@ mod tests {
             max_touched_after_warmup <= 2,
             "appends touched {max_touched_after_warmup} rows"
         );
+        assert!(streaming.stable_text_len > full.len() / 2);
+    }
+
+    #[test]
+    fn streaming_stable_prefix_stops_at_open_fences() {
+        let mut streaming = StreamingMarkdown::new();
+        streaming.push("first\n\nsecond");
+        assert_eq!(streaming.stable_text_len, "first\n\n".len());
+
+        streaming.push("\n\n```rust\nline\n\n");
+        assert_eq!(streaming.stable_text_len, "first\n\nsecond\n\n".len());
+
+        streaming.push("more\n```\n\nlast");
+        assert_eq!(streaming.blocks, parse_blocks(streaming.text()));
+        assert!(streaming.stable_text_len > "first\n\nsecond\n\n".len());
     }
 }

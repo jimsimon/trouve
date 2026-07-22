@@ -52,7 +52,7 @@ pub fn parse_unified_diff(diff: &str) -> Vec<FileDiff> {
             let path = rest
                 .split_whitespace()
                 .last()
-                .map(|p| p.trim_start_matches("b/").to_string())
+                .map(|p| p.strip_prefix("b/").unwrap_or(p).to_string())
                 .unwrap_or_else(|| rest.to_string());
             files.push(FileDiff {
                 path,
@@ -283,6 +283,13 @@ diff --git a/README.md b/README.md
         assert_eq!(lines[3].new_no, Some(3));
         assert_eq!(files[1].hunks[0].lines[0].old_no, Some(10));
         assert_eq!(file_stats(&files[0]), (2, 1));
+    }
+
+    #[test]
+    fn strips_only_the_synthetic_new_path_prefix() {
+        let files =
+            parse_unified_diff("diff --git a/b/foo.rs b/b/foo.rs\n@@ -1 +1 @@\n-old\n+new\n");
+        assert_eq!(files[0].path, "b/foo.rs");
     }
 
     #[test]

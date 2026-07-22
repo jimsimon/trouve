@@ -70,8 +70,25 @@ pub fn parse_ansi_line(line: &str) -> Vec<AnsiSegment> {
             continue; // strip cursor movement etc.
         }
         flush(&mut segments, &mut current, color);
-        for code in params.split(';') {
-            match code.parse::<u32>().unwrap_or(0) {
+        let mut codes = params
+            .split(';')
+            .map(|code| code.parse::<u32>().unwrap_or(0));
+        while let Some(code) = codes.next() {
+            if matches!(code, 38 | 48) {
+                match codes.next() {
+                    Some(5) => {
+                        codes.next();
+                    }
+                    Some(2) => {
+                        for _ in 0..3 {
+                            codes.next();
+                        }
+                    }
+                    _ => {}
+                }
+                continue;
+            }
+            match code {
                 0 | 39 => color = 0,
                 n @ 30..=37 => color = PALETTE[(n - 30) as usize],
                 n @ 90..=97 => color = PALETTE[(n - 90 + 8) as usize],
@@ -384,7 +401,7 @@ pub fn encode_key(text: &str, ctrl: bool, alt: bool, app_cursor: bool) -> Option
             match n {
                 1..=4 => vec![0x1b, b'O', (b'P' + (n - 1) as u8)],
                 5 => b"\x1b[15~".to_vec(),
-                6..=8 => format!("\x1b[{}~", n + 11).into_bytes(),
+                6..=10 => format!("\x1b[{}~", n + 11).into_bytes(),
                 _ => format!("\x1b[{}~", n + 12).into_bytes(),
             }
         }
@@ -451,6 +468,19 @@ mod tests {
         let texts: Vec<&str> = segs.iter().map(|s| s.text.as_str()).collect();
         assert_eq!(texts, vec!["ab", "c"]);
         assert_eq!(segs[1].color, PALETTE[1]);
+    }
+
+    #[test]
+    fn extended_color_parameters_do_not_leak_into_palette_codes() {
+        let segs = parse_ansi_line("\u{1b}[32ma\u{1b}[38;5;31mb\u{1b}[48;2;1;2;31mc\u{1b}[91md");
+        assert_eq!(
+            segs.iter()
+                .map(|segment| segment.text.as_str())
+                .collect::<Vec<_>>(),
+            vec!["a", "b", "c", "d"]
+        );
+        assert!(segs[..3].iter().all(|segment| segment.color == PALETTE[2]));
+        assert_eq!(segs[3].color, PALETTE[9]);
     }
 
     #[test]
@@ -522,6 +552,30 @@ mod tests {
         assert_eq!(encode_key("x", false, true, false).unwrap(), b"\x1bx");
         // Bare modifier presses produce nothing.
         assert_eq!(encode_key("\u{11}", false, false, false), None);
+    }
+
+    #[test]
+    fn function_keys_use_xterm_sequences() {
+        let expected: [&[u8]; 12] = [
+            b"\x1bOP",
+            b"\x1bOQ",
+            b"\x1bOR",
+            b"\x1bOS",
+            b"\x1b[15~",
+            b"\x1b[17~",
+            b"\x1b[18~",
+            b"\x1b[19~",
+            b"\x1b[20~",
+            b"\x1b[21~",
+            b"\x1b[23~",
+            b"\x1b[24~",
+        ];
+        for (offset, expected) in expected.into_iter().enumerate() {
+            let key = char::from_u32(K_F1 as u32 + offset as u32)
+                .expect("function-key constants are contiguous")
+                .to_string();
+            assert_eq!(encode_key(&key, false, false, false).unwrap(), expected);
+        }
     }
 
     #[test]

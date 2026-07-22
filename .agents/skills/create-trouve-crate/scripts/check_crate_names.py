@@ -11,7 +11,6 @@ import sys
 
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[4]
-EXEMPT_PACKAGES = {"trouve-app"}
 IGNORED_NODE_DIRS = {".git", "dist", "node_modules", "target"}
 
 
@@ -52,9 +51,7 @@ def main() -> int:
     for package in packages:
         name = package["name"]
         directory = Path(package["manifest_path"]).parent.name
-        if name not in EXEMPT_PACKAGES and (
-            not name.startswith("trouve-") or directory != name
-        ):
+        if not name.startswith("trouve-") or directory != name:
             invalid_crates.append((name, directory))
 
     invalid_node_packages = []
