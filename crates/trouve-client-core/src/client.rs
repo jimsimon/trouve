@@ -280,6 +280,16 @@ impl ProtocolClient {
         .await
     }
 
+    /// Promote this queued prompt and run it immediately, cancelling an
+    /// active turn on its thread first when necessary.
+    pub async fn dispatch_queued_prompt(&self, prompt_id: &str) -> Result<TurnAccepted> {
+        self.post_json(
+            &format!("/queue/{prompt_id}/dispatch"),
+            &serde_json::json!({}),
+        )
+        .await
+    }
+
     /// Interrupt the turn currently running on a thread.
     pub async fn cancel_turn(&self, thread_id: &str) -> Result<()> {
         self.post_empty(&format!("/threads/{thread_id}/cancel"))

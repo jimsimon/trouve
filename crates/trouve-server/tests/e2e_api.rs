@@ -2090,8 +2090,31 @@ async fn queued_prompts_crud_and_in_order_dispatch() {
         .unwrap();
     assert_eq!(resp.status(), 204);
 
-    // Release the gate: turn 1 finishes, then the queue drains in order.
-    gate.add_permits(3);
+    // "Send now" on the second row promotes it, cancels turn 1, and starts
+    // it as turn 2 without waiting for the gated first turn to complete.
+    let dispatched: serde_json::Value = client
+        .post(format!("{base}/queue/{id_two}/dispatch"))
+        .json(&serde_json::json!({}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(dispatched["queued"], true);
+    assert_eq!(dispatched["turn"], 0);
+    let preempted = wait_for_event(&client, &events_url, |e| {
+        e["type"] == "user.message" && e["turn"] == 2 && e["content"] == "two v2"
+    })
+    .await;
+    assert!(
+        preempted
+            .iter()
+            .any(|e| e["type"] == "turn.cancelled" && e["turn"] == 1)
+    );
+
+    // Turn 2 is now the gated turn; release it and the remaining turn 3.
+    gate.add_permits(2);
     let events = wait_for_event(&client, &events_url, |e| {
         e["type"] == "turn.completed" && e["turn"] == 3
     })
@@ -2101,7 +2124,7 @@ async fn queued_prompts_crud_and_in_order_dispatch() {
         .filter(|e| e["type"] == "user.message")
         .map(|e| e["content"].as_str().unwrap())
         .collect();
-    assert_eq!(user_messages, ["one", "three", "two v2"]);
+    assert_eq!(user_messages, ["one", "two v2", "three"]);
 
     // The queue announced every change on the event stream and ended empty.
     let last_queue = events

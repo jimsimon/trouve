@@ -85,7 +85,9 @@ pub use requests::*;
 // selection, and profile snapshots on durable review jobs (all additive).
 // 1.3: per-repository reviewer model overrides and inherit/append/replace
 // prompt policies (additive).
-pub const PROTOCOL_VERSION: &str = "1.3";
+// 1.4: POST /v1/queue/{id}/dispatch promotes a queued prompt and runs it
+// immediately, preempting the thread's active turn when necessary (additive).
+pub const PROTOCOL_VERSION: &str = "1.4";
 
 pub type WorkspaceId = String;
 pub type SessionId = String;

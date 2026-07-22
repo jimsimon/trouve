@@ -7,7 +7,7 @@
       "name": "MIT",
       "identifier": "MIT"
     },
-    "version": "1.3"
+    "version": "1.4"
   },
   "paths": {
     "/v1/approvals": {
@@ -1726,6 +1726,55 @@
             "description": ""
           },
           "404": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/queue/{id}/dispatch": {
+      "post": {
+        "tags": [],
+        "summary": "Promote a specific queued prompt and run it now. If its thread is active,\nthe current turn is cancelled and the dispatcher continues immediately\nwith this prompt; an idle thread starts it directly.",
+        "operationId": "dispatch_queued_prompt",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "202": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TurnAccepted"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "409": {
             "description": "",
             "content": {
               "application/json": {
@@ -4089,7 +4138,7 @@
           },
           {
             "type": "object",
-            "description": "The turn was interrupted by the user (via the cancel endpoint). Like\n`turn.failed` it pauses the queue, but it isn't an error condition.",
+            "description": "The turn was interrupted by the user. Cancellation normally pauses\nthe queue; dispatching a specific queued prompt preempts this turn and\nimmediately continues with that promoted prompt instead.",
             "required": [
               "turn",
               "type"
@@ -6463,7 +6512,7 @@
       },
       "TurnAccepted": {
         "type": "object",
-        "description": "Accepted-for-processing response; progress arrives on the event stream.\nWhen the thread already has a turn running the prompt is queued instead:\n`queued` is true and `turn` is 0 (the turn number is assigned when the\nprompt is dispatched).",
+        "description": "Accepted-for-processing response; progress arrives on the event stream.\nWhen work cannot begin synchronously, `queued` is true and `turn` is 0:\nordinary sends wait behind the active turn, while per-prompt dispatch may\nstill be cancelling that turn before assigning the replacement turn.",
         "required": [
           "thread_id",
           "turn"

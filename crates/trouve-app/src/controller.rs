@@ -222,6 +222,8 @@ pub enum UiCommand {
     },
     /// Queued-prompt panel: start draining an idle thread's queue.
     QueueSendNow,
+    /// Promote this row and dispatch it immediately, cancelling the active
+    /// turn first when the thread is busy.
     QueueSendNowAt(usize),
     Approval {
         row: usize,
@@ -4483,25 +4485,9 @@ impl Controller {
                 }
             }
             UiCommand::QueueSendNowAt(index) => {
-                if let Some(thread_id) = self.current_thread_id() {
-                    let (mut ids, idle): (Vec<String>, bool) = self
-                        .vms
-                        .get(&thread_id)
-                        .map(|vm| {
-                            (
-                                vm.queue.iter().map(|p| p.id.clone()).collect(),
-                                !vm.turn_running,
-                            )
-                        })
-                        .unwrap_or_default();
-                    if index < ids.len() {
-                        let id = ids.remove(index);
-                        ids.insert(0, id);
-                        self.client.reorder_queue(&thread_id, &ids).await?;
-                        if idle {
-                            self.client.dispatch_queue(&thread_id).await?;
-                        }
-                    }
+                if let Some(id) = self.queued_prompt_id(index) {
+                    self.client.dispatch_queued_prompt(&id).await?;
+                    self.apply_scroll_intent(true);
                 }
             }
             UiCommand::Approval { row, approved } => {

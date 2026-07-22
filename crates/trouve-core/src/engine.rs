@@ -161,6 +161,10 @@ pub struct Engine {
     /// upstream GitHub poll.
     github_dashboard_caches:
         tokio::sync::Mutex<HashMap<String, crate::github::GitHubDashboardCache>>,
+    /// Threads whose current turn should be cancelled and immediately
+    /// replaced by the front queued prompt. Ordinary cancellation still
+    /// pauses the queue; this intent is set only by per-prompt "Send now".
+    preempt_threads: Mutex<std::collections::HashSet<String>>,
     pub(crate) config: Mutex<Config>,
     /// Where provider configuration changes are persisted. `None` disables
     /// persistence (tests).
@@ -460,6 +464,7 @@ impl Engine {
             deleting_sessions: Mutex::new(std::collections::HashSet::new()),
             turn_cancels: Mutex::new(std::collections::HashMap::new()),
             github_dashboard_caches: tokio::sync::Mutex::new(HashMap::new()),
+            preempt_threads: Mutex::new(std::collections::HashSet::new()),
             config: Mutex::new(config.clone()),
             // No write-back by default: only a caller that loaded `config`
             // from disk should enable persisting to that file (see
@@ -3957,6 +3962,67 @@ impl Engine {
         self.emit_queue(thread_id)
     }
 
+    /// Promote one queued prompt and run it immediately. On an active thread
+    /// this cancels the current turn but keeps the dispatcher alive so the
+    /// promoted prompt starts next; on an idle thread it starts a dispatcher.
+    /// Returns the thread id and the new turn number when it could start
+    /// synchronously (`None` means cancellation is still winding down).
+    pub fn dispatch_queued_prompt(
+        self: &Arc<Self>,
+        prompt_id: &str,
+    ) -> Result<(String, Option<u64>), EngineError> {
+        let thread_id = self
+            .store
+            .queued_prompt_thread(prompt_id)?
+            .ok_or_else(|| EngineError::NotFound(format!("queued prompt {prompt_id}")))?;
+        let thread = self.get_thread(&thread_id)?;
+        let preempting = {
+            // The running dispatcher also holds this lock while claiming its
+            // next row, so promotion and the decision to preempt are atomic
+            // against a natural turn boundary.
+            let active = self.active_threads.lock().unwrap();
+            if self
+                .deleting_sessions
+                .lock()
+                .unwrap()
+                .contains(&thread.session_id)
+            {
+                return Err(EngineError::Conflict(format!(
+                    "session {} is being deleted",
+                    thread.session_id
+                )));
+            }
+            if !self.store.promote_queued_prompt(&thread_id, prompt_id)? {
+                return Err(EngineError::NotFound(format!("queued prompt {prompt_id}")));
+            }
+            let preempting = active.contains_key(&thread_id);
+            // Publish the promoted order before triggering cancellation. The
+            // active-thread lock keeps the current dispatcher from claiming
+            // a next row in between those state transitions.
+            self.emit_queue(&thread_id)?;
+            if preempting {
+                self.preempt_threads
+                    .lock()
+                    .unwrap()
+                    .insert(thread_id.clone());
+                if let Some(cancel) = self.turn_cancels.lock().unwrap().get(&thread_id) {
+                    cancel.cancel();
+                }
+            }
+            preempting
+        };
+
+        if preempting {
+            // The turn may be between active-thread registration and cancel
+            // token registration. `register_cancel` also observes the intent
+            // so either side of that race reliably trips the token.
+            Ok((thread_id, None))
+        } else {
+            let turn = self.dispatch_queue(&thread_id)?;
+            Ok((thread_id, turn))
+        }
+    }
+
     /// Start draining the thread's queue if it's idle — the "Send now"
     /// affordance. Deliberately never called automatically at startup: a
     /// crash may have cut a turn short, and running the queue on top of
@@ -4052,6 +4118,11 @@ impl Engine {
         prompt: trouve_protocol::QueuedPrompt,
         first_cancel: tokio_util::sync::CancellationToken,
     ) {
+        enum Transition {
+            Next(trouve_protocol::QueuedPrompt),
+            Stop { session_idle: bool },
+        }
+
         let mut thread = thread;
         let mut turn = turn;
         let mut prompt = prompt;
@@ -4061,48 +4132,78 @@ impl Engine {
                 .take()
                 .unwrap_or_else(|| self.register_cancel(&thread.id));
             let result = self.run_turn(&thread, turn, &prompt, cancel.clone()).await;
-            let cancelled = cancel.is_cancelled();
-            self.clear_cancel(&thread.id);
-            if let Err(e) = result {
-                tracing::error!("turn {turn} of {} failed: {e}", thread.id);
-                let _ = self.store.release_queued_prompt(&prompt.id);
-                let _ = self.emit_queue(&thread.id);
-                let _ = self.store.append_event(
-                    Scope::Thread(thread.id.clone()),
-                    Event::TurnFailed {
-                        turn,
-                        error: e.to_string(),
-                    },
-                );
-                self.release_thread(&thread.id);
-                return;
-            }
-            if cancelled {
-                // A user-cancelled turn pauses the queue (like a failure, but
-                // not an error): leave queued prompts for the user to resume.
-                let _ = self.store.append_event(
-                    Scope::Thread(thread.id.clone()),
-                    Event::TurnCancelled { turn },
-                );
-                self.release_thread(&thread.id);
-                return;
-            }
-            // Pop the next prompt; releasing the claim and inspecting the
-            // queue must be atomic against concurrent send_message calls.
-            let (next, session_idle) = {
+            let transition = {
+                // Serialize the turn-end decision with per-prompt dispatch.
+                // Otherwise "Send now" could land after cancellation was
+                // sampled but before the natural next row was claimed, then
+                // accidentally cancel the selected replacement turn.
                 let mut active = self.active_threads.lock().unwrap();
-                match self.store.claim_queued_prompt(&thread.id) {
-                    Ok(Some(p)) => (Some(p), false),
-                    _ => {
-                        active.remove(&thread.id);
-                        (None, !active.values().any(|s| *s == thread.session_id))
+                let cancelled = cancel.is_cancelled();
+                self.clear_cancel(&thread.id);
+                let error = if cancelled { None } else { result.err() };
+                let preempting =
+                    cancelled && self.preempt_threads.lock().unwrap().remove(&thread.id);
+
+                if cancelled {
+                    // Persist the terminal event before releasing or
+                    // continuing the dispatcher claim. A concurrent send can
+                    // never publish the replacement turn ahead of this.
+                    let _ = self.store.append_event(
+                        Scope::Thread(thread.id.clone()),
+                        Event::TurnCancelled { turn },
+                    );
+                }
+                if cancelled && !preempting {
+                    // An ordinary user cancellation pauses the queue (like a
+                    // failure, but not an error).
+                    let session_idle = active
+                        .remove(&thread.id)
+                        .filter(|session| !active.values().any(|s| s == session))
+                        .is_some();
+                    Transition::Stop { session_idle }
+                } else if let Some(error) = error {
+                    self.preempt_threads.lock().unwrap().remove(&thread.id);
+                    tracing::error!("turn {turn} of {} failed: {error}", thread.id);
+                    let _ = self.store.release_queued_prompt(&prompt.id);
+                    let _ = self.emit_queue(&thread.id);
+                    let _ = self.store.append_event(
+                        Scope::Thread(thread.id.clone()),
+                        Event::TurnFailed {
+                            turn,
+                            error: error.to_string(),
+                        },
+                    );
+                    let session_idle = active
+                        .remove(&thread.id)
+                        .filter(|session| !active.values().any(|s| s == session))
+                        .is_some();
+                    Transition::Stop { session_idle }
+                } else {
+                    // Pop the next prompt while still holding the dispatcher
+                    // claim. A preemption falls through here and therefore
+                    // continues directly with the promoted front row.
+                    match self.store.claim_queued_prompt(&thread.id) {
+                        Ok(Some(prompt)) => Transition::Next(prompt),
+                        _ => {
+                            let session_idle = active
+                                .remove(&thread.id)
+                                .filter(|session| !active.values().any(|s| s == session))
+                                .is_some();
+                            Transition::Stop { session_idle }
+                        }
                     }
                 }
             };
-            if session_idle {
-                self.emit_session_activity(&thread.session_id, false);
-            }
-            let Some(next) = next else { return };
+
+            let next = match transition {
+                Transition::Next(prompt) => prompt,
+                Transition::Stop { session_idle } => {
+                    if session_idle {
+                        self.emit_session_activity(&thread.session_id, false);
+                    }
+                    return;
+                }
+            };
             let _ = self.emit_queue(&thread.id);
             // Thread settings may have changed between turns.
             if let Ok(t) = self.get_thread(&thread.id) {
@@ -4131,6 +4232,7 @@ impl Engine {
                 .remove(thread_id)
                 .filter(|session| !active.values().any(|s| s == session))
         };
+        self.preempt_threads.lock().unwrap().remove(thread_id);
         if let Some(session_id) = idle_session {
             self.emit_session_activity(&session_id, false);
         }
@@ -4143,6 +4245,9 @@ impl Engine {
             .lock()
             .unwrap()
             .insert(thread_id.to_string(), token.clone());
+        if self.preempt_threads.lock().unwrap().contains(thread_id) {
+            token.cancel();
+        }
         token
     }
 
