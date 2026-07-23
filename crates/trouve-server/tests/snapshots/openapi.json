@@ -7,7 +7,7 @@
       "name": "MIT",
       "identifier": "MIT"
     },
-    "version": "1.4"
+    "version": "1.5"
   },
   "paths": {
     "/v1/approvals": {
@@ -6039,7 +6039,7 @@
       },
       "ReviewerProfile": {
         "type": "object",
-        "description": "Configuration for one focused reviewer. Built-in profiles are shipped by\ntrouve; custom profiles are user-managed and may choose their own model.",
+        "description": "Configuration for one focused reviewer. Built-in profiles are shipped by\ntrouve; every profile may choose model and thinking defaults.",
         "required": [
           "id",
           "name",
@@ -6048,6 +6048,13 @@
         "properties": {
           "built_in": {
             "type": "boolean"
+          },
+          "default_thinking_level": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Preferred thinking level for this reviewer. None inherits the review\nmode's default, then the global default."
           },
           "id": {
             "type": "string"
@@ -6765,12 +6772,18 @@
       },
       "UpsertReviewerProfileRequest": {
         "type": "object",
-        "description": "Create or update a custom reviewer profile. Omit `id` to create one;\nbuilt-in profiles cannot be changed through this request.",
+        "description": "Create or update a reviewer profile. Omit `id` to create a custom profile;\nbuilt-in ids update only that persona's model and thinking defaults.\n\nThis request uses full-replace PUT semantics: omitted optional `model` or\n`default_thinking_level` values are cleared rather than merged with the\nexisting profile. Callers updating either field must resend both fields.",
         "required": [
           "name",
           "prompt"
         ],
         "properties": {
+          "default_thinking_level": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "id": {
             "type": [
               "string",

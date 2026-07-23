@@ -279,6 +279,17 @@ fn cli_for_kind(kind: &str) -> Option<trouve_agents::install::CliId> {
     }
 }
 
+/// Resolve the executable for a CLI-backed provider. An explicit command
+/// wins; otherwise a trouve-managed binary takes precedence over PATH.
+fn resolved_cli_command(kind: &str, command: Option<String>, data_dir: &Path) -> Option<String> {
+    command.or_else(|| {
+        cli_for_kind(kind)
+            .map(|cli| trouve_agents::install::managed_bin(data_dir, cli))
+            .filter(|bin| bin.exists())
+            .map(|bin| bin.to_string_lossy().into_owned())
+    })
+}
+
 /// Config kinds handled by the [`AgentBackend`] seam rather than a Provider.
 fn is_backend_kind(kind: &str) -> bool {
     matches!(kind, "codex-app-server" | "cursor-cli" | "claude-cli")
@@ -385,12 +396,7 @@ fn build_all_backends(
     for (id, pc) in &config.providers {
         // Explicit command wins; otherwise a trouve-managed install beats
         // whatever is on PATH (distro packages lag behind vendor releases).
-        let command = pc.command.clone().or_else(|| {
-            cli_for_kind(&pc.kind)
-                .map(|cli| trouve_agents::install::managed_bin(data_dir, cli))
-                .filter(|bin| bin.exists())
-                .map(|bin| bin.to_string_lossy().into_owned())
-        });
+        let command = resolved_cli_command(&pc.kind, pc.command.clone(), data_dir);
         let backend: Arc<dyn AgentBackend> = match pc.kind.as_str() {
             "codex-app-server" => Arc::new(trouve_agents::codex::CodexBackend::new(id, command)),
             "cursor-cli" => {
@@ -1083,7 +1089,8 @@ impl Engine {
             backend.start_login().await
         } else {
             // codex-responses: credentials come from the Codex CLI login.
-            let cmd = command.unwrap_or_else(|| "codex".into());
+            let cmd = resolved_cli_command(kind, command, &self.data_dir)
+                .unwrap_or_else(|| "codex".into());
             trouve_agents::spawn_login(&cmd, &["login"]).await
         }
         .map_err(|e| EngineError::BadRequest(e.to_string()))?;
@@ -7643,6 +7650,33 @@ mod tests {
         ] {
             assert!(!is_loopback_base_url(url), "should not be loopback: {url}");
         }
+    }
+
+    #[test]
+    fn cli_command_prefers_explicit_then_managed_binary() {
+        let tmp = tempfile::tempdir().unwrap();
+        let managed =
+            trouve_agents::install::managed_bin(tmp.path(), trouve_agents::install::CliId::Codex);
+        std::fs::create_dir_all(managed.parent().unwrap()).unwrap();
+        std::fs::write(&managed, b"stub").unwrap();
+
+        assert_eq!(
+            resolved_cli_command("codex-responses", None, tmp.path()),
+            Some(managed.to_string_lossy().into_owned())
+        );
+        assert_eq!(
+            resolved_cli_command(
+                "codex-responses",
+                Some("/opt/custom/codex".into()),
+                tmp.path()
+            )
+            .as_deref(),
+            Some("/opt/custom/codex")
+        );
+        assert_eq!(
+            resolved_cli_command("openai-compat", None, tmp.path()),
+            None
+        );
     }
 
     #[tokio::test]

@@ -1,4 +1,17 @@
 import "./styles.css";
+import {
+  type CliInfo,
+  type CliInstallStatus,
+  cliIsInstalled,
+  cliProgressLabel,
+  cliVersionLabel,
+  idleCliInstallStatus,
+} from "./cli";
+import {
+  defaultThinkingSelection,
+  thinkingLevelLabel,
+  thinkingOptions,
+} from "./model-settings";
 import { jobStatusClass, normalizedReviewMode, safeExternalUrl } from "./security";
 
 type ReviewMode = "off" | "manual" | "automatic";
@@ -34,6 +47,7 @@ interface ReviewerProfile {
   name: string;
   prompt: string;
   model?: string;
+  default_thinking_level?: string;
   built_in: boolean;
 }
 
@@ -76,6 +90,12 @@ interface Provider {
   experimental: boolean;
 }
 
+interface ProvidersResponse {
+  providers: Provider[];
+  default_model: string;
+  default_thinking_level?: string;
+}
+
 interface KnownProvider {
   id: string;
   display_name: string;
@@ -110,6 +130,12 @@ interface ProviderLogin {
 interface Model {
   id: string;
   display_name: string;
+  options_schema?: unknown;
+}
+
+interface CliNotice {
+  message: string;
+  error: boolean;
 }
 
 const root = document.querySelector<HTMLElement>("#app")!;
@@ -117,6 +143,16 @@ let dashboard: Dashboard | null = null;
 let providers: Provider[] = [];
 let knownProviders: KnownProvider[] = [];
 let models: Model[] = [];
+let defaultModel = "";
+let defaultThinkingLevel: string | undefined;
+let clis: CliInfo[] = [];
+let cliInstallStatuses: Record<string, CliInstallStatus> = {};
+let clisLoaded = false;
+let clisLoading = false;
+let cliLoadError = "";
+let cliActionId = "";
+let cliNotice: CliNotice | null = null;
+let selectedCliProviderId = "";
 let timer: number | undefined;
 let providerLogin: ProviderLogin | null = null;
 let providerLoginAttempt = 0;
@@ -126,6 +162,7 @@ let repositoryPage = 0;
 let repositoryPageSize = 10;
 let repositorySearchTimer: number | undefined;
 const expandedRepositories = new Set<string>();
+const cliInstallPolls = new Set<string>();
 
 function escape(value: unknown): string {
   return String(value ?? "")
@@ -148,15 +185,16 @@ async function api<T>(path: string, init: RequestInit = {}): Promise<T> {
     const body = await response.json().catch(() => ({ message: response.statusText }));
     throw new Error(body.message ?? `Request failed (${response.status})`);
   }
-  if (response.status === 204) return undefined as T;
-  return response.json() as Promise<T>;
+  const body = await response.text();
+  if (!body) return undefined as T;
+  return JSON.parse(body) as T;
 }
 
 function time(value?: string): string {
   return value ? new Date(value).toLocaleString() : "Never";
 }
 
-function modelOptions(selected?: string, inheritedLabel = "Use review/default model"): string {
+function modelOptions(selected?: string, inheritedLabel = "Use review/system default"): string {
   const choices = selected && !models.some((model) => model.id === selected)
     ? [{ id: selected, display_name: selected }, ...models]
     : models;
@@ -168,6 +206,58 @@ function modelOptions(selected?: string, inheritedLabel = "Use review/default mo
   ].join("");
 }
 
+function explicitModelOptions(selected: string): string {
+  const choices = selected && !models.some((model) => model.id === selected)
+    ? [{ id: selected, display_name: selected, options_schema: undefined }, ...models]
+    : models;
+  return choices.map(
+    (model) => `<option value="${escape(model.id)}" ${model.id === selected ? "selected" : ""}>${escape(model.display_name)} · ${escape(model.id)}</option>`,
+  ).join("");
+}
+
+function modelById(id: string): Model | undefined {
+  return models.find((model) => model.id === id);
+}
+
+function thinkingOptionsMarkup(
+  modelId: string,
+  selected: string | undefined,
+  inheritedLabel?: string,
+): { markup: string; disabled: boolean } {
+  const { values } = thinkingOptions(modelById(modelId));
+  const choices = inheritedLabel && selected && !values.includes(selected)
+    ? [selected, ...values]
+    : values;
+  if (inheritedLabel) {
+    return {
+      markup: [
+        `<option value="" ${selected ? "" : "selected"}>${escape(inheritedLabel)}</option>`,
+        ...choices.map((value) => `<option value="${escape(value)}" ${value === selected ? "selected" : ""}>${escape(thinkingLevelLabel(value))}</option>`),
+      ].join(""),
+      disabled: choices.length === 0,
+    };
+  }
+  const resolved = defaultThinkingSelection(modelById(modelId), selected);
+  if (choices.length === 0) {
+    return {
+      markup: `<option value="">Not available for this model</option>`,
+      disabled: true,
+    };
+  }
+  return {
+    markup: choices.map((value) => `<option value="${escape(value)}" ${value === resolved ? "selected" : ""}>${escape(thinkingLevelLabel(value))}</option>`).join(""),
+    disabled: false,
+  };
+}
+
+function reviewerThinkingOptions(reviewer: ReviewerProfile): { markup: string; disabled: boolean } {
+  return thinkingOptionsMarkup(
+    reviewer.model ?? defaultModel,
+    reviewer.default_thinking_level,
+    "Use review/global thinking default",
+  );
+}
+
 function knownProvider(id: string): KnownProvider | undefined {
   return knownProviders.find((provider) => provider.id === id);
 }
@@ -176,11 +266,35 @@ function providerDisplayName(id: string): string {
   return knownProvider(id)?.display_name ?? id;
 }
 
+function cliForKind(kind: string): CliInfo | undefined {
+  return clis.find((cli) => cli.kinds.includes(kind));
+}
+
+function cliForProviderId(providerId: string): CliInfo | undefined {
+  const provider = providers.find((candidate) => candidate.id === providerId)
+    ?? knownProvider(providerId);
+  return provider ? cliForKind(provider.kind) : undefined;
+}
+
+function cliStatus(cliId: string): CliInstallStatus {
+  return cliInstallStatuses[cliId] ?? idleCliInstallStatus();
+}
+
 function providerCredentialLabel(provider: Provider): string {
-  if (provider.auth === "cli") return provider.has_credentials ? "CLI ready" : "sign-in required";
+  if (provider.auth === "cli") {
+    const requiredCli = cliForKind(provider.kind);
+    if (requiredCli && !cliIsInstalled(requiredCli)) return "CLI missing";
+    if (!clisLoaded && clisLoading) return "checking CLI";
+    return provider.has_credentials ? "CLI ready" : "sign-in required";
+  }
   if (provider.auth === "oauth") return provider.has_credentials ? "signed in" : "sign-in required";
   if (provider.auth === "none") return "ready";
   return provider.has_credentials ? "API key ready" : "API key required";
+}
+
+function providerIsReady(provider: Provider): boolean {
+  const requiredCli = provider.auth === "cli" ? cliForKind(provider.kind) : undefined;
+  return provider.has_credentials && (!requiredCli || cliIsInstalled(requiredCli));
 }
 
 function renderProviderLogin(): string {
@@ -202,46 +316,123 @@ function renderProviderLogin(): string {
       : login.state === "failed"
         ? `<p class="error">${escape(login.error || "The vendor CLI did not complete sign-in.")}</p>`
         : "<p>Starting the vendor CLI and waiting for its authorization URL…</p>";
+  const requiredCli = cliForProviderId(login.provider_id);
+  const install = requiredCli ? cliStatus(requiredCli.id) : idleCliInstallStatus();
+  const recoveryAction = login.state === "failed" && requiredCli && !cliIsInstalled(requiredCli)
+    ? install.status === "pending"
+      ? `<div class="login-actions"><button class="ghost" type="button" data-cli-cancel="${escape(requiredCli.id)}">Cancel CLI install</button></div>`
+      : `<div class="login-actions"><button type="button" data-cli-install="${escape(requiredCli.id)}" ${cliActionId === requiredCli.id ? "disabled" : ""}>Install ${escape(requiredCli.display_name)}</button></div>`
+    : "";
   return `<aside class="provider-login ${login.state}" role="status" aria-live="polite">
     <div><span class="provider-state ${login.state === "success" ? "ready" : ""}">${stateLabel}</span><strong>${escape(login.display_name)}</strong></div>
     ${login.user_code ? `<p>Enter this code when prompted: <code>${escape(login.user_code)}</code></p>` : ""}
     ${instructions}
+    ${recoveryAction}
   </aside>`;
+}
+
+function renderProviderAction(provider: Provider, loginStarting: boolean): string {
+  const canLogin = provider.auth === "cli" || provider.auth === "oauth";
+  if (!canLogin) return "";
+  if (provider.auth === "cli") {
+    const requiredCli = cliForKind(provider.kind);
+    if (requiredCli) {
+      const install = cliStatus(requiredCli.id);
+      if (install.status === "pending") {
+        return `<button class="ghost provider-login-button" type="button" data-cli-cancel="${escape(requiredCli.id)}">Cancel install</button>`;
+      }
+      if (!cliIsInstalled(requiredCli)) {
+        return `<button class="ghost provider-login-button" type="button" data-cli-install="${escape(requiredCli.id)}" ${cliActionId === requiredCli.id ? "disabled" : ""}>Install CLI</button>`;
+      }
+    } else if (!clisLoaded && clisLoading) {
+      return `<button class="ghost provider-login-button" type="button" disabled>Checking CLI…</button>`;
+    }
+  }
+  return `<button class="ghost provider-login-button" type="button" data-provider-login="${escape(provider.id)}" ${loginStarting ? "disabled" : ""}>${provider.has_credentials ? "Sign in again" : "Sign in"}</button>`;
+}
+
+function renderCliManager(): string {
+  const body = !clisLoaded
+    ? `<p class="${cliLoadError ? "error" : "muted"}">${escape(cliLoadError || (clisLoading ? "Checking the server's CLI binaries…" : "CLI status has not loaded yet."))}</p>`
+    : `<div class="cli-list">${clis.map((cli) => {
+      const install = cliStatus(cli.id);
+      const pending = install.status === "pending";
+      const installed = cliIsInstalled(cli);
+      const canInstall = !installed || cli.update_available || install.status === "failed";
+      const providerNames = knownProviders
+        .filter((provider) => cli.kinds.includes(provider.kind))
+        .map((provider) => provider.display_name)
+        .join(", ");
+      const received = Math.max(0, Number(install.received_bytes) || 0);
+      const total = Math.max(0, Number(install.total_bytes) || 0);
+      const progress = pending
+        ? `<div class="cli-progress"><progress ${total > 0 ? `max="${total}" value="${Math.min(received, total)}"` : ""}></progress><small>${escape(cliProgressLabel(install))}</small></div>`
+        : install.status === "failed"
+          ? `<p class="cli-error">${escape(install.error || "Install failed.")}</p>`
+          : "";
+      const actions = pending
+        ? `<button class="ghost cli-button" type="button" data-cli-cancel="${escape(cli.id)}">Cancel</button>`
+        : `${canInstall ? `<button class="ghost cli-button" type="button" data-cli-install="${escape(cli.id)}" ${cliActionId === cli.id ? "disabled" : ""}>${install.status === "failed" ? "Retry" : installed ? "Update" : "Install"}</button>` : ""}
+           ${cli.source === "managed" ? `<button class="ghost cli-button danger" type="button" data-cli-uninstall="${escape(cli.id)}" ${cliActionId === cli.id ? "disabled" : ""}>Remove</button>` : ""}`;
+      return `<article class="cli-item">
+        <div class="cli-copy">
+          <div><strong>${escape(cli.display_name)}</strong><span class="cli-source ${installed ? "ready" : ""}">${installed ? (cli.source === "managed" ? "managed" : "system") : "missing"}</span></div>
+          <small>${escape(cliVersionLabel(cli))}</small>
+          ${providerNames ? `<small>Used by ${escape(providerNames)}</small>` : ""}
+          ${progress}
+        </div>
+        <div class="cli-actions">${actions}</div>
+      </article>`;
+    }).join("") || `<p class="muted">This server did not report any manageable CLIs.</p>`}</div>`;
+  return `<section class="cli-manager" aria-labelledby="cli-manager-title">
+    <div class="cli-manager-title">
+      <div><h3 id="cli-manager-title">Subscription CLI binaries</h3><p class="muted form-help">Install vendor CLIs into trouve's data directory. Managed versions take precedence over system copies on PATH.</p></div>
+      <button class="ghost cli-refresh" type="button" data-cli-refresh ${clisLoading ? "disabled" : ""}>Refresh</button>
+    </div>
+    ${cliNotice ? `<p class="cli-notice ${cliNotice.error ? "error" : ""}" role="status">${escape(cliNotice.message)}</p>` : ""}
+    ${cliLoadError && clisLoaded ? `<p class="cli-notice error" role="status">${escape(cliLoadError)}</p>` : ""}
+    ${body}
+  </section>`;
 }
 
 function renderProviderSettings(): string {
   const cliProviders = knownProviders.filter((provider) => provider.auth === "cli");
   const apiProviders = knownProviders.filter((provider) => provider.auth !== "cli");
-  const selectedCli = providerLogin && cliProviders.some((provider) => provider.id === providerLogin?.provider_id)
-    ? providerLogin.provider_id
+  const loginProviderId = providerLogin?.provider_id ?? "";
+  const rememberedCli = selectedCliProviderId
+    || (cliProviders.some((provider) => provider.id === loginProviderId)
+      ? loginProviderId
+      : "");
+  const selectedCli = cliProviders.some((provider) => provider.id === rememberedCli)
+    ? rememberedCli
     : "";
-  const loginStarting = providerLogin?.state === "starting" ? "disabled" : "";
+  const loginStarting = providerLogin?.state === "starting";
 
-  return `<section class="card provider-settings">
+  return `<section class="card provider-settings" id="provider-settings">
     <p class="eyebrow">Models</p><h2>Providers</h2>
     <p class="muted">Connect a subscription through its vendor CLI, or add a usage-billed API provider.</p>
     <div class="provider-list">
       ${providers.map((provider) => {
         const name = providerDisplayName(provider.id);
-        const canLogin = provider.auth === "cli" || provider.auth === "oauth";
         return `<article class="provider-item">
           <div class="provider-copy"><strong>${escape(name)}</strong><small>${escape(provider.id)} · ${escape(provider.kind)}</small>${provider.experimental ? "<em>experimental</em>" : ""}</div>
           <div class="provider-actions">
-            <span class="provider-state ${provider.has_credentials ? "ready" : "needs"}">${providerCredentialLabel(provider)}</span>
-            ${canLogin ? `<button class="ghost provider-login-button" type="button" data-provider-login="${escape(provider.id)}" ${loginStarting}>${provider.has_credentials ? "Sign in again" : "Sign in"}</button>` : ""}
+            <span class="provider-state ${providerIsReady(provider) ? "ready" : "needs"}">${providerCredentialLabel(provider)}</span>
+            ${renderProviderAction(provider, loginStarting)}
           </div>
         </article>`;
       }).join("") || "<p class=\"muted\">No providers configured yet.</p>"}
     </div>
     ${renderProviderLogin()}
+    ${renderCliManager()}
     <div class="provider-setup">
       <form id="cli-provider-form" class="stack compact">
-        <div><h3>Subscription CLI</h3><p class="muted form-help">Choose a vendor CLI installed on the server. trouve configures the provider, starts its login flow, and opens the vendor's authorization page here.</p></div>
+        <div><h3>Subscription provider</h3><p class="muted form-help">Choose a provider. If its CLI is missing, trouve installs it first; click again after installation to configure the provider and open the vendor's authorization page.</p></div>
         <label>CLI provider<select name="provider" required>
           <option value="">Choose a CLI provider…</option>
           ${cliProviders.map((provider) => `<option value="${escape(provider.id)}" ${provider.id === selectedCli ? "selected" : ""}>${escape(provider.display_name)}${provider.experimental ? " · Experimental" : ""}</option>`).join("")}
         </select></label>
-        <button ${loginStarting}>Configure and sign in</button>
+        <button id="cli-provider-submit" ${loginStarting ? "disabled" : ""}>Configure and sign in</button>
       </form>
       <form id="provider-form" class="stack compact">
         <div><h3>API or custom provider</h3><p class="muted form-help">Pick a preset to fill in its endpoint, or choose Custom for another OpenAI-compatible or Anthropic API.</p></div>
@@ -256,6 +447,28 @@ function renderProviderSettings(): string {
       </form>
     </div>
   </section>`;
+}
+
+function renderGlobalDefaults(): string {
+  const thinking = thinkingOptionsMarkup(defaultModel, defaultThinkingLevel);
+  return `<section class="card wide model-defaults" id="model-defaults">
+    <div class="section-title"><div><p class="eyebrow">Defaults</p><h2>System model defaults</h2></div><span class="muted">Base fallback for reviews that do not select more specific defaults.</span></div>
+    ${models.length === 0 ? `<p class="defaults-warning">No provider models are available yet. Configure and sign in to a provider before changing the system default.</p>` : ""}
+    <form id="global-defaults-form" class="defaults-form">
+      <label>Global default model<select name="model" required ${models.length === 0 ? "disabled" : ""}>${explicitModelOptions(defaultModel)}</select></label>
+      <label>Global thinking level<select name="default_thinking_level" ${thinking.disabled ? "disabled" : ""}>${thinking.markup}</select></label>
+      <button ${models.length === 0 ? "disabled" : ""}>Save system defaults</button>
+    </form>
+    <p class="muted defaults-help">Thinking choices come from the selected model. Models without a thinking control use their own behavior.</p>
+  </section>`;
+}
+
+function renderReviewerDefaultControls(reviewer: ReviewerProfile): string {
+  const thinking = reviewerThinkingOptions(reviewer);
+  return `<div class="reviewer-default-controls">
+    <label>Default model<select name="model" data-reviewer-model-default>${modelOptions(reviewer.model, "Use repository/review default")}</select></label>
+    <label>Thinking level<select name="default_thinking_level" data-reviewer-thinking-default ${thinking.disabled ? "disabled" : ""}>${thinking.markup}</select></label>
+  </div>`;
 }
 
 function repositoryKey(repo: Repository): string {
@@ -374,22 +587,31 @@ function render(): void {
       </section>
       ${renderProviderSettings()}
     </div>
+    ${renderGlobalDefaults()}
     <section class="card wide">
       <div class="section-title"><div><p class="eyebrow">Review passes</p><h2>Reviewers</h2></div><span class="muted">Each selected reviewer examines every changed file batch; a final editor validates and deduplicates their findings.</span></div>
       <div class="reviewer-grid">
-        ${builtInReviewers.map((reviewer) => `<article class="reviewer-card"><div><strong>${escape(reviewer.name)}</strong><span>built-in</span></div><p>${escape(reviewer.prompt)}</p><small>Uses the repository/default model</small></article>`).join("")}
+        ${builtInReviewers.map((reviewer) => `<form class="reviewer-card built-in-reviewer" data-id="${escape(reviewer.id)}">
+          <div><strong>${escape(reviewer.name)}</strong><span>built-in</span></div>
+          <p>${escape(reviewer.prompt)}</p>
+          ${renderReviewerDefaultControls(reviewer)}
+          <button>Save persona defaults</button>
+        </form>`).join("")}
       </div>
       <h3>Custom reviewers</h3>
       <div class="custom-reviewers">
         ${customReviewers.map((reviewer) => `<form class="custom-reviewer" data-id="${escape(reviewer.id)}">
           <input name="name" value="${escape(reviewer.name)}" aria-label="Reviewer name" required />
-          <select name="model" aria-label="Reviewer model">${modelOptions(reviewer.model)}</select>
+          ${renderReviewerDefaultControls(reviewer)}
           <textarea name="prompt" rows="3" aria-label="Reviewer prompt" required>${escape(reviewer.prompt)}</textarea>
           <div class="reviewer-actions"><button>Save</button><button class="ghost delete-reviewer" type="button">Delete</button></div>
         </form>`).join("") || `<p class="empty">No custom reviewers yet.</p>`}
       </div>
       <form id="reviewer-form" class="stack reviewer-create">
-        <div class="split"><label>Name<input name="name" placeholder="Domain invariants" required /></label><label>Model<select name="model">${modelOptions()}</select></label></div>
+        <div class="reviewer-create-fields">
+          <label>Name<input name="name" placeholder="Domain invariants" required /></label>
+          ${renderReviewerDefaultControls({ id: "", name: "", prompt: "", built_in: false })}
+        </div>
         <label>Prompt<textarea name="prompt" rows="3" placeholder="Describe this reviewer's focused mandate." required></textarea></label>
         <button>Add custom reviewer</button>
       </form>
@@ -560,6 +782,314 @@ async function pollProviderLogin(providerId: string, displayName: string, attemp
   render();
 }
 
+function refreshProviderSettings(): void {
+  if (!dashboard) return;
+  const section = document.querySelector<HTMLElement>("#provider-settings");
+  if (!section) return;
+  section.outerHTML = renderProviderSettings();
+  bindProviderSettings();
+}
+
+function ensureCliInstallPoll(cliId: string): void {
+  if (cliInstallPolls.has(cliId)) return;
+  cliInstallPolls.add(cliId);
+  void pollCliInstall(cliId);
+}
+
+async function refreshCliData(updateUi = true): Promise<void> {
+  clisLoading = true;
+  cliLoadError = "";
+  if (updateUi) refreshProviderSettings();
+  try {
+    const list = await api<{ clis: CliInfo[] }>("/clis");
+    const statuses = await Promise.all(list.clis.map(async (cli): Promise<[string, CliInstallStatus]> => {
+      try {
+        return [cli.id, await api<CliInstallStatus>(`/clis/${encodeURIComponent(cli.id)}/install`)];
+      } catch {
+        return [cli.id, cliInstallStatuses[cli.id] ?? idleCliInstallStatus()];
+      }
+    }));
+    clis = list.clis;
+    cliInstallStatuses = Object.fromEntries(statuses);
+    clisLoaded = true;
+    for (const [cliId, status] of statuses) {
+      if (status.status === "pending") ensureCliInstallPoll(cliId);
+    }
+  } catch (error) {
+    cliLoadError = error instanceof Error ? error.message : String(error);
+  } finally {
+    clisLoading = false;
+    if (updateUi) refreshProviderSettings();
+  }
+}
+
+async function startCliInstall(cliId: string): Promise<void> {
+  if (cliActionId) return;
+  cliActionId = cliId;
+  cliNotice = { message: `Starting ${cliId} install…`, error: false };
+  refreshProviderSettings();
+  try {
+    await api(`/clis/${encodeURIComponent(cliId)}/install`, { method: "POST" });
+    cliInstallStatuses = {
+      ...cliInstallStatuses,
+      [cliId]: {
+        status: "pending",
+        received_bytes: 0,
+        total_bytes: 0,
+      },
+    };
+    cliNotice = { message: `Installing ${cliId}. You can leave this page open while it downloads.`, error: false };
+    ensureCliInstallPoll(cliId);
+  } catch (error) {
+    cliNotice = {
+      message: error instanceof Error ? error.message : String(error),
+      error: true,
+    };
+  } finally {
+    cliActionId = "";
+    refreshProviderSettings();
+  }
+}
+
+async function cancelCliInstall(cliId: string): Promise<void> {
+  if (cliActionId) return;
+  cliActionId = cliId;
+  cliNotice = { message: `Cancelling ${cliId} install…`, error: false };
+  refreshProviderSettings();
+  try {
+    await api(`/clis/${encodeURIComponent(cliId)}/install`, { method: "DELETE" });
+    ensureCliInstallPoll(cliId);
+  } catch (error) {
+    cliNotice = {
+      message: error instanceof Error ? error.message : String(error),
+      error: true,
+    };
+  } finally {
+    cliActionId = "";
+    refreshProviderSettings();
+  }
+}
+
+async function uninstallCli(cliId: string): Promise<void> {
+  if (cliActionId) return;
+  const cli = clis.find((candidate) => candidate.id === cliId);
+  if (!window.confirm(`Remove trouve's managed ${cli?.display_name ?? cliId}? A system copy on PATH will still be used if one exists.`)) return;
+  cliActionId = cliId;
+  cliNotice = { message: `Removing ${cliId}…`, error: false };
+  refreshProviderSettings();
+  try {
+    await api(`/clis/${encodeURIComponent(cliId)}`, { method: "DELETE" });
+    cliInstallStatuses = { ...cliInstallStatuses, [cliId]: idleCliInstallStatus() };
+    if (providerLogin && cliForProviderId(providerLogin.provider_id)?.id === cliId) {
+      providerLoginAttempt += 1;
+      providerLogin = null;
+    }
+    cliNotice = { message: `Removed the managed ${cli?.display_name ?? cliId}.`, error: false };
+    await refreshCliData(false);
+    await loadData();
+  } catch (error) {
+    cliNotice = {
+      message: error instanceof Error ? error.message : String(error),
+      error: true,
+    };
+  } finally {
+    cliActionId = "";
+    refreshProviderSettings();
+  }
+}
+
+async function pollCliInstall(cliId: string): Promise<void> {
+  let consecutiveErrors = 0;
+  const refreshProviderSettingsWhenIdle = (): void => {
+    if (!hasEditableFocus(document.querySelector("#provider-settings"))) {
+      refreshProviderSettings();
+    }
+  };
+  try {
+    for (let poll = 0; poll < 1200; poll += 1) {
+      await new Promise((resolve) => window.setTimeout(resolve, 1_000));
+      let status: CliInstallStatus;
+      try {
+        status = await api<CliInstallStatus>(`/clis/${encodeURIComponent(cliId)}/install`);
+        consecutiveErrors = 0;
+      } catch (error) {
+        consecutiveErrors += 1;
+        if (consecutiveErrors < 3) continue;
+        cliNotice = {
+          message: `Could not check ${cliId} install status: ${error instanceof Error ? error.message : String(error)}`,
+          error: true,
+        };
+        refreshProviderSettingsWhenIdle();
+        return;
+      }
+      cliInstallStatuses = { ...cliInstallStatuses, [cliId]: status };
+      if (status.status === "pending") {
+        refreshProviderSettingsWhenIdle();
+        continue;
+      }
+
+      if (status.status === "success") {
+        const version = status.version ? ` ${status.version}` : "";
+        clis = clis.map((cli) => cli.id === cliId
+          ? {
+              ...cli,
+              installed_version: status.version ?? cli.latest_version,
+              source: "managed",
+              update_available: false,
+            }
+          : cli);
+        cliNotice = { message: `Installed ${cliId}${version}. You can sign in now.`, error: false };
+        if (providerLogin?.state === "failed"
+          && cliForProviderId(providerLogin.provider_id)?.id === cliId
+          && /not installed|not on path/i.test(providerLogin.error)) {
+          providerLoginAttempt += 1;
+          providerLogin = null;
+        }
+      } else if (status.status === "failed") {
+        cliNotice = { message: `Install of ${cliId} failed: ${status.error || "unknown error"}`, error: true };
+      } else {
+        cliNotice = { message: `Cancelled the ${cliId} install.`, error: false };
+      }
+      refreshProviderSettingsWhenIdle();
+      await refreshCliData(false);
+      try {
+        await loadData();
+      } catch {
+        refreshProviderSettingsWhenIdle();
+      }
+      return;
+    }
+    cliNotice = { message: `The ${cliId} install is still running. Refresh CLI status to check it again.`, error: true };
+    refreshProviderSettingsWhenIdle();
+  } finally {
+    cliInstallPolls.delete(cliId);
+  }
+}
+
+function bindProviderSettings(): void {
+  document.querySelectorAll<HTMLButtonElement>("[data-provider-login]").forEach((button) => {
+    button.onclick = () => {
+      const providerId = button.dataset.providerLogin;
+      if (providerId) {
+        selectedCliProviderId = providerId;
+        void startProviderLogin(providerId);
+      }
+    };
+  });
+  document.querySelectorAll<HTMLButtonElement>("[data-cli-install]").forEach((button) => {
+    button.onclick = () => {
+      const cliId = button.dataset.cliInstall;
+      if (cliId) void startCliInstall(cliId);
+    };
+  });
+  document.querySelectorAll<HTMLButtonElement>("[data-cli-cancel]").forEach((button) => {
+    button.onclick = () => {
+      const cliId = button.dataset.cliCancel;
+      if (cliId) void cancelCliInstall(cliId);
+    };
+  });
+  document.querySelectorAll<HTMLButtonElement>("[data-cli-uninstall]").forEach((button) => {
+    button.onclick = () => {
+      const cliId = button.dataset.cliUninstall;
+      if (cliId) void uninstallCli(cliId);
+    };
+  });
+  const cliRefresh = document.querySelector<HTMLButtonElement>("[data-cli-refresh]");
+  if (cliRefresh) {
+    cliRefresh.onclick = () => {
+      cliNotice = null;
+      void refreshCliData();
+    };
+  }
+
+  const cliProviderForm = document.querySelector<HTMLFormElement>("#cli-provider-form")!;
+  const cliProviderSelect = cliProviderForm.elements.namedItem("provider") as HTMLSelectElement;
+  const cliProviderSubmit = cliProviderForm.querySelector<HTMLButtonElement>("#cli-provider-submit")!;
+  const syncCliProvider = () => {
+    const preset = knownProvider(cliProviderSelect.value);
+    const requiredCli = preset ? cliForKind(preset.kind) : undefined;
+    const install = requiredCli ? cliStatus(requiredCli.id) : idleCliInstallStatus();
+    const checking = Boolean(preset && !clisLoaded && clisLoading);
+    cliProviderSubmit.disabled = providerLogin?.state === "starting"
+      || checking
+      || install.status === "pending";
+    cliProviderSubmit.textContent = install.status === "pending"
+      ? `Installing ${requiredCli?.display_name ?? "CLI"}…`
+      : requiredCli && !cliIsInstalled(requiredCli)
+        ? `Install ${requiredCli.display_name}`
+        : checking
+          ? "Checking CLI…"
+          : "Configure and sign in";
+  };
+  cliProviderSelect.onchange = () => {
+    selectedCliProviderId = cliProviderSelect.value;
+    syncCliProvider();
+  };
+  syncCliProvider();
+  cliProviderForm.onsubmit = (event) => {
+    event.preventDefault();
+    const providerId = cliProviderSelect.value;
+    const preset = knownProvider(providerId);
+    if (!preset) return;
+    selectedCliProviderId = providerId;
+    const requiredCli = cliForKind(preset.kind);
+    if (requiredCli && !cliIsInstalled(requiredCli)) {
+      void startCliInstall(requiredCli.id);
+      return;
+    }
+    void startProviderLogin(providerId, preset);
+  };
+
+  const providerForm = document.querySelector<HTMLFormElement>("#provider-form")!;
+  const providerPreset = providerForm.querySelector<HTMLSelectElement>("#provider-preset")!;
+  const syncProviderPreset = () => {
+    const preset = knownProvider(providerPreset.value);
+    const id = providerForm.elements.namedItem("id") as HTMLInputElement;
+    const kind = providerForm.elements.namedItem("kind") as HTMLSelectElement;
+    const baseUrl = providerForm.elements.namedItem("base_url") as HTMLInputElement;
+    const apiKey = providerForm.elements.namedItem("api_key") as HTMLInputElement;
+    const apiKeyHint = providerForm.querySelector<HTMLElement>("#api-key-hint")!;
+    if (!preset) {
+      id.value = "";
+      kind.value = "openai-compat";
+      baseUrl.value = "";
+      apiKey.disabled = false;
+      apiKeyHint.textContent = "stored in trouve's secret store";
+      return;
+    }
+    id.value = preset.id;
+    kind.value = preset.kind;
+    baseUrl.value = preset.base_url ?? "";
+    apiKey.disabled = preset.auth === "none";
+    apiKeyHint.textContent = preset.auth === "none"
+      ? "not required for this provider"
+      : preset.api_key_env
+        ? `or set ${preset.api_key_env} on the server`
+        : "stored in trouve's secret store";
+  };
+  providerPreset.onchange = syncProviderPreset;
+  providerForm.onsubmit = async (event) => {
+    event.preventDefault();
+    const form = event.currentTarget as HTMLFormElement;
+    const data = new FormData(form);
+    const id = encodeURIComponent(String(data.get("id")));
+    try {
+      await api(`/providers/${id}`, {
+        method: "PUT",
+        body: JSON.stringify({
+          kind: data.get("kind"),
+          base_url: String(data.get("base_url") || "") || null,
+          api_key: String(data.get("api_key") || "") || null,
+        }),
+      });
+      form.reset();
+      await loadData();
+    } catch (error) {
+      alert(String(error));
+    }
+  };
+}
+
 function refreshRepositorySection(refocusSearch = false): void {
   if (!dashboard) return;
   const section = document.querySelector<HTMLElement>("#repositories-section");
@@ -677,6 +1207,33 @@ function bindRepositorySection(): void {
   });
 }
 
+function bindReviewerThinking(form: HTMLFormElement): void {
+  const model = form.querySelector<HTMLSelectElement>("[data-reviewer-model-default]");
+  const thinking = form.querySelector<HTMLSelectElement>("[data-reviewer-thinking-default]");
+  if (!model || !thinking) return;
+  model.onchange = () => {
+    const options = thinkingOptionsMarkup(
+      model.value || defaultModel,
+      undefined,
+      "Use review/global thinking default",
+    );
+    thinking.innerHTML = options.markup;
+    thinking.disabled = options.disabled;
+  };
+}
+
+function reviewerDefaultsPayload(form: HTMLFormElement): {
+  model: string | null;
+  default_thinking_level: string | null;
+} {
+  const model = form.querySelector<HTMLSelectElement>("[data-reviewer-model-default]")?.value ?? "";
+  const thinking = form.querySelector<HTMLSelectElement>("[data-reviewer-thinking-default]")?.value ?? "";
+  return {
+    model: model || null,
+    default_thinking_level: thinking || null,
+  };
+}
+
 function bind(): void {
   document.querySelector<HTMLButtonElement>("#refresh-github")!.onclick = async (event) => {
     const button = event.currentTarget as HTMLButtonElement;
@@ -709,67 +1266,57 @@ function bind(): void {
       alert(String(error));
     }
   };
-  document.querySelectorAll<HTMLButtonElement>("[data-provider-login]").forEach((button) => {
-    button.onclick = () => {
-      const providerId = button.dataset.providerLogin;
-      if (providerId) void startProviderLogin(providerId);
-    };
-  });
-  document.querySelector<HTMLFormElement>("#cli-provider-form")!.onsubmit = (event) => {
-    event.preventDefault();
-    const providerId = String(new FormData(event.currentTarget as HTMLFormElement).get("provider") ?? "");
-    const preset = knownProvider(providerId);
-    if (preset) void startProviderLogin(providerId, preset);
+  bindProviderSettings();
+  const globalDefaultsForm = document.querySelector<HTMLFormElement>("#global-defaults-form")!;
+  const globalModel = globalDefaultsForm.elements.namedItem("model") as HTMLSelectElement;
+  const globalThinking = globalDefaultsForm.elements.namedItem("default_thinking_level") as HTMLSelectElement;
+  globalModel.onchange = () => {
+    const options = thinkingOptionsMarkup(globalModel.value, undefined);
+    globalThinking.innerHTML = options.markup;
+    globalThinking.disabled = options.disabled;
   };
-  const providerForm = document.querySelector<HTMLFormElement>("#provider-form")!;
-  const providerPreset = providerForm.querySelector<HTMLSelectElement>("#provider-preset")!;
-  const syncProviderPreset = () => {
-    const preset = knownProvider(providerPreset.value);
-    const id = providerForm.elements.namedItem("id") as HTMLInputElement;
-    const kind = providerForm.elements.namedItem("kind") as HTMLSelectElement;
-    const baseUrl = providerForm.elements.namedItem("base_url") as HTMLInputElement;
-    const apiKey = providerForm.elements.namedItem("api_key") as HTMLInputElement;
-    const apiKeyHint = providerForm.querySelector<HTMLElement>("#api-key-hint")!;
-    if (!preset) {
-      id.value = "";
-      kind.value = "openai-compat";
-      baseUrl.value = "";
-      apiKey.disabled = false;
-      apiKeyHint.textContent = "stored in trouve's secret store";
-      return;
-    }
-    id.value = preset.id;
-    kind.value = preset.kind;
-    baseUrl.value = preset.base_url ?? "";
-    apiKey.disabled = preset.auth === "none";
-    apiKeyHint.textContent = preset.auth === "none"
-      ? "not required for this provider"
-      : preset.api_key_env
-        ? `or set ${preset.api_key_env} on the server`
-        : "stored in trouve's secret store";
-  };
-  providerPreset.onchange = syncProviderPreset;
-  document.querySelector<HTMLFormElement>("#provider-form")!.onsubmit = async (event) => {
+  globalDefaultsForm.onsubmit = async (event) => {
     event.preventDefault();
-    const form = event.currentTarget as HTMLFormElement;
-    const data = new FormData(form);
-    const id = encodeURIComponent(String(data.get("id")));
     try {
-      await api(`/providers/${id}`, {
+      await api("/config/default-model", {
         method: "PUT",
         body: JSON.stringify({
-          kind: data.get("kind"),
-          base_url: String(data.get("base_url") || "") || null,
-          api_key: String(data.get("api_key") || "") || null,
+          model: globalModel.value,
+          default_thinking_level: globalThinking.disabled ? null : globalThinking.value || null,
         }),
       });
-      form.reset();
       await loadData();
     } catch (error) {
       alert(String(error));
     }
   };
-  document.querySelector<HTMLFormElement>("#reviewer-form")!.onsubmit = async (event) => {
+
+  document.querySelectorAll<HTMLFormElement>("form.built-in-reviewer").forEach((form) => {
+    bindReviewerThinking(form);
+    form.onsubmit = async (event) => {
+      event.preventDefault();
+      const reviewer = dashboard?.reviewers.find((candidate) => candidate.id === form.dataset.id);
+      if (!reviewer) return;
+      try {
+        await api("/code-review/reviewer", {
+          method: "PUT",
+          body: JSON.stringify({
+            id: reviewer.id,
+            name: reviewer.name,
+            prompt: reviewer.prompt,
+            ...reviewerDefaultsPayload(form),
+          }),
+        });
+        await loadData();
+      } catch (error) {
+        alert(String(error));
+      }
+    };
+  });
+
+  const reviewerForm = document.querySelector<HTMLFormElement>("#reviewer-form")!;
+  bindReviewerThinking(reviewerForm);
+  reviewerForm.onsubmit = async (event) => {
     event.preventDefault();
     const form = event.currentTarget as HTMLFormElement;
     const data = new FormData(form);
@@ -778,8 +1325,8 @@ function bind(): void {
         method: "PUT",
         body: JSON.stringify({
           name: data.get("name"),
-          model: String(data.get("model") || "") || null,
           prompt: data.get("prompt"),
+          ...reviewerDefaultsPayload(form),
         }),
       });
       form.reset();
@@ -789,6 +1336,7 @@ function bind(): void {
     }
   };
   document.querySelectorAll<HTMLFormElement>("form.custom-reviewer").forEach((form) => {
+    bindReviewerThinking(form);
     form.onsubmit = async (event) => {
       event.preventDefault();
       const data = new FormData(form);
@@ -798,8 +1346,8 @@ function bind(): void {
           body: JSON.stringify({
             id: form.dataset.id,
             name: data.get("name"),
-            model: String(data.get("model") || "") || null,
             prompt: data.get("prompt"),
+            ...reviewerDefaultsPayload(form),
           }),
         });
         await loadData();
@@ -820,9 +1368,10 @@ function bind(): void {
   bindRepositorySection();
 }
 
-function hasEditableFocus(): boolean {
+function hasEditableFocus(scope?: Element | null): boolean {
   const active = document.activeElement;
   return active instanceof HTMLElement
+    && (scope === undefined || scope?.contains(active) === true)
     && active.matches("input, textarea, select, [contenteditable='true']");
 }
 
@@ -836,18 +1385,25 @@ function handleLoadError(error: unknown): void {
 }
 
 async function loadData(renderDashboard = true): Promise<void> {
-  [dashboard, providers, models, knownProviders] = await Promise.all([
+  const [loadedDashboard, providerResponse, loadedModels, loadedKnownProviders] = await Promise.all([
     api<Dashboard>("/code-review"),
-    api<{ providers: Provider[] }>("/providers").then((value) => value.providers),
+    api<ProvidersResponse>("/providers"),
     api<Model[]>("/models"),
     api<KnownProvider[]>("/providers/known"),
   ]);
+  dashboard = loadedDashboard;
+  providers = providerResponse.providers;
+  defaultModel = providerResponse.default_model;
+  defaultThinkingLevel = providerResponse.default_thinking_level;
+  models = loadedModels;
+  knownProviders = loadedKnownProviders;
   if (renderDashboard) render();
 }
 
 async function load(): Promise<void> {
   try {
     await loadData();
+    void refreshCliData();
     if (timer) window.clearInterval(timer);
     timer = window.setInterval(() => {
       void loadData(!hasEditableFocus()).catch(handleLoadError);

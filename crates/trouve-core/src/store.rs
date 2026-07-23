@@ -146,6 +146,8 @@ CREATE TABLE IF NOT EXISTS code_review_identities (
   name TEXT NOT NULL,
   prompt TEXT NOT NULL,
   model TEXT,
+  thinking_level TEXT,
+  built_in INTEGER NOT NULL DEFAULT 0,
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL
 );
@@ -202,6 +204,8 @@ const MIGRATIONS: &[&str] = &[
     "ALTER TABLE code_review_repositories ADD COLUMN reviewer_overrides TEXT NOT NULL DEFAULT '[]'",
     "ALTER TABLE code_review_jobs ADD COLUMN identities TEXT NOT NULL DEFAULT '[]'",
     "ALTER TABLE code_review_jobs ADD COLUMN config_hash TEXT NOT NULL DEFAULT ''",
+    "ALTER TABLE code_review_identities ADD COLUMN thinking_level TEXT",
+    "ALTER TABLE code_review_identities ADD COLUMN built_in INTEGER NOT NULL DEFAULT 0",
     // Context-size proxy for compaction/UI: the input tokens of the turn's
     // *last* request, not the sum over its iterations (see record_usage).
     "ALTER TABLE usage ADD COLUMN context_input_tokens INTEGER NOT NULL DEFAULT 0",
@@ -1397,43 +1401,61 @@ impl Store {
     // --- automated code review ---------------------------------------------
 
     pub fn list_custom_reviewer_profiles(&self) -> Result<Vec<trouve_protocol::ReviewerProfile>> {
+        self.list_reviewer_profiles(false)
+    }
+
+    pub fn list_built_in_reviewer_defaults(&self) -> Result<Vec<trouve_protocol::ReviewerProfile>> {
+        self.list_reviewer_profiles(true)
+    }
+
+    fn list_reviewer_profiles(
+        &self,
+        built_in: bool,
+    ) -> Result<Vec<trouve_protocol::ReviewerProfile>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT id, name, prompt, model
-             FROM code_review_identities ORDER BY lower(name), id",
+            "SELECT id, name, prompt, model, thinking_level
+             FROM code_review_identities
+             WHERE built_in = ?1
+             ORDER BY lower(name), id",
         )?;
-        let rows = stmt.query_map([], |row| {
+        let rows = stmt.query_map([built_in], |row| {
             Ok(trouve_protocol::ReviewerProfile {
                 id: row.get(0)?,
                 name: row.get(1)?,
                 prompt: row.get(2)?,
                 model: row.get(3)?,
-                built_in: false,
+                default_thinking_level: row.get(4)?,
+                built_in,
             })
         })?;
         rows.collect::<rusqlite::Result<Vec<_>>>()
             .map_err(Into::into)
     }
 
-    pub fn upsert_custom_reviewer_profile(
+    pub fn upsert_reviewer_profile(
         &self,
         reviewer: &trouve_protocol::ReviewerProfile,
     ) -> Result<()> {
         let now = chrono::Utc::now().to_rfc3339();
         self.conn.lock().unwrap().execute(
             "INSERT INTO code_review_identities
-                    (id, name, prompt, model, created_at, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?5)
+                    (id, name, prompt, model, thinking_level, built_in, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7)
              ON CONFLICT(id) DO UPDATE SET
                name = excluded.name,
                prompt = excluded.prompt,
                model = excluded.model,
+               thinking_level = excluded.thinking_level,
+               built_in = excluded.built_in,
                updated_at = excluded.updated_at",
             params![
                 reviewer.id,
                 reviewer.name,
                 reviewer.prompt,
                 reviewer.model,
+                reviewer.default_thinking_level,
+                reviewer.built_in,
                 now,
             ],
         )?;
@@ -1444,7 +1466,7 @@ impl Store {
         let mut conn = self.conn.lock().unwrap();
         let tx = conn.transaction()?;
         let deleted = tx.execute(
-            "DELETE FROM code_review_identities WHERE id = ?1",
+            "DELETE FROM code_review_identities WHERE id = ?1 AND built_in = 0",
             params![id],
         )?;
         if deleted > 0 {
@@ -2965,6 +2987,11 @@ mod tests {
             Some(2)
         );
 
+        let mut reviewers: Vec<_> = crate::reviewers::built_in_reviewers()
+            .into_iter()
+            .filter(|reviewer| configured.reviewer_ids.contains(&reviewer.id))
+            .collect();
+        reviewers[0].default_thinking_level = Some("high".into());
         let new_job = NewCodeReviewJob {
             dedupe_key: "acme/widgets#42:head:automatic:config".into(),
             installation_id: 7,
@@ -2978,10 +3005,7 @@ mod tests {
             trigger: "automatic".into(),
             model: configured.model,
             prompt: configured.prompt,
-            reviewers: crate::reviewers::built_in_reviewers()
-                .into_iter()
-                .filter(|reviewer| configured.reviewer_ids.contains(&reviewer.id))
-                .collect(),
+            reviewers,
             config_hash: "config".into(),
         };
         let queued = store.enqueue_code_review_job(&new_job).unwrap().unwrap();
@@ -2992,6 +3016,10 @@ mod tests {
         let running = store.claim_code_review_job().unwrap().unwrap();
         assert_eq!(running.job.id, queued.id);
         assert_eq!(running.job.status, "running");
+        assert_eq!(
+            running.reviewers[0].default_thinking_level.as_deref(),
+            Some("high")
+        );
         store
             .set_code_review_job_session(&queued.id, "se_review", "th_review")
             .unwrap();
@@ -3084,9 +3112,10 @@ mod tests {
             name: "Domain invariants".into(),
             prompt: "Check widget state transitions.".into(),
             model: Some("openai/gpt-5".into()),
+            default_thinking_level: Some("high".into()),
             built_in: false,
         };
-        store.upsert_custom_reviewer_profile(&reviewer).unwrap();
+        store.upsert_reviewer_profile(&reviewer).unwrap();
         let reviewers = store.list_custom_reviewer_profiles().unwrap();
         assert_eq!(reviewers.as_slice(), std::slice::from_ref(&reviewer));
         store
@@ -3122,6 +3151,27 @@ mod tests {
             store.list_code_review_repositories().unwrap()[0]
                 .reviewer_overrides
                 .is_empty()
+        );
+    }
+
+    #[test]
+    fn built_in_reviewer_defaults_are_durable_and_separate_from_custom_profiles() {
+        let store = Store::open_in_memory().unwrap();
+        let mut reviewer = crate::reviewers::built_in_reviewers().remove(0);
+        reviewer.model = Some("anthropic/claude-sonnet".into());
+        reviewer.default_thinking_level = Some("high".into());
+
+        store.upsert_reviewer_profile(&reviewer).unwrap();
+
+        assert!(store.list_custom_reviewer_profiles().unwrap().is_empty());
+        assert_eq!(
+            store.list_built_in_reviewer_defaults().unwrap(),
+            vec![reviewer.clone()]
+        );
+        assert!(!store.delete_custom_reviewer_profile(&reviewer.id).unwrap());
+        assert_eq!(
+            store.list_built_in_reviewer_defaults().unwrap(),
+            vec![reviewer]
         );
     }
 
