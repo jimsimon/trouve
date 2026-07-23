@@ -45,7 +45,7 @@ jobs:
           shared-key: release-target-${{ matrix.target }}
           cache-on-failure: true
           cache-bin: false
-          save-if: ${{ github.event_name == 'push' }}
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Unit and integration tests (offline)
         run: cargo test --workspace
       # Match the release job's package set and target on trusted main pushes.
@@ -76,7 +76,7 @@ jobs:
           shared-key: release-target-x86_64-pc-windows-msvc
           cache-on-failure: true
           cache-bin: false
-          save-if: ${{ github.event_name == 'push' }}
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Check Windows desktop app
         if: github.event_name == 'pull_request'
         run: cargo check --package trouve-app --target x86_64-pc-windows-msvc
