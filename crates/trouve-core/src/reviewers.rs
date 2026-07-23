@@ -9,6 +9,7 @@ fn built_in(id: &str, name: &str, prompt: &str) -> ReviewerProfile {
         name: name.into(),
         prompt: prompt.into(),
         model: None,
+        default_thinking_level: None,
         built_in: true,
     }
 }

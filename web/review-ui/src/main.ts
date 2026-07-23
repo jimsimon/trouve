@@ -7,6 +7,11 @@ import {
   cliVersionLabel,
   idleCliInstallStatus,
 } from "./cli";
+import {
+  defaultThinkingSelection,
+  thinkingLevelLabel,
+  thinkingOptions,
+} from "./model-settings";
 import { jobStatusClass, normalizedReviewMode, safeExternalUrl } from "./security";
 
 type ReviewMode = "off" | "manual" | "automatic";
@@ -42,6 +47,7 @@ interface ReviewerProfile {
   name: string;
   prompt: string;
   model?: string;
+  default_thinking_level?: string;
   built_in: boolean;
 }
 
@@ -84,6 +90,12 @@ interface Provider {
   experimental: boolean;
 }
 
+interface ProvidersResponse {
+  providers: Provider[];
+  default_model: string;
+  default_thinking_level?: string;
+}
+
 interface KnownProvider {
   id: string;
   display_name: string;
@@ -118,6 +130,7 @@ interface ProviderLogin {
 interface Model {
   id: string;
   display_name: string;
+  options_schema?: unknown;
 }
 
 interface CliNotice {
@@ -130,6 +143,8 @@ let dashboard: Dashboard | null = null;
 let providers: Provider[] = [];
 let knownProviders: KnownProvider[] = [];
 let models: Model[] = [];
+let defaultModel = "";
+let defaultThinkingLevel: string | undefined;
 let clis: CliInfo[] = [];
 let cliInstallStatuses: Record<string, CliInstallStatus> = {};
 let clisLoaded = false;
@@ -189,6 +204,56 @@ function modelOptions(selected?: string, inheritedLabel = "Use review/default mo
       (model) => `<option value="${escape(model.id)}" ${model.id === selected ? "selected" : ""}>${escape(model.display_name)} · ${escape(model.id)}</option>`,
     ),
   ].join("");
+}
+
+function explicitModelOptions(selected: string): string {
+  const choices = selected && !models.some((model) => model.id === selected)
+    ? [{ id: selected, display_name: selected, options_schema: undefined }, ...models]
+    : models;
+  return choices.map(
+    (model) => `<option value="${escape(model.id)}" ${model.id === selected ? "selected" : ""}>${escape(model.display_name)} · ${escape(model.id)}</option>`,
+  ).join("");
+}
+
+function modelById(id: string): Model | undefined {
+  return models.find((model) => model.id === id);
+}
+
+function thinkingOptionsMarkup(
+  modelId: string,
+  selected: string | undefined,
+  inheritedLabel?: string,
+): { markup: string; disabled: boolean } {
+  const { values } = thinkingOptions(modelById(modelId));
+  const choices = selected && !values.includes(selected) ? [selected, ...values] : values;
+  if (inheritedLabel) {
+    return {
+      markup: [
+        `<option value="" ${selected ? "" : "selected"}>${escape(inheritedLabel)}</option>`,
+        ...choices.map((value) => `<option value="${escape(value)}" ${value === selected ? "selected" : ""}>${escape(thinkingLevelLabel(value))}</option>`),
+      ].join(""),
+      disabled: choices.length === 0,
+    };
+  }
+  const resolved = defaultThinkingSelection(modelById(modelId), selected);
+  if (choices.length === 0) {
+    return {
+      markup: `<option value="">Not available for this model</option>`,
+      disabled: true,
+    };
+  }
+  return {
+    markup: choices.map((value) => `<option value="${escape(value)}" ${value === resolved ? "selected" : ""}>${escape(thinkingLevelLabel(value))}</option>`).join(""),
+    disabled: false,
+  };
+}
+
+function reviewerThinkingOptions(reviewer: ReviewerProfile): { markup: string; disabled: boolean } {
+  return thinkingOptionsMarkup(
+    reviewer.model ?? defaultModel,
+    reviewer.default_thinking_level,
+    "Use review/global thinking default",
+  );
 }
 
 function knownProvider(id: string): KnownProvider | undefined {
@@ -382,6 +447,28 @@ function renderProviderSettings(): string {
   </section>`;
 }
 
+function renderGlobalDefaults(): string {
+  const thinking = thinkingOptionsMarkup(defaultModel, defaultThinkingLevel);
+  return `<section class="card wide model-defaults" id="model-defaults">
+    <div class="section-title"><div><p class="eyebrow">Defaults</p><h2>System model defaults</h2></div><span class="muted">Base fallback for reviews that do not select more specific defaults.</span></div>
+    ${models.length === 0 ? `<p class="defaults-warning">No provider models are available yet. Configure and sign in to a provider before changing the system default.</p>` : ""}
+    <form id="global-defaults-form" class="defaults-form">
+      <label>Global default model<select name="model" required ${models.length === 0 ? "disabled" : ""}>${explicitModelOptions(defaultModel)}</select></label>
+      <label>Global thinking level<select name="default_thinking_level" ${thinking.disabled ? "disabled" : ""}>${thinking.markup}</select></label>
+      <button ${models.length === 0 ? "disabled" : ""}>Save system defaults</button>
+    </form>
+    <p class="muted defaults-help">Thinking choices come from the selected model. Models without a thinking control use their own behavior.</p>
+  </section>`;
+}
+
+function renderReviewerDefaultControls(reviewer: ReviewerProfile): string {
+  const thinking = reviewerThinkingOptions(reviewer);
+  return `<div class="reviewer-default-controls">
+    <label>Default model<select name="model" data-reviewer-model-default>${modelOptions(reviewer.model, "Use repository/review default")}</select></label>
+    <label>Thinking level<select name="default_thinking_level" data-reviewer-thinking-default ${thinking.disabled ? "disabled" : ""}>${thinking.markup}</select></label>
+  </div>`;
+}
+
 function repositoryKey(repo: Repository): string {
   return `${repo.installation_id}:${repo.repository}`;
 }
@@ -498,22 +585,31 @@ function render(): void {
       </section>
       ${renderProviderSettings()}
     </div>
+    ${renderGlobalDefaults()}
     <section class="card wide">
       <div class="section-title"><div><p class="eyebrow">Review passes</p><h2>Reviewers</h2></div><span class="muted">Each selected reviewer examines every changed file batch; a final editor validates and deduplicates their findings.</span></div>
       <div class="reviewer-grid">
-        ${builtInReviewers.map((reviewer) => `<article class="reviewer-card"><div><strong>${escape(reviewer.name)}</strong><span>built-in</span></div><p>${escape(reviewer.prompt)}</p><small>Uses the repository/default model</small></article>`).join("")}
+        ${builtInReviewers.map((reviewer) => `<form class="reviewer-card built-in-reviewer" data-id="${escape(reviewer.id)}">
+          <div><strong>${escape(reviewer.name)}</strong><span>built-in</span></div>
+          <p>${escape(reviewer.prompt)}</p>
+          ${renderReviewerDefaultControls(reviewer)}
+          <button>Save persona defaults</button>
+        </form>`).join("")}
       </div>
       <h3>Custom reviewers</h3>
       <div class="custom-reviewers">
         ${customReviewers.map((reviewer) => `<form class="custom-reviewer" data-id="${escape(reviewer.id)}">
           <input name="name" value="${escape(reviewer.name)}" aria-label="Reviewer name" required />
-          <select name="model" aria-label="Reviewer model">${modelOptions(reviewer.model)}</select>
+          ${renderReviewerDefaultControls(reviewer)}
           <textarea name="prompt" rows="3" aria-label="Reviewer prompt" required>${escape(reviewer.prompt)}</textarea>
           <div class="reviewer-actions"><button>Save</button><button class="ghost delete-reviewer" type="button">Delete</button></div>
         </form>`).join("") || `<p class="empty">No custom reviewers yet.</p>`}
       </div>
       <form id="reviewer-form" class="stack reviewer-create">
-        <div class="split"><label>Name<input name="name" placeholder="Domain invariants" required /></label><label>Model<select name="model">${modelOptions()}</select></label></div>
+        <div class="reviewer-create-fields">
+          <label>Name<input name="name" placeholder="Domain invariants" required /></label>
+          ${renderReviewerDefaultControls({ id: "", name: "", prompt: "", built_in: false })}
+        </div>
         <label>Prompt<textarea name="prompt" rows="3" placeholder="Describe this reviewer's focused mandate." required></textarea></label>
         <button>Add custom reviewer</button>
       </form>
@@ -1104,6 +1200,33 @@ function bindRepositorySection(): void {
   });
 }
 
+function bindReviewerThinking(form: HTMLFormElement): void {
+  const model = form.querySelector<HTMLSelectElement>("[data-reviewer-model-default]");
+  const thinking = form.querySelector<HTMLSelectElement>("[data-reviewer-thinking-default]");
+  if (!model || !thinking) return;
+  model.onchange = () => {
+    const options = thinkingOptionsMarkup(
+      model.value || defaultModel,
+      undefined,
+      "Use review/global thinking default",
+    );
+    thinking.innerHTML = options.markup;
+    thinking.disabled = options.disabled;
+  };
+}
+
+function reviewerDefaultsPayload(form: HTMLFormElement): {
+  model: string | null;
+  default_thinking_level: string | null;
+} {
+  const model = form.querySelector<HTMLSelectElement>("[data-reviewer-model-default]")?.value ?? "";
+  const thinking = form.querySelector<HTMLSelectElement>("[data-reviewer-thinking-default]")?.value ?? "";
+  return {
+    model: model || null,
+    default_thinking_level: thinking || null,
+  };
+}
+
 function bind(): void {
   document.querySelector<HTMLButtonElement>("#refresh-github")!.onclick = async (event) => {
     const button = event.currentTarget as HTMLButtonElement;
@@ -1137,7 +1260,56 @@ function bind(): void {
     }
   };
   bindProviderSettings();
-  document.querySelector<HTMLFormElement>("#reviewer-form")!.onsubmit = async (event) => {
+  const globalDefaultsForm = document.querySelector<HTMLFormElement>("#global-defaults-form")!;
+  const globalModel = globalDefaultsForm.elements.namedItem("model") as HTMLSelectElement;
+  const globalThinking = globalDefaultsForm.elements.namedItem("default_thinking_level") as HTMLSelectElement;
+  globalModel.onchange = () => {
+    const options = thinkingOptionsMarkup(globalModel.value, undefined);
+    globalThinking.innerHTML = options.markup;
+    globalThinking.disabled = options.disabled;
+  };
+  globalDefaultsForm.onsubmit = async (event) => {
+    event.preventDefault();
+    try {
+      await api("/config/default-model", {
+        method: "PUT",
+        body: JSON.stringify({
+          model: globalModel.value,
+          default_thinking_level: globalThinking.disabled ? null : globalThinking.value || null,
+        }),
+      });
+      await loadData();
+    } catch (error) {
+      alert(String(error));
+    }
+  };
+
+  document.querySelectorAll<HTMLFormElement>("form.built-in-reviewer").forEach((form) => {
+    bindReviewerThinking(form);
+    form.onsubmit = async (event) => {
+      event.preventDefault();
+      const reviewer = dashboard?.reviewers.find((candidate) => candidate.id === form.dataset.id);
+      if (!reviewer) return;
+      try {
+        await api("/code-review/reviewer", {
+          method: "PUT",
+          body: JSON.stringify({
+            id: reviewer.id,
+            name: reviewer.name,
+            prompt: reviewer.prompt,
+            ...reviewerDefaultsPayload(form),
+          }),
+        });
+        await loadData();
+      } catch (error) {
+        alert(String(error));
+      }
+    };
+  });
+
+  const reviewerForm = document.querySelector<HTMLFormElement>("#reviewer-form")!;
+  bindReviewerThinking(reviewerForm);
+  reviewerForm.onsubmit = async (event) => {
     event.preventDefault();
     const form = event.currentTarget as HTMLFormElement;
     const data = new FormData(form);
@@ -1146,8 +1318,8 @@ function bind(): void {
         method: "PUT",
         body: JSON.stringify({
           name: data.get("name"),
-          model: String(data.get("model") || "") || null,
           prompt: data.get("prompt"),
+          ...reviewerDefaultsPayload(form),
         }),
       });
       form.reset();
@@ -1157,6 +1329,7 @@ function bind(): void {
     }
   };
   document.querySelectorAll<HTMLFormElement>("form.custom-reviewer").forEach((form) => {
+    bindReviewerThinking(form);
     form.onsubmit = async (event) => {
       event.preventDefault();
       const data = new FormData(form);
@@ -1166,8 +1339,8 @@ function bind(): void {
           body: JSON.stringify({
             id: form.dataset.id,
             name: data.get("name"),
-            model: String(data.get("model") || "") || null,
             prompt: data.get("prompt"),
+            ...reviewerDefaultsPayload(form),
           }),
         });
         await loadData();
@@ -1204,12 +1377,18 @@ function handleLoadError(error: unknown): void {
 }
 
 async function loadData(renderDashboard = true): Promise<void> {
-  [dashboard, providers, models, knownProviders] = await Promise.all([
+  const [loadedDashboard, providerResponse, loadedModels, loadedKnownProviders] = await Promise.all([
     api<Dashboard>("/code-review"),
-    api<{ providers: Provider[] }>("/providers").then((value) => value.providers),
+    api<ProvidersResponse>("/providers"),
     api<Model[]>("/models"),
     api<KnownProvider[]>("/providers/known"),
   ]);
+  dashboard = loadedDashboard;
+  providers = providerResponse.providers;
+  defaultModel = providerResponse.default_model;
+  defaultThinkingLevel = providerResponse.default_thinking_level;
+  models = loadedModels;
+  knownProviders = loadedKnownProviders;
   if (renderDashboard) render();
 }
 

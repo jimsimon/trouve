@@ -3754,12 +3754,33 @@ async fn code_review_dashboard_and_repository_policy_round_trip() {
             .any(|reviewer| reviewer["id"] == "correctness" && reviewer["built_in"] == true)
     );
 
+    let built_in_defaults: serde_json::Value = client
+        .put(format!("{base}/reviewer"))
+        .json(&serde_json::json!({
+            "id": "correctness",
+            "name": "stale client label",
+            "prompt": "stale client prompt",
+            "model": "anthropic/claude",
+            "default_thinking_level": "high"
+        }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(built_in_defaults["built_in"], true);
+    assert_ne!(built_in_defaults["name"], "stale client label");
+    assert_eq!(built_in_defaults["model"], "anthropic/claude");
+    assert_eq!(built_in_defaults["default_thinking_level"], "high");
+
     let custom: serde_json::Value = client
         .put(format!("{base}/reviewer"))
         .json(&serde_json::json!({
             "name": "Widget invariants",
             "prompt": "Check every widget state transition.",
-            "model": "openai/gpt-5"
+            "model": "openai/gpt-5",
+            "default_thinking_level": "medium"
         }))
         .send()
         .await
@@ -3770,6 +3791,7 @@ async fn code_review_dashboard_and_repository_policy_round_trip() {
     let custom_id = custom["id"].as_str().unwrap();
     assert!(custom_id.starts_with("custom:"));
     assert_eq!(custom["built_in"], false);
+    assert_eq!(custom["default_thinking_level"], "medium");
 
     let response = client
         .put(format!("{base}/repository"))
@@ -3821,6 +3843,15 @@ async fn code_review_dashboard_and_repository_policy_round_trip() {
     assert_eq!(
         dashboard["repositories"][0]["reviewer_overrides"][1]["prompt_mode"],
         "replace"
+    );
+    assert!(
+        dashboard["reviewers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|reviewer| reviewer["id"] == "correctness"
+                && reviewer["model"] == "anthropic/claude"
+                && reviewer["default_thinking_level"] == "high")
     );
 
     let deleted = client

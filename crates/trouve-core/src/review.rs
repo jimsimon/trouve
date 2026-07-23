@@ -447,6 +447,15 @@ impl Engine {
 
     fn code_review_reviewer_catalog(&self) -> Result<Vec<ReviewerProfile>, EngineError> {
         let mut reviewers = crate::reviewers::built_in_reviewers();
+        for defaults in self.store.list_built_in_reviewer_defaults()? {
+            if let Some(reviewer) = reviewers
+                .iter_mut()
+                .find(|reviewer| reviewer.id == defaults.id)
+            {
+                reviewer.model = defaults.model;
+                reviewer.default_thinking_level = defaults.default_thinking_level;
+            }
+        }
         reviewers.extend(self.store.list_custom_reviewer_profiles()?);
         Ok(reviewers)
     }
@@ -547,18 +556,6 @@ impl Engine {
         &self,
         request: UpsertReviewerProfileRequest,
     ) -> Result<ReviewerProfile, EngineError> {
-        let name = request.name.trim();
-        let prompt = request.prompt.trim();
-        if name.is_empty() || name.len() > 100 {
-            return Err(EngineError::BadRequest(
-                "reviewer name must contain 1 to 100 bytes".into(),
-            ));
-        }
-        if prompt.is_empty() || prompt.len() > 16_000 {
-            return Err(EngineError::BadRequest(
-                "reviewer prompt must contain 1 to 16000 bytes".into(),
-            ));
-        }
         let model = request
             .model
             .map(|model| model.trim().to_string())
@@ -568,35 +565,56 @@ impl Engine {
                 "reviewer model must be provider-qualified".into(),
             ));
         }
+        let default_thinking_level = request
+            .default_thinking_level
+            .map(|level| level.trim().to_string())
+            .filter(|level| !level.is_empty());
         let updating = request.id.is_some();
         let id = request
             .id
             .unwrap_or_else(|| format!("custom:{}", crate::new_id("rp")));
-        if !id.starts_with("custom:") {
-            return Err(EngineError::BadRequest(
-                "built-in reviewers cannot be changed".into(),
-            ));
-        }
         if id.len() > 150 {
             return Err(EngineError::BadRequest("reviewer id is too long".into()));
         }
-        if updating
-            && !self
-                .store
-                .list_custom_reviewer_profiles()?
-                .iter()
-                .any(|reviewer| reviewer.id == id)
-        {
-            return Err(EngineError::NotFound(format!("reviewer profile {id}")));
-        }
+        let (name, prompt, built_in) = if id.starts_with("custom:") {
+            let name = request.name.trim();
+            let prompt = request.prompt.trim();
+            if name.is_empty() || name.len() > 100 {
+                return Err(EngineError::BadRequest(
+                    "reviewer name must contain 1 to 100 bytes".into(),
+                ));
+            }
+            if prompt.is_empty() || prompt.len() > 16_000 {
+                return Err(EngineError::BadRequest(
+                    "reviewer prompt must contain 1 to 16000 bytes".into(),
+                ));
+            }
+            if updating
+                && !self
+                    .store
+                    .list_custom_reviewer_profiles()?
+                    .iter()
+                    .any(|reviewer| reviewer.id == id)
+            {
+                return Err(EngineError::NotFound(format!("reviewer profile {id}")));
+            }
+            (name.to_string(), prompt.to_string(), false)
+        } else {
+            let reviewer = crate::reviewers::built_in_reviewers()
+                .into_iter()
+                .find(|reviewer| reviewer.id == id)
+                .ok_or_else(|| EngineError::NotFound(format!("reviewer profile {id}")))?;
+            (reviewer.name, reviewer.prompt, true)
+        };
         let reviewer = ReviewerProfile {
             id,
-            name: name.into(),
-            prompt: prompt.into(),
+            name,
+            prompt,
             model,
-            built_in: false,
+            default_thinking_level,
+            built_in,
         };
-        self.store.upsert_custom_reviewer_profile(&reviewer)?;
+        self.store.upsert_reviewer_profile(&reviewer)?;
         self.code_review.poll_wake.notify_one();
         self.emit_code_review_updated(None)?;
         Ok(reviewer)
@@ -1303,7 +1321,7 @@ impl Engine {
                     session_id: session.id.clone(),
                     mode: Some("review".into()),
                     model: reviewer.model.clone().or_else(|| job.model.clone()),
-                    model_options: serde_json::Map::new(),
+                    model_options: reviewer_model_options(reviewer),
                     permission_mode: Some(PermissionMode::Yolo),
                 })?;
                 let output = self
@@ -1608,6 +1626,21 @@ fn apply_reviewer_overrides(
             reviewer
         })
         .collect()
+}
+
+fn reviewer_model_options(
+    reviewer: &ReviewerProfile,
+) -> serde_json::Map<String, serde_json::Value> {
+    reviewer
+        .default_thinking_level
+        .as_ref()
+        .map(|level| {
+            serde_json::Map::from_iter([(
+                "thinking_level".into(),
+                serde_json::Value::String(level.clone()),
+            )])
+        })
+        .unwrap_or_default()
 }
 
 fn ensure_review_current(superseded: &CancellationToken) -> Result<()> {
@@ -1947,6 +1980,7 @@ mod tests {
             name: "Security".into(),
             prompt: "Check trust boundaries.".into(),
             model: Some("openai/base".into()),
+            default_thinking_level: Some("high".into()),
             built_in: true,
         };
         let appended = apply_reviewer_overrides(
@@ -1959,6 +1993,7 @@ mod tests {
             }],
         );
         assert_eq!(appended[0].model.as_deref(), Some("anthropic/reviewer"));
+        assert_eq!(appended[0].default_thinking_level.as_deref(), Some("high"));
         assert!(appended[0].prompt.starts_with(&reviewer.prompt));
         assert!(appended[0].prompt.ends_with("Focus on tenant isolation."));
 
@@ -1973,6 +2008,53 @@ mod tests {
         );
         assert_eq!(replaced[0].model.as_deref(), Some("openai/base"));
         assert_eq!(replaced[0].prompt, "Review only authorization changes.");
+    }
+
+    #[test]
+    fn reviewer_thinking_default_becomes_a_canonical_thread_option() {
+        let mut reviewer = crate::reviewers::built_in_reviewers().remove(0);
+        assert!(reviewer_model_options(&reviewer).is_empty());
+
+        reviewer.default_thinking_level = Some("high".into());
+        assert_eq!(
+            reviewer_model_options(&reviewer).get("thinking_level"),
+            Some(&serde_json::json!("high"))
+        );
+    }
+
+    #[test]
+    fn built_in_reviewer_model_and_thinking_defaults_can_be_customized() {
+        let data = tempfile::tempdir().unwrap();
+        let store = crate::store::Store::open_in_memory().unwrap();
+        let engine = Engine::new(
+            store,
+            data.path().to_path_buf(),
+            &crate::config::Config::default(),
+        );
+        let saved = engine
+            .upsert_reviewer_profile(UpsertReviewerProfileRequest {
+                id: Some("security".into()),
+                // Built-in content remains canonical even if a client sends
+                // stale display data while changing its defaults.
+                name: "stale".into(),
+                prompt: "stale".into(),
+                model: Some("anthropic/claude-sonnet".into()),
+                default_thinking_level: Some("high".into()),
+            })
+            .unwrap();
+
+        assert!(saved.built_in);
+        assert_eq!(saved.name, "Security & Privacy");
+        assert_ne!(saved.prompt, "stale");
+        assert_eq!(saved.model.as_deref(), Some("anthropic/claude-sonnet"));
+        assert_eq!(saved.default_thinking_level.as_deref(), Some("high"));
+
+        let catalog = engine.code_review_reviewer_catalog().unwrap();
+        let security = catalog
+            .iter()
+            .find(|reviewer| reviewer.id == "security")
+            .unwrap();
+        assert_eq!(security, &saved);
     }
 
     #[test]
