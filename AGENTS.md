@@ -69,7 +69,7 @@ These are load-bearing. Do not violate them without a new ADR.
   and network tests are `#[ignore]` behind env flags (`TROUVE_E2E=1`).
 - Releases are tagged repository-wide (`v1.2.3`). Edit only root
   `[workspace.package].version`, then run `python3 scripts/sync_versions.py`.
-  Use the `sync-trouve-versions` skill for releases, version changes, and new
+  Use the `prepare-release` skill for releases, version changes, and new
   version-bearing artifacts.
 - Commit style: imperative, concise subject; explain *why* in the body when
   it isn't obvious.

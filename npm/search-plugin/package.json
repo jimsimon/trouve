@@ -1,6 +1,6 @@
 {
   "name": "@trouve-ai/search-plugin",
-  "version": "3.0.0",
+  "version": "3.1.0",
   "description": "trouve code search plugin for OpenCode, Kilo Code, Claude Code, and Codex: native tools (OpenCode/Kilo), MCP server + skill + sub-agent (Claude/Codex).",
   "type": "module",
   "main": "./src/plugin.ts",
@@ -37,7 +37,7 @@
   },
   "dependencies": {
     "@opencode-ai/plugin": "^1.17.13",
-    "@trouve-ai/search-core": "3.0.0"
+    "@trouve-ai/search-core": "3.1.0"
   },
   "devDependencies": {
     "@types/bun": "^1.2.0",

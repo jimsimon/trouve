@@ -4,6 +4,45 @@ All notable changes to this project are documented in this file. The format
 is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this
 project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [3.1.0] - 2026-07-23
+
+### Added
+
+- **Downloadable application and server binaries**: GitHub releases now ship
+  prebuilt `trouve` desktop application and `trouve-server` archives for
+  supported Linux, macOS, and Windows targets alongside the existing
+  `trouve-search` assets and SHA-256 checksums.
+
+### Changed
+
+- **Review dashboard setup**: provider settings now show credential state,
+  guide subscription CLI sign-in, and offer presets for API providers.
+  Repository policies are easier to manage with search, mode filters,
+  pagination, collapsible details, and clearer per-reviewer overrides.
+- **Pull request merge readiness**: session PR icons use GitHub's detailed
+  merge state and semantic colors, distinguishing merge-ready pull requests
+  from open pull requests that are blocked, behind, or still being evaluated.
+- **Review deployment access**: the single-user review dashboard and `/v1`
+  API no longer use a shared bearer token. Keep them on a trusted private
+  network or VPN, or add authentication and TLS at the reverse proxy before
+  exposing them; GitHub webhooks and internal provider bridges retain their
+  dedicated authentication.
+- **Container publishing**: AMD64 and ARM64 images are built on matching
+  native runners before being joined under the existing multi-platform
+  version and commit tags.
+
+### Fixed
+
+- **Queued prompt previews**: multiline queued prompts now render a clipped
+  one-line teaser without bleeding into the surrounding chat, while the full
+  prompt remains available when editing the queue entry.
+
+### Security
+
+- **Review dashboard rendering**: server-provided labels, identifiers,
+  messages, and repository data are escaped before rendering, and external
+  review links are limited to safe HTTP(S) URLs.
+
 ## [3.0.0] - 2026-07-22
 
 This is the first release of the trouve AI coding harness and its GitHub
@@ -352,6 +391,7 @@ semble ([BENCHMARKS.md](BENCHMARKS.md)):
 - Incremental reindex (1 file touched): 0.86 s vs ~3 min (212x)
 - Warm query: 0.55 s vs 7.2 s (13x)
 
+[3.1.0]: https://github.com/jimsimon/trouve/releases/tag/v3.1.0
 [3.0.0]: https://github.com/jimsimon/trouve/releases/tag/v3.0.0
 [2.0.0]: https://github.com/jimsimon/trouve/releases/tag/v2.0.0
 [1.1.0]: https://github.com/jimsimon/trouve/releases/tag/v1.1.0
