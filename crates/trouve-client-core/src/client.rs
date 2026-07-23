@@ -12,30 +12,9 @@ pub struct ProtocolClient {
 
 impl ProtocolClient {
     pub fn new(server: &str) -> Self {
-        Self::with_token(server, None)
-    }
-
-    /// Build a client that sends `Authorization: Bearer <token>` on every
-    /// request (the local server requires it). `None` disables auth (tests
-    /// and unauthenticated servers).
-    pub fn with_token(server: &str, token: Option<String>) -> Self {
-        let http = match token.filter(|t| !t.is_empty()) {
-            Some(token) => {
-                let mut headers = reqwest::header::HeaderMap::new();
-                let mut value = reqwest::header::HeaderValue::from_str(&format!("Bearer {token}"))
-                    .expect("bearer token is valid header value");
-                value.set_sensitive(true);
-                headers.insert(reqwest::header::AUTHORIZATION, value);
-                reqwest::Client::builder()
-                    .default_headers(headers)
-                    .build()
-                    .expect("reqwest client builds")
-            }
-            None => reqwest::Client::new(),
-        };
         Self {
             base: format!("{}/v1", server.trim_end_matches('/')),
-            http,
+            http: reqwest::Client::new(),
         }
     }
 

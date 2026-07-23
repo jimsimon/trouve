@@ -270,114 +270,53 @@ pub fn openapi_json() -> serde_json::Value {
 }
 
 /// Access controls for the HTTP surface. The server drives an agent that
-/// runs shell commands and edits files, so an open local port is a
-/// privilege boundary: any other local process, or a web page via DNS
-/// rebinding, could otherwise drive it.
+/// runs shell commands and edits files, so the embedded server rejects
+/// non-loopback hosts to block browser-based DNS rebinding.
 #[derive(Clone, Default)]
 pub struct ServerSecurity {
-    /// Bearer token required on every `/v1` request. `None` disables the
-    /// token check (tests, and explicit opt-out).
-    pub token: Option<String>,
     /// Reject requests whose `Host` header isn't loopback. Blocks DNS
     /// rebinding: an attacker page rebinds its hostname to 127.0.0.1, but
     /// the browser still sends that hostname in `Host`, which won't match.
     pub require_loopback_host: bool,
     /// Ephemeral credential for vendor CLI children calling `/internal/*`.
-    /// Unlike the API token this is never persisted or user-facing.
+    /// This is never persisted or user-facing.
     pub internal_token: Option<String>,
 }
 
 impl ServerSecurity {
-    /// No auth and no host check — for in-process tests and embedders that
-    /// bind their own trusted listener.
+    /// No host or internal-route checks — for in-process tests and embedders
+    /// that bind their own trusted listener.
     pub fn open() -> Self {
         Self::default()
     }
 
-    /// A per-launch token supplied by a trusted embedder (the desktop app):
-    /// loopback-only, with a fresh internal bridge token. Nothing is read
-    /// from the environment or persisted.
-    pub fn with_token(token: String) -> Self {
+    /// Protect an embedded desktop server from browser-based DNS rebinding
+    /// and give vendor CLI children a fresh internal bridge credential.
+    pub fn loopback() -> Self {
         Self {
-            token: Some(token),
             require_loopback_host: true,
             internal_token: Some(fresh_token()),
         }
     }
 
-    /// Resolve from the environment and data dir:
-    /// - token: `TROUVE_AUTH_TOKEN`, else `<data_dir>/auth-token`, else a
-    ///   freshly generated token persisted there with 0600 perms.
-    ///   `TROUVE_NO_AUTH=1` disables the token (host check stays on).
-    /// - host: loopback-only unless `TROUVE_ALLOW_REMOTE` is set.
-    pub fn resolve(data_dir: &std::path::Path) -> Self {
-        let require_loopback_host = std::env::var_os("TROUVE_ALLOW_REMOTE").is_none();
-        let internal_token = Some(fresh_token());
-        if std::env::var("TROUVE_NO_AUTH").is_ok_and(|v| v == "1" || v == "true") {
-            tracing::warn!("TROUVE_NO_AUTH set: the API is unauthenticated");
-            return Self {
-                token: None,
-                require_loopback_host,
-                internal_token,
-            };
-        }
-        let token = match std::env::var("TROUVE_AUTH_TOKEN") {
-            Ok(t) if !t.is_empty() => t,
-            _ => Self::load_or_create_token(data_dir),
-        };
+    /// Configure a standalone server. It accepts remote host names only when
+    /// `TROUVE_ALLOW_REMOTE` is set and always protects internal CLI routes
+    /// with an ephemeral bridge credential.
+    pub fn resolve() -> Self {
         Self {
-            token: Some(token),
-            require_loopback_host,
-            internal_token,
+            require_loopback_host: std::env::var_os("TROUVE_ALLOW_REMOTE").is_none(),
+            internal_token: Some(fresh_token()),
         }
-    }
-
-    fn load_or_create_token(data_dir: &std::path::Path) -> String {
-        let path = data_dir.join("auth-token");
-        if let Ok(existing) = std::fs::read_to_string(&path) {
-            let existing = existing.trim().to_string();
-            if !existing.is_empty() {
-                return existing;
-            }
-        }
-        let token = fresh_token();
-        let _ = std::fs::create_dir_all(data_dir);
-        if write_private(&path, token.as_bytes()).is_err() {
-            tracing::warn!("could not persist auth token to {}", path.display());
-        } else {
-            tracing::info!("generated API auth token at {}", path.display());
-        }
-        token
     }
 }
 
-/// A 256-bit random bearer token (two v4 UUIDs, hex).
+/// A 256-bit random internal credential (two v4 UUIDs, hex).
 fn fresh_token() -> String {
     format!(
         "{}{}",
         uuid::Uuid::new_v4().simple(),
         uuid::Uuid::new_v4().simple()
     )
-}
-
-/// Write a file readable only by the owner (0600 on unix).
-fn write_private(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
-    #[cfg(unix)]
-    {
-        use std::io::Write;
-        use std::os::unix::fs::OpenOptionsExt;
-        let mut f = std::fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .mode(0o600)
-            .open(path)?;
-        f.write_all(bytes)
-    }
-    #[cfg(not(unix))]
-    {
-        std::fs::write(path, bytes)
-    }
 }
 
 /// True when the `Host` header names a loopback address (or `localhost`).
@@ -404,7 +343,7 @@ fn host_is_loopback(headers: &HeaderMap) -> bool {
         .unwrap_or(false)
 }
 
-/// Constant-time-ish equality for the bearer token.
+/// Constant-time-ish equality for internal bridge credentials.
 fn token_matches(expected: &str, provided: &str) -> bool {
     let (a, b) = (expected.as_bytes(), provided.as_bytes());
     if a.len() != b.len() {
@@ -427,33 +366,21 @@ async fn enforce_security(
             .into_response();
     }
     let internal = request.uri().path().starts_with("/internal/");
-    if internal {
-        if let Some(expected) = security.internal_token.as_deref() {
-            let provided = request.uri().query().and_then(|query| {
-                query
-                    .split('&')
-                    .filter_map(|part| part.split_once('='))
-                    .find_map(|(key, value)| (key == "bridge_token").then_some(value))
-            });
-            if !provided.is_some_and(|token| token_matches(expected, token)) {
-                return (StatusCode::UNAUTHORIZED, "missing or invalid bridge token")
-                    .into_response();
-            }
-        }
-    } else if !webhook && let Some(expected) = security.token.as_deref() {
-        let provided = request
-            .headers()
-            .get(axum::http::header::AUTHORIZATION)
-            .and_then(|v| v.to_str().ok())
-            .and_then(|v| v.strip_prefix("Bearer "));
-        if !provided.is_some_and(|p| token_matches(expected, p)) {
-            return (StatusCode::UNAUTHORIZED, "missing or invalid auth token").into_response();
+    if internal && let Some(expected) = security.internal_token.as_deref() {
+        let provided = request.uri().query().and_then(|query| {
+            query
+                .split('&')
+                .filter_map(|part| part.split_once('='))
+                .find_map(|(key, value)| (key == "bridge_token").then_some(value))
+        });
+        if !provided.is_some_and(|token| token_matches(expected, token)) {
+            return (StatusCode::UNAUTHORIZED, "missing or invalid bridge token").into_response();
         }
     }
     next.run(request).await
 }
 
-/// Wrap the router with host + token enforcement.
+/// Wrap the router with host and internal bridge-credential enforcement.
 pub fn build_secured_router(engine: Arc<Engine>, security: ServerSecurity) -> Router {
     engine.set_bridge_token(security.internal_token.clone());
     let security = Arc::new(security);
@@ -572,8 +499,8 @@ pub fn build_router(engine: Arc<Engine>) -> Router {
             axum::routing::put(update_code_review_repository),
         )
         .route("/v1/code-review/refresh", post(refresh_code_reviews))
-        // GitHub cannot attach trouve's bearer token. This one public route
-        // is authenticated in its handler with the configured HMAC secret.
+        // This public route is authenticated in its handler with the
+        // configured HMAC secret.
         .route("/github/webhooks", post(github_review_webhook))
         .route("/v1/local", get(local_status))
         .route("/v1/local/enabled", axum::routing::put(set_local_enabled))

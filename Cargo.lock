@@ -8549,7 +8549,6 @@ dependencies = [
  "trouve-slint-diff-view",
  "trouve-slint-markdown",
  "trouve-slint-terminal",
- "uuid",
 ]
 
 [[package]]

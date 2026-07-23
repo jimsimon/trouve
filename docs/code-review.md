@@ -12,24 +12,14 @@ rate-limit allocation for each installation.
 
 ## Deploy
 
-Create a `.env` beside `docker-compose.review.yml` with a long random token:
+Create a `.env` beside `docker-compose.review.yml` with the deployment
+settings:
 
 ```dotenv
-TROUVE_AUTH_TOKEN=replace-with-at-least-32-random-bytes
 TROUVE_VERSION=3.0.0
 TROUVE_REVIEW_PORT=7433
 TROUVE_CODE_REVIEW_POLL_INTERVAL_SECONDS=60
 ```
-
-Keep `.env` out of version control and restrict it to the deployment account:
-
-```bash
-chmod 600 .env
-```
-
-Treat `TROUVE_AUTH_TOKEN` like a password. Generate and store it with your
-secret manager or password manager, and share it only through an approved
-secret-sharing channel—not chat, email, issue trackers, or shell history.
 
 For a published release, set `TROUVE_VERSION` to that release's version and
 pull and start both containers:
@@ -52,17 +42,18 @@ copy is required:
 TROUVE_VERSION=dev docker compose -f docker-compose.review.yml up -d --build
 ```
 
-Open `http://your-server:7433`, enter `TROUVE_AUTH_TOKEN`, and add at least
-one model provider. The token is kept in browser session storage, so closing
-the tab signs the dashboard out. Provider API keys, the GitHub private key,
-and the webhook secret are held by trouve's secret store in the persistent
-`trouve-data` volume.
+Open `http://your-server:7433` and add at least one model provider. Provider
+credentials, the GitHub private key, and the webhook secret are held by
+trouve's secret store in the persistent `trouve-data` volume.
 
-The compose file exposes plain HTTP. Put the dashboard behind your existing TLS
-reverse proxy before exposing it to the internet, or keep it reachable only on
-a trusted network or VPN. The bundled nginx forwards `/v1/*` to the private
-server container. If webhooks are enabled, it also forwards
-`/github/webhooks`; that route must be publicly reachable over HTTPS.
+The dashboard and `/v1` API intentionally have no application-level login or
+token for this single-user deployment. Anyone who can reach them can change
+configuration and start reviews, so keep the dashboard on a trusted private
+network or VPN. If it must be internet-accessible, put authentication and TLS
+in front of it at the reverse proxy. The bundled nginx forwards `/v1/*` to the
+private server container. If webhooks are enabled, expose only
+`/github/webhooks` publicly over HTTPS and keep `/` and `/v1/*` restricted to
+the private network.
 
 ## Create the bot identity
 
