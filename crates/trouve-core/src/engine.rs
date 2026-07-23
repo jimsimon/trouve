@@ -3235,12 +3235,21 @@ impl Engine {
                     })
                     .unwrap_or_default();
             }
+            let pull_requests = trouve_protocol::GithubPrList { viewer, host, prs };
+            if !cache.has_published_snapshot()
+                && let Some(persisted) =
+                    self.store.latest_github_pr_snapshot(&pull_requests.host)?
+            {
+                cache.seed_published_snapshot(&persisted)?;
+            }
+            let Some(snapshot) = cache.unpublished_snapshot(&pull_requests)? else {
+                continue;
+            };
             self.store.append_event(
                 Scope::Server,
-                Event::GithubPullRequestsUpdated {
-                    pull_requests: trouve_protocol::GithubPrList { viewer, host, prs },
-                },
+                Event::GithubPullRequestsUpdated { pull_requests },
             )?;
+            cache.mark_snapshot_published(snapshot);
         }
         if !failures.is_empty() {
             return Err(EngineError::BadRequest(failures.join("; ")));

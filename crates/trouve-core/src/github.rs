@@ -12,7 +12,7 @@ use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use octocrab::Octocrab;
 use serde::Deserialize;
-use trouve_protocol::{CheckRun, PrInfo, PrReview};
+use trouve_protocol::{CheckRun, GithubPrList, PrInfo, PrReview};
 
 /// A dashboard refresh should stay bounded even for repositories with an
 /// unusually deep PR history. Each page contains up to 100 PRs.
@@ -356,6 +356,7 @@ pub struct GitHubAccount {
 pub struct GitHubDashboardCache {
     viewer: Option<String>,
     entries: HashMap<String, CachedDashboardPullRequest>,
+    published_snapshot: Option<String>,
 }
 
 struct CachedDashboardPullRequest {
@@ -383,6 +384,29 @@ impl GitHubDashboardCache {
         self.entries
             .get(id)
             .is_none_or(|cached| cached.fingerprint != *fingerprint)
+    }
+
+    /// Serialize once for an exact, stable comparison with the last snapshot
+    /// emitted by this server process. Returning the serialized value lets the
+    /// caller remember it only after the durable event append succeeds.
+    pub(crate) fn unpublished_snapshot(&self, snapshot: &GithubPrList) -> Result<Option<String>> {
+        let serialized = serde_json::to_string(snapshot)?;
+        Ok((self.published_snapshot.as_deref() != Some(serialized.as_str())).then_some(serialized))
+    }
+
+    pub(crate) fn has_published_snapshot(&self) -> bool {
+        self.published_snapshot.is_some()
+    }
+
+    pub(crate) fn seed_published_snapshot(&mut self, snapshot: &GithubPrList) -> Result<()> {
+        if self.published_snapshot.is_none() {
+            self.published_snapshot = Some(serde_json::to_string(snapshot)?);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn mark_snapshot_published(&mut self, serialized: String) {
+        self.published_snapshot = Some(serialized);
     }
 }
 
@@ -1568,5 +1592,20 @@ mod tests {
         assert_eq!(cache.entries.len(), 1);
         cache.begin_viewer("bob");
         assert!(cache.entries.is_empty());
+
+        let snapshot = GithubPrList {
+            viewer: "bob".into(),
+            host: "github.com".into(),
+            prs: Vec::new(),
+        };
+        let serialized = cache.unpublished_snapshot(&snapshot).unwrap().unwrap();
+        cache.mark_snapshot_published(serialized);
+        assert!(cache.unpublished_snapshot(&snapshot).unwrap().is_none());
+
+        let changed = GithubPrList {
+            viewer: "carol".into(),
+            ..snapshot
+        };
+        assert!(cache.unpublished_snapshot(&changed).unwrap().is_some());
     }
 }

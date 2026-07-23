@@ -35,6 +35,36 @@ const PR_DASH_REFRESH_INTERVAL: std::time::Duration = std::time::Duration::from_
 /// The dashboard refresh clock is repainted once per second without rebuilding
 /// the PR grid or contacting GitHub.
 const PR_DASH_CLOCK_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
+/// Older server events are persisted history rather than live transitions.
+const SERVER_EVENT_FRESH_WINDOW: std::time::Duration = std::time::Duration::from_secs(20);
+/// A quiet period marks the end of a server-history burst when no fresh event
+/// arrives to provide a natural boundary.
+const SERVER_REPLAY_IDLE_FLUSH: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// During global history replay, only the newest state snapshot for each
+/// GitHub host matters. Lifecycle events are edge-triggered and stale ones are
+/// intentionally discarded by the controller.
+#[derive(Default)]
+struct ServerReplayBuffer {
+    github_prs: HashMap<String, EventEnvelope>,
+}
+
+impl ServerReplayBuffer {
+    fn push(&mut self, envelope: EventEnvelope) -> bool {
+        let trouve_protocol::Event::GithubPullRequestsUpdated { pull_requests } = &envelope.event
+        else {
+            return false;
+        };
+        self.github_prs.insert(pull_requests.host.clone(), envelope);
+        true
+    }
+
+    fn take(&mut self) -> Vec<EventEnvelope> {
+        let mut snapshots: Vec<_> = std::mem::take(&mut self.github_prs).into_values().collect();
+        snapshots.sort_by_key(|envelope| envelope.cursor);
+        snapshots
+    }
+}
 
 fn format_pr_dashboard_refresh_status(
     last_refreshed: Option<std::time::Instant>,
@@ -426,6 +456,8 @@ pub enum UiCommand {
     /// Internal: a server-scope event (session lifecycle, automation runs)
     /// arrived on the global stream.
     ServerEvent(Box<trouve_protocol::EventEnvelope>),
+    /// Persisted server history reduced to the newest PR snapshot per host.
+    ServerEvents(Vec<trouve_protocol::EventEnvelope>),
     /// Internal: the transient "back online" notice timed out. Carries the
     /// sequence number of the notice it should clear, so a newer notice
     /// survives an older notice's timer.
@@ -685,6 +717,9 @@ struct Controller {
     pr_error: String,
     /// PR dashboard: per-GitHub-instance account results.
     pr_dash: HashMap<String, trouve_protocol::GithubPrList>,
+    /// Newest applied snapshot cursor per host. A debounce flush and a fresh
+    /// event may race; cursors prevent an older replay snapshot winning.
+    pr_dash_cursors: HashMap<String, u64>,
     /// Multi-instance account refresh failures.
     pr_dash_errors: HashMap<String, String>,
     /// Shared GitHub refreshes in flight (the `github` key is the guard).
@@ -905,6 +940,7 @@ pub async fn run(
         pr_selected: 0,
         pr_error: String::new(),
         pr_dash: HashMap::new(),
+        pr_dash_cursors: HashMap::new(),
         pr_dash_errors: HashMap::new(),
         pr_dash_loading: HashSet::new(),
         pr_dash_last_refreshed: None,
@@ -1155,12 +1191,69 @@ impl Controller {
             let client = self.client.clone();
             let tx = self.tx.clone();
             tokio::spawn(async move {
+                use std::sync::atomic::{AtomicU64, Ordering};
+
                 let mut after = 0u64;
                 let mut lost_reported = false;
+                let replay =
+                    std::sync::Arc::new(std::sync::Mutex::new(ServerReplayBuffer::default()));
+                let replay_generation = std::sync::Arc::new(AtomicU64::new(0));
+                let replay_notify = std::sync::Arc::new(tokio::sync::Notify::new());
+                {
+                    let replay = replay.clone();
+                    let generation = replay_generation.clone();
+                    let notify = replay_notify.clone();
+                    let event_tx = tx.clone();
+                    tokio::spawn(async move {
+                        loop {
+                            notify.notified().await;
+                            loop {
+                                let observed = generation.load(Ordering::Acquire);
+                                tokio::time::sleep(SERVER_REPLAY_IDLE_FLUSH).await;
+                                if generation.load(Ordering::Acquire) == observed {
+                                    break;
+                                }
+                            }
+                            let snapshots = replay.lock().unwrap().take();
+                            if !snapshots.is_empty()
+                                && event_tx.send(UiCommand::ServerEvents(snapshots)).is_err()
+                            {
+                                return;
+                            }
+                        }
+                    });
+                }
                 loop {
+                    let replay = replay.clone();
+                    let generation = replay_generation.clone();
+                    let notify = replay_notify.clone();
+                    let event_tx = tx.clone();
                     if let Ok(last) = client
-                        .follow_server_events(after, |envelope| {
-                            let _ = tx.send(UiCommand::ServerEvent(Box::new(envelope)));
+                        .follow_server_events(after, move |envelope| {
+                            let persisted_replay = std::time::SystemTime::from(envelope.ts)
+                                .elapsed()
+                                .is_ok_and(|age| age > SERVER_EVENT_FRESH_WINDOW);
+                            if persisted_replay {
+                                if replay.lock().unwrap().push(envelope) {
+                                    generation.fetch_add(1, Ordering::Release);
+                                    notify.notify_one();
+                                }
+                            } else {
+                                let mut snapshots = replay.lock().unwrap().take();
+                                if matches!(
+                                    &envelope.event,
+                                    trouve_protocol::Event::GithubPullRequestsUpdated { .. }
+                                ) {
+                                    snapshots.push(envelope);
+                                    let _ = event_tx.send(UiCommand::ServerEvents(snapshots));
+                                } else {
+                                    if !snapshots.is_empty() {
+                                        let _ = event_tx.send(UiCommand::ServerEvents(snapshots));
+                                    }
+                                    let _ =
+                                        event_tx.send(UiCommand::ServerEvent(Box::new(envelope)));
+                                }
+                            }
                             std::ops::ControlFlow::Continue(())
                         })
                         .await
@@ -3901,30 +3994,67 @@ impl Controller {
         ui::set_automation_templates(&self.ui, templates);
     }
 
-    /// Fold server-scope state events during replay; edge-triggered lifecycle
-    /// events only act when fresh so reconnects do not trigger reload storms.
+    fn apply_github_pr_snapshot(
+        &mut self,
+        cursor: u64,
+        pull_requests: trouve_protocol::GithubPrList,
+    ) -> bool {
+        let host = pull_requests.host.clone();
+        if self
+            .pr_dash_cursors
+            .get(&host)
+            .is_some_and(|seen| *seen >= cursor)
+        {
+            return false;
+        }
+        self.pr_dash_cursors.insert(host.clone(), cursor);
+        self.pr_dash.insert(host, pull_requests);
+        true
+    }
+
+    fn handle_server_replay(&mut self, envelopes: Vec<trouve_protocol::EventEnvelope>) {
+        let mut changed = false;
+        for envelope in envelopes {
+            if let trouve_protocol::Event::GithubPullRequestsUpdated { pull_requests } =
+                envelope.event
+            {
+                changed |= self.apply_github_pr_snapshot(envelope.cursor, pull_requests);
+            }
+        }
+        if changed {
+            self.sync_shared_prs(false);
+            self.push_pr_dashboard();
+        }
+    }
+
+    /// Fold server-scope state events; edge-triggered lifecycle events only
+    /// act when fresh so reconnects do not trigger reload storms.
     async fn handle_server_event(&mut self, envelope: trouve_protocol::EventEnvelope) {
         use trouve_protocol::Event;
 
-        // Dashboard snapshots are folded even during replay: unlike the
-        // lifecycle events below, the persisted payload is the state itself
-        // and reconstructs the cache after launch/reconnect.
-        if let Event::GithubPullRequestsUpdated { pull_requests } = &envelope.event {
-            self.pr_dash
-                .insert(pull_requests.host.clone(), pull_requests.clone());
-            self.sync_shared_prs(false);
-            self.push_pr_dashboard();
-            return;
-        }
+        let trouve_protocol::EventEnvelope {
+            cursor, ts, event, ..
+        } = envelope;
 
-        let fresh = std::time::SystemTime::from(envelope.ts)
+        let event = match event {
+            Event::GithubPullRequestsUpdated { pull_requests } => {
+                if self.apply_github_pr_snapshot(cursor, pull_requests) {
+                    self.sync_shared_prs(false);
+                    self.push_pr_dashboard();
+                }
+                return;
+            }
+            event => event,
+        };
+
+        let fresh = std::time::SystemTime::from(ts)
             .elapsed()
-            .map(|age| age.as_secs() < 20)
+            .map(|age| age < SERVER_EVENT_FRESH_WINDOW)
             .unwrap_or(true);
         if !fresh {
             return;
         }
-        match &envelope.event {
+        match &event {
             // An automation ran: its last/next fields changed, and a
             // successful run created a session this UI hasn't seen.
             Event::AutomationFired { .. } => {
@@ -5800,6 +5930,9 @@ impl Controller {
             UiCommand::ServerEvent(envelope) => {
                 self.handle_server_event(*envelope).await;
             }
+            UiCommand::ServerEvents(envelopes) => {
+                self.handle_server_replay(envelopes);
+            }
             UiCommand::ConnectivityNoticeExpired(seq) => {
                 if seq == self.connectivity_notice_seq {
                     ui::set_connectivity_notice(&self.ui, String::new());
@@ -6979,14 +7112,16 @@ fn should_open_chat_at_tail(force_tail: bool, turn_running: bool, has_queue: boo
 #[cfg(test)]
 mod tests {
     use super::{
-        SubscriptionRefresh, SubscriptionRefreshState, approval_pill, attention_badge, check_pill,
-        classify_pr, download_progress, format_pr_dashboard_refresh_status, human_age, human_rate,
-        merge_pill, model_health_view, pr_badge, project_session_prs, reconcile_pr_group_order,
-        reconcile_workspace_order, reorder_id, should_open_chat_at_tail, thinking_property,
+        ServerReplayBuffer, SubscriptionRefresh, SubscriptionRefreshState, approval_pill,
+        attention_badge, check_pill, classify_pr, download_progress,
+        format_pr_dashboard_refresh_status, human_age, human_rate, merge_pill, model_health_view,
+        pr_badge, project_session_prs, reconcile_pr_group_order, reconcile_workspace_order,
+        reorder_id, should_open_chat_at_tail, thinking_property,
     };
     use chrono::{Duration, TimeZone, Utc};
     use trouve_protocol::{
-        CheckRun, PrInfo, PrReview, Session, SubscriptionHealth, SubscriptionWindow, Workspace,
+        CheckRun, Event, EventEnvelope, GithubPrList, PrInfo, PrReview, Scope, Session,
+        SubscriptionHealth, SubscriptionWindow, Workspace,
     };
 
     fn workspaces(ids: &[&str]) -> Vec<Workspace> {
@@ -6997,6 +7132,49 @@ mod tests {
                 path: format!("/{id}"),
             })
             .collect()
+    }
+
+    fn github_snapshot(cursor: u64, host: &str) -> EventEnvelope {
+        EventEnvelope {
+            cursor,
+            scope: Scope::Server,
+            ts: Utc::now(),
+            event: Event::GithubPullRequestsUpdated {
+                pull_requests: GithubPrList {
+                    viewer: "octocat".into(),
+                    host: host.into(),
+                    prs: Vec::new(),
+                },
+            },
+        }
+    }
+
+    #[test]
+    fn server_replay_keeps_only_the_newest_pr_snapshot_per_host() {
+        let mut replay = ServerReplayBuffer::default();
+        assert!(replay.push(github_snapshot(1, "github.com")));
+        assert!(replay.push(github_snapshot(2, "github.example.com")));
+        assert!(replay.push(github_snapshot(3, "github.com")));
+        assert!(!replay.push(EventEnvelope {
+            cursor: 4,
+            scope: Scope::Server,
+            ts: Utc::now(),
+            event: Event::SessionActivity {
+                session_id: "se_1".into(),
+                workspace_id: "ws_1".into(),
+                active: true,
+            },
+        }));
+
+        let snapshots = replay.take();
+        assert_eq!(
+            snapshots
+                .iter()
+                .map(|envelope| envelope.cursor)
+                .collect::<Vec<_>>(),
+            [2, 3]
+        );
+        assert!(replay.take().is_empty());
     }
 
     #[test]
