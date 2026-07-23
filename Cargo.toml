@@ -65,7 +65,7 @@ trouve-slint-terminal = { path = "crates/trouve-slint-terminal", version = "3.1.
 
 [profile.release]
 lto = "thin"
-codegen-units = 1
+codegen-units = 8
 
 # Keep dev target dirs small: full DWARF debuginfo dominates target/ size.
 # Line tables are enough for backtraces and panic locations; flip to
