@@ -1,6 +1,6 @@
 {
   "name": "@trouve-ai/search-linux-arm64-musl",
-  "version": "3.1.0",
+  "version": "3.2.0",
   "description": "trouve-search native binary for aarch64-unknown-linux-musl",
   "license": "MIT",
   "repository": {
