@@ -57,6 +57,26 @@ textarea { resize: vertical; }
 .login-actions { margin-top: .7rem; }
 .button-link { display: inline-block; border-radius: 8px; padding: .65rem .85rem; color: #092017; background: #82e6b8; font-size: .82rem; font-weight: 800; }
 .button-link:hover { background: #a1f1ca; text-decoration: none; }
+.cli-manager { margin-top: 1rem; padding-top: 1rem; border-top: 1px solid #292e2b; }
+.cli-manager-title { display: flex; align-items: flex-start; justify-content: space-between; gap: .8rem; }
+.cli-manager-title h3 { margin-bottom: .3rem; font-size: 1rem; }
+.cli-manager-title p { margin-bottom: .7rem; }
+.cli-refresh, .cli-button { padding: .48rem .65rem; font-size: .74rem; }
+.cli-list { display: grid; gap: .5rem; }
+.cli-item { display: flex; align-items: center; justify-content: space-between; gap: .8rem; padding: .72rem; border: 1px solid #2d3430; border-radius: 10px; background: #111512; }
+.cli-copy { display: grid; gap: .25rem; min-width: 0; }
+.cli-copy > div { display: flex; align-items: center; gap: .45rem; flex-wrap: wrap; }
+.cli-copy small { color: #78817c; overflow-wrap: anywhere; }
+.cli-source { border-radius: 999px; padding: .2rem .42rem; color: #ffb19c; background: #49251e; font-size: .62rem; font-weight: 800; text-transform: uppercase; }
+.cli-source.ready { color: #8debc0; background: #173b2d; }
+.cli-actions { display: flex; justify-content: flex-end; gap: .4rem; flex-shrink: 0; }
+.cli-button.danger { color: #ffb19c; background: #3b211c; }
+.cli-progress { display: grid; grid-template-columns: minmax(100px, 1fr) auto; align-items: center; gap: .55rem; margin-top: .25rem; }
+.cli-progress progress { width: 100%; height: .42rem; accent-color: #82e6b8; }
+.cli-progress small { color: #a7ada9; white-space: nowrap; }
+.cli-error, .cli-notice { margin: .35rem 0 0; font-size: .78rem; line-height: 1.4; }
+.cli-error { color: #ffab96; }
+.cli-notice { margin: .2rem 0 .65rem; color: #b7dcca; }
 .provider-setup { display: grid; grid-template-columns: 1fr 1fr; gap: 1rem; margin-top: 1rem; padding-top: 1rem; border-top: 1px solid #292e2b; }
 .provider-setup form { align-content: start; margin-top: 0; }
 .provider-setup h3 { margin-bottom: .3rem; font-size: 1rem; }
@@ -142,6 +162,10 @@ textarea { resize: vertical; }
   .metrics, .split, .provider-setup, .repository-toolbar, .reviewer-grid, .custom-reviewer, .repo-controls, .reviewer-override-controls { grid-template-columns: 1fr; }
   .provider-item { align-items: flex-start; flex-direction: column; }
   .provider-actions { width: 100%; justify-content: space-between; }
+  .cli-manager-title, .cli-item { align-items: flex-start; flex-direction: column; }
+  .cli-actions { width: 100%; justify-content: flex-start; }
+  .cli-progress { grid-template-columns: 1fr; }
+  .cli-progress small { white-space: normal; }
   .repository-search, .repo-controls > label:nth-child(3) { grid-column: auto; }
   .repository-results { align-items: flex-start; flex-direction: column; }
   .repository-pagination { width: 100%; justify-content: space-between; }
