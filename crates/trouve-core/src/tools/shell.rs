@@ -83,6 +83,8 @@ async fn terminate_process(
         }
         return Err(error);
     }
+    #[cfg(not(unix))]
+    let _ = pid;
     child.lock().await.start_kill()
 }
 
