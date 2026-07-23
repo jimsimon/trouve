@@ -194,7 +194,7 @@ function time(value?: string): string {
   return value ? new Date(value).toLocaleString() : "Never";
 }
 
-function modelOptions(selected?: string, inheritedLabel = "Use review/default model"): string {
+function modelOptions(selected?: string, inheritedLabel = "Use review/system default"): string {
   const choices = selected && !models.some((model) => model.id === selected)
     ? [{ id: selected, display_name: selected }, ...models]
     : models;
