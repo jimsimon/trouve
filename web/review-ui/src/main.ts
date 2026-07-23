@@ -900,6 +900,11 @@ async function uninstallCli(cliId: string): Promise<void> {
 
 async function pollCliInstall(cliId: string): Promise<void> {
   let consecutiveErrors = 0;
+  const refreshProviderSettingsWhenIdle = (): void => {
+    if (!hasEditableFocus(document.querySelector("#provider-settings"))) {
+      refreshProviderSettings();
+    }
+  };
   try {
     for (let poll = 0; poll < 1200; poll += 1) {
       await new Promise((resolve) => window.setTimeout(resolve, 1_000));
@@ -914,14 +919,12 @@ async function pollCliInstall(cliId: string): Promise<void> {
           message: `Could not check ${cliId} install status: ${error instanceof Error ? error.message : String(error)}`,
           error: true,
         };
-        refreshProviderSettings();
+        refreshProviderSettingsWhenIdle();
         return;
       }
       cliInstallStatuses = { ...cliInstallStatuses, [cliId]: status };
       if (status.status === "pending") {
-        if (!hasEditableFocus(document.querySelector("#provider-settings"))) {
-          refreshProviderSettings();
-        }
+        refreshProviderSettingsWhenIdle();
         continue;
       }
 
@@ -947,17 +950,17 @@ async function pollCliInstall(cliId: string): Promise<void> {
       } else {
         cliNotice = { message: `Cancelled the ${cliId} install.`, error: false };
       }
-      refreshProviderSettings();
+      refreshProviderSettingsWhenIdle();
       await refreshCliData(false);
       try {
         await loadData();
       } catch {
-        refreshProviderSettings();
+        refreshProviderSettingsWhenIdle();
       }
       return;
     }
     cliNotice = { message: `The ${cliId} install is still running. Refresh CLI status to check it again.`, error: true };
-    refreshProviderSettings();
+    refreshProviderSettingsWhenIdle();
   } finally {
     cliInstallPolls.delete(cliId);
   }
