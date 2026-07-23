@@ -4,6 +4,29 @@ All notable changes to this project are documented in this file. The format
 is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this
 project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [3.2.0] - 2026-07-23
+
+### Added
+
+- **Managed subscription CLIs in code review**: the hosted review dashboard
+  can install, update, cancel, retry, and remove trouve-managed vendor CLIs,
+  so Claude, Codex, and Cursor subscription sign-in no longer depends on a
+  binary already being available on `PATH`. Direct Codex provider login also
+  resolves the managed binary.
+- **Review model and thinking defaults**: the dashboard now exposes the
+  system-wide review model and thinking defaults and persists model and
+  thinking defaults for every reviewer persona, including built-ins. Durable
+  jobs snapshot persona thinking settings so queued and webhook-triggered
+  reviews use the configuration selected when they were created.
+
+### Changed
+
+- **Faster, hardened release builds**: app, server, and search artifacts now
+  compile together per target; server images reuse the static musl artifacts;
+  release caches are shared with trusted main builds; and platform npm
+  packages publish concurrently. Release workflows pin reviewed actions,
+  avoid persisted checkout credentials, and restrict cache writes to main.
+
 ## [3.1.0] - 2026-07-23
 
 ### Added
@@ -391,6 +414,7 @@ semble ([BENCHMARKS.md](BENCHMARKS.md)):
 - Incremental reindex (1 file touched): 0.86 s vs ~3 min (212x)
 - Warm query: 0.55 s vs 7.2 s (13x)
 
+[3.2.0]: https://github.com/jimsimon/trouve/compare/v3.1.0...v3.2.0
 [3.1.0]: https://github.com/jimsimon/trouve/releases/tag/v3.1.0
 [3.0.0]: https://github.com/jimsimon/trouve/releases/tag/v3.0.0
 [2.0.0]: https://github.com/jimsimon/trouve/releases/tag/v2.0.0
