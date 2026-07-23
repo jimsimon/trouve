@@ -225,7 +225,9 @@ function thinkingOptionsMarkup(
   inheritedLabel?: string,
 ): { markup: string; disabled: boolean } {
   const { values } = thinkingOptions(modelById(modelId));
-  const choices = selected && !values.includes(selected) ? [selected, ...values] : values;
+  const choices = inheritedLabel && selected && !values.includes(selected)
+    ? [selected, ...values]
+    : values;
   if (inheritedLabel) {
     return {
       markup: [
