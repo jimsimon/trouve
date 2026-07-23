@@ -113,7 +113,6 @@ interface Model {
 }
 
 const root = document.querySelector<HTMLElement>("#app")!;
-let token = sessionStorage.getItem("trouve-token") ?? "";
 let dashboard: Dashboard | null = null;
 let providers: Provider[] = [];
 let knownProviders: KnownProvider[] = [];
@@ -142,7 +141,6 @@ async function api<T>(path: string, init: RequestInit = {}): Promise<T> {
     ...init,
     headers: {
       "Content-Type": "application/json",
-      Authorization: `Bearer ${token}`,
       ...(init.headers ?? {}),
     },
   });
@@ -333,28 +331,20 @@ function renderRepositorySection(reviewers: ReviewerProfile[]): string {
   </section>`;
 }
 
-function renderLogin(message = ""): void {
+function renderConnectionError(message: string): void {
   root.innerHTML = `
-    <section class="login card">
+    <section class="connection-error card">
       <p class="eyebrow">trouve</p>
-      <h1>Code review, on your server.</h1>
-      <p class="lede">Enter the API token configured for this deployment. It stays in this browser tab.</p>
-      <form id="login-form">
-        <label>Server API token<input name="token" type="password" autocomplete="current-password" required /></label>
-        ${message ? `<p class="error">${escape(message)}</p>` : ""}
-        <button>Connect</button>
-      </form>
+      <h1>Dashboard unavailable</h1>
+      <p class="lede">The browser could not connect to this trouve server.</p>
+      <p class="error">${escape(message)}</p>
+      <button id="retry-load">Retry</button>
     </section>`;
-  document.querySelector<HTMLFormElement>("#login-form")!.onsubmit = (event) => {
-    event.preventDefault();
-    token = String(new FormData(event.currentTarget as HTMLFormElement).get("token") ?? "");
-    sessionStorage.setItem("trouve-token", token);
-    void load();
-  };
+  document.querySelector<HTMLButtonElement>("#retry-load")!.onclick = () => void load();
 }
 
 function render(): void {
-  if (!dashboard) return renderLogin();
+  if (!dashboard) return;
   const app = dashboard.app;
   const reviewers = dashboard.reviewers;
   const builtInReviewers = reviewers.filter((reviewer) => reviewer.built_in);
@@ -362,7 +352,7 @@ function render(): void {
   root.innerHTML = `
     <header>
       <div><p class="eyebrow">trouve</p><h1>Review control room</h1></div>
-      <div class="header-actions"><span class="status ${app.last_error ? "bad" : "good"}">${app.last_error ? "Needs attention" : "Online"}</span><button class="ghost" id="disconnect">Disconnect</button></div>
+      <div class="header-actions"><span class="status ${app.last_error ? "bad" : "good"}">${app.last_error ? "Needs attention" : "Online"}</span></div>
     </header>
     ${app.last_error ? `<div class="banner error">${escape(app.last_error)}</div>` : ""}
     <section class="metrics">
@@ -688,20 +678,6 @@ function bindRepositorySection(): void {
 }
 
 function bind(): void {
-  document.querySelector<HTMLButtonElement>("#disconnect")!.onclick = () => {
-    token = "";
-    dashboard = null;
-    providerLogin = null;
-    providerLoginAttempt += 1;
-    clearRepositorySearchTimer();
-    repositoryQuery = "";
-    repositoryModeFilter = "all";
-    repositoryPage = 0;
-    expandedRepositories.clear();
-    sessionStorage.removeItem("trouve-token");
-    if (timer) window.clearInterval(timer);
-    renderLogin();
-  };
   document.querySelector<HTMLButtonElement>("#refresh-github")!.onclick = async (event) => {
     const button = event.currentTarget as HTMLButtonElement;
     button.disabled = true;
@@ -856,7 +832,7 @@ function handleLoadError(error: unknown): void {
     window.clearInterval(timer);
     timer = undefined;
   }
-  renderLogin(error instanceof Error ? error.message : String(error));
+  renderConnectionError(error instanceof Error ? error.message : String(error));
 }
 
 async function loadData(renderDashboard = true): Promise<void> {
@@ -870,7 +846,6 @@ async function loadData(renderDashboard = true): Promise<void> {
 }
 
 async function load(): Promise<void> {
-  if (!token) return renderLogin();
   try {
     await loadData();
     if (timer) window.clearInterval(timer);

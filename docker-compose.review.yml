@@ -7,7 +7,6 @@ services:
     restart: unless-stopped
     environment:
       TROUVE_ALLOW_REMOTE: "1"
-      TROUVE_AUTH_TOKEN: "${TROUVE_AUTH_TOKEN:?set TROUVE_AUTH_TOKEN in .env}"
       TROUVE_CODE_REVIEW_POLL_INTERVAL_SECONDS: "${TROUVE_CODE_REVIEW_POLL_INTERVAL_SECONDS:-60}"
       RUST_LOG: "${RUST_LOG:-info}"
     volumes:
@@ -17,7 +16,6 @@ services:
         - CMD-SHELL
         - >-
           curl --fail --silent --show-error
-          --header "Authorization: Bearer $$TROUVE_AUTH_TOKEN"
           http://127.0.0.1:7433/v1/info >/dev/null
       interval: 10s
       timeout: 3s

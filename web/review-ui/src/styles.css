@@ -23,7 +23,7 @@ header, .section-title { display: flex; align-items: center; justify-content: sp
 .eyebrow { color: #82e6b8; font-size: .72rem; font-weight: 800; letter-spacing: .16em; text-transform: uppercase; margin-bottom: .35rem; }
 .lede, .muted { color: #9ca39f; }
 .card { padding: 1.4rem; border: 1px solid #2b302e; border-radius: 14px; background: rgba(21, 25, 23, .92); box-shadow: 0 18px 60px #0004; }
-.login { width: min(470px, 100%); margin: 12vh auto 0; padding: 2rem; }
+.connection-error { width: min(470px, 100%); margin: 12vh auto 0; padding: 2rem; }
 .metrics { display: grid; grid-template-columns: repeat(4, 1fr); gap: .8rem; margin: 2rem 0 .8rem; }
 .metrics article { min-height: 105px; padding: 1rem; border: 1px solid #2b302e; border-radius: 12px; background: #151917; }
 .metrics span, .metrics small { display: block; color: #8e9691; font-size: .76rem; }

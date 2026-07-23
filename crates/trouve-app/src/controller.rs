@@ -1023,10 +1023,7 @@ async fn start_local_server() -> Result<(
     Option<(EmbeddedServer, tokio::task::JoinHandle<Result<()>>)>,
 )> {
     if let Ok(url) = std::env::var("TROUVE_SERVER_URL") {
-        // Connecting to an externally-managed server: the user supplies its
-        // token (if any) in the environment.
-        let token = std::env::var("TROUVE_AUTH_TOKEN").ok();
-        let client = ProtocolClient::with_token(&url, token);
+        let client = ProtocolClient::new(&url);
         client
             .info()
             .await
@@ -1034,21 +1031,10 @@ async fn start_local_server() -> Result<(
         return Ok((client, url, None));
     }
 
-    // A per-launch bearer token so no other local process can drive the
-    // server we embed (it can run shell and edit files).
-    let token = format!(
-        "{}{}",
-        uuid::Uuid::new_v4().simple(),
-        uuid::Uuid::new_v4().simple()
-    );
-
-    let (addr, handle) = spawn_embedded_server("127.0.0.1:0".parse()?, &token).await?;
-    let info = EmbeddedServer {
-        addr,
-        token: token.clone(),
-    };
+    let (addr, handle) = spawn_embedded_server("127.0.0.1:0".parse()?).await?;
+    let info = EmbeddedServer { addr };
     let url = format!("http://{addr}");
-    let client = ProtocolClient::with_token(&url, Some(token));
+    let client = ProtocolClient::new(&url);
     if let Err(e) = wait_server_ready(&client).await {
         // Abort and join so the listener/engine tear down before we return.
         handle.abort();
@@ -1064,7 +1050,6 @@ async fn start_local_server() -> Result<(
 #[derive(Clone)]
 struct EmbeddedServer {
     addr: std::net::SocketAddr,
-    token: String,
 }
 
 /// Bind and launch the embedded server task (full local engine behind the
@@ -1072,9 +1057,8 @@ struct EmbeddedServer {
 /// address and the join handle used to observe its exit.
 async fn spawn_embedded_server(
     addr: std::net::SocketAddr,
-    token: &str,
 ) -> Result<(std::net::SocketAddr, tokio::task::JoinHandle<Result<()>>)> {
-    let security = trouve_server::ServerSecurity::with_token(token.to_string());
+    let security = trouve_server::ServerSecurity::loopback();
     let (addr, server) = trouve_server::bind_local(addr, security).await?;
     Ok((addr, tokio::spawn(server)))
 }
@@ -1396,7 +1380,7 @@ impl Controller {
         }
         self.last_respawn = Some(std::time::Instant::now());
         self.push_connectivity();
-        let restarted = match spawn_embedded_server(info.addr, &info.token).await {
+        let restarted = match spawn_embedded_server(info.addr).await {
             Ok((_, handle)) => {
                 if wait_server_ready(&self.client).await.is_ok() {
                     // Hand ownership to the watcher only once the server
