@@ -11,11 +11,15 @@ version. Follow ADR 0012 and keep every first-party artifact in lockstep.
 ## Establish the release
 
 1. Read `docs/adr/0012-single-version-monorepo-release-train.md`.
-2. Inspect the worktree status, root workspace version, latest repository
-   `vX.Y.Z` tag, changelog, and commits since that tag. Preserve unrelated
-   user changes.
-3. Choose SemVer from the most severe user-visible change anywhere in the
-   repository. Explain a non-obvious major or minor bump.
+2. Inspect the worktree status, root workspace version, changelog, and remote
+   repository `vX.Y.Z` tags. Preserve unrelated user changes.
+3. Validate a tag before treating it as a release baseline: resolve its commit
+   and read `[workspace.package].version` from that commit. The tag must equal
+   `v<workspace-version>`. Ignore and report stale or pre-created tags that do
+   not match, then select the newest valid tag.
+4. Inspect commits since that valid baseline. Choose SemVer from the most
+   severe user-visible change anywhere in the repository. Explain a
+   non-obvious major or minor bump.
 
 ## Update the release
 
@@ -40,7 +44,13 @@ version. Follow ADR 0012 and keep every first-party artifact in lockstep.
    dependency versions.
 
 Do not commit, tag, push, publish, or deploy unless the user explicitly asks.
-When authorized, use the single repository tag `vX.Y.Z`.
+When authorized, commit and merge the synchronized release state before
+tagging. Resolve the exact post-bump release commit and verify its root
+workspace version first. If `vX.Y.Z` already exists but points elsewhere or
+contains a mismatched workspace version, stop and require explicit
+authorization to move or recreate the tag and any associated release. Confirm
+the corrected tag resolves to the release commit and matches its workspace
+version before triggering or rerunning release automation.
 
 ## Write useful release notes
 
