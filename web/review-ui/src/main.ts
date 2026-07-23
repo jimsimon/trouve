@@ -919,7 +919,9 @@ async function pollCliInstall(cliId: string): Promise<void> {
       }
       cliInstallStatuses = { ...cliInstallStatuses, [cliId]: status };
       if (status.status === "pending") {
-        refreshProviderSettings();
+        if (!hasEditableFocus(document.querySelector("#provider-settings"))) {
+          refreshProviderSettings();
+        }
         continue;
       }
 
@@ -1363,9 +1365,10 @@ function bind(): void {
   bindRepositorySection();
 }
 
-function hasEditableFocus(): boolean {
+function hasEditableFocus(scope?: Element | null): boolean {
   const active = document.activeElement;
   return active instanceof HTMLElement
+    && (scope === undefined || scope?.contains(active) === true)
     && active.matches("input, textarea, select, [contenteditable='true']");
 }
 

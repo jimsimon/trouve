@@ -680,6 +680,10 @@ pub struct ReviewerProfile {
 
 /// Create or update a reviewer profile. Omit `id` to create a custom profile;
 /// built-in ids update only that persona's model and thinking defaults.
+///
+/// This request uses full-replace PUT semantics: omitted optional `model` or
+/// `default_thinking_level` values are cleared rather than merged with the
+/// existing profile. Callers updating either field must resend both fields.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct UpsertReviewerProfileRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
