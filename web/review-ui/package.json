@@ -5,7 +5,8 @@
   "type": "module",
   "scripts": {
     "build": "tsc && vite build",
-    "dev": "vite --host 0.0.0.0"
+    "dev": "vite --host 0.0.0.0",
+    "test": "node --test src/*.test.mjs"
   },
   "devDependencies": {
     "typescript": "^5.9.2",

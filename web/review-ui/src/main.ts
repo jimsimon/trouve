@@ -1,4 +1,5 @@
 import "./styles.css";
+import { jobStatusClass, normalizedReviewMode, safeExternalUrl } from "./security";
 
 type ReviewMode = "off" | "manual" | "automatic";
 type ReviewerPromptMode = "inherit" | "append" | "replace";
@@ -184,15 +185,6 @@ function providerCredentialLabel(provider: Provider): string {
   return provider.has_credentials ? "API key ready" : "API key required";
 }
 
-function safeExternalUrl(value: string): string {
-  try {
-    const url = new URL(value);
-    return url.protocol === "https:" || url.protocol === "http:" ? url.toString() : "";
-  } catch {
-    return "";
-  }
-}
-
 function renderProviderLogin(): string {
   if (!providerLogin) return "";
   const login = providerLogin;
@@ -276,9 +268,10 @@ function filteredRepositories(): Repository[] {
   if (!dashboard) return [];
   const query = repositoryQuery.trim().toLowerCase();
   return dashboard.repositories.filter((repo) => {
+    const mode = normalizedReviewMode(repo.mode);
     const matchesQuery = !query || repo.repository.toLowerCase().includes(query);
     const matchesMode = repositoryModeFilter === "all"
-      || (repositoryModeFilter === "enabled" ? repo.mode !== "off" : repo.mode === repositoryModeFilter);
+      || (repositoryModeFilter === "enabled" ? mode !== "off" : mode === repositoryModeFilter);
     return matchesQuery && matchesMode;
   });
 }
@@ -310,12 +303,13 @@ function renderRepositorySection(reviewers: ReviewerProfile[]): string {
     <div class="repo-list">
       ${pageRepositories.map((repo) => {
         const key = repositoryKey(repo);
-        const modeLabel = repo.mode === "automatic" ? "Automatic" : repo.mode === "manual" ? "Manual" : "Off";
+        const mode = normalizedReviewMode(repo.mode);
+        const modeLabel = mode === "automatic" ? "Automatic" : mode === "manual" ? "Manual" : "Off";
         return `<details class="repo-shell" data-repository-key="${escape(key)}" ${expandedRepositories.has(key) ? "open" : ""}>
-          <summary><div class="repo-summary-name"><strong>${escape(repo.repository)}</strong><small>Installation ${repo.installation_id}</small></div><div class="repo-summary-status">${repo.private ? "<span class=\"repo-visibility\">private</span>" : ""}<span class="repo-mode ${repo.mode}">${modeLabel}</span><span class="repo-expand-label" aria-hidden="true"></span></div></summary>
+          <summary><div class="repo-summary-name"><strong>${escape(repo.repository)}</strong><small>Installation ${repo.installation_id}</small></div><div class="repo-summary-status">${repo.private ? "<span class=\"repo-visibility\">private</span>" : ""}<span class="repo-mode ${mode}">${modeLabel}</span><span class="repo-expand-label" aria-hidden="true"></span></div></summary>
           <form class="repo" data-installation-id="${repo.installation_id}" data-repository="${escape(repo.repository)}">
             <div class="repo-controls">
-              <label>Review mode<select name="mode"><option value="off" ${repo.mode === "off" ? "selected" : ""}>Off</option><option value="manual" ${repo.mode === "manual" ? "selected" : ""}>Manual</option><option value="automatic" ${repo.mode === "automatic" ? "selected" : ""}>Automatic</option></select></label>
+              <label>Review mode<select name="mode"><option value="off" ${mode === "off" ? "selected" : ""}>Off</option><option value="manual" ${mode === "manual" ? "selected" : ""}>Manual</option><option value="automatic" ${mode === "automatic" ? "selected" : ""}>Automatic</option></select></label>
               <label>Default review model<select name="model">${modelOptions(repo.model)}</select></label>
               <label>Repository instructions<input name="prompt" value="${escape(repo.prompt)}" placeholder="Extra repository instructions" /></label>
               <button>Save repository</button>
@@ -414,11 +408,19 @@ function render(): void {
     <section class="card wide">
       <p class="eyebrow">History</p><h2>Review jobs</h2>
       <div class="jobs">
-        ${dashboard.jobs.map((job) => `<article>
-          <span class="job-status ${escape(job.status)}">${escape(job.status)}</span>
-          <div><a href="${escape(job.pull_url)}" target="_blank" rel="noreferrer">${escape(job.repository)} #${job.pull_number}</a><strong>${escape(job.pull_title)}</strong><small>${escape(job.trigger)} · ${escape(job.model ?? "default model")} · ${time(job.created_at)} · ${escape(job.head_sha.slice(0, 8))}</small>${job.error ? `<p class="error">${escape(job.error)}</p>` : ""}</div>
-          ${job.review_url ? `<a class="review-link" href="${escape(job.review_url)}" target="_blank" rel="noreferrer">Open review ↗</a>` : ""}
-        </article>`).join("") || `<p class="empty">No reviews have run yet.</p>`}
+        ${dashboard.jobs.map((job) => {
+          const pullUrl = safeExternalUrl(job.pull_url);
+          const reviewUrl = safeExternalUrl(job.review_url);
+          const pullLabel = `${escape(job.repository)} #${escape(job.pull_number)}`;
+          const pullReference = pullUrl
+            ? `<a href="${escape(pullUrl)}" target="_blank" rel="noopener noreferrer">${pullLabel}</a>`
+            : `<span>${pullLabel}</span>`;
+          return `<article>
+            <span class="job-status ${jobStatusClass(job.status)}">${escape(job.status)}</span>
+            <div>${pullReference}<strong>${escape(job.pull_title)}</strong><small>${escape(job.trigger)} · ${escape(job.model ?? "default model")} · ${time(job.created_at)} · ${escape(job.head_sha.slice(0, 8))}</small>${job.error ? `<p class="error">${escape(job.error)}</p>` : ""}</div>
+            ${reviewUrl ? `<a class="review-link" href="${escape(reviewUrl)}" target="_blank" rel="noopener noreferrer">Open review ↗</a>` : ""}
+          </article>`;
+        }).join("") || `<p class="empty">No reviews have run yet.</p>`}
       </div>
     </section>`;
   bind();
