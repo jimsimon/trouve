@@ -1,0 +1,4 @@
+interface:
+  display_name: "Prepare Trouve Release"
+  short_description: "Prepare and verify a lockstep Trouve release"
+  default_prompt: "Use $prepare-release to prepare the next Trouve release and return its GitHub-ready changelog."

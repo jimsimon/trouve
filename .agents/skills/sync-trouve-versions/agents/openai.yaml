@@ -1,4 +1,0 @@
-interface:
-  display_name: "Sync Trouve Versions"
-  short_description: "Keep every Trouve artifact on one version"
-  default_prompt: "Use $sync-trouve-versions to bump the entire repository to the next release version."
