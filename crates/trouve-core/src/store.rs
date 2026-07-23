@@ -12,7 +12,9 @@ use std::sync::{Arc, Mutex};
 use anyhow::{Context, Result};
 use rusqlite::{Connection, OptionalExtension, params};
 use tokio::sync::broadcast;
-use trouve_protocol::{Event, EventEnvelope, PermissionMode, Scope, Session, Thread, Workspace};
+use trouve_protocol::{
+    Event, EventEnvelope, GithubPrList, PermissionMode, Scope, Session, Thread, Workspace,
+};
 
 const SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS workspaces (
@@ -443,6 +445,18 @@ pub struct CheckpointRow {
     pub commit_hash: String,
 }
 
+/// One bounded slice of persisted event history.
+///
+/// `next_after` advances across every database row the page inspected,
+/// including retired or forward-incompatible events that were skipped while
+/// decoding. This lets stream consumers make progress without retaining the
+/// whole replay in memory.
+pub struct EventReplayPage {
+    pub events: Vec<EventEnvelope>,
+    pub next_after: u64,
+    pub exhausted: bool,
+}
+
 /// Shared handle to the database plus the live event fan-out.
 #[derive(Clone)]
 pub struct Store {
@@ -644,26 +658,65 @@ impl Store {
             .map_err(|_| anyhow::anyhow!("event writer thread has exited"))?
     }
 
-    /// Persisted events for a scope after `after` (exclusive), oldest first.
-    pub fn events_after(&self, scope: &Scope, after: u64) -> Result<Vec<EventEnvelope>> {
+    /// Newest persisted cursor for `scope`, or zero when the scope is empty.
+    pub fn latest_event_cursor(&self, scope: &Scope) -> Result<u64> {
+        let (kind, id) = scope_cols(scope);
+        let conn = self.conn.lock().unwrap();
+        let cursor = conn.query_row(
+            "SELECT MAX(cursor) FROM events WHERE scope_kind = ?1 AND scope_id = ?2",
+            params![kind, id],
+            |row| row.get::<_, Option<i64>>(0),
+        )?;
+        Ok(cursor.unwrap_or(0) as u64)
+    }
+
+    /// Read at most `limit` persisted rows in `(after, through]`.
+    ///
+    /// The fixed upper cursor gives callers a stable replay snapshot while a
+    /// live subscription captures concurrent appends. Pages release the
+    /// SQLite connection between batches, bounding both heap use and lock
+    /// hold time for large histories.
+    pub fn event_replay_page(
+        &self,
+        scope: &Scope,
+        after: u64,
+        through: u64,
+        limit: usize,
+    ) -> Result<EventReplayPage> {
+        if after >= through || limit == 0 {
+            return Ok(EventReplayPage {
+                events: Vec::new(),
+                next_after: after,
+                exhausted: true,
+            });
+        }
         let (kind, id) = scope_cols(scope);
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
             "SELECT cursor, scope_kind, scope_id, ts, payload FROM events
-             WHERE scope_kind = ?1 AND scope_id = ?2 AND cursor > ?3 ORDER BY cursor",
+             WHERE scope_kind = ?1 AND scope_id = ?2
+               AND cursor > ?3 AND cursor <= ?4
+             ORDER BY cursor LIMIT ?5",
         )?;
-        let rows = stmt.query_map(params![kind, id, after as i64], |row| {
-            Ok((
-                row.get::<_, i64>(0)? as u64,
-                row.get::<_, String>(1)?,
-                row.get::<_, String>(2)?,
-                row.get::<_, String>(3)?,
-                row.get::<_, String>(4)?,
-            ))
-        })?;
+        let rows = stmt.query_map(
+            params![kind, id, after as i64, through as i64, limit as i64],
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)? as u64,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                ))
+            },
+        )?;
         let mut out = Vec::new();
+        let mut rows_seen = 0usize;
+        let mut next_after = after;
         for row in rows {
             let (cursor, kind, id, ts, payload) = row?;
+            rows_seen += 1;
+            next_after = cursor;
             // Skip a row we can't deserialize (e.g. an event type written by
             // a newer build) rather than failing the whole scope's replay —
             // otherwise one unknown event makes the session/thread
@@ -683,7 +736,60 @@ impl Store {
                 event,
             });
         }
+        Ok(EventReplayPage {
+            events: out,
+            next_after,
+            exhausted: next_after >= through || rows_seen < limit,
+        })
+    }
+
+    /// Persisted events for a scope after `after` (exclusive), oldest first.
+    ///
+    /// Callers that consume events incrementally should prefer
+    /// [`Self::event_replay_page`]. This compatibility helper still returns a
+    /// single vector, but uses bounded database pages while assembling it.
+    pub fn events_after(&self, scope: &Scope, after: u64) -> Result<Vec<EventEnvelope>> {
+        const PAGE_SIZE: usize = 256;
+
+        let through = self.latest_event_cursor(scope)?;
+        let mut cursor = after;
+        let mut out = Vec::new();
+        while cursor < through {
+            let page = self.event_replay_page(scope, cursor, through, PAGE_SIZE)?;
+            let next = page.next_after;
+            out.extend(page.events);
+            if page.exhausted || next <= cursor {
+                break;
+            }
+            cursor = next;
+        }
         Ok(out)
+    }
+
+    /// Most recently persisted account PR snapshot for `host`.
+    ///
+    /// The scan runs newest-first and stops at the first matching host, so a
+    /// fresh server process can seed its change detector without replaying or
+    /// retaining historical snapshots.
+    pub fn latest_github_pr_snapshot(&self, host: &str) -> Result<Option<GithubPrList>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT payload FROM events
+             WHERE scope_kind = 'server' AND scope_id = ''
+             ORDER BY cursor DESC",
+        )?;
+        let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+        for payload in rows {
+            let Ok(Event::GithubPullRequestsUpdated { pull_requests }) =
+                serde_json::from_str::<Event>(&payload?)
+            else {
+                continue;
+            };
+            if pull_requests.host.eq_ignore_ascii_case(host) {
+                return Ok(Some(pull_requests));
+            }
+        }
+        Ok(None)
     }
 
     /// Live subscription to all events; callers filter by scope.
@@ -2402,6 +2508,92 @@ mod tests {
             replayed[0].event,
             Event::WorkspaceRegistered { .. }
         ));
+    }
+
+    #[test]
+    fn replay_pages_are_bounded_and_advance_past_retired_rows() {
+        let store = Store::open_in_memory().unwrap();
+        let retired_payload = serde_json::json!({
+            "type": "workspace.pull_requests_updated",
+            "workspace_id": "ws_1",
+            "pull_requests": { "viewer": "octocat", "prs": [] },
+        })
+        .to_string();
+        store
+            .conn
+            .lock()
+            .unwrap()
+            .execute(
+                "INSERT INTO events (scope_kind, scope_id, ts, payload) VALUES ('server', '', ?1, ?2)",
+                params![chrono::Utc::now().to_rfc3339(), retired_payload],
+            )
+            .unwrap();
+        for index in 0..3 {
+            store
+                .append_event(
+                    Scope::Server,
+                    Event::WorkspaceRegistered {
+                        workspace_id: format!("ws_{index}"),
+                        path: format!("/tmp/workspace-{index}"),
+                    },
+                )
+                .unwrap();
+        }
+
+        let through = store.latest_event_cursor(&Scope::Server).unwrap();
+        let first = store
+            .event_replay_page(&Scope::Server, 0, through, 2)
+            .unwrap();
+        assert_eq!(first.events.len(), 1);
+        assert!(!first.exhausted);
+        assert_eq!(first.events[0].cursor, first.next_after);
+
+        let second = store
+            .event_replay_page(&Scope::Server, first.next_after, through, 2)
+            .unwrap();
+        assert_eq!(second.events.len(), 2);
+        assert!(second.exhausted);
+        assert_eq!(second.next_after, through);
+    }
+
+    #[test]
+    fn latest_github_snapshot_is_scoped_to_host() {
+        let store = Store::open_in_memory().unwrap();
+        for (viewer, host) in [
+            ("alice", "github.com"),
+            ("enterprise", "github.example.com"),
+            ("bob", "github.com"),
+        ] {
+            store
+                .append_event(
+                    Scope::Server,
+                    Event::GithubPullRequestsUpdated {
+                        pull_requests: GithubPrList {
+                            viewer: viewer.into(),
+                            host: host.into(),
+                            prs: Vec::new(),
+                        },
+                    },
+                )
+                .unwrap();
+        }
+
+        let github = store
+            .latest_github_pr_snapshot("GITHUB.COM")
+            .unwrap()
+            .unwrap();
+        assert_eq!(github.viewer, "bob");
+        let enterprise = store
+            .latest_github_pr_snapshot("github.example.com")
+            .unwrap()
+            .unwrap();
+        assert_eq!(enterprise.viewer, "enterprise");
+        assert!(
+            store
+                .latest_github_pr_snapshot("missing.example.com")
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]
