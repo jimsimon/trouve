@@ -57,7 +57,7 @@ chrono.workspace = true
 arboard = { version = "3.6.1", features = ["wayland-data-control"] }
 mime_guess = "2.0.5"
 png = "0.18.1"
-base64 = "0.22"
+base64 = "0.23"
 
 [build-dependencies]
 slint-build = "1.17"
