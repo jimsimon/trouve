@@ -2484,6 +2484,130 @@ mod tests {
         server.await.unwrap();
     }
 
+    #[tokio::test]
+    async fn manual_comment_polling_stops_at_seen_comments_and_claims_requests_atomically() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        let comment = |id, pull_number, body: &str, association: &str, kind: &str| {
+            serde_json::json!({
+                "id": id,
+                "body": body,
+                "author_association": association,
+                "issue_url": format!(
+                    "https://api.github.com/repos/acme/widgets/issues/{pull_number}"
+                ),
+                "user": {"type": kind}
+            })
+        };
+        let mut first_page = vec![
+            comment(300, 42, "@trouve-ai review", "OWNER", "User"),
+            comment(299, 99, "@trouve-ai review", "MEMBER", "User"),
+            comment(298, 42, "@trouve-ai review", "CONTRIBUTOR", "User"),
+            comment(297, 42, "@trouve-ai review", "OWNER", "Bot"),
+        ];
+        first_page.extend(
+            (0..96).map(|index| comment(400 + index, 42, "ordinary discussion", "OWNER", "User")),
+        );
+        let mut second_page = vec![comment(
+            200,
+            42,
+            "@trouve-ai review",
+            "COLLABORATOR",
+            "User",
+        )];
+        second_page.extend(
+            (0..99).map(|index| comment(100 + index, 42, "older discussion", "OWNER", "User")),
+        );
+        assert_eq!(first_page.len(), REVIEW_COMMENT_PAGE_SIZE);
+        assert_eq!(second_page.len(), REVIEW_COMMENT_PAGE_SIZE);
+
+        let store = crate::store::Store::open_in_memory().unwrap();
+        assert!(
+            store
+                .claim_code_review_polled_comment("acme/widgets", 200, None)
+                .unwrap()
+        );
+        let data = tempfile::tempdir().unwrap();
+        let engine = Engine::new(
+            store,
+            data.path().to_path_buf(),
+            &crate::config::Config::default(),
+        );
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            for (page, body) in [
+                (1, serde_json::to_string(&first_page).unwrap()),
+                (2, serde_json::to_string(&second_page).unwrap()),
+            ] {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut request = Vec::new();
+                let mut buffer = [0_u8; 1024];
+                while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                    let count = stream.read(&mut buffer).await.unwrap();
+                    assert!(count > 0);
+                    request.extend_from_slice(&buffer[..count]);
+                }
+                let request = String::from_utf8(request).unwrap().to_ascii_lowercase();
+                let expected = format!(
+                    "get /repos/acme/widgets/issues/comments?sort=created&direction=desc&per_page=100&page={page} http/1.1\r\n"
+                );
+                assert!(request.starts_with(&expected), "{request}");
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                stream.write_all(response.as_bytes()).await.unwrap();
+            }
+        });
+
+        let api = GithubApi::with_base_url(
+            "Bearer token".into(),
+            format!("http://{address}"),
+            "installation:7".into(),
+        )
+        .unwrap();
+        engine
+            .poll_manual_review_comments(&api, "acme/widgets", &HashSet::from([42]))
+            .await
+            .unwrap();
+        server.await.unwrap();
+
+        assert_eq!(
+            engine
+                .store
+                .pending_code_review_manual_requests("acme/widgets")
+                .unwrap(),
+            vec![CodeReviewManualRequest {
+                pull_number: 42,
+                trigger_key: "manual:comment:300".into(),
+            }]
+        );
+        for (comment_id, pull_number) in [(299, 99), (298, 42), (297, 42), (200, 42), (300, 42)] {
+            assert!(
+                !engine
+                    .store
+                    .claim_code_review_polled_comment(
+                        "acme/widgets",
+                        comment_id,
+                        Some((pull_number, "manual:comment:duplicate")),
+                    )
+                    .unwrap()
+            );
+        }
+        assert_eq!(
+            engine
+                .store
+                .pending_code_review_manual_requests("acme/widgets")
+                .unwrap(),
+            vec![CodeReviewManualRequest {
+                pull_number: 42,
+                trigger_key: "manual:comment:300".into(),
+            }]
+        );
+    }
+
     #[test]
     fn parses_fenced_review_json() {
         let review =

@@ -195,6 +195,9 @@ CREATE TABLE IF NOT EXISTS github_webhook_deliveries (
   delivery_id TEXT PRIMARY KEY,
   received_at TEXT NOT NULL
 );
+-- TODO(retention): use seen_at for periodic archival or cleanup, but retain a
+-- durable per-repository watermark or equivalent tombstone so deleting old
+-- rows can never make stale manual-review commands eligible again.
 CREATE TABLE IF NOT EXISTS code_review_polled_comments (
   repository TEXT NOT NULL,
   comment_id INTEGER NOT NULL,
