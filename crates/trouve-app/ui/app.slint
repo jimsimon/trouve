@@ -395,6 +395,10 @@ component SearchPicker inherits Rectangle {
                             }
                             if oi >= 0 && oi < root.health.length
                                 && root.health[oi].summary != "": HorizontalLayout {
+                                // Reserve one fixed metadata column so the
+                                // status dot does not follow model-name width.
+                                min-width: 202px;
+                                max-width: 202px;
                                 spacing: 5px;
                                 Rectangle {
                                     width: 7px;
