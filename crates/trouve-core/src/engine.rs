@@ -157,10 +157,13 @@ pub struct Engine {
     /// stream, tool calls, and approval waits at the next await point.
     turn_cancels: Mutex<std::collections::HashMap<String, tokio_util::sync::CancellationToken>>,
     /// Per-host incremental PR snapshots. The map lock is held only for entry
-    /// management and durable publication; each host has its own async lock so
+    /// management and identity validation; each host has its own async lock so
     /// network refreshes do not block host removal or unrelated hosts.
     github_dashboard_caches:
         Mutex<HashMap<String, Arc<tokio::sync::Mutex<crate::github::GitHubDashboardCache>>>>,
+    /// Orders snapshot publication against host removal without holding the
+    /// cache map lock across event-log writes.
+    github_dashboard_publication: Mutex<()>,
     pub(crate) config: Mutex<Config>,
     /// Where provider configuration changes are persisted. `None` disables
     /// persistence (tests).
@@ -469,6 +472,7 @@ impl Engine {
             deleting_sessions: Mutex::new(std::collections::HashSet::new()),
             turn_cancels: Mutex::new(std::collections::HashMap::new()),
             github_dashboard_caches: Mutex::new(HashMap::new()),
+            github_dashboard_publication: Mutex::new(()),
             config: Mutex::new(config.clone()),
             // No write-back by default: only a caller that loaded `config`
             // from disk should enable persisting to that file (see
@@ -2950,8 +2954,11 @@ impl Engine {
         let _ = self
             .secrets
             .delete(&trouve_providers::secrets::oauth_secret(&id));
-        let mut dashboard_caches = self.github_dashboard_caches.lock().unwrap();
-        dashboard_caches.remove(&host);
+        let _publication = self.github_dashboard_publication.lock().unwrap();
+        {
+            let mut dashboard_caches = self.github_dashboard_caches.lock().unwrap();
+            dashboard_caches.remove(&host);
+        }
         self.store.append_event(
             Scope::Server,
             Event::GithubPullRequestsUpdated {
@@ -3338,11 +3345,14 @@ impl Engine {
             let Some(snapshot) = cache.unpublished_snapshot(&pull_requests)? else {
                 continue;
             };
-            let dashboard_caches = self.github_dashboard_caches.lock().unwrap();
-            if !dashboard_caches
-                .get(&pull_requests.host)
-                .is_some_and(|current| Arc::ptr_eq(current, &cache_handle))
-            {
+            let _publication = self.github_dashboard_publication.lock().unwrap();
+            let cache_is_current = {
+                let dashboard_caches = self.github_dashboard_caches.lock().unwrap();
+                dashboard_caches
+                    .get(&pull_requests.host)
+                    .is_some_and(|current| Arc::ptr_eq(current, &cache_handle))
+            };
+            if !cache_is_current {
                 continue;
             }
             self.store.append_event(
