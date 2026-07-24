@@ -1502,6 +1502,8 @@ export component AppWindow inherits Window {
     in property <[ModeItem]> settings-mode-items;
     in property <[string]> settings-mode-model-names;
     in property <string> settings-status: "";
+    in property <string> settings-login-provider-id: "";
+    in property <bool> settings-login-code-required: false;
     in-out property <int> settings-preset-index: 0;
     // Which settings section shows when the screen opens (0 providers …
     // 3 integrations); the controller sets it before flipping center-screen.
@@ -1533,7 +1535,8 @@ export component AppWindow inherits Window {
     callback provider-saved(/* id */ string, /* kind */ string,
                             /* base-url */ string, /* api-key */ string);
     callback provider-deleted(string);
-    callback provider-login(string);
+    callback provider-login(/* id */ string, /* kind */ string);
+    callback provider-login-response(/* id */ string, /* response */ string);
     callback default-model-picked(int, string);
     callback default-permission-picked(int);
     callback mode-saved(string, string, string, string, bool, int, int, string);
@@ -5267,6 +5270,8 @@ export component AppWindow inherits Window {
         mode-items: root.settings-mode-items;
         mode-model-names: root.settings-mode-model-names;
         settings-status: root.settings-status;
+        login-provider-id: root.settings-login-provider-id;
+        login-code-required: root.settings-login-code-required;
         preset-index <=> root.settings-preset-index;
         section <=> root.settings-section;
         github-hosts: root.settings-github-hosts;
@@ -5305,7 +5310,10 @@ export component AppWindow inherits Window {
             root.provider-saved(id, kind, url, key);
         }
         provider-deleted(id) => { root.provider-deleted(id); }
-        provider-login(id) => { root.provider-login(id); }
+        provider-login(id, kind) => { root.provider-login(id, kind); }
+        provider-login-response(id, response) => {
+            root.provider-login-response(id, response);
+        }
         default-model-picked(i, thinking) => { root.default-model-picked(i, thinking); }
         default-permission-picked(i) => { root.default-permission-picked(i); }
         mode-saved(id, name, prompt, tools, ro, perm, model, thinking) => {

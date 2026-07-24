@@ -14,9 +14,8 @@
 //! `--permission-prompt-tool`, so headless print mode routes permission
 //! requests to trouve's approval flow instead of failing them.
 //!
-//! Login uses `claude auth login` in a small PTY. The browser callback can
-//! complete directly when it reaches the CLI, or the client can paste the
-//! failed localhost callback URL back through trouve on remote hosts.
+//! Login uses `claude auth login` in a small PTY. The client pastes the
+//! authentication code shown by Claude's browser flow back through trouve.
 //!
 //! Subscription usage (the data behind the TUI's `/usage` dialog) is read
 //! through the same stream-json surface: a short-lived print-mode process
@@ -61,6 +60,23 @@ impl ClaudeBackend {
             pool: Arc::new(Pool::default()),
         }
     }
+}
+
+fn auth_status_is_logged_in(output: &[u8]) -> bool {
+    serde_json::from_slice::<Value>(output)
+        .ok()
+        .and_then(|status| status.get("loggedIn")?.as_bool())
+        .unwrap_or(false)
+}
+
+fn claude_is_logged_in(command: &str) -> bool {
+    std::process::Command::new(command)
+        .args(["auth", "status", "--json"])
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output()
+        .map(|output| output.status.success() && auth_status_is_logged_in(&output.stdout))
+        .unwrap_or(false)
 }
 
 /// Live `claude` processes keyed by trouve thread id.
@@ -200,16 +216,10 @@ impl AgentBackend for ClaudeBackend {
     }
 
     fn status(&self) -> BackendStatus {
-        let home = dirs::home_dir();
-        let has_credentials = home
-            .map(|h| {
-                h.join(".claude").join(".credentials.json").exists()
-                    || h.join(".claude.json").exists()
-            })
-            .unwrap_or(false);
+        let installed = binary_on_path(&self.command);
         BackendStatus {
-            installed: binary_on_path(&self.command),
-            has_credentials,
+            installed,
+            has_credentials: installed && claude_is_logged_in(&self.command),
         }
     }
 
@@ -936,6 +946,14 @@ fn parse_reset_at(v: &Value) -> Option<i64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parses_authoritative_claude_auth_status() {
+        assert!(auth_status_is_logged_in(br#"{"loggedIn":true}"#));
+        assert!(!auth_status_is_logged_in(br#"{"loggedIn":false}"#));
+        assert!(!auth_status_is_logged_in(br#"{"authMethod":"none"}"#));
+        assert!(!auth_status_is_logged_in(b"not json"));
+    }
 
     fn rfc3339_in(secs: i64) -> String {
         chrono::DateTime::from_timestamp(chrono::Utc::now().timestamp() + secs, 0)

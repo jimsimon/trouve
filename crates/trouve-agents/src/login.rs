@@ -31,9 +31,9 @@ pub async fn spawn_codex_login(command: &str) -> Result<BackendLogin, BackendErr
 
 /// Start Claude Code's subscription login in a PTY.
 ///
-/// Claude buffers the prompt when stdout is a pipe and requires stdin when a
-/// remote browser cannot reach its localhost callback. A PTY makes the URL
-/// available immediately and lets the client paste that callback back in.
+/// Claude buffers the prompt when stdout is a pipe and requires stdin for the
+/// authentication code shown by its browser flow. A PTY makes the URL
+/// available immediately and lets the client paste that code back in.
 pub async fn spawn_claude_login(command: &str) -> Result<BackendLogin, BackendError> {
     if !crate::binary_on_path(command) {
         return Err(BackendError::NotInstalled(command.to_string()));
@@ -80,7 +80,8 @@ pub async fn spawn_claude_login(command: &str) -> Result<BackendLogin, BackendEr
     std::thread::spawn(move || {
         if let Some(callback) = callback_rx.blocking_recv() {
             use std::io::Write as _;
-            let _ = writer.write_all(callback.as_bytes());
+            let input = claude_login_input(&callback);
+            let _ = writer.write_all(input.as_bytes());
             let _ = writer.write_all(b"\n");
             let _ = writer.flush();
         }
@@ -267,7 +268,7 @@ fn find_url(line: &str) -> Option<String> {
     let start = line.find("https://").or_else(|| line.find("http://"))?;
     let url: String = line[start..]
         .chars()
-        .take_while(|c| !c.is_whitespace() && *c != '"' && *c != '\'' && *c != '\u{1b}')
+        .take_while(|c| !c.is_whitespace() && !c.is_control() && *c != '"' && *c != '\'')
         .collect();
     // Trim trailing punctuation that often follows URLs in prose.
     let url = url.trim_end_matches(['.', ',', ')', ']']);
@@ -286,6 +287,28 @@ fn find_url(line: &str) -> Option<String> {
         return None;
     }
     Some(url.to_string())
+}
+
+/// Claude's current browser flow displays `code#state`, while older clients
+/// may still submit the full callback URL. Convert either form to the input
+/// expected by `claude auth login`.
+fn claude_login_input(input: &str) -> String {
+    let Ok(url) = reqwest::Url::parse(input) else {
+        return input.to_string();
+    };
+    let mut code = None;
+    let mut state = None;
+    for (key, value) in url.query_pairs() {
+        match key.as_ref() {
+            "code" => code = Some(value.into_owned()),
+            "state" => state = Some(value.into_owned()),
+            _ => {}
+        }
+    }
+    match (code, state) {
+        (Some(code), Some(state)) => format!("{code}#{state}"),
+        _ => input.to_string(),
+    }
 }
 
 /// Device-flow style codes ("Enter code: ABCD-1234").
@@ -327,17 +350,32 @@ fn valid_user_code(code: &str) -> bool {
         && code.chars().any(|c| c.is_ascii_digit() || c == '-')
 }
 
-/// Remove ANSI control-sequence introducer escapes from vendor CLI output.
+/// Remove ANSI CSI and OSC escape sequences from vendor CLI output.
 fn strip_ansi(line: &str) -> String {
     let mut clean = String::with_capacity(line.len());
     let mut chars = line.chars().peekable();
     while let Some(c) = chars.next() {
-        if c == '\u{1b}' && chars.peek() == Some(&'[') {
-            chars.next();
-            for part in chars.by_ref() {
-                if ('@'..='~').contains(&part) {
-                    break;
+        if c == '\u{1b}' {
+            match chars.next() {
+                Some('[') => {
+                    for part in chars.by_ref() {
+                        if ('@'..='~').contains(&part) {
+                            break;
+                        }
+                    }
                 }
+                Some(']') => {
+                    while let Some(part) = chars.next() {
+                        if part == '\u{7}' {
+                            break;
+                        }
+                        if part == '\u{1b}' && chars.peek() == Some(&'\\') {
+                            chars.next();
+                            break;
+                        }
+                    }
+                }
+                Some(_) | None => {}
             }
         } else {
             clean.push(c);
@@ -384,6 +422,31 @@ mod tests {
     }
 
     #[test]
+    fn strips_osc_hyperlinks_without_corrupting_urls() {
+        let url = "https://claude.example.test/oauth?state=test-state";
+        let linked = format!("\u{1b}]8;;{url}\u{7}{url}\u{1b}]8;;\u{7}");
+        assert_eq!(strip_ansi(&linked), url);
+        assert_eq!(find_url(&linked).as_deref(), Some(url));
+
+        let string_terminated = format!("\u{1b}]8;;{url}\u{1b}\\{url}\u{1b}]8;;\u{1b}\\");
+        assert_eq!(strip_ansi(&string_terminated), url);
+    }
+
+    #[test]
+    fn converts_claude_callback_urls_to_authentication_codes() {
+        assert_eq!(
+            claude_login_input(
+                "https://platform.claude.com/oauth/code/callback?code=test-code&state=test-state"
+            ),
+            "test-code#test-state"
+        );
+        assert_eq!(
+            claude_login_input("test-code#test-state"),
+            "test-code#test-state"
+        );
+    }
+
+    #[test]
     fn extracts_user_codes() {
         assert_eq!(
             find_user_code("Enter code: ABCD-1234"),
@@ -422,7 +485,7 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn claude_login_uses_pty_and_forwards_browser_callback() {
+    async fn claude_login_uses_pty_and_forwards_authentication_code() {
         let dir = tempfile::tempdir().unwrap();
         let command = dir.path().join("fake-claude");
         std::fs::write(
@@ -431,10 +494,11 @@ mod tests {
 if [ "$1" != "auth" ] || [ "$2" != "login" ] || [ "$3" != "--claudeai" ]; then
   exit 2
 fi
-printf 'If the browser did not open, visit: https://claude.example.test/oauth\n'
+url='https://claude.example.test/oauth'
+printf 'If the browser did not open, visit: \033]8;;%s\a%s\033]8;;\a\n' "$url" "$url"
 printf 'Paste code here if prompted > '
-IFS= read -r callback
-if [ "$callback" = "http://localhost:54545/callback?code=test-code&state=test-state" ]; then
+IFS= read -r code
+if [ "$code" = "test-code#test-state" ]; then
   exit 0
 fi
 exit 3
@@ -453,7 +517,10 @@ exit 3
         login
             .callback_sender
             .unwrap()
-            .send("http://localhost:54545/callback?code=test-code&state=test-state".into())
+            .send(
+                "https://platform.claude.com/oauth/code/callback?code=test-code&state=test-state"
+                    .into(),
+            )
             .await
             .unwrap();
         tokio::time::timeout(Duration::from_secs(3), login.done)

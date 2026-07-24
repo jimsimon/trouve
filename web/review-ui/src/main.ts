@@ -310,14 +310,14 @@ function renderProviderLogin(): string {
     failed: "Sign-in failed",
   }[login.state];
   const callbackFallback = login.state === "pending" && login.callback_required
-    ? `<p>If the browser ends on a localhost connection error, copy the full URL from its address bar and paste it here.</p>
+    ? `<p>After authorizing, copy the authentication code shown by Claude and paste it here.</p>
        <form class="login-callback" data-provider-login-callback>
-         <input name="callback_url" type="text" autocomplete="off" spellcheck="false" placeholder="http://localhost:…?code=…&state=…" aria-label="Claude browser callback URL" required>
-         <button type="submit">Complete sign-in</button>
+         <input name="callback_url" type="text" autocomplete="off" spellcheck="false" placeholder="Authentication code" aria-label="Claude authentication code" required>
+         <button type="submit">Submit code</button>
        </form>
        ${login.callback_error ? `<p class="error">${escape(login.callback_error)}</p>` : ""}`
     : login.state === "pending" && login.callback_submitted
-      ? `<p>Browser callback sent to Claude Code. Waiting for sign-in to finish…</p>`
+      ? `<p>Authentication code sent to Claude Code. Waiting for sign-in to finish…</p>`
       : "";
   const instructions = login.state === "pending"
     ? login.verification_url

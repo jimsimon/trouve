@@ -212,9 +212,8 @@ pub enum BackendError {
 
 pub type BackendEventStream = BoxStream<'static, Result<BackendEvent, BackendError>>;
 
-/// Cheap, filesystem-based health check (no subprocesses) so provider
-/// listings stay fast. Best effort: "has_credentials" means "looks logged
-/// in", verified for real on the first turn.
+/// Best-effort provider health. Implementations should keep this fast;
+/// `has_credentials` means the vendor currently reports a usable login.
 #[derive(Debug, Clone, Default)]
 pub struct BackendStatus {
     pub installed: bool,
@@ -227,8 +226,8 @@ pub struct BackendLogin {
     /// URL the user must open (also opened by most vendor CLIs themselves).
     pub verification_url: Option<String>,
     pub user_code: Option<String>,
-    /// Sends a browser callback URL/code back to an interactive vendor CLI.
-    /// Present for flows such as Claude Code's remote/headless fallback.
+    /// Sends a browser authentication code or callback URL back to an
+    /// interactive vendor CLI.
     pub callback_sender: Option<tokio::sync::mpsc::Sender<String>>,
     pub done: BoxFuture<'static, Result<(), BackendError>>,
 }

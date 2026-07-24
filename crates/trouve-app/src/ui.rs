@@ -1594,6 +1594,30 @@ pub fn set_settings_status(ui: &Ui, text: String) {
         .upgrade_in_event_loop(move |ui| ui.set_settings_status(SharedString::from(text.as_str())));
 }
 
+pub fn set_provider_login_prompt(ui: &Ui, provider_id: String, code_required: bool) {
+    let _ = ui.upgrade_in_event_loop(move |ui| {
+        ui.set_settings_login_provider_id(provider_id.into());
+        ui.set_settings_login_code_required(code_required);
+    });
+}
+
+pub fn set_provider_login_code_required(ui: &Ui, provider_id: String, required: bool) {
+    let _ = ui.upgrade_in_event_loop(move |ui| {
+        if ui.get_settings_login_provider_id().as_str() == provider_id.as_str() {
+            ui.set_settings_login_code_required(required);
+        }
+    });
+}
+
+pub fn clear_provider_login_prompt(ui: &Ui, provider_id: String) {
+    let _ = ui.upgrade_in_event_loop(move |ui| {
+        if ui.get_settings_login_provider_id().as_str() == provider_id.as_str() {
+            ui.set_settings_login_provider_id(Default::default());
+            ui.set_settings_login_code_required(false);
+        }
+    });
+}
+
 fn string_model(values: Vec<String>) -> ModelRc<SharedString> {
     ModelRc::new(VecModel::from(
         values
