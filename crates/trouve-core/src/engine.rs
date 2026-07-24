@@ -125,6 +125,9 @@ fn normalize_thinking_option(
     }
 }
 
+type GithubDashboardCacheHandle = Arc<tokio::sync::Mutex<crate::github::GitHubDashboardCache>>;
+type GithubDashboardRefresh = (String, String, GithubDashboardCacheHandle);
+
 pub struct Engine {
     pub(crate) store: Store,
     pub(crate) data_dir: PathBuf,
@@ -159,10 +162,10 @@ pub struct Engine {
     /// Per-host incremental PR snapshots. The map lock is held only for entry
     /// management and identity validation; each host has its own async lock so
     /// network refreshes do not block host removal or unrelated hosts.
-    github_dashboard_caches:
-        Mutex<HashMap<String, Arc<tokio::sync::Mutex<crate::github::GitHubDashboardCache>>>>,
-    /// Orders snapshot publication against host removal without holding the
-    /// cache map lock across event-log writes.
+    github_dashboard_caches: Mutex<HashMap<String, GithubDashboardCacheHandle>>,
+    /// Orders authenticated-host capture, cache registration, and snapshot
+    /// publication against host removal without holding the cache map lock
+    /// across event-log writes.
     github_dashboard_publication: Mutex<()>,
     pub(crate) config: Mutex<Config>,
     /// Where provider configuration changes are persisted. `None` disables
@@ -3256,6 +3259,46 @@ impl Engine {
         Ok(self.store.list_workspaces()?)
     }
 
+    fn prepare_github_dashboard_refreshes(&self) -> Vec<GithubDashboardRefresh> {
+        self.prepare_github_dashboard_refreshes_with(|| {})
+    }
+
+    fn prepare_github_dashboard_refreshes_with(
+        &self,
+        after_capture: impl FnOnce(),
+    ) -> Vec<GithubDashboardRefresh> {
+        // Host/token capture and cache registration are one lifecycle step:
+        // removal must either run before both or clear the registered handles
+        // after both.
+        let _publication = self.github_dashboard_publication.lock().unwrap();
+        let authenticated_hosts = self
+            .github_hosts()
+            .into_iter()
+            .filter_map(|(host, _)| self.github_token(&host).map(|token| (host, token)))
+            .collect::<Vec<_>>();
+        after_capture();
+        let known_hosts = authenticated_hosts
+            .iter()
+            .map(|(host, _token)| host.clone())
+            .collect::<HashSet<_>>();
+        let mut dashboard_caches = self.github_dashboard_caches.lock().unwrap();
+        dashboard_caches.retain(|host, _cache| known_hosts.contains(host));
+        authenticated_hosts
+            .into_iter()
+            .map(|(host, token)| {
+                let cache = dashboard_caches
+                    .entry(host.clone())
+                    .or_insert_with(|| {
+                        Arc::new(tokio::sync::Mutex::new(
+                            crate::github::GitHubDashboardCache::default(),
+                        ))
+                    })
+                    .clone();
+                (host, token, cache)
+            })
+            .collect()
+    }
+
     /// Refresh the account-centric PR feed on every signed-in GitHub instance.
     pub async fn refresh_github_prs(&self) -> Result<(), EngineError> {
         let merged_since = chrono::Utc::now() - chrono::Duration::hours(24);
@@ -3273,33 +3316,7 @@ impl Engine {
         .await
         .map_err(|error| EngineError::Internal(anyhow!(error)))?;
         let mut failures = Vec::new();
-        let authenticated_hosts = self
-            .github_hosts()
-            .into_iter()
-            .filter_map(|(host, _)| self.github_token(&host).map(|token| (host, token)))
-            .collect::<Vec<_>>();
-        let known_hosts = authenticated_hosts
-            .iter()
-            .map(|(host, _token)| host.clone())
-            .collect::<HashSet<_>>();
-        let refreshes = {
-            let mut dashboard_caches = self.github_dashboard_caches.lock().unwrap();
-            dashboard_caches.retain(|host, _cache| known_hosts.contains(host));
-            authenticated_hosts
-                .into_iter()
-                .map(|(host, token)| {
-                    let cache = dashboard_caches
-                        .entry(host.clone())
-                        .or_insert_with(|| {
-                            Arc::new(tokio::sync::Mutex::new(
-                                crate::github::GitHubDashboardCache::default(),
-                            ))
-                        })
-                        .clone();
-                    (host, token, cache)
-                })
-                .collect::<Vec<_>>()
-        };
+        let refreshes = self.prepare_github_dashboard_refreshes();
         for (host, token, cache_handle) in refreshes {
             let Ok(mut cache) = cache_handle.try_lock() else {
                 tracing::debug!(host, "coalescing concurrent GitHub dashboard refresh");
@@ -7610,6 +7627,94 @@ mod tests {
         };
         let cache = cache.lock().await;
         assert!(!cache.has_published_snapshot());
+    }
+
+    #[test]
+    fn stale_github_refresh_registration_cannot_survive_host_removal() {
+        const HOST: &str = "github.example.com";
+
+        let data = tempfile::tempdir().unwrap();
+        let store = Store::open_in_memory().unwrap();
+        let config = Config {
+            local_enabled: Some(false),
+            github_enterprise: vec![crate::config::GithubEnterpriseConfig {
+                host: HOST.into(),
+                client_id: Some("client-id".into()),
+            }],
+            ..Default::default()
+        };
+        let mut engine = Engine::new(store.clone(), data.path().into(), &config);
+        engine.secrets = Arc::new(trouve_providers::secrets::FileStore::new(
+            data.path().join("secrets.json"),
+        ));
+        let tokens = trouve_providers::auth::OAuthTokens {
+            access_token: "token".into(),
+            refresh_token: None,
+            expires_at: None,
+            id_token: None,
+        };
+        engine
+            .secrets
+            .set(
+                &trouve_providers::secrets::oauth_secret(&Engine::github_secret_id(HOST)),
+                &serde_json::to_string(&tokens).unwrap(),
+            )
+            .unwrap();
+        let engine = Arc::new(engine);
+        let (captured_tx, captured_rx) = std::sync::mpsc::sync_channel(0);
+        let (resume_tx, resume_rx) = std::sync::mpsc::sync_channel(0);
+
+        let refresh_engine = Arc::clone(&engine);
+        let refresh = std::thread::spawn(move || {
+            refresh_engine.prepare_github_dashboard_refreshes_with(|| {
+                captured_tx.send(()).unwrap();
+                resume_rx
+                    .recv_timeout(std::time::Duration::from_secs(5))
+                    .unwrap();
+            })
+        });
+        captured_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+        assert!(
+            engine.github_dashboard_publication.try_lock().is_err(),
+            "host capture and cache registration must share the publication lock"
+        );
+
+        let removal_engine = Arc::clone(&engine);
+        let removal = std::thread::spawn(move || removal_engine.remove_github_host(HOST));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while engine
+            .github_hosts()
+            .iter()
+            .any(|(host, _client_id)| host == HOST)
+        {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "host removal did not update config"
+            );
+            std::thread::yield_now();
+        }
+        assert!(
+            !removal.is_finished(),
+            "removal must wait for refresh registration before clearing it"
+        );
+
+        resume_tx.send(()).unwrap();
+        let refreshes = refresh.join().unwrap();
+        removal.join().unwrap().unwrap();
+
+        let (_, _, stale_cache) = refreshes.into_iter().next().unwrap();
+        let cache_is_current = engine
+            .github_dashboard_caches
+            .lock()
+            .unwrap()
+            .get(HOST)
+            .is_some_and(|current| Arc::ptr_eq(current, &stale_cache));
+        assert!(!cache_is_current);
+        let cleared = store.latest_github_pr_snapshot(HOST).unwrap().unwrap();
+        assert!(cleared.viewer.is_empty());
+        assert!(cleared.prs.is_empty());
     }
 
     #[test]
