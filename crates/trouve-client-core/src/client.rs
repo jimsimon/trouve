@@ -377,6 +377,15 @@ impl ProtocolClient {
         self.get_json(&format!("/providers/{id}/login")).await
     }
 
+    pub async fn complete_login(
+        &self,
+        id: &str,
+        request: &CompleteLoginRequest,
+    ) -> Result<LoginStatus> {
+        self.post_json(&format!("/providers/{id}/login/callback"), request)
+            .await
+    }
+
     pub async fn upsert_provider(
         &self,
         id: &str,

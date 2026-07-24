@@ -55,6 +55,9 @@ textarea { resize: vertical; }
 .provider-login p.error { color: #ffab96; }
 .provider-login code { padding: .2rem .4rem; border-radius: 5px; color: #fff0b5; background: #332c18; font-size: 1rem; letter-spacing: .08em; }
 .login-actions { margin-top: .7rem; }
+.login-callback { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: .55rem; margin-top: .7rem; }
+.login-callback input { padding: .6rem .7rem; font-family: ui-monospace, SFMono-Regular, Consolas, monospace; font-size: .75rem; }
+.login-callback button { padding: .6rem .75rem; white-space: nowrap; }
 .button-link { display: inline-block; border-radius: 8px; padding: .65rem .85rem; color: #092017; background: #82e6b8; font-size: .82rem; font-weight: 800; }
 .button-link:hover { background: #a1f1ca; text-decoration: none; }
 .cli-manager { margin-top: 1rem; padding-top: 1rem; border-top: 1px solid #292e2b; }

@@ -8504,6 +8504,7 @@ dependencies = [
  "dirs",
  "flate2",
  "futures",
+ "portable-pty",
  "reqwest",
  "serde",
  "serde_json",

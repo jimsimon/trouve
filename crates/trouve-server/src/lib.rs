@@ -22,14 +22,14 @@ use trouve_core::Engine;
 use trouve_core::engine::EngineError;
 use trouve_protocol::{
     AddLocalModelRequest, AgentMode, Automation, BranchList, CliInfo, CliInstallStatus, CliList,
-    CodeReviewDashboard, CodeReviewRepository, ConfigureGithubAppRequest, CreatePrRequest,
-    CreateSessionRequest, CreateThreadRequest, DirEntry, ErrorBody, FileContent, GithubAppStatus,
-    GithubIntegration, GithubPrList, KnownProvider, LocalSearchResult, LocalStatus, LoginStarted,
-    LoginStatus, McpLogs, McpServerInfo, MergePrRequest, ModeInfo, ModelInfo, OpenTerminalRequest,
-    PROTOCOL_VERSION, PrInfo, ProviderInfo, ProvidersResponse, QueuedPrompt,
-    RegisterWorkspaceRequest, ReorderQueueRequest, ResolveApprovalRequest, ResolveQuestionRequest,
-    ReviewerProfile, Scope, SendMessageRequest, ServerInfo, Session, SessionDiff,
-    SetDefaultModelRequest, SetDefaultPermissionModeRequest, SetLocalEnabledRequest,
+    CodeReviewDashboard, CodeReviewRepository, CompleteLoginRequest, ConfigureGithubAppRequest,
+    CreatePrRequest, CreateSessionRequest, CreateThreadRequest, DirEntry, ErrorBody, FileContent,
+    GithubAppStatus, GithubIntegration, GithubPrList, KnownProvider, LocalSearchResult,
+    LocalStatus, LoginStarted, LoginStatus, McpLogs, McpServerInfo, MergePrRequest, ModeInfo,
+    ModelInfo, OpenTerminalRequest, PROTOCOL_VERSION, PrInfo, ProviderInfo, ProvidersResponse,
+    QueuedPrompt, RegisterWorkspaceRequest, ReorderQueueRequest, ResolveApprovalRequest,
+    ResolveQuestionRequest, ReviewerProfile, Scope, SendMessageRequest, ServerInfo, Session,
+    SessionDiff, SetDefaultModelRequest, SetDefaultPermissionModeRequest, SetLocalEnabledRequest,
     SubscriptionHealth, TerminalInfo, TerminalInputRequest, TerminalResizeRequest, Thread,
     TurnAccepted, UpdateCodeReviewRepositoryRequest, UpdateQueuedPromptRequest,
     UpdateSessionRequest, UpdateThreadRequest, UpsertAutomationRequest, UpsertMcpServerRequest,
@@ -117,6 +117,7 @@ impl IntoResponse for ApiError {
         upsert_provider,
         delete_provider,
         start_login,
+        complete_login,
         login_status,
         list_clis,
         start_cli_install,
@@ -198,6 +199,7 @@ impl IntoResponse for ApiError {
         ProvidersResponse,
         KnownProvider,
         LoginStarted,
+        CompleteLoginRequest,
         LoginStatus,
         CliInfo,
         CliList,
@@ -461,6 +463,7 @@ pub fn build_router(engine: Arc<Engine>) -> Router {
             "/v1/providers/{id}/login",
             post(start_login).get(login_status),
         )
+        .route("/v1/providers/{id}/login/callback", post(complete_login))
         .route("/v1/clis", get(list_clis))
         .route(
             "/v1/clis/{id}/install",
@@ -1036,6 +1039,18 @@ async fn start_login(
     Path(id): Path<String>,
 ) -> Result<Json<LoginStarted>, ApiError> {
     Ok(Json(engine.start_login(&id).await?))
+}
+
+#[utoipa::path(post, path = "/v1/providers/{id}/login/callback",
+    params(("id" = String, Path,)), request_body = CompleteLoginRequest,
+    responses((status = 200, body = LoginStatus), (status = 400, body = ErrorBody),
+              (status = 404, body = ErrorBody), (status = 409, body = ErrorBody)))]
+async fn complete_login(
+    State(engine): State<Arc<Engine>>,
+    Path(id): Path<String>,
+    Json(request): Json<CompleteLoginRequest>,
+) -> Result<Json<LoginStatus>, ApiError> {
+    Ok(Json(engine.complete_login(&id, request).await?))
 }
 
 #[utoipa::path(get, path = "/v1/providers/{id}/login", params(("id" = String, Path,)),

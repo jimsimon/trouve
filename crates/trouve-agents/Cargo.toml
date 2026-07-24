@@ -14,6 +14,7 @@ chrono.workspace = true
 dirs.workspace = true
 flate2 = "1"
 futures.workspace = true
+portable-pty = "0.9.0"
 reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true

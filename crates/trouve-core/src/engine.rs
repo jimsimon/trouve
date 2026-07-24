@@ -218,7 +218,10 @@ enum LoginState {
     /// In flight; carries what the user was told to do so a repeated
     /// start_login can re-present it (e.g. after closing the browser tab)
     /// instead of refusing while the flow is still valid.
-    Pending(trouve_protocol::LoginStarted),
+    Pending {
+        started: trouve_protocol::LoginStarted,
+        callback_sender: Option<tokio::sync::mpsc::Sender<String>>,
+    },
     Success,
     Failed(String),
 }
@@ -985,7 +988,7 @@ impl Engine {
         // A login is already in flight (the user may have closed the
         // browser tab): re-present the same instructions — the URL/code
         // stay valid while the flow waits — instead of refusing.
-        if let Some(LoginState::Pending(started)) = self.logins.lock().unwrap().get(id) {
+        if let Some(LoginState::Pending { started, .. }) = self.logins.lock().unwrap().get(id) {
             return Ok(started.clone());
         }
 
@@ -1001,10 +1004,13 @@ impl Engine {
                     .unwrap_or_else(|| device.verification_uri.clone()),
                 user_code: Some(device.user_code.clone()),
             };
-            self.logins
-                .lock()
-                .unwrap()
-                .insert(id.to_string(), LoginState::Pending(started.clone()));
+            self.logins.lock().unwrap().insert(
+                id.to_string(),
+                LoginState::Pending {
+                    started: started.clone(),
+                    callback_sender: None,
+                },
+            );
             let engine = self.clone();
             let id = id.to_string();
             tokio::spawn(async move {
@@ -1033,10 +1039,13 @@ impl Engine {
                 verification_url: url,
                 user_code: None,
             };
-            self.logins
-                .lock()
-                .unwrap()
-                .insert(id.to_string(), LoginState::Pending(started.clone()));
+            self.logins.lock().unwrap().insert(
+                id.to_string(),
+                LoginState::Pending {
+                    started: started.clone(),
+                    callback_sender: None,
+                },
+            );
             let engine = self.clone();
             let id = id.to_string();
             tokio::spawn(async move {
@@ -1075,7 +1084,7 @@ impl Engine {
         // The vendor CLI is still waiting on its verification URL (the
         // user may have closed the browser tab): hand the same URL back
         // so the client can reopen it, rather than refusing.
-        if let Some(LoginState::Pending(started)) = self.logins.lock().unwrap().get(id) {
+        if let Some(LoginState::Pending { started, .. }) = self.logins.lock().unwrap().get(id) {
             return Ok(started.clone());
         }
         let login = if is_backend_kind(kind) {
@@ -1091,22 +1100,31 @@ impl Engine {
             // codex-responses: credentials come from the Codex CLI login.
             let cmd = resolved_cli_command(kind, command, &self.data_dir)
                 .unwrap_or_else(|| "codex".into());
-            trouve_agents::spawn_login(&cmd, &["login"]).await
+            trouve_agents::spawn_codex_login(&cmd).await
         }
         .map_err(|e| EngineError::BadRequest(e.to_string()))?;
 
+        let trouve_agents::BackendLogin {
+            verification_url,
+            user_code,
+            callback_sender,
+            done,
+        } = login;
         let started = trouve_protocol::LoginStarted {
-            verification_url: login.verification_url.clone().unwrap_or_default(),
-            user_code: login.user_code.clone(),
+            verification_url: verification_url.unwrap_or_default(),
+            user_code,
         };
-        self.logins
-            .lock()
-            .unwrap()
-            .insert(id.to_string(), LoginState::Pending(started.clone()));
+        self.logins.lock().unwrap().insert(
+            id.to_string(),
+            LoginState::Pending {
+                started: started.clone(),
+                callback_sender,
+            },
+        );
         let engine = self.clone();
         let id_owned = id.to_string();
         tokio::spawn(async move {
-            let state = match login.done.await {
+            let state = match done.await {
                 Ok(()) => LoginState::Success,
                 Err(e) => LoginState::Failed(e.to_string()),
             };
@@ -2070,7 +2088,7 @@ impl Engine {
                 status: "none".into(),
                 error: None,
             },
-            Some(LoginState::Pending(_)) => trouve_protocol::LoginStatus {
+            Some(LoginState::Pending { .. }) => trouve_protocol::LoginStatus {
                 status: "pending".into(),
                 error: None,
             },
@@ -2083,6 +2101,58 @@ impl Engine {
                 error: Some(e.clone()),
             },
         }
+    }
+
+    /// Forward a browser callback to an interactive vendor CLI login.
+    pub async fn complete_login(
+        &self,
+        id: &str,
+        request: trouve_protocol::CompleteLoginRequest,
+    ) -> Result<trouve_protocol::LoginStatus, EngineError> {
+        let callback = request.callback_url.trim();
+        if callback.is_empty() {
+            return Err(EngineError::BadRequest(
+                "callback_url must not be empty".into(),
+            ));
+        }
+        if callback.len() > 16 * 1024 || callback.chars().any(char::is_control) {
+            return Err(EngineError::BadRequest(
+                "callback_url is too long or contains control characters".into(),
+            ));
+        }
+
+        let sender = {
+            let mut logins = self.logins.lock().unwrap();
+            match logins.get_mut(id) {
+                Some(LoginState::Pending {
+                    callback_sender, ..
+                }) => callback_sender.take().ok_or_else(|| {
+                    EngineError::Conflict(format!(
+                        "provider {id} login does not accept a browser callback"
+                    ))
+                })?,
+                Some(LoginState::Success) => {
+                    return Ok(trouve_protocol::LoginStatus {
+                        status: "success".into(),
+                        error: None,
+                    });
+                }
+                Some(LoginState::Failed(error)) => {
+                    return Err(EngineError::Conflict(format!(
+                        "provider {id} login already failed: {error}"
+                    )));
+                }
+                None => {
+                    return Err(EngineError::NotFound(format!(
+                        "no login is running for provider {id}"
+                    )));
+                }
+            }
+        };
+        sender.send(callback.to_string()).await.map_err(|_| {
+            EngineError::Conflict(format!("provider {id} login is no longer accepting input"))
+        })?;
+        Ok(self.login_status(id))
     }
 
     fn finish_login(
@@ -8034,5 +8104,62 @@ mod tests {
         options.insert("thinking_level".into(), serde_json::json!("high"));
         normalize_thinking_option(&mut options, None);
         assert!(options.is_empty());
+    }
+
+    #[tokio::test]
+    async fn complete_login_forwards_callback_once() {
+        let data = tempfile::tempdir().unwrap();
+        let engine = Engine::new(
+            Store::open_in_memory().unwrap(),
+            data.path().to_path_buf(),
+            &Config::default(),
+        );
+        let (callback_tx, mut callback_rx) = tokio::sync::mpsc::channel(1);
+        engine.logins.lock().unwrap().insert(
+            "claude-code".into(),
+            LoginState::Pending {
+                started: trouve_protocol::LoginStarted {
+                    verification_url: "https://claude.example.test/oauth".into(),
+                    user_code: None,
+                },
+                callback_sender: Some(callback_tx),
+            },
+        );
+
+        let callback = "http://localhost:54545/callback?code=test-code&state=test-state";
+        let status = engine
+            .complete_login(
+                "claude-code",
+                trouve_protocol::CompleteLoginRequest {
+                    callback_url: callback.into(),
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(status.status, "pending");
+        assert_eq!(callback_rx.recv().await.as_deref(), Some(callback));
+
+        assert!(matches!(
+            engine
+                .complete_login(
+                    "claude-code",
+                    trouve_protocol::CompleteLoginRequest {
+                        callback_url: callback.into(),
+                    },
+                )
+                .await,
+            Err(EngineError::Conflict(_))
+        ));
+        assert!(matches!(
+            engine
+                .complete_login(
+                    "claude-code",
+                    trouve_protocol::CompleteLoginRequest {
+                        callback_url: "http://localhost/callback\ninjected".into(),
+                    },
+                )
+                .await,
+            Err(EngineError::BadRequest(_))
+        ));
     }
 }

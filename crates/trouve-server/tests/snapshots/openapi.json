@@ -7,7 +7,7 @@
       "name": "MIT",
       "identifier": "MIT"
     },
-    "version": "1.5"
+    "version": "1.6"
   },
   "paths": {
     "/v1/approvals": {
@@ -1615,6 +1615,74 @@
             }
           },
           "400": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/providers/{id}/login/callback": {
+      "post": {
+        "tags": [],
+        "operationId": "complete_login",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CompleteLoginRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/LoginStatus"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
             "description": "",
             "content": {
               "application/json": {
@@ -3839,6 +3907,18 @@
           "name": {
             "type": "string",
             "description": "Name without the leading slash."
+          }
+        }
+      },
+      "CompleteLoginRequest": {
+        "type": "object",
+        "description": "Browser callback URL/code pasted into a CLI login running on another host.",
+        "required": [
+          "callback_url"
+        ],
+        "properties": {
+          "callback_url": {
+            "type": "string"
           }
         }
       },

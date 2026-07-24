@@ -1626,8 +1626,16 @@ async fn backend_turns_bridge_approvals_resume_sessions_and_checkpoint() {
 
     let backend = Arc::new(ScriptedBackend::new());
     let store = Store::open(&tmp.path().join("db/trouve.db")).unwrap();
+    let mut config = Config::default();
+    config.providers.insert(
+        "claude-code".into(),
+        trouve_core::config::ProviderConfig {
+            command: Some("/definitely/not/a/claude-test-binary".into()),
+            ..Default::default()
+        },
+    );
     let engine = Arc::new(
-        Engine::new(store, tmp.path().join("data"), &Config::default())
+        Engine::new(store, tmp.path().join("data"), &config)
             .with_config_dir(None)
             .with_backend("fake-agent", backend.clone())
             .with_default_model("fake-agent/agent-model"),
@@ -1873,7 +1881,8 @@ async fn backend_turns_bridge_approvals_resume_sessions_and_checkpoint() {
     assert!(text.contains("\"behavior\":\"deny\""), "{verdict}");
 
     // CLI-kind provider CRUD: upsert reports auth "cli"; login relays the
-    // vendor flow (here: a bogus binary, so it fails with 400).
+    // vendor flow (the configured test binary is absent, so it fails with
+    // 400).
     let provider: serde_json::Value = client
         .put(format!("{base}/providers/claude-code"))
         .json(&serde_json::json!({"kind": "claude-cli"}))
@@ -1890,7 +1899,6 @@ async fn backend_turns_bridge_approvals_resume_sessions_and_checkpoint() {
         .send()
         .await
         .unwrap();
-    // Claude Code's login is an interactive TUI; we surface instructions.
     assert_eq!(resp.status(), 400);
 }
 
@@ -3887,4 +3895,40 @@ async fn code_review_dashboard_and_repository_policy_round_trip() {
             .len(),
         1
     );
+}
+
+#[tokio::test]
+async fn provider_login_callback_endpoint_validates_requests() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Store::open(&tmp.path().join("db/trouve.db")).unwrap();
+    let engine = Arc::new(
+        Engine::new(store, tmp.path().join("data"), &Config::default()).with_config_dir(None),
+    );
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let router = trouve_server::build_router(engine);
+    tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+    let endpoint = format!("http://{addr}/v1/providers/claude-code/login/callback");
+    let client = reqwest::Client::new();
+
+    let malformed = client
+        .post(&endpoint)
+        .json(&serde_json::json!({
+            "callback_url": "http://localhost/callback\ninjected"
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(malformed.status(), reqwest::StatusCode::BAD_REQUEST);
+
+    let absent = client
+        .post(&endpoint)
+        .json(&serde_json::json!({
+            "callback_url": "http://localhost/callback?code=test&state=test"
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(absent.status(), reqwest::StatusCode::NOT_FOUND);
 }

@@ -31,7 +31,8 @@ use trouve_providers::codex::completed_reasoning_text;
 
 use crate::{
     AgentBackend, BackendError, BackendEvent, BackendEventStream, BackendLogin, BackendPermission,
-    BackendStatus, BackendTurn, async_stream, binary_on_path, format_reset, model, spawn_login,
+    BackendStatus, BackendTurn, async_stream, binary_on_path, format_reset, model,
+    spawn_codex_login,
 };
 
 pub struct CodexBackend {
@@ -187,7 +188,7 @@ impl AgentBackend for CodexBackend {
     }
 
     async fn start_login(&self) -> Result<BackendLogin, BackendError> {
-        spawn_login(&self.command, &["login"]).await
+        spawn_codex_login(&self.command).await
     }
 
     async fn run_turn(&self, turn: BackendTurn) -> Result<BackendEventStream, BackendError> {

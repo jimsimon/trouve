@@ -124,6 +124,9 @@ interface ProviderLogin {
   state: "starting" | "pending" | "success" | "failed";
   verification_url: string;
   user_code?: string;
+  callback_required: boolean;
+  callback_submitted?: boolean;
+  callback_error?: string;
   error: string;
 }
 
@@ -306,11 +309,23 @@ function renderProviderLogin(): string {
     success: "Signed in",
     failed: "Sign-in failed",
   }[login.state];
+  const callbackFallback = login.state === "pending" && login.callback_required
+    ? `<p>If the browser ends on a localhost connection error, copy the full URL from its address bar and paste it here.</p>
+       <form class="login-callback" data-provider-login-callback>
+         <input name="callback_url" type="text" autocomplete="off" spellcheck="false" placeholder="http://localhost:…?code=…&state=…" aria-label="Claude browser callback URL" required>
+         <button type="submit">Complete sign-in</button>
+       </form>
+       ${login.callback_error ? `<p class="error">${escape(login.callback_error)}</p>` : ""}`
+    : login.state === "pending" && login.callback_submitted
+      ? `<p>Browser callback sent to Claude Code. Waiting for sign-in to finish…</p>`
+      : "";
   const instructions = login.state === "pending"
     ? login.verification_url
       ? `<p>Finish authorization in the newly opened tab. If it did not open, use the button below.</p>
-         <div class="login-actions"><a class="button-link" href="${escape(login.verification_url)}" target="_blank" rel="noopener noreferrer">Open sign-in page ↗</a></div>`
-      : `<p>${escape(login.error || "The CLI started but did not expose a browser URL. Check the server terminal for its login instructions.")}</p>`
+         <div class="login-actions"><a class="button-link" href="${escape(login.verification_url)}" target="_blank" rel="noopener noreferrer">Open sign-in page ↗</a></div>
+         ${callbackFallback}`
+      : `<p>${escape(login.error || "The CLI started but did not expose a browser URL. Check the server terminal for its login instructions.")}</p>
+         ${callbackFallback}`
     : login.state === "success"
       ? "<p>Credentials are ready. The provider's models are now available to reviewers.</p>"
       : login.state === "failed"
@@ -654,6 +669,8 @@ function openLoginPlaceholder(): Window | null {
 async function startProviderLogin(providerId: string, preset?: KnownProvider): Promise<void> {
   const attempt = ++providerLoginAttempt;
   const displayName = preset?.display_name ?? providerDisplayName(providerId);
+  const callbackRequired = (preset?.kind
+    ?? providers.find((provider) => provider.id === providerId)?.kind) === "claude-cli";
   const popup = openLoginPlaceholder();
   providerLogin = {
     attempt,
@@ -661,6 +678,7 @@ async function startProviderLogin(providerId: string, preset?: KnownProvider): P
     display_name: displayName,
     state: "starting",
     verification_url: "",
+    callback_required: callbackRequired,
     error: "",
   };
   render();
@@ -695,6 +713,7 @@ async function startProviderLogin(providerId: string, preset?: KnownProvider): P
       state: "pending",
       verification_url: verificationUrl,
       user_code: started.user_code,
+      callback_required: callbackRequired,
       error: verificationUrl ? "" : "Login is running, but the vendor CLI did not provide a browser URL. Check the server terminal for any remaining instructions.",
     };
     if (verificationUrl && popup && !popup.closed) {
@@ -717,6 +736,7 @@ async function startProviderLogin(providerId: string, preset?: KnownProvider): P
       display_name: displayName,
       state: "failed",
       verification_url: "",
+      callback_required: false,
       error: error instanceof Error ? error.message : String(error),
     };
     try {
@@ -751,6 +771,7 @@ async function pollProviderLogin(providerId: string, displayName: string, attemp
         display_name: displayName,
         state: "success",
         verification_url: "",
+        callback_required: false,
         error: "",
       };
     } else {
@@ -760,6 +781,7 @@ async function pollProviderLogin(providerId: string, displayName: string, attemp
         display_name: displayName,
         state: "failed",
         verification_url: "",
+        callback_required: false,
         error: status.error || (status.status === "none" ? "The server no longer has a sign-in attempt in progress." : "The vendor CLI did not complete sign-in."),
       };
     }
@@ -777,6 +799,7 @@ async function pollProviderLogin(providerId: string, displayName: string, attemp
     display_name: displayName,
     state: "failed",
     verification_url: "",
+    callback_required: false,
     error: "Sign-in timed out after 10 minutes. Start it again to retry.",
   };
   render();
@@ -976,6 +999,39 @@ function bindProviderSettings(): void {
       }
     };
   });
+  const callbackForm = document.querySelector<HTMLFormElement>("[data-provider-login-callback]");
+  if (callbackForm) {
+    callbackForm.onsubmit = async (event) => {
+      event.preventDefault();
+      const login = providerLogin;
+      if (!login || login.state !== "pending") return;
+      const input = callbackForm.elements.namedItem("callback_url");
+      const callbackUrl = input instanceof HTMLInputElement ? input.value.trim() : "";
+      if (!callbackUrl) return;
+      const submit = callbackForm.querySelector<HTMLButtonElement>("button[type=submit]");
+      if (submit) submit.disabled = true;
+      try {
+        await api<LoginStatus>(`/providers/${encodeURIComponent(login.provider_id)}/login/callback`, {
+          method: "POST",
+          body: JSON.stringify({ callback_url: callbackUrl }),
+        });
+        if (providerLogin?.attempt !== login.attempt) return;
+        providerLogin = {
+          ...login,
+          callback_required: false,
+          callback_submitted: true,
+          callback_error: "",
+        };
+      } catch (error) {
+        if (providerLogin?.attempt !== login.attempt) return;
+        providerLogin = {
+          ...login,
+          callback_error: error instanceof Error ? error.message : String(error),
+        };
+      }
+      refreshProviderSettings();
+    };
+  }
   document.querySelectorAll<HTMLButtonElement>("[data-cli-install]").forEach((button) => {
     button.onclick = () => {
       const cliId = button.dataset.cliInstall;

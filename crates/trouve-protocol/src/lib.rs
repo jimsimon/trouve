@@ -89,7 +89,9 @@ pub use requests::*;
 // distinguish PRs that are ready to merge from open-but-blocked PRs.
 // 1.5: reviewer personas gain an optional default thinking level, and
 // built-in reviewer model/thinking defaults can be customized (additive).
-pub const PROTOCOL_VERSION: &str = "1.5";
+// 1.6: POST /v1/providers/{id}/login/callback forwards a failed browser
+// callback URL to an interactive vendor CLI login (additive).
+pub const PROTOCOL_VERSION: &str = "1.6";
 
 pub type WorkspaceId = String;
 pub type SessionId = String;

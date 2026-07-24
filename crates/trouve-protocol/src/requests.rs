@@ -933,6 +933,12 @@ pub struct LoginStarted {
     pub user_code: Option<String>,
 }
 
+/// Browser callback URL/code pasted into a CLI login running on another host.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct CompleteLoginRequest {
+    pub callback_url: String,
+}
+
 /// Current state of a provider's OAuth login attempt.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct LoginStatus {
