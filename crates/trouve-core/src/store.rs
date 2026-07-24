@@ -184,6 +184,13 @@ CREATE TABLE IF NOT EXISTS code_review_pr_state (
   manual_generation INTEGER NOT NULL DEFAULT 0,
   PRIMARY KEY (repository, pull_number)
 );
+CREATE TABLE IF NOT EXISTS code_review_manual_requests (
+  repository TEXT NOT NULL,
+  pull_number INTEGER NOT NULL,
+  trigger_key TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  PRIMARY KEY (repository, pull_number, trigger_key)
+);
 CREATE TABLE IF NOT EXISTS github_webhook_deliveries (
   delivery_id TEXT PRIMARY KEY,
   received_at TEXT NOT NULL
@@ -359,6 +366,12 @@ pub struct NewCodeReviewJob {
     pub prompt: String,
     pub reviewers: Vec<trouve_protocol::ReviewerProfile>,
     pub config_hash: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CodeReviewManualRequest {
+    pub pull_number: u64,
+    pub trigger_key: String,
 }
 
 #[derive(Debug, Clone)]
@@ -1857,15 +1870,70 @@ impl Store {
         Ok((requested && !was_requested).then_some(next_generation as u64))
     }
 
-    /// Claim one GitHub webhook delivery. Duplicate delivery ids are ignored,
-    /// which makes GitHub's at-least-once delivery safe to retry.
-    pub fn claim_github_webhook_delivery(&self, delivery_id: &str) -> Result<bool> {
-        let inserted = self.conn.lock().unwrap().execute(
+    /// Claim one GitHub webhook delivery and, when present, durably record its
+    /// manual review request in the same transaction. Duplicate delivery ids
+    /// are ignored, which makes GitHub's at-least-once delivery safe to retry.
+    pub fn claim_github_webhook_delivery(
+        &self,
+        delivery_id: &str,
+        manual_request: Option<(&str, u64, &str)>,
+    ) -> Result<bool> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        let inserted = tx.execute(
             "INSERT OR IGNORE INTO github_webhook_deliveries (delivery_id, received_at)
              VALUES (?1, ?2)",
             params![delivery_id, chrono::Utc::now().to_rfc3339()],
         )?;
+        if inserted > 0
+            && let Some((repository, pull_number, trigger_key)) = manual_request
+        {
+            tx.execute(
+                "INSERT OR IGNORE INTO code_review_manual_requests
+                        (repository, pull_number, trigger_key, created_at)
+                 VALUES (?1, ?2, ?3, ?4)",
+                params![
+                    repository,
+                    pull_number as i64,
+                    trigger_key,
+                    chrono::Utc::now().to_rfc3339()
+                ],
+            )?;
+        }
+        tx.commit()?;
         Ok(inserted > 0)
+    }
+
+    pub fn pending_code_review_manual_requests(
+        &self,
+        repository: &str,
+    ) -> Result<Vec<CodeReviewManualRequest>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT pull_number, trigger_key FROM code_review_manual_requests
+             WHERE repository = ?1 ORDER BY created_at, trigger_key",
+        )?;
+        let rows = stmt.query_map(params![repository], |row| {
+            Ok(CodeReviewManualRequest {
+                pull_number: row.get::<_, i64>(0)? as u64,
+                trigger_key: row.get(1)?,
+            })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    pub fn complete_code_review_manual_request(
+        &self,
+        repository: &str,
+        pull_number: u64,
+        trigger_key: &str,
+    ) -> Result<()> {
+        self.conn.lock().unwrap().execute(
+            "DELETE FROM code_review_manual_requests
+             WHERE repository = ?1 AND pull_number = ?2 AND trigger_key = ?3",
+            params![repository, pull_number as i64, trigger_key],
+        )?;
+        Ok(())
     }
 
     // --- provider transcript --------------------------------------------------
@@ -3042,8 +3110,40 @@ mod tests {
         assert!(completed.thread_id.is_none());
         assert!(store.pending_code_review_job_cleanups().unwrap().is_empty());
 
-        assert!(store.claim_github_webhook_delivery("delivery-1").unwrap());
-        assert!(!store.claim_github_webhook_delivery("delivery-1").unwrap());
+        assert!(
+            store
+                .claim_github_webhook_delivery(
+                    "delivery-1",
+                    Some(("acme/widgets", 42, "comment:100")),
+                )
+                .unwrap()
+        );
+        assert!(
+            !store
+                .claim_github_webhook_delivery(
+                    "delivery-1",
+                    Some(("acme/widgets", 42, "comment:duplicate")),
+                )
+                .unwrap()
+        );
+        assert_eq!(
+            store
+                .pending_code_review_manual_requests("acme/widgets")
+                .unwrap(),
+            vec![CodeReviewManualRequest {
+                pull_number: 42,
+                trigger_key: "comment:100".into(),
+            }]
+        );
+        store
+            .complete_code_review_manual_request("acme/widgets", 42, "comment:100")
+            .unwrap();
+        assert!(
+            store
+                .pending_code_review_manual_requests("acme/widgets")
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]

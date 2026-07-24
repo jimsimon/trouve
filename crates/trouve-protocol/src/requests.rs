@@ -617,9 +617,10 @@ pub struct AddGithubHostRequest {
 pub enum CodeReviewMode {
     #[default]
     Off,
-    /// Review only when the App bot is requested through GitHub's reviewer UI.
+    /// Review only when a trusted collaborator comments `@trouve-ai review`
+    /// on the pull request or explicitly requests the App bot as a reviewer.
     Manual,
-    /// Review every new non-draft head SHA and manual re-requests.
+    /// Review every new non-draft head SHA and manual comment/reviewer requests.
     Automatic,
 }
 
