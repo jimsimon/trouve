@@ -249,6 +249,13 @@ component ToggleRow inherits HorizontalLayout {
     }
 }
 
+// Persistent labels keep settings fields understandable after they contain a
+// value (placeholder text disappears as soon as the user starts typing).
+component FormFieldLabel inherits Text {
+    color: Theme.c.text-soft;
+    font-size: Theme.fs(10px);
+}
+
 // One metered subscription window: label, usage bar, reset note. The bar
 // shifts to warn/err colors as the window fills up.
 component SubscriptionMeter inherits VerticalLayout {
@@ -594,6 +601,7 @@ export component SettingsScreen inherits Rectangle {
                         // ---------------- providers ----------------
                         if root.section == 0: VerticalLayout {
                             spacing: 12px;
+                            alignment: start;
 
                             HorizontalLayout {
                                 Text {
@@ -783,65 +791,89 @@ export component SettingsScreen inherits Rectangle {
                             // Provider picker: a known preset prefills (and
                             // hides) the id / protocol / URL details;
                             // "Custom" shows them for hand entry.
-                            preset-box := ComboBox {
-                                model: root.active-known-provider-names;
-                                current-index <=> root.preset-index;
-                                selected => {
-                                    if (!root.preset-is-custom) {
-                                        root.form-id = root.active-known-providers[root.preset-index].id;
-                                        root.form-base-url = root.active-known-providers[root.preset-index].base-url;
-                                        root.form-kind = root.active-known-providers[root.preset-index].kind;
-                                        root.form-kind-index =
-                                            root.active-known-providers[root.preset-index].kind == "anthropic" ? 1 : 0;
-                                        root.form-warning = root.active-known-providers[root.preset-index].experimental;
-                                        root.form-hint =
-                                            root.active-known-providers[root.preset-index].experimental
-                                            ? "Experimental: talks to an undocumented vendor endpoint using your `codex login` token. OpenAI may break or restrict it at any time — use at your own risk. Save, then log in via the Codex CLI."
-                                            : (root.active-known-providers[root.preset-index].auth == "cli"
-                                                ? "Subscription via the vendor's CLI: install it, save, then click \"Log in\" in the list above (or log in from a terminal)."
-                                                : (root.active-known-providers[root.preset-index].auth == "oauth"
-                                                    ? "Subscription login: save, then click \"Log in\" in the list above."
-                                                    : (root.active-known-providers[root.preset-index].auth == "api-key"
-                                                        ? "Paste your API key below and save. Also honors the "
-                                                            + root.active-known-providers[root.preset-index].api-key-env
-                                                            + " environment variable."
-                                                        : "No API key needed — just save.")));
-                                    } else {
-                                        root.form-kind = root.form-kind-index == 1 ? "anthropic" : "openai-compat";
-                                        root.form-hint = "";
-                                        root.form-warning = false;
+                            VerticalLayout {
+                                spacing: 4px;
+                                alignment: start;
+                                FormFieldLabel { text: "Provider preset"; }
+                                preset-box := ComboBox {
+                                    width: 280px;
+                                    model: root.active-known-provider-names;
+                                    current-index <=> root.preset-index;
+                                    selected => {
+                                        if (!root.preset-is-custom) {
+                                            root.form-id = root.active-known-providers[root.preset-index].id;
+                                            root.form-base-url = root.active-known-providers[root.preset-index].base-url;
+                                            root.form-kind = root.active-known-providers[root.preset-index].kind;
+                                            root.form-kind-index =
+                                                root.active-known-providers[root.preset-index].kind == "anthropic" ? 1 : 0;
+                                            root.form-warning = root.active-known-providers[root.preset-index].experimental;
+                                            root.form-hint =
+                                                root.active-known-providers[root.preset-index].experimental
+                                                ? "Experimental: talks to an undocumented vendor endpoint using your `codex login` token. OpenAI may break or restrict it at any time — use at your own risk. Save, then log in via the Codex CLI."
+                                                : (root.active-known-providers[root.preset-index].auth == "cli"
+                                                    ? "Subscription via the vendor's CLI: install it, save, then click \"Log in\" in the list above (or log in from a terminal)."
+                                                    : (root.active-known-providers[root.preset-index].auth == "oauth"
+                                                        ? "Subscription login: save, then click \"Log in\" in the list above."
+                                                        : (root.active-known-providers[root.preset-index].auth == "api-key"
+                                                            ? "Paste your API key below and save. Also honors the "
+                                                                + root.active-known-providers[root.preset-index].api-key-env
+                                                                + " environment variable."
+                                                            : "No API key needed — just save.")));
+                                        } else {
+                                            root.form-kind = root.form-kind-index == 1 ? "anthropic" : "openai-compat";
+                                            root.form-hint = "";
+                                            root.form-warning = false;
+                                        }
                                     }
                                 }
                             }
                             if root.preset-is-custom: HorizontalLayout {
                                 spacing: 8px;
-                                LineEdit {
-                                    width: 150px;
-                                    placeholder-text: "id (e.g. openai)";
-                                    text <=> root.form-id;
-                                }
-                                ComboBox {
-                                    width: 150px;
-                                    model: ["openai-compat", "anthropic"];
-                                    current-index <=> root.form-kind-index;
-                                    selected => {
-                                        root.form-kind = root.form-kind-index == 1 ? "anthropic" : "openai-compat";
+                                alignment: start;
+                                VerticalLayout {
+                                    spacing: 4px;
+                                    FormFieldLabel { text: "Provider ID"; }
+                                    LineEdit {
+                                        width: 150px;
+                                        placeholder-text: "e.g. openai";
+                                        text <=> root.form-id;
                                     }
                                 }
-                                LineEdit {
-                                    horizontal-stretch: 1;
-                                    placeholder-text: "base URL (optional)";
-                                    text <=> root.form-base-url;
+                                VerticalLayout {
+                                    spacing: 4px;
+                                    FormFieldLabel { text: "Protocol"; }
+                                    ComboBox {
+                                        width: 150px;
+                                        model: ["openai-compat", "anthropic"];
+                                        current-index <=> root.form-kind-index;
+                                        selected => {
+                                            root.form-kind = root.form-kind-index == 1 ? "anthropic" : "openai-compat";
+                                        }
+                                    }
+                                }
+                                VerticalLayout {
+                                    spacing: 4px;
+                                    FormFieldLabel { text: "Base URL (optional)"; }
+                                    LineEdit {
+                                        width: 250px;
+                                        placeholder-text: "https://api.example.com/v1";
+                                        text <=> root.form-base-url;
+                                    }
+                                }
+                            }
+                            VerticalLayout {
+                                visible: root.preset-auth == "api-key";
+                                spacing: 4px;
+                                alignment: start;
+                                FormFieldLabel { text: "API key"; }
+                                key-edit := LineEdit {
+                                    width: 400px;
+                                    placeholder-text: "Stored in the OS keychain; leave empty to keep";
+                                    input-type: password;
                                 }
                             }
                             HorizontalLayout {
-                                spacing: 8px;
-                                key-edit := LineEdit {
-                                    horizontal-stretch: 1;
-                                    visible: root.preset-auth == "api-key";
-                                    placeholder-text: "API key (stored in the OS keychain; leave empty to keep)";
-                                    input-type: password;
-                                }
+                                alignment: start;
                                 Button {
                                     text: "Save provider";
                                     primary: true;
@@ -1053,6 +1085,7 @@ export component SettingsScreen inherits Rectangle {
                         // ---------------- modes & models ----------------
                         if root.section == 1: VerticalLayout {
                             spacing: 12px;
+                            alignment: start;
 
                             Text {
                                 text: "Modes & Models";
@@ -1094,8 +1127,9 @@ export component SettingsScreen inherits Rectangle {
                             }
                             HorizontalLayout {
                                 spacing: 8px;
+                                alignment: start;
                                 model-box := ComboBox {
-                                    horizontal-stretch: 1;
+                                    width: 400px;
                                     model: root.models;
                                     current-index: root.default-model-index;
                                     enabled: root.models.length > 0;
@@ -1127,7 +1161,7 @@ export component SettingsScreen inherits Rectangle {
                             HorizontalLayout {
                                 alignment: start;
                                 Button {
-                                    text: "Set defaults";
+                                    text: "Save model defaults";
                                     enabled: root.models.length > 0 && model-box.current-index >= 0;
                                     clicked => {
                                         root.default-model-picked(
@@ -1179,7 +1213,7 @@ export component SettingsScreen inherits Rectangle {
                                     for mode in root.mode-items: mode-row := Rectangle {
                                         property <int> thinking-model-index: mode.model-index >= 0
                                             ? mode.model-index : root.default-model-index;
-                                        height: Theme.fs(68px);
+                                        height: Theme.fs(94px);
                                         HorizontalLayout {
                                             padding-left: 10px;
                                             padding-right: 6px;
@@ -1218,7 +1252,8 @@ export component SettingsScreen inherits Rectangle {
                                             // is "Global default".
                                             VerticalLayout {
                                                 alignment: center;
-                                                spacing: 3px;
+                                                spacing: 2px;
+                                                FormFieldLabel { text: "Default model"; }
                                                 ComboBox {
                                                     width: 190px;
                                                     model: root.mode-model-names;
@@ -1231,42 +1266,52 @@ export component SettingsScreen inherits Rectangle {
                                                 }
                                                 if mode-row.thinking-model-index >= 0
                                                     && mode-row.thinking-model-index < root.model-thinking-items.length
-                                                    && root.model-thinking-items[mode-row.thinking-model-index].values.length > 0: ComboBox {
-                                                    width: 190px;
-                                                    model: root.model-thinking-items[mode-row.thinking-model-index].mode-names;
-                                                    current-index: mode.thinking-index + 1;
-                                                    enabled: mode.origin != "workspace";
-                                                    selected => {
-                                                        root.mode-thinking-picked(
-                                                            mode.id,
-                                                            self.current-index > 0
-                                                                ? root.model-thinking-items[mode-row.thinking-model-index].values[self.current-index - 1]
-                                                                : "");
+                                                    && root.model-thinking-items[mode-row.thinking-model-index].values.length > 0: VerticalLayout {
+                                                    spacing: 2px;
+                                                    FormFieldLabel { text: "Thinking level"; }
+                                                    ComboBox {
+                                                        width: 190px;
+                                                        model: root.model-thinking-items[mode-row.thinking-model-index].mode-names;
+                                                        current-index: mode.thinking-index + 1;
+                                                        enabled: mode.origin != "workspace";
+                                                        selected => {
+                                                            root.mode-thinking-picked(
+                                                                mode.id,
+                                                                self.current-index > 0
+                                                                    ? root.model-thinking-items[mode-row.thinking-model-index].values[self.current-index - 1]
+                                                                    : "");
+                                                        }
                                                     }
                                                 }
                                             }
-                                            if mode.origin != "workspace": Button {
-                                                text: "Edit";
-                                                clicked => {
-                                                    root.mode-form-open = true;
-                                                    root.mode-form-editing = true;
-                                                    root.mode-form-id = mode.id;
-                                                    root.mode-form-display = mode.display-name;
-                                                    root.mode-form-prompt = mode.system-prompt;
-                                                    root.mode-form-tools = mode.allowed-tools;
-                                                    root.mode-form-readonly = mode.read-only;
-                                                    root.mode-form-permission = mode.permission-index;
-                                                    root.mode-form-model = mode.model-index;
-                                                    root.mode-form-thinking = mode.thinking-index;
+                                            if mode.origin != "workspace": VerticalLayout {
+                                                alignment: center;
+                                                HorizontalLayout {
+                                                    spacing: 4px;
+                                                    Button {
+                                                        text: "Edit";
+                                                        clicked => {
+                                                            root.mode-form-open = true;
+                                                            root.mode-form-editing = true;
+                                                            root.mode-form-id = mode.id;
+                                                            root.mode-form-display = mode.display-name;
+                                                            root.mode-form-prompt = mode.system-prompt;
+                                                            root.mode-form-tools = mode.allowed-tools;
+                                                            root.mode-form-readonly = mode.read-only;
+                                                            root.mode-form-permission = mode.permission-index;
+                                                            root.mode-form-model = mode.model-index;
+                                                            root.mode-form-thinking = mode.thinking-index;
+                                                        }
+                                                    }
+                                                    if mode.origin == "customized": Button {
+                                                        text: "Reset";
+                                                        clicked => { root.mode-deleted(mode.id); }
+                                                    }
+                                                    if mode.origin == "custom": Button {
+                                                        text: "Remove";
+                                                        clicked => { root.mode-deleted(mode.id); }
+                                                    }
                                                 }
-                                            }
-                                            if mode.origin == "customized": Button {
-                                                text: "Reset";
-                                                clicked => { root.mode-deleted(mode.id); }
-                                            }
-                                            if mode.origin == "custom": Button {
-                                                text: "Remove";
-                                                clicked => { root.mode-deleted(mode.id); }
                                             }
                                         }
                                     }
@@ -1310,15 +1355,23 @@ export component SettingsScreen inherits Rectangle {
                                     }
                                     HorizontalLayout {
                                         spacing: 8px;
-                                        if !root.mode-form-editing: LineEdit {
-                                            width: 150px;
-                                            placeholder-text: "id (e.g. docs)";
-                                            text <=> root.mode-form-id;
+                                        if !root.mode-form-editing: VerticalLayout {
+                                            spacing: 4px;
+                                            FormFieldLabel { text: "Mode ID"; }
+                                            LineEdit {
+                                                width: 150px;
+                                                placeholder-text: "e.g. docs";
+                                                text <=> root.mode-form-id;
+                                            }
                                         }
-                                        LineEdit {
+                                        VerticalLayout {
+                                            spacing: 4px;
                                             horizontal-stretch: 1;
-                                            placeholder-text: "display name";
-                                            text <=> root.mode-form-display;
+                                            FormFieldLabel { text: "Display name"; }
+                                            LineEdit {
+                                                placeholder-text: "e.g. Documentation";
+                                                text <=> root.mode-form-display;
+                                            }
                                         }
                                     }
                                     Text {
@@ -1331,8 +1384,9 @@ export component SettingsScreen inherits Rectangle {
                                         text <=> root.mode-form-prompt;
                                         wrap: word-wrap;
                                     }
+                                    FormFieldLabel { text: "Allowed tools"; }
                                     LineEdit {
-                                        placeholder-text: "allowed tools, comma-separated (empty = all tools)";
+                                        placeholder-text: "Comma-separated; leave empty to allow all tools";
                                         text <=> root.mode-form-tools;
                                     }
                                     HorizontalLayout {
@@ -1442,6 +1496,7 @@ export component SettingsScreen inherits Rectangle {
                         // ---------------- local models (Providers → Local) ----------------
                         if root.section == 0 && root.provider-tab == 2: VerticalLayout {
                             spacing: 12px;
+                            alignment: start;
 
                             HorizontalLayout {
                                 spacing: 12px;
@@ -1641,28 +1696,32 @@ export component SettingsScreen inherits Rectangle {
                                                     pct: model.progress;
                                                 }
                                             }
-                                            if model.downloaded: VerticalLayout {
+                                            VerticalLayout {
                                                 alignment: center;
-                                                Text {
+                                                spacing: 3px;
+                                                if model.downloaded: Text {
                                                     text: "✓ downloaded";
                                                     color: Theme.c.ok;
                                                     font-size: Theme.fs(11px);
                                                 }
-                                            }
-                                            if model.downloading: Button {
-                                                text: "Cancel";
-                                                min-width: Theme.fs(96px);
-                                                clicked => { root.local-cancel(model.id); }
-                                            }
-                                            if !model.downloaded && !model.downloading: Button {
-                                                text: model.error != "" ? "Retry" : "Download";
-                                                min-width: Theme.fs(96px);
-                                                clicked => { root.local-download(model.id); }
-                                            }
-                                            if !model.downloading && (model.downloaded || model.custom): Button {
-                                                text: "Remove";
-                                                min-width: Theme.fs(96px);
-                                                clicked => { root.local-delete(model.id); }
+                                                HorizontalLayout {
+                                                    spacing: 4px;
+                                                    if model.downloading: Button {
+                                                        text: "Cancel";
+                                                        min-width: Theme.fs(96px);
+                                                        clicked => { root.local-cancel(model.id); }
+                                                    }
+                                                    if !model.downloaded && !model.downloading: Button {
+                                                        text: model.error != "" ? "Retry" : "Download";
+                                                        min-width: Theme.fs(96px);
+                                                        clicked => { root.local-download(model.id); }
+                                                    }
+                                                    if !model.downloading && (model.downloaded || model.custom): Button {
+                                                        text: "Remove";
+                                                        min-width: Theme.fs(96px);
+                                                        clicked => { root.local-delete(model.id); }
+                                                    }
+                                                }
                                             }
                                         }
                                     }
@@ -1813,6 +1872,7 @@ export component SettingsScreen inherits Rectangle {
                         // ---------------- mcp servers ----------------
                         if root.section == 2: VerticalLayout {
                             spacing: 12px;
+                            alignment: start;
 
                             HorizontalLayout {
                                 Text {
@@ -2017,21 +2077,30 @@ export component SettingsScreen inherits Rectangle {
                                     }
                                     HorizontalLayout {
                                         spacing: 8px;
-                                        LineEdit {
-                                            text <=> root.mcp-form-name;
-                                            placeholder-text: "name (e.g. jira)";
-                                            enabled: !root.mcp-form-editing;
+                                        VerticalLayout {
+                                            spacing: 4px;
                                             width: 160px;
+                                            FormFieldLabel { text: "Server name"; }
+                                            LineEdit {
+                                                text <=> root.mcp-form-name;
+                                                placeholder-text: "e.g. jira";
+                                                enabled: !root.mcp-form-editing;
+                                            }
                                         }
-                                        LineEdit {
-                                            text <=> root.mcp-form-command;
-                                            placeholder-text: "command and args (e.g. npx -y jira-mcp --stdio)";
+                                        VerticalLayout {
+                                            spacing: 4px;
                                             horizontal-stretch: 1;
+                                            FormFieldLabel { text: "Command and arguments"; }
+                                            LineEdit {
+                                                text <=> root.mcp-form-command;
+                                                placeholder-text: "e.g. npx -y jira-mcp --stdio";
+                                            }
                                         }
                                     }
+                                    FormFieldLabel { text: "Environment variables (optional)"; }
                                     TextEdit {
                                         text <=> root.mcp-form-env;
-                                        placeholder-text: "environment, one KEY=VALUE per line; ${VAR} expands at launch";
+                                        placeholder-text: "One KEY=VALUE per line; ${VAR} expands at launch";
                                         height: Theme.fs(64px);
                                         wrap: no-wrap;
                                     }
@@ -2110,6 +2179,7 @@ export component SettingsScreen inherits Rectangle {
                         // ---------------- integrations ----------------
                         if root.section == 3: VerticalLayout {
                             spacing: 12px;
+                            alignment: start;
 
                             Text {
                                 text: "Integrations";
@@ -2216,22 +2286,33 @@ export component SettingsScreen inherits Rectangle {
                                     }
                                     HorizontalLayout {
                                         spacing: 8px;
-                                        ghe-host := LineEdit {
-                                            placeholder-text: "github.example.com";
+                                        VerticalLayout {
+                                            spacing: 4px;
                                             horizontal-stretch: 1;
+                                            FormFieldLabel { text: "GitHub Enterprise host"; }
+                                            ghe-host := LineEdit {
+                                                placeholder-text: "github.example.com";
+                                            }
                                         }
-                                        ghe-client-id := LineEdit {
-                                            placeholder-text: "OAuth app client id";
+                                        VerticalLayout {
+                                            spacing: 4px;
                                             horizontal-stretch: 1;
+                                            FormFieldLabel { text: "OAuth app client ID"; }
+                                            ghe-client-id := LineEdit {
+                                                placeholder-text: "Client ID";
+                                            }
                                         }
-                                        Button {
-                                            text: "Add";
-                                            primary: ghe-host.text != "" && ghe-client-id.text != "";
-                                            enabled: ghe-host.text != "" && ghe-client-id.text != "";
-                                            clicked => {
-                                                root.github-host-added(ghe-host.text, ghe-client-id.text);
-                                                ghe-host.text = "";
-                                                ghe-client-id.text = "";
+                                        VerticalLayout {
+                                            alignment: end;
+                                            Button {
+                                                text: "Add";
+                                                primary: ghe-host.text != "" && ghe-client-id.text != "";
+                                                enabled: ghe-host.text != "" && ghe-client-id.text != "";
+                                                clicked => {
+                                                    root.github-host-added(ghe-host.text, ghe-client-id.text);
+                                                    ghe-host.text = "";
+                                                    ghe-client-id.text = "";
+                                                }
                                             }
                                         }
                                     }
@@ -2242,6 +2323,7 @@ export component SettingsScreen inherits Rectangle {
                         // ---------------- appearance ----------------
                         if root.section == 4: VerticalLayout {
                             spacing: 12px;
+                            alignment: start;
 
                             Text {
                                 text: "Appearance";
@@ -2259,6 +2341,7 @@ export component SettingsScreen inherits Rectangle {
                                     font-weight: 700;
                                 }
                                 ComboBox {
+                                    width: 280px;
                                     model: root.theme-names;
                                     current-index <=> root.theme-index;
                                     selected => { root.theme-picked(self.current-index); }
@@ -2273,6 +2356,7 @@ export component SettingsScreen inherits Rectangle {
 
                             HorizontalLayout {
                                 spacing: 12px;
+                                alignment: start;
                                 VerticalLayout {
                                     spacing: 6px;
                                     horizontal-stretch: 0;
@@ -2291,7 +2375,8 @@ export component SettingsScreen inherits Rectangle {
                                 }
                                 VerticalLayout {
                                     spacing: 6px;
-                                    horizontal-stretch: 1;
+                                    width: 300px;
+                                    horizontal-stretch: 0;
                                     Text {
                                         text: "Font";
                                         color: Theme.c.text-mid;
@@ -2299,6 +2384,7 @@ export component SettingsScreen inherits Rectangle {
                                         font-weight: 700;
                                     }
                                     ComboBox {
+                                        width: 300px;
                                         model: root.font-names;
                                         current-index <=> root.font-index;
                                         selected => { root.font-picked(self.current-index); }
@@ -2322,6 +2408,7 @@ export component SettingsScreen inherits Rectangle {
                         // ---------------- notifications ----------------
                         if root.section == 5: VerticalLayout {
                             spacing: 12px;
+                            alignment: start;
 
                             Text {
                                 text: "Notifications";
@@ -2380,6 +2467,7 @@ export component SettingsScreen inherits Rectangle {
                         // ---------------- about ----------------
                         if root.section == 6: VerticalLayout {
                             spacing: 12px;
+                            alignment: start;
 
                             Text {
                                 text: "About";
