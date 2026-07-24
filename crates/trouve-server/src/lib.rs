@@ -1738,7 +1738,7 @@ async fn remove_github_host(
     State(engine): State<Arc<Engine>>,
     Path(host): Path<String>,
 ) -> Result<Json<GithubIntegration>, ApiError> {
-    engine.remove_github_host(&host)?;
+    engine.remove_github_host(&host).await?;
     Ok(Json(engine.github_integration()))
 }
 

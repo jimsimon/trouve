@@ -3206,9 +3206,10 @@ export component AppWindow inherits Window {
                                         font-size: Theme.fs(10px);
                                         vertical-alignment: center;
                                     }
-                                    // Running tools show an indeterminate
-                                    // spinner; settled ones a status glyph.
-                                    // Reduce motion: a static glyph instead.
+                                    // Running tools show a determinate spinner
+                                    // stepped by the shared activity phase;
+                                    // settled ones use a status glyph. Reduce
+                                    // motion uses a static glyph instead.
                                     if row.tool-status == 1 && !Theme.reduce-motion: VerticalLayout {
                                         alignment: center;
                                         Spinner {
@@ -4373,7 +4374,8 @@ export component AppWindow inherits Window {
                             clicked => { root.attach-file(); }
                         }
                     }
-                    // Context usage dial; indeterminate while compacting.
+                    // Context usage dial; compacting uses determinate,
+                    // phase-driven progress.
                     VerticalLayout {
                         spacing: 2px;
                         Text { text: " "; font-size: Theme.fs(10px); }
