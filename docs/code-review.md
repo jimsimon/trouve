@@ -16,7 +16,7 @@ Create a `.env` beside `docker-compose.review.yml` with the deployment
 settings:
 
 ```dotenv
-TROUVE_VERSION=3.2.0
+TROUVE_VERSION=3.3.0
 TROUVE_REVIEW_PORT=7433
 TROUVE_CODE_REVIEW_POLL_INTERVAL_SECONDS=60
 ```

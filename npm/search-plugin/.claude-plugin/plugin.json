@@ -1,7 +1,7 @@
 {
   "name": "trouve-search",
   "description": "Fast, accurate code search for agents: hybrid semantic + BM25 search over any local git repository, with incremental branch-aware indexing. Adds trouve search tools (MCP), a trouve-search sub-agent, and a workflow skill.",
-  "version": "3.2.0",
+  "version": "3.3.0",
   "author": {
     "name": "Jim Simon"
   },
