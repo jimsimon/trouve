@@ -4,6 +4,21 @@ All notable changes to this project are documented in this file. The format
 is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this
 project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [3.3.2] - 2026-07-24
+
+### Changed
+
+- **End-to-end release publishing**: the repository release workflow now
+  prepares and validates the synchronized release, merges it through a checked
+  pull request, and verifies the tag, GitHub release, assets, and downstream
+  publishing jobs.
+
+### Fixed
+
+- **Checkpoints without a configured Git identity**: session checkpoints now
+  use a dedicated internal identity, so creating or updating a session no
+  longer depends on global `user.name` and `user.email` Git settings.
+
 ## [3.3.1] - 2026-07-24
 
 ### Fixed
@@ -441,6 +456,7 @@ semble ([BENCHMARKS.md](BENCHMARKS.md)):
 - Incremental reindex (1 file touched): 0.86 s vs ~3 min (212x)
 - Warm query: 0.55 s vs 7.2 s (13x)
 
+[3.3.2]: https://github.com/jimsimon/trouve/compare/v3.3.1...v3.3.2
 [3.3.1]: https://github.com/jimsimon/trouve/compare/v3.3.0...v3.3.1
 [3.3.0]: https://github.com/jimsimon/trouve/compare/v3.2.0...v3.3.0
 [3.2.0]: https://github.com/jimsimon/trouve/compare/v3.1.0...v3.2.0
