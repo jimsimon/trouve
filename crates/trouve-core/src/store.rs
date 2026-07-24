@@ -195,6 +195,12 @@ CREATE TABLE IF NOT EXISTS github_webhook_deliveries (
   delivery_id TEXT PRIMARY KEY,
   received_at TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS code_review_polled_comments (
+  repository TEXT NOT NULL,
+  comment_id INTEGER NOT NULL,
+  seen_at TEXT NOT NULL,
+  PRIMARY KEY (repository, comment_id)
+);
 "#;
 
 /// Additive migrations for databases created before a column existed.
@@ -1936,6 +1942,58 @@ impl Store {
         Ok(())
     }
 
+    pub fn code_review_comment_poll_initialized(&self, repository: &str) -> Result<bool> {
+        Ok(self.conn.lock().unwrap().query_row(
+            "SELECT EXISTS(
+                 SELECT 1 FROM code_review_polled_comments
+                 WHERE repository = ?1 LIMIT 1
+             )",
+            params![repository],
+            |row| row.get(0),
+        )?)
+    }
+
+    /// Claim a comment discovered by reconciliation and, when it is a manual
+    /// review command, record the request in the same transaction. Keeping
+    /// seen comments after their request is consumed prevents an old command
+    /// from retriggering whenever the pull request head changes.
+    pub fn claim_code_review_polled_comment(
+        &self,
+        repository: &str,
+        comment_id: u64,
+        manual_request: Option<(u64, &str)>,
+    ) -> Result<bool> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        let inserted = tx.execute(
+            "INSERT OR IGNORE INTO code_review_polled_comments
+                    (repository, comment_id, seen_at)
+             VALUES (?1, ?2, ?3)",
+            params![
+                repository,
+                comment_id as i64,
+                chrono::Utc::now().to_rfc3339()
+            ],
+        )?;
+        if inserted > 0
+            && let Some((pull_number, trigger_key)) = manual_request
+        {
+            tx.execute(
+                "INSERT OR IGNORE INTO code_review_manual_requests
+                        (repository, pull_number, trigger_key, created_at)
+                 VALUES (?1, ?2, ?3, ?4)",
+                params![
+                    repository,
+                    pull_number as i64,
+                    trigger_key,
+                    chrono::Utc::now().to_rfc3339()
+                ],
+            )?;
+        }
+        tx.commit()?;
+        Ok(inserted > 0)
+    }
+
     // --- provider transcript --------------------------------------------------
 
     pub fn append_message(&self, thread_id: &str, payload: &serde_json::Value) -> Result<()> {
@@ -3143,6 +3201,44 @@ mod tests {
                 .pending_code_review_manual_requests("acme/widgets")
                 .unwrap()
                 .is_empty()
+        );
+
+        assert!(
+            !store
+                .code_review_comment_poll_initialized("acme/widgets")
+                .unwrap()
+        );
+        assert!(
+            store
+                .claim_code_review_polled_comment(
+                    "acme/widgets",
+                    200,
+                    Some((43, "manual:comment:200")),
+                )
+                .unwrap()
+        );
+        assert!(
+            store
+                .code_review_comment_poll_initialized("acme/widgets")
+                .unwrap()
+        );
+        assert!(
+            !store
+                .claim_code_review_polled_comment(
+                    "acme/widgets",
+                    200,
+                    Some((43, "manual:comment:duplicate")),
+                )
+                .unwrap()
+        );
+        assert_eq!(
+            store
+                .pending_code_review_manual_requests("acme/widgets")
+                .unwrap(),
+            vec![CodeReviewManualRequest {
+                pull_number: 43,
+                trigger_key: "manual:comment:200".into(),
+            }]
         );
     }
 
