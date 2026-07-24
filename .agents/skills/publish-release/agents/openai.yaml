@@ -1,0 +1,4 @@
+interface:
+  display_name: "Publish Trouve Release"
+  short_description: "Prepare, merge, and publish a Trouve release"
+  default_prompt: "Use $publish-release to prepare and publish the next Trouve release through a verified pull request."
