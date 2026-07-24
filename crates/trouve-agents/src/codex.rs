@@ -27,7 +27,7 @@ use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin};
 use tokio::sync::{Mutex, mpsc, oneshot};
 use trouve_protocol::{ModelInfo, Usage};
-use trouve_providers::codex::completed_reasoning_text;
+use trouve_providers::codex::completed_raw_reasoning_text;
 
 use crate::{
     AgentBackend, BackendError, BackendEvent, BackendEventStream, BackendLogin, BackendPermission,
@@ -213,16 +213,13 @@ impl AgentBackend for CodexBackend {
             json!({ "type": sandbox_policy_type })
         };
 
-        // Per-thread config overrides: the trouve MCP bridge rides along so
-        // codex gets trouve's semantic search / question tools, plus any
-        // user-configured MCP servers (both thread/start and thread/resume
-        // accept `config`, and resumed threads re-spawn their MCP servers
-        // from it).
-        let config_override = mcp_config_override(&turn);
+        // Per-thread config overrides: request raw reasoning from models that
+        // expose it and mount trouve/user MCP servers. Both thread/start and
+        // thread/resume accept `config`, and resumed threads re-spawn their
+        // MCP servers from it.
+        let config_override = codex_config_override(&turn);
         let with_config = |mut params: Value| {
-            if let Some(config) = &config_override {
-                params["config"] = config.clone();
-            }
+            params["config"] = config_override.clone();
             params
         };
 
@@ -299,11 +296,10 @@ impl AgentBackend for CodexBackend {
     }
 }
 
-/// Codex config overrides mounting the trouve MCP bridge and the user's
-/// configured MCP servers as per-thread MCP servers (same shape as
-/// `mcp_servers` in codex's config.toml). `None` when there is nothing to
-/// mount.
-fn mcp_config_override(turn: &crate::BackendTurn) -> Option<Value> {
+/// Codex config overrides enabling raw reasoning when available and mounting
+/// the trouve MCP bridge plus the user's configured MCP servers as per-thread
+/// MCP servers (same shape as `mcp_servers` in codex's config.toml).
+fn codex_config_override(turn: &crate::BackendTurn) -> Value {
     let env_map = |env: &[(String, String)]| -> serde_json::Map<String, Value> {
         env.iter()
             .map(|(k, v)| (k.clone(), Value::String(v.clone())))
@@ -325,10 +321,11 @@ fn mcp_config_override(turn: &crate::BackendTurn) -> Option<Value> {
         // transport in codex's mcp_servers config shape).
         servers.insert("trouve".into(), json!({ "url": bridge.url }));
     }
-    if servers.is_empty() {
-        return None;
+    let mut config = json!({ "show_raw_agent_reasoning": true });
+    if !servers.is_empty() {
+        config["mcp_servers"] = Value::Object(servers);
     }
-    Some(json!({ "mcp_servers": servers }))
+    config
 }
 
 fn model_or_default(model: &str) -> &str {
@@ -349,14 +346,28 @@ fn split_effort(model: &str) -> (&str, Option<&str>) {
     }
 }
 
-/// Ask Codex for the readable reasoning summaries that drive trouve's
-/// thinking blocks. Model defaults can disable summaries (notably for some
-/// dynamically-listed models), so relying on the omitted-field behavior is
-/// not sufficient.
+/// Commentary messages, rather than reasoning summaries, drive trouve's
+/// thinking blocks. Disable summaries so their heading-like text is not
+/// generated alongside the richer commentary stream.
 fn apply_reasoning_options(params: &mut Value, effort: Option<&str>) {
-    params["summary"] = json!("auto");
+    params["summary"] = json!("none");
     if let Some(effort) = effort {
         params["effort"] = json!(effort);
+    }
+}
+
+fn agent_message_delta(
+    params: &Value,
+    commentary_messages: &HashSet<String>,
+) -> Option<BackendEvent> {
+    let delta = params["delta"].as_str()?;
+    if params["itemId"]
+        .as_str()
+        .is_some_and(|id| commentary_messages.contains(id))
+    {
+        Some(BackendEvent::ThinkingDelta(delta.into()))
+    } else {
+        Some(BackendEvent::TextDelta(delta.into()))
     }
 }
 
@@ -430,40 +441,45 @@ fn turn_stream(
                 .await;
         }
         let mut usage = Usage::default();
-        // Some Codex/app-server combinations only populate the completed
-        // reasoning item instead of emitting its optional delta
-        // notifications. Remember which items did stream so `item/completed`
-        // can be a lossless fallback without displaying the same thought
-        // twice.
-        let mut streamed_reasoning = HashSet::new();
+        // Message phase is carried by item/started, not by the corresponding
+        // delta. Remember commentary item ids so interim model-authored
+        // progress is displayed as thinking rather than appended to the final
+        // answer. Missing phases retain the legacy final-answer behavior.
+        let mut commentary_messages = HashSet::new();
+        // Some providers only populate raw reasoning on the completed item.
+        // Track streamed raw items so the completion fallback does not repeat
+        // content already shown.
+        let mut streamed_raw_reasoning = HashSet::new();
         let mut turn_finished = false;
         while let Some(msg) = route.recv().await {
             match msg {
                 ServerMsg::Notification { method, params } => match method.as_str() {
                     "item/agentMessage/delta" => {
-                        if let Some(d) = params["delta"].as_str() {
-                            let _ = tx.send(Ok(BackendEvent::TextDelta(d.into()))).await;
+                        if let Some(event) = agent_message_delta(&params, &commentary_messages) {
+                            let _ = tx.send(Ok(event)).await;
                         }
                     }
-                    // Reasoning summaries (all OpenAI models) and raw
-                    // reasoning (open-source models).
-                    "item/reasoning/summaryTextDelta" | "item/reasoning/textDelta" => {
+                    // Raw reasoning is only exposed by some models (notably
+                    // open-source models). Summary deltas are deliberately not
+                    // used as thinking; they are section headings, while
+                    // agent-message commentary is the readable progress stream.
+                    "item/reasoning/textDelta" => {
                         if let Some(d) = params["delta"].as_str() {
                             if let Some(id) = params["itemId"].as_str() {
-                                streamed_reasoning.insert(id.to_string());
+                                streamed_raw_reasoning.insert(id.to_string());
                             }
                             let _ = tx.send(Ok(BackendEvent::ThinkingDelta(d.into()))).await;
                         }
                     }
-                    // Boundary between summary sections.
-                    "item/reasoning/summaryPartAdded" => {
-                        let _ = tx
-                            .send(Ok(BackendEvent::ThinkingDelta("\n\n".into())))
-                            .await;
-                    }
                     "item/started" => {
                         let item = &params["item"];
                         let ty = item["type"].as_str().unwrap_or("");
+                        if ty == "agentMessage"
+                            && item["phase"].as_str() == Some("commentary")
+                            && let Some(id) = item["id"].as_str()
+                        {
+                            commentary_messages.insert(id.to_string());
+                        }
                         if !matches!(
                             ty,
                             "" | "agentMessage" | "userMessage" | "plan" | "reasoning"
@@ -495,10 +511,15 @@ fn turn_stream(
                         if ty == "reasoning"
                             && item["id"]
                                 .as_str()
-                                .is_none_or(|id| !streamed_reasoning.contains(id))
-                            && let Some(text) = completed_reasoning_text(item)
+                                .is_none_or(|id| !streamed_raw_reasoning.contains(id))
+                            && let Some(text) = completed_raw_reasoning_text(item)
                         {
                             let _ = tx.send(Ok(BackendEvent::ThinkingDelta(text))).await;
+                        }
+                        if ty == "agentMessage"
+                            && let Some(id) = item["id"].as_str()
+                        {
+                            commentary_messages.remove(id);
                         }
                         if !matches!(
                             ty,
@@ -1043,7 +1064,7 @@ mod tests {
     }
 
     #[test]
-    fn extracts_completed_codex_reasoning_as_a_stream_fallback() {
+    fn extracts_completed_raw_codex_reasoning_as_a_stream_fallback() {
         let summarized = json!({
             "id": "reason-1",
             "type": "reasoning",
@@ -1051,12 +1072,15 @@ mod tests {
             "content": ["raw text is secondary"],
         });
         assert_eq!(
-            completed_reasoning_text(&summarized).as_deref(),
-            Some("Checking the adapter\n\nFound the missing fallback")
+            completed_raw_reasoning_text(&summarized).as_deref(),
+            Some("raw text is secondary")
         );
 
         let raw = json!({ "type": "reasoning", "summary": [], "content": ["thinking"] });
-        assert_eq!(completed_reasoning_text(&raw).as_deref(), Some("thinking"));
+        assert_eq!(
+            completed_raw_reasoning_text(&raw).as_deref(),
+            Some("thinking")
+        );
         let response_item = json!({
             "type": "reasoning",
             "summary": [
@@ -1066,26 +1090,50 @@ mod tests {
             "content": [{ "type": "reasoning_text", "text": "raw thought" }],
         });
         assert_eq!(
-            completed_reasoning_text(&response_item).as_deref(),
-            Some("Checking the adapter\n\nFound the rich item shape")
+            completed_raw_reasoning_text(&response_item).as_deref(),
+            Some("raw thought")
         );
         assert_eq!(
-            completed_reasoning_text(&json!({ "type": "reasoning" })),
+            completed_raw_reasoning_text(&json!({ "type": "reasoning" })),
             None
         );
     }
 
     #[test]
-    fn turn_requests_readable_reasoning_summaries() {
+    fn turn_disables_reasoning_summaries() {
         let mut params = json!({ "threadId": "thread-1", "input": [] });
         apply_reasoning_options(&mut params, Some("high"));
-        assert_eq!(params["summary"], "auto");
+        assert_eq!(params["summary"], "none");
         assert_eq!(params["effort"], "high");
 
         let mut without_effort = json!({});
         apply_reasoning_options(&mut without_effort, None);
-        assert_eq!(without_effort["summary"], "auto");
+        assert_eq!(without_effort["summary"], "none");
         assert!(without_effort["effort"].is_null());
+    }
+
+    #[test]
+    fn routes_codex_commentary_as_thinking() {
+        let commentary = HashSet::from(["commentary-1".to_string()]);
+        let params = json!({ "itemId": "commentary-1", "delta": "Checking the parser." });
+        assert!(matches!(
+            agent_message_delta(&params, &commentary),
+            Some(BackendEvent::ThinkingDelta(text)) if text == "Checking the parser."
+        ));
+
+        let final_params = json!({ "itemId": "final-1", "delta": "Done." });
+        assert!(matches!(
+            agent_message_delta(&final_params, &commentary),
+            Some(BackendEvent::TextDelta(text)) if text == "Done."
+        ));
+
+        // Older Codex versions omit itemId/phase; preserve their historical
+        // final-answer routing rather than guessing.
+        let legacy = json!({ "delta": "Legacy response." });
+        assert!(matches!(
+            agent_message_delta(&legacy, &commentary),
+            Some(BackendEvent::TextDelta(text)) if text == "Legacy response."
+        ));
     }
 
     #[tokio::test]
@@ -1200,9 +1248,11 @@ mod tests {
     }
 
     #[test]
-    fn mcp_config_override_merges_bridge_and_user_servers() {
+    fn codex_config_override_requests_raw_reasoning_and_merges_mcp_servers() {
         let mut turn = bare_turn();
-        assert!(mcp_config_override(&turn).is_none());
+        let config = codex_config_override(&turn);
+        assert_eq!(config["show_raw_agent_reasoning"], true);
+        assert!(config["mcp_servers"].is_null());
 
         turn.mcp_servers.push(crate::McpServerLaunch {
             name: "jira".into(),
@@ -1215,7 +1265,7 @@ mod tests {
             bridge_tools: false,
             disallowed_tools: Vec::new(),
         });
-        let config = mcp_config_override(&turn).unwrap();
+        let config = codex_config_override(&turn);
         let servers = &config["mcp_servers"];
         assert_eq!(servers["jira"]["command"], "jira-mcp");
         assert_eq!(servers["jira"]["env"]["TOKEN"], "sekrit");
@@ -1227,7 +1277,7 @@ mod tests {
 
         // User servers alone (no bridge) still produce an override.
         turn.mcp_bridge = None;
-        let config = mcp_config_override(&turn).unwrap();
+        let config = codex_config_override(&turn);
         assert!(config["mcp_servers"]["jira"].is_object());
         assert!(config["mcp_servers"]["trouve"].is_null());
     }

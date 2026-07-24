@@ -20,7 +20,7 @@ use std::path::PathBuf;
 use serde_json::{Map, Value, json};
 use tokio::sync::mpsc;
 
-use crate::codex::completed_reasoning_text;
+use crate::codex::completed_raw_reasoning_text;
 use crate::{EventStream, Message, Provider, ProviderError, ProviderEvent, ToolSpec};
 use trouve_protocol::Usage;
 
@@ -201,14 +201,31 @@ impl Provider for CodexResponsesProvider {
     }
 }
 
-/// Request displayable summaries instead of relying on a model-specific
-/// default that may be `none`.
+/// Commentary output, rather than reasoning summaries, drives trouve's
+/// thinking blocks. Disable summaries so only the richer model-authored
+/// progress stream is displayed.
 fn reasoning_options(options: &Map<String, Value>) -> Value {
-    let mut reasoning = json!({ "summary": "auto" });
+    let mut reasoning = json!({ "summary": "none" });
     if let Some(effort) = options.get("reasoning_effort").and_then(Value::as_str) {
         reasoning["effort"] = json!(effort);
     }
     reasoning
+}
+
+fn output_text_delta(
+    event: &Value,
+    commentary_messages: &HashSet<String>,
+) -> Option<ProviderEvent> {
+    let delta = event["delta"].as_str()?;
+    let is_commentary = event["item_id"]
+        .as_str()
+        .or_else(|| event["itemId"].as_str())
+        .is_some_and(|id| commentary_messages.contains(id));
+    if is_commentary {
+        Some(ProviderEvent::ThinkingDelta(delta.to_string()))
+    } else {
+        Some(ProviderEvent::TextDelta(delta.to_string()))
+    }
 }
 
 /// Map trouve messages onto Responses API input items. The base system
@@ -289,20 +306,34 @@ fn sse_events(
     resp: reqwest::Response,
 ) -> impl futures::Stream<Item = Result<ProviderEvent, ProviderError>> {
     use futures::StreamExt;
+    sse_byte_events(
+        resp.bytes_stream()
+            .map(|chunk| chunk.map_err(|error| error.to_string())),
+    )
+}
+
+fn sse_byte_events(
+    bytes: impl futures::Stream<Item = Result<bytes::Bytes, String>> + Send + 'static,
+) -> impl futures::Stream<Item = Result<ProviderEvent, ProviderError>> {
+    use futures::StreamExt;
     let (tx, mut rx) = mpsc::channel::<Result<ProviderEvent, ProviderError>>(64);
     tokio::spawn(async move {
-        let mut bytes = resp.bytes_stream();
+        let mut bytes = Box::pin(bytes);
         let mut buf = crate::sse::LineBuffer::default();
         let mut usage = Usage::default();
-        // A few Codex models omit reasoning delta events but populate the
-        // completed reasoning item. Track streamed item ids so that fallback
-        // remains lossless without duplicating summaries that did stream.
-        let mut streamed_reasoning = HashSet::new();
+        // Output deltas do not repeat the phase from output_item.added. Track
+        // commentary message ids so their text is displayed as thinking and
+        // does not pollute the final assistant response.
+        let mut commentary_messages = HashSet::new();
+        // A few models omit raw reasoning delta events but populate the
+        // completed reasoning item. Track streamed ids so the fallback does
+        // not duplicate raw text that already streamed.
+        let mut streamed_raw_reasoning = HashSet::new();
         while let Some(chunk) = bytes.next().await {
             let chunk = match chunk {
                 Ok(c) => c,
-                Err(e) => {
-                    let _ = tx.send(Err(ProviderError::Request(e.to_string()))).await;
+                Err(error) => {
+                    let _ = tx.send(Err(ProviderError::Request(error))).await;
                     return;
                 }
             };
@@ -320,18 +351,29 @@ fn sse_events(
                     continue;
                 };
                 match ev["type"].as_str().unwrap_or("") {
-                    "response.output_text.delta" => {
-                        if let Some(d) = ev["delta"].as_str() {
-                            let _ = tx.send(Ok(ProviderEvent::TextDelta(d.to_string()))).await;
+                    "response.output_item.added" => {
+                        let item = &ev["item"];
+                        if item["type"].as_str() == Some("message")
+                            && item["phase"].as_str() == Some("commentary")
+                            && let Some(id) = item["id"].as_str()
+                        {
+                            commentary_messages.insert(id.to_string());
                         }
                     }
-                    // Reasoning summaries (and raw reasoning where exposed).
-                    "response.reasoning_summary_text.delta" | "response.reasoning_text.delta" => {
+                    "response.output_text.delta" => {
+                        if let Some(event) = output_text_delta(&ev, &commentary_messages) {
+                            let _ = tx.send(Ok(event)).await;
+                        }
+                    }
+                    // Raw reasoning is only exposed by some models. Summary
+                    // deltas are heading-like and intentionally ignored in
+                    // favor of commentary message output.
+                    "response.reasoning_text.delta" => {
                         if let Some(d) = ev["delta"].as_str() {
                             if let Some(id) =
                                 ev["item_id"].as_str().or_else(|| ev["itemId"].as_str())
                             {
-                                streamed_reasoning.insert(id.to_string());
+                                streamed_raw_reasoning.insert(id.to_string());
                             }
                             let _ = tx
                                 .send(Ok(ProviderEvent::ThinkingDelta(d.to_string())))
@@ -343,8 +385,8 @@ fn sse_events(
                         if item["type"].as_str() == Some("reasoning")
                             && item["id"]
                                 .as_str()
-                                .is_none_or(|id| !streamed_reasoning.contains(id))
-                            && let Some(text) = completed_reasoning_text(item)
+                                .is_none_or(|id| !streamed_raw_reasoning.contains(id))
+                            && let Some(text) = completed_raw_reasoning_text(item)
                         {
                             let _ = tx.send(Ok(ProviderEvent::ThinkingDelta(text))).await;
                         } else if item["type"].as_str() == Some("function_call") {
@@ -359,6 +401,11 @@ fn sse_events(
                                     arguments,
                                 })))
                                 .await;
+                        }
+                        if item["type"].as_str() == Some("message")
+                            && let Some(id) = item["id"].as_str()
+                        {
+                            commentary_messages.remove(id);
                         }
                     }
                     "response.completed" => {
@@ -438,15 +485,59 @@ mod tests {
     }
 
     #[test]
-    fn requests_reasoning_summaries_with_or_without_effort() {
+    fn disables_reasoning_summaries_with_or_without_effort() {
         let mut options = Map::new();
-        assert_eq!(reasoning_options(&options), json!({ "summary": "auto" }));
+        assert_eq!(reasoning_options(&options), json!({ "summary": "none" }));
 
         options.insert("reasoning_effort".into(), json!("high"));
         assert_eq!(
             reasoning_options(&options),
-            json!({ "summary": "auto", "effort": "high" })
+            json!({ "summary": "none", "effort": "high" })
         );
+    }
+
+    #[test]
+    fn routes_codex_commentary_as_thinking() {
+        let commentary = HashSet::from(["commentary-1".to_string()]);
+        let event = json!({ "item_id": "commentary-1", "delta": "Checking the parser." });
+        assert!(matches!(
+            output_text_delta(&event, &commentary),
+            Some(ProviderEvent::ThinkingDelta(text)) if text == "Checking the parser."
+        ));
+
+        let final_event = json!({ "item_id": "final-1", "delta": "Done." });
+        assert!(matches!(
+            output_text_delta(&final_event, &commentary),
+            Some(ProviderEvent::TextDelta(text)) if text == "Done."
+        ));
+    }
+
+    #[tokio::test]
+    async fn streamed_raw_reasoning_is_not_repeated_by_the_completed_item() {
+        use futures::StreamExt;
+
+        let body = concat!(
+            "data: {\"type\":\"response.reasoning_text.delta\",",
+            "\"item_id\":\"reasoning-1\",\"delta\":\"Raw reasoning.\"}\n\n",
+            "data: {\"type\":\"response.output_item.done\",\"item\":{",
+            "\"id\":\"reasoning-1\",\"type\":\"reasoning\",",
+            "\"summary\":[],\"content\":[{\"type\":\"reasoning_text\",",
+            "\"text\":\"Raw reasoning.\"}]}}\n\n",
+        );
+        let chunks = futures::stream::iter([Ok(bytes::Bytes::from_static(body.as_bytes()))]);
+        let events = sse_byte_events(chunks)
+            .map(|event| event.expect("valid SSE event"))
+            .collect::<Vec<_>>()
+            .await;
+        let thinking = events
+            .into_iter()
+            .filter_map(|event| match event {
+                ProviderEvent::ThinkingDelta(text) => Some(text),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(thinking, ["Raw reasoning."]);
     }
 
     #[test]
@@ -460,14 +551,17 @@ mod tests {
             "content": [{ "type": "reasoning_text", "text": "raw thought" }],
         });
         assert_eq!(
-            completed_reasoning_text(&item).as_deref(),
-            Some("First thought\n\nSecond thought")
+            completed_raw_reasoning_text(&item).as_deref(),
+            Some("raw thought")
         );
 
         assert_eq!(
-            completed_reasoning_text(&json!({ "summary": [], "content": ["raw thought"] }))
-                .as_deref(),
+            completed_raw_reasoning_text(&json!({ "content": ["raw thought"] })).as_deref(),
             Some("raw thought")
+        );
+        assert_eq!(
+            completed_raw_reasoning_text(&json!({ "summary": ["heading"] })),
+            None
         );
     }
 

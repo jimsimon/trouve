@@ -607,7 +607,14 @@ echo '{"jsonrpc":"2.0","id":2,"result":{"thread":{"id":"thr-1"}}}'
 IFS= read -r line # turn/start
 printf '%s\n' "$line" > "$0.turn-start"
 echo '{"jsonrpc":"2.0","id":3,"result":{"turn":{"id":"turn-1"}}}'
+echo '{"jsonrpc":"2.0","method":"item/started","params":{"threadId":"thr-1","item":{"id":"thinking-1","type":"agentMessage","text":"","phase":"commentary"}}}'
+echo '{"jsonrpc":"2.0","method":"item/agentMessage/delta","params":{"threadId":"thr-1","itemId":"thinking-1","delta":"Checking the workspace."}}'
+echo '{"jsonrpc":"2.0","method":"item/completed","params":{"threadId":"thr-1","item":{"id":"thinking-1","type":"agentMessage","text":"Checking the workspace.","phase":"commentary"}}}'
+echo '{"jsonrpc":"2.0","method":"item/started","params":{"threadId":"thr-1","item":{"id":"i1","type":"agentMessage","text":"","phase":"final_answer"}}}'
 echo '{"jsonrpc":"2.0","method":"item/agentMessage/delta","params":{"threadId":"thr-1","itemId":"i1","delta":"Hello"}}'
+echo '{"jsonrpc":"2.0","method":"item/started","params":{"threadId":"thr-1","item":{"id":"reasoning-1","type":"reasoning","summary":[],"content":[]}}}'
+echo '{"jsonrpc":"2.0","method":"item/reasoning/textDelta","params":{"threadId":"thr-1","itemId":"reasoning-1","delta":"Raw reasoning."}}'
+echo '{"jsonrpc":"2.0","method":"item/completed","params":{"threadId":"thr-1","item":{"id":"reasoning-1","type":"reasoning","summary":[],"content":["Raw reasoning."]}}}'
 echo '{"jsonrpc":"2.0","method":"item/started","params":{"threadId":"thr-1","item":{"id":"c1","type":"commandExecution","command":"ls"}}}'
 echo '{"jsonrpc":"2.0","id":100,"method":"item/commandExecution/requestApproval","params":{"threadId":"thr-1","itemId":"c1","command":"ls"}}'
 IFS= read -r approval
@@ -625,6 +632,7 @@ cat > /dev/null
     })
     .await;
 
+    let mut thinking = Vec::new();
     let mut saw_text = false;
     let mut saw_tool_started = false;
     let mut saw_tool_output = false;
@@ -634,6 +642,7 @@ cat > /dev/null
     while let Some(ev) = stream.next().await {
         match ev.unwrap() {
             BackendEvent::SessionStarted { session_id } => sessions.push(session_id),
+            BackendEvent::ThinkingDelta(t) => thinking.push(t),
             BackendEvent::TextDelta(t) => saw_text |= t == "Hello",
             BackendEvent::ToolStarted { call_id, .. } => saw_tool_started |= call_id == "c1",
             BackendEvent::ToolOutput { call_id, .. } => saw_tool_output |= call_id == "c1",
@@ -651,13 +660,24 @@ cat > /dev/null
                 responder.send(true).unwrap();
             }
             BackendEvent::Completed { usage: u } => usage = Some(u),
-            BackendEvent::ThinkingDelta(_)
-            | BackendEvent::QuestionsNeeded { .. }
-            | BackendEvent::CommandsUpdated { .. } => {}
+            BackendEvent::QuestionsNeeded { .. } | BackendEvent::CommandsUpdated { .. } => {}
         }
     }
 
     assert_eq!(sessions, vec!["thr-1"]);
+    assert!(
+        thinking
+            .iter()
+            .any(|text| text == "Checking the workspace.")
+    );
+    assert_eq!(
+        thinking
+            .iter()
+            .filter(|text| text.as_str() == "Raw reasoning.")
+            .count(),
+        1,
+        "completed reasoning must not repeat a streamed raw delta: {thinking:?}"
+    );
     assert!(saw_text && saw_tool_started && saw_tool_output && saw_tool_completed);
     let usage = usage.expect("turn completed");
     assert_eq!(usage.input_tokens, 11);
@@ -675,10 +695,14 @@ cat > /dev/null
     let thread_start: serde_json::Value = serde_json::from_str(&thread_start).unwrap();
     assert_eq!(thread_start["params"]["approvalPolicy"], "untrusted");
     assert_eq!(thread_start["params"]["sandbox"], "danger-full-access");
+    assert_eq!(
+        thread_start["params"]["config"]["show_raw_agent_reasoning"],
+        true
+    );
     let turn_start = std::fs::read_to_string(format!("{stub}.turn-start")).unwrap();
     let turn_start: serde_json::Value = serde_json::from_str(&turn_start).unwrap();
     assert_eq!(turn_start["params"]["approvalPolicy"], "untrusted");
-    assert_eq!(turn_start["params"]["summary"], "auto");
+    assert_eq!(turn_start["params"]["summary"], "none");
     assert_eq!(
         turn_start["params"]["sandboxPolicy"],
         serde_json::json!({ "type": "dangerFullAccess" })
