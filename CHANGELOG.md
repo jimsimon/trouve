@@ -4,6 +4,24 @@ All notable changes to this project are documented in this file. The format
 is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this
 project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [3.3.0] - 2026-07-24
+
+### Added
+
+- **Pull request comment review requests**: repository owners, members, and
+  collaborators can comment `@trouve-ai review` on a pull request to request
+  an on-demand review in either manual or automatic mode, including while the
+  pull request is a draft. Comment triggers are persisted and deduplicated
+  across webhook retries and service restarts.
+
+### Fixed
+
+- **Remote Codex and Claude Code sign-in**: Codex now uses device
+  authentication, while Claude Code runs its subscription login in a PTY and
+  accepts a validated browser callback pasted through the review dashboard.
+  Both vendor CLI login flows now work when the browser and trouve server do
+  not share the same localhost.
+
 ## [3.2.0] - 2026-07-23
 
 ### Added
@@ -414,6 +432,7 @@ semble ([BENCHMARKS.md](BENCHMARKS.md)):
 - Incremental reindex (1 file touched): 0.86 s vs ~3 min (212x)
 - Warm query: 0.55 s vs 7.2 s (13x)
 
+[3.3.0]: https://github.com/jimsimon/trouve/compare/v3.2.0...v3.3.0
 [3.2.0]: https://github.com/jimsimon/trouve/compare/v3.1.0...v3.2.0
 [3.1.0]: https://github.com/jimsimon/trouve/releases/tag/v3.1.0
 [3.0.0]: https://github.com/jimsimon/trouve/releases/tag/v3.0.0
