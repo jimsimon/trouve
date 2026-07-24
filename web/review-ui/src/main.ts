@@ -324,7 +324,8 @@ function renderProviderLogin(): string {
       ? `<p>Finish authorization in the newly opened tab. If it did not open, use the button below.</p>
          <div class="login-actions"><a class="button-link" href="${escape(login.verification_url)}" target="_blank" rel="noopener noreferrer">Open sign-in page ↗</a></div>
          ${callbackFallback}`
-      : `<p>${escape(login.error || "The CLI started but did not expose a browser URL. Check the server terminal for its login instructions.")}</p>`
+      : `<p>${escape(login.error || "The CLI started but did not expose a browser URL. Check the server terminal for its login instructions.")}</p>
+         ${callbackFallback}`
     : login.state === "success"
       ? "<p>Credentials are ready. The provider's models are now available to reviewers.</p>"
       : login.state === "failed"

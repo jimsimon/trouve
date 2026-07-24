@@ -56,8 +56,20 @@ pub async fn spawn_claude_login(command: &str) -> Result<BackendLogin, BackendEr
     let mut child = pair.slave.spawn_command(cmd).map_err(pty_error)?;
     drop(pair.slave);
 
-    let reader = pair.master.try_clone_reader().map_err(pty_error)?;
-    let mut writer = pair.master.take_writer().map_err(pty_error)?;
+    let reader = match pair.master.try_clone_reader() {
+        Ok(reader) => reader,
+        Err(error) => {
+            let _ = child.kill();
+            return Err(pty_error(error));
+        }
+    };
+    let mut writer = match pair.master.take_writer() {
+        Ok(writer) => writer,
+        Err(error) => {
+            let _ = child.kill();
+            return Err(pty_error(error));
+        }
+    };
     drop(pair.master);
 
     let (line_tx, line_rx) = tokio::sync::mpsc::channel::<String>(64);
@@ -240,7 +252,10 @@ fn pump_blocking_lines(
     use std::io::BufRead as _;
 
     let lines = std::io::BufReader::new(reader).lines();
-    for line in lines.map_while(Result::ok) {
+    for result in lines {
+        let Ok(line) = result else {
+            continue;
+        };
         if tx.blocking_send(line).is_err() {
             break;
         }
@@ -445,5 +460,18 @@ exit 3
             .await
             .expect("fake Claude login should exit")
             .expect("fake Claude login should accept the callback");
+    }
+
+    #[tokio::test]
+    async fn blocking_line_pump_skips_invalid_lines() {
+        let reader = std::io::Cursor::new(b"before\n\xff\nafter\n".to_vec());
+        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+        std::thread::spawn(move || pump_blocking_lines(Box::new(reader), tx))
+            .join()
+            .unwrap();
+
+        assert_eq!(rx.recv().await.as_deref(), Some("before"));
+        assert_eq!(rx.recv().await.as_deref(), Some("after"));
+        assert!(rx.recv().await.is_none());
     }
 }
