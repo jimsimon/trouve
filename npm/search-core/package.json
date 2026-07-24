@@ -1,6 +1,6 @@
 {
   "name": "@trouve-ai/search-core",
-  "version": "3.3.1",
+  "version": "3.3.2",
   "description": "trouve-search native binary and MCP launcher for Node. Platform-specific binaries install via optional dependencies.",
   "type": "module",
   "exports": {
@@ -35,14 +35,14 @@
     "typecheck": "tsc --noEmit"
   },
   "optionalDependencies": {
-    "@trouve-ai/search-darwin-arm64": "3.3.1",
-    "@trouve-ai/search-darwin-x64": "3.3.1",
-    "@trouve-ai/search-linux-arm64-gnu": "3.3.1",
-    "@trouve-ai/search-linux-arm64-musl": "3.3.1",
-    "@trouve-ai/search-linux-x64-gnu": "3.3.1",
-    "@trouve-ai/search-linux-x64-musl": "3.3.1",
-    "@trouve-ai/search-win32-arm64": "3.3.1",
-    "@trouve-ai/search-win32-x64": "3.3.1"
+    "@trouve-ai/search-darwin-arm64": "3.3.2",
+    "@trouve-ai/search-darwin-x64": "3.3.2",
+    "@trouve-ai/search-linux-arm64-gnu": "3.3.2",
+    "@trouve-ai/search-linux-arm64-musl": "3.3.2",
+    "@trouve-ai/search-linux-x64-gnu": "3.3.2",
+    "@trouve-ai/search-linux-x64-musl": "3.3.2",
+    "@trouve-ai/search-win32-arm64": "3.3.2",
+    "@trouve-ai/search-win32-x64": "3.3.2"
   },
   "devDependencies": {
     "@types/node": "^24.0.0",
