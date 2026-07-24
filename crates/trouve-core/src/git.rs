@@ -13,6 +13,8 @@ use anyhow::{Context, Result, bail};
 
 const FETCH_TIMEOUT: Duration = Duration::from_secs(30);
 const COMMAND_POLL_INTERVAL: Duration = Duration::from_millis(25);
+const CHECKPOINT_IDENTITY_NAME: &str = "trouve";
+const CHECKPOINT_IDENTITY_EMAIL: &str = "trouve@localhost";
 
 fn git(dir: &Path, args: &[&str]) -> Result<String> {
     let out = Command::new("git")
@@ -40,6 +42,22 @@ fn git_untrimmed(dir: &Path, args: &[&str]) -> Result<String> {
         );
     }
     Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+fn git_as_checkpoint_identity(dir: &Path, args: &[&str]) -> Result<String> {
+    let out = Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(args)
+        // Checkpoints are trouve bookkeeping commits, and session creation
+        // must not depend on the host having a global Git identity.
+        .env("GIT_AUTHOR_NAME", CHECKPOINT_IDENTITY_NAME)
+        .env("GIT_AUTHOR_EMAIL", CHECKPOINT_IDENTITY_EMAIL)
+        .env("GIT_COMMITTER_NAME", CHECKPOINT_IDENTITY_NAME)
+        .env("GIT_COMMITTER_EMAIL", CHECKPOINT_IDENTITY_EMAIL)
+        .output()
+        .with_context(|| format!("running git {args:?} in {}", dir.display()))?;
+    git_result(dir, args, out.status, out.stdout, out.stderr)
 }
 
 fn git_with_timeout(dir: &Path, args: &[&str], timeout: Duration) -> Result<String> {
@@ -301,7 +319,7 @@ pub fn checkpoint(worktree: &Path, session_id: &str, seq: i64, message: &str) ->
     git(worktree, &["add", "-A"])?;
     let tree = git(worktree, &["write-tree"])?;
     let head = git(worktree, &["rev-parse", "HEAD"])?;
-    let commit = git(
+    let commit = git_as_checkpoint_identity(
         worktree,
         &["commit-tree", &tree, "-p", &head, "-m", message],
     )?;
@@ -598,5 +616,24 @@ mod tests {
 
         remove_worktree(&repo, &wt).unwrap();
         assert!(!wt.exists());
+    }
+
+    #[test]
+    fn checkpoint_does_not_require_a_configured_git_identity() {
+        let tmp = tempfile::tempdir().unwrap();
+        init_repo(tmp.path());
+        run(tmp.path(), &["config", "user.name", ""]);
+        run(tmp.path(), &["config", "user.email", ""]);
+
+        let commit = checkpoint(tmp.path(), "se_t", 0, "checkpoint").unwrap();
+        let identity = run(
+            tmp.path(),
+            &["show", "-s", "--format=%an <%ae>%n%cn <%ce>", &commit],
+        );
+
+        assert_eq!(
+            identity,
+            "trouve <trouve@localhost>\ntrouve <trouve@localhost>"
+        );
     }
 }
