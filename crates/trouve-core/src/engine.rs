@@ -2957,21 +2957,25 @@ impl Engine {
         let _ = self
             .secrets
             .delete(&trouve_providers::secrets::oauth_secret(&id));
-        let _publication = self.github_dashboard_publication.lock().unwrap();
         {
-            let mut dashboard_caches = self.github_dashboard_caches.lock().unwrap();
-            dashboard_caches.remove(&host);
-        }
-        self.store.append_event(
-            Scope::Server,
-            Event::GithubPullRequestsUpdated {
-                pull_requests: trouve_protocol::GithubPrList {
-                    viewer: String::new(),
-                    host,
-                    prs: Vec::new(),
+            let _publication = self.github_dashboard_publication.lock().unwrap();
+            {
+                let mut dashboard_caches = self.github_dashboard_caches.lock().unwrap();
+                dashboard_caches.remove(&host);
+            }
+            // The durable clear must stay ordered with stale-refresh
+            // validation, not just with the in-memory cache removal.
+            self.store.append_event(
+                Scope::Server,
+                Event::GithubPullRequestsUpdated {
+                    pull_requests: trouve_protocol::GithubPrList {
+                        viewer: String::new(),
+                        host,
+                        prs: Vec::new(),
+                    },
                 },
-            },
-        )?;
+            )?;
+        }
         Ok(())
     }
 
@@ -3259,10 +3263,15 @@ impl Engine {
         Ok(self.store.list_workspaces()?)
     }
 
+    /// Capture authenticated hosts and register their cache handles as one
+    /// publication-locked lifecycle step.
     fn prepare_github_dashboard_refreshes(&self) -> Vec<GithubDashboardRefresh> {
         self.prepare_github_dashboard_refreshes_with(|| {})
     }
 
+    /// Testable preparation path. `after_capture` runs with the publication
+    /// lock held, after host/token capture and before cache pruning and
+    /// registration, so tests can coordinate a concurrent removal.
     fn prepare_github_dashboard_refreshes_with(
         &self,
         after_capture: impl FnOnce(),
@@ -3362,21 +3371,25 @@ impl Engine {
             let Some(snapshot) = cache.unpublished_snapshot(&pull_requests)? else {
                 continue;
             };
-            let _publication = self.github_dashboard_publication.lock().unwrap();
-            let cache_is_current = {
-                let dashboard_caches = self.github_dashboard_caches.lock().unwrap();
-                dashboard_caches
-                    .get(&pull_requests.host)
-                    .is_some_and(|current| Arc::ptr_eq(current, &cache_handle))
-            };
-            if !cache_is_current {
-                continue;
+            {
+                let _publication = self.github_dashboard_publication.lock().unwrap();
+                let cache_is_current = {
+                    let dashboard_caches = self.github_dashboard_caches.lock().unwrap();
+                    dashboard_caches
+                        .get(&pull_requests.host)
+                        .is_some_and(|current| Arc::ptr_eq(current, &cache_handle))
+                };
+                if !cache_is_current {
+                    continue;
+                }
+                // Validation, durable publication, and cache marking must be
+                // serialized together with host removal.
+                self.store.append_event(
+                    Scope::Server,
+                    Event::GithubPullRequestsUpdated { pull_requests },
+                )?;
+                cache.mark_snapshot_published(snapshot);
             }
-            self.store.append_event(
-                Scope::Server,
-                Event::GithubPullRequestsUpdated { pull_requests },
-            )?;
-            cache.mark_snapshot_published(snapshot);
         }
         if !failures.is_empty() {
             return Err(EngineError::BadRequest(failures.join("; ")));
