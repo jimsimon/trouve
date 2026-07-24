@@ -33,8 +33,8 @@ pub struct NavRowData {
     pub unread: bool,
     /// Session has a failed turn that has not been viewed yet.
     pub error: bool,
-    /// Pull-request badge: 0 none, 1 open, 2 draft, 3 merged, 4 closed,
-    /// 5 multiple (neutral).
+    /// Pull-request badge: 0 none, 1 ready to merge, 2 unable to merge,
+    /// 3 merged, 4 closed.
     pub pr_kind: i32,
     /// Hover/focus detail for the pull-request badge.
     pub pr_tooltip: String,
@@ -508,20 +508,38 @@ pub fn set_at_files(ui: &Ui, files: Vec<String>) {
 /// ("📎2", empty for none — kept out of the editable text), and whether the
 /// thread is idle (idle + non-empty queue surfaces the "Send now" pill).
 pub fn set_queue(ui: &Ui, prompts: Vec<String>, badges: Vec<String>, idle: bool) {
+    let previews = prompts
+        .iter()
+        .map(|prompt| queue_preview(prompt))
+        .collect::<Vec<_>>();
     let _ = ui.upgrade_in_event_loop(move |ui| {
-        // Replacing either model makes Slint rebuild the queue repeater. In
-        // particular, replacing `queue-prompts` fires its changed handler and
+        // Replacing queue-prompts makes Slint rebuild the queue repeater and
         // closes an open inline editor. Chat events call this bridge even when
-        // the queue itself is unchanged, so retain the models (and the editor's
-        // local draft/focus) unless their contents really changed.
+        // the queue itself is unchanged, so retain every model unless its
+        // contents really changed.
         if !string_model_matches(&ui.get_queue_prompts(), &prompts) {
             ui.set_queue_prompts(string_model(prompts));
+        }
+        if !string_model_matches(&ui.get_queue_previews(), &previews) {
+            ui.set_queue_previews(string_model(previews));
         }
         if !string_model_matches(&ui.get_queue_badges(), &badges) {
             ui.set_queue_badges(string_model(badges));
         }
         ui.set_queue_idle(idle);
     });
+}
+
+/// The compact queue row is a teaser, not an editor. Rendering the original
+/// multiline prompt in its fixed-height slot lets later lines escape the row,
+/// so show its first meaningful line and keep the full text in queue-prompts.
+fn queue_preview(prompt: &str) -> String {
+    prompt
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .unwrap_or_default()
+        .to_owned()
 }
 
 fn string_model_matches(model: &ModelRc<SharedString>, values: &[String]) -> bool {
@@ -969,7 +987,7 @@ pub fn set_settings_section(ui: &Ui, section: i32) {
     let _ = ui.upgrade_in_event_loop(move |ui| ui.set_settings_section(section));
 }
 
-pub fn set_diff(ui: &Ui, rows: Vec<slint_diff_view::RowData>, raw: String) {
+pub fn set_diff(ui: &Ui, rows: Vec<trouve_slint_diff_view::RowData>, raw: String) {
     let _ = ui.upgrade_in_event_loop(move |ui| {
         let items: Vec<DiffRow> = rows
             .into_iter()
@@ -982,7 +1000,7 @@ pub fn set_diff(ui: &Ui, rows: Vec<slint_diff_view::RowData>, raw: String) {
                 collapsed: r.collapsed,
             })
             .collect();
-        let file_texts: Vec<SharedString> = slint_diff_view::split_file_diffs(&raw)
+        let file_texts: Vec<SharedString> = trouve_slint_diff_view::split_file_diffs(&raw)
             .into_iter()
             .map(|s| SharedString::from(s.as_str()))
             .collect();
@@ -997,7 +1015,7 @@ pub fn set_diff(ui: &Ui, rows: Vec<slint_diff_view::RowData>, raw: String) {
 /// a status note ("shell exited"), and whether a terminal is attached.
 pub fn set_term(
     ui: &Ui,
-    rows: Vec<Vec<slint_terminal::GridSpan>>,
+    rows: Vec<Vec<trouve_slint_terminal::GridSpan>>,
     cursor: Option<(u16, u16)>,
     scrollback: usize,
     status: String,
@@ -1594,6 +1612,14 @@ mod tests {
     use slint::{ComponentHandle as _, PhysicalSize};
 
     use super::*;
+
+    #[test]
+    fn queued_prompt_preview_is_one_line() {
+        let prompt = "\n  If we support multiple users:  \n\n1. Configure credentials\n2. Log in";
+
+        assert_eq!(queue_preview(prompt), "If we support multiple users:");
+        assert_eq!(queue_preview(" \r\n\t\n"), "");
+    }
 
     fn workspace_rows(ids: &[&str]) -> Vec<NavRowData> {
         ids.iter()

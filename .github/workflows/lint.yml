@@ -31,8 +31,12 @@ jobs:
         run: cargo doc --no-deps
         env:
           RUSTDOCFLAGS: -D warnings
+      - name: version sync tests
+        run: python3 -m unittest scripts/test_sync_versions.py
       - name: versions in sync
         run: python3 scripts/sync_versions.py --check
+      - name: benchmark gate tests
+        run: python3 -m unittest benchmarks/test_compare_benchmarks.py
       # The test-with-model job in test.yml runs ignored tests from these two
       # crates, so an #[ignore]d test anywhere else would silently never run.
       # Keep them there, or widen that job's scope on purpose.
@@ -52,11 +56,8 @@ jobs:
           cache-dependency-path: npm/package-lock.json
       # npm/ is an npm workspace; one install links the local packages
       # (search-plugin -> search-core) and installs all dev dependencies.
-      # `npm install` rather than `npm ci`: search-core's optional platform
-      # packages aren't in the lockfile until they exist on the registry, and
-      # `npm ci` refuses to run with an incomplete lockfile.
       - name: npm typecheck
         working-directory: npm
         run: |
-          npm install
+          npm ci
           npm run typecheck

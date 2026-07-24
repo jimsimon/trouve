@@ -3536,7 +3536,7 @@ async fn spawn_session_child_agent_isolated() {
 }
 
 #[tokio::test]
-async fn secured_router_enforces_token_and_loopback_host() {
+async fn secured_router_enforces_loopback_host_and_internal_token() {
     let tmp = tempfile::tempdir().unwrap();
     let store = Store::open(&tmp.path().join("db/trouve.db")).unwrap();
     let engine = Arc::new(
@@ -3544,7 +3544,6 @@ async fn secured_router_enforces_token_and_loopback_host() {
     );
 
     let security = trouve_server::ServerSecurity {
-        token: Some("s3cret-token".to_string()),
         require_loopback_host: true,
         internal_token: Some("bridge-secret".to_string()),
     };
@@ -3555,41 +3554,21 @@ async fn secured_router_enforces_token_and_loopback_host() {
     let base = format!("http://{addr}/v1");
     let client = reqwest::Client::new();
 
-    // No token -> 401.
+    // Loopback API requests do not require authentication.
     let resp = client.get(format!("{base}/info")).send().await.unwrap();
-    assert_eq!(resp.status(), reqwest::StatusCode::UNAUTHORIZED);
-
-    // Wrong token -> 401.
-    let resp = client
-        .get(format!("{base}/info"))
-        .bearer_auth("nope")
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), reqwest::StatusCode::UNAUTHORIZED);
-
-    // Correct token -> 200.
-    let resp = client
-        .get(format!("{base}/info"))
-        .bearer_auth("s3cret-token")
-        .send()
-        .await
-        .unwrap();
     assert_eq!(resp.status(), reqwest::StatusCode::OK);
 
-    // Non-loopback Host header (DNS-rebinding attempt) -> 403, even with a
-    // valid token.
+    // Non-loopback Host header (DNS-rebinding attempt) -> 403.
     let resp = client
         .get(format!("{base}/info"))
-        .bearer_auth("s3cret-token")
         .header(reqwest::header::HOST, "attacker.example.com")
         .send()
         .await
         .unwrap();
     assert_eq!(resp.status(), reqwest::StatusCode::FORBIDDEN);
 
-    // GitHub's public webhook route bypasses bearer and loopback-host checks;
-    // its handler still rejects unauthenticated payloads before processing.
+    // GitHub's public webhook route bypasses the loopback-host check; its
+    // handler still rejects unsigned payloads before processing.
     let resp = client
         .post(format!("http://{addr}/github/webhooks"))
         .header(reqwest::header::HOST, "hooks.example.com")
@@ -3775,12 +3754,33 @@ async fn code_review_dashboard_and_repository_policy_round_trip() {
             .any(|reviewer| reviewer["id"] == "correctness" && reviewer["built_in"] == true)
     );
 
+    let built_in_defaults: serde_json::Value = client
+        .put(format!("{base}/reviewer"))
+        .json(&serde_json::json!({
+            "id": "correctness",
+            "name": "stale client label",
+            "prompt": "stale client prompt",
+            "model": "anthropic/claude",
+            "default_thinking_level": "high"
+        }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(built_in_defaults["built_in"], true);
+    assert_ne!(built_in_defaults["name"], "stale client label");
+    assert_eq!(built_in_defaults["model"], "anthropic/claude");
+    assert_eq!(built_in_defaults["default_thinking_level"], "high");
+
     let custom: serde_json::Value = client
         .put(format!("{base}/reviewer"))
         .json(&serde_json::json!({
             "name": "Widget invariants",
             "prompt": "Check every widget state transition.",
-            "model": "openai/gpt-5"
+            "model": "openai/gpt-5",
+            "default_thinking_level": "medium"
         }))
         .send()
         .await
@@ -3791,6 +3791,7 @@ async fn code_review_dashboard_and_repository_policy_round_trip() {
     let custom_id = custom["id"].as_str().unwrap();
     assert!(custom_id.starts_with("custom:"));
     assert_eq!(custom["built_in"], false);
+    assert_eq!(custom["default_thinking_level"], "medium");
 
     let response = client
         .put(format!("{base}/repository"))
@@ -3842,6 +3843,15 @@ async fn code_review_dashboard_and_repository_policy_round_trip() {
     assert_eq!(
         dashboard["repositories"][0]["reviewer_overrides"][1]["prompt_mode"],
         "replace"
+    );
+    assert!(
+        dashboard["reviewers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|reviewer| reviewer["id"] == "correctness"
+                && reviewer["model"] == "anthropic/claude"
+                && reviewer["default_thinking_level"] == "high")
     );
 
     let deleted = client

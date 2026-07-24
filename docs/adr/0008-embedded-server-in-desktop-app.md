@@ -30,11 +30,11 @@ stay out of engine internals.
   hooks, system connectivity probe), binds the address (port 0 for
   ephemeral), and returns the bound address plus the serve future.
 - The desktop app depends on the `trouve-server` **library**, spawns that
-  future on its runtime with a per-launch bearer token
-  (`ServerSecurity::with_token`), and talks to it over loopback HTTP + SSE
-  via `ProtocolClient` exactly as before. If the server task dies, the app
-  restarts it once on the same address/token (fresh engine over the
-  persisted store) before surfacing failure.
+  future on its runtime with loopback host enforcement
+  (`ServerSecurity::loopback`), and talks to it over loopback HTTP + SSE via
+  `ProtocolClient` exactly as before. If the server task dies, the app
+  restarts it once on the same address (fresh engine over the persisted
+  store) before surfacing failure.
 - The protocol boundary is enforced by the dependency graph, not
   convention: `trouve-app` declares no dependency on `trouve-core`, so
   engine types are unnameable there, and `trouve-server`'s public API
@@ -72,3 +72,6 @@ stay out of engine internals.
 - The app binary links the server stack (axum, SQLite, reqwest, octocrab):
   bigger binary, longer link times for UI-only iteration.
 - Server logs share the app's stderr/tracing subscriber.
+- The loopback API has no bearer authentication. Host validation blocks
+  browser-based DNS rebinding, but another process running as the user can
+  reach it; this is accepted for the single-user desktop deployment model.

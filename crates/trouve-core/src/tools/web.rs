@@ -136,7 +136,7 @@ impl Tool for WebFetch {
             };
             let mut builder = reqwest::Client::builder()
                 .timeout(FETCH_TIMEOUT)
-                .user_agent("trouve-agent/1.0")
+                .user_agent(concat!("trouve-agent/", env!("CARGO_PKG_VERSION")))
                 .redirect(reqwest::redirect::Policy::none());
             if let Some(host) = current.host_str() {
                 builder = builder.resolve_to_addrs(host, &addrs);

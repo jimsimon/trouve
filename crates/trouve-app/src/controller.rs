@@ -789,7 +789,7 @@ struct Controller {
     new_chat: Option<NewChat>,
     branches: Vec<String>,
 
-    diff_files: Vec<slint_diff_view::FileDiff>,
+    diff_files: Vec<trouve_slint_diff_view::FileDiff>,
     diff_collapsed: Vec<bool>,
     diff_raw: String,
     /// Files tab tree: directory listings cached by worktree-relative path
@@ -829,7 +829,7 @@ struct RateSample {
 /// Client-side state of one session's terminal.
 struct TermState {
     terminal_id: String,
-    grid: slint_terminal::GridState,
+    grid: trouve_slint_terminal::GridState,
     /// Bytes consumed from the output stream (resume offset).
     offset: u64,
     exited: bool,
@@ -1023,10 +1023,7 @@ async fn start_local_server() -> Result<(
     Option<(EmbeddedServer, tokio::task::JoinHandle<Result<()>>)>,
 )> {
     if let Ok(url) = std::env::var("TROUVE_SERVER_URL") {
-        // Connecting to an externally-managed server: the user supplies its
-        // token (if any) in the environment.
-        let token = std::env::var("TROUVE_AUTH_TOKEN").ok();
-        let client = ProtocolClient::with_token(&url, token);
+        let client = ProtocolClient::new(&url);
         client
             .info()
             .await
@@ -1034,21 +1031,10 @@ async fn start_local_server() -> Result<(
         return Ok((client, url, None));
     }
 
-    // A per-launch bearer token so no other local process can drive the
-    // server we embed (it can run shell and edit files).
-    let token = format!(
-        "{}{}",
-        uuid::Uuid::new_v4().simple(),
-        uuid::Uuid::new_v4().simple()
-    );
-
-    let (addr, handle) = spawn_embedded_server("127.0.0.1:0".parse()?, &token).await?;
-    let info = EmbeddedServer {
-        addr,
-        token: token.clone(),
-    };
+    let (addr, handle) = spawn_embedded_server("127.0.0.1:0".parse()?).await?;
+    let info = EmbeddedServer { addr };
     let url = format!("http://{addr}");
-    let client = ProtocolClient::with_token(&url, Some(token));
+    let client = ProtocolClient::new(&url);
     if let Err(e) = wait_server_ready(&client).await {
         // Abort and join so the listener/engine tear down before we return.
         handle.abort();
@@ -1064,7 +1050,6 @@ async fn start_local_server() -> Result<(
 #[derive(Clone)]
 struct EmbeddedServer {
     addr: std::net::SocketAddr,
-    token: String,
 }
 
 /// Bind and launch the embedded server task (full local engine behind the
@@ -1072,9 +1057,8 @@ struct EmbeddedServer {
 /// address and the join handle used to observe its exit.
 async fn spawn_embedded_server(
     addr: std::net::SocketAddr,
-    token: &str,
 ) -> Result<(std::net::SocketAddr, tokio::task::JoinHandle<Result<()>>)> {
-    let security = trouve_server::ServerSecurity::with_token(token.to_string());
+    let security = trouve_server::ServerSecurity::loopback();
     let (addr, server) = trouve_server::bind_local(addr, security).await?;
     Ok((addr, tokio::spawn(server)))
 }
@@ -1396,7 +1380,7 @@ impl Controller {
         }
         self.last_respawn = Some(std::time::Instant::now());
         self.push_connectivity();
-        let restarted = match spawn_embedded_server(info.addr, &info.token).await {
+        let restarted = match spawn_embedded_server(info.addr).await {
             Ok((_, handle)) => {
                 if wait_server_ready(&self.client).await.is_ok() {
                     // Hand ownership to the watcher only once the server
@@ -2526,7 +2510,7 @@ impl Controller {
         // the next resize event if it disagrees.
         let mut state = TermState {
             terminal_id: info.id.clone(),
-            grid: slint_terminal::GridState::new(rows, cols, TERM_SCROLLBACK),
+            grid: trouve_slint_terminal::GridState::new(rows, cols, TERM_SCROLLBACK),
             offset: 0,
             exited: info.exited,
         };
@@ -2687,7 +2671,7 @@ impl Controller {
             .filter(|(_, c)| **c)
             .map(|(f, _)| f.path.clone())
             .collect();
-        self.diff_files = slint_diff_view::parse_unified_diff(&diff.diff);
+        self.diff_files = trouve_slint_diff_view::parse_unified_diff(&diff.diff);
         self.diff_collapsed = self
             .diff_files
             .iter()
@@ -2701,7 +2685,7 @@ impl Controller {
     fn push_diff(&self) {
         ui::set_diff(
             &self.ui,
-            slint_diff_view::build_rows(&self.diff_files, &self.diff_collapsed),
+            trouve_slint_diff_view::build_rows(&self.diff_files, &self.diff_collapsed),
             self.diff_raw.clone(),
         );
     }
@@ -3938,8 +3922,13 @@ impl Controller {
             }
             // Workspace lifecycle is server-scoped so another app instance
             // can keep its sidebar in sync with opens and closes here.
-            Event::WorkspaceRegistered { .. } if self.reload_sessions().await.is_ok() => {
-                self.sync_home_workspace();
+            // Keep the side-effecting reload in the arm body rather than a
+            // match guard, even though Clippy can collapse this shape.
+            #[allow(clippy::collapsible_match)]
+            Event::WorkspaceRegistered { .. } => {
+                if self.reload_sessions().await.is_ok() {
+                    self.sync_home_workspace();
+                }
             }
             Event::WorkspaceClosed { workspace_id } => {
                 self.close_current_session_if_in_workspace(workspace_id);
@@ -4714,8 +4703,13 @@ impl Controller {
             }
             UiCommand::TermKey { text, ctrl, alt } => {
                 let Some((id, bytes)) = self.term_attached().and_then(|(id, state)| {
-                    slint_terminal::encode_key(&text, ctrl, alt, state.grid.application_cursor())
-                        .map(|b| (id, b))
+                    trouve_slint_terminal::encode_key(
+                        &text,
+                        ctrl,
+                        alt,
+                        state.grid.application_cursor(),
+                    )
+                    .map(|b| (id, b))
                 }) else {
                     return Ok(());
                 };
@@ -4737,7 +4731,7 @@ impl Controller {
                 else {
                     return Ok(());
                 };
-                let bytes = slint_terminal::encode_paste(&text, bracketed);
+                let bytes = trouve_slint_terminal::encode_paste(&text, bracketed);
                 if let Err(e) = self.client.terminal_input(&id, &bytes).await {
                     self.error(&format!("terminal paste: {e:#}"));
                 }
@@ -5738,7 +5732,7 @@ impl Controller {
                         time: time.trim().to_string(),
                         days: days
                             .split(',')
-                            .filter_map(|d| d.trim().parse().ok())
+                            .filter_map(|d| d.trim().parse::<u8>().ok())
                             .collect(),
                     },
                     enabled,
@@ -6379,45 +6373,52 @@ fn attention_badge(approvals: usize, questions: usize) -> (i32, String) {
     }
 }
 
-/// Pull-request badge kind + detail. A single PR inherits its status color;
-/// multiple PRs intentionally collapse to the neutral kind while the tooltip
-/// preserves each individual status.
+/// Pull-request badge kind + detail. Open PRs are green only when GitHub's
+/// detailed merge state says the merge button is ready; every other open
+/// state is conservatively yellow. With multiple open PRs, all must be ready.
 fn pr_badge(prs: &[trouve_protocol::PrInfo]) -> (i32, String) {
     if prs.is_empty() {
         return (0, String::new());
     }
-    let state = |pr: &trouve_protocol::PrInfo| {
-        if pr.draft {
-            "Draft"
-        } else {
-            match pr.state.as_str() {
-                "open" => "Open",
-                "merged" => "Merged",
-                "closed" => "Closed",
-                _ => "Pull request",
-            }
-        }
-    };
     let lines = prs
         .iter()
-        .map(|pr| format!("#{} · {}", pr.number, state(pr)))
+        .map(|pr| format!("#{} · {}", pr.number, pr_badge_status(pr).1))
         .collect::<Vec<_>>()
         .join("\n");
-    if prs.len() > 1 {
-        return (5, format!("{} pull requests\n{lines}", prs.len()));
-    }
-    let pr = &prs[0];
-    let kind = if pr.draft {
-        2
-    } else {
-        match pr.state.as_str() {
-            "open" => 1,
-            "merged" => 3,
-            "closed" => 4,
-            _ => 5,
+
+    let mut open = prs.iter().filter(|pr| pr.state == "open").peekable();
+    let kind = if open.peek().is_some() {
+        if open.all(|pr| pr_badge_status(pr).0 == 1) {
+            1
+        } else {
+            2
         }
+    } else {
+        pr_badge_status(&prs[0]).0
     };
-    (kind, format!("Pull request\n{lines}"))
+    let heading = if prs.len() == 1 {
+        "Pull request".to_string()
+    } else {
+        format!("{} pull requests", prs.len())
+    };
+    (kind, format!("{heading}\n{lines}"))
+}
+
+fn pr_badge_status(pr: &trouve_protocol::PrInfo) -> (i32, &'static str) {
+    match pr.state.as_str() {
+        "merged" => (3, "Merged"),
+        "closed" => (4, "Closed"),
+        "open"
+            if !pr.draft
+                && pr.merge_state_status.as_deref().is_some_and(|status| {
+                    status.eq_ignore_ascii_case("clean") || status.eq_ignore_ascii_case("has_hooks")
+                }) =>
+        {
+            (1, "Ready to merge")
+        }
+        "open" if pr.draft => (2, "Unable to merge · Draft"),
+        _ => (2, "Unable to merge"),
+    }
 }
 
 fn format_reviews(reviews: &[trouve_protocol::PrReview]) -> String {
@@ -7071,6 +7072,7 @@ mod tests {
             comments: 0,
             last_comment_at: None,
             mergeable: None,
+            merge_state_status: None,
             merged_at: None,
         }
     }
@@ -7302,20 +7304,33 @@ mod tests {
             comments: 0,
             last_comment_at: None,
             mergeable: None,
+            merge_state_status: None,
             merged_at: None,
         }
     }
 
     #[test]
-    fn pr_badges_color_single_status_and_neutralize_multiple() {
+    fn pr_badges_follow_github_merge_readiness_and_terminal_state() {
         assert_eq!(pr_badge(&[]).0, 0);
-        assert_eq!(pr_badge(&[nav_pr(1, "open", false)]).0, 1);
+        assert_eq!(pr_badge(&[nav_pr(1, "open", false)]).0, 2);
+
+        let mut ready = nav_pr(2, "open", false);
+        ready.merge_state_status = Some("clean".into());
+        let (kind, tip) = pr_badge(&[ready.clone()]);
+        assert_eq!(kind, 1);
+        assert!(tip.contains("#2 · Ready to merge"));
+
+        let mut hooked = nav_pr(3, "open", false);
+        hooked.merge_state_status = Some("HAS_HOOKS".into());
+        assert_eq!(pr_badge(&[ready.clone(), hooked]).0, 1);
+
         assert_eq!(pr_badge(&[nav_pr(2, "open", true)]).0, 2);
         assert_eq!(pr_badge(&[nav_pr(3, "merged", false)]).0, 3);
         assert_eq!(pr_badge(&[nav_pr(4, "closed", false)]).0, 4);
-        let (kind, tip) = pr_badge(&[nav_pr(5, "open", false), nav_pr(4, "merged", false)]);
-        assert_eq!(kind, 5);
-        assert!(tip.contains("#5 · Open"));
+
+        let (kind, tip) = pr_badge(&[ready, nav_pr(5, "open", false), nav_pr(4, "merged", false)]);
+        assert_eq!(kind, 2);
+        assert!(tip.contains("#5 · Unable to merge"));
         assert!(tip.contains("#4 · Merged"));
     }
 

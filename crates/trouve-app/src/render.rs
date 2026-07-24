@@ -4,9 +4,9 @@
 
 use std::collections::{HashMap, HashSet};
 
-use slint_markdown::{BlockKind, parse_blocks};
 use trouve_client_core::viewmodel::{ChatItem, ThreadViewModel, ToolCallStatus, TurnState};
 use trouve_protocol::QuestionAnswer;
+use trouve_slint_markdown::{BlockKind, parse_blocks};
 
 /// Mirrors the `ChatRow` struct in `app.slint`.
 /// Kinds: 0 user, 1 markdown block, 2 tool card, 3 turn status (failures),

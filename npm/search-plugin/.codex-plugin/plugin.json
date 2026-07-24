@@ -1,6 +1,6 @@
 {
   "name": "trouve-search",
-  "version": "2.1.0",
+  "version": "3.2.0",
   "description": "Fast, accurate code search for agents: hybrid semantic + BM25 search over any local git repository, with incremental branch-aware indexing.",
   "author": {
     "name": "Jim Simon",

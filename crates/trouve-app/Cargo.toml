@@ -1,6 +1,6 @@
 [package]
 name = "trouve-app"
-version = "0.1.0"
+version.workspace = true
 edition.workspace = true
 description = "trouve desktop client: Slint UI over the trouve protocol."
 license.workspace = true
@@ -34,10 +34,10 @@ trouve-protocol.workspace = true
 trouve-server.workspace = true
 # Plain-data helpers (diff parsing, markdown blocks, highlight segments,
 # terminal screen state + key encoding).
-slint-code-view = { path = "../slint-code-view" }
-slint-diff-view = { path = "../slint-diff-view" }
-slint-markdown = { path = "../slint-markdown" }
-slint-terminal = { path = "../slint-terminal" }
+trouve-slint-code-view.workspace = true
+trouve-slint-diff-view.workspace = true
+trouve-slint-markdown.workspace = true
+trouve-slint-terminal.workspace = true
 # Syntax highlighting for the file viewer.
 syntect = { version = "5", default-features = false, features = ["default-fancy"] }
 rfd = { version = "0.17.2", default-features = false, features = ["xdg-portal", "pollster"] }
@@ -49,8 +49,6 @@ shlex = "2.0.1"
 notify-rust = "4.18.0"
 # Automations: local-time rendering of schedule timestamps.
 chrono.workspace = true
-# Per-launch bearer token for the embedded local server.
-uuid.workspace = true
 
 # Prompt attachments: clipboard image paste (arboard), PNG encoding of the
 # pasted RGBA pixels, and MIME sniffing for picked files. Arboard otherwise

@@ -20,27 +20,74 @@ concurrency:
 
 jobs:
   test:
+    name: test (${{ matrix.os }})
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest]
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - os: macos-latest
+            target: aarch64-apple-darwin
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
       - name: Install Linux native build dependencies
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y libfontconfig1-dev libdbus-1-dev
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          shared-key: release-target-${{ matrix.target }}
+          cache-on-failure: true
+          cache-bin: false
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Unit and integration tests (offline)
         run: cargo test --workspace
-      # The full-workspace release build takes ~10-13 minutes (thin LTO,
-      # codegen-units=1), so it runs as a smoke check on main only. Release
-      # compilation of trouve-search is still exercised on every PR by the
-      # bench and parity jobs, and release.yml covers the rest on tags.
-      - name: Build release binaries
+      # Match the release job's package set and target on trusted main pushes.
+      # Later tags can restore the release-profile dependency outputs.
+      - name: Build and cache release artifacts
         if: github.ref == 'refs/heads/main'
-        run: cargo build --release
+        run: >-
+          cargo build --locked --release
+          --package trouve-server
+          --package trouve-search
+          --package trouve-app
+          --target ${{ matrix.target }}
+
+  # Windows-only dependencies and trait impls must be compiled on Windows.
+  # Pull requests get a fast check; trusted main pushes build the exact release
+  # package set and seed the cache used by a tag at the same commit.
+  windows-check:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+        with:
+          targets: x86_64-pc-windows-msvc
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          shared-key: release-target-x86_64-pc-windows-msvc
+          cache-on-failure: true
+          cache-bin: false
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Check Windows desktop app
+        if: github.event_name == 'pull_request'
+        run: cargo check --package trouve-app --target x86_64-pc-windows-msvc
+      - name: Build and cache Windows release artifacts
+        if: github.ref == 'refs/heads/main'
+        run: >-
+          cargo build --locked --release
+          --package trouve-server
+          --package trouve-search
+          --package trouve-app
+          --target x86_64-pc-windows-msvc
 
   # Opt-in tests: model-backed trouve-search coverage plus loopback protocol
   # client coverage. These crates hold every #[ignore]d test in the workspace

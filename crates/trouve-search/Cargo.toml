@@ -1,6 +1,6 @@
 [package]
 name = "trouve-search"
-version = "2.1.0"
+version.workspace = true
 edition.workspace = true
 description = "Fast and accurate code search for agents. Rust port of MinishLab/semble with incremental, branch- and worktree-aware indexing."
 license.workspace = true

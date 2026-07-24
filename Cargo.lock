@@ -7005,22 +7005,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "slint-code-view"
-version = "0.1.0"
-dependencies = [
- "slint",
- "slint-build",
-]
-
-[[package]]
-name = "slint-diff-view"
-version = "0.1.0"
-dependencies = [
- "slint",
- "slint-build",
-]
-
-[[package]]
 name = "slint-macros"
 version = "1.17.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -7030,23 +7014,6 @@ dependencies = [
  "proc-macro2",
  "quote",
  "spin_on",
-]
-
-[[package]]
-name = "slint-markdown"
-version = "0.1.0"
-dependencies = [
- "slint",
- "slint-build",
-]
-
-[[package]]
-name = "slint-terminal"
-version = "0.1.0"
-dependencies = [
- "slint",
- "slint-build",
- "vt100",
 ]
 
 [[package]]
@@ -8529,7 +8496,7 @@ dependencies = [
 
 [[package]]
 name = "trouve-agents"
-version = "0.1.0"
+version = "3.2.0"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -8552,7 +8519,7 @@ dependencies = [
 
 [[package]]
 name = "trouve-app"
-version = "0.1.0"
+version = "3.2.0"
 dependencies = [
  "anyhow",
  "arboard",
@@ -8571,10 +8538,6 @@ dependencies = [
  "shlex 2.0.1",
  "slint",
  "slint-build",
- "slint-code-view",
- "slint-diff-view",
- "slint-markdown",
- "slint-terminal",
  "syntect",
  "tokio",
  "tracing",
@@ -8582,12 +8545,15 @@ dependencies = [
  "trouve-client-core",
  "trouve-protocol",
  "trouve-server",
- "uuid",
+ "trouve-slint-code-view",
+ "trouve-slint-diff-view",
+ "trouve-slint-markdown",
+ "trouve-slint-terminal",
 ]
 
 [[package]]
 name = "trouve-client-core"
-version = "0.1.0"
+version = "3.2.0"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -8602,7 +8568,7 @@ dependencies = [
 
 [[package]]
 name = "trouve-core"
-version = "0.1.0"
+version = "3.2.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -8641,7 +8607,7 @@ dependencies = [
 
 [[package]]
 name = "trouve-protocol"
-version = "0.1.0"
+version = "3.2.0"
 dependencies = [
  "chrono",
  "serde",
@@ -8651,7 +8617,7 @@ dependencies = [
 
 [[package]]
 name = "trouve-providers"
-version = "0.1.0"
+version = "3.2.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -8676,7 +8642,7 @@ dependencies = [
 
 [[package]]
 name = "trouve-search"
-version = "2.1.0"
+version = "3.2.0"
 dependencies = [
  "ahash",
  "anyhow",
@@ -8754,7 +8720,7 @@ dependencies = [
 
 [[package]]
 name = "trouve-server"
-version = "0.1.0"
+version = "3.2.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -8777,6 +8743,39 @@ dependencies = [
  "trouve-providers",
  "utoipa",
  "uuid",
+]
+
+[[package]]
+name = "trouve-slint-code-view"
+version = "3.2.0"
+dependencies = [
+ "slint",
+ "slint-build",
+]
+
+[[package]]
+name = "trouve-slint-diff-view"
+version = "3.2.0"
+dependencies = [
+ "slint",
+ "slint-build",
+]
+
+[[package]]
+name = "trouve-slint-markdown"
+version = "3.2.0"
+dependencies = [
+ "slint",
+ "slint-build",
+]
+
+[[package]]
+name = "trouve-slint-terminal"
+version = "3.2.0"
+dependencies = [
+ "slint",
+ "slint-build",
+ "vt100",
 ]
 
 [[package]]

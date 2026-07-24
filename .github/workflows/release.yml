@@ -1,174 +1,309 @@
-name: Release trouve-search
+name: Release
 
-# The workspace versions crates independently, so release tags are
-# per-crate: `trouve-search-v1.2.3` releases the search tool. (The legacy
-# bare `v1.2.3` tags predate the monorepo conversion.) Fires whether the tag
-# is pushed from the CLI or created by publishing a release from GitHub's
-# release UI. Either way the run ends at the same place: a GitHub release
-# for the tag with binaries attached.
+# Every first-party artifact uses the root workspace version, and repository
+# releases use `vX.Y.Z`. The workflow publishes the desktop and server
+# binaries, search packages, and review containers; all workspace package
+# versions advance together.
 on:
   push:
-    tags: ["trouve-search-v[0-9]+.[0-9]+.[0-9]+*"]
+    tags: ["v[0-9]+.[0-9]+.[0-9]+*"]
+  # A manual run can repair the binary assets on an existing release without
+  # republishing immutable crates, npm packages, or container images.
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing vX.Y.Z release tag to rebuild
+        required: true
+        type: string
 
 env:
   CARGO_TERM_COLOR: always
+  RELEASE_TAG: ${{ github.event.inputs.tag || github.ref_name }}
 
 permissions:
-  contents: write
+  # Build and verification jobs only need to read repository contents.
+  contents: read
 
 concurrency:
-  group: release-trouve-search-${{ github.ref_name }}
+  group: release-${{ github.event.inputs.tag || github.ref_name }}
   cancel-in-progress: false
 
 jobs:
-  # A release tag must match the crate version, and every published npm
-  # manifest must match the crate — one version everywhere, always.
+  # The release tag and every first-party manifest must match the canonical
+  # root workspace version — one version everywhere, always.
   verify-versions:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
-      - name: Manifests in sync and tag matches crate version
+          ref: ${{ env.RELEASE_TAG }}
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
+        with:
+          python-version: "3.11.9"
+      - name: Manifests in sync and tag matches workspace version
         run: |
           python3 scripts/sync_versions.py --check
-          crate="$(python3 -c "import tomllib; print(tomllib.load(open('crates/trouve-search/Cargo.toml', 'rb'))['package']['version'])")"
-          tag="${GITHUB_REF_NAME#trouve-search-v}"
-          if [ "$tag" != "$crate" ]; then
-            echo "Tag trouve-search-v$tag does not match crate version $crate" >&2
+          workspace="$(python3 -c "import tomllib; print(tomllib.load(open('Cargo.toml', 'rb'))['workspace']['package']['version'])")"
+          if [ "$RELEASE_TAG" != "v$workspace" ]; then
+            echo "Tag $RELEASE_TAG does not match workspace version $workspace" >&2
             exit 1
           fi
 
-  build:
+  build-artifacts:
+    name: Build release artifacts (${{ matrix.target }})
     needs: verify-versions
     strategy:
       fail-fast: false
       matrix:
         include:
-          # Linux (glibc): native builds on x64 and arm64 runners.
+          # App, server, and search share one target directory on the six
+          # desktop targets so common dependencies compile only once.
           - target: x86_64-unknown-linux-gnu
             os: ubuntu-latest
+            app: true
           - target: aarch64-unknown-linux-gnu
             os: ubuntu-24.04-arm
-          # Linux (musl, fully static): built with `cross`, whose images ship
-          # the musl C/C++ toolchains needed by the native deps (tree-sitter
-          # grammars, oniguruma, esaxx).
+            app: true
           - target: x86_64-unknown-linux-musl
             os: ubuntu-latest
             cross: true
+            app: false
           - target: aarch64-unknown-linux-musl
             os: ubuntu-latest
             cross: true
-          # macOS: arm64 native; x64 cross-compiled from the arm64 runner
-          # (first-class in Apple's toolchain).
+            app: false
           - target: aarch64-apple-darwin
             os: macos-latest
+            app: true
           - target: x86_64-apple-darwin
             os: macos-latest
-          # Windows: x64 and arm64, each built natively.
+            app: true
           - target: x86_64-pc-windows-msvc
             os: windows-latest
+            app: true
           - target: aarch64-pc-windows-msvc
             os: windows-11-arm
+            app: true
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@stable
+          ref: ${{ env.RELEASE_TAG }}
+      - name: Install Linux native build dependencies
+        if: matrix.app && runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libfontconfig1-dev libdbus-1-dev
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
         with:
           targets: ${{ matrix.target }}
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
-          key: ${{ matrix.target }}
+          shared-key: release-target-${{ matrix.target }}
+          cache-on-failure: true
+          cache-bin: false
       - name: Install cross
         if: matrix.cross
-        uses: taiki-e/install-action@v2
+        uses: taiki-e/install-action@7572810d7dd469b651bb7793945692cf78da5dd7 # v2
         with:
           tool: cross
-      - name: Build
-        run: ${{ matrix.cross && 'cross' || 'cargo' }} build --release --package trouve-search --target ${{ matrix.target }}
-      # Artifact names keep the historical `trouve-search-vX.Y.Z-<target>`
-      # shape: strip the crate prefix from the tag to recover `vX.Y.Z`.
-      - name: Package (unix)
+      - name: Build release artifacts
+        if: github.event_name == 'push'
+        run: >-
+          ${{ matrix.cross && 'cross' || 'cargo' }} build --locked --release
+          --package trouve-server
+          --package trouve-search
+          ${{ matrix.app && '--package trouve-app' || '' }}
+          --target ${{ matrix.target }}
+      # Manual runs backfill only application and server binaries. Existing
+      # search assets stay byte-for-byte unchanged.
+      - name: Build backfill artifacts
+        if: github.event_name == 'workflow_dispatch'
+        run: >-
+          ${{ matrix.cross && 'cross' || 'cargo' }} build --locked --release
+          --package trouve-server
+          ${{ matrix.app && '--package trouve-app' || '' }}
+          --target ${{ matrix.target }}
+      - name: Package trouve-server (unix)
         if: runner.os != 'Windows'
-        env:
-          REF_NAME: ${{ github.ref_name }}
         run: |
-          version_ref="v${REF_NAME#trouve-search-v}"
           cd target/${{ matrix.target }}/release
-          tar czf "trouve-search-${version_ref}-${{ matrix.target }}.tar.gz" trouve-search
-      - name: Package (windows)
+          tar czf "trouve-server-${RELEASE_TAG}-${{ matrix.target }}.tar.gz" trouve-server
+      - name: Package trouve-server (windows)
         if: runner.os == 'Windows'
         shell: pwsh
-        env:
-          REF_NAME: ${{ github.ref_name }}
         run: |
-          $versionRef = "v" + $env:REF_NAME.Substring("trouve-search-v".Length)
           cd target/${{ matrix.target }}/release
-          Compress-Archive -Path trouve-search.exe -DestinationPath "trouve-search-$versionRef-${{ matrix.target }}.zip"
-      - uses: actions/upload-artifact@v7
+          Compress-Archive -Path trouve-server.exe -DestinationPath "trouve-server-$env:RELEASE_TAG-${{ matrix.target }}.zip"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: trouve-server-${{ matrix.target }}
+          path: |
+            target/${{ matrix.target }}/release/trouve-server-${{ env.RELEASE_TAG }}-${{ matrix.target }}.tar.gz
+            target/${{ matrix.target }}/release/trouve-server-${{ env.RELEASE_TAG }}-${{ matrix.target }}.zip
+          if-no-files-found: error
+      - name: Package trouve (unix)
+        if: matrix.app && runner.os != 'Windows'
+        run: |
+          cd target/${{ matrix.target }}/release
+          tar czf "trouve-${RELEASE_TAG}-${{ matrix.target }}.tar.gz" trouve
+      - name: Package trouve (windows)
+        if: matrix.app && runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          cd target/${{ matrix.target }}/release
+          Compress-Archive -Path trouve.exe -DestinationPath "trouve-$env:RELEASE_TAG-${{ matrix.target }}.zip"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: matrix.app
+        with:
+          name: trouve-${{ matrix.target }}
+          path: |
+            target/${{ matrix.target }}/release/trouve-${{ env.RELEASE_TAG }}-${{ matrix.target }}.tar.gz
+            target/${{ matrix.target }}/release/trouve-${{ env.RELEASE_TAG }}-${{ matrix.target }}.zip
+          if-no-files-found: error
+      # Search artifact names keep the historical
+      # `trouve-search-vX.Y.Z-<target>` shape.
+      - name: Package trouve-search (unix)
+        if: github.event_name == 'push' && runner.os != 'Windows'
+        run: |
+          cd target/${{ matrix.target }}/release
+          tar czf "trouve-search-${RELEASE_TAG}-${{ matrix.target }}.tar.gz" trouve-search
+      - name: Package trouve-search (windows)
+        if: github.event_name == 'push' && runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          cd target/${{ matrix.target }}/release
+          Compress-Archive -Path trouve-search.exe -DestinationPath "trouve-search-$env:RELEASE_TAG-${{ matrix.target }}.zip"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: github.event_name == 'push'
         with:
           name: trouve-search-${{ matrix.target }}
           path: |
-            target/${{ matrix.target }}/release/trouve-search-*.tar.gz
-            target/${{ matrix.target }}/release/trouve-search-*.zip
+            target/${{ matrix.target }}/release/trouve-search-${{ env.RELEASE_TAG }}-${{ matrix.target }}.tar.gz
+            target/${{ matrix.target }}/release/trouve-search-${{ env.RELEASE_TAG }}-${{ matrix.target }}.zip
+          if-no-files-found: error
 
   release:
-    needs: build
+    needs: build-artifacts
     runs-on: ubuntu-latest
+    permissions:
+      # softprops/action-gh-release uploads assets to the repository release.
+      contents: write
     steps:
-      - uses: actions/download-artifact@v8
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
           path: artifacts
           merge-multiple: true
+      - name: Download existing search assets for backfill checksums
+        if: github.event_name == 'workflow_dispatch'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          search_asset_count="$(gh release view "$RELEASE_TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --json assets \
+            --jq '[.assets[].name | select(startswith("trouve-search-"))] | length')"
+          if [ "$search_asset_count" -gt 0 ]; then
+            gh release download "$RELEASE_TAG" \
+              --repo "$GITHUB_REPOSITORY" \
+              --dir existing-artifacts \
+              --pattern 'trouve-search-*'
+          fi
       - name: Generate checksums
         run: |
-          cd artifacts
-          sha256sum * > SHA256SUMS
+          checksum_file="$(mktemp)"
+          (
+            cd artifacts
+            sha256sum *
+            if [ -d ../existing-artifacts ]; then
+              cd ../existing-artifacts
+              sha256sum *
+            fi
+          ) | sort -k2 > "$checksum_file"
+          mv "$checksum_file" artifacts/SHA256SUMS
       # Attaches to the existing release when one was published from the UI;
       # creates the release when the run came from a pushed tag.
       - name: Create or update GitHub Release
-        uses: softprops/action-gh-release@v3
+        uses: softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228 # v3
         with:
-          tag_name: ${{ github.ref_name }}
+          tag_name: ${{ env.RELEASE_TAG }}
           files: artifacts/*
-          generate_release_notes: true
+          # Existing release notes are user-authored state. Manual backfills
+          # only attach assets; tag-triggered releases still generate notes.
+          generate_release_notes: ${{ github.event_name == 'push' }}
 
   publish-containers:
     needs: release
-    runs-on: ubuntu-latest
+    if: github.event_name == 'push'
+    runs-on: ${{ matrix.runner }}
     permissions:
+      # Checkout reads repository contents; image publication writes GHCR packages.
       contents: read
       packages: write
     strategy:
       fail-fast: false
+      # Build on matching native hardware; the manifest job below joins the
+      # architecture-specific images under the public version and SHA tags.
       matrix:
         include:
           - component: server
-            context: .
-            dockerfile: Dockerfile.server
+            context: container-server
+            dockerfile: container-server/Dockerfile
             image: trouve-server
+            runner: ubuntu-latest
+            platform: linux/amd64
+            arch: amd64
+            target: x86_64-unknown-linux-musl
+          - component: server
+            context: container-server
+            dockerfile: container-server/Dockerfile
+            image: trouve-server
+            runner: ubuntu-24.04-arm
+            platform: linux/arm64
+            arch: arm64
+            target: aarch64-unknown-linux-musl
           - component: review-ui
             context: web/review-ui
             dockerfile: web/review-ui/Dockerfile
             image: trouve-review-ui
+            runner: ubuntu-latest
+            platform: linux/amd64
+            arch: amd64
+          - component: review-ui
+            context: web/review-ui
+            dockerfile: web/review-ui/Dockerfile
+            image: trouve-review-ui
+            runner: ubuntu-24.04-arm
+            platform: linux/arm64
+            arch: arm64
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        if: matrix.component == 'server'
+        with:
+          name: trouve-server-${{ matrix.target }}
+          path: server-artifact
+      - name: Prepare prebuilt server image context
+        if: matrix.component == 'server'
+        shell: bash
+        run: |
+          mkdir -p container-server
+          tar xzf \
+            "server-artifact/trouve-server-${RELEASE_TAG}-${{ matrix.target }}.tar.gz" \
+            -C container-server
+          cp Dockerfile.server.release container-server/Dockerfile
       - name: Resolve release version
         id: version
         shell: bash
-        run: echo "value=${GITHUB_REF_NAME#trouve-search-v}" >> "$GITHUB_OUTPUT"
+        run: echo "value=${RELEASE_TAG#v}" >> "$GITHUB_OUTPUT"
       - name: Log in to GitHub Container Registry
-        uses: docker/login-action@af1e73f918a031802d376d3c8bbc3fe56130a9b0 # v4
+        uses: docker/login-action@06fb636fac595d6fb4b28a5dfcb21a6f5091859c # v4
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-      - name: Set up QEMU
-        uses: docker/setup-qemu-action@96fe6ef7f33517b61c61be40b68a1882f3264fb8 # v4
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4
       - name: Generate image metadata
@@ -177,36 +312,69 @@ jobs:
         with:
           images: ghcr.io/${{ github.repository_owner }}/${{ matrix.image }}
           tags: |
-            type=raw,value=${{ steps.version.outputs.value }}
-            type=sha,format=long
+            type=raw,value=${{ steps.version.outputs.value }}-${{ matrix.arch }}
+            type=raw,value=sha-${{ github.sha }}-${{ matrix.arch }}
       - name: Build and publish
         uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7
         with:
           context: ${{ matrix.context }}
           file: ${{ matrix.dockerfile }}
-          platforms: linux/amd64,linux/arm64
+          platforms: ${{ matrix.platform }}
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
-          cache-from: type=gha,scope=${{ matrix.component }}
-          cache-to: type=gha,mode=max,scope=${{ matrix.component }}
+          cache-from: type=gha,scope=${{ matrix.component }}-${{ matrix.arch }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.component }}-${{ matrix.arch }}
+
+  publish-container-manifests:
+    needs: publish-containers
+    runs-on: ubuntu-latest
+    permissions:
+      # Required to read architecture images and publish manifests in GHCR.
+      packages: write
+    strategy:
+      matrix:
+        image: [trouve-server, trouve-review-ui]
+    steps:
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@06fb636fac595d6fb4b28a5dfcb21a6f5091859c # v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4
+      - name: Publish multi-platform manifests
+        shell: bash
+        env:
+          IMAGE: ${{ matrix.image }}
+          IMAGE_PREFIX: ghcr.io/${{ github.repository_owner }}
+          SHA_TAG: sha-${{ github.sha }}
+        run: |
+          version="${RELEASE_TAG#v}"
+          for tag in "$version" "$SHA_TAG"; do
+            docker buildx imagetools create \
+              --tag "${IMAGE_PREFIX}/${IMAGE}:${tag}" \
+              "${IMAGE_PREFIX}/${IMAGE}:${tag}-amd64" \
+              "${IMAGE_PREFIX}/${IMAGE}:${tag}-arm64"
+          done
 
   # Mutable tags reconcile separately from release-scoped immutable builds.
   # GitHub may coalesce pending jobs in this shared group; that is safe because
-  # every publisher starts after both versioned images exist and revalidates
-  # releases/latest while holding the global publisher slot.
+  # every publisher starts after both multi-platform versioned images exist and
+  # revalidates releases/latest while holding the global publisher slot.
   publish-latest-containers:
-    needs: publish-containers
+    needs: publish-container-manifests
     runs-on: ubuntu-latest
     concurrency:
-      group: release-trouve-search-latest-containers
+      group: release-latest-containers
       cancel-in-progress: false
     permissions:
       contents: read
       packages: write
     steps:
       - name: Log in to GitHub Container Registry
-        uses: docker/login-action@af1e73f918a031802d376d3c8bbc3fe56130a9b0 # v4
+        uses: docker/login-action@06fb636fac595d6fb4b28a5dfcb21a6f5091859c # v4
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -218,13 +386,12 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           IMAGE_PREFIX: ghcr.io/${{ github.repository_owner }}
-          VERSION: ${{ github.ref_name }}
         run: |
           latest_tag="$(gh api "repos/${GITHUB_REPOSITORY}/releases/latest" --jq .tag_name)"
-          if [ "$latest_tag" != "$GITHUB_REF_NAME" ]; then
+          if [ "$latest_tag" != "$RELEASE_TAG" ]; then
             exit 0
           fi
-          version="${VERSION#trouve-search-v}"
+          version="${RELEASE_TAG#v}"
           for image in trouve-server trouve-review-ui; do
             docker buildx imagetools create \
               --tag "${IMAGE_PREFIX}/${image}:latest" \
@@ -233,6 +400,7 @@ jobs:
 
   publish-crate:
     needs: release
+    if: github.event_name == 'push'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
@@ -247,6 +415,7 @@ jobs:
   # Publish platform packages, @trouve-ai/search-core, then search-plugin.
   publish-npm:
     needs: release
+    if: github.event_name == 'push'
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -258,7 +427,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
-      - uses: actions/download-artifact@v8
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
           path: artifacts
           merge-multiple: true
@@ -268,7 +437,7 @@ jobs:
           registry-url: https://registry.npmjs.org
       - name: Stage platform binaries
         run: python3 scripts/stage_npm_binaries.py artifacts
-      - name: Publish npm packages
+      - name: Publish npm packages (platforms in parallel)
         run: |
           if [ -z "$NODE_AUTH_TOKEN" ]; then
             echo "NPM_TOKEN is not configured; skipping npm publishes." >&2
@@ -286,13 +455,32 @@ jobs:
             echo "Publishing $name@$version from $dir"
             (cd "$dir" && npm publish --access public --provenance)
           }
+          wait_for_platform() {
+            if ! wait "$1"; then
+              platform_publish_failed=1
+            fi
+          }
+          platform_publish_failed=0
+          platform_pids=()
           shopt -s nullglob
           for pkg in npm/search-*/package.json; do
             dir="$(dirname "$pkg")"
             case "$dir" in
               npm/search-core|npm/search-plugin) continue ;;
             esac
-            publish_if_new "$dir"
+            while [ "${#platform_pids[@]}" -ge 4 ]; do
+              wait_for_platform "${platform_pids[0]}"
+              platform_pids=("${platform_pids[@]:1}")
+            done
+            publish_if_new "$dir" &
+            platform_pids+=("$!")
           done
+          for pid in "${platform_pids[@]}"; do
+            wait_for_platform "$pid"
+          done
+          if [ "$platform_publish_failed" -ne 0 ]; then
+            echo "One or more platform package publishes failed." >&2
+            exit 1
+          fi
           publish_if_new npm/search-core
           publish_if_new npm/search-plugin

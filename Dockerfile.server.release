@@ -1,0 +1,15 @@
+# Release images consume the already-built static musl binary. Source builds
+# for local Docker Compose development continue to use Dockerfile.server.
+FROM debian:bookworm-slim
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates curl git sqlite3 \
+    && rm -rf /var/lib/apt/lists/* \
+    && groupadd --system --gid 10001 trouve \
+    && useradd --system --uid 10001 --gid trouve --home-dir /var/lib/trouve \
+        --no-create-home --shell /usr/sbin/nologin trouve \
+    && install -d --owner trouve --group trouve /var/lib/trouve
+COPY trouve-server /usr/local/bin/trouve-server
+ENV TROUVE_DATA_DIR=/var/lib/trouve
+EXPOSE 7433
+USER trouve
+ENTRYPOINT ["trouve-server", "--addr", "0.0.0.0:7433"]

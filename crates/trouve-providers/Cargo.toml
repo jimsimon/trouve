@@ -1,6 +1,6 @@
 [package]
 name = "trouve-providers"
-version = "0.1.0"
+version.workspace = true
 edition.workspace = true
 description = "LLM provider abstraction and implementations for the trouve AI coding harness."
 license.workspace = true

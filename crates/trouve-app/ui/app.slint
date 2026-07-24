@@ -53,7 +53,7 @@ export struct NavRow {
     unread: bool,
     // A failed turn landed while the session was not being viewed.
     error: bool,
-    // 0 none, 1 open, 2 draft, 3 merged, 4 closed, 5 multiple.
+    // 0 none, 1 ready to merge, 2 unable to merge, 3 merged, 4 closed.
     pr-kind: int,
     pr-tooltip: string,
     // 0 none, 1 approval, 2 question, 3 both.
@@ -1702,6 +1702,9 @@ export component AppWindow inherits Window {
     // paused by a failed turn never auto-run — a crash may have cut the
     // previous turn short, so resuming is the user's call.
     in property <[string]> queue-prompts;
+    // Single-line display text derived from queue-prompts. Keep the original
+    // model intact because the inline editor must retain embedded newlines.
+    in property <[string]> queue-previews;
     // Per-row attachment badge ("📎2"; empty hides it). Parallel to
     // queue-prompts so the editable row text stays pristine.
     in property <[string]> queue-badges;
@@ -2600,8 +2603,8 @@ export component AppWindow inherits Window {
                                     icon-image: @image-url("assets/git-merge.svg");
                                     icon-size: Theme.fs(18px);
                                     icon-color: row.pr-kind == 1 ? Theme.c.ok
-                                        : row.pr-kind == 2 ? Theme.c.text-dim
-                                        : row.pr-kind == 3 ? Theme.c.accent
+                                        : row.pr-kind == 2 ? Theme.c.warn
+                                        : row.pr-kind == 3 ? Theme.c.merged
                                         : row.pr-kind == 4 ? Theme.c.err
                                         : Theme.c.text-mid;
                                     hover-icon-color: self.icon-color;
@@ -3867,6 +3870,10 @@ export component AppWindow inherits Window {
                                 spacing: 4px;
                                 Rectangle {
                                     height: Theme.fs(24px);
+                                    // Queue previews have a fixed one-line
+                                    // slot. Clipping is a defensive boundary
+                                    // against text ever escaping into chat.
+                                    clip: true;
                                     border-radius: 4px;
                                     // Dragged row reads as "lifted"; the slot
                                     // it would land in gets a soft highlight.
@@ -3924,7 +3931,8 @@ export component AppWindow inherits Window {
                                         vertical-alignment: center;
                                     }
                                     Text {
-                                        text: qtext;
+                                        text: qi < root.queue-previews.length
+                                            ? root.queue-previews[qi] : "";
                                         color: Theme.c.text-mid;
                                         font-size: Theme.fs(12px);
                                         overflow: elide;

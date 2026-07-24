@@ -1,6 +1,6 @@
 [package]
 name = "trouve-protocol"
-version = "0.1.0"
+version.workspace = true
 edition.workspace = true
 description = "Wire types and OpenAPI schema for the trouve AI coding harness protocol."
 license.workspace = true

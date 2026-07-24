@@ -8,7 +8,7 @@ on. Decisions live in `docs/adr/` — check there before re-litigating one.
 ## Layout
 
 - `crates/trouve-search` — code search library + CLI (published to crates.io
-  and npm; its version drives `scripts/sync_versions.py`).
+  and npm; the root workspace version drives `scripts/sync_versions.py`).
 - `crates/trouve-protocol` — protocol types + OpenAPI schema. No logic.
 - `crates/trouve-core` — sessions, threads, worktrees, event log,
   checkpoints, agent loop, tools, permissions.
@@ -17,7 +17,7 @@ on. Decisions live in `docs/adr/` — check there before re-litigating one.
   protocol.
 - `crates/trouve-client-core` — shared client logic (protocol client, session
   state, view models) for native clients.
-- `crates/slint-*` — standalone, reusable Slint widgets (code view, diff
+- `crates/trouve-slint-*` — standalone, reusable Slint widgets (code view, diff
   view, markdown, terminal). No trouve-specific types in their public APIs.
 - `crates/trouve-app` — thin Slint desktop/mobile app composing the above.
 - `docs/adr/` — architectural decision records. `docs/design/` — living
@@ -49,17 +49,28 @@ These are load-bearing. Do not violate them without a new ADR.
 6. **Agent modes are data.** Modes (plan/code/review/…) are prompt + tool
    policy + default permission mode. Adding a mode must not require new Rust
    control flow.
-7. **Widget crates stay generic.** `slint-*` crates take plain data (text,
+7. **Widget crates stay generic.** `trouve-slint-*` crates take plain data (text,
    spans, hunks), not trouve protocol types.
+8. **One workspace version.** Every first-party Cargo crate, Node package,
+   plugin manifest, internal package pin, and release artifact uses root
+   `[workspace.package].version`. Repository releases use `vX.Y.Z` tags (ADR
+   0012). Protocol and storage-format compatibility versions remain separate.
 
 ## Conventions
 
+- Every Cargo package and crate directory we create is prefixed `trouve-`,
+  and every Node package is scoped under `@trouve-ai/`, including private
+  apps. Keep `trouve-app` as the main application package. Use the
+  `create-trouve-crate` skill whenever adding or renaming a workspace crate
+  or Node package.
 - Rust edition/lints come from the workspace; run `cargo fmt --all` and
   `cargo clippy --all-targets -- -D warnings` before finishing.
 - Tests: `cargo test --workspace` must stay offline-safe. Model-downloading
   and network tests are `#[ignore]` behind env flags (`TROUVE_E2E=1`).
-- Releases are tagged per crate (`trouve-search-v1.2.3`). After bumping
-  `crates/trouve-search/Cargo.toml`, run `python3 scripts/sync_versions.py`.
+- Releases are tagged repository-wide (`v1.2.3`). Edit only root
+  `[workspace.package].version`, then run `python3 scripts/sync_versions.py`.
+  Use the `prepare-release` skill for releases, version changes, and new
+  version-bearing artifacts.
 - Commit style: imperative, concise subject; explain *why* in the body when
   it isn't obvious.
 - Licensing: workspace code is MIT. Slint is used under its Royalty-Free
