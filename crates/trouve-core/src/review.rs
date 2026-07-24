@@ -269,6 +269,14 @@ fn requested_review_triggers(
     triggers
 }
 
+fn manual_request_can_satisfy_automatic_review(
+    mode: CodeReviewMode,
+    draft: bool,
+    trigger: &str,
+) -> bool {
+    trigger == "manual" && mode == CodeReviewMode::Automatic && !draft
+}
+
 #[derive(Deserialize)]
 struct PublishedReview {
     html_url: String,
@@ -1062,9 +1070,11 @@ impl Engine {
                     // The first manual request for an unseen automatic head
                     // satisfies its automatic review. Later requests retain
                     // their own stable keys and intentionally run again.
-                    let trigger_key = if requested.trigger == "manual"
-                        && repository.mode == CodeReviewMode::Automatic
-                        && !self.store.code_review_job_exists(&automatic_key)?
+                    let trigger_key = if manual_request_can_satisfy_automatic_review(
+                        repository.mode,
+                        pull.draft,
+                        requested.trigger,
+                    ) && !self.store.code_review_job_exists(&automatic_key)?
                     {
                         "automatic".into()
                     } else {
@@ -2372,6 +2382,25 @@ mod tests {
                 comment_key: None,
             }]
         );
+    }
+
+    #[test]
+    fn draft_manual_requests_keep_their_stable_dedupe_key() {
+        assert!(!manual_request_can_satisfy_automatic_review(
+            CodeReviewMode::Automatic,
+            true,
+            "manual"
+        ));
+        assert!(manual_request_can_satisfy_automatic_review(
+            CodeReviewMode::Automatic,
+            false,
+            "manual"
+        ));
+        assert!(!manual_request_can_satisfy_automatic_review(
+            CodeReviewMode::Manual,
+            false,
+            "manual"
+        ));
     }
 
     #[test]
