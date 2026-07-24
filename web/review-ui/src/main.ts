@@ -503,7 +503,7 @@ function renderRepositorySection(reviewers: ReviewerProfile[]): string {
     : `Showing ${pageStart + 1}–${pageEnd} of ${matches.length}${matches.length === allRepositories.length ? "" : ` (${allRepositories.length} total)`}`;
 
   return `<section class="card wide" id="repositories-section">
-    <div class="section-title"><div><p class="eyebrow">Policy</p><h2>Repositories</h2></div><span class="muted">Manual means GitHub reviewer requests only.</span></div>
+    <div class="section-title"><div><p class="eyebrow">Policy</p><h2>Repositories</h2></div><span class="muted">Comment <code>@trouve-ai review</code> on a PR to request a manual review.</span></div>
     <div class="repository-toolbar">
       <label class="repository-search">Find a repository<input id="repository-search" type="search" value="${escape(repositoryQuery)}" placeholder="Search owner or repository…" autocomplete="off" spellcheck="false" /></label>
       <label>Review mode<select id="repository-mode-filter"><option value="all" ${repositoryModeFilter === "all" ? "selected" : ""}>All modes</option><option value="enabled" ${repositoryModeFilter === "enabled" ? "selected" : ""}>Enabled only</option><option value="automatic" ${repositoryModeFilter === "automatic" ? "selected" : ""}>Automatic</option><option value="manual" ${repositoryModeFilter === "manual" ? "selected" : ""}>Manual</option><option value="off" ${repositoryModeFilter === "off" ? "selected" : ""}>Off</option></select></label>
@@ -581,7 +581,7 @@ function render(): void {
         <form id="app-form" class="stack">
           <label>App ID<input name="app_id" inputmode="numeric" value="${app.app_id ?? ""}" required /></label>
           <label>Private key (.pem)<textarea name="private_key_pem" rows="5" placeholder="-----BEGIN RSA PRIVATE KEY-----" required></textarea></label>
-          <label>Webhook secret <small>(optional; leave empty for polling only)</small><input name="webhook_secret" type="password" /></label>
+          <label>Webhook secret <small>(required for comment triggers; grant Issues: read and subscribe to issue comments)</small><input name="webhook_secret" type="password" /></label>
           <button>${app.configured ? "Replace credentials" : "Connect GitHub App"}</button>
         </form>
       </section>

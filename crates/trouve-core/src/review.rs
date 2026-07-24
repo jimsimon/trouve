@@ -26,7 +26,7 @@ use trouve_protocol::{
 
 use crate::config::GithubReviewAppConfig;
 use crate::engine::{Engine, EngineError};
-use crate::store::{CodeReviewJobRecord, NewCodeReviewJob};
+use crate::store::{CodeReviewJobRecord, CodeReviewManualRequest, NewCodeReviewJob};
 use crate::tools::{ReviewDiffFile, ReviewRepositoryDiff, ReviewRepositorySync};
 
 const PRIVATE_KEY_SECRET: &str = "github:review-app:private-key";
@@ -38,6 +38,7 @@ const REVIEW_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 const REVIEW_BATCH_MAX_BYTES: usize = 128 * 1024;
 const REVIEW_BATCH_MAX_FILES: usize = 24;
 const MAX_CANDIDATE_FINDINGS: usize = 200;
+const MANUAL_REVIEW_MENTION: &str = "@trouve-ai";
 
 fn parse_code_review_poll_interval(value: &str) -> Option<Duration> {
     value
@@ -172,6 +173,100 @@ struct GithubPullRef {
 #[derive(Clone, Deserialize)]
 struct GithubUser {
     login: String,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct ManualReviewComment {
+    repository: String,
+    installation_id: u64,
+    pull_number: u64,
+    trigger_key: String,
+}
+
+fn contains_manual_review_command(body: &str) -> bool {
+    body.lines().any(|line| {
+        let mut words = line.split_whitespace();
+        words
+            .next()
+            .is_some_and(|word| word.eq_ignore_ascii_case(MANUAL_REVIEW_MENTION))
+            && words
+                .next()
+                .is_some_and(|word| word.eq_ignore_ascii_case("review"))
+            && words.next().is_none()
+    })
+}
+
+fn manual_review_comment(payload: &serde_json::Value) -> Option<ManualReviewComment> {
+    if payload["action"].as_str()? != "created"
+        || !payload["issue"]["pull_request"].is_object()
+        || payload["comment"]["user"]["type"]
+            .as_str()
+            .is_some_and(|kind| kind.eq_ignore_ascii_case("bot"))
+        || !matches!(
+            payload["comment"]["author_association"].as_str()?,
+            "OWNER" | "MEMBER" | "COLLABORATOR"
+        )
+        || !contains_manual_review_command(payload["comment"]["body"].as_str()?)
+    {
+        return None;
+    }
+    let repository = payload["repository"]["full_name"].as_str()?.to_owned();
+    let installation_id = payload["installation"]["id"].as_u64()?;
+    let pull_number = payload["issue"]["number"].as_u64()?;
+    let comment_id = payload["comment"]["id"].as_u64()?;
+    (installation_id > 0 && pull_number > 0 && comment_id > 0).then(|| ManualReviewComment {
+        repository,
+        installation_id,
+        pull_number,
+        trigger_key: format!("manual:comment:{comment_id}"),
+    })
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct RequestedReviewTrigger {
+    requested_key: String,
+    trigger: &'static str,
+    comment_key: Option<String>,
+}
+
+fn requested_review_triggers(
+    mode: CodeReviewMode,
+    draft: bool,
+    reviewer_generation: Option<u64>,
+    replace_reviewer_request: bool,
+    comment_requests: &[CodeReviewManualRequest],
+) -> Vec<RequestedReviewTrigger> {
+    let mut triggers = Vec::new();
+    if let Some(generation) = reviewer_generation {
+        triggers.push(RequestedReviewTrigger {
+            requested_key: format!("manual:{generation}"),
+            trigger: "manual",
+            comment_key: None,
+        });
+    } else if replace_reviewer_request {
+        triggers.push(RequestedReviewTrigger {
+            requested_key: "manual:revision".into(),
+            trigger: "manual",
+            comment_key: None,
+        });
+    }
+    triggers.extend(
+        comment_requests
+            .iter()
+            .map(|request| RequestedReviewTrigger {
+                requested_key: request.trigger_key.clone(),
+                trigger: "manual",
+                comment_key: Some(request.trigger_key.clone()),
+            }),
+    );
+    if triggers.is_empty() && !draft && mode == CodeReviewMode::Automatic {
+        triggers.push(RequestedReviewTrigger {
+            requested_key: "automatic".into(),
+            trigger: "automatic",
+            comment_key: None,
+        });
+    }
+    triggers
 }
 
 #[derive(Deserialize)]
@@ -867,6 +962,16 @@ impl Engine {
 
     async fn poll_code_review_repository(&self, repository: &CodeReviewRepository) -> Result<bool> {
         validate_repository(&repository.repository)?;
+        let mut comment_requests: HashMap<u64, Vec<CodeReviewManualRequest>> = HashMap::new();
+        for request in self
+            .store
+            .pending_code_review_manual_requests(&repository.repository)?
+        {
+            comment_requests
+                .entry(request.pull_number)
+                .or_default()
+                .push(request);
+        }
         let reviewers = apply_reviewer_overrides(
             self.resolve_code_review_reviewers(&repository.reviewer_ids)?,
             &repository.reviewer_overrides,
@@ -902,6 +1007,7 @@ impl Engine {
         let mut had_errors = false;
         for pull in pulls {
             let pull_number = pull.number;
+            let pending_comments = comment_requests.remove(&pull.number).unwrap_or_default();
             let result = (|| -> Result<()> {
                 validate_sha(&pull.base.sha)?;
                 validate_sha(&pull.head.sha)?;
@@ -937,59 +1043,64 @@ impl Engine {
                     manual_requested,
                     generation,
                 );
-                if pull.draft && generation.is_none() && !replace_manual_review {
-                    return Ok(());
-                }
-                let trigger = if generation.is_some() || replace_manual_review {
-                    "manual"
-                } else if repository.mode == CodeReviewMode::Automatic {
-                    "automatic"
-                } else {
-                    return Ok(());
-                };
                 let automatic_key = format!(
                     "{}#{}:{}:{}:automatic:{config_hash}",
                     repository.repository, pull.number, pull.base.sha, pull.head.sha
                 );
-                // A manual request that arrives before this automatic head was
-                // seen satisfies the automatic review too. Later re-requests get
-                // their own generation and intentionally run again.
-                let trigger_key = if let Some(generation) = generation {
-                    if repository.mode == CodeReviewMode::Automatic
+                let triggers = requested_review_triggers(
+                    repository.mode,
+                    pull.draft,
+                    generation,
+                    replace_manual_review,
+                    &pending_comments,
+                );
+                if triggers.is_empty() {
+                    return Ok(());
+                }
+
+                for requested in triggers {
+                    // The first manual request for an unseen automatic head
+                    // satisfies its automatic review. Later requests retain
+                    // their own stable keys and intentionally run again.
+                    let trigger_key = if requested.trigger == "manual"
+                        && repository.mode == CodeReviewMode::Automatic
                         && !self.store.code_review_job_exists(&automatic_key)?
                     {
                         "automatic".into()
                     } else {
-                        format!("manual:{generation}")
+                        requested.requested_key
+                    };
+                    let dedupe_key = format!(
+                        "{}#{}:{}:{}:{trigger_key}:{config_hash}",
+                        repository.repository, pull.number, pull.base.sha, pull.head.sha
+                    );
+                    let job = self.store.enqueue_code_review_job(&NewCodeReviewJob {
+                        dedupe_key,
+                        installation_id: repository.installation_id,
+                        repository: repository.repository.clone(),
+                        pull_number: pull.number,
+                        pull_title: pull.title.clone(),
+                        pull_url: pull.html_url.clone(),
+                        head_sha: pull.head.sha.clone(),
+                        base_ref: pull.base.sha.clone(),
+                        head_ref: pull.head.name.clone(),
+                        trigger: requested.trigger.into(),
+                        model: repository.model.clone(),
+                        prompt: repository.prompt.clone(),
+                        reviewers: reviewers.clone(),
+                        config_hash: config_hash.clone(),
+                    })?;
+                    if let Some(comment_key) = requested.comment_key {
+                        self.store.complete_code_review_manual_request(
+                            &repository.repository,
+                            pull.number,
+                            &comment_key,
+                        )?;
                     }
-                } else if replace_manual_review {
-                    "manual:revision".into()
-                } else {
-                    "automatic".into()
-                };
-                let dedupe_key = format!(
-                    "{}#{}:{}:{}:{trigger_key}:{config_hash}",
-                    repository.repository, pull.number, pull.base.sha, pull.head.sha
-                );
-                let job = self.store.enqueue_code_review_job(&NewCodeReviewJob {
-                    dedupe_key,
-                    installation_id: repository.installation_id,
-                    repository: repository.repository.clone(),
-                    pull_number: pull.number,
-                    pull_title: pull.title,
-                    pull_url: pull.html_url,
-                    head_sha: pull.head.sha,
-                    base_ref: pull.base.sha,
-                    head_ref: pull.head.name,
-                    trigger: trigger.into(),
-                    model: repository.model.clone(),
-                    prompt: repository.prompt.clone(),
-                    reviewers: reviewers.clone(),
-                    config_hash: config_hash.clone(),
-                })?;
-                if let Some(job) = job {
-                    self.emit_code_review_updated(Some(job.id))?;
-                    self.code_review.job_wake.notify_one();
+                    if let Some(job) = job {
+                        self.emit_code_review_updated(Some(job.id))?;
+                        self.code_review.job_wake.notify_one();
+                    }
                 }
                 Ok(())
             })();
@@ -1001,6 +1112,15 @@ impl Engine {
                     repository.repository, pull_number
                 ));
             }
+        }
+        // A request can race with a PR being closed. Once the complete open-PR
+        // listing succeeds, unmatched requests have no reviewable target.
+        for request in comment_requests.into_values().flatten() {
+            self.store.complete_code_review_manual_request(
+                &repository.repository,
+                request.pull_number,
+                &request.trigger_key,
+            )?;
         }
         Ok(had_errors)
     }
@@ -1026,30 +1146,42 @@ impl Engine {
         mac.update(body);
         mac.verify_slice(&signature)
             .map_err(|_| EngineError::BadRequest("invalid webhook signature".into()))?;
-        if !self.store.claim_github_webhook_delivery(delivery_id)? {
-            return Ok(());
-        }
-        if event != "pull_request" {
+        if !matches!(event, "pull_request" | "issue_comment") {
+            self.store
+                .claim_github_webhook_delivery(delivery_id, None)?;
             return Ok(());
         }
         let payload: serde_json::Value = serde_json::from_slice(body)
             .map_err(|error| EngineError::BadRequest(format!("invalid webhook JSON: {error}")))?;
         let action = payload["action"].as_str().unwrap_or_default();
-        if !matches!(
-            action,
-            "opened"
-                | "reopened"
-                | "synchronize"
-                | "ready_for_review"
-                | "review_requested"
-                | "review_request_removed"
-        ) {
+        let pull_request_event = event == "pull_request"
+            && matches!(
+                action,
+                "opened"
+                    | "reopened"
+                    | "synchronize"
+                    | "ready_for_review"
+                    | "review_requested"
+                    | "review_request_removed"
+            );
+        let manual_comment = (event == "issue_comment")
+            .then(|| manual_review_comment(&payload))
+            .flatten();
+        if !pull_request_event && manual_comment.is_none() {
+            self.store
+                .claim_github_webhook_delivery(delivery_id, None)?;
             return Ok(());
         }
-        let repository_name = payload["repository"]["full_name"]
-            .as_str()
+        let repository_name = manual_comment
+            .as_ref()
+            .map(|request| request.repository.as_str())
+            .or_else(|| payload["repository"]["full_name"].as_str())
             .unwrap_or_default();
-        let installation_id = payload["installation"]["id"].as_u64().unwrap_or_default();
+        let installation_id = manual_comment
+            .as_ref()
+            .map(|request| request.installation_id)
+            .or_else(|| payload["installation"]["id"].as_u64())
+            .unwrap_or_default();
         let repository = self
             .store
             .list_code_review_repositories()?
@@ -1059,6 +1191,21 @@ impl Engine {
                     && repository.installation_id == installation_id
                     && repository.mode != CodeReviewMode::Off
             });
+        let durable_request = repository.as_ref().and_then(|_| {
+            manual_comment.as_ref().map(|request| {
+                (
+                    request.repository.as_str(),
+                    request.pull_number,
+                    request.trigger_key.as_str(),
+                )
+            })
+        });
+        if !self
+            .store
+            .claim_github_webhook_delivery(delivery_id, durable_request)?
+        {
+            return Ok(());
+        }
         if let Some(repository) = repository {
             let engine = self.clone();
             tokio::spawn(async move {
@@ -2145,6 +2292,89 @@ mod tests {
     }
 
     #[test]
+    fn manual_review_command_must_be_on_its_own_line() {
+        for body in [
+            "@trouve-ai review",
+            "  @TROUVE-AI   REVIEW  ",
+            "Context before\n@trouve-ai review\nContext after",
+        ] {
+            assert!(contains_manual_review_command(body), "{body:?}");
+        }
+        for body in [
+            "@trouve-ai reviews",
+            "please @trouve-ai review",
+            "@trouve-ai review this",
+            "`@trouve-ai review`",
+        ] {
+            assert!(!contains_manual_review_command(body), "{body:?}");
+        }
+    }
+
+    #[test]
+    fn trusted_pr_comments_create_stable_manual_review_requests() {
+        let mut payload = serde_json::json!({
+            "action": "created",
+            "installation": {"id": 7},
+            "repository": {"full_name": "acme/widgets"},
+            "issue": {
+                "number": 42,
+                "pull_request": {"url": "https://api.github.com/repos/acme/widgets/pulls/42"}
+            },
+            "comment": {
+                "id": 100,
+                "body": "@trouve-ai review",
+                "author_association": "MEMBER",
+                "user": {"type": "User"}
+            }
+        });
+        assert_eq!(
+            manual_review_comment(&payload),
+            Some(ManualReviewComment {
+                repository: "acme/widgets".into(),
+                installation_id: 7,
+                pull_number: 42,
+                trigger_key: "manual:comment:100".into(),
+            })
+        );
+
+        payload["comment"]["author_association"] = serde_json::json!("CONTRIBUTOR");
+        assert_eq!(manual_review_comment(&payload), None);
+        payload["comment"]["author_association"] = serde_json::json!("OWNER");
+        payload["comment"]["user"]["type"] = serde_json::json!("Bot");
+        assert_eq!(manual_review_comment(&payload), None);
+        payload["comment"]["user"]["type"] = serde_json::json!("User");
+        payload["issue"]["pull_request"] = serde_json::Value::Null;
+        assert_eq!(manual_review_comment(&payload), None);
+    }
+
+    #[test]
+    fn comment_requests_trigger_manual_reviews_even_for_drafts() {
+        let comments = vec![CodeReviewManualRequest {
+            pull_number: 42,
+            trigger_key: "manual:comment:100".into(),
+        }];
+        assert_eq!(
+            requested_review_triggers(CodeReviewMode::Manual, true, None, false, &comments),
+            vec![RequestedReviewTrigger {
+                requested_key: "manual:comment:100".into(),
+                trigger: "manual",
+                comment_key: Some("manual:comment:100".into()),
+            }]
+        );
+        assert!(
+            requested_review_triggers(CodeReviewMode::Manual, false, None, false, &[]).is_empty()
+        );
+        assert_eq!(
+            requested_review_triggers(CodeReviewMode::Automatic, false, None, false, &[]),
+            vec![RequestedReviewTrigger {
+                requested_key: "automatic".into(),
+                trigger: "automatic",
+                comment_key: None,
+            }]
+        );
+    }
+
+    #[test]
     fn outstanding_manual_request_replaces_a_superseded_review() {
         assert!(should_replace_manual_review(
             CodeReviewMode::Manual,
@@ -2220,5 +2450,74 @@ mod tests {
         engine
             .accept_github_review_webhook("ping", "delivery-1", &signature, body)
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn trusted_comment_webhook_durably_records_manual_request() {
+        let data = tempfile::tempdir().unwrap();
+        let store = crate::store::Store::open_in_memory().unwrap();
+        store
+            .upsert_discovered_code_review_repository(7, "acme/widgets", false)
+            .unwrap();
+        store
+            .update_code_review_repository(&UpdateCodeReviewRepositoryRequest {
+                installation_id: 7,
+                repository: "acme/widgets".into(),
+                mode: CodeReviewMode::Manual,
+                model: None,
+                prompt: String::new(),
+                reviewer_ids: None,
+                reviewer_overrides: None,
+            })
+            .unwrap();
+        let config = crate::config::Config {
+            github_review_app: Some(GithubReviewAppConfig {
+                app_id: 7,
+                slug: "trouve-review".into(),
+            }),
+            ..Default::default()
+        };
+        let mut engine = Engine::new(store, data.path().to_path_buf(), &config);
+        engine.secrets = Arc::new(trouve_providers::secrets::FileStore::new(
+            data.path().join("secrets.json"),
+        ));
+        let engine = Arc::new(engine);
+        engine.secrets.set(WEBHOOK_SECRET, "shared-secret").unwrap();
+        let body = serde_json::to_vec(&serde_json::json!({
+            "action": "created",
+            "installation": {"id": 7},
+            "repository": {"full_name": "acme/widgets"},
+            "issue": {
+                "number": 42,
+                "pull_request": {"url": "https://api.github.com/repos/acme/widgets/pulls/42"}
+            },
+            "comment": {
+                "id": 100,
+                "body": "@trouve-ai review",
+                "author_association": "OWNER",
+                "user": {"type": "User"}
+            }
+        }))
+        .unwrap();
+        let mut mac = Hmac::<Sha256>::new_from_slice(b"shared-secret").unwrap();
+        mac.update(&body);
+        let signature = format!("sha256={}", hex::encode(mac.finalize().into_bytes()));
+
+        // Keep the spawned reconciliation behind the lock so this assertion
+        // specifically verifies the synchronous durable webhook handoff.
+        let _reconcile_guard = engine.code_review.reconcile_lock.lock().await;
+        engine
+            .accept_github_review_webhook("issue_comment", "delivery-comment-1", &signature, &body)
+            .unwrap();
+        assert_eq!(
+            engine
+                .store
+                .pending_code_review_manual_requests("acme/widgets")
+                .unwrap(),
+            vec![CodeReviewManualRequest {
+                pull_number: 42,
+                trigger_key: "manual:comment:100".into(),
+            }]
+        );
     }
 }
