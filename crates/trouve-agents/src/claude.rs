@@ -14,8 +14,9 @@
 //! `--permission-prompt-tool`, so headless print mode routes permission
 //! requests to trouve's approval flow instead of failing them.
 //!
-//! Login is an interactive TUI (`/login` inside `claude`); we detect
-//! credentials but can't orchestrate the flow headlessly.
+//! Login uses `claude auth login` in a small PTY. The browser callback can
+//! complete directly when it reaches the CLI, or the client can paste the
+//! failed localhost callback URL back through trouve on remote hosts.
 //!
 //! Subscription usage (the data behind the TUI's `/usage` dialog) is read
 //! through the same stream-json surface: a short-lived print-mode process
@@ -36,7 +37,7 @@ use trouve_protocol::{ModelInfo, Usage};
 
 use crate::{
     AgentBackend, BackendError, BackendEvent, BackendEventStream, BackendLogin, BackendPermission,
-    BackendStatus, BackendTurn, async_stream, binary_on_path, format_reset,
+    BackendStatus, BackendTurn, async_stream, binary_on_path, format_reset, spawn_claude_login,
 };
 
 /// Most live processes kept at once; the least recently used is evicted.
@@ -213,9 +214,7 @@ impl AgentBackend for ClaudeBackend {
     }
 
     async fn start_login(&self) -> Result<BackendLogin, BackendError> {
-        Err(BackendError::Auth(
-            "Claude Code login is interactive: run `claude` in a terminal and use /login".into(),
-        ))
+        spawn_claude_login(&self.command).await
     }
 
     async fn subscription_health(&self) -> Option<trouve_protocol::SubscriptionHealth> {

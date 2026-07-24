@@ -21,7 +21,7 @@ use futures::future::BoxFuture;
 use futures::stream::BoxStream;
 use trouve_protocol::{ModelInfo, Usage};
 
-pub use login::spawn_login;
+pub use login::{spawn_claude_login, spawn_codex_login, spawn_login};
 
 /// Permission posture for a backend turn, folded down from trouve's
 /// permission mode + agent mode (read-only) for the thread.
@@ -227,6 +227,9 @@ pub struct BackendLogin {
     /// URL the user must open (also opened by most vendor CLIs themselves).
     pub verification_url: Option<String>,
     pub user_code: Option<String>,
+    /// Sends a browser callback URL/code back to an interactive vendor CLI.
+    /// Present for flows such as Claude Code's remote/headless fallback.
+    pub callback_sender: Option<tokio::sync::mpsc::Sender<String>>,
     pub done: BoxFuture<'static, Result<(), BackendError>>,
 }
 
