@@ -1,6 +1,6 @@
 {
   "name": "@trouve-ai/search-linux-x64-gnu",
-  "version": "3.3.2",
+  "version": "3.3.3",
   "description": "trouve-search native binary for x86_64-unknown-linux-gnu",
   "license": "MIT",
   "repository": {

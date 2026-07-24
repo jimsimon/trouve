@@ -961,8 +961,20 @@ fn main() -> anyhow::Result<()> {
     }
     {
         let tx = tx.clone();
-        window.on_provider_login(move |id| {
-            let _ = tx.send(UiCommand::ProviderLogin(id.to_string()));
+        window.on_provider_login(move |id, kind| {
+            let _ = tx.send(UiCommand::ProviderLogin {
+                id: id.to_string(),
+                kind: kind.to_string(),
+            });
+        });
+    }
+    {
+        let tx = tx.clone();
+        window.on_provider_login_response(move |id, response| {
+            let _ = tx.send(UiCommand::CompleteProviderLogin {
+                id: id.to_string(),
+                response: response.to_string(),
+            });
         });
     }
     {

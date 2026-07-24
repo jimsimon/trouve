@@ -15,9 +15,10 @@ use tokio::sync::mpsc;
 use trouve_client_core::client::ProtocolClient;
 use trouve_client_core::viewmodel::ThreadViewModel;
 use trouve_protocol::{
-    AddLocalModelRequest, AgentMode, ApprovalDecision, CreateSessionRequest, CreateThreadRequest,
-    DirEntry, EventEnvelope, ModelInfo, PermissionMode, Session, Thread, TodoStatus,
-    UpdateSessionRequest, UpdateThreadRequest, UpsertModeRequest, UpsertProviderRequest, Workspace,
+    AddLocalModelRequest, AgentMode, ApprovalDecision, CompleteLoginRequest, CreateSessionRequest,
+    CreateThreadRequest, DirEntry, EventEnvelope, ModelInfo, PermissionMode, Session, Thread,
+    TodoStatus, UpdateSessionRequest, UpdateThreadRequest, UpsertModeRequest,
+    UpsertProviderRequest, Workspace,
 };
 
 use crate::render;
@@ -35,6 +36,10 @@ const PR_DASH_REFRESH_INTERVAL: std::time::Duration = std::time::Duration::from_
 /// The dashboard refresh clock is repainted once per second without rebuilding
 /// the PR grid or contacting GitHub.
 const PR_DASH_CLOCK_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
+
+fn provider_login_requires_code(kind: &str) -> bool {
+    kind == "claude-cli"
+}
 
 fn format_pr_dashboard_refresh_status(
     last_refreshed: Option<std::time::Instant>,
@@ -286,7 +291,14 @@ pub enum UiCommand {
         api_key: String,
     },
     DeleteProvider(String),
-    ProviderLogin(String),
+    ProviderLogin {
+        id: String,
+        kind: String,
+    },
+    CompleteProviderLogin {
+        id: String,
+        response: String,
+    },
     SetDefaultModel(usize, Option<String>),
     /// Set the global default permission mode (0 ask/1 allow-list/2 yolo).
     SetDefaultPermission(i32),
@@ -5234,17 +5246,26 @@ impl Controller {
                     ui::set_settings_status(&self.ui, format!("{e:#}"));
                 }
             },
-            UiCommand::ProviderLogin(id) => match self.client.start_login(&id).await {
+            UiCommand::ProviderLogin { id, kind } => match self.client.start_login(&id).await {
                 Ok(started) => {
+                    let code_required = provider_login_requires_code(&kind);
+                    ui::set_provider_login_prompt(&self.ui, id.clone(), code_required);
                     // CLI-driven logins may open the browser themselves and
                     // print no URL for us to show.
-                    let msg = match (&started.user_code, started.verification_url.is_empty()) {
-                        (Some(code), _) => format!(
+                    let msg = match (
+                        code_required,
+                        &started.user_code,
+                        started.verification_url.is_empty(),
+                    ) {
+                        (true, _, _) => "finish authorization in the browser, then paste Claude's \
+                             authentication code below"
+                            .to_string(),
+                        (false, Some(code), _) => format!(
                             "opening browser — enter code {code} at {}",
                             started.verification_url
                         ),
-                        (None, false) => format!("opening browser to log in to {id}…"),
-                        (None, true) => {
+                        (false, None, false) => format!("opening browser to log in to {id}…"),
+                        (false, None, true) => {
                             format!("login started for {id} — follow the vendor's prompts…")
                         }
                     };
@@ -5266,6 +5287,7 @@ impl Controller {
                             match status.status.as_str() {
                                 "pending" => continue,
                                 "success" => {
+                                    ui::clear_provider_login_prompt(&settings_ui, id.clone());
                                     ui::set_settings_status(
                                         &settings_ui,
                                         format!("logged in to {id}"),
@@ -5273,6 +5295,7 @@ impl Controller {
                                     let _ = tx.send(UiCommand::RefreshSettings);
                                 }
                                 _ => {
+                                    ui::clear_provider_login_prompt(&settings_ui, id.clone());
                                     ui::set_settings_status(
                                         &settings_ui,
                                         format!(
@@ -5287,9 +5310,42 @@ impl Controller {
                     });
                 }
                 Err(e) => {
+                    ui::clear_provider_login_prompt(&self.ui, id);
                     ui::set_settings_status(&self.ui, format!("{e:#}"));
                 }
             },
+            UiCommand::CompleteProviderLogin { id, response } => {
+                let response = response.trim();
+                if response.is_empty() {
+                    ui::set_settings_status(
+                        &self.ui,
+                        "Claude authentication code must not be empty".into(),
+                    );
+                    return Ok(());
+                }
+                match self
+                    .client
+                    .complete_login(
+                        &id,
+                        &CompleteLoginRequest {
+                            callback_url: response.to_string(),
+                        },
+                    )
+                    .await
+                {
+                    Ok(_) => {
+                        ui::set_provider_login_code_required(&self.ui, id, false);
+                        ui::set_settings_status(
+                            &self.ui,
+                            "authentication code sent to Claude Code…".into(),
+                        );
+                    }
+                    Err(error) => {
+                        ui::set_provider_login_code_required(&self.ui, id, true);
+                        ui::set_settings_status(&self.ui, format!("{error:#}"));
+                    }
+                }
+            }
             UiCommand::SetDefaultModel(i, thinking_level) => {
                 if let Some(model) = self.models.get(i) {
                     match self
@@ -6965,8 +7021,9 @@ mod tests {
     use super::{
         SubscriptionRefresh, SubscriptionRefreshState, approval_pill, attention_badge, check_pill,
         classify_pr, download_progress, format_pr_dashboard_refresh_status, human_age, human_rate,
-        merge_pill, model_health_view, pr_badge, project_session_prs, reconcile_pr_group_order,
-        reconcile_workspace_order, reorder_id, should_open_chat_at_tail, thinking_property,
+        merge_pill, model_health_view, pr_badge, project_session_prs, provider_login_requires_code,
+        reconcile_pr_group_order, reconcile_workspace_order, reorder_id, should_open_chat_at_tail,
+        thinking_property,
     };
     use chrono::{Duration, TimeZone, Utc};
     use trouve_protocol::{
@@ -6996,6 +7053,14 @@ mod tests {
         let changed2 = reconcile_workspace_order(&mut order2, &list);
         assert_eq!(order2, ["c", "a", "b", "d"]);
         assert!(!changed2); // No changes when order already matches
+    }
+
+    #[test]
+    fn only_claude_cli_login_prompts_for_a_browser_code() {
+        assert!(provider_login_requires_code("claude-cli"));
+        assert!(!provider_login_requires_code("cursor-cli"));
+        assert!(!provider_login_requires_code("codex-app-server"));
+        assert!(!provider_login_requires_code("codex-responses"));
     }
 
     #[test]

@@ -2103,7 +2103,7 @@ impl Engine {
         }
     }
 
-    /// Forward a browser callback to an interactive vendor CLI login.
+    /// Forward a browser authentication response to an interactive vendor CLI.
     pub async fn complete_login(
         &self,
         id: &str,
@@ -2112,12 +2112,12 @@ impl Engine {
         let callback = request.callback_url.trim();
         if callback.is_empty() {
             return Err(EngineError::BadRequest(
-                "callback_url must not be empty".into(),
+                "authentication response must not be empty".into(),
             ));
         }
         if callback.len() > 16 * 1024 || callback.chars().any(char::is_control) {
             return Err(EngineError::BadRequest(
-                "callback_url is too long or contains control characters".into(),
+                "authentication response is too long or contains control characters".into(),
             ));
         }
 
@@ -2128,7 +2128,7 @@ impl Engine {
                     callback_sender, ..
                 }) => callback_sender.take().ok_or_else(|| {
                     EngineError::Conflict(format!(
-                        "provider {id} login does not accept a browser callback"
+                        "provider {id} login does not accept an authentication response"
                     ))
                 })?,
                 Some(LoginState::Success) => {

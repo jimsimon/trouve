@@ -316,6 +316,8 @@ export component SettingsScreen inherits Rectangle {
     // Allow list / Yolo (index i maps to permission-index i - 1).
     property <[string]> mode-permission-names: ["Global default", "Ask", "Allow list", "Yolo"];
     in property <string> settings-status: "";
+    in property <string> login-provider-id: "";
+    in property <bool> login-code-required: false;
 
     // Provider form state (prefilled by "Edit" or a preset).
     in-out property <string> form-id: "";
@@ -376,7 +378,8 @@ export component SettingsScreen inherits Rectangle {
     callback provider-saved(/* id */ string, /* kind */ string,
                             /* base-url */ string, /* api-key */ string);
     callback provider-deleted(string);
-    callback provider-login(string);
+    callback provider-login(/* id */ string, /* kind */ string);
+    callback provider-login-response(/* id */ string, /* response */ string);
     callback default-model-picked(/* model-index */ int, /* thinking-level */ string);
     // 0 ask, 1 allow-list, 2 yolo.
     callback default-permission-picked(int);
@@ -745,7 +748,9 @@ export component SettingsScreen inherits Rectangle {
                                             }
                                             if provider.auth == "oauth" || provider.auth == "cli": Button {
                                                 text: provider.has-credentials ? "Re-login" : "Log in";
-                                                clicked => { root.provider-login(provider.id); }
+                                                clicked => {
+                                                    root.provider-login(provider.id, provider.kind);
+                                                }
                                             }
                                             Button {
                                                 text: "Edit";
@@ -858,6 +863,35 @@ export component SettingsScreen inherits Rectangle {
                                 color: root.form-warning ? Theme.c.err : Theme.c.ok-dim;
                                 font-size: Theme.fs(12px);
                                 wrap: word-wrap;
+                            }
+                            if root.login-code-required: VerticalLayout {
+                                spacing: 6px;
+                                Text {
+                                    text: "After authorizing, copy the authentication code shown by Claude and paste it here.";
+                                    color: Theme.c.text-mid;
+                                    font-size: Theme.fs(12px);
+                                    wrap: word-wrap;
+                                }
+                                HorizontalLayout {
+                                    spacing: 8px;
+                                    login-code-edit := LineEdit {
+                                        horizontal-stretch: 1;
+                                        placeholder-text: "Claude authentication code";
+                                    }
+                                    Button {
+                                        text: "Submit code";
+                                        primary: true;
+                                        enabled: login-code-edit.text != "";
+                                        clicked => {
+                                            root.provider-login-response(
+                                                root.login-provider-id,
+                                                login-code-edit.text);
+                                            // Prevent duplicate submissions while the
+                                            // controller forwards the response.
+                                            login-code-edit.text = "";
+                                        }
+                                    }
+                                }
                             }
                             if root.settings-status != "": Text {
                                 text: root.settings-status;
@@ -2145,7 +2179,7 @@ export component SettingsScreen inherits Rectangle {
                                             primary: gh.source != "oauth";
                                             clicked => {
                                                 root.provider-login(gh.host == "github.com"
-                                                    ? "github" : "github:" + gh.host);
+                                                    ? "github" : "github:" + gh.host, "oauth");
                                             }
                                         }
                                     }
