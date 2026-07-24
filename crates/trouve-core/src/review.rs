@@ -39,6 +39,10 @@ const REVIEW_BATCH_MAX_BYTES: usize = 128 * 1024;
 const REVIEW_BATCH_MAX_FILES: usize = 24;
 const MAX_CANDIDATE_FINDINGS: usize = 200;
 const MANUAL_REVIEW_MENTION: &str = "@trouve-ai";
+const REVIEW_COMMENT_PAGE_SIZE: usize = 100;
+const REVIEW_COMMENT_MAX_PAGES: u64 = 10;
+const GITHUB_REST_CACHE_MAX_ENTRIES: usize = 512;
+const GITHUB_REST_CACHE_MAX_BYTES: usize = 16 * 1024 * 1024;
 
 fn parse_code_review_poll_interval(value: &str) -> Option<Duration> {
     value
@@ -72,6 +76,7 @@ pub struct CodeReviewRuntime {
     started: AtomicBool,
     state: Mutex<RuntimeState>,
     installation_tokens: tokio::sync::Mutex<HashMap<u64, CachedToken>>,
+    rest_cache: Mutex<GithubRestCache>,
     reconcile_lock: tokio::sync::Mutex<()>,
     poll_wake: Notify,
     job_wake: Notify,
@@ -107,6 +112,67 @@ struct RuntimeState {
 struct CachedToken {
     token: String,
     expires_at: DateTime<Utc>,
+}
+
+#[derive(Clone, Hash, PartialEq, Eq)]
+struct GithubRestCacheKey {
+    scope: String,
+    path: String,
+}
+
+#[derive(Clone)]
+struct CachedGithubResponse {
+    etag: String,
+    body: Arc<str>,
+}
+
+#[derive(Default)]
+struct GithubRestCache {
+    entries: HashMap<GithubRestCacheKey, CachedGithubResponse>,
+    order: VecDeque<GithubRestCacheKey>,
+    bytes: usize,
+}
+
+impl GithubRestCache {
+    fn get(&mut self, key: &GithubRestCacheKey) -> Option<CachedGithubResponse> {
+        let response = self.entries.get(key)?.clone();
+        self.order.retain(|candidate| candidate != key);
+        self.order.push_back(key.clone());
+        Some(response)
+    }
+
+    fn insert(&mut self, key: GithubRestCacheKey, response: CachedGithubResponse) {
+        self.remove(&key);
+        if response.body.len() > GITHUB_REST_CACHE_MAX_BYTES {
+            return;
+        }
+        while self.entries.len() >= GITHUB_REST_CACHE_MAX_ENTRIES
+            || self.bytes + response.body.len() > GITHUB_REST_CACHE_MAX_BYTES
+        {
+            let Some(oldest) = self.order.pop_front() else {
+                break;
+            };
+            if let Some(removed) = self.entries.remove(&oldest) {
+                self.bytes = self.bytes.saturating_sub(removed.body.len());
+            }
+        }
+        self.bytes += response.body.len();
+        self.order.push_back(key.clone());
+        self.entries.insert(key, response);
+    }
+
+    fn remove(&mut self, key: &GithubRestCacheKey) {
+        self.order.retain(|candidate| candidate != key);
+        if let Some(removed) = self.entries.remove(key) {
+            self.bytes = self.bytes.saturating_sub(removed.body.len());
+        }
+    }
+
+    fn clear(&mut self) {
+        self.entries.clear();
+        self.order.clear();
+        self.bytes = 0;
+    }
 }
 
 #[derive(Clone, Copy, Default)]
@@ -175,6 +241,21 @@ struct GithubUser {
     login: String,
 }
 
+#[derive(Debug, Deserialize)]
+struct GithubIssueComment {
+    id: u64,
+    body: Option<String>,
+    author_association: String,
+    issue_url: String,
+    user: Option<GithubIssueCommentUser>,
+}
+
+#[derive(Debug, Deserialize)]
+struct GithubIssueCommentUser {
+    #[serde(rename = "type")]
+    kind: String,
+}
+
 #[derive(Debug, PartialEq, Eq)]
 struct ManualReviewComment {
     repository: String,
@@ -196,17 +277,24 @@ fn contains_manual_review_command(body: &str) -> bool {
     })
 }
 
+fn is_trusted_manual_review_command(
+    body: &str,
+    author_association: &str,
+    user_kind: Option<&str>,
+) -> bool {
+    !user_kind.is_some_and(|kind| kind.eq_ignore_ascii_case("bot"))
+        && matches!(author_association, "OWNER" | "MEMBER" | "COLLABORATOR")
+        && contains_manual_review_command(body)
+}
+
 fn manual_review_comment(payload: &serde_json::Value) -> Option<ManualReviewComment> {
     if payload["action"].as_str()? != "created"
         || !payload["issue"]["pull_request"].is_object()
-        || payload["comment"]["user"]["type"]
-            .as_str()
-            .is_some_and(|kind| kind.eq_ignore_ascii_case("bot"))
-        || !matches!(
+        || !is_trusted_manual_review_command(
+            payload["comment"]["body"].as_str()?,
             payload["comment"]["author_association"].as_str()?,
-            "OWNER" | "MEMBER" | "COLLABORATOR"
+            payload["comment"]["user"]["type"].as_str(),
         )
-        || !contains_manual_review_command(payload["comment"]["body"].as_str()?)
     {
         return None;
     }
@@ -220,6 +308,32 @@ fn manual_review_comment(payload: &serde_json::Value) -> Option<ManualReviewComm
         pull_number,
         trigger_key: format!("manual:comment:{comment_id}"),
     })
+}
+
+fn pull_number_from_issue_url(issue_url: &str) -> Option<u64> {
+    issue_url
+        .trim_end_matches('/')
+        .rsplit('/')
+        .next()?
+        .parse::<u64>()
+        .ok()
+        .filter(|number| *number > 0)
+}
+
+fn polled_manual_review_comment(comment: &GithubIssueComment) -> Option<(u64, String)> {
+    if comment.id == 0
+        || !is_trusted_manual_review_command(
+            comment.body.as_deref()?,
+            &comment.author_association,
+            comment.user.as_ref().map(|user| user.kind.as_str()),
+        )
+    {
+        return None;
+    }
+    Some((
+        pull_number_from_issue_url(&comment.issue_url)?,
+        format!("manual:comment:{}", comment.id),
+    ))
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -321,21 +435,39 @@ fn default_review_side() -> String {
 struct GithubApi {
     http: reqwest::Client,
     authorization: String,
+    base_url: String,
+    cache_scope: String,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum ConditionalGet {
+    Modified { body: String, etag: Option<String> },
+    NotModified { etag: Option<String> },
 }
 
 impl GithubApi {
-    fn new(authorization: String) -> Result<Self> {
+    fn new(authorization: String, cache_scope: String) -> Result<Self> {
+        Self::with_base_url(authorization, "https://api.github.com", cache_scope)
+    }
+
+    fn with_base_url(
+        authorization: String,
+        base_url: impl Into<String>,
+        cache_scope: String,
+    ) -> Result<Self> {
         Ok(Self {
             http: reqwest::Client::builder()
                 .user_agent("trouve-code-review")
                 .build()?,
             authorization,
+            base_url: base_url.into(),
+            cache_scope,
         })
     }
 
     fn request(&self, method: reqwest::Method, path: &str) -> reqwest::RequestBuilder {
         self.http
-            .request(method, format!("https://api.github.com{path}"))
+            .request(method, format!("{}{path}", self.base_url))
             .header("Authorization", &self.authorization)
             .header("Accept", "application/vnd.github+json")
             .header("X-GitHub-Api-Version", "2022-11-28")
@@ -343,6 +475,51 @@ impl GithubApi {
 
     async fn get<T: DeserializeOwned>(&self, path: &str) -> Result<(T, RateInfo)> {
         decode_response(self.request(reqwest::Method::GET, path).send().await?).await
+    }
+
+    async fn get_cached<T: DeserializeOwned>(
+        &self,
+        path: &str,
+        cache: &Mutex<GithubRestCache>,
+    ) -> Result<(T, RateInfo)> {
+        let key = GithubRestCacheKey {
+            scope: self.cache_scope.clone(),
+            path: path.to_owned(),
+        };
+        let cached = cache.lock().unwrap().get(&key);
+        let mut request = self.request(reqwest::Method::GET, path);
+        if let Some(cached) = &cached {
+            request = request.header(reqwest::header::IF_NONE_MATCH, &cached.etag);
+        }
+        let (response, rate) = decode_conditional_response(request.send().await?).await?;
+        let value = match response {
+            ConditionalGet::Modified { body, etag } => {
+                cache.lock().unwrap().remove(&key);
+                let value = serde_json::from_str(&body)
+                    .with_context(|| format!("decoding GitHub response for {path}"))?;
+                if let Some(etag) = etag {
+                    cache.lock().unwrap().insert(
+                        key,
+                        CachedGithubResponse {
+                            etag,
+                            body: Arc::from(body.as_str()),
+                        },
+                    );
+                }
+                value
+            }
+            ConditionalGet::NotModified { etag } => {
+                let mut cached = cached
+                    .ok_or_else(|| anyhow!("GitHub returned 304 without a cached response"))?;
+                if let Some(etag) = etag {
+                    cached.etag = etag;
+                    cache.lock().unwrap().insert(key, cached.clone());
+                }
+                serde_json::from_str(&cached.body)
+                    .with_context(|| format!("decoding cached GitHub response for {path}"))?
+            }
+        };
+        Ok((value, rate))
     }
 
     async fn post<T: DeserializeOwned>(
@@ -371,6 +548,26 @@ async fn decode_response<T: DeserializeOwned>(
     }
     let value = serde_json::from_str(&body).context("decoding GitHub response")?;
     Ok((value, rate))
+}
+
+async fn decode_conditional_response(
+    response: reqwest::Response,
+) -> Result<(ConditionalGet, RateInfo)> {
+    let status = response.status();
+    let rate = rate_info(response.headers());
+    let etag = response
+        .headers()
+        .get(reqwest::header::ETAG)
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_owned);
+    if status == reqwest::StatusCode::NOT_MODIFIED {
+        return Ok((ConditionalGet::NotModified { etag }, rate));
+    }
+    let body = response.text().await?;
+    if !status.is_success() {
+        bail!("GitHub API {status}: {}", compact_api_error(&body));
+    }
+    Ok((ConditionalGet::Modified { body, etag }, rate))
 }
 
 fn compact_api_error(body: &str) -> String {
@@ -450,7 +647,10 @@ impl Engine {
     }
 
     fn app_api(app_id: u64, private_key: &str) -> Result<GithubApi> {
-        GithubApi::new(format!("Bearer {}", app_jwt(app_id, private_key)?))
+        GithubApi::new(
+            format!("Bearer {}", app_jwt(app_id, private_key)?),
+            format!("app:{app_id}"),
+        )
     }
 
     fn record_review_rate(&self, rate: RateInfo) {
@@ -500,6 +700,7 @@ impl Engine {
         };
         self.persist_config(&snapshot);
         self.code_review.installation_tokens.lock().await.clear();
+        self.code_review.rest_cache.lock().unwrap().clear();
         self.record_review_rate(rate);
         {
             let mut state = self.code_review.state.lock().unwrap();
@@ -831,10 +1032,10 @@ impl Engine {
     }
 
     async fn installation_api(&self, installation_id: u64) -> Result<GithubApi> {
-        GithubApi::new(format!(
-            "Bearer {}",
-            self.installation_token(installation_id).await?
-        ))
+        GithubApi::new(
+            format!("Bearer {}", self.installation_token(installation_id).await?),
+            format!("installation:{installation_id}"),
+        )
     }
 
     pub async fn refresh_code_reviews(&self) -> Result<(), EngineError> {
@@ -856,9 +1057,10 @@ impl Engine {
         let mut installation_page = 1;
         loop {
             let response = api
-                .get(&format!(
-                    "/app/installations?per_page=100&page={installation_page}"
-                ))
+                .get_cached(
+                    &format!("/app/installations?per_page=100&page={installation_page}"),
+                    &self.code_review.rest_cache,
+                )
                 .await
                 .context("listing GitHub App installations");
             let (page, rate): (Vec<Installation>, _) = match response {
@@ -901,9 +1103,10 @@ impl Engine {
             let mut page = 1;
             loop {
                 let response = installation_api
-                    .get(&format!(
-                        "/installation/repositories?per_page=100&page={page}"
-                    ))
+                    .get_cached(
+                        &format!("/installation/repositories?per_page=100&page={page}"),
+                        &self.code_review.rest_cache,
+                    )
                     .await
                     .context("listing installation repositories");
                 let (repositories, rate): (InstallationRepositories, _) = match response {
@@ -970,16 +1173,6 @@ impl Engine {
 
     async fn poll_code_review_repository(&self, repository: &CodeReviewRepository) -> Result<bool> {
         validate_repository(&repository.repository)?;
-        let mut comment_requests: HashMap<u64, Vec<CodeReviewManualRequest>> = HashMap::new();
-        for request in self
-            .store
-            .pending_code_review_manual_requests(&repository.repository)?
-        {
-            comment_requests
-                .entry(request.pull_number)
-                .or_default()
-                .push(request);
-        }
         let reviewers = apply_reviewer_overrides(
             self.resolve_code_review_reviewers(&repository.reviewer_ids)?,
             &repository.reviewer_overrides,
@@ -998,10 +1191,13 @@ impl Engine {
         let mut page = 1;
         loop {
             let (pull_page, rate): (Vec<GithubPullRequest>, _) = api
-                .get(&format!(
-                    "/repos/{}/pulls?state=open&per_page=100&page={page}",
-                    repository.repository
-                ))
+                .get_cached(
+                    &format!(
+                        "/repos/{}/pulls?state=open&per_page=100&page={page}",
+                        repository.repository
+                    ),
+                    &self.code_review.rest_cache,
+                )
                 .await
                 .with_context(|| format!("listing pull requests for {}", repository.repository))?;
             self.record_review_rate(rate);
@@ -1013,6 +1209,27 @@ impl Engine {
             page += 1;
         }
         let mut had_errors = false;
+        let open_pulls: HashSet<_> = pulls.iter().map(|pull| pull.number).collect();
+        if let Err(error) = self
+            .poll_manual_review_comments(&api, &repository.repository, &open_pulls)
+            .await
+        {
+            had_errors = true;
+            self.record_review_error(format!(
+                "polling review comments for {} failed: {error:#}",
+                repository.repository
+            ));
+        }
+        let mut comment_requests: HashMap<u64, Vec<CodeReviewManualRequest>> = HashMap::new();
+        for request in self
+            .store
+            .pending_code_review_manual_requests(&repository.repository)?
+        {
+            comment_requests
+                .entry(request.pull_number)
+                .or_default()
+                .push(request);
+        }
         for pull in pulls {
             let pull_number = pull.number;
             let pending_comments = comment_requests.remove(&pull.number).unwrap_or_default();
@@ -1133,6 +1350,52 @@ impl Engine {
             )?;
         }
         Ok(had_errors)
+    }
+
+    async fn poll_manual_review_comments(
+        &self,
+        api: &GithubApi,
+        repository: &str,
+        open_pulls: &HashSet<u64>,
+    ) -> Result<()> {
+        let initialized = self
+            .store
+            .code_review_comment_poll_initialized(repository)?;
+        let max_pages = if initialized {
+            REVIEW_COMMENT_MAX_PAGES
+        } else {
+            // Establish a recent baseline without replaying every historical
+            // review command the first time this fallback runs.
+            1
+        };
+        for page in 1..=max_pages {
+            let path = format!(
+                "/repos/{repository}/issues/comments?sort=created&direction=desc&per_page={REVIEW_COMMENT_PAGE_SIZE}&page={page}"
+            );
+            let (comments, rate): (Vec<GithubIssueComment>, _) = api
+                .get_cached(&path, &self.code_review.rest_cache)
+                .await
+                .with_context(|| format!("listing issue comments for {repository}"))?;
+            self.record_review_rate(rate);
+            let count = comments.len();
+            let mut reached_seen_comment = false;
+            for comment in comments {
+                let manual_request = polled_manual_review_comment(&comment)
+                    .filter(|(pull_number, _)| open_pulls.contains(pull_number));
+                let inserted = self.store.claim_code_review_polled_comment(
+                    repository,
+                    comment.id,
+                    manual_request
+                        .as_ref()
+                        .map(|(pull_number, trigger_key)| (*pull_number, trigger_key.as_str())),
+                )?;
+                reached_seen_comment |= !inserted;
+            }
+            if count < REVIEW_COMMENT_PAGE_SIZE || reached_seen_comment {
+                break;
+            }
+        }
+        Ok(())
     }
 
     pub fn accept_github_review_webhook(
@@ -1532,10 +1795,10 @@ impl Engine {
 
         let api = self.installation_api(job.installation_id).await?;
         let (current, rate): (GithubPullRequest, _) = api
-            .get(&format!(
-                "/repos/{}/pulls/{}",
-                job.repository, job.pull_number
-            ))
+            .get_cached(
+                &format!("/repos/{}/pulls/{}", job.repository, job.pull_number),
+                &self.code_review.rest_cache,
+            )
             .await?;
         self.record_review_rate(rate);
         if current.state != "open"
@@ -2123,6 +2386,229 @@ mod tests {
     use super::*;
 
     #[test]
+    fn rest_cache_is_bounded_and_refreshes_recent_entries() {
+        let mut cache = GithubRestCache::default();
+        let key = |index| GithubRestCacheKey {
+            scope: "installation:7".into(),
+            path: format!("/resource/{index}"),
+        };
+        for index in 0..=GITHUB_REST_CACHE_MAX_ENTRIES {
+            cache.insert(
+                key(index),
+                CachedGithubResponse {
+                    etag: format!("\"v{index}\""),
+                    body: Arc::from("[]"),
+                },
+            );
+        }
+        assert_eq!(cache.entries.len(), GITHUB_REST_CACHE_MAX_ENTRIES);
+        assert!(!cache.entries.contains_key(&key(0)));
+
+        assert!(cache.get(&key(1)).is_some());
+        cache.insert(
+            key(GITHUB_REST_CACHE_MAX_ENTRIES + 1),
+            CachedGithubResponse {
+                etag: "\"latest\"".into(),
+                body: Arc::from("[]"),
+            },
+        );
+        assert!(cache.entries.contains_key(&key(1)));
+        assert!(!cache.entries.contains_key(&key(2)));
+        assert_eq!(cache.bytes, cache.entries.len() * 2);
+    }
+
+    #[tokio::test]
+    async fn cached_get_reuses_not_modified_body_and_isolates_auth_scopes() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            for (expected_etag, response) in [
+                (
+                    None,
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\netag: \"comments-v1\"\r\nx-ratelimit-remaining: 4999\r\ncontent-length: 5\r\nconnection: close\r\n\r\n[1,2]",
+                ),
+                (
+                    Some("if-none-match: \"comments-v1\""),
+                    "HTTP/1.1 304 Not Modified\r\netag: \"comments-v1\"\r\nx-ratelimit-remaining: 4999\r\ncontent-length: 0\r\nconnection: close\r\n\r\n",
+                ),
+                (
+                    None,
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\netag: \"comments-other\"\r\nx-ratelimit-remaining: 4998\r\ncontent-length: 3\r\nconnection: close\r\n\r\n[3]",
+                ),
+            ] {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut request = Vec::new();
+                let mut buffer = [0_u8; 1024];
+                while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                    let count = stream.read(&mut buffer).await.unwrap();
+                    assert!(count > 0);
+                    request.extend_from_slice(&buffer[..count]);
+                }
+                let request = String::from_utf8(request).unwrap().to_ascii_lowercase();
+                assert!(request.starts_with("get /comments http/1.1\r\n"));
+                match expected_etag {
+                    Some(etag) => assert!(request.contains(etag)),
+                    None => assert!(!request.contains("if-none-match:")),
+                }
+                stream.write_all(response.as_bytes()).await.unwrap();
+            }
+        });
+
+        let cache = Mutex::new(GithubRestCache::default());
+        let api = GithubApi::with_base_url(
+            "Bearer token".into(),
+            format!("http://{address}"),
+            "installation:7".into(),
+        )
+        .unwrap();
+        let (first, rate): (Vec<u64>, _) = api.get_cached("/comments", &cache).await.unwrap();
+        assert_eq!(rate.remaining, Some(4999));
+        assert_eq!(first, vec![1, 2]);
+
+        let (second, rate): (Vec<u64>, _) = api.get_cached("/comments", &cache).await.unwrap();
+        assert_eq!(rate.remaining, Some(4999));
+        assert_eq!(second, vec![1, 2]);
+
+        let other_api = GithubApi::with_base_url(
+            "Bearer other".into(),
+            format!("http://{address}"),
+            "installation:8".into(),
+        )
+        .unwrap();
+        let (other, rate): (Vec<u64>, _) = other_api.get_cached("/comments", &cache).await.unwrap();
+        assert_eq!(rate.remaining, Some(4998));
+        assert_eq!(other, vec![3]);
+        assert_eq!(cache.lock().unwrap().entries.len(), 2);
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn manual_comment_polling_stops_at_seen_comments_and_claims_requests_atomically() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        let comment = |id, pull_number, body: &str, association: &str, kind: &str| {
+            serde_json::json!({
+                "id": id,
+                "body": body,
+                "author_association": association,
+                "issue_url": format!(
+                    "https://api.github.com/repos/acme/widgets/issues/{pull_number}"
+                ),
+                "user": {"type": kind}
+            })
+        };
+        let mut first_page = vec![
+            comment(300, 42, "@trouve-ai review", "OWNER", "User"),
+            comment(299, 99, "@trouve-ai review", "MEMBER", "User"),
+            comment(298, 42, "@trouve-ai review", "CONTRIBUTOR", "User"),
+            comment(297, 42, "@trouve-ai review", "OWNER", "Bot"),
+        ];
+        first_page.extend(
+            (0..96).map(|index| comment(400 + index, 42, "ordinary discussion", "OWNER", "User")),
+        );
+        let mut second_page = vec![comment(
+            200,
+            42,
+            "@trouve-ai review",
+            "COLLABORATOR",
+            "User",
+        )];
+        second_page.extend(
+            (0..99).map(|index| comment(100 + index, 42, "older discussion", "OWNER", "User")),
+        );
+        assert_eq!(first_page.len(), REVIEW_COMMENT_PAGE_SIZE);
+        assert_eq!(second_page.len(), REVIEW_COMMENT_PAGE_SIZE);
+
+        let store = crate::store::Store::open_in_memory().unwrap();
+        assert!(
+            store
+                .claim_code_review_polled_comment("acme/widgets", 200, None)
+                .unwrap()
+        );
+        let data = tempfile::tempdir().unwrap();
+        let engine = Engine::new(
+            store,
+            data.path().to_path_buf(),
+            &crate::config::Config::default(),
+        );
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            for (page, body) in [
+                (1, serde_json::to_string(&first_page).unwrap()),
+                (2, serde_json::to_string(&second_page).unwrap()),
+            ] {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut request = Vec::new();
+                let mut buffer = [0_u8; 1024];
+                while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                    let count = stream.read(&mut buffer).await.unwrap();
+                    assert!(count > 0);
+                    request.extend_from_slice(&buffer[..count]);
+                }
+                let request = String::from_utf8(request).unwrap().to_ascii_lowercase();
+                let expected = format!(
+                    "get /repos/acme/widgets/issues/comments?sort=created&direction=desc&per_page=100&page={page} http/1.1\r\n"
+                );
+                assert!(request.starts_with(&expected), "{request}");
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                stream.write_all(response.as_bytes()).await.unwrap();
+            }
+        });
+
+        let api = GithubApi::with_base_url(
+            "Bearer token".into(),
+            format!("http://{address}"),
+            "installation:7".into(),
+        )
+        .unwrap();
+        engine
+            .poll_manual_review_comments(&api, "acme/widgets", &HashSet::from([42]))
+            .await
+            .unwrap();
+        server.await.unwrap();
+
+        assert_eq!(
+            engine
+                .store
+                .pending_code_review_manual_requests("acme/widgets")
+                .unwrap(),
+            vec![CodeReviewManualRequest {
+                pull_number: 42,
+                trigger_key: "manual:comment:300".into(),
+            }]
+        );
+        for (comment_id, pull_number) in [(299, 99), (298, 42), (297, 42), (200, 42), (300, 42)] {
+            assert!(
+                !engine
+                    .store
+                    .claim_code_review_polled_comment(
+                        "acme/widgets",
+                        comment_id,
+                        Some((pull_number, "manual:comment:duplicate")),
+                    )
+                    .unwrap()
+            );
+        }
+        assert_eq!(
+            engine
+                .store
+                .pending_code_review_manual_requests("acme/widgets")
+                .unwrap(),
+            vec![CodeReviewManualRequest {
+                pull_number: 42,
+                trigger_key: "manual:comment:300".into(),
+            }]
+        );
+    }
+
+    #[test]
     fn parses_fenced_review_json() {
         let review =
             parse_review_output("```json\n{\"summary\":\"ok\",\"findings\":[]}\n```").unwrap();
@@ -2355,6 +2841,31 @@ mod tests {
         payload["comment"]["user"]["type"] = serde_json::json!("User");
         payload["issue"]["pull_request"] = serde_json::Value::Null;
         assert_eq!(manual_review_comment(&payload), None);
+    }
+
+    #[test]
+    fn polled_pr_comments_match_the_webhook_command_rules() {
+        let mut comment: GithubIssueComment = serde_json::from_value(serde_json::json!({
+            "id": 100,
+            "body": "@Trouve-AI review",
+            "author_association": "OWNER",
+            "issue_url": "https://api.github.com/repos/acme/widgets/issues/42",
+            "user": {"type": "User"}
+        }))
+        .unwrap();
+        assert_eq!(
+            polled_manual_review_comment(&comment),
+            Some((42, "manual:comment:100".into()))
+        );
+
+        comment.author_association = "CONTRIBUTOR".into();
+        assert_eq!(polled_manual_review_comment(&comment), None);
+        comment.author_association = "OWNER".into();
+        comment.user.as_mut().unwrap().kind = "Bot".into();
+        assert_eq!(polled_manual_review_comment(&comment), None);
+        comment.user.as_mut().unwrap().kind = "User".into();
+        comment.issue_url = "https://api.github.com/repos/acme/widgets/issues/not-a-number".into();
+        assert_eq!(polled_manual_review_comment(&comment), None);
     }
 
     #[test]

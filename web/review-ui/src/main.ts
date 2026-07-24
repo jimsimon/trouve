@@ -596,7 +596,7 @@ function render(): void {
         <form id="app-form" class="stack">
           <label>App ID<input name="app_id" inputmode="numeric" value="${app.app_id ?? ""}" required /></label>
           <label>Private key (.pem)<textarea name="private_key_pem" rows="5" placeholder="-----BEGIN RSA PRIVATE KEY-----" required></textarea></label>
-          <label>Webhook secret <small>(required for comment triggers; grant Issues: read and subscribe to issue comments)</small><input name="webhook_secret" type="password" /></label>
+          <label>Webhook secret <small>(recommended for immediate comment triggers; polling is the fallback; grant Issues: read and subscribe to issue comments)</small><input name="webhook_secret" type="password" /></label>
           <button>${app.configured ? "Replace credentials" : "Connect GitHub App"}</button>
         </form>
       </section>
