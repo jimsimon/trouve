@@ -768,28 +768,50 @@ impl Store {
 
     /// Most recently persisted account PR snapshot for `host`.
     ///
-    /// The scan runs newest-first and stops at the first matching host, so a
-    /// fresh server process can seed its change detector without replaying or
-    /// retaining historical snapshots.
+    /// The scan runs newest-first in bounded pages and stops at the first
+    /// matching host. Payloads are decoded after releasing the SQLite
+    /// connection mutex so a cold or missing host cannot block unrelated
+    /// store operations for the full server history.
     pub fn latest_github_pr_snapshot(&self, host: &str) -> Result<Option<GithubPrList>> {
-        let conn = self.conn.lock().unwrap();
-        let mut stmt = conn.prepare(
-            "SELECT payload FROM events
-             WHERE scope_kind = 'server' AND scope_id = ''
-             ORDER BY cursor DESC",
-        )?;
-        let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
-        for payload in rows {
-            let Ok(Event::GithubPullRequestsUpdated { pull_requests }) =
-                serde_json::from_str::<Event>(&payload?)
-            else {
-                continue;
+        const PAGE_SIZE: usize = 64;
+
+        let mut before = i64::MAX;
+        loop {
+            let page = {
+                let conn = self.conn.lock().unwrap();
+                let mut stmt = conn.prepare(
+                    "SELECT cursor, payload FROM events
+                     WHERE scope_kind = 'server' AND scope_id = '' AND cursor < ?1
+                     ORDER BY cursor DESC LIMIT ?2",
+                )?;
+                let rows = stmt.query_map(params![before, PAGE_SIZE as i64], |row| {
+                    Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+                })?;
+                let mut page = Vec::new();
+                for row in rows {
+                    page.push(row?);
+                }
+                page
             };
-            if pull_requests.host.eq_ignore_ascii_case(host) {
-                return Ok(Some(pull_requests));
+            let Some((oldest, _)) = page.last() else {
+                return Ok(None);
+            };
+            before = *oldest;
+            let exhausted = page.len() < PAGE_SIZE;
+            for (_, payload) in page {
+                let Ok(Event::GithubPullRequestsUpdated { pull_requests }) =
+                    serde_json::from_str::<Event>(&payload)
+                else {
+                    continue;
+                };
+                if pull_requests.host.eq_ignore_ascii_case(host) {
+                    return Ok(Some(pull_requests));
+                }
+            }
+            if exhausted {
+                return Ok(None);
             }
         }
-        Ok(None)
     }
 
     /// Live subscription to all events; callers filter by scope.
@@ -2562,7 +2584,6 @@ mod tests {
         for (viewer, host) in [
             ("alice", "github.com"),
             ("enterprise", "github.example.com"),
-            ("bob", "github.com"),
         ] {
             store
                 .append_event(
@@ -2577,6 +2598,29 @@ mod tests {
                 )
                 .unwrap();
         }
+        for index in 0..70 {
+            store
+                .append_event(
+                    Scope::Server,
+                    Event::WorkspaceRegistered {
+                        workspace_id: format!("ws_{index}"),
+                        path: format!("/tmp/workspace-{index}"),
+                    },
+                )
+                .unwrap();
+        }
+        store
+            .append_event(
+                Scope::Server,
+                Event::GithubPullRequestsUpdated {
+                    pull_requests: GithubPrList {
+                        viewer: "bob".into(),
+                        host: "github.com".into(),
+                        prs: Vec::new(),
+                    },
+                },
+            )
+            .unwrap();
 
         let github = store
             .latest_github_pr_snapshot("GITHUB.COM")

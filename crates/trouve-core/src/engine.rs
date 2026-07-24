@@ -156,11 +156,11 @@ pub struct Engine {
     /// a turn runs; `cancel_turn` trips one to interrupt the turn's provider
     /// stream, tool calls, and approval waits at the next await point.
     turn_cancels: Mutex<std::collections::HashMap<String, tokio_util::sync::CancellationToken>>,
-    /// Per-host incremental PR snapshots. Holding this asynchronous lock also
-    /// coalesces refresh requests from multiple connected clients into one
-    /// upstream GitHub poll.
+    /// Per-host incremental PR snapshots. The map lock is held only for entry
+    /// management and durable publication; each host has its own async lock so
+    /// network refreshes do not block host removal or unrelated hosts.
     github_dashboard_caches:
-        tokio::sync::Mutex<HashMap<String, crate::github::GitHubDashboardCache>>,
+        Mutex<HashMap<String, Arc<tokio::sync::Mutex<crate::github::GitHubDashboardCache>>>>,
     pub(crate) config: Mutex<Config>,
     /// Where provider configuration changes are persisted. `None` disables
     /// persistence (tests).
@@ -468,7 +468,7 @@ impl Engine {
             active_threads: Mutex::new(std::collections::HashMap::new()),
             deleting_sessions: Mutex::new(std::collections::HashSet::new()),
             turn_cancels: Mutex::new(std::collections::HashMap::new()),
-            github_dashboard_caches: tokio::sync::Mutex::new(HashMap::new()),
+            github_dashboard_caches: Mutex::new(HashMap::new()),
             config: Mutex::new(config.clone()),
             // No write-back by default: only a caller that loaded `config`
             // from disk should enable persisting to that file (see
@@ -2931,9 +2931,8 @@ impl Engine {
     }
 
     /// Remove an enterprise host and forget its stored secrets.
-    pub async fn remove_github_host(&self, host: &str) -> Result<(), EngineError> {
+    pub fn remove_github_host(&self, host: &str) -> Result<(), EngineError> {
         let host = host.trim().to_ascii_lowercase();
-        let mut dashboard_caches = self.github_dashboard_caches.lock().await;
         let snapshot = {
             let mut config = self.config.lock().unwrap();
             let before = config.github_enterprise.len();
@@ -2951,6 +2950,7 @@ impl Engine {
         let _ = self
             .secrets
             .delete(&trouve_providers::secrets::oauth_secret(&id));
+        let mut dashboard_caches = self.github_dashboard_caches.lock().unwrap();
         dashboard_caches.remove(&host);
         self.store.append_event(
             Scope::Server,
@@ -3251,13 +3251,6 @@ impl Engine {
 
     /// Refresh the account-centric PR feed on every signed-in GitHub instance.
     pub async fn refresh_github_prs(&self) -> Result<(), EngineError> {
-        let mut dashboard_caches = match self.github_dashboard_caches.try_lock() {
-            Ok(caches) => caches,
-            Err(_) => {
-                tracing::debug!("coalescing concurrent GitHub dashboard refresh");
-                return Ok(());
-            }
-        };
         let merged_since = chrono::Utc::now() - chrono::Duration::hours(24);
         let workspaces = self.store.list_workspaces()?;
         let workspace_repositories = tokio::task::spawn_blocking(move || {
@@ -3273,23 +3266,43 @@ impl Engine {
         .await
         .map_err(|error| EngineError::Internal(anyhow!(error)))?;
         let mut failures = Vec::new();
-        let github_hosts = self.github_hosts();
-        let known_hosts = github_hosts
+        let authenticated_hosts = self
+            .github_hosts()
+            .into_iter()
+            .filter_map(|(host, _)| self.github_token(&host).map(|token| (host, token)))
+            .collect::<Vec<_>>();
+        let known_hosts = authenticated_hosts
             .iter()
-            .map(|(host, _)| host.clone())
+            .map(|(host, _token)| host.clone())
             .collect::<HashSet<_>>();
-        dashboard_caches.retain(|host, _| known_hosts.contains(host));
-        for (host, _) in github_hosts {
-            let Some(token) = self.github_token(&host) else {
-                dashboard_caches.remove(&host);
+        let refreshes = {
+            let mut dashboard_caches = self.github_dashboard_caches.lock().unwrap();
+            dashboard_caches.retain(|host, _cache| known_hosts.contains(host));
+            authenticated_hosts
+                .into_iter()
+                .map(|(host, token)| {
+                    let cache = dashboard_caches
+                        .entry(host.clone())
+                        .or_insert_with(|| {
+                            Arc::new(tokio::sync::Mutex::new(
+                                crate::github::GitHubDashboardCache::default(),
+                            ))
+                        })
+                        .clone();
+                    (host, token, cache)
+                })
+                .collect::<Vec<_>>()
+        };
+        for (host, token, cache_handle) in refreshes {
+            let Ok(mut cache) = cache_handle.try_lock() else {
+                tracing::debug!(host, "coalescing concurrent GitHub dashboard refresh");
                 continue;
             };
             let account =
                 crate::github::GitHubAccount::new(&token, &host).map_err(EngineError::Internal)?;
-            let cache = dashboard_caches.entry(host.clone()).or_default();
             let refresh = tokio::time::timeout(
                 GITHUB_DASHBOARD_REFRESH_TIMEOUT,
-                account.dashboard_prs(merged_since, cache),
+                account.dashboard_prs(merged_since, &mut cache),
             )
             .await;
             let (viewer, mut prs) = match refresh {
@@ -3325,6 +3338,13 @@ impl Engine {
             let Some(snapshot) = cache.unpublished_snapshot(&pull_requests)? else {
                 continue;
             };
+            let dashboard_caches = self.github_dashboard_caches.lock().unwrap();
+            if !dashboard_caches
+                .get(&pull_requests.host)
+                .is_some_and(|current| Arc::ptr_eq(current, &cache_handle))
+            {
+                continue;
+            }
             self.store.append_event(
                 Scope::Server,
                 Event::GithubPullRequestsUpdated { pull_requests },
@@ -7544,28 +7564,41 @@ mod tests {
         let engine = Engine::new(store.clone(), data.path().into(), &config);
         let mut cache = crate::github::GitHubDashboardCache::default();
         cache.mark_snapshot_published("stale snapshot".into());
+        let cache_handle = Arc::new(tokio::sync::Mutex::new(cache));
         engine
             .github_dashboard_caches
             .lock()
-            .await
-            .insert(HOST.into(), cache);
+            .unwrap()
+            .insert(HOST.into(), cache_handle.clone());
+        let in_flight = cache_handle.lock().await;
 
-        engine.remove_github_host(HOST).await.unwrap();
+        engine.remove_github_host(HOST).unwrap();
 
         assert!(
             !engine
                 .github_dashboard_caches
                 .lock()
-                .await
+                .unwrap()
                 .contains_key(HOST)
         );
+        drop(in_flight);
         let cleared = store.latest_github_pr_snapshot(HOST).unwrap().unwrap();
         assert!(cleared.viewer.is_empty());
         assert!(cleared.prs.is_empty());
 
         engine.add_github_host(HOST, "client-id").unwrap();
-        let mut caches = engine.github_dashboard_caches.lock().await;
-        let cache = caches.entry(HOST.into()).or_default();
+        let cache = {
+            let mut caches = engine.github_dashboard_caches.lock().unwrap();
+            caches
+                .entry(HOST.into())
+                .or_insert_with(|| {
+                    Arc::new(tokio::sync::Mutex::new(
+                        crate::github::GitHubDashboardCache::default(),
+                    ))
+                })
+                .clone()
+        };
+        let cache = cache.lock().await;
         assert!(!cache.has_published_snapshot());
     }
 

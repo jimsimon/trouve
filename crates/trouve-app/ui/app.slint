@@ -2092,7 +2092,9 @@ export component AppWindow inherits Window {
     Timer {
         interval: 125ms;
         running: !Theme.reduce-motion
-            && (root.agents-running > 0 || root.context-compacting);
+            && (root.agents-running > 0
+                || root.composer-turn-running
+                || root.context-compacting);
         triggered => {
             root.activity-phase = root.activity-phase >= 11
                 ? 0 : root.activity-phase + 1;
