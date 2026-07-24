@@ -2931,16 +2931,18 @@ impl Engine {
     }
 
     /// Remove an enterprise host and forget its stored secrets.
-    pub fn remove_github_host(&self, host: &str) -> Result<(), EngineError> {
+    pub async fn remove_github_host(&self, host: &str) -> Result<(), EngineError> {
         let host = host.trim().to_ascii_lowercase();
-        let mut config = self.config.lock().unwrap();
-        let before = config.github_enterprise.len();
-        config.github_enterprise.retain(|e| e.host != host);
-        if config.github_enterprise.len() == before {
-            return Err(EngineError::NotFound(format!("GitHub host {host}")));
-        }
-        let snapshot = config.clone();
-        drop(config);
+        let mut dashboard_caches = self.github_dashboard_caches.lock().await;
+        let snapshot = {
+            let mut config = self.config.lock().unwrap();
+            let before = config.github_enterprise.len();
+            config.github_enterprise.retain(|e| e.host != host);
+            if config.github_enterprise.len() == before {
+                return Err(EngineError::NotFound(format!("GitHub host {host}")));
+            }
+            config.clone()
+        };
         self.persist_config(&snapshot);
         let id = Self::github_secret_id(&host);
         let _ = self
@@ -2949,6 +2951,7 @@ impl Engine {
         let _ = self
             .secrets
             .delete(&trouve_providers::secrets::oauth_secret(&id));
+        dashboard_caches.remove(&host);
         self.store.append_event(
             Scope::Server,
             Event::GithubPullRequestsUpdated {
@@ -3312,12 +3315,21 @@ impl Engine {
                     })
                     .unwrap_or_default();
             }
+            let pull_requests = trouve_protocol::GithubPrList { viewer, host, prs };
+            if !cache.has_published_snapshot()
+                && let Some(persisted) =
+                    self.store.latest_github_pr_snapshot(&pull_requests.host)?
+            {
+                cache.seed_published_snapshot(&persisted)?;
+            }
+            let Some(snapshot) = cache.unpublished_snapshot(&pull_requests)? else {
+                continue;
+            };
             self.store.append_event(
                 Scope::Server,
-                Event::GithubPullRequestsUpdated {
-                    pull_requests: trouve_protocol::GithubPrList { viewer, host, prs },
-                },
+                Event::GithubPullRequestsUpdated { pull_requests },
             )?;
+            cache.mark_snapshot_published(snapshot);
         }
         if !failures.is_empty() {
             return Err(EngineError::BadRequest(failures.join("; ")));
@@ -7514,6 +7526,48 @@ fn resolved_api_key(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn removing_github_host_discards_its_dashboard_cache() {
+        const HOST: &str = "github.example.com";
+
+        let data = tempfile::tempdir().unwrap();
+        let store = Store::open_in_memory().unwrap();
+        let config = Config {
+            local_enabled: Some(false),
+            github_enterprise: vec![crate::config::GithubEnterpriseConfig {
+                host: HOST.into(),
+                client_id: Some("client-id".into()),
+            }],
+            ..Default::default()
+        };
+        let engine = Engine::new(store.clone(), data.path().into(), &config);
+        let mut cache = crate::github::GitHubDashboardCache::default();
+        cache.mark_snapshot_published("stale snapshot".into());
+        engine
+            .github_dashboard_caches
+            .lock()
+            .await
+            .insert(HOST.into(), cache);
+
+        engine.remove_github_host(HOST).await.unwrap();
+
+        assert!(
+            !engine
+                .github_dashboard_caches
+                .lock()
+                .await
+                .contains_key(HOST)
+        );
+        let cleared = store.latest_github_pr_snapshot(HOST).unwrap().unwrap();
+        assert!(cleared.viewer.is_empty());
+        assert!(cleared.prs.is_empty());
+
+        engine.add_github_host(HOST, "client-id").unwrap();
+        let mut caches = engine.github_dashboard_caches.lock().await;
+        let cache = caches.entry(HOST.into()).or_default();
+        assert!(!cache.has_published_snapshot());
+    }
 
     #[test]
     fn collects_provider_neutral_pr_evidence() {

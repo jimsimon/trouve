@@ -1680,7 +1680,7 @@ async fn remove_github_host(
     State(engine): State<Arc<Engine>>,
     Path(host): Path<String>,
 ) -> Result<Json<GithubIntegration>, ApiError> {
-    engine.remove_github_host(&host)?;
+    engine.remove_github_host(&host).await?;
     Ok(Json(engine.github_integration()))
 }
 
@@ -1700,6 +1700,48 @@ fn resume_cursor(headers: &HeaderMap, q: &EventsQuery) -> u64 {
         .unwrap_or(0)
 }
 
+const EVENT_REPLAY_PAGE_SIZE: usize = 64;
+
+enum EventReplayError {
+    Store(anyhow::Error),
+    Disconnected,
+}
+
+/// Send a fixed snapshot of persisted history in bounded pages. The caller
+/// subscribes to live events first, so appends after the snapshot ceiling are
+/// waiting in the broadcast receiver and duplicates can be filtered by the
+/// returned cursor.
+async fn replay_persisted_events(
+    engine: &Engine,
+    scope: &Scope,
+    tx: &tokio::sync::mpsc::Sender<SseEvent>,
+    after: u64,
+) -> Result<u64, EventReplayError> {
+    let through = engine
+        .store()
+        .latest_event_cursor(scope)
+        .map_err(EventReplayError::Store)?;
+    let mut cursor = after;
+    while cursor < through {
+        let page = engine
+            .store()
+            .event_replay_page(scope, cursor, through, EVENT_REPLAY_PAGE_SIZE)
+            .map_err(EventReplayError::Store)?;
+        let next = page.next_after;
+        for env in page.events {
+            send_envelope(tx, &env)
+                .await
+                .map_err(|()| EventReplayError::Disconnected)?;
+        }
+        if page.exhausted || next <= cursor {
+            cursor = next;
+            break;
+        }
+        cursor = next;
+    }
+    Ok(cursor)
+}
+
 /// Replay persisted events after the cursor, then continue live. The live
 /// subscription is opened *before* the replay query so no event can fall in
 /// the gap; duplicates at the boundary are filtered by cursor.
@@ -1711,20 +1753,14 @@ fn event_stream(
     let (tx, rx) = tokio::sync::mpsc::channel::<SseEvent>(256);
     tokio::spawn(async move {
         let mut live = engine.store().subscribe();
-        let replayed = match engine.store().events_after(&scope, after) {
-            Ok(events) => events,
-            Err(e) => {
+        let mut last = match replay_persisted_events(&engine, &scope, &tx, after).await {
+            Ok(last) => last,
+            Err(EventReplayError::Store(e)) => {
                 tracing::error!("event replay failed: {e}");
                 return;
             }
+            Err(EventReplayError::Disconnected) => return,
         };
-        let mut last = after;
-        for env in replayed {
-            last = env.cursor;
-            if send_envelope(&tx, &env).await.is_err() {
-                return;
-            }
-        }
         loop {
             match live.recv().await {
                 Ok(env) => {
@@ -1738,19 +1774,13 @@ fn event_stream(
                 }
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
                     // Fall back to replay to fill the hole.
-                    match engine.store().events_after(&scope, last) {
-                        Ok(events) => {
-                            for env in events {
-                                last = env.cursor;
-                                if send_envelope(&tx, &env).await.is_err() {
-                                    return;
-                                }
-                            }
-                        }
-                        Err(e) => {
+                    match replay_persisted_events(&engine, &scope, &tx, last).await {
+                        Ok(replayed_through) => last = replayed_through,
+                        Err(EventReplayError::Store(e)) => {
                             tracing::error!("event catch-up failed: {e}");
                             return;
                         }
+                        Err(EventReplayError::Disconnected) => return,
                     }
                 }
                 Err(tokio::sync::broadcast::error::RecvError::Closed) => return,

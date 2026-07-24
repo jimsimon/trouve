@@ -1306,9 +1306,10 @@ component NewChatForm inherits VerticalLayout {
 // (reduce motion) the dots rest as static faint marks.
 component PulseDots inherits Rectangle {
     in property <bool> animate: true;
+    in property <int> phase: 0;
     width: 38px;
     height: 16px;
-    property <float> t: root.animate ? animation-tick() / 1.4s : 0.0;
+    property <float> t: root.animate ? root.phase / 12.0 : 0.0;
     for i in [0, 1, 2]: Rectangle {
         // Half-wave per dot, staggered: sin clipped at 0 so each dot rests
         // between pulses instead of dipping below the baseline.
@@ -2081,6 +2082,19 @@ export component AppWindow inherits Window {
     // Quit confirmation while agents run: closing the window with active
     // turns opens the modal instead of quitting.
     in property <int> agents-running: 0;
+    // One low-frequency clock drives every busy affordance. Slint's
+    // animation-tick() repaints the whole scene at display rate even though
+    // these tiny indicators need only a handful of visual steps per second.
+    property <int> activity-phase: 0;
+    Timer {
+        interval: 125ms;
+        running: !Theme.reduce-motion
+            && (root.agents-running > 0 || root.context-compacting);
+        triggered => {
+            root.activity-phase = root.activity-phase >= 11
+                ? 0 : root.activity-phase + 1;
+        }
+    }
     in-out property <bool> quit-dialog: false;
     in-out property <bool> quit-when-idle-armed: false;
     in-out property <bool> quit-cancel-pending: false;
@@ -2594,7 +2608,8 @@ export component AppWindow inherits Window {
                                     background: Theme.c.accent;
                                     opacity: Theme.reduce-motion
                                         ? 1.0
-                                        : 0.55 + 0.45 * Math.sin(360deg * (animation-tick() / 1.6s));
+                                        : 0.55 + 0.45 * Math.sin(
+                                            360deg * (root.activity-phase / 12.0));
                                 }
                                 if row.attention-kind == 0 && !row.error && !row.unread && !row.busy && row.pr-kind != 0: IconButton {
                                     width: 26px;
@@ -3191,15 +3206,17 @@ export component AppWindow inherits Window {
                                         font-size: Theme.fs(10px);
                                         vertical-alignment: center;
                                     }
-                                    // Running tools show an indeterminate
-                                    // spinner; settled ones a status glyph.
-                                    // Reduce motion: a static glyph instead.
+                                    // Running tools show a determinate spinner
+                                    // stepped by the shared activity phase;
+                                    // settled ones use a status glyph. Reduce
+                                    // motion uses a static glyph instead.
                                     if row.tool-status == 1 && !Theme.reduce-motion: VerticalLayout {
                                         alignment: center;
                                         Spinner {
                                             width: 12px;
                                             height: 12px;
-                                            indeterminate: true;
+                                            progress: (root.activity-phase + 1) / 12.0;
+                                            indeterminate: false;
                                         }
                                     }
                                     if row.tool-status == 1 && Theme.reduce-motion: Text {
@@ -3458,6 +3475,7 @@ export component AppWindow inherits Window {
                                 PulseDots {
                                     // Reduce motion: dots rest as static marks.
                                     animate: !Theme.reduce-motion;
+                                    phase: root.activity-phase;
                                 }
                                 Text {
                                     text: row.text;
@@ -4356,7 +4374,8 @@ export component AppWindow inherits Window {
                             clicked => { root.attach-file(); }
                         }
                     }
-                    // Context usage dial; indeterminate while compacting.
+                    // Context usage dial; compacting uses determinate,
+                    // phase-driven progress.
                     VerticalLayout {
                         spacing: 2px;
                         Text { text: " "; font-size: Theme.fs(10px); }
@@ -4371,8 +4390,11 @@ export component AppWindow inherits Window {
                             x: 2px;
                             y: 2px;
                             progress: root.context-compacting && Theme.reduce-motion
-                                ? 1.0 : root.context-fill;
-                            indeterminate: root.context-compacting && !Theme.reduce-motion;
+                                ? 1.0
+                                : root.context-compacting
+                                    ? (root.activity-phase + 1) / 12.0
+                                    : root.context-fill;
+                            indeterminate: false;
                         }
                         dial-ta := TouchArea { }
                         if dial-ta.has-hover: Rectangle {
