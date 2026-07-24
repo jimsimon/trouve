@@ -13,7 +13,7 @@ resolver = "2"
 members = ["crates/*"]
 
 [workspace.package]
-version = "3.3.0"
+version = "3.3.1"
 edition = "2024"
 license = "MIT"
 repository = "https://github.com/jimsimon/trouve"
@@ -51,17 +51,17 @@ utoipa = { version = "5", features = ["chrono"] }
 uuid = { version = "1", features = ["v4"] }
 
 # Internal crates
-trouve-protocol = { path = "crates/trouve-protocol", version = "3.3.0" }
-trouve-search = { path = "crates/trouve-search", version = "3.3.0" }
-trouve-agents = { path = "crates/trouve-agents", version = "3.3.0" }
-trouve-core = { path = "crates/trouve-core", version = "3.3.0" }
-trouve-providers = { path = "crates/trouve-providers", version = "3.3.0" }
-trouve-server = { path = "crates/trouve-server", version = "3.3.0" }
-trouve-client-core = { path = "crates/trouve-client-core", version = "3.3.0" }
-trouve-slint-code-view = { path = "crates/trouve-slint-code-view", version = "3.3.0" }
-trouve-slint-diff-view = { path = "crates/trouve-slint-diff-view", version = "3.3.0" }
-trouve-slint-markdown = { path = "crates/trouve-slint-markdown", version = "3.3.0" }
-trouve-slint-terminal = { path = "crates/trouve-slint-terminal", version = "3.3.0" }
+trouve-protocol = { path = "crates/trouve-protocol", version = "3.3.1" }
+trouve-search = { path = "crates/trouve-search", version = "3.3.1" }
+trouve-agents = { path = "crates/trouve-agents", version = "3.3.1" }
+trouve-core = { path = "crates/trouve-core", version = "3.3.1" }
+trouve-providers = { path = "crates/trouve-providers", version = "3.3.1" }
+trouve-server = { path = "crates/trouve-server", version = "3.3.1" }
+trouve-client-core = { path = "crates/trouve-client-core", version = "3.3.1" }
+trouve-slint-code-view = { path = "crates/trouve-slint-code-view", version = "3.3.1" }
+trouve-slint-diff-view = { path = "crates/trouve-slint-diff-view", version = "3.3.1" }
+trouve-slint-markdown = { path = "crates/trouve-slint-markdown", version = "3.3.1" }
+trouve-slint-terminal = { path = "crates/trouve-slint-terminal", version = "3.3.1" }
 
 [profile.release]
 lto = "thin"
