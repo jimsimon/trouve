@@ -2543,7 +2543,9 @@ export component AppWindow inherits Window {
 
                         // Session row.
                         if row.kind == 1: HorizontalLayout {
-                            padding-left: 8px;
+                            // No left padding: the status slot spans the whole
+                            // leading gutter, so its centered indicator sits on
+                            // the same axis as the workspace header's caret.
                             padding-right: 4px;
                             // Every session status shares this fixed slot.
                             // Conditions are mutually exclusive and encode
@@ -2554,6 +2556,12 @@ export component AppWindow inherits Window {
                                 if row.attention-kind != 0: IconButton {
                                     width: 26px;
                                     height: 30px;
+                                    // Anchor to the fixed slot: an `if` element
+                                    // has an implementation wrapper, so default
+                                    // placement is not a reliable centering
+                                    // anchor here.
+                                    x: (status-slot.width - self.width) / 2;
+                                    y: (status-slot.height - self.height) / 2;
                                     icon: row.attention-kind == 2 ? "?" : "!";
                                     icon-size: Theme.fs(16px);
                                     icon-color: Theme.c.warn;
@@ -2565,6 +2573,8 @@ export component AppWindow inherits Window {
                                 if row.attention-kind == 0 && row.error: IconButton {
                                     width: 26px;
                                     height: 30px;
+                                    x: (status-slot.width - self.width) / 2;
+                                    y: (status-slot.height - self.height) / 2;
                                     icon: "×";
                                     icon-size: Theme.fs(18px);
                                     icon-color: Theme.c.err;
@@ -2576,6 +2586,8 @@ export component AppWindow inherits Window {
                                 if row.attention-kind == 0 && !row.error && row.unread: IconButton {
                                     width: 26px;
                                     height: 30px;
+                                    x: (status-slot.width - self.width) / 2;
+                                    y: (status-slot.height - self.height) / 2;
                                     icon: "●";
                                     icon-size: Theme.fs(11px);
                                     icon-color: Theme.c.accent;
@@ -2587,12 +2599,8 @@ export component AppWindow inherits Window {
                                 if row.attention-kind == 0 && !row.error && !row.unread && row.busy: Rectangle {
                                     width: 10px;
                                     height: 10px;
-                                    // Refer to the fixed slot explicitly: an
-                                    // `if` element has an implementation
-                                    // wrapper, so `parent.width` is not a
-                                    // reliable centering anchor here.
                                     x: (status-slot.width - self.width) / 2;
-                                    y: (parent.height - self.height) / 2;
+                                    y: (status-slot.height - self.height) / 2;
                                     border-radius: 5px;
                                     background: Theme.c.accent;
                                     opacity: Theme.reduce-motion
@@ -2602,6 +2610,8 @@ export component AppWindow inherits Window {
                                 if row.attention-kind == 0 && !row.error && !row.unread && !row.busy && row.pr-kind != 0: IconButton {
                                     width: 26px;
                                     height: 30px;
+                                    x: (status-slot.width - self.width) / 2;
+                                    y: (status-slot.height - self.height) / 2;
                                     use-icon-image: true;
                                     icon-image: @image-url("assets/git-merge.svg");
                                     icon-size: Theme.fs(18px);
