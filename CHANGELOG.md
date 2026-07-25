@@ -4,6 +4,45 @@ All notable changes to this project are documented in this file. The format
 is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this
 project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [3.4.0] - 2026-07-25
+
+### Added
+
+- **Expanded code review workflows**: review jobs now expose durable live
+  progress, reviewer output, elapsed time, findings, and coverage; operators
+  can filter, cancel, retry, and request either incremental or full-branch
+  reviews from the redesigned dashboard.
+- **GitHub review lifecycle integration**: reviews publish Check Run progress
+  and pull request status comments, reconcile fixed findings with review
+  threads, and support signed webhook actions for reruns and full reviews.
+  GitHub Apps must grant `checks:write`; subscribe to `check_run` events to
+  enable the GitHub action buttons.
+- **Review remediation and statistics**: the desktop pull request view offers
+  per-finding **Fix** and summary **Fix all** actions, while the dashboard
+  reports repository, reviewer, model, queue, runtime, token, cache, and issue
+  history.
+
+### Changed
+
+- **Review throughput and context reuse**: read-shared sessions,
+  provider-aware prioritized capacity, adaptive backoff, coalesced progress,
+  diff reuse, persona routing, batched context, and Anthropic prompt caching
+  improve concurrent review efficiency.
+- **Bounded event replay**: persisted SSE history is replayed in fixed-size
+  pages, stale pull request dashboard snapshots are coalesced, and unchanged
+  snapshots are no longer persisted, reducing startup memory and redundant UI
+  work without deleting existing event history.
+
+### Fixed
+
+- **Review lifecycle reliability**: cancellation, retry, branch selection,
+  concurrent detail loading, CLI polling updates, cache bounds, and credential
+  handling now remain correct across overlapping review and dashboard work.
+- **Pull request dashboard refreshes**: per-host publication locking prevents
+  stale state from resurfacing when a GitHub host is removed and re-added.
+- **Review dashboard builds**: Vite's client declarations keep stylesheet
+  imports valid under TypeScript 7.
+
 ## [3.3.3] - 2026-07-24
 
 ### Fixed
@@ -466,6 +505,7 @@ semble ([BENCHMARKS.md](BENCHMARKS.md)):
 - Incremental reindex (1 file touched): 0.86 s vs ~3 min (212x)
 - Warm query: 0.55 s vs 7.2 s (13x)
 
+[3.4.0]: https://github.com/jimsimon/trouve/compare/v3.3.3...v3.4.0
 [3.3.3]: https://github.com/jimsimon/trouve/compare/v3.3.2...v3.3.3
 [3.3.2]: https://github.com/jimsimon/trouve/compare/v3.3.1...v3.3.2
 [3.3.1]: https://github.com/jimsimon/trouve/compare/v3.3.0...v3.3.1
