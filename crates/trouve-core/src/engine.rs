@@ -7,6 +7,7 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, RwLock};
+use std::time::Instant;
 
 use anyhow::{Context, Result, anyhow, bail};
 use futures::{FutureExt, StreamExt};
@@ -35,6 +36,175 @@ const COMPACTION_THRESHOLD: f64 = 0.8;
 /// End-to-end budget for refreshing one GitHub host. This bounds how long a
 /// stalled GraphQL request can retain the shared dashboard-cache lock.
 const GITHUB_DASHBOARD_REFRESH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
+const TURN_CONCURRENCY_ENV: &str = "TROUVE_TURN_CONCURRENCY";
+const DEFAULT_TURN_CONCURRENCY: usize = 12;
+const BACKGROUND_TURN_CONCURRENCY_ENV: &str = "TROUVE_BACKGROUND_TURN_CONCURRENCY";
+const DEFAULT_BACKGROUND_TURN_CONCURRENCY: usize = 10;
+const PROVIDER_TURN_CONCURRENCY_ENV: &str = "TROUVE_PROVIDER_TURN_CONCURRENCY";
+const DEFAULT_PROVIDER_TURN_CONCURRENCY: usize = 8;
+const PROVIDER_BACKGROUND_CONCURRENCY_ENV: &str = "TROUVE_PROVIDER_BACKGROUND_TURN_CONCURRENCY";
+const DEFAULT_PROVIDER_BACKGROUND_CONCURRENCY: usize = 6;
+
+fn positive_limit_from_env(name: &str, default: usize) -> usize {
+    std::env::var(name)
+        .ok()
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(default)
+}
+
+#[derive(Clone)]
+struct ProviderTurnCapacity {
+    all: Arc<tokio::sync::Semaphore>,
+    background: Arc<tokio::sync::Semaphore>,
+    backoff: Arc<Mutex<ProviderBackoff>>,
+}
+
+#[derive(Default)]
+struct ProviderBackoff {
+    until: Option<Instant>,
+    delay: std::time::Duration,
+}
+
+/// Capacity shared by interactive desktop turns, spawned agents, and
+/// background review personas. Background work has a smaller second gate, so
+/// it can never occupy all global/provider slots and starve the desktop.
+struct TurnScheduler {
+    all: Arc<tokio::sync::Semaphore>,
+    background: Arc<tokio::sync::Semaphore>,
+    provider_all_limit: usize,
+    provider_background_limit: usize,
+    providers: Mutex<HashMap<String, ProviderTurnCapacity>>,
+}
+
+struct TurnCapacityGuard {
+    _permits: Vec<tokio::sync::OwnedSemaphorePermit>,
+    wait_ms: u64,
+}
+
+impl TurnScheduler {
+    fn new() -> Self {
+        let all_limit = positive_limit_from_env(TURN_CONCURRENCY_ENV, DEFAULT_TURN_CONCURRENCY);
+        let background_limit = positive_limit_from_env(
+            BACKGROUND_TURN_CONCURRENCY_ENV,
+            DEFAULT_BACKGROUND_TURN_CONCURRENCY,
+        )
+        .min(all_limit.saturating_sub(1).max(1));
+        let provider_all_limit = positive_limit_from_env(
+            PROVIDER_TURN_CONCURRENCY_ENV,
+            DEFAULT_PROVIDER_TURN_CONCURRENCY,
+        );
+        let provider_background_limit = positive_limit_from_env(
+            PROVIDER_BACKGROUND_CONCURRENCY_ENV,
+            DEFAULT_PROVIDER_BACKGROUND_CONCURRENCY,
+        )
+        .min(provider_all_limit.saturating_sub(1).max(1));
+        Self {
+            all: Arc::new(tokio::sync::Semaphore::new(all_limit)),
+            background: Arc::new(tokio::sync::Semaphore::new(background_limit)),
+            provider_all_limit,
+            provider_background_limit,
+            providers: Mutex::new(HashMap::new()),
+        }
+    }
+
+    fn provider(&self, model: &str) -> ProviderTurnCapacity {
+        let provider = model
+            .split_once('/')
+            .map_or(model, |(provider, _)| provider);
+        self.providers
+            .lock()
+            .unwrap()
+            .entry(provider.to_owned())
+            .or_insert_with(|| ProviderTurnCapacity {
+                all: Arc::new(tokio::sync::Semaphore::new(self.provider_all_limit)),
+                background: Arc::new(tokio::sync::Semaphore::new(self.provider_background_limit)),
+                backoff: Arc::new(Mutex::new(ProviderBackoff::default())),
+            })
+            .clone()
+    }
+
+    async fn acquire(&self, model: &str, background: bool) -> Result<TurnCapacityGuard> {
+        let started = Instant::now();
+        let provider = self.provider(model);
+        let cooldown = provider
+            .backoff
+            .lock()
+            .unwrap()
+            .until
+            .and_then(|until| until.checked_duration_since(Instant::now()));
+        if let Some(cooldown) = cooldown {
+            tokio::time::sleep(cooldown).await;
+        }
+        let mut permits = Vec::with_capacity(if background { 4 } else { 2 });
+        if background {
+            permits.push(
+                self.background
+                    .clone()
+                    .acquire_owned()
+                    .await
+                    .map_err(|_| anyhow!("background turn scheduler closed"))?,
+            );
+            permits.push(
+                provider
+                    .background
+                    .clone()
+                    .acquire_owned()
+                    .await
+                    .map_err(|_| anyhow!("provider background scheduler closed"))?,
+            );
+        }
+        permits.push(
+            self.all
+                .clone()
+                .acquire_owned()
+                .await
+                .map_err(|_| anyhow!("turn scheduler closed"))?,
+        );
+        permits.push(
+            provider
+                .all
+                .clone()
+                .acquire_owned()
+                .await
+                .map_err(|_| anyhow!("provider turn scheduler closed"))?,
+        );
+        Ok(TurnCapacityGuard {
+            _permits: permits,
+            wait_ms: started.elapsed().as_millis().try_into().unwrap_or(u64::MAX),
+        })
+    }
+
+    fn record_outcome(&self, model: &str, error: Option<&str>) {
+        let provider = self.provider(model);
+        let mut backoff = provider.backoff.lock().unwrap();
+        let throttled = error.is_some_and(|error| {
+            let error = error.to_ascii_lowercase();
+            [
+                "429",
+                "rate limit",
+                "too many requests",
+                "overloaded",
+                "resource exhausted",
+                "capacity",
+            ]
+            .iter()
+            .any(|needle| error.contains(needle))
+        });
+        if throttled {
+            backoff.delay = if backoff.delay.is_zero() {
+                std::time::Duration::from_secs(1)
+            } else {
+                (backoff.delay * 2).min(std::time::Duration::from_secs(30))
+            };
+            backoff.until = Some(Instant::now() + backoff.delay);
+        } else if error.is_none() && backoff.until.is_none_or(|until| Instant::now() >= until) {
+            backoff.delay /= 2;
+            backoff.until = None;
+        }
+    }
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum EngineError {
@@ -145,7 +315,12 @@ pub struct Engine {
     pub(crate) executor: Arc<dyn ToolExecutor>,
     approvals: Arc<ApprovalHub>,
     questions: Arc<QuestionHub>,
-    session_locks: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+    turn_scheduler: TurnScheduler,
+    /// Per-session worktree access. Read-only turns share a read guard;
+    /// mutating turns, checkpoint restoration, and settings changes take the
+    /// write guard. This lets review/plan work fan out without weakening the
+    /// sessions-own-worktrees serialization invariant.
+    session_locks: Mutex<HashMap<String, Arc<tokio::sync::RwLock<()>>>>,
     /// Threads with a dispatcher currently running turns, mapped to their
     /// session. A thread in this map drains its own prompt queue; sends
     /// while present just enqueue. The session ids feed `Session.active`
@@ -470,6 +645,7 @@ impl Engine {
             executor: Arc::new(LocalToolExecutor::with_mcp_logs(mcp_logs.clone())),
             approvals: Arc::new(ApprovalHub::default()),
             questions: Arc::new(QuestionHub::default()),
+            turn_scheduler: TurnScheduler::new(),
             session_locks: Mutex::new(HashMap::new()),
             active_threads: Mutex::new(std::collections::HashMap::new()),
             deleting_sessions: Mutex::new(std::collections::HashSet::new()),
@@ -1644,7 +1820,7 @@ impl Engine {
         turn: u64,
     ) {
         let scope = Scope::Thread(thread_id);
-        let mut live = self.store.subscribe();
+        let mut live = self.store.subscribe_scope(&scope);
         let mut after = 0u64;
         let mut replay = std::collections::VecDeque::from(
             self.store.events_after(&scope, after).unwrap_or_default(),
@@ -3201,7 +3377,7 @@ impl Engine {
         Ok((from, replay, rx, terminal.exited()))
     }
 
-    fn session_lock(&self, session_id: &str) -> Arc<tokio::sync::Mutex<()>> {
+    fn session_lock(&self, session_id: &str) -> Arc<tokio::sync::RwLock<()>> {
         self.session_locks
             .lock()
             .unwrap()
@@ -3352,6 +3528,7 @@ impl Engine {
                     continue;
                 }
             };
+            let bot_login = self.github_app_status()?.bot_login;
             for pr in &mut prs {
                 pr.workspace_id = workspace_repositories
                     .iter()
@@ -3360,6 +3537,12 @@ impl Engine {
                             .then(|| workspace_id.clone())
                     })
                     .unwrap_or_default();
+                pr.trouve_review = self.store.latest_code_review_for_pull(
+                    &pr.repository,
+                    pr.number,
+                    pr.head_sha.as_deref(),
+                    &bot_login,
+                )?;
             }
             let pull_requests = trouve_protocol::GithubPrList { viewer, host, prs };
             if !cache.has_published_snapshot()
@@ -3753,7 +3936,7 @@ impl Engine {
         // The session lock is held for the duration of a turn; a locked
         // session means settings would change under a running agent.
         let lock = self.session_lock(&session.id);
-        let _guard = lock.try_lock().map_err(|_| {
+        let _guard = lock.try_write().map_err(|_| {
             EngineError::Conflict("cannot change thread settings while a turn is running".into())
         })?;
 
@@ -3891,7 +4074,7 @@ impl Engine {
     ) -> Result<(), EngineError> {
         let session = self.get_session(session_id)?;
         let lock = self.session_lock(session_id);
-        let _guard = lock.lock().await;
+        let _guard = lock.write().await;
 
         let latest = self
             .store
@@ -4210,6 +4393,9 @@ impl Engine {
                 .take()
                 .unwrap_or_else(|| self.register_cancel(&thread.id));
             let result = self.run_turn(&thread, turn, &prompt, cancel.clone()).await;
+            let outcome_error = result.as_ref().err().map(ToString::to_string);
+            self.turn_scheduler
+                .record_outcome(&thread.model, outcome_error.as_deref());
             let cancelled = cancel.is_cancelled();
             self.clear_cancel(&thread.id);
             if let Err(e) = result {
@@ -4366,18 +4552,45 @@ impl Engine {
         let mode = modes::find_mode(&all_modes, &thread.mode)
             .cloned()
             .unwrap_or_else(modes::fallback_mode);
+        let background = self.store.is_code_review_thread(&thread.id)?;
+        let turn_capacity = self
+            .turn_scheduler
+            .acquire(&thread.model, background)
+            .await?;
+        if background {
+            self.store
+                .set_code_review_task_provider_wait(&thread.id, turn_capacity.wait_ms)?;
+        }
+        self.store.append_event(
+            scope.clone(),
+            Event::TurnCapacityAcquired {
+                turn,
+                wait_ms: turn_capacity.wait_ms,
+                background,
+            },
+        )?;
 
-        // Serialize worktree mutations across the session's threads — except
-        // agent-spawned children in read-only modes: they can't write, and
-        // running them concurrently with the parent's turn (which holds this
-        // lock) is the whole point of spawn_thread exploration fan-out.
+        // Serialize worktree mutations across the session's threads while
+        // allowing ordinary read-only siblings (review, plan, question) to
+        // run together. Agent-spawned read-only children retain their
+        // lock-free exception so they can inspect while a writing parent
+        // holds the write guard; that pre-existing trade-off is what makes
+        // spawn_thread fan-out usable from code mode.
         let concurrent_child = mode.read_only && self.store.spawn_parent(&thread.id)?.is_some();
         let lock = self.session_lock(&session.id);
-        let _guard = if concurrent_child {
-            None
+        let _read_guard;
+        let _write_guard;
+        if concurrent_child {
+            _read_guard = None;
+            _write_guard = None;
+        } else if mode.read_only {
+            _read_guard = Some(lock.read().await);
+            _write_guard = None;
         } else {
-            Some(lock.lock().await)
-        };
+            _read_guard = None;
+            _write_guard = Some(lock.write().await);
+        }
+        let _turn_capacity = turn_capacity;
 
         // External agent backend? The vendor harness owns the loop; we
         // stream its events and bridge approvals. (Session lock stays held.)
@@ -8376,5 +8589,27 @@ mod tests {
                 .await,
             Err(EngineError::BadRequest(_))
         ));
+    }
+
+    #[tokio::test]
+    async fn session_access_shares_readers_and_excludes_writers() {
+        let data = tempfile::tempdir().unwrap();
+        let engine = Engine::new(
+            Store::open_in_memory().unwrap(),
+            data.path().to_path_buf(),
+            &Config::default(),
+        );
+        let lock = engine.session_lock("se_shared");
+        let first_reader = lock.read().await;
+        let second_reader = lock
+            .try_read()
+            .expect("a second read-only turn should overlap");
+        assert!(
+            lock.try_write().is_err(),
+            "mutating work must wait for every read-only turn"
+        );
+        drop(second_reader);
+        drop(first_reader);
+        assert!(lock.try_write().is_ok());
     }
 }

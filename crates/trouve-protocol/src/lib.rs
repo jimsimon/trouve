@@ -91,7 +91,14 @@ pub use requests::*;
 // built-in reviewer model/thinking defaults can be customized (additive).
 // 1.6: POST /v1/providers/{id}/login/callback forwards a failed browser
 // callback URL to an interactive vendor CLI login (additive).
-pub const PROTOCOL_VERSION: &str = "1.6";
+// 1.7: durable code-review task/output streams, progress and elapsed timing,
+// cancellation/retry/full-review actions, incremental review metadata,
+// published finding attribution, GitHub Check Run state, filtered history,
+// review statistics, and first-party desktop review actions (all additive).
+// 1.8: review tasks/persona/model statistics expose provider-capacity wait,
+// model/tool elapsed time, token/cache usage, tool-call count, and
+// not-applicable persona batches (all additive).
+pub const PROTOCOL_VERSION: &str = "1.8";
 
 pub type WorkspaceId = String;
 pub type SessionId = String;

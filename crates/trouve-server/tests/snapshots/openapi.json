@@ -7,7 +7,7 @@
       "name": "MIT",
       "identifier": "MIT"
     },
-    "version": "1.6"
+    "version": "1.8"
   },
   "paths": {
     "/v1/approvals": {
@@ -511,6 +511,234 @@
         }
       }
     },
+    "/v1/code-review/jobs": {
+      "get": {
+        "tags": [],
+        "operationId": "list_code_review_jobs",
+        "parameters": [
+          {
+            "name": "limit",
+            "in": "query",
+            "description": "Maximum jobs, 1 through 500",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "minimum": 0
+            }
+          },
+          {
+            "name": "status",
+            "in": "query",
+            "description": "Exact job status",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "repository",
+            "in": "query",
+            "description": "Exact owner/name repository",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CodeReviewJobList"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/code-review/jobs/{id}": {
+      "get": {
+        "tags": [],
+        "operationId": "get_code_review_job",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Review job id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CodeReviewJobDetail"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/code-review/jobs/{id}/cancel": {
+      "post": {
+        "tags": [],
+        "operationId": "cancel_code_review_job",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Review job id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CodeReviewJob"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/code-review/jobs/{id}/events": {
+      "get": {
+        "tags": [],
+        "operationId": "code_review_job_events",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Review job id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "after",
+            "in": "query",
+            "description": "Resume after this event cursor",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int64",
+              "minimum": 0
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Cursor-addressed code-review job SSE stream"
+          }
+        }
+      }
+    },
+    "/v1/code-review/jobs/{id}/retry": {
+      "post": {
+        "tags": [],
+        "operationId": "retry_code_review_job",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Review job id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CodeReviewJob"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/v1/code-review/refresh": {
       "post": {
         "tags": [],
@@ -553,6 +781,44 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/CodeReviewRepository"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/code-review/requests": {
+      "post": {
+        "tags": [],
+        "operationId": "request_code_review",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RequestCodeReviewRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CodeReviewJob"
                 }
               }
             }
@@ -638,6 +904,54 @@
             }
           },
           "404": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/code-review/stats": {
+      "get": {
+        "tags": [],
+        "operationId": "code_review_stats",
+        "parameters": [
+          {
+            "name": "range",
+            "in": "query",
+            "description": "hour, day, week, month, year, or all",
+            "required": false,
+            "schema": {
+              "$ref": "#/components/schemas/CodeReviewStatsRange"
+            }
+          },
+          {
+            "name": "repository",
+            "in": "query",
+            "description": "Exact owner/name repository",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CodeReviewStats"
+                }
+              }
+            }
+          },
+          "400": {
             "description": "",
             "content": {
               "application/json": {
@@ -3728,6 +4042,142 @@
           }
         }
       },
+      "CodeReviewDurationStats": {
+        "type": "object",
+        "required": [
+          "samples",
+          "average_ms",
+          "p50_ms",
+          "p95_ms",
+          "maximum_ms"
+        ],
+        "properties": {
+          "average_ms": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "maximum_ms": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "p50_ms": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "p95_ms": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "samples": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          }
+        }
+      },
+      "CodeReviewFinding": {
+        "type": "object",
+        "description": "A confirmed issue produced by the coordinator and, when possible,\npublished as an inline GitHub review comment.",
+        "required": [
+          "id",
+          "job_id",
+          "path",
+          "line",
+          "side",
+          "severity",
+          "body",
+          "status"
+        ],
+        "properties": {
+          "body": {
+            "type": "string"
+          },
+          "github_comment_id": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "minimum": 0
+          },
+          "github_comment_url": {
+            "type": "string"
+          },
+          "github_thread_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "id": {
+            "type": "string"
+          },
+          "job_id": {
+            "type": "string"
+          },
+          "line": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "path": {
+            "type": "string"
+          },
+          "prompt_for_agents": {
+            "type": "string"
+          },
+          "resolved_at": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time"
+          },
+          "severity": {
+            "type": "string"
+          },
+          "side": {
+            "type": "string"
+          },
+          "sources": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/CodeReviewFindingSource"
+            }
+          },
+          "status": {
+            "type": "string",
+            "description": "`open`, `fixed`, or `dismissed`."
+          }
+        }
+      },
+      "CodeReviewFindingSource": {
+        "type": "object",
+        "description": "A persona/candidate that contributed to a confirmed published finding.",
+        "required": [
+          "reviewer_id",
+          "reviewer_name",
+          "candidate_id"
+        ],
+        "properties": {
+          "candidate_id": {
+            "type": "string"
+          },
+          "reviewer_id": {
+            "type": "string"
+          },
+          "reviewer_name": {
+            "type": "string"
+          },
+          "task_id": {
+            "type": "string"
+          }
+        }
+      },
       "CodeReviewJob": {
         "type": "object",
         "description": "A durable execution of one model review against one immutable PR head.",
@@ -3749,6 +4199,28 @@
           "base_ref": {
             "type": "string"
           },
+          "cancel_requested": {
+            "type": "boolean"
+          },
+          "candidate_issue_count": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "check_run_id": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "minimum": 0
+          },
+          "check_run_url": {
+            "type": "string"
+          },
+          "check_sync_error": {
+            "type": "string"
+          },
           "completed_at": {
             "type": [
               "string",
@@ -3756,12 +4228,22 @@
             ],
             "format": "date-time"
           },
+          "coordinator_elapsed_ms": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
           "created_at": {
             "type": "string",
             "format": "date-time"
           },
           "error": {
             "type": "string"
+          },
+          "fixed_issue_count": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
           },
           "head_ref": {
             "type": "string"
@@ -3777,11 +4259,37 @@
             "format": "int64",
             "minimum": 0
           },
+          "issue_count": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "lifecycle_comment_url": {
+            "type": "string"
+          },
           "model": {
             "type": [
               "string",
               "null"
             ]
+          },
+          "pending_elapsed_ms": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "preparation_elapsed_ms": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "progress": {
+            "$ref": "#/components/schemas/CodeReviewProgress"
+          },
+          "publication_elapsed_ms": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
           },
           "pull_number": {
             "type": "integer",
@@ -3797,8 +4305,29 @@
           "repository": {
             "type": "string"
           },
+          "retried_by": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "retry_of": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "review_base_sha": {
+            "type": "string",
+            "description": "Commit used as the left side of this review's diff. For incremental\njobs this is normally the last successfully published head."
+          },
           "review_url": {
             "type": "string"
+          },
+          "reviewer_elapsed_ms": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
           },
           "reviewer_ids": {
             "type": "array",
@@ -3806,6 +4335,14 @@
               "type": "string"
             },
             "description": "Reviewer profiles are snapshotted internally; their stable ids are\nexposed here for history and diagnostics."
+          },
+          "running_elapsed_ms": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "scope": {
+            "$ref": "#/components/schemas/CodeReviewJobScope"
           },
           "session_id": {
             "type": [
@@ -3822,7 +4359,7 @@
           },
           "status": {
             "type": "string",
-            "description": "`queued`, `running`, `succeeded`, `failed`, or `stale`."
+            "description": "`queued`, `running`, `succeeded`, `failed`, `cancelled`, or `stale`."
           },
           "thread_id": {
             "type": [
@@ -3836,6 +4373,63 @@
           }
         }
       },
+      "CodeReviewJobDetail": {
+        "type": "object",
+        "required": [
+          "job"
+        ],
+        "properties": {
+          "findings": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/CodeReviewFinding"
+            }
+          },
+          "job": {
+            "$ref": "#/components/schemas/CodeReviewJob"
+          },
+          "personas": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/CodeReviewPersonaResult"
+            }
+          },
+          "prompt_for_agents": {
+            "type": "string"
+          },
+          "summary": {
+            "type": "string"
+          },
+          "tasks": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/CodeReviewTask"
+            }
+          }
+        }
+      },
+      "CodeReviewJobList": {
+        "type": "object",
+        "required": [
+          "jobs"
+        ],
+        "properties": {
+          "jobs": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/CodeReviewJob"
+            }
+          }
+        }
+      },
+      "CodeReviewJobScope": {
+        "type": "string",
+        "description": "Whether a job reviews only changes since the last successfully published\nhead, or the entire pull-request branch against its GitHub base.",
+        "enum": [
+          "incremental",
+          "full"
+        ]
+      },
       "CodeReviewMode": {
         "type": "string",
         "description": "Whether an installed repository participates in automated code review.",
@@ -3844,6 +4438,224 @@
           "manual",
           "automatic"
         ]
+      },
+      "CodeReviewOutputStream": {
+        "type": "string",
+        "enum": [
+          "assistant",
+          "thinking",
+          "tool"
+        ]
+      },
+      "CodeReviewPersonaModelStats": {
+        "type": "object",
+        "required": [
+          "reviewer_id",
+          "reviewer_name",
+          "model",
+          "task_count",
+          "succeeded",
+          "failed",
+          "cancelled",
+          "candidate_issue_count",
+          "confirmed_issue_count"
+        ],
+        "properties": {
+          "cached_input_tokens": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "cancelled": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "candidate_issue_count": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "confirmed_issue_count": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "duration": {
+            "$ref": "#/components/schemas/CodeReviewDurationStats"
+          },
+          "failed": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "input_tokens": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "model": {
+            "type": "string"
+          },
+          "model_duration": {
+            "$ref": "#/components/schemas/CodeReviewDurationStats"
+          },
+          "not_applicable": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "output_tokens": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "provider_wait_duration": {
+            "$ref": "#/components/schemas/CodeReviewDurationStats"
+          },
+          "reviewer_id": {
+            "type": "string"
+          },
+          "reviewer_name": {
+            "type": "string"
+          },
+          "succeeded": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "task_count": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "tool_call_count": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          }
+        }
+      },
+      "CodeReviewPersonaResult": {
+        "type": "object",
+        "description": "Reviewer-level rollup across one or more diff batches.",
+        "required": [
+          "reviewer_id",
+          "reviewer_name",
+          "status"
+        ],
+        "properties": {
+          "cached_input_tokens": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "candidate_issue_count": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "completed_at": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time"
+          },
+          "completed_batches": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "confirmed_issue_count": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "elapsed_ms": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "input_tokens": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "model_elapsed_ms": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "models": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "output_tokens": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "provider_wait_ms": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "reviewer_id": {
+            "type": "string"
+          },
+          "reviewer_name": {
+            "type": "string"
+          },
+          "started_at": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time"
+          },
+          "status": {
+            "type": "string"
+          },
+          "tool_call_count": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "total_batches": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          }
+        }
+      },
+      "CodeReviewProgress": {
+        "type": "object",
+        "required": [
+          "completed_reviewers",
+          "total_reviewers",
+          "percent"
+        ],
+        "properties": {
+          "completed_reviewers": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "percent": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Integer percentage in the inclusive range 0..=100.",
+            "minimum": 0
+          },
+          "total_reviewers": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          }
+        }
       },
       "CodeReviewRepository": {
         "type": "object",
@@ -3893,6 +4705,353 @@
             "description": "Per-reviewer repository overrides. Entries may be retained while a\nreviewer is disabled so re-enabling it restores its configuration."
           }
         }
+      },
+      "CodeReviewRepositoryStats": {
+        "type": "object",
+        "required": [
+          "repository",
+          "issue_count"
+        ],
+        "properties": {
+          "coordinator_duration": {
+            "$ref": "#/components/schemas/CodeReviewDurationStats"
+          },
+          "issue_count": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "pending_duration": {
+            "$ref": "#/components/schemas/CodeReviewDurationStats"
+          },
+          "preparation_duration": {
+            "$ref": "#/components/schemas/CodeReviewDurationStats"
+          },
+          "publication_duration": {
+            "$ref": "#/components/schemas/CodeReviewDurationStats"
+          },
+          "repository": {
+            "type": "string"
+          },
+          "reviewer_duration": {
+            "$ref": "#/components/schemas/CodeReviewDurationStats"
+          },
+          "running_duration": {
+            "$ref": "#/components/schemas/CodeReviewDurationStats"
+          },
+          "status": {
+            "$ref": "#/components/schemas/CodeReviewStatusCounts"
+          }
+        }
+      },
+      "CodeReviewStats": {
+        "type": "object",
+        "required": [
+          "range",
+          "generated_at",
+          "issue_count"
+        ],
+        "properties": {
+          "buckets": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/CodeReviewStatsBucket"
+            }
+          },
+          "coordinator_duration": {
+            "$ref": "#/components/schemas/CodeReviewDurationStats"
+          },
+          "generated_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "issue_count": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "pending_duration": {
+            "$ref": "#/components/schemas/CodeReviewDurationStats"
+          },
+          "personas": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/CodeReviewPersonaModelStats"
+            }
+          },
+          "preparation_duration": {
+            "$ref": "#/components/schemas/CodeReviewDurationStats"
+          },
+          "publication_duration": {
+            "$ref": "#/components/schemas/CodeReviewDurationStats"
+          },
+          "range": {
+            "$ref": "#/components/schemas/CodeReviewStatsRange"
+          },
+          "repositories": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/CodeReviewRepositoryStats"
+            }
+          },
+          "repository": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "reviewer_duration": {
+            "$ref": "#/components/schemas/CodeReviewDurationStats"
+          },
+          "running_duration": {
+            "$ref": "#/components/schemas/CodeReviewDurationStats"
+          },
+          "status": {
+            "$ref": "#/components/schemas/CodeReviewStatusCounts",
+            "description": "Current active work plus terminal outcomes in the selected range."
+          }
+        }
+      },
+      "CodeReviewStatsBucket": {
+        "type": "object",
+        "required": [
+          "started_at",
+          "completed_at"
+        ],
+        "properties": {
+          "completed_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "issue_count": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "pending_average_ms": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "running_average_ms": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "started_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "status": {
+            "$ref": "#/components/schemas/CodeReviewStatusCounts"
+          }
+        }
+      },
+      "CodeReviewStatsRange": {
+        "type": "string",
+        "enum": [
+          "hour",
+          "day",
+          "week",
+          "month",
+          "year",
+          "all"
+        ]
+      },
+      "CodeReviewStatusCounts": {
+        "type": "object",
+        "required": [
+          "queued",
+          "running",
+          "succeeded",
+          "failed",
+          "cancelled",
+          "stale"
+        ],
+        "properties": {
+          "cancelled": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "failed": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "queued": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "running": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "stale": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "succeeded": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          }
+        }
+      },
+      "CodeReviewTask": {
+        "type": "object",
+        "description": "One durable reviewer/coordinator execution. Tasks survive cleanup of their\nimplementation sessions and threads.",
+        "required": [
+          "id",
+          "job_id",
+          "role",
+          "status",
+          "created_at"
+        ],
+        "properties": {
+          "batch_count": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "batch_index": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "cached_input_tokens": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "candidate_issue_count": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "completed_at": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time"
+          },
+          "confirmed_issue_count": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "created_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "elapsed_ms": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Current elapsed time for active tasks and final elapsed time for\nterminal tasks, as measured by the server.",
+            "minimum": 0
+          },
+          "error": {
+            "type": "string"
+          },
+          "id": {
+            "type": "string"
+          },
+          "input_tokens": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "job_id": {
+            "type": "string"
+          },
+          "model": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The provider-qualified model actually used by the created thread."
+          },
+          "model_elapsed_ms": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Wall time from model dispatch through tool iterations and completion.",
+            "minimum": 0
+          },
+          "output": {
+            "type": "string"
+          },
+          "output_tokens": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "prompt": {
+            "type": "string"
+          },
+          "provider_wait_ms": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Time spent waiting for shared/provider model capacity.",
+            "minimum": 0
+          },
+          "reviewer_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "reviewer_name": {
+            "type": "string"
+          },
+          "role": {
+            "$ref": "#/components/schemas/CodeReviewTaskRole"
+          },
+          "session_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "started_at": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time"
+          },
+          "status": {
+            "type": "string",
+            "description": "`queued`, `running`, `succeeded`, `failed`, `cancelled`, or\n`not_applicable`."
+          },
+          "thinking": {
+            "type": "string"
+          },
+          "thread_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "tool_call_count": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "tool_output": {
+            "type": "string"
+          }
+        }
+      },
+      "CodeReviewTaskRole": {
+        "type": "string",
+        "enum": [
+          "reviewer",
+          "coordinator"
+        ]
       },
       "CommandInfo": {
         "type": "object",
@@ -4081,6 +5240,37 @@
       },
       "Event": {
         "oneOf": [
+          {
+            "type": "object",
+            "description": "Shared/provider capacity has been acquired for this turn. Interactive\nturns use the foreground lane; unattended review tasks use background.",
+            "required": [
+              "turn",
+              "wait_ms",
+              "background",
+              "type"
+            ],
+            "properties": {
+              "background": {
+                "type": "boolean"
+              },
+              "turn": {
+                "type": "integer",
+                "format": "int64",
+                "minimum": 0
+              },
+              "type": {
+                "type": "string",
+                "enum": [
+                  "turn.capacity_acquired"
+                ]
+              },
+              "wait_ms": {
+                "type": "integer",
+                "format": "int64",
+                "minimum": 0
+              }
+            }
+          },
           {
             "type": "object",
             "required": [
@@ -4719,6 +5909,102 @@
           },
           {
             "type": "object",
+            "description": "A reviewer or coordinator task changed durable state.",
+            "required": [
+              "job_id",
+              "task",
+              "type"
+            ],
+            "properties": {
+              "job_id": {
+                "type": "string"
+              },
+              "task": {
+                "$ref": "#/components/schemas/CodeReviewTask"
+              },
+              "type": {
+                "type": "string",
+                "enum": [
+                  "code_review.task_updated"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "description": "Live output projected from the disposable agent thread into durable\nreview history.",
+            "required": [
+              "job_id",
+              "task_id",
+              "stream",
+              "text",
+              "type"
+            ],
+            "properties": {
+              "job_id": {
+                "type": "string"
+              },
+              "stream": {
+                "$ref": "#/components/schemas/CodeReviewOutputStream"
+              },
+              "task_id": {
+                "type": "string"
+              },
+              "text": {
+                "type": "string"
+              },
+              "type": {
+                "type": "string",
+                "enum": [
+                  "code_review.output_delta"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "description": "Reviewer-level progress changed. Coordinator/summary work is exposed\non its task but does not inflate the reviewer count.",
+            "required": [
+              "job_id",
+              "progress",
+              "type"
+            ],
+            "properties": {
+              "job_id": {
+                "type": "string"
+              },
+              "progress": {
+                "$ref": "#/components/schemas/CodeReviewProgress"
+              },
+              "type": {
+                "type": "string",
+                "enum": [
+                  "code_review.progress_updated"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "description": "Other durable job state changed.",
+            "required": [
+              "job_id",
+              "type"
+            ],
+            "properties": {
+              "job_id": {
+                "type": "string"
+              },
+              "type": {
+                "type": "string",
+                "enum": [
+                  "code_review.job_updated"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
             "required": [
               "workspace_id",
               "path",
@@ -5063,6 +6349,44 @@
           }
         }
       },
+      "FirstPartyCodeReview": {
+        "type": "object",
+        "description": "A review produced by trouve's first-party review service. The marker is\njoined from durable job/finding records rather than inferred from an\nuntrusted comment author or body.",
+        "required": [
+          "job_id",
+          "bot_login",
+          "status",
+          "summary",
+          "prompt_for_agents",
+          "review_url"
+        ],
+        "properties": {
+          "bot_login": {
+            "type": "string"
+          },
+          "findings": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/CodeReviewFinding"
+            }
+          },
+          "job_id": {
+            "type": "string"
+          },
+          "prompt_for_agents": {
+            "type": "string"
+          },
+          "review_url": {
+            "type": "string"
+          },
+          "status": {
+            "type": "string"
+          },
+          "summary": {
+            "type": "string"
+          }
+        }
+      },
       "GithubAppStatus": {
         "type": "object",
         "description": "Public GitHub App state. Private keys and webhook secrets are never\nreturned by the protocol.",
@@ -5080,6 +6404,14 @@
           },
           "bot_login": {
             "type": "string"
+          },
+          "check_run_webhook_configured": {
+            "type": "boolean",
+            "description": "Whether `check_run` delivery is selected in the GitHub App. This is\noptional unless interactive Re-run actions are desired."
+          },
+          "checks_write_configured": {
+            "type": "boolean",
+            "description": "Whether the installation token reports `checks: write`. Polling-only\ndeployments still create and update Check Runs when this is true."
           },
           "configured": {
             "type": "boolean"
@@ -5813,6 +7145,17 @@
           "title": {
             "type": "string"
           },
+          "trouve_review": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/FirstPartyCodeReview",
+                "description": "Latest successfully published trouve review for this exact PR head."
+              }
+            ]
+          },
           "url": {
             "type": "string"
           },
@@ -6049,6 +7392,33 @@
           }
         }
       },
+      "RequestCodeReviewRequest": {
+        "type": "object",
+        "description": "Manual review request. Full scope always compares the current head with\nthe pull request's GitHub base; incremental scope uses the saved watermark\nwhen it remains valid.",
+        "required": [
+          "installation_id",
+          "repository",
+          "pull_number"
+        ],
+        "properties": {
+          "installation_id": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "pull_number": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "repository": {
+            "type": "string"
+          },
+          "scope": {
+            "$ref": "#/components/schemas/CodeReviewJobScope"
+          }
+        }
+      },
       "ResolveApprovalRequest": {
         "type": "object",
         "required": [
@@ -6188,6 +7558,17 @@
             "properties": {
               "thread": {
                 "$ref": "#/components/schemas/String"
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "code_review_job"
+            ],
+            "properties": {
+              "code_review_job": {
+                "type": "string"
               }
             }
           }

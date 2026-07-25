@@ -17,7 +17,9 @@ import {
     SubscriptionItem, ModeItem, ThinkingItem, LocalModelItem, LocalSearchItem, GithubHostItem
 } from "settings-window.slint";
 import { AutomationsScreen, AutomationItem, AutomationTemplateItem } from "automations-screen.slint";
-import { PullRequestsScreen, PrGroupItem, PrRowItem } from "pull-requests-screen.slint";
+import {
+    PullRequestsScreen, PrGroupItem, PrReviewFindingItem, PrRowItem
+} from "pull-requests-screen.slint";
 import { ConnectivityBanner } from "connectivity-banner.slint";
 import { ScrollKeys } from "scroll-keys.slint";
 import { Theme, ThemePalette } from "theme.slint";
@@ -27,7 +29,7 @@ import { Palette } from "std-widgets.slint";
 export {
     DiffRow, TextSegment, TermSpan, ProviderItem, CliItem, KnownProviderItem, McpServerItem,
     SubscriptionItem, ModeItem, LocalModelItem, LocalSearchItem, AutomationItem, GithubHostItem,
-    PrGroupItem, PrRowItem
+    PrGroupItem, PrReviewFindingItem, PrRowItem
 }
 export { ThinkingItem }
 export { Theme, ThemePalette }
@@ -1457,6 +1459,7 @@ export component AppWindow inherits Window {
     callback pr-group-dropped(data-transfer, /* target key */ string, /* after */ bool) -> bool;
     callback pr-group-moved(/* group key */ string, /* signed offset */ int);
     callback pr-chat-clicked(/* workspace id */ string, /* head branch */ string);
+    callback pr-fix-clicked(/* workspace id */ string, /* head branch */ string, /* prompt */ string);
 
     // --- automations screen ----------------------------------------------------
     in property <[AutomationItem]> automations;
@@ -5249,6 +5252,9 @@ export component AppWindow inherits Window {
         group-dropped(data, target, after) => { root.pr-group-dropped(data, target, after) }
         group-moved(key, offset) => { root.pr-group-moved(key, offset); }
         chat-clicked(workspace-id, branch) => { root.pr-chat-clicked(workspace-id, branch); }
+        fix-clicked(workspace-id, branch, prompt) => {
+            root.pr-fix-clicked(workspace-id, branch, prompt);
+        }
         open-url(url) => { root.open-link(url); }
         open-integrations => { root.open-integrations-settings(); }
     }

@@ -12,6 +12,15 @@ import { ConnectivityBanner } from "connectivity-banner.slint";
 import { ScrollKeys } from "scroll-keys.slint";
 import { Theme } from "theme.slint";
 
+// One inline finding from a first-party trouve review.
+export struct PrReviewFindingItem {
+    location: string,
+    severity: string,
+    body: string,
+    prompt: string,
+    status: string,
+}
+
 // One pull request row, pre-rendered by the controller.
 export struct PrRowItem {
     workspace-id: string,
@@ -40,6 +49,12 @@ export struct PrRowItem {
     // A session for this PR's branch exists: the chat button jumps to it
     // instead of offering to start a new chat.
     has-chat: bool,
+    // First-party review data is joined by the server from its durable job
+    // records, so the desktop never trusts a lookalike comment author/body.
+    has-trouve-review: bool,
+    trouve-review-summary: string,
+    trouve-review-prompt: string,
+    trouve-review-findings: [PrReviewFindingItem],
 }
 
 // One dashboard group ("Ready to Merge", …) in display order.
@@ -230,6 +245,8 @@ export component PullRequestsScreen inherits Rectangle {
     callback group-moved(/* group key */ string, /* signed offset */ int);
     // Jump to the PR's existing chat, or start a new one for it.
     callback chat-clicked(/* workspace id */ string, /* head branch */ string);
+    // Start an agent thread with the review's ready-to-use remediation prompt.
+    callback fix-clicked(/* workspace id */ string, /* head branch */ string, /* prompt */ string);
     callback open-url(string);
     callback open-integrations();
 
@@ -681,6 +698,85 @@ export component PullRequestsScreen inherits Rectangle {
                                                             color: Theme.c.text-soft;
                                                             font-size: Theme.fs(11px);
                                                             vertical-alignment: center;
+                                                        }
+                                                    }
+                                                    if pr.has-trouve-review: Rectangle {
+                                                        background: Theme.c.surface;
+                                                        border-radius: 6px;
+                                                        border-width: 1px;
+                                                        border-color: Theme.c.border;
+                                                        height: review-col.preferred-height + 16px;
+                                                        review-col := VerticalLayout {
+                                                            padding: 8px;
+                                                            spacing: 6px;
+                                                            HorizontalLayout {
+                                                                spacing: 8px;
+                                                                Text {
+                                                                    text: "trouve review";
+                                                                    color: Theme.c.accent-tint;
+                                                                    font-size: Theme.fs(11px);
+                                                                    font-weight: 700;
+                                                                    vertical-alignment: center;
+                                                                    horizontal-stretch: 1;
+                                                                }
+                                                                Button {
+                                                                    text: "Fix all";
+                                                                    primary: true;
+                                                                    enabled: pr.trouve-review-prompt != "";
+                                                                    clicked => {
+                                                                        root.fix-clicked(
+                                                                            pr.workspace-id,
+                                                                            pr.branch,
+                                                                            pr.trouve-review-prompt
+                                                                        );
+                                                                    }
+                                                                }
+                                                            }
+                                                            Text {
+                                                                text: pr.trouve-review-summary;
+                                                                color: Theme.c.text-mid;
+                                                                font-size: Theme.fs(11px);
+                                                                wrap: word-wrap;
+                                                            }
+                                                            for finding in pr.trouve-review-findings: Rectangle {
+                                                                background: Theme.c.inset-bg;
+                                                                border-radius: 4px;
+                                                                height: finding-col.preferred-height + 12px;
+                                                                finding-col := VerticalLayout {
+                                                                    padding: 6px;
+                                                                    spacing: 4px;
+                                                                    HorizontalLayout {
+                                                                        spacing: 8px;
+                                                                        Text {
+                                                                            text: finding.severity + " · " + finding.location;
+                                                                            color: finding.severity == "critical" || finding.severity == "high"
+                                                                                ? Theme.c.err-soft : Theme.c.warn;
+                                                                            font-size: Theme.fs(10px);
+                                                                            font-weight: 700;
+                                                                            vertical-alignment: center;
+                                                                            horizontal-stretch: 1;
+                                                                            overflow: elide;
+                                                                        }
+                                                                        Button {
+                                                                            text: "Fix";
+                                                                            enabled: finding.prompt != "" && finding.status == "open";
+                                                                            clicked => {
+                                                                                root.fix-clicked(
+                                                                                    pr.workspace-id,
+                                                                                    pr.branch,
+                                                                                    finding.prompt
+                                                                                );
+                                                                            }
+                                                                        }
+                                                                    }
+                                                                    Text {
+                                                                        text: finding.body;
+                                                                        color: Theme.c.text-mid;
+                                                                        font-size: Theme.fs(11px);
+                                                                        wrap: word-wrap;
+                                                                    }
+                                                                }
+                                                            }
                                                         }
                                                     }
                                                 }

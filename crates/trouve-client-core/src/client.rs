@@ -775,6 +775,78 @@ impl ProtocolClient {
         Ok(())
     }
 
+    // --- automated code reviews ---------------------------------------------
+
+    pub async fn code_review_dashboard(&self) -> Result<CodeReviewDashboard> {
+        self.get_json("/code-review").await
+    }
+
+    pub async fn code_review_job(&self, id: &str) -> Result<CodeReviewJobDetail> {
+        self.get_json(&format!("/code-review/jobs/{id}")).await
+    }
+
+    pub async fn code_review_jobs(
+        &self,
+        limit: usize,
+        status: Option<&str>,
+        repository: Option<&str>,
+    ) -> Result<CodeReviewJobList> {
+        let mut path = format!("/code-review/jobs?limit={}", limit.clamp(1, 500));
+        if let Some(status) = status {
+            path.push_str("&status=");
+            path.push_str(&urlencode(status));
+        }
+        if let Some(repository) = repository {
+            path.push_str("&repository=");
+            path.push_str(&urlencode(repository));
+        }
+        self.get_json(&path).await
+    }
+
+    pub async fn request_code_review(
+        &self,
+        request: &RequestCodeReviewRequest,
+    ) -> Result<CodeReviewJob> {
+        self.post_json("/code-review/requests", request).await
+    }
+
+    pub async fn cancel_code_review_job(&self, id: &str) -> Result<CodeReviewJob> {
+        self.post_json(
+            &format!("/code-review/jobs/{id}/cancel"),
+            &serde_json::json!({}),
+        )
+        .await
+    }
+
+    pub async fn retry_code_review_job(&self, id: &str) -> Result<CodeReviewJob> {
+        self.post_json(
+            &format!("/code-review/jobs/{id}/retry"),
+            &serde_json::json!({}),
+        )
+        .await
+    }
+
+    pub async fn code_review_stats(
+        &self,
+        range: CodeReviewStatsRange,
+        repository: Option<&str>,
+    ) -> Result<CodeReviewStats> {
+        let range = match range {
+            CodeReviewStatsRange::Hour => "hour",
+            CodeReviewStatsRange::Day => "day",
+            CodeReviewStatsRange::Week => "week",
+            CodeReviewStatsRange::Month => "month",
+            CodeReviewStatsRange::Year => "year",
+            CodeReviewStatsRange::All => "all",
+        };
+        let mut path = format!("/code-review/stats?range={range}");
+        if let Some(repository) = repository {
+            path.push_str("&repository=");
+            path.push_str(&urlencode(repository));
+        }
+        self.get_json(&path).await
+    }
+
     // --- automations -----------------------------------------------------------
 
     pub async fn list_automations(&self) -> Result<Vec<trouve_protocol::Automation>> {
@@ -844,6 +916,23 @@ impl ProtocolClient {
     ) -> Result<u64> {
         self.follow_sse(
             format!("{}/threads/{thread_id}/events?after={after}", self.base),
+            after,
+            on_event,
+        )
+        .await
+    }
+
+    pub async fn follow_code_review_job_events(
+        &self,
+        job_id: &str,
+        after: u64,
+        on_event: impl FnMut(EventEnvelope) -> std::ops::ControlFlow<()>,
+    ) -> Result<u64> {
+        self.follow_sse(
+            format!(
+                "{}/code-review/jobs/{job_id}/events?after={after}",
+                self.base
+            ),
             after,
             on_event,
         )
