@@ -4761,7 +4761,6 @@ impl Engine {
                 tracing::error!("turn {turn} of {} failed: {e}", thread.id);
                 let _ = self.store.release_queued_prompt(&prompt.id);
                 let _ = self.emit_queue(&thread.id);
-                self.release_thread(&thread.id);
                 let _ = self.store.append_event(
                     Scope::Thread(thread.id.clone()),
                     Event::TurnFailed {
@@ -4769,19 +4768,22 @@ impl Engine {
                         error: e.to_string(),
                     },
                 );
+                self.release_thread(&thread.id);
                 return;
             }
             if cancelled {
                 // A user-cancelled turn normally pauses the queue (like a
                 // failure, but not an error). A prompt submitted after the
-                // cancel request is itself an explicit resume, though. Make
-                // that decision atomically with releasing the active claim
-                // so the racing send cannot be stranded between the two.
-                let resume = self.finish_cancelled_turn(&thread.id);
+                // cancel request is itself an explicit resume, though.
+                // Publish the terminal event before making that decision so
+                // a subsequent turn cannot overtake it in the event log.
                 let _ = self.store.append_event(
                     Scope::Thread(thread.id.clone()),
                     Event::TurnCancelled { turn },
                 );
+                // Decide atomically with releasing the active claim so a
+                // racing send cannot be stranded between the two.
+                let resume = self.finish_cancelled_turn(&thread.id);
                 if !resume {
                     return;
                 }
