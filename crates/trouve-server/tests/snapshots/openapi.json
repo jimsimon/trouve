@@ -7,7 +7,7 @@
       "name": "MIT",
       "identifier": "MIT"
     },
-    "version": "1.8"
+    "version": "1.9"
   },
   "paths": {
     "/v1/approvals": {
@@ -4010,6 +4010,56 @@
           }
         }
       },
+      "CodeReviewCandidateRejection": {
+        "type": "object",
+        "description": "A reviewer candidate that the final editor chose not to publish.",
+        "required": [
+          "candidate_id",
+          "task_id",
+          "reviewer_id",
+          "reviewer_name",
+          "path",
+          "line",
+          "side",
+          "severity",
+          "body",
+          "reason"
+        ],
+        "properties": {
+          "body": {
+            "type": "string"
+          },
+          "candidate_id": {
+            "type": "string"
+          },
+          "line": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "path": {
+            "type": "string"
+          },
+          "reason": {
+            "type": "string"
+          },
+          "reviewer_id": {
+            "type": "string"
+          },
+          "reviewer_name": {
+            "type": "string"
+          },
+          "severity": {
+            "type": "string"
+          },
+          "side": {
+            "type": "string"
+          },
+          "task_id": {
+            "type": "string"
+          }
+        }
+      },
       "CodeReviewDashboard": {
         "type": "object",
         "required": [
@@ -4379,6 +4429,12 @@
           "job"
         ],
         "properties": {
+          "candidate_rejections": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/CodeReviewCandidateRejection"
+            }
+          },
           "findings": {
             "type": "array",
             "items": {

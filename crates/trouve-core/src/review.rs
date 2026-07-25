@@ -6,7 +6,7 @@
 
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -38,11 +38,12 @@ const WEBHOOK_SECRET: &str = "github:review-app:webhook-secret";
 const RECONCILE_INTERVAL_ENV: &str = "TROUVE_CODE_REVIEW_POLL_INTERVAL_SECONDS";
 const DEFAULT_RECONCILE_INTERVAL: Duration = Duration::from_secs(60);
 const JOB_IDLE_INTERVAL: Duration = Duration::from_secs(5);
-const REVIEW_TIMEOUT: Duration = Duration::from_secs(30 * 60);
+const REVIEW_TIMEOUT_ENV: &str = "TROUVE_CODE_REVIEW_TIMEOUT_SECONDS";
+const DEFAULT_REVIEW_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 const REVIEW_JOB_CONCURRENCY_ENV: &str = "TROUVE_CODE_REVIEW_JOB_CONCURRENCY";
 const DEFAULT_REVIEW_JOB_CONCURRENCY: usize = 2;
 const REVIEW_TASK_CONCURRENCY_ENV: &str = "TROUVE_CODE_REVIEW_TASK_CONCURRENCY";
-const DEFAULT_REVIEW_TASK_CONCURRENCY: usize = 12;
+const DEFAULT_REVIEW_TASK_CONCURRENCY: usize = 24;
 const REVIEW_BATCH_MAX_BYTES: usize = 128 * 1024;
 const REVIEW_BATCH_TARGET_TOKENS: usize = 24 * 1024;
 const REVIEW_BATCH_MAX_FILES: usize = 24;
@@ -57,6 +58,20 @@ const GITHUB_REST_CACHE_MAX_BYTES: usize = 16 * 1024 * 1024;
 const REVIEW_OUTPUT_FLUSH_INTERVAL: Duration = Duration::from_millis(75);
 const REVIEW_OUTPUT_FLUSH_BYTES: usize = 8 * 1024;
 const REVIEW_PROJECTION_DEBOUNCE: Duration = Duration::from_millis(750);
+const REVIEW_PROJECTION_REPAIR_LIMIT: usize = 25;
+const CHECK_ACTION_DESCRIPTION_MAX_CHARS: usize = 40;
+const RETRY_CHECK_ACTION_DESCRIPTION: &str = "Retry this review on the current PR head";
+const FULL_REVIEW_CHECK_ACTION_DESCRIPTION: &str = "Review full branch against the PR base";
+const REVIEWER_EXECUTION_GUIDANCE: &str = "\
+Time and exploration budget: finish this review in about three minutes. Use no more than 12 \
+tool calls total. Treat the supplied diff as the primary evidence; do not inventory the \
+repository, recreate the diff, make a todo list, or run builds/tests. Batch independent reads or \
+searches when the tool supports it. If the budget is nearly exhausted, stop exploring and return \
+the best supported JSON result.";
+const COORDINATOR_EXECUTION_GUIDANCE: &str = "\
+Time and exploration budget: finish validation in about one minute. Use no more than 4 tool calls \
+total, only to resolve a concrete ambiguity that the supplied candidate and diff context cannot \
+settle. Do not inventory the repository, recreate the diff, make a todo list, or run builds/tests.";
 
 fn parse_code_review_poll_interval(value: &str) -> Option<Duration> {
     value
@@ -85,6 +100,33 @@ fn code_review_poll_interval() -> Duration {
     }
 }
 
+fn parse_code_review_timeout(value: &str) -> Option<Duration> {
+    value
+        .trim()
+        .parse::<u64>()
+        .ok()
+        .filter(|seconds| *seconds > 0)
+        .map(Duration::from_secs)
+}
+
+fn code_review_timeout() -> Duration {
+    let Ok(value) = std::env::var(REVIEW_TIMEOUT_ENV) else {
+        return DEFAULT_REVIEW_TIMEOUT;
+    };
+    match parse_code_review_timeout(&value) {
+        Some(timeout) => timeout,
+        None => {
+            tracing::warn!(
+                variable = REVIEW_TIMEOUT_ENV,
+                value,
+                default_seconds = DEFAULT_REVIEW_TIMEOUT.as_secs(),
+                "invalid code-review timeout; using the default"
+            );
+            DEFAULT_REVIEW_TIMEOUT
+        }
+    }
+}
+
 fn positive_concurrency_from_env(name: &str, default: usize) -> usize {
     std::env::var(name)
         .ok()
@@ -104,6 +146,7 @@ pub struct CodeReviewRuntime {
     job_wake: Notify,
     running: Mutex<HashMap<String, RunningReview>>,
     projection_queue: Mutex<HashMap<String, ProjectionQueueState>>,
+    projection_locks: Mutex<HashMap<String, Weak<tokio::sync::Mutex<()>>>>,
     diff_cache: Mutex<ReviewDiffCache>,
 }
 
@@ -170,6 +213,17 @@ impl ReviewDiffCache {
 }
 
 impl CodeReviewRuntime {
+    fn projection_lock(&self, key: String) -> Arc<tokio::sync::Mutex<()>> {
+        let mut locks = self.projection_locks.lock().unwrap();
+        locks.retain(|_, lock| lock.strong_count() > 0);
+        if let Some(lock) = locks.get(&key).and_then(Weak::upgrade) {
+            return lock;
+        }
+        let lock = Arc::new(tokio::sync::Mutex::new(()));
+        locks.insert(key, Arc::downgrade(&lock));
+        lock
+    }
+
     fn cancel_superseded(&self, job_ids: &[String]) {
         let running = self.running.lock().unwrap();
         for job_id in job_ids {
@@ -547,9 +601,18 @@ struct ReviewOutput {
     summary: String,
     #[serde(default)]
     findings: Vec<ReviewFinding>,
+    /// Candidate ids the final editor discarded, with a concise explanation.
+    #[serde(default)]
+    rejected_candidates: Vec<ReviewCandidateRejection>,
     /// Previously published finding ids that are now demonstrably fixed.
     #[serde(default)]
     resolved_finding_ids: Vec<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+struct ReviewCandidateRejection {
+    candidate_id: String,
+    reason: String,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -762,6 +825,17 @@ impl GithubApi {
                 .await?,
         )
         .await
+    }
+
+    async fn delete(&self, path: &str) -> Result<RateInfo> {
+        let response = self.request(reqwest::Method::DELETE, path).send().await?;
+        let status = response.status();
+        let rate = rate_info(response.headers());
+        let body = response.text().await?;
+        if !status.is_success() {
+            bail!("GitHub API {status}: {}", compact_api_error(&body));
+        }
+        Ok(rate)
     }
 }
 
@@ -1732,6 +1806,12 @@ impl Engine {
                 }
             }
         }
+        for job in self
+            .store
+            .code_review_jobs_with_projection_errors(REVIEW_PROJECTION_REPAIR_LIMIT)?
+        {
+            self.sync_code_review_projection(&job).await;
+        }
         {
             let mut state = self.code_review.state.lock().unwrap();
             state.last_poll_at = Some(Utc::now());
@@ -2211,8 +2291,9 @@ impl Engine {
         let _ = self.emit_code_review_updated(Some(job_id.clone()));
         self.sync_code_review_projection(&record.job).await;
         let active_threads = Arc::new(Mutex::new(HashSet::new()));
+        let review_timeout = code_review_timeout();
         let result = tokio::time::timeout(
-            REVIEW_TIMEOUT,
+            review_timeout,
             self.execute_code_review(&record, &cancel, &active_threads),
         )
         .await;
@@ -2256,8 +2337,8 @@ impl Engine {
                 "failed",
                 String::new(),
                 format!(
-                    "review timed out after {} minutes",
-                    REVIEW_TIMEOUT.as_secs() / 60
+                    "review timed out after {}",
+                    compact_elapsed(review_timeout.as_millis().try_into().unwrap_or(u64::MAX))
                 ),
             ),
         };
@@ -2518,8 +2599,8 @@ impl Engine {
                             )?
                             .ok_or_else(|| anyhow!("review task was cancelled before dispatch"))?;
                         engine.emit_code_review_task(&job.id, task.clone())?;
-                        let turn = engine
-                            .run_tracked_code_review_turn(
+                        let (turn, parsed) = engine
+                            .run_parsed_code_review_turn(
                                 &job,
                                 &task.id,
                                 &thread.id,
@@ -2528,10 +2609,6 @@ impl Engine {
                                 &active_threads,
                             )
                             .await?;
-                        engine
-                            .store
-                            .set_code_review_task_metrics(&task.id, &turn.metrics)?;
-                        let parsed = parse_review_output(&turn.output)?;
                         let candidates = parsed
                             .findings
                             .into_iter()
@@ -2617,6 +2694,7 @@ impl Engine {
                     diff_files.len()
                 ),
                 findings: Vec::new(),
+                rejected_candidates: Vec::new(),
                 resolved_finding_ids: Vec::new(),
             }
         } else {
@@ -2650,7 +2728,7 @@ impl Engine {
                 .ok_or_else(|| anyhow!("coordinator task was cancelled before dispatch"))?;
             self.emit_code_review_task(&job.id, task.clone())?;
             let turn = self
-                .run_tracked_code_review_turn(
+                .run_parsed_code_review_turn(
                     &job,
                     &task.id,
                     &coordinator.id,
@@ -2678,9 +2756,7 @@ impl Engine {
                     return Err(error);
                 }
             };
-            self.store
-                .set_code_review_task_metrics(&task.id, &turn.metrics)?;
-            let validated = parse_review_output(&turn.output)?;
+            let (turn, validated) = turn;
             if let Some(task) = self.store.finish_code_review_task(
                 &task.id,
                 "succeeded",
@@ -2701,6 +2777,7 @@ impl Engine {
                     &candidates,
                     &diff_files,
                 ),
+                rejected_candidates: validated.rejected_candidates,
                 resolved_finding_ids: validated
                     .resolved_finding_ids
                     .into_iter()
@@ -2763,12 +2840,14 @@ impl Engine {
             })
             .collect::<Vec<_>>();
         let prompt_for_agents = review_prompt_for_agents(&job, &parsed.summary, &parsed.findings);
+        let candidate_rejections = candidate_rejections(&parsed, &candidates);
         let persisted = self.store.save_code_review_result(
             &job.id,
             &parsed.summary,
             &prompt_for_agents,
             candidate_count,
             &stored_findings,
+            &candidate_rejections,
         )?;
         let review_url = self
             .publish_review(&api, &job, &parsed.summary, &prompt_for_agents, &persisted)
@@ -2812,6 +2891,58 @@ impl Engine {
             .await;
         active_threads.lock().unwrap().remove(thread_id);
         result
+    }
+
+    async fn run_parsed_code_review_turn(
+        self: &Arc<Self>,
+        job: &trouve_protocol::CodeReviewJob,
+        task_id: &str,
+        thread_id: &str,
+        prompt: String,
+        superseded: &CancellationToken,
+        active_threads: &Arc<Mutex<HashSet<String>>>,
+    ) -> Result<(ReviewTurnResult, ReviewOutput)> {
+        let mut turn = self
+            .run_tracked_code_review_turn(
+                job,
+                task_id,
+                thread_id,
+                prompt,
+                superseded,
+                active_threads,
+            )
+            .await?;
+        self.store
+            .set_code_review_task_metrics(task_id, &turn.metrics)?;
+        let initial_error = match parse_review_output(&turn.output) {
+            Ok(parsed) => return Ok((turn, parsed)),
+            Err(error) => error,
+        };
+
+        let repaired = self
+            .run_tracked_code_review_turn(
+                job,
+                task_id,
+                thread_id,
+                review_output_repair_prompt(&initial_error),
+                superseded,
+                active_threads,
+            )
+            .await
+            .with_context(|| {
+                format!("repairing malformed model review output after: {initial_error:#}")
+            })?;
+        merge_review_task_metrics(&mut turn.metrics, &repaired.metrics);
+        turn.output = repaired.output;
+        self.store
+            .set_code_review_task_metrics(task_id, &turn.metrics)?;
+        let parsed = parse_review_output(&turn.output).with_context(|| {
+            format!(
+                "model review remained invalid after one JSON repair attempt; \
+                 initial response error: {initial_error:#}"
+            )
+        })?;
+        Ok((turn, parsed))
     }
 
     async fn run_code_review_turn(
@@ -3060,12 +3191,26 @@ impl Engine {
         &self,
         job: &trouve_protocol::CodeReviewJob,
     ) -> Result<()> {
+        let api = self.installation_api(job.installation_id).await?;
+        let lifecycle = self.sync_code_review_lifecycle_projection(&api, job).await;
+        let check = self.sync_code_review_check_projection(&api, job).await;
+        combine_projection_results(lifecycle, check)
+    }
+
+    async fn sync_code_review_check_projection(
+        &self,
+        api: &GithubApi,
+        job: &trouve_protocol::CodeReviewJob,
+    ) -> Result<()> {
+        let lock = self
+            .code_review
+            .projection_lock(format!("check:{}", job.id));
+        let _guard = lock.lock().await;
         let detail = self
             .store
             .code_review_job_detail(&job.id)?
             .ok_or_else(|| anyhow!("review job no longer exists"))?;
         let job = &detail.job;
-        let api = self.installation_api(job.installation_id).await?;
         let status = match job.status.as_str() {
             "queued" => "queued",
             "running" => "in_progress",
@@ -3098,6 +3243,7 @@ impl Engine {
                 }
             }
         };
+        let check_details = render_check_details(&detail);
         let mut check_body = serde_json::json!({
             "name": "trouve-code-review",
             "head_sha": job.head_sha,
@@ -3107,21 +3253,31 @@ impl Engine {
             "output": {
                 "title": format!("trouve review: {}", job.status),
                 "summary": check_summary,
-                "text": detail.summary,
+                "text": check_details,
             }
         });
         if let Some(conclusion) = conclusion {
+            debug_assert!(
+                [
+                    RETRY_CHECK_ACTION_DESCRIPTION,
+                    FULL_REVIEW_CHECK_ACTION_DESCRIPTION,
+                ]
+                .iter()
+                .all(|description| {
+                    description.chars().count() <= CHECK_ACTION_DESCRIPTION_MAX_CHARS
+                })
+            );
             check_body["conclusion"] = serde_json::Value::String(conclusion.into());
             check_body["completed_at"] = serde_json::Value::String(Utc::now().to_rfc3339());
             check_body["actions"] = serde_json::json!([
                 {
                     "label": "Run again",
-                    "description": "Retry this review scope on the current pull request head",
+                    "description": RETRY_CHECK_ACTION_DESCRIPTION,
                     "identifier": "retry"
                 },
                 {
                     "label": "Full branch review",
-                    "description": "Review the full branch against the pull request base",
+                    "description": FULL_REVIEW_CHECK_ACTION_DESCRIPTION,
                     "identifier": "full_review"
                 }
             ]);
@@ -3164,28 +3320,64 @@ impl Engine {
                 "",
             )?;
         }
+        Ok(())
+    }
 
+    async fn sync_code_review_lifecycle_projection(
+        &self,
+        api: &GithubApi,
+        job: &trouve_protocol::CodeReviewJob,
+    ) -> Result<()> {
+        let lock = self
+            .code_review
+            .projection_lock(format!("lifecycle:{}#{}", job.repository, job.pull_number));
+        let _guard = lock.lock().await;
+        let detail = self
+            .store
+            .code_review_job_detail(&job.id)?
+            .ok_or_else(|| anyhow!("review job no longer exists"))?;
+        let job = &detail.job;
         let state = self
             .store
             .code_review_pull_state(&job.repository, job.pull_number)?;
         let lifecycle_body = render_lifecycle_comment(&detail);
-        let (comment, rate): (PublishedIssueComment, _) =
-            if let Some(comment_id) = state.lifecycle_comment_id {
-                api.patch(
-                    &format!("/repos/{}/issues/comments/{comment_id}", job.repository),
-                    &serde_json::json!({ "body": lifecycle_body }),
-                )
-                .await?
-            } else {
-                api.post(
-                    &format!(
-                        "/repos/{}/issues/{}/comments",
-                        job.repository, job.pull_number
-                    ),
-                    &serde_json::json!({ "body": lifecycle_body }),
-                )
-                .await?
-            };
+        let terminal = matches!(
+            job.status.as_str(),
+            "succeeded" | "failed" | "cancelled" | "stale"
+        );
+        let mut maintenance_errors = Vec::new();
+        let discovered_ids = if state.lifecycle_comment_id.is_none() || terminal {
+            match self.find_code_review_lifecycle_comments(api, job).await {
+                Ok(ids) => ids,
+                Err(error) => {
+                    maintenance_errors.push(error);
+                    Vec::new()
+                }
+            }
+        } else {
+            Vec::new()
+        };
+        let comment_id = discovered_ids
+            .iter()
+            .min()
+            .copied()
+            .or(state.lifecycle_comment_id);
+        let (comment, rate): (PublishedIssueComment, _) = if let Some(comment_id) = comment_id {
+            api.patch(
+                &format!("/repos/{}/issues/comments/{comment_id}", job.repository),
+                &serde_json::json!({ "body": lifecycle_body }),
+            )
+            .await?
+        } else {
+            api.post(
+                &format!(
+                    "/repos/{}/issues/{}/comments",
+                    job.repository, job.pull_number
+                ),
+                &serde_json::json!({ "body": lifecycle_body }),
+            )
+            .await?
+        };
         self.record_review_rate(rate);
         self.store.set_code_review_lifecycle_comment(
             &job.repository,
@@ -3195,7 +3387,68 @@ impl Engine {
         )?;
         self.store
             .set_code_review_job_lifecycle_comment_url(&job.id, &comment.html_url)?;
-        Ok(())
+        for duplicate_id in discovered_ids
+            .into_iter()
+            .filter(|comment_id| *comment_id != comment.id)
+        {
+            match api
+                .delete(&format!(
+                    "/repos/{}/issues/comments/{duplicate_id}",
+                    job.repository
+                ))
+                .await
+            {
+                Ok(rate) => self.record_review_rate(rate),
+                Err(error) => maintenance_errors.push(error.context(format!(
+                    "deleting duplicate review status comment {duplicate_id}"
+                ))),
+            }
+        }
+        if maintenance_errors.is_empty() {
+            Ok(())
+        } else {
+            Err(anyhow!(
+                "{}",
+                maintenance_errors
+                    .iter()
+                    .map(|error| format!("{error:#}"))
+                    .collect::<Vec<_>>()
+                    .join("; ")
+            ))
+        }
+    }
+
+    async fn find_code_review_lifecycle_comments(
+        &self,
+        api: &GithubApi,
+        job: &trouve_protocol::CodeReviewJob,
+    ) -> Result<Vec<u64>> {
+        let marker = lifecycle_comment_marker(&job.id);
+        let mut ids = Vec::new();
+        for page in 1..=REVIEW_COMMENT_MAX_PAGES {
+            let (comments, rate): (Vec<GithubIssueComment>, _) = api
+                .get(&format!(
+                    "/repos/{}/issues/{}/comments?per_page={REVIEW_COMMENT_PAGE_SIZE}&page={page}",
+                    job.repository, job.pull_number
+                ))
+                .await?;
+            self.record_review_rate(rate);
+            let count = comments.len();
+            ids.extend(comments.into_iter().filter_map(|comment| {
+                (comment.user.as_ref().is_some_and(|user| user.kind == "Bot")
+                    && comment
+                        .body
+                        .as_deref()
+                        .is_some_and(|body| body.contains(&marker)))
+                .then_some(comment.id)
+            }));
+            if count < REVIEW_COMMENT_PAGE_SIZE {
+                break;
+            }
+        }
+        ids.sort_unstable();
+        ids.dedup();
+        Ok(ids)
     }
 
     async fn resolve_fixed_review_findings(
@@ -3361,6 +3614,98 @@ fn elapsed_since_ms(started: Instant) -> u64 {
     started.elapsed().as_millis().try_into().unwrap_or(u64::MAX)
 }
 
+fn combine_projection_results(lifecycle: Result<()>, check: Result<()>) -> Result<()> {
+    match (lifecycle, check) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(error), Ok(())) => Err(error).context("updating GitHub review status comment failed"),
+        (Ok(()), Err(error)) => Err(error).context("updating GitHub Check Run failed"),
+        (Err(lifecycle), Err(check)) => Err(anyhow!(
+            "updating GitHub review status comment failed: {lifecycle:#}; \
+             updating GitHub Check Run failed: {check:#}"
+        )),
+    }
+}
+
+fn lifecycle_comment_marker(job_id: &str) -> String {
+    format!("<!-- trouve-code-review lifecycle job:{job_id} -->")
+}
+
+fn render_check_details(detail: &trouve_protocol::CodeReviewJobDetail) -> String {
+    let job = &detail.job;
+    let mut body = String::new();
+    if !detail.summary.trim().is_empty() {
+        body.push_str(detail.summary.trim());
+        body.push_str("\n\n");
+    } else {
+        body.push_str(match job.status.as_str() {
+            "queued" => "No reviewer has started yet.\n\n",
+            "running" => "Reviewers are examining the current revision.\n\n",
+            "succeeded" => "The review completed without an additional summary.\n\n",
+            "cancelled" => "The review was cancelled before completion.\n\n",
+            "stale" => {
+                "The review stopped because a newer revision or configuration replaced it.\n\n"
+            }
+            _ => "The review did not complete successfully.\n\n",
+        });
+    }
+
+    if !job.error.trim().is_empty() {
+        body.push_str("### Error\n\n```text\n");
+        body.push_str(&safe_prompt_fence(job.error.trim()));
+        body.push_str("\n```\n\n");
+    }
+
+    if !detail.personas.is_empty() {
+        body.push_str("### Reviewer status\n\n");
+        body.push_str("| Reviewer | Status | Batches | Elapsed | Model |\n");
+        body.push_str("| --- | --- | ---: | ---: | --- |\n");
+        for persona in &detail.personas {
+            let models = if persona.models.is_empty() {
+                "—".to_string()
+            } else {
+                persona.models.join(", ")
+            };
+            body.push_str(&format!(
+                "| {} | {} | {}/{} | {} | {} |\n",
+                markdown_table_cell(&persona.reviewer_name),
+                markdown_table_cell(&persona.status),
+                persona.completed_batches,
+                persona.total_batches,
+                compact_elapsed(persona.elapsed_ms),
+                markdown_table_cell(&models),
+            ));
+        }
+        body.push('\n');
+    }
+
+    let failed_tasks = detail
+        .tasks
+        .iter()
+        .filter(|task| task.status == "failed" && !task.error.trim().is_empty())
+        .collect::<Vec<_>>();
+    if !failed_tasks.is_empty() {
+        body.push_str("### Failed reviewer tasks\n\n");
+        for task in failed_tasks {
+            body.push_str(&format!(
+                "- **{} · batch {}/{}:** {}\n",
+                markdown_table_cell(&task.reviewer_name),
+                task.batch_index + 1,
+                task.batch_count,
+                markdown_table_cell(task.error.trim()),
+            ));
+        }
+    }
+
+    body
+}
+
+fn markdown_table_cell(value: &str) -> String {
+    value
+        .replace('|', "\\|")
+        .replace('\r', "")
+        .replace('\n', "<br>")
+}
+
 fn render_lifecycle_comment(detail: &trouve_protocol::CodeReviewJobDetail) -> String {
     let job = &detail.job;
     let icon = match job.status.as_str() {
@@ -3417,10 +3762,7 @@ fn render_lifecycle_comment(detail: &trouve_protocol::CodeReviewJobDetail) -> St
     if !job.error.is_empty() {
         body.push_str(&format!("**Error:** {}\n\n", job.error));
     }
-    body.push_str(&format!(
-        "<!-- trouve-code-review lifecycle job:{} -->",
-        job.id
-    ));
+    body.push_str(&lifecycle_comment_marker(&job.id));
     body
 }
 
@@ -3899,7 +4241,7 @@ fn reviewer_prompt(
          {reviewer_instructions}\n\nReview every supplied file or fragment. Inspect relevant \
          unchanged code with read/search tools only when the supplied diff leaves a concrete \
          ambiguity. Report only actionable problems introduced by the change. Do not ask \
-         questions and do not modify files.\n\n\
+         questions and do not modify files.\n\n{execution_guidance}\n\n\
          Return JSON only, with no Markdown fence, using exactly this shape:\n\
          {{\"summary\":\"short overall assessment\",\"findings\":[{{\"path\":\"relative/file.rs\",\"line\":123,\"side\":\"RIGHT\",\"severity\":\"high|medium|low\",\"body\":\"specific problem and fix\"}}]}}\n\
          Use RIGHT for added/context lines in the new version and LEFT only \
@@ -3907,6 +4249,7 @@ fn reviewer_prompt(
          actionable issues.",
         reviewer_name = reviewer.name,
         reviewer_instructions = reviewer.prompt,
+        execution_guidance = REVIEWER_EXECUTION_GUIDANCE,
         number = job.pull_number,
         title = job.pull_title,
         head = job.head_sha,
@@ -3960,10 +4303,15 @@ fn validation_prompt(
          supplied below; use tools only when surrounding unchanged code is necessary to settle \
          a concrete ambiguity. Do not add a finding merely because a \
          reviewer suggested it. Each retained finding must include every contributing \
-         `candidate_id` in `source_candidate_ids`; never invent an id. Also inspect the \
+         `candidate_id` in `source_candidate_ids`; never invent an id. Include each candidate \
+         you do not retain exactly once in `rejected_candidates` with a concise, specific \
+         reason such as false positive, pre-existing behavior, duplicate, insufficient \
+         evidence, or non-actionable impact. Every candidate id must appear in either a \
+         retained finding or rejected_candidates. Also inspect the \
          previously published open findings and include an id in `resolved_finding_ids` \
          only when this revision demonstrably fixed it. An unchanged, moved, or uncertain \
-         issue remains open.\n\n{extra}Changed paths: {paths}\n\nCandidate findings:\n{candidates}\n\n\
+         issue remains open.\n\n{execution_guidance}\n\n{extra}Changed paths: {paths}\n\n\
+         Candidate findings:\n{candidates}\n\n\
          Previously published open findings:\n{previous_findings}\n\n\
          Relevant diff context:\n{diff_context}\n\n\
          Return JSON only, with no Markdown fence, using exactly this shape:\n\
@@ -3971,11 +4319,14 @@ fn validation_prompt(
          \"findings\":[{{\"path\":\"relative/file.rs\",\"line\":123,\"side\":\"RIGHT\",\
          \"severity\":\"high|medium|low\",\"body\":\"specific verified problem and fix\",\
          \"source_candidate_ids\":[\"candidate id\"]}}],\
+         \"rejected_candidates\":[{{\"candidate_id\":\"candidate id\",\
+         \"reason\":\"specific reason this candidate was not retained\"}}],\
          \"resolved_finding_ids\":[\"previous finding id\"]}}",
         number = job.pull_number,
         title = job.pull_title,
         base = job.review_base_sha,
         head = job.head_sha,
+        execution_guidance = COORDINATOR_EXECUTION_GUIDANCE,
     ))
 }
 
@@ -4025,6 +4376,49 @@ fn coordinator_validated_findings(
                 candidate_ids.contains(candidate_id.as_str()) && seen.insert(candidate_id.clone())
             });
             (!finding.source_candidate_ids.is_empty()).then_some(finding)
+        })
+        .collect()
+}
+
+fn candidate_rejections(
+    review: &ReviewOutput,
+    candidates: &[CandidateFinding],
+) -> Vec<trouve_protocol::CodeReviewCandidateRejection> {
+    let accepted = review
+        .findings
+        .iter()
+        .flat_map(|finding| finding.source_candidate_ids.iter())
+        .map(String::as_str)
+        .collect::<HashSet<_>>();
+    let reasons = review
+        .rejected_candidates
+        .iter()
+        .filter_map(|rejection| {
+            let reason = rejection.reason.trim();
+            (!reason.is_empty()).then_some((rejection.candidate_id.as_str(), reason))
+        })
+        .collect::<HashMap<_, _>>();
+
+    candidates
+        .iter()
+        .filter(|candidate| !accepted.contains(candidate.candidate_id.as_str()))
+        .map(|candidate| trouve_protocol::CodeReviewCandidateRejection {
+            candidate_id: candidate.candidate_id.clone(),
+            task_id: candidate.task_id.clone(),
+            reviewer_id: candidate.reviewer_id.clone(),
+            reviewer_name: candidate.reviewer_name.clone(),
+            path: candidate.finding.path.clone(),
+            line: candidate.finding.line,
+            side: candidate.finding.side.clone(),
+            severity: candidate.finding.severity.clone(),
+            body: candidate.finding.body.clone(),
+            reason: reasons
+                .get(candidate.candidate_id.as_str())
+                .copied()
+                .unwrap_or(
+                    "The final review editor did not retain this candidate and did not provide a specific reason.",
+                )
+                .to_owned(),
         })
         .collect()
 }
@@ -4174,9 +4568,359 @@ fn parse_review_output(output: &str) -> Result<ReviewOutput> {
     serde_json::from_str(&trimmed[start..=end]).context("decoding model review JSON")
 }
 
+fn review_output_repair_prompt(error: &anyhow::Error) -> String {
+    format!(
+        "Your previous review response could not be decoded as the required JSON: \
+         {error:#}\n\nDo not perform more analysis and do not call tools. Reformat the \
+         conclusions already reached and return JSON only, with no Markdown fence, using \
+         exactly this shape:\n\
+         {{\"summary\":\"short overall assessment\",\"findings\":[{{\"path\":\"relative/file.rs\",\
+         \"line\":123,\"side\":\"RIGHT|LEFT\",\"severity\":\"high|medium|low\",\
+         \"body\":\"specific problem and fix\",\"source_candidate_ids\":[]}}],\
+         \"rejected_candidates\":[{{\"candidate_id\":\"candidate id\",\
+         \"reason\":\"specific reason this candidate was not retained\"}}],\
+         \"resolved_finding_ids\":[]}}\n\
+         Preserve every actionable finding from the previous response. Reviewer findings may \
+         leave source_candidate_ids empty; a final review editor must retain the candidate ids \
+         required by the original request and explain every rejected candidate. Use empty arrays \
+         when there are no findings, rejected candidates, or resolved findings."
+    )
+}
+
+fn merge_review_task_metrics(
+    accumulated: &mut CodeReviewTaskMetrics,
+    additional: &CodeReviewTaskMetrics,
+) {
+    accumulated.model_elapsed_ms = accumulated
+        .model_elapsed_ms
+        .saturating_add(additional.model_elapsed_ms);
+    accumulated.input_tokens = accumulated
+        .input_tokens
+        .saturating_add(additional.input_tokens);
+    accumulated.cached_input_tokens = accumulated
+        .cached_input_tokens
+        .saturating_add(additional.cached_input_tokens);
+    accumulated.output_tokens = accumulated
+        .output_tokens
+        .saturating_add(additional.output_tokens);
+    accumulated.tool_call_count = accumulated
+        .tool_call_count
+        .saturating_add(additional.tool_call_count);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn enqueue_test_review_job(
+        store: &crate::store::Store,
+        dedupe_key: &str,
+    ) -> trouve_protocol::CodeReviewJob {
+        store
+            .enqueue_code_review_job(&NewCodeReviewJob {
+                dedupe_key: dedupe_key.into(),
+                installation_id: 7,
+                repository: "acme/widgets".into(),
+                pull_number: 42,
+                pull_title: "Ship widgets".into(),
+                pull_url: "https://github.com/acme/widgets/pull/42".into(),
+                head_sha: "2222222222222222222222222222222222222222".into(),
+                review_base_sha: "1111111111111111111111111111111111111111".into(),
+                base_ref: "main".into(),
+                head_ref: "ship".into(),
+                scope: trouve_protocol::CodeReviewJobScope::Incremental,
+                trigger: "automatic".into(),
+                retry_of: None,
+                model: Some("provider/default".into()),
+                prompt: "Review it".into(),
+                reviewers: crate::reviewers::built_in_reviewers()
+                    .into_iter()
+                    .take(1)
+                    .collect(),
+                config_hash: "config".into(),
+            })
+            .unwrap()
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn concurrent_lifecycle_updates_create_one_comment_then_patch_it() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        let store = crate::store::Store::open_in_memory().unwrap();
+        let job = enqueue_test_review_job(&store, "acme/widgets#42:lifecycle");
+        let data = tempfile::tempdir().unwrap();
+        let engine = Engine::new(
+            store,
+            data.path().to_path_buf(),
+            &crate::config::Config::default(),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            for (index, (expected, body)) in [
+                (
+                    "get /repos/acme/widgets/issues/42/comments?per_page=100&page=1 http/1.1\r\n",
+                    "[]",
+                ),
+                (
+                    "post /repos/acme/widgets/issues/42/comments http/1.1\r\n",
+                    r#"{"id":10,"html_url":"https://github.com/acme/widgets/pull/42#issuecomment-10"}"#,
+                ),
+                (
+                    "patch /repos/acme/widgets/issues/comments/10 http/1.1\r\n",
+                    r#"{"id":10,"html_url":"https://github.com/acme/widgets/pull/42#issuecomment-10"}"#,
+                ),
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut request = Vec::new();
+                let mut buffer = [0_u8; 2048];
+                while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                    let count = stream.read(&mut buffer).await.unwrap();
+                    assert!(count > 0);
+                    request.extend_from_slice(&buffer[..count]);
+                }
+                let request = String::from_utf8(request).unwrap().to_ascii_lowercase();
+                assert!(request.starts_with(expected), "{request}");
+                if index == 1 {
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\n\
+                     content-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                stream.write_all(response.as_bytes()).await.unwrap();
+            }
+        });
+        let api = GithubApi::with_base_url(
+            "Bearer installation-token".into(),
+            format!("http://{address}"),
+            "installation:7".into(),
+        )
+        .unwrap();
+
+        let (first, second) = tokio::join!(
+            engine.sync_code_review_lifecycle_projection(&api, &job),
+            engine.sync_code_review_lifecycle_projection(&api, &job),
+        );
+        first.unwrap();
+        second.unwrap();
+        server.await.unwrap();
+
+        let state = engine
+            .store
+            .code_review_pull_state("acme/widgets", 42)
+            .unwrap();
+        assert_eq!(state.lifecycle_comment_id, Some(10));
+        assert_eq!(
+            state.lifecycle_comment_url,
+            "https://github.com/acme/widgets/pull/42#issuecomment-10"
+        );
+    }
+
+    #[test]
+    fn failed_review_lifecycle_comment_is_terminal_and_includes_the_error() {
+        let store = crate::store::Store::open_in_memory().unwrap();
+        let queued = enqueue_test_review_job(&store, "acme/widgets#42:failed-lifecycle");
+        store.claim_code_review_job().unwrap().unwrap();
+        store
+            .finish_code_review_job(
+                &queued.id,
+                "failed",
+                "",
+                "model review remained invalid after one JSON repair attempt",
+            )
+            .unwrap();
+        let detail = store.code_review_job_detail(&queued.id).unwrap().unwrap();
+
+        let body = render_lifecycle_comment(&detail);
+        assert!(body.starts_with("## ❌ trouve review failed"));
+        assert!(
+            body.contains("**Error:** model review remained invalid after one JSON repair attempt")
+        );
+        assert!(!body.contains("trouve review running"));
+    }
+
+    #[test]
+    fn check_details_show_live_personas_and_terminal_failures() {
+        let store = crate::store::Store::open_in_memory().unwrap();
+        let queued = enqueue_test_review_job(&store, "acme/widgets#42:check-details");
+        store.claim_code_review_job().unwrap().unwrap();
+        store
+            .set_code_review_job_progress(&queued.id, 0, 1)
+            .unwrap();
+        let task = store
+            .create_code_review_task(&NewCodeReviewTask {
+                job_id: queued.id.clone(),
+                role: trouve_protocol::CodeReviewTaskRole::Reviewer,
+                reviewer_id: Some("reliability".into()),
+                reviewer_name: "Reliability & Error Handling".into(),
+                batch_index: 0,
+                batch_count: 1,
+                model: Some("provider/reviewer".into()),
+                prompt: "Review failure paths".into(),
+            })
+            .unwrap();
+        store
+            .start_code_review_task(
+                &task.id,
+                "session-review",
+                "thread-review",
+                "provider/reviewer",
+            )
+            .unwrap();
+
+        let detail = store.code_review_job_detail(&queued.id).unwrap().unwrap();
+        let running = render_check_details(&detail);
+        assert!(running.contains("Reviewers are examining the current revision."));
+        assert!(running.contains("### Reviewer status"));
+        assert!(running.contains("Reliability & Error Handling"));
+        assert!(running.contains("| running | 0/1 |"));
+
+        store
+            .finish_code_review_task(
+                &task.id,
+                "failed",
+                "",
+                0,
+                "review did not contain JSON\nrepair also failed",
+            )
+            .unwrap();
+        store
+            .set_code_review_job_progress(&queued.id, 1, 1)
+            .unwrap();
+        store
+            .finish_code_review_job(&queued.id, "failed", "", "reviewer output was invalid")
+            .unwrap();
+
+        let detail = store.code_review_job_detail(&queued.id).unwrap().unwrap();
+        let failed = render_check_details(&detail);
+        assert!(failed.contains("### Error"));
+        assert!(failed.contains("reviewer output was invalid"));
+        assert!(failed.contains("### Failed reviewer tasks"));
+        assert!(failed.contains("review did not contain JSON<br>repair also failed"));
+        assert!(!failed.trim().is_empty());
+    }
+
+    #[tokio::test]
+    async fn terminal_lifecycle_update_keeps_the_original_and_deletes_duplicates() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        let store = crate::store::Store::open_in_memory().unwrap();
+        let queued = enqueue_test_review_job(&store, "acme/widgets#42:duplicate-lifecycle");
+        store.claim_code_review_job().unwrap().unwrap();
+        store
+            .finish_code_review_job(&queued.id, "failed", "", "review failed")
+            .unwrap();
+        store
+            .set_code_review_lifecycle_comment(
+                "acme/widgets",
+                42,
+                11,
+                "https://github.com/acme/widgets/pull/42#issuecomment-11",
+            )
+            .unwrap();
+        let data = tempfile::tempdir().unwrap();
+        let engine = Engine::new(
+            store,
+            data.path().to_path_buf(),
+            &crate::config::Config::default(),
+        );
+        let marker = lifecycle_comment_marker(&queued.id);
+        let comments = serde_json::to_string(&serde_json::json!([
+            {
+                "id": 10,
+                "body": format!("queued\n{marker}"),
+                "author_association": "NONE",
+                "issue_url": "https://api.github.com/repos/acme/widgets/issues/42",
+                "user": {"type": "Bot"}
+            },
+            {
+                "id": 11,
+                "body": format!("running\n{marker}"),
+                "author_association": "NONE",
+                "issue_url": "https://api.github.com/repos/acme/widgets/issues/42",
+                "user": {"type": "Bot"}
+            }
+        ]))
+        .unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            for (expected, status, body) in [
+                (
+                    "get /repos/acme/widgets/issues/42/comments?per_page=100&page=1 http/1.1\r\n",
+                    "200 OK",
+                    comments,
+                ),
+                (
+                    "patch /repos/acme/widgets/issues/comments/10 http/1.1\r\n",
+                    "200 OK",
+                    r#"{"id":10,"html_url":"https://github.com/acme/widgets/pull/42#issuecomment-10"}"#
+                        .into(),
+                ),
+                (
+                    "delete /repos/acme/widgets/issues/comments/11 http/1.1\r\n",
+                    "204 No Content",
+                    String::new(),
+                ),
+            ] {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut request = Vec::new();
+                let mut buffer = [0_u8; 2048];
+                while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                    let count = stream.read(&mut buffer).await.unwrap();
+                    assert!(count > 0);
+                    request.extend_from_slice(&buffer[..count]);
+                }
+                let request = String::from_utf8(request).unwrap().to_ascii_lowercase();
+                assert!(request.starts_with(expected), "{request}");
+                let response = format!(
+                    "HTTP/1.1 {status}\r\ncontent-type: application/json\r\n\
+                     content-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                stream.write_all(response.as_bytes()).await.unwrap();
+            }
+        });
+        let api = GithubApi::with_base_url(
+            "Bearer installation-token".into(),
+            format!("http://{address}"),
+            "installation:7".into(),
+        )
+        .unwrap();
+
+        engine
+            .sync_code_review_lifecycle_projection(&api, &queued)
+            .await
+            .unwrap();
+        server.await.unwrap();
+        let state = engine
+            .store
+            .code_review_pull_state("acme/widgets", 42)
+            .unwrap();
+        assert_eq!(state.lifecycle_comment_id, Some(10));
+        assert_eq!(
+            state.lifecycle_comment_url,
+            "https://github.com/acme/widgets/pull/42#issuecomment-10"
+        );
+    }
+
+    #[test]
+    fn projection_errors_report_comment_and_check_failures_together() {
+        let error = combine_projection_results(
+            Err(anyhow!("comment unavailable")),
+            Err(anyhow!("check unavailable")),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("review status comment failed: comment unavailable"));
+        assert!(error.contains("Check Run failed: check unavailable"));
+    }
 
     #[test]
     fn rest_cache_is_bounded_and_refreshes_recent_entries() {
@@ -4429,6 +5173,52 @@ mod tests {
     }
 
     #[test]
+    fn malformed_review_repair_prompt_repeats_the_json_contract() {
+        let error = parse_review_output("Confirmed three performance issues.").unwrap_err();
+        let prompt = review_output_repair_prompt(&error);
+        assert!(prompt.contains("review did not contain JSON"));
+        assert!(prompt.contains("\"findings\""));
+        assert!(prompt.contains("\"source_candidate_ids\""));
+        assert!(prompt.contains("do not call tools"));
+    }
+
+    #[test]
+    fn repair_turn_metrics_are_accumulated() {
+        let mut accumulated = CodeReviewTaskMetrics {
+            model_elapsed_ms: u64::MAX,
+            input_tokens: 10,
+            cached_input_tokens: 20,
+            output_tokens: 30,
+            tool_call_count: 40,
+        };
+        merge_review_task_metrics(
+            &mut accumulated,
+            &CodeReviewTaskMetrics {
+                model_elapsed_ms: 1,
+                input_tokens: 2,
+                cached_input_tokens: 3,
+                output_tokens: 4,
+                tool_call_count: 5,
+            },
+        );
+        assert_eq!(accumulated.model_elapsed_ms, u64::MAX);
+        assert_eq!(accumulated.input_tokens, 12);
+        assert_eq!(accumulated.cached_input_tokens, 23);
+        assert_eq!(accumulated.output_tokens, 34);
+        assert_eq!(accumulated.tool_call_count, 45);
+    }
+
+    #[test]
+    fn check_run_action_descriptions_fit_github_limits() {
+        for description in [
+            RETRY_CHECK_ACTION_DESCRIPTION,
+            FULL_REVIEW_CHECK_ACTION_DESCRIPTION,
+        ] {
+            assert!(description.chars().count() <= CHECK_ACTION_DESCRIPTION_MAX_CHARS);
+        }
+    }
+
+    #[test]
     fn reviewer_overrides_append_or_replace_prompts_and_models() {
         let reviewer = ReviewerProfile {
             id: "security".into(),
@@ -4582,6 +5372,56 @@ mod tests {
     }
 
     #[test]
+    fn candidate_rejection_details_cover_every_unselected_candidate() {
+        let candidate = |id: &str| CandidateFinding {
+            candidate_id: id.into(),
+            task_id: "rt_test".into(),
+            reviewer_id: "correctness".into(),
+            reviewer_name: "Correctness".into(),
+            finding: ReviewFinding {
+                path: "src/lib.rs".into(),
+                line: 3,
+                side: "RIGHT".into(),
+                severity: "medium".into(),
+                body: format!("candidate {id}"),
+                source_candidate_ids: Vec::new(),
+            },
+        };
+        let candidates = vec![
+            candidate("accepted"),
+            candidate("explained"),
+            candidate("missing-reason"),
+        ];
+        let review = ReviewOutput {
+            summary: String::new(),
+            findings: vec![ReviewFinding {
+                path: "src/lib.rs".into(),
+                line: 3,
+                side: "RIGHT".into(),
+                severity: "medium".into(),
+                body: "accepted".into(),
+                source_candidate_ids: vec!["accepted".into()],
+            }],
+            rejected_candidates: vec![ReviewCandidateRejection {
+                candidate_id: "explained".into(),
+                reason: "Duplicate of the accepted finding.".into(),
+            }],
+            resolved_finding_ids: Vec::new(),
+        };
+
+        let rejected = candidate_rejections(&review, &candidates);
+        assert_eq!(rejected.len(), 2);
+        assert_eq!(rejected[0].candidate_id, "explained");
+        assert_eq!(rejected[0].reason, "Duplicate of the accepted finding.");
+        assert_eq!(rejected[1].candidate_id, "missing-reason");
+        assert!(
+            rejected[1]
+                .reason
+                .contains("did not provide a specific reason")
+        );
+    }
+
+    #[test]
     fn validates_repository_names_and_shas() {
         assert!(validate_repository("owner/repo-name").is_ok());
         assert!(validate_repository("../repo").is_err());
@@ -4591,15 +5431,30 @@ mod tests {
     }
 
     #[test]
-    fn poll_interval_values_must_be_positive_seconds() {
+    fn review_duration_settings_must_be_positive_seconds() {
         assert_eq!(DEFAULT_RECONCILE_INTERVAL, Duration::from_secs(60));
+        assert_eq!(DEFAULT_REVIEW_TIMEOUT, Duration::from_secs(5 * 60));
         assert_eq!(
             parse_code_review_poll_interval(" 15 "),
             Some(Duration::from_secs(15))
         );
+        assert_eq!(
+            parse_code_review_timeout(" 300 "),
+            Some(Duration::from_secs(300))
+        );
         for value in ["", "0", "nope"] {
             assert_eq!(parse_code_review_poll_interval(value), None);
+            assert_eq!(parse_code_review_timeout(value), None);
         }
+    }
+
+    #[test]
+    fn review_prompts_bound_exploration_to_fit_the_latency_target() {
+        assert!(REVIEWER_EXECUTION_GUIDANCE.contains("about three minutes"));
+        assert!(REVIEWER_EXECUTION_GUIDANCE.contains("no more than 12 tool calls"));
+        assert!(COORDINATOR_EXECUTION_GUIDANCE.contains("about one minute"));
+        assert!(COORDINATOR_EXECUTION_GUIDANCE.contains("no more than 4 tool calls"));
+        assert_eq!(DEFAULT_REVIEW_TASK_CONCURRENCY, 24);
     }
 
     #[test]

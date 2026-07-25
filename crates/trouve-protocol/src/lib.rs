@@ -98,7 +98,9 @@ pub use requests::*;
 // 1.8: review tasks/persona/model statistics expose provider-capacity wait,
 // model/tool elapsed time, token/cache usage, tool-call count, and
 // not-applicable persona batches (all additive).
-pub const PROTOCOL_VERSION: &str = "1.8";
+// 1.9: code-review job details expose durable final-editor rejection reasons
+// for reviewer candidates that were not selected (additive).
+pub const PROTOCOL_VERSION: &str = "1.9";
 
 pub type WorkspaceId = String;
 pub type SessionId = String;

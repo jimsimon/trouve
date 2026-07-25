@@ -174,11 +174,25 @@ export interface Finding {
   resolved_at?: string;
 }
 
+export interface CandidateRejection {
+  candidate_id: string;
+  task_id: string;
+  reviewer_id: string;
+  reviewer_name: string;
+  path: string;
+  line: number;
+  side: string;
+  severity: string;
+  body: string;
+  reason: string;
+}
+
 export interface JobDetail {
   job: ReviewJob;
   tasks: ReviewTask[];
   personas: PersonaResult[];
   findings: Finding[];
+  candidate_rejections: CandidateRejection[];
   summary: string;
   prompt_for_agents: string;
 }
@@ -220,6 +234,8 @@ export interface PersonaStats {
   reviewer_id: string;
   reviewer_name: string;
   model: string;
+  // Per-batch reviewer tasks. Outcome counters below are rolled-up persona
+  // runs, one per review job and actual model.
   task_count: number;
   succeeded: number;
   failed: number;

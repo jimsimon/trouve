@@ -264,6 +264,22 @@ CREATE TABLE IF NOT EXISTS code_review_finding_sources (
   reviewer_name TEXT NOT NULL,
   PRIMARY KEY (finding_id, candidate_id)
 );
+CREATE TABLE IF NOT EXISTS code_review_candidate_rejections (
+  candidate_id TEXT PRIMARY KEY,
+  job_id TEXT NOT NULL REFERENCES code_review_jobs(id),
+  task_id TEXT NOT NULL,
+  reviewer_id TEXT NOT NULL,
+  reviewer_name TEXT NOT NULL,
+  path TEXT NOT NULL,
+  line INTEGER NOT NULL,
+  side TEXT NOT NULL,
+  severity TEXT NOT NULL,
+  body TEXT NOT NULL,
+  reason TEXT NOT NULL,
+  created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS code_review_candidate_rejections_job
+  ON code_review_candidate_rejections (job_id, reviewer_id, candidate_id);
 CREATE TABLE IF NOT EXISTS code_review_pr_state (
   repository TEXT NOT NULL,
   pull_number INTEGER NOT NULL,
@@ -786,7 +802,8 @@ fn code_review_persona_results(
             let mut has_queued = false;
             let mut has_failed = false;
             let mut has_cancelled = false;
-            let mut all_succeeded = true;
+            let mut has_succeeded = false;
+            let mut all_successful_or_not_applicable = true;
             let mut completed_batches = 0_u64;
             let mut total_batches = 0_u64;
             let mut candidate_issue_count = 0_u64;
@@ -829,7 +846,9 @@ fn code_review_persona_results(
                 has_queued |= task.status == "queued";
                 has_failed |= task.status == "failed";
                 has_cancelled |= task.status == "cancelled";
-                all_succeeded &= task.status == "succeeded";
+                has_succeeded |= task.status == "succeeded";
+                all_successful_or_not_applicable &=
+                    matches!(task.status.as_str(), "succeeded" | "not_applicable");
                 candidate_issue_count += task.candidate_issue_count;
                 confirmed_issue_count += task.confirmed_issue_count;
                 provider_wait_ms += task.provider_wait_ms;
@@ -847,7 +866,7 @@ fn code_review_persona_results(
                 "running"
             } else if has_queued {
                 "queued"
-            } else if all_succeeded && all_terminal {
+            } else if all_successful_or_not_applicable && has_succeeded && all_terminal {
                 "succeeded"
             } else if all_terminal && tasks.iter().all(|task| task.status == "not_applicable") {
                 "not_applicable"
@@ -2424,6 +2443,22 @@ impl Store {
         Ok(records.into_iter().map(|record| record.job).collect())
     }
 
+    pub fn code_review_jobs_with_projection_errors(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<trouve_protocol::CodeReviewJob>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {CODE_REVIEW_JOB_COLUMNS} FROM code_review_jobs
+             WHERE check_sync_error != ''
+             ORDER BY COALESCE(completed_at, started_at, created_at) DESC
+             LIMIT ?1"
+        ))?;
+        let rows = stmt.query_map(params![limit as i64], row_to_code_review_job)?;
+        let records = rows.collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(records.into_iter().map(|record| record.job).collect())
+    }
+
     pub fn code_review_job(&self, id: &str) -> Result<Option<CodeReviewJobRecord>> {
         let conn = self.conn.lock().unwrap();
         Ok(conn
@@ -2794,6 +2829,7 @@ impl Store {
         prompt_for_agents: &str,
         candidate_issue_count: u64,
         findings: &[NewCodeReviewFinding],
+        candidate_rejections: &[trouve_protocol::CodeReviewCandidateRejection],
     ) -> Result<Vec<trouve_protocol::CodeReviewFinding>> {
         let mut conn = self.conn.lock().unwrap();
         let tx = conn.transaction()?;
@@ -2804,6 +2840,10 @@ impl Store {
         )?;
         tx.execute(
             "DELETE FROM code_review_findings WHERE job_id = ?1",
+            params![job_id],
+        )?;
+        tx.execute(
+            "DELETE FROM code_review_candidate_rejections WHERE job_id = ?1",
             params![job_id],
         )?;
         tx.execute(
@@ -2855,6 +2895,28 @@ impl Store {
                 }
             }
         }
+        for rejection in candidate_rejections {
+            tx.execute(
+                "INSERT INTO code_review_candidate_rejections
+                        (candidate_id, job_id, task_id, reviewer_id, reviewer_name,
+                         path, line, side, severity, body, reason, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+                params![
+                    rejection.candidate_id,
+                    job_id,
+                    rejection.task_id,
+                    rejection.reviewer_id,
+                    rejection.reviewer_name,
+                    rejection.path,
+                    rejection.line as i64,
+                    rejection.side,
+                    rejection.severity,
+                    rejection.body,
+                    rejection.reason,
+                    now,
+                ],
+            )?;
+        }
         tx.execute(
             "UPDATE code_review_jobs
              SET summary = ?2, prompt_for_agents = ?3,
@@ -2871,6 +2933,36 @@ impl Store {
         tx.commit()?;
         drop(conn);
         self.code_review_findings(job_id)
+    }
+
+    fn code_review_candidate_rejections(
+        &self,
+        job_id: &str,
+    ) -> Result<Vec<trouve_protocol::CodeReviewCandidateRejection>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT candidate_id, task_id, reviewer_id, reviewer_name,
+                    path, line, side, severity, body, reason
+             FROM code_review_candidate_rejections
+             WHERE job_id = ?1
+             ORDER BY reviewer_name, path, line, candidate_id",
+        )?;
+        Ok(stmt
+            .query_map(params![job_id], |row| {
+                Ok(trouve_protocol::CodeReviewCandidateRejection {
+                    candidate_id: row.get(0)?,
+                    task_id: row.get(1)?,
+                    reviewer_id: row.get(2)?,
+                    reviewer_name: row.get(3)?,
+                    path: row.get(4)?,
+                    line: row.get::<_, i64>(5)? as u64,
+                    side: row.get(6)?,
+                    severity: row.get(7)?,
+                    body: row.get(8)?,
+                    reason: row.get(9)?,
+                })
+            })?
+            .collect::<rusqlite::Result<_>>()?)
     }
 
     pub fn update_code_review_finding_publication(
@@ -2996,11 +3088,13 @@ impl Store {
         let tasks = self.code_review_tasks(id)?;
         let personas = code_review_persona_results(&tasks);
         let findings = self.code_review_findings(id)?;
+        let candidate_rejections = self.code_review_candidate_rejections(id)?;
         Ok(Some(trouve_protocol::CodeReviewJobDetail {
             job: record.job,
             tasks,
             personas,
             findings,
+            candidate_rejections,
             summary: record.summary,
             prompt_for_agents: record.prompt_for_agents,
         }))
@@ -3314,8 +3408,12 @@ impl Store {
             persona.cached_input_tokens += execution.cached_input_tokens;
             persona.output_tokens += execution.output_tokens;
             persona.tool_call_count += execution.tool_call_count;
-            let all_succeeded = execution.succeeded_tasks == execution.task_count;
-            if all_succeeded {
+            let succeeded_with_optional_skips = execution.succeeded_tasks > 0
+                && execution
+                    .succeeded_tasks
+                    .saturating_add(execution.not_applicable_tasks)
+                    == execution.task_count;
+            if succeeded_with_optional_skips {
                 persona.succeeded += 1;
             } else if execution.failed_tasks > 0 {
                 persona.failed += 1;
@@ -5450,16 +5548,10 @@ mod tests {
             })
             .unwrap();
         store
-            .start_code_review_task(
+            .skip_code_review_task(
                 &second_task.id,
-                "se_review",
-                "th_review_2",
-                "provider/model",
+                "No changed files or hunks matched this focused persona.",
             )
-            .unwrap()
-            .unwrap();
-        store
-            .finish_code_review_task(&second_task.id, "succeeded", "clean", 0, "")
             .unwrap()
             .unwrap();
         assert_eq!(store.completed_code_review_personas(&queued.id).unwrap(), 1);
@@ -5488,6 +5580,18 @@ mod tests {
                         task_id: task.id.clone(),
                     }],
                 }],
+                &[trouve_protocol::CodeReviewCandidateRejection {
+                    candidate_id: "candidate-2".into(),
+                    task_id: task.id.clone(),
+                    reviewer_id: "correctness".into(),
+                    reviewer_name: "Correctness".into(),
+                    path: "src/lib.rs".into(),
+                    line: 18,
+                    side: "RIGHT".into(),
+                    severity: "low".into(),
+                    body: "This branch could be simplified.".into(),
+                    reason: "This is a non-actionable style preference.".into(),
+                }],
             )
             .unwrap();
         assert_eq!(findings.len(), 1);
@@ -5496,9 +5600,31 @@ mod tests {
         assert_eq!(detail.job.progress.completed_reviewers, 1);
         assert_eq!(detail.tasks[0].output, "candidate output");
         assert_eq!(detail.personas[0].candidate_issue_count, 1);
+        assert_eq!(detail.candidate_rejections.len(), 1);
+        assert_eq!(
+            detail.candidate_rejections[0].reason,
+            "This is a non-actionable style preference."
+        );
         assert_eq!(detail.personas[0].confirmed_issue_count, 1);
+        assert_eq!(detail.personas[0].status, "succeeded");
         assert_eq!(detail.findings[0].sources[0].task_id, task.id);
         assert_eq!(detail.prompt_for_agents, "Fix every confirmed issue.");
+
+        store
+            .set_code_review_job_check_run(&queued.id, Some(99), "https://checks/99", "bad payload")
+            .unwrap();
+        let projection_errors = store.code_review_jobs_with_projection_errors(10).unwrap();
+        assert_eq!(projection_errors.len(), 1);
+        assert_eq!(projection_errors[0].id, queued.id);
+        store
+            .set_code_review_job_check_run(&queued.id, None, "", "")
+            .unwrap();
+        assert!(
+            store
+                .code_review_jobs_with_projection_errors(10)
+                .unwrap()
+                .is_empty()
+        );
 
         let replacement = store.retry_code_review_job(&queued.id).unwrap().unwrap();
         assert_eq!(replacement.retry_of.as_deref(), Some(queued.id.as_str()));
@@ -5546,6 +5672,16 @@ mod tests {
         assert_eq!(stats.status.queued, 1);
         assert_eq!(stats.personas[0].candidate_issue_count, 1);
         assert_eq!(stats.personas[0].confirmed_issue_count, 1);
+        assert_eq!(stats.personas[0].task_count, 2);
+        assert_eq!(stats.personas[0].succeeded, 1);
+        assert_eq!(
+            stats.personas[0].succeeded
+                + stats.personas[0].failed
+                + stats.personas[0].cancelled
+                + stats.personas[0].not_applicable,
+            1
+        );
+        assert_eq!(stats.personas[0].not_applicable, 0);
     }
 
     #[test]

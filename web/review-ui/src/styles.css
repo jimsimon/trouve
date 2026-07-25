@@ -135,12 +135,6 @@ dd { margin: 5px 0 0; }
 .summary { line-height: 1.65; }
 .link-row { margin-top: 13px; font-size: 12px; }
 
-.persona-list { display: grid; grid-template-columns: repeat(auto-fill, minmax(215px, 1fr)); gap: 9px; }
-.persona-list article { padding: 12px; border-radius: 8px; background: var(--surface-2); border: 1px solid var(--line-soft); }
-.persona-list header { display: flex; justify-content: space-between; gap: 8px; }
-.persona-list p { margin: 5px 0 10px; color: var(--muted); font-size: 11px; }
-.persona-list dl { display: grid; grid-template-columns: repeat(3, 1fr); margin: 0; }
-.persona-list dd { font-size: 12px; }
 .finding { padding: 14px; margin: 9px 0; border: 1px solid var(--line); border-left: 3px solid var(--amber); border-radius: 8px; background: var(--surface-2); }
 .finding.high { border-left-color: var(--red); }
 .finding.low { border-left-color: var(--blue); }
@@ -149,11 +143,37 @@ dd { margin: 5px 0 0; }
 .finding small { color: var(--muted); }
 .finding .action-row { margin-top: 12px; }
 
-.task-output { margin-bottom: 8px; border: 1px solid var(--line-soft); border-radius: 8px; background: #0e131d; }
-.task-output > summary { display: grid; grid-template-columns: auto minmax(130px, 1fr) auto auto; gap: 10px; align-items: center; padding: 11px; cursor: pointer; }
-.task-output > summary span, .task-output > summary time { color: var(--muted); font-size: 11px; }
-.task-output > :not(summary) { margin-left: 12px; margin-right: 12px; }
-.task-metrics { color: var(--muted); font-size: 11px; }
+.candidate-decisions { margin-top: 13px; border: 1px solid var(--line-soft); border-radius: 8px; background: #0e131d; }
+.candidate-decisions > summary { display: flex; justify-content: space-between; gap: 12px; padding: 12px 14px; cursor: pointer; }
+.candidate-decisions > summary span { color: var(--muted); font-size: 11px; font-weight: normal; }
+.rejection-list { display: grid; gap: 8px; padding: 0 10px 10px; }
+.candidate-rejection { padding: 12px; border-radius: 7px; background: var(--surface-2); border-left: 3px solid var(--line); }
+.candidate-rejection header { display: flex; justify-content: space-between; gap: 10px; }
+.candidate-rejection header span, .candidate-rejection > div { color: var(--muted); font-size: 11px; }
+.candidate-rejection p { margin: 8px 0; line-height: 1.5; }
+.candidate-rejection > div b { color: var(--text); }
+.decision-note { padding: 11px 12px; border-radius: 7px; background: var(--surface-2); color: var(--muted); font-size: 12px; }
+
+.activity-layout { display: grid; grid-template-columns: minmax(190px, .72fr) minmax(0, 1.5fr); gap: 10px; align-items: start; }
+.activity-groups { display: flex; min-width: 0; flex-direction: column; gap: 6px; }
+.activity-group { overflow: hidden; border: 1px solid var(--line-soft); border-radius: 8px; background: #0e131d; }
+.activity-group.active { border-color: #315f94; }
+.activity-group > button { width: 100%; display: flex; justify-content: space-between; align-items: center; gap: 9px; padding: 10px; border: 0; border-radius: 0; background: transparent; text-align: left; }
+.activity-group > button:hover { background: var(--surface-2); filter: none; }
+.activity-group > button > span:first-child { min-width: 0; }
+.activity-group > button strong, .activity-group > button small { display: block; overflow: hidden; text-overflow: ellipsis; }
+.activity-group > button small { margin-top: 3px; color: var(--muted); font-size: 10px; white-space: nowrap; }
+.batch-tabs { display: grid; gap: 3px; padding: 0 7px 7px; }
+.batch-tabs button { display: flex; justify-content: space-between; align-items: center; padding: 6px 7px; border-color: transparent; background: #080c12; color: var(--muted); font-size: 10px; }
+.batch-tabs button.active { border-color: #315f94; color: var(--text); background: #12243b; }
+.activity-detail { min-width: 0; padding: 13px; border: 1px solid var(--line-soft); border-radius: 8px; background: #0e131d; }
+.activity-detail > header { display: flex; justify-content: space-between; gap: 12px; }
+.activity-detail > header h3 { margin: 7px 0 3px; font-size: 15px; }
+.activity-detail > header p, .activity-detail > header time { margin: 0; color: var(--muted); font-size: 11px; }
+.persona-rollup { margin: 11px 0 0; color: var(--muted); font-size: 11px; line-height: 1.5; }
+.task-facts { display: grid; grid-template-columns: repeat(3, 1fr); gap: 1px; margin: 13px 0; overflow: hidden; border: 1px solid var(--line-soft); border-radius: 7px; background: var(--line-soft); }
+.task-facts div { min-width: 0; padding: 9px; background: var(--surface-2); }
+.task-facts dd { overflow: hidden; font-size: 11px; text-overflow: ellipsis; }
 .output-block h3 { margin: 13px 0 5px; color: var(--muted); font-size: 11px; text-transform: uppercase; }
 pre { max-height: 430px; margin: 0 0 12px; overflow: auto; padding: 12px; border-radius: 6px; background: #070a10; color: #cbd4e2; font-size: 11px; line-height: 1.55; white-space: pre-wrap; overflow-wrap: anywhere; }
 .nested { margin-bottom: 12px; }
@@ -272,6 +292,8 @@ th { color: var(--muted); font-size: 10px; text-transform: uppercase; letter-spa
   .job-meta { display: none; }
   .health-list { grid-template-columns: 1fr; }
   .provider-setup, .split-fields { grid-template-columns: 1fr; }
-  .task-output > summary { grid-template-columns: auto 1fr auto; }
-  .task-output > summary span { display: none; }
+  .activity-layout { grid-template-columns: 1fr; }
+  .activity-groups { max-height: 280px; overflow: auto; }
+  .task-facts { grid-template-columns: 1fr 1fr; }
+  .candidate-decisions > summary { flex-direction: column; }
 }
