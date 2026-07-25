@@ -1072,7 +1072,8 @@ function OutputBlock({
       <h3>{title}</h3>
       <pre
         ref={preRef}
-        aria-live={followTail ? "polite" : "off"}
+        tabIndex={0}
+        aria-busy={followTail}
         onScroll={(event) => {
           const element = event.currentTarget;
           pinnedRef.current =

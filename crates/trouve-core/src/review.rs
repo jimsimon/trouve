@@ -39,7 +39,7 @@ const RECONCILE_INTERVAL_ENV: &str = "TROUVE_CODE_REVIEW_POLL_INTERVAL_SECONDS";
 const DEFAULT_RECONCILE_INTERVAL: Duration = Duration::from_secs(60);
 const JOB_IDLE_INTERVAL: Duration = Duration::from_secs(5);
 const REVIEW_TIMEOUT_ENV: &str = "TROUVE_CODE_REVIEW_TIMEOUT_SECONDS";
-const DEFAULT_REVIEW_TIMEOUT: Duration = Duration::from_secs(5 * 60);
+const DEFAULT_REVIEW_TIMEOUT: Duration = Duration::from_secs(15 * 60);
 const REVIEW_JOB_CONCURRENCY_ENV: &str = "TROUVE_CODE_REVIEW_JOB_CONCURRENCY";
 const DEFAULT_REVIEW_JOB_CONCURRENCY: usize = 2;
 const REVIEW_TASK_CONCURRENCY_ENV: &str = "TROUVE_CODE_REVIEW_TASK_CONCURRENCY";
@@ -60,6 +60,9 @@ const REVIEW_OUTPUT_FLUSH_BYTES: usize = 8 * 1024;
 const REVIEW_PROJECTION_DEBOUNCE: Duration = Duration::from_millis(750);
 const REVIEW_PROJECTION_REPAIR_LIMIT: usize = 25;
 const CHECK_ACTION_DESCRIPTION_MAX_CHARS: usize = 40;
+const CHECK_DETAILS_MAX_CHARS: usize = 60_000;
+const CHECK_DETAILS_TRUNCATION_MARKER: &str =
+    "\n\n---\nDetails truncated; open the trouve dashboard for complete output.";
 const RETRY_CHECK_ACTION_DESCRIPTION: &str = "Retry this review on the current PR head";
 const FULL_REVIEW_CHECK_ACTION_DESCRIPTION: &str = "Review full branch against the PR base";
 const REVIEWER_EXECUTION_GUIDANCE: &str = "\
@@ -612,6 +615,7 @@ struct ReviewOutput {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 struct ReviewCandidateRejection {
     candidate_id: String,
+    #[serde(default)]
     reason: String,
 }
 
@@ -832,7 +836,10 @@ impl GithubApi {
         let status = response.status();
         let rate = rate_info(response.headers());
         let body = response.text().await?;
-        if !status.is_success() {
+        if !status.is_success()
+            && status != reqwest::StatusCode::NOT_FOUND
+            && status != reqwest::StatusCode::GONE
+        {
             bail!("GitHub API {status}: {}", compact_api_error(&body));
         }
         Ok(rate)
@@ -3180,10 +3187,16 @@ impl Engine {
     async fn sync_code_review_projection(&self, job: &trouve_protocol::CodeReviewJob) {
         if let Err(error) = self.sync_code_review_projection_inner(job).await {
             let message = format!("{error:#}");
+            let retryable = projection_error_is_retryable(&error);
             let _ = self
                 .store
-                .set_code_review_job_check_run(&job.id, None, "", &message);
-            tracing::warn!(job_id = %job.id, %error, "updating GitHub review progress failed");
+                .record_code_review_projection_failure(&job.id, &message, retryable);
+            tracing::warn!(
+                job_id = %job.id,
+                retryable,
+                %error,
+                "updating GitHub review progress failed"
+            );
         }
     }
 
@@ -3243,7 +3256,7 @@ impl Engine {
                 }
             }
         };
-        let check_details = render_check_details(&detail);
+        let check_details = bounded_check_details(&render_check_details(&detail));
         let mut check_body = serde_json::json!({
             "name": "trouve-code-review",
             "head_sha": job.head_sha,
@@ -3291,12 +3304,7 @@ impl Engine {
             !state.checks_write_configured && state.installation_count > 0
         };
         if checks_known_missing {
-            self.store.set_code_review_job_check_run(
-                &job.id,
-                None,
-                "",
-                "GitHub App needs repository permission: Checks (read and write)",
-            )?;
+            bail!("GitHub App needs repository permission: Checks (read and write)");
         } else {
             let (check, rate): (PublishedCheckRun, _) = if let Some(check_run_id) = job.check_run_id
             {
@@ -3427,10 +3435,13 @@ impl Engine {
         let mut ids = Vec::new();
         for page in 1..=REVIEW_COMMENT_MAX_PAGES {
             let (comments, rate): (Vec<GithubIssueComment>, _) = api
-                .get(&format!(
-                    "/repos/{}/issues/{}/comments?per_page={REVIEW_COMMENT_PAGE_SIZE}&page={page}",
-                    job.repository, job.pull_number
-                ))
+                .get_cached(
+                    &format!(
+                        "/repos/{}/issues/{}/comments?per_page={REVIEW_COMMENT_PAGE_SIZE}&page={page}",
+                        job.repository, job.pull_number
+                    ),
+                    &self.code_review.rest_cache,
+                )
                 .await?;
             self.record_review_rate(rate);
             let count = comments.len();
@@ -3626,6 +3637,37 @@ fn combine_projection_results(lifecycle: Result<()>, check: Result<()>) -> Resul
     }
 }
 
+fn projection_error_is_retryable(error: &anyhow::Error) -> bool {
+    let message = format!("{error:#}").to_ascii_lowercase();
+    projection_error_message_is_retryable(&message)
+}
+
+fn projection_error_message_is_retryable(message: &str) -> bool {
+    if let Some((lifecycle, check)) = message.split_once("; updating github check run failed:") {
+        return projection_error_message_is_retryable(lifecycle)
+            || projection_error_message_is_retryable(check);
+    }
+    if message.contains("rate limit")
+        || message.contains("github api 408")
+        || message.contains("github api 425")
+        || message.contains("github api 429")
+        || message.contains("github api 5")
+    {
+        return true;
+    }
+    ![
+        "github api 400",
+        "github api 401",
+        "github api 403",
+        "github api 404",
+        "github api 410",
+        "github api 422",
+        "needs repository permission",
+    ]
+    .iter()
+    .any(|non_retryable| message.contains(non_retryable))
+}
+
 fn lifecycle_comment_marker(job_id: &str) -> String {
     format!("<!-- trouve-code-review lifecycle job:{job_id} -->")
 }
@@ -3697,6 +3739,17 @@ fn render_check_details(detail: &trouve_protocol::CodeReviewJobDetail) -> String
     }
 
     body
+}
+
+fn bounded_check_details(details: &str) -> String {
+    if details.chars().count() <= CHECK_DETAILS_MAX_CHARS {
+        return details.to_owned();
+    }
+    let keep =
+        CHECK_DETAILS_MAX_CHARS.saturating_sub(CHECK_DETAILS_TRUNCATION_MARKER.chars().count());
+    let mut bounded = details.chars().take(keep).collect::<String>();
+    bounded.push_str(CHECK_DETAILS_TRUNCATION_MARKER);
+    bounded
 }
 
 fn markdown_table_cell(value: &str) -> String {
@@ -4806,6 +4859,17 @@ mod tests {
         assert!(!failed.trim().is_empty());
     }
 
+    #[test]
+    fn check_details_are_bounded_on_character_boundaries() {
+        let short = "Complete details";
+        assert_eq!(bounded_check_details(short), short);
+
+        let long = "🦀".repeat(CHECK_DETAILS_MAX_CHARS + 1);
+        let bounded = bounded_check_details(&long);
+        assert_eq!(bounded.chars().count(), CHECK_DETAILS_MAX_CHARS);
+        assert!(bounded.ends_with(CHECK_DETAILS_TRUNCATION_MARKER));
+    }
+
     #[tokio::test]
     async fn terminal_lifecycle_update_keeps_the_original_and_deletes_duplicates() {
         use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
@@ -4845,6 +4909,13 @@ mod tests {
                 "author_association": "NONE",
                 "issue_url": "https://api.github.com/repos/acme/widgets/issues/42",
                 "user": {"type": "Bot"}
+            },
+            {
+                "id": 12,
+                "body": format!("running\n{marker}"),
+                "author_association": "NONE",
+                "issue_url": "https://api.github.com/repos/acme/widgets/issues/42",
+                "user": {"type": "Bot"}
             }
         ]))
         .unwrap();
@@ -4865,7 +4936,12 @@ mod tests {
                 ),
                 (
                     "delete /repos/acme/widgets/issues/comments/11 http/1.1\r\n",
-                    "204 No Content",
+                    "404 Not Found",
+                    String::new(),
+                ),
+                (
+                    "delete /repos/acme/widgets/issues/comments/12 http/1.1\r\n",
+                    "410 Gone",
                     String::new(),
                 ),
             ] {
@@ -4920,6 +4996,30 @@ mod tests {
         .to_string();
         assert!(error.contains("review status comment failed: comment unavailable"));
         assert!(error.contains("Check Run failed: check unavailable"));
+    }
+
+    #[test]
+    fn projection_errors_retry_only_transient_failures() {
+        assert!(!projection_error_is_retryable(&anyhow!(
+            "GitHub API 422 Unprocessable Entity"
+        )));
+        assert!(!projection_error_is_retryable(&anyhow!(
+            "GitHub App needs repository permission: Checks (read and write)"
+        )));
+        assert!(projection_error_is_retryable(&anyhow!(
+            "GitHub API 403 secondary rate limit"
+        )));
+        assert!(projection_error_is_retryable(&anyhow!(
+            "sending request: connection reset"
+        )));
+        assert!(projection_error_is_retryable(&anyhow!(
+            "updating GitHub review status comment failed: GitHub API 404; \
+             updating GitHub Check Run failed: sending request"
+        )));
+        assert!(!projection_error_is_retryable(&anyhow!(
+            "updating GitHub review status comment failed: GitHub API 404; \
+             updating GitHub Check Run failed: GitHub API 422"
+        )));
     }
 
     #[test]
@@ -5170,6 +5270,17 @@ mod tests {
             parse_review_output("```json\n{\"summary\":\"ok\",\"findings\":[]}\n```").unwrap();
         assert_eq!(review.summary, "ok");
         assert!(review.findings.is_empty());
+    }
+
+    #[test]
+    fn parses_candidate_rejection_without_reason() {
+        let review = parse_review_output(
+            r#"{"summary":"ok","findings":[],"rejected_candidates":[{"candidate_id":"candidate-1"}]}"#,
+        )
+        .unwrap();
+        assert_eq!(review.rejected_candidates.len(), 1);
+        assert_eq!(review.rejected_candidates[0].candidate_id, "candidate-1");
+        assert!(review.rejected_candidates[0].reason.is_empty());
     }
 
     #[test]
@@ -5433,7 +5544,7 @@ mod tests {
     #[test]
     fn review_duration_settings_must_be_positive_seconds() {
         assert_eq!(DEFAULT_RECONCILE_INTERVAL, Duration::from_secs(60));
-        assert_eq!(DEFAULT_REVIEW_TIMEOUT, Duration::from_secs(5 * 60));
+        assert_eq!(DEFAULT_REVIEW_TIMEOUT, Duration::from_secs(15 * 60));
         assert_eq!(
             parse_code_review_poll_interval(" 15 "),
             Some(Duration::from_secs(15))

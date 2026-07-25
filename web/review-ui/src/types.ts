@@ -192,7 +192,7 @@ export interface JobDetail {
   tasks: ReviewTask[];
   personas: PersonaResult[];
   findings: Finding[];
-  candidate_rejections: CandidateRejection[];
+  candidate_rejections?: CandidateRejection[];
   summary: string;
   prompt_for_agents: string;
 }

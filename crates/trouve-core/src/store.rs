@@ -186,6 +186,9 @@ CREATE TABLE IF NOT EXISTS code_review_jobs (
   check_run_id INTEGER,
   check_run_url TEXT NOT NULL DEFAULT '',
   check_sync_error TEXT NOT NULL DEFAULT '',
+  projection_retry_count INTEGER NOT NULL DEFAULT 0,
+  projection_retry_at TEXT,
+  projection_retryable INTEGER NOT NULL DEFAULT 1,
   cancel_requested INTEGER NOT NULL DEFAULT 0,
   completed_reviewers INTEGER NOT NULL DEFAULT 0,
   total_reviewers INTEGER NOT NULL DEFAULT 0,
@@ -265,8 +268,8 @@ CREATE TABLE IF NOT EXISTS code_review_finding_sources (
   PRIMARY KEY (finding_id, candidate_id)
 );
 CREATE TABLE IF NOT EXISTS code_review_candidate_rejections (
-  candidate_id TEXT PRIMARY KEY,
   job_id TEXT NOT NULL REFERENCES code_review_jobs(id),
+  candidate_id TEXT NOT NULL,
   task_id TEXT NOT NULL,
   reviewer_id TEXT NOT NULL,
   reviewer_name TEXT NOT NULL,
@@ -276,10 +279,9 @@ CREATE TABLE IF NOT EXISTS code_review_candidate_rejections (
   severity TEXT NOT NULL,
   body TEXT NOT NULL,
   reason TEXT NOT NULL,
-  created_at TEXT NOT NULL
+  created_at TEXT NOT NULL,
+  PRIMARY KEY (job_id, candidate_id)
 );
-CREATE INDEX IF NOT EXISTS code_review_candidate_rejections_job
-  ON code_review_candidate_rejections (job_id, reviewer_id, candidate_id);
 CREATE TABLE IF NOT EXISTS code_review_pr_state (
   repository TEXT NOT NULL,
   pull_number INTEGER NOT NULL,
@@ -336,6 +338,9 @@ const MIGRATIONS: &[&str] = &[
     "ALTER TABLE code_review_jobs ADD COLUMN check_run_id INTEGER",
     "ALTER TABLE code_review_jobs ADD COLUMN check_run_url TEXT NOT NULL DEFAULT ''",
     "ALTER TABLE code_review_jobs ADD COLUMN check_sync_error TEXT NOT NULL DEFAULT ''",
+    "ALTER TABLE code_review_jobs ADD COLUMN projection_retry_count INTEGER NOT NULL DEFAULT 0",
+    "ALTER TABLE code_review_jobs ADD COLUMN projection_retry_at TEXT",
+    "ALTER TABLE code_review_jobs ADD COLUMN projection_retryable INTEGER NOT NULL DEFAULT 1",
     "ALTER TABLE code_review_jobs ADD COLUMN cancel_requested INTEGER NOT NULL DEFAULT 0",
     "ALTER TABLE code_review_jobs ADD COLUMN completed_reviewers INTEGER NOT NULL DEFAULT 0",
     "ALTER TABLE code_review_jobs ADD COLUMN total_reviewers INTEGER NOT NULL DEFAULT 0",
@@ -378,6 +383,15 @@ fn apply_migrations(conn: &Connection) -> Result<()> {
     }
     migrate_backend_sessions(conn)?;
     Ok(())
+}
+
+fn projection_retry_delay_seconds(attempt: u32) -> u64 {
+    const BASE_SECONDS: u64 = 60;
+    const MAX_SECONDS: u64 = 6 * 60 * 60;
+    let exponent = attempt.saturating_sub(1).min(9);
+    BASE_SECONDS
+        .saturating_mul(1_u64 << exponent)
+        .min(MAX_SECONDS)
 }
 
 /// Rebuild `backend_sessions` for databases created before it was keyed by
@@ -2451,10 +2465,16 @@ impl Store {
         let mut stmt = conn.prepare(&format!(
             "SELECT {CODE_REVIEW_JOB_COLUMNS} FROM code_review_jobs
              WHERE check_sync_error != ''
-             ORDER BY COALESCE(completed_at, started_at, created_at) DESC
-             LIMIT ?1"
+               AND projection_retryable != 0
+               AND (projection_retry_at IS NULL OR projection_retry_at <= ?1)
+             ORDER BY projection_retry_at,
+                      COALESCE(completed_at, started_at, created_at)
+             LIMIT ?2"
         ))?;
-        let rows = stmt.query_map(params![limit as i64], row_to_code_review_job)?;
+        let rows = stmt.query_map(
+            params![chrono::Utc::now().to_rfc3339(), limit as i64],
+            row_to_code_review_job,
+        )?;
         let records = rows.collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(records.into_iter().map(|record| record.job).collect())
     }
@@ -3694,7 +3714,13 @@ impl Store {
             "UPDATE code_review_jobs
              SET check_run_id = COALESCE(?2, check_run_id),
                  check_run_url = CASE WHEN ?3 = '' THEN check_run_url ELSE ?3 END,
-                 check_sync_error = ?4
+                 check_sync_error = ?4,
+                 projection_retry_count =
+                   CASE WHEN ?4 = '' THEN 0 ELSE projection_retry_count END,
+                 projection_retry_at =
+                   CASE WHEN ?4 = '' THEN NULL ELSE projection_retry_at END,
+                 projection_retryable =
+                   CASE WHEN ?4 = '' THEN 1 ELSE projection_retryable END
              WHERE id = ?1",
             params![
                 id,
@@ -3703,6 +3729,44 @@ impl Store {
                 sync_error
             ],
         )? > 0)
+    }
+
+    pub fn record_code_review_projection_failure(
+        &self,
+        id: &str,
+        error: &str,
+        retryable: bool,
+    ) -> Result<bool> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        let current_attempts = tx
+            .query_row(
+                "SELECT projection_retry_count FROM code_review_jobs WHERE id = ?1",
+                params![id],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()?;
+        let Some(current_attempts) = current_attempts else {
+            return Ok(false);
+        };
+        let attempts = u32::try_from(current_attempts)
+            .unwrap_or(u32::MAX)
+            .saturating_add(1);
+        let retry_at = retryable.then(|| {
+            let delay = projection_retry_delay_seconds(attempts);
+            (chrono::Utc::now() + chrono::Duration::seconds(delay as i64)).to_rfc3339()
+        });
+        tx.execute(
+            "UPDATE code_review_jobs
+             SET check_sync_error = ?2,
+                 projection_retry_count = ?3,
+                 projection_retry_at = ?4,
+                 projection_retryable = ?5
+             WHERE id = ?1",
+            params![id, error, i64::from(attempts), retry_at, retryable],
+        )?;
+        tx.commit()?;
+        Ok(true)
     }
 
     pub fn set_code_review_job_lifecycle_comment_url(&self, id: &str, url: &str) -> Result<bool> {
@@ -5610,14 +5674,43 @@ mod tests {
         assert_eq!(detail.findings[0].sources[0].task_id, task.id);
         assert_eq!(detail.prompt_for_agents, "Fix every confirmed issue.");
 
+        assert_eq!(projection_retry_delay_seconds(1), 60);
+        assert_eq!(projection_retry_delay_seconds(20), 6 * 60 * 60);
         store
-            .set_code_review_job_check_run(&queued.id, Some(99), "https://checks/99", "bad payload")
+            .record_code_review_projection_failure(&queued.id, "temporary failure", true)
+            .unwrap();
+        assert!(
+            store
+                .code_review_jobs_with_projection_errors(10)
+                .unwrap()
+                .is_empty()
+        );
+        store
+            .conn
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE code_review_jobs SET projection_retry_at = ?2 WHERE id = ?1",
+                params![
+                    queued.id,
+                    (chrono::Utc::now() - chrono::Duration::seconds(1)).to_rfc3339()
+                ],
+            )
             .unwrap();
         let projection_errors = store.code_review_jobs_with_projection_errors(10).unwrap();
         assert_eq!(projection_errors.len(), 1);
         assert_eq!(projection_errors[0].id, queued.id);
         store
             .set_code_review_job_check_run(&queued.id, None, "", "")
+            .unwrap();
+        assert!(
+            store
+                .code_review_jobs_with_projection_errors(10)
+                .unwrap()
+                .is_empty()
+        );
+        store
+            .record_code_review_projection_failure(&queued.id, "permanent failure", false)
             .unwrap();
         assert!(
             store
