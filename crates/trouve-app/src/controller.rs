@@ -3226,7 +3226,7 @@ impl Controller {
             .branches
             .iter()
             .position(|candidate| candidate == branch)
-            .unwrap_or(0);
+            .with_context(|| format!("review branch {branch} is not available locally"))?;
         // The reviewed branch chooses its model server-side. Do not carry the
         // provisional form's model-specific thinking key into that thread.
         self.new_chat_thinking_key = None;

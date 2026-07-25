@@ -1,7 +1,7 @@
 import { Chart, registerables } from "chart.js";
 import { render } from "preact";
 import type { ComponentChildren } from "preact";
-import { useEffect, useMemo, useRef, useState } from "preact/hooks";
+import { useCallback, useEffect, useMemo, useRef, useState } from "preact/hooks";
 import "./styles.css";
 import {
   api,
@@ -559,32 +559,30 @@ function JobDetailPane({
   const [error, setError] = useState("");
   const [busy, setBusy] = useState("");
   const now = useClock(detail?.job.status === "running");
-  const load = async (): Promise<void> => {
+  const aliveRef = useRef<string | null>(jobId);
+  const detailStatusRef = useRef(detail?.job.status);
+  detailStatusRef.current = detail?.job.status;
+  const load = useCallback(async (): Promise<void> => {
+    const requestedJobId = jobId;
     try {
-      setDetail(await getJob(jobId));
-      setError("");
-    } catch (cause) {
-      setError(cause instanceof Error ? cause.message : String(cause));
-    }
-  };
-  useEffect(() => {
-    setDetail(null);
-    let alive = true;
-    const timeouts = new Set<number>();
-    const reload = async (): Promise<void> => {
-      try {
-        const next = await getJob(jobId);
-        if (alive) {
-          setDetail(next);
-          setError("");
-        }
-      } catch (cause) {
-        if (alive) setError(cause instanceof Error ? cause.message : String(cause));
+      const next = await getJob(requestedJobId);
+      if (aliveRef.current === requestedJobId) {
+        setDetail(next);
+        setError("");
       }
-    };
-    void reload();
+    } catch (cause) {
+      if (aliveRef.current === requestedJobId) {
+        setError(cause instanceof Error ? cause.message : String(cause));
+      }
+    }
+  }, [jobId]);
+  useEffect(() => {
+    aliveRef.current = jobId;
+    setDetail(null);
+    const timeouts = new Set<number>();
+    void load();
     const close = openJobEvents(jobId, (event) => {
-      if (!alive) return;
+      if (aliveRef.current !== jobId) return;
       if (event.type === "code_review.output_delta" && event.task_id && event.text) {
         setDetail((current) => {
           if (!current) return current;
@@ -616,40 +614,35 @@ function JobDetailPane({
         });
         const timeout = window.setTimeout(() => {
           timeouts.delete(timeout);
-          void reload();
+          void load();
         }, 150);
         timeouts.add(timeout);
       } else {
-        void reload();
+        void load();
       }
     });
     return () => {
-      alive = false;
+      if (aliveRef.current === jobId) aliveRef.current = null;
       for (const timeout of timeouts) window.clearTimeout(timeout);
       close();
     };
-  }, [jobId]);
+  }, [jobId, load]);
 
   useEffect(() => {
-    if (detail?.job.status !== "running" && detail?.job.status !== "queued") return;
-    let alive = true;
-    const reload = async (): Promise<void> => {
-      try {
-        const next = await getJob(jobId);
-        if (alive) {
-          setDetail(next);
-          setError("");
-        }
-      } catch (cause) {
-        if (alive) setError(cause instanceof Error ? cause.message : String(cause));
+    aliveRef.current = jobId;
+    const timer = window.setInterval(() => {
+      if (
+        detailStatusRef.current === "running" ||
+        detailStatusRef.current === "queued"
+      ) {
+        void load();
       }
-    };
-    const timer = window.setInterval(() => void reload(), 3_000);
+    }, 3_000);
     return () => {
-      alive = false;
+      if (aliveRef.current === jobId) aliveRef.current = null;
       window.clearInterval(timer);
     };
-  }, [detail?.job.status, jobId]);
+  }, [jobId, load]);
 
   const act = async (action: "cancel" | "retry" | "full"): Promise<void> => {
     if (!detail) return;
@@ -1718,10 +1711,10 @@ function ProviderSettings({
     try {
       if (action === "install") {
         await installCli(id);
-        setCliStatuses({
-          ...cliStatuses,
+        setCliStatuses((current) => ({
+          ...current,
           [id]: { status: "pending", received_bytes: 0, total_bytes: 0 },
-        });
+        }));
         flash(`Installing ${id}…`);
       } else if (action === "cancel") {
         await cancelCliInstall(id);
