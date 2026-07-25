@@ -433,6 +433,12 @@ pub enum UiCommand {
         workspace_id: String,
         branch: String,
     },
+    /// Start a new agent thread with a first-party review remediation prompt.
+    PrFixClicked {
+        workspace_id: String,
+        branch: String,
+        prompt: String,
+    },
     /// Open the full-window automations screen.
     OpenAutomations,
     /// Leave the automations screen (back to chat / new-chat).
@@ -3041,6 +3047,7 @@ impl Controller {
                     .sessions
                     .iter()
                     .any(|s| s.workspace_id == pr.workspace_id && s.branch == pr.head);
+                let trouve_review = pr.trouve_review.as_ref();
                 let sort_key = match pr.merged_at {
                     Some(at) if group == "recently-merged" => -at.timestamp(),
                     _ => -(pr.number as i64),
@@ -3070,6 +3077,25 @@ impl Controller {
                         },
                         url: pr.url.clone(),
                         has_chat,
+                        has_trouve_review: trouve_review.is_some(),
+                        trouve_review_summary: trouve_review
+                            .map(|review| review.summary.clone())
+                            .unwrap_or_default(),
+                        trouve_review_prompt: trouve_review
+                            .map(|review| review.prompt_for_agents.clone())
+                            .unwrap_or_default(),
+                        trouve_review_findings: trouve_review
+                            .into_iter()
+                            .flat_map(|review| review.findings.iter())
+                            .filter(|finding| finding.status == "open")
+                            .map(|finding| ui::PrReviewFindingView {
+                                location: format!("{}:{}", finding.path, finding.line),
+                                severity: finding.severity.clone(),
+                                body: finding.body.clone(),
+                                prompt: finding.prompt_for_agents.clone(),
+                                status: finding.status.clone(),
+                            })
+                            .collect(),
                     },
                 ));
             }
@@ -3161,6 +3187,62 @@ impl Controller {
             ui::set_branches(&self.ui, self.branches.clone(), i as i32);
         }
         Ok(())
+    }
+
+    /// Open the reviewed branch in a dedicated thread and immediately hand
+    /// the agent the remediation prompt supplied by the first-party review.
+    async fn fix_pr_review(
+        &mut self,
+        workspace_id: &str,
+        branch: &str,
+        prompt: String,
+    ) -> Result<()> {
+        let mode_idx = self
+            .modes
+            .iter()
+            .position(|mode| mode.id == "code")
+            .unwrap_or_else(|| usize::try_from(default_mode_index(&self.modes)).unwrap_or(0));
+        let existing_session = self
+            .sessions
+            .iter()
+            .position(|session| session.workspace_id == workspace_id && session.branch == branch);
+        self.open_pr_chat(workspace_id, branch).await?;
+
+        if existing_session.is_some() {
+            self.create_thread(mode_idx, usize::MAX, serde_json::Map::new(), None)
+                .await?;
+            if let Some(thread_id) = self.current_thread_id() {
+                self.client.send_message(&thread_id, &prompt).await?;
+            }
+            return Ok(());
+        }
+
+        let workspace_idx = self
+            .workspaces
+            .iter()
+            .position(|workspace| workspace.id == workspace_id)
+            .context("review workspace is no longer registered")?;
+        let branch_idx = self
+            .branches
+            .iter()
+            .position(|candidate| candidate == branch)
+            .with_context(|| format!("review branch {branch} is not available locally"))?;
+        // The reviewed branch chooses its model server-side. Do not carry the
+        // provisional form's model-specific thinking key into that thread.
+        self.new_chat_thinking_key = None;
+        self.start_new_chat(
+            NewChatSelection {
+                workspace_idx,
+                branch_idx,
+                fetch_latest: true,
+                mode_idx,
+                model_idx: usize::MAX,
+                thinking_idx: 0,
+                permission_idx: 0,
+            },
+            prompt,
+        )
+        .await
     }
 
     /// Record a fresh integration snapshot: per-host state plus the "any
@@ -4211,6 +4293,7 @@ impl Controller {
             match &command {
                 UiCommand::SendMessage(_)
                 | UiCommand::StartNewChat { .. }
+                | UiCommand::PrFixClicked { .. }
                 | UiCommand::QueueEdit { .. }
                 | UiCommand::QueueDelete(_)
                 | UiCommand::QueueMove { .. }
@@ -5842,6 +5925,13 @@ impl Controller {
             } => {
                 self.open_pr_chat(&workspace_id, &branch).await?;
             }
+            UiCommand::PrFixClicked {
+                workspace_id,
+                branch,
+                prompt,
+            } => {
+                self.fix_pr_review(&workspace_id, &branch, prompt).await?;
+            }
             UiCommand::OpenAutomations => {
                 ui::set_automations_status(&self.ui, String::new());
                 self.push_automations(); // last known list while the fetch runs
@@ -7309,6 +7399,7 @@ mod tests {
             head_sha: None,
             checks: Vec::new(),
             reviews: Vec::new(),
+            trouve_review: None,
             author: "author".into(),
             requested_reviewers: Vec::new(),
             comments: 0,
@@ -7541,6 +7632,7 @@ mod tests {
             head_sha: None,
             checks: Vec::new(),
             reviews: Vec::new(),
+            trouve_review: None,
             author: String::new(),
             requested_reviewers: Vec::new(),
             comments: 0,

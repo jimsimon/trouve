@@ -16,6 +16,7 @@ pub enum Scope {
     Server,
     Session(SessionId),
     Thread(ThreadId),
+    CodeReviewJob(String),
 }
 
 /// The envelope every event is delivered in (and persisted as).
@@ -117,6 +118,14 @@ pub enum ToolStatus {
 #[serde(tag = "type")]
 pub enum Event {
     // --- thread scope -----------------------------------------------------
+    /// Shared/provider capacity has been acquired for this turn. Interactive
+    /// turns use the foreground lane; unattended review tasks use background.
+    #[serde(rename = "turn.capacity_acquired")]
+    TurnCapacityAcquired {
+        turn: u64,
+        wait_ms: u64,
+        background: bool,
+    },
     #[serde(rename = "turn.started")]
     TurnStarted {
         turn: u64,
@@ -248,6 +257,33 @@ pub enum Event {
     #[serde(rename = "worktree.removed")]
     WorktreeRemoved { path: String, branch: String },
 
+    // --- code-review-job scope ------------------------------------------
+    /// A reviewer or coordinator task changed durable state.
+    #[serde(rename = "code_review.task_updated")]
+    CodeReviewTaskUpdated {
+        job_id: String,
+        task: Box<crate::CodeReviewTask>,
+    },
+    /// Live output projected from the disposable agent thread into durable
+    /// review history.
+    #[serde(rename = "code_review.output_delta")]
+    CodeReviewOutputDelta {
+        job_id: String,
+        task_id: String,
+        stream: crate::CodeReviewOutputStream,
+        text: String,
+    },
+    /// Reviewer-level progress changed. Coordinator/summary work is exposed
+    /// on its task but does not inflate the reviewer count.
+    #[serde(rename = "code_review.progress_updated")]
+    CodeReviewProgressUpdated {
+        job_id: String,
+        progress: crate::CodeReviewProgress,
+    },
+    /// Other durable job state changed.
+    #[serde(rename = "code_review.job_updated")]
+    CodeReviewJobUpdated { job_id: String },
+
     // --- server scope -----------------------------------------------------
     #[serde(rename = "workspace.registered")]
     WorkspaceRegistered {
@@ -354,6 +390,17 @@ mod tests {
         })
         .unwrap();
         assert_eq!(review["type"], "code_review.updated");
+
+        let progress = serde_json::to_value(Event::CodeReviewProgressUpdated {
+            job_id: "rv_1".into(),
+            progress: crate::CodeReviewProgress {
+                completed_reviewers: 1,
+                total_reviewers: 2,
+                percent: 50,
+            },
+        })
+        .unwrap();
+        assert_eq!(progress["type"], "code_review.progress_updated");
     }
 
     #[test]

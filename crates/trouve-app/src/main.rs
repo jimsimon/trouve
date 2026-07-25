@@ -1201,6 +1201,16 @@ fn main() -> anyhow::Result<()> {
     }
     {
         let tx = tx.clone();
+        window.on_pr_fix_clicked(move |workspace_id, branch, prompt| {
+            let _ = tx.send(UiCommand::PrFixClicked {
+                workspace_id: workspace_id.to_string(),
+                branch: branch.to_string(),
+                prompt: prompt.to_string(),
+            });
+        });
+    }
+    {
+        let tx = tx.clone();
         window.on_open_automations(move || {
             let _ = tx.send(UiCommand::OpenAutomations);
         });

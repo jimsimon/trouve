@@ -6,6 +6,7 @@
 //! what was sent to/received from the model, which the event taxonomy does
 //! not try to encode.
 
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
@@ -176,14 +177,103 @@ CREATE TABLE IF NOT EXISTS code_review_jobs (
   error TEXT NOT NULL DEFAULT '',
   created_at TEXT NOT NULL,
   started_at TEXT,
-  completed_at TEXT
+  completed_at TEXT,
+  review_base_sha TEXT NOT NULL DEFAULT '',
+  review_scope TEXT NOT NULL DEFAULT 'incremental',
+  retry_of TEXT,
+  retried_by TEXT,
+  lifecycle_comment_url TEXT NOT NULL DEFAULT '',
+  check_run_id INTEGER,
+  check_run_url TEXT NOT NULL DEFAULT '',
+  check_sync_error TEXT NOT NULL DEFAULT '',
+  cancel_requested INTEGER NOT NULL DEFAULT 0,
+  completed_reviewers INTEGER NOT NULL DEFAULT 0,
+  total_reviewers INTEGER NOT NULL DEFAULT 0,
+  candidate_issue_count INTEGER NOT NULL DEFAULT 0,
+  issue_count INTEGER NOT NULL DEFAULT 0,
+  fixed_issue_count INTEGER NOT NULL DEFAULT 0,
+  summary TEXT NOT NULL DEFAULT '',
+  prompt_for_agents TEXT NOT NULL DEFAULT '',
+  publication_claimed INTEGER NOT NULL DEFAULT 0,
+  preparation_elapsed_ms INTEGER NOT NULL DEFAULT 0,
+  reviewer_elapsed_ms INTEGER NOT NULL DEFAULT 0,
+  coordinator_elapsed_ms INTEGER NOT NULL DEFAULT 0,
+  publication_elapsed_ms INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS code_review_jobs_status ON code_review_jobs (status, created_at);
+CREATE INDEX IF NOT EXISTS code_review_jobs_repository_history
+  ON code_review_jobs (repository, status, completed_at, created_at);
+CREATE TABLE IF NOT EXISTS code_review_tasks (
+  id TEXT PRIMARY KEY,
+  job_id TEXT NOT NULL REFERENCES code_review_jobs(id),
+  role TEXT NOT NULL,
+  reviewer_id TEXT,
+  reviewer_name TEXT NOT NULL DEFAULT '',
+  batch_index INTEGER NOT NULL DEFAULT 0,
+  batch_count INTEGER NOT NULL DEFAULT 0,
+  status TEXT NOT NULL DEFAULT 'queued',
+  model TEXT,
+  session_id TEXT,
+  thread_id TEXT,
+  prompt TEXT NOT NULL DEFAULT '',
+  output TEXT NOT NULL DEFAULT '',
+  thinking TEXT NOT NULL DEFAULT '',
+  tool_output TEXT NOT NULL DEFAULT '',
+  candidate_issue_count INTEGER NOT NULL DEFAULT 0,
+  confirmed_issue_count INTEGER NOT NULL DEFAULT 0,
+  provider_wait_ms INTEGER NOT NULL DEFAULT 0,
+  model_elapsed_ms INTEGER NOT NULL DEFAULT 0,
+  input_tokens INTEGER NOT NULL DEFAULT 0,
+  cached_input_tokens INTEGER NOT NULL DEFAULT 0,
+  output_tokens INTEGER NOT NULL DEFAULT 0,
+  tool_call_count INTEGER NOT NULL DEFAULT 0,
+  error TEXT NOT NULL DEFAULT '',
+  created_at TEXT NOT NULL,
+  started_at TEXT,
+  completed_at TEXT
+);
+CREATE INDEX IF NOT EXISTS code_review_tasks_job
+  ON code_review_tasks (job_id, role, reviewer_id, batch_index, created_at);
+CREATE INDEX IF NOT EXISTS code_review_tasks_stats
+  ON code_review_tasks (reviewer_id, model, status, completed_at);
+CREATE TABLE IF NOT EXISTS code_review_findings (
+  id TEXT PRIMARY KEY,
+  job_id TEXT NOT NULL REFERENCES code_review_jobs(id),
+  path TEXT NOT NULL,
+  line INTEGER NOT NULL,
+  side TEXT NOT NULL,
+  severity TEXT NOT NULL,
+  body TEXT NOT NULL,
+  prompt_for_agents TEXT NOT NULL DEFAULT '',
+  status TEXT NOT NULL DEFAULT 'open',
+  github_comment_id INTEGER,
+  github_comment_url TEXT NOT NULL DEFAULT '',
+  github_thread_id TEXT,
+  resolved_at TEXT,
+  created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS code_review_findings_job
+  ON code_review_findings (job_id, status);
+CREATE INDEX IF NOT EXISTS code_review_findings_open_pr
+  ON code_review_findings (status, job_id, path, line);
+CREATE TABLE IF NOT EXISTS code_review_finding_sources (
+  finding_id TEXT NOT NULL REFERENCES code_review_findings(id),
+  candidate_id TEXT NOT NULL,
+  task_id TEXT NOT NULL DEFAULT '',
+  reviewer_id TEXT NOT NULL,
+  reviewer_name TEXT NOT NULL,
+  PRIMARY KEY (finding_id, candidate_id)
+);
 CREATE TABLE IF NOT EXISTS code_review_pr_state (
   repository TEXT NOT NULL,
   pull_number INTEGER NOT NULL,
   manual_requested INTEGER NOT NULL DEFAULT 0,
   manual_generation INTEGER NOT NULL DEFAULT 0,
+  last_reviewed_head_sha TEXT NOT NULL DEFAULT '',
+  last_reviewed_base_sha TEXT NOT NULL DEFAULT '',
+  last_reviewed_at TEXT,
+  lifecycle_comment_id INTEGER,
+  lifecycle_comment_url TEXT NOT NULL DEFAULT '',
   PRIMARY KEY (repository, pull_number)
 );
 CREATE TABLE IF NOT EXISTS code_review_manual_requests (
@@ -222,8 +312,40 @@ const MIGRATIONS: &[&str] = &[
     "ALTER TABLE code_review_repositories ADD COLUMN reviewer_overrides TEXT NOT NULL DEFAULT '[]'",
     "ALTER TABLE code_review_jobs ADD COLUMN identities TEXT NOT NULL DEFAULT '[]'",
     "ALTER TABLE code_review_jobs ADD COLUMN config_hash TEXT NOT NULL DEFAULT ''",
+    "ALTER TABLE code_review_jobs ADD COLUMN review_base_sha TEXT NOT NULL DEFAULT ''",
+    "ALTER TABLE code_review_jobs ADD COLUMN review_scope TEXT NOT NULL DEFAULT 'incremental'",
+    "ALTER TABLE code_review_jobs ADD COLUMN retry_of TEXT",
+    "ALTER TABLE code_review_jobs ADD COLUMN retried_by TEXT",
+    "ALTER TABLE code_review_jobs ADD COLUMN lifecycle_comment_url TEXT NOT NULL DEFAULT ''",
+    "ALTER TABLE code_review_jobs ADD COLUMN check_run_id INTEGER",
+    "ALTER TABLE code_review_jobs ADD COLUMN check_run_url TEXT NOT NULL DEFAULT ''",
+    "ALTER TABLE code_review_jobs ADD COLUMN check_sync_error TEXT NOT NULL DEFAULT ''",
+    "ALTER TABLE code_review_jobs ADD COLUMN cancel_requested INTEGER NOT NULL DEFAULT 0",
+    "ALTER TABLE code_review_jobs ADD COLUMN completed_reviewers INTEGER NOT NULL DEFAULT 0",
+    "ALTER TABLE code_review_jobs ADD COLUMN total_reviewers INTEGER NOT NULL DEFAULT 0",
+    "ALTER TABLE code_review_jobs ADD COLUMN candidate_issue_count INTEGER NOT NULL DEFAULT 0",
+    "ALTER TABLE code_review_jobs ADD COLUMN issue_count INTEGER NOT NULL DEFAULT 0",
+    "ALTER TABLE code_review_jobs ADD COLUMN fixed_issue_count INTEGER NOT NULL DEFAULT 0",
+    "ALTER TABLE code_review_jobs ADD COLUMN summary TEXT NOT NULL DEFAULT ''",
+    "ALTER TABLE code_review_jobs ADD COLUMN prompt_for_agents TEXT NOT NULL DEFAULT ''",
+    "ALTER TABLE code_review_jobs ADD COLUMN publication_claimed INTEGER NOT NULL DEFAULT 0",
+    "ALTER TABLE code_review_jobs ADD COLUMN preparation_elapsed_ms INTEGER NOT NULL DEFAULT 0",
+    "ALTER TABLE code_review_jobs ADD COLUMN reviewer_elapsed_ms INTEGER NOT NULL DEFAULT 0",
+    "ALTER TABLE code_review_jobs ADD COLUMN coordinator_elapsed_ms INTEGER NOT NULL DEFAULT 0",
+    "ALTER TABLE code_review_jobs ADD COLUMN publication_elapsed_ms INTEGER NOT NULL DEFAULT 0",
+    "ALTER TABLE code_review_pr_state ADD COLUMN last_reviewed_head_sha TEXT NOT NULL DEFAULT ''",
+    "ALTER TABLE code_review_pr_state ADD COLUMN last_reviewed_base_sha TEXT NOT NULL DEFAULT ''",
+    "ALTER TABLE code_review_pr_state ADD COLUMN last_reviewed_at TEXT",
+    "ALTER TABLE code_review_pr_state ADD COLUMN lifecycle_comment_id INTEGER",
+    "ALTER TABLE code_review_pr_state ADD COLUMN lifecycle_comment_url TEXT NOT NULL DEFAULT ''",
     "ALTER TABLE code_review_identities ADD COLUMN thinking_level TEXT",
     "ALTER TABLE code_review_identities ADD COLUMN built_in INTEGER NOT NULL DEFAULT 0",
+    "ALTER TABLE code_review_tasks ADD COLUMN provider_wait_ms INTEGER NOT NULL DEFAULT 0",
+    "ALTER TABLE code_review_tasks ADD COLUMN model_elapsed_ms INTEGER NOT NULL DEFAULT 0",
+    "ALTER TABLE code_review_tasks ADD COLUMN input_tokens INTEGER NOT NULL DEFAULT 0",
+    "ALTER TABLE code_review_tasks ADD COLUMN cached_input_tokens INTEGER NOT NULL DEFAULT 0",
+    "ALTER TABLE code_review_tasks ADD COLUMN output_tokens INTEGER NOT NULL DEFAULT 0",
+    "ALTER TABLE code_review_tasks ADD COLUMN tool_call_count INTEGER NOT NULL DEFAULT 0",
     // Context-size proxy for compaction/UI: the input tokens of the turn's
     // *last* request, not the sum over its iterations (see record_usage).
     "ALTER TABLE usage ADD COLUMN context_input_tokens INTEGER NOT NULL DEFAULT 0",
@@ -341,6 +463,49 @@ fn parse_optional_datetime(value: Option<String>) -> Option<chrono::DateTime<chr
     value.and_then(|value| value.parse().ok())
 }
 
+fn code_review_scope_from(value: &str) -> trouve_protocol::CodeReviewJobScope {
+    match value {
+        "full" => trouve_protocol::CodeReviewJobScope::Full,
+        _ => trouve_protocol::CodeReviewJobScope::Incremental,
+    }
+}
+
+fn code_review_scope_str(value: trouve_protocol::CodeReviewJobScope) -> &'static str {
+    match value {
+        trouve_protocol::CodeReviewJobScope::Incremental => "incremental",
+        trouve_protocol::CodeReviewJobScope::Full => "full",
+    }
+}
+
+fn elapsed_ms(
+    started: chrono::DateTime<chrono::Utc>,
+    finished: chrono::DateTime<chrono::Utc>,
+) -> u64 {
+    finished
+        .signed_duration_since(started)
+        .num_milliseconds()
+        .max(0) as u64
+}
+
+fn job_elapsed_ms(
+    status: &str,
+    created_at: chrono::DateTime<chrono::Utc>,
+    started_at: Option<chrono::DateTime<chrono::Utc>>,
+    completed_at: Option<chrono::DateTime<chrono::Utc>>,
+) -> (u64, u64) {
+    let now = chrono::Utc::now();
+    let pending_end = started_at.or(completed_at).unwrap_or(now);
+    let pending = elapsed_ms(created_at, pending_end);
+    let running = started_at
+        .map(|started| elapsed_ms(started, completed_at.unwrap_or(now)))
+        .unwrap_or(0);
+    if status == "queued" {
+        (elapsed_ms(created_at, now), 0)
+    } else {
+        (pending, running)
+    }
+}
+
 fn row_to_code_review_repository(
     r: &rusqlite::Row<'_>,
 ) -> rusqlite::Result<trouve_protocol::CodeReviewRepository> {
@@ -370,9 +535,12 @@ pub struct NewCodeReviewJob {
     pub pull_title: String,
     pub pull_url: String,
     pub head_sha: String,
+    pub review_base_sha: String,
     pub base_ref: String,
     pub head_ref: String,
+    pub scope: trouve_protocol::CodeReviewJobScope,
     pub trigger: String,
+    pub retry_of: Option<String>,
     pub model: Option<String>,
     pub prompt: String,
     pub reviewers: Vec<trouve_protocol::ReviewerProfile>,
@@ -390,11 +558,34 @@ pub struct CodeReviewJobRecord {
     pub job: trouve_protocol::CodeReviewJob,
     pub prompt: String,
     pub reviewers: Vec<trouve_protocol::ReviewerProfile>,
+    pub summary: String,
+    pub prompt_for_agents: String,
+    pub publication_claimed: bool,
 }
 
 fn row_to_code_review_job(r: &rusqlite::Row<'_>) -> rusqlite::Result<CodeReviewJobRecord> {
     let reviewers: Vec<trouve_protocol::ReviewerProfile> =
         serde_json::from_str(&r.get::<_, String>(13)?).unwrap_or_default();
+    let created_at = parse_datetime(r.get(19)?);
+    let started_at = parse_optional_datetime(r.get(20)?);
+    let completed_at = parse_optional_datetime(r.get(21)?);
+    let status: String = r.get(10)?;
+    let completed_reviewers = r.get::<_, i64>(31)? as u64;
+    let total_reviewers = r.get::<_, i64>(32)? as u64;
+    let percent = completed_reviewers
+        .saturating_mul(100)
+        .checked_div(total_reviewers)
+        .map(|value| value.min(100) as u8)
+        .unwrap_or_else(|| {
+            u8::from(matches!(
+                status.as_str(),
+                "succeeded" | "failed" | "cancelled" | "stale"
+            )) * 100
+        });
+    let (pending_elapsed_ms, running_elapsed_ms) =
+        job_elapsed_ms(&status, created_at, started_at, completed_at);
+    let base_ref: String = r.get(7)?;
+    let review_base_sha: String = r.get(22)?;
     Ok(CodeReviewJobRecord {
         job: trouve_protocol::CodeReviewJob {
             id: r.get(0)?,
@@ -404,10 +595,18 @@ fn row_to_code_review_job(r: &rusqlite::Row<'_>) -> rusqlite::Result<CodeReviewJ
             pull_title: r.get(4)?,
             pull_url: r.get(5)?,
             head_sha: r.get(6)?,
-            base_ref: r.get(7)?,
+            review_base_sha: if review_base_sha.is_empty() {
+                base_ref.clone()
+            } else {
+                review_base_sha
+            },
+            base_ref,
             head_ref: r.get(8)?,
+            scope: code_review_scope_from(&r.get::<_, String>(23)?),
             trigger: r.get(9)?,
-            status: r.get(10)?,
+            status,
+            retry_of: r.get(24)?,
+            retried_by: r.get(25)?,
             model: r.get(11)?,
             reviewer_ids: reviewers
                 .iter()
@@ -416,19 +615,329 @@ fn row_to_code_review_job(r: &rusqlite::Row<'_>) -> rusqlite::Result<CodeReviewJ
             session_id: r.get(15)?,
             thread_id: r.get(16)?,
             review_url: r.get(17)?,
+            lifecycle_comment_url: r.get(26)?,
+            check_run_id: r.get::<_, Option<i64>>(27)?.map(|value| value as u64),
+            check_run_url: r.get(28)?,
+            check_sync_error: r.get(29)?,
+            cancel_requested: r.get(30)?,
+            progress: trouve_protocol::CodeReviewProgress {
+                completed_reviewers,
+                total_reviewers,
+                percent,
+            },
+            candidate_issue_count: r.get::<_, i64>(33)? as u64,
+            issue_count: r.get::<_, i64>(34)? as u64,
+            fixed_issue_count: r.get::<_, i64>(35)? as u64,
             error: r.get(18)?,
-            created_at: parse_datetime(r.get(19)?),
-            started_at: parse_optional_datetime(r.get(20)?),
-            completed_at: parse_optional_datetime(r.get(21)?),
+            created_at,
+            started_at,
+            completed_at,
+            pending_elapsed_ms,
+            running_elapsed_ms,
+            preparation_elapsed_ms: r.get::<_, i64>(39)? as u64,
+            reviewer_elapsed_ms: r.get::<_, i64>(40)? as u64,
+            coordinator_elapsed_ms: r.get::<_, i64>(41)? as u64,
+            publication_elapsed_ms: r.get::<_, i64>(42)? as u64,
         },
         prompt: r.get(12)?,
         reviewers,
+        summary: r.get(36)?,
+        prompt_for_agents: r.get(37)?,
+        publication_claimed: r.get(38)?,
     })
 }
 
 const CODE_REVIEW_JOB_COLUMNS: &str = "id, installation_id, repository, pull_number, pull_title, pull_url, head_sha, \
      base_ref, head_ref, trigger, status, model, prompt, identities, config_hash, session_id, thread_id, \
-     review_url, error, created_at, started_at, completed_at";
+     review_url, error, created_at, started_at, completed_at, review_base_sha, review_scope, retry_of, \
+     retried_by, lifecycle_comment_url, check_run_id, check_run_url, check_sync_error, cancel_requested, \
+     completed_reviewers, total_reviewers, candidate_issue_count, issue_count, fixed_issue_count, summary, \
+     prompt_for_agents, publication_claimed, preparation_elapsed_ms, reviewer_elapsed_ms, \
+     coordinator_elapsed_ms, publication_elapsed_ms";
+
+#[derive(Debug, Clone)]
+pub struct NewCodeReviewTask {
+    pub job_id: String,
+    pub role: trouve_protocol::CodeReviewTaskRole,
+    pub reviewer_id: Option<String>,
+    pub reviewer_name: String,
+    pub batch_index: u64,
+    pub batch_count: u64,
+    pub model: Option<String>,
+    pub prompt: String,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct CodeReviewTaskMetrics {
+    pub model_elapsed_ms: u64,
+    pub input_tokens: u64,
+    pub cached_input_tokens: u64,
+    pub output_tokens: u64,
+    pub tool_call_count: u64,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum CodeReviewJobPhase {
+    Preparation,
+    Reviewers,
+    Coordinator,
+    Publication,
+}
+
+fn code_review_task_role_str(role: trouve_protocol::CodeReviewTaskRole) -> &'static str {
+    match role {
+        trouve_protocol::CodeReviewTaskRole::Reviewer => "reviewer",
+        trouve_protocol::CodeReviewTaskRole::Coordinator => "coordinator",
+    }
+}
+
+fn code_review_task_role_from(value: &str) -> trouve_protocol::CodeReviewTaskRole {
+    match value {
+        "coordinator" => trouve_protocol::CodeReviewTaskRole::Coordinator,
+        _ => trouve_protocol::CodeReviewTaskRole::Reviewer,
+    }
+}
+
+fn row_to_code_review_task(
+    r: &rusqlite::Row<'_>,
+) -> rusqlite::Result<trouve_protocol::CodeReviewTask> {
+    let created_at = parse_datetime(r.get(24)?);
+    let started_at = parse_optional_datetime(r.get(25)?);
+    let completed_at = parse_optional_datetime(r.get(26)?);
+    let elapsed = started_at
+        .map(|started| elapsed_ms(started, completed_at.unwrap_or_else(chrono::Utc::now)))
+        .unwrap_or(0);
+    Ok(trouve_protocol::CodeReviewTask {
+        id: r.get(0)?,
+        job_id: r.get(1)?,
+        role: code_review_task_role_from(&r.get::<_, String>(2)?),
+        reviewer_id: r.get(3)?,
+        reviewer_name: r.get(4)?,
+        batch_index: r.get::<_, i64>(5)? as u64,
+        batch_count: r.get::<_, i64>(6)? as u64,
+        status: r.get(7)?,
+        model: r.get(8)?,
+        session_id: r.get(9)?,
+        thread_id: r.get(10)?,
+        prompt: r.get(11)?,
+        output: r.get(12)?,
+        thinking: r.get(13)?,
+        tool_output: r.get(14)?,
+        candidate_issue_count: r.get::<_, i64>(15)? as u64,
+        confirmed_issue_count: r.get::<_, i64>(16)? as u64,
+        provider_wait_ms: r.get::<_, i64>(17)? as u64,
+        model_elapsed_ms: r.get::<_, i64>(18)? as u64,
+        input_tokens: r.get::<_, i64>(19)? as u64,
+        cached_input_tokens: r.get::<_, i64>(20)? as u64,
+        output_tokens: r.get::<_, i64>(21)? as u64,
+        tool_call_count: r.get::<_, i64>(22)? as u64,
+        error: r.get(23)?,
+        created_at,
+        started_at,
+        completed_at,
+        elapsed_ms: elapsed,
+    })
+}
+
+const CODE_REVIEW_TASK_COLUMNS: &str = "id, job_id, role, reviewer_id, reviewer_name, batch_index, \
+     batch_count, status, model, session_id, thread_id, prompt, output, thinking, tool_output, \
+     candidate_issue_count, confirmed_issue_count, provider_wait_ms, model_elapsed_ms, input_tokens, \
+     cached_input_tokens, output_tokens, tool_call_count, error, created_at, started_at, completed_at";
+
+#[derive(Debug, Clone)]
+pub struct NewCodeReviewFinding {
+    pub path: String,
+    pub line: u64,
+    pub side: String,
+    pub severity: String,
+    pub body: String,
+    pub prompt_for_agents: String,
+    pub sources: Vec<trouve_protocol::CodeReviewFindingSource>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct CodeReviewPullStateRecord {
+    pub last_reviewed_head_sha: String,
+    pub last_reviewed_base_sha: String,
+    pub last_reviewed_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub lifecycle_comment_id: Option<u64>,
+    pub lifecycle_comment_url: String,
+}
+
+fn code_review_persona_results(
+    tasks: &[trouve_protocol::CodeReviewTask],
+) -> Vec<trouve_protocol::CodeReviewPersonaResult> {
+    let mut grouped: BTreeMap<String, Vec<&trouve_protocol::CodeReviewTask>> = BTreeMap::new();
+    for task in tasks {
+        if task.role == trouve_protocol::CodeReviewTaskRole::Reviewer
+            && let Some(reviewer_id) = task.reviewer_id.as_ref()
+        {
+            grouped.entry(reviewer_id.clone()).or_default().push(task);
+        }
+    }
+    grouped
+        .into_iter()
+        .map(|(reviewer_id, tasks)| {
+            let mut models = BTreeSet::new();
+            let mut started_at = None;
+            let mut completed_at = None;
+            let mut all_terminal = true;
+            let mut has_running = false;
+            let mut has_queued = false;
+            let mut has_failed = false;
+            let mut has_cancelled = false;
+            let mut all_succeeded = true;
+            let mut completed_batches = 0_u64;
+            let mut total_batches = 0_u64;
+            let mut candidate_issue_count = 0_u64;
+            let mut confirmed_issue_count = 0_u64;
+            let mut provider_wait_ms = 0_u64;
+            let mut model_elapsed_ms = 0_u64;
+            let mut input_tokens = 0_u64;
+            let mut cached_input_tokens = 0_u64;
+            let mut output_tokens = 0_u64;
+            let mut tool_call_count = 0_u64;
+            for task in &tasks {
+                total_batches = total_batches.max(task.batch_count);
+                if let Some(model) = &task.model {
+                    models.insert(model.clone());
+                }
+                if let Some(started) = task.started_at {
+                    started_at = Some(
+                        started_at.map_or(started, |current: chrono::DateTime<chrono::Utc>| {
+                            current.min(started)
+                        }),
+                    );
+                }
+                if let Some(completed) = task.completed_at {
+                    completed_at = Some(
+                        completed_at.map_or(completed, |current: chrono::DateTime<chrono::Utc>| {
+                            current.max(completed)
+                        }),
+                    );
+                }
+                let terminal = matches!(
+                    task.status.as_str(),
+                    "succeeded" | "failed" | "cancelled" | "not_applicable"
+                );
+                if terminal {
+                    completed_batches += 1;
+                } else {
+                    all_terminal = false;
+                }
+                has_running |= task.status == "running";
+                has_queued |= task.status == "queued";
+                has_failed |= task.status == "failed";
+                has_cancelled |= task.status == "cancelled";
+                all_succeeded &= task.status == "succeeded";
+                candidate_issue_count += task.candidate_issue_count;
+                confirmed_issue_count += task.confirmed_issue_count;
+                provider_wait_ms += task.provider_wait_ms;
+                model_elapsed_ms += task.model_elapsed_ms;
+                input_tokens += task.input_tokens;
+                cached_input_tokens += task.cached_input_tokens;
+                output_tokens += task.output_tokens;
+                tool_call_count += task.tool_call_count;
+            }
+            all_terminal &= completed_batches >= total_batches;
+            if !all_terminal {
+                completed_at = None;
+            }
+            let status = if has_running {
+                "running"
+            } else if has_queued {
+                "queued"
+            } else if all_succeeded && all_terminal {
+                "succeeded"
+            } else if all_terminal && tasks.iter().all(|task| task.status == "not_applicable") {
+                "not_applicable"
+            } else if has_failed {
+                "failed"
+            } else if has_cancelled {
+                "cancelled"
+            } else {
+                "queued"
+            };
+            let elapsed = started_at
+                .map(|started| elapsed_ms(started, completed_at.unwrap_or_else(chrono::Utc::now)))
+                .unwrap_or(0);
+            trouve_protocol::CodeReviewPersonaResult {
+                reviewer_id,
+                reviewer_name: tasks
+                    .first()
+                    .map(|task| task.reviewer_name.clone())
+                    .unwrap_or_default(),
+                status: status.into(),
+                models: models.into_iter().collect(),
+                completed_batches,
+                total_batches,
+                candidate_issue_count,
+                confirmed_issue_count,
+                provider_wait_ms,
+                model_elapsed_ms,
+                input_tokens,
+                cached_input_tokens,
+                output_tokens,
+                tool_call_count,
+                started_at,
+                completed_at,
+                elapsed_ms: elapsed,
+            }
+        })
+        .collect()
+}
+
+fn code_review_status_add(counts: &mut trouve_protocol::CodeReviewStatusCounts, status: &str) {
+    match status {
+        "queued" => counts.queued += 1,
+        "running" => counts.running += 1,
+        "succeeded" => counts.succeeded += 1,
+        "failed" => counts.failed += 1,
+        "cancelled" => counts.cancelled += 1,
+        "stale" => counts.stale += 1,
+        _ => {}
+    }
+}
+
+fn code_review_duration_stats(mut samples: Vec<u64>) -> trouve_protocol::CodeReviewDurationStats {
+    if samples.is_empty() {
+        return trouve_protocol::CodeReviewDurationStats::default();
+    }
+    samples.sort_unstable();
+    let sum = samples.iter().map(|value| u128::from(*value)).sum::<u128>();
+    let percentile = |numerator: usize, denominator: usize| -> u64 {
+        let index = ((samples.len() - 1) * numerator).div_ceil(denominator);
+        samples[index.min(samples.len() - 1)]
+    };
+    trouve_protocol::CodeReviewDurationStats {
+        samples: samples.len() as u64,
+        average_ms: (sum / samples.len() as u128) as u64,
+        p50_ms: percentile(50, 100),
+        p95_ms: percentile(95, 100),
+        maximum_ms: *samples.last().unwrap_or(&0),
+    }
+}
+
+fn push_nonzero_duration(samples: &mut Vec<u64>, duration_ms: u64) {
+    if duration_ms > 0 {
+        samples.push(duration_ms);
+    }
+}
+
+fn code_review_stats_start(
+    range: trouve_protocol::CodeReviewStatsRange,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Option<chrono::DateTime<chrono::Utc>> {
+    let duration = match range {
+        trouve_protocol::CodeReviewStatsRange::Hour => chrono::Duration::hours(1),
+        trouve_protocol::CodeReviewStatsRange::Day => chrono::Duration::days(1),
+        trouve_protocol::CodeReviewStatsRange::Week => chrono::Duration::weeks(1),
+        trouve_protocol::CodeReviewStatsRange::Month => chrono::Duration::days(30),
+        trouve_protocol::CodeReviewStatsRange::Year => chrono::Duration::days(365),
+        trouve_protocol::CodeReviewStatsRange::All => return None,
+    };
+    Some(now - duration)
+}
 
 pub enum UsageScope<'a> {
     Thread(&'a str),
@@ -458,10 +967,13 @@ pub struct EventReplayPage {
 }
 
 /// Shared handle to the database plus the live event fan-out.
+type ScopedEventSenders = Arc<Mutex<HashMap<(String, String), broadcast::Sender<EventEnvelope>>>>;
+
 #[derive(Clone)]
 pub struct Store {
     conn: Arc<Mutex<Connection>>,
     events_tx: broadcast::Sender<EventEnvelope>,
+    scoped_events: ScopedEventSenders,
     append_tx: std::sync::mpsc::Sender<AppendRequest>,
 }
 
@@ -500,6 +1012,7 @@ fn scope_cols(scope: &Scope) -> (&'static str, String) {
         Scope::Server => ("server", String::new()),
         Scope::Session(id) => ("session", id.clone()),
         Scope::Thread(id) => ("thread", id.clone()),
+        Scope::CodeReviewJob(id) => ("code_review_job", id.clone()),
     }
 }
 
@@ -507,6 +1020,7 @@ fn scope_from_cols(kind: &str, id: String) -> Scope {
     match kind {
         "session" => Scope::Session(id),
         "thread" => Scope::Thread(id),
+        "code_review_job" => Scope::CodeReviewJob(id),
         _ => Scope::Server,
     }
 }
@@ -522,6 +1036,7 @@ fn scope_from_cols(kind: &str, id: String) -> Scope {
 fn spawn_event_writer(
     conn: Arc<Mutex<Connection>>,
     events_tx: broadcast::Sender<EventEnvelope>,
+    scoped_events: ScopedEventSenders,
 ) -> std::sync::mpsc::Sender<AppendRequest> {
     let (tx, rx) = std::sync::mpsc::channel::<AppendRequest>();
     std::thread::Builder::new()
@@ -550,6 +1065,13 @@ fn spawn_event_writer(
                             // Nobody listening is fine; a caller that gave up
                             // waiting is too.
                             let _ = events_tx.send(envelope.clone());
+                            let key = {
+                                let (kind, id) = scope_cols(&envelope.scope);
+                                (kind.to_owned(), id)
+                            };
+                            if let Some(sender) = scoped_events.lock().unwrap().get(&key) {
+                                let _ = sender.send(envelope.clone());
+                            }
                             let _ = req.reply.send(Ok(envelope));
                         }
                     }
@@ -623,10 +1145,16 @@ impl Store {
     fn from_conn(conn: Connection) -> Self {
         let conn = Arc::new(Mutex::new(conn));
         let (events_tx, _) = broadcast::channel(4096);
-        let append_tx = spawn_event_writer(Arc::clone(&conn), events_tx.clone());
+        let scoped_events = Arc::new(Mutex::new(HashMap::new()));
+        let append_tx = spawn_event_writer(
+            Arc::clone(&conn),
+            events_tx.clone(),
+            Arc::clone(&scoped_events),
+        );
         Self {
             conn,
             events_tx,
+            scoped_events,
             append_tx,
         }
     }
@@ -817,6 +1345,22 @@ impl Store {
     /// Live subscription to all events; callers filter by scope.
     pub fn subscribe(&self) -> broadcast::Receiver<EventEnvelope> {
         self.events_tx.subscribe()
+    }
+
+    /// Live subscription to exactly one event scope. Persisted replay still
+    /// comes from `events_after`; this channel only avoids waking every active
+    /// thread and SSE follower for unrelated live events.
+    pub fn subscribe_scope(&self, scope: &Scope) -> broadcast::Receiver<EventEnvelope> {
+        let (kind, id) = scope_cols(scope);
+        let key = (kind.to_owned(), id);
+        let mut senders = self.scoped_events.lock().unwrap();
+        if senders.len() > 1_024 {
+            senders.retain(|_, sender| sender.receiver_count() > 0);
+        }
+        senders
+            .entry(key)
+            .or_insert_with(|| broadcast::channel(1_024).0)
+            .subscribe()
     }
 
     // --- workspaces ---------------------------------------------------------
@@ -1751,9 +2295,10 @@ impl Store {
             "INSERT OR IGNORE INTO code_review_jobs
                     (id, dedupe_key, installation_id, repository, pull_number, pull_title,
                      pull_url, head_sha, base_ref, head_ref, trigger, status, model, prompt,
-                     identities, config_hash, created_at)
+                     identities, config_hash, created_at, review_base_sha, review_scope,
+                     retry_of, total_reviewers)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, 'queued',
-                     ?12, ?13, ?14, ?15, ?16)",
+                     ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20)",
             params![
                 id,
                 new_job.dedupe_key,
@@ -1771,6 +2316,10 @@ impl Store {
                 reviewers,
                 new_job.config_hash,
                 now,
+                new_job.review_base_sha,
+                code_review_scope_str(new_job.scope),
+                new_job.retry_of,
+                new_job.reviewers.len() as i64,
             ],
         )?;
         if inserted == 0 {
@@ -1845,12 +2394,32 @@ impl Store {
         &self,
         limit: usize,
     ) -> Result<Vec<trouve_protocol::CodeReviewJob>> {
+        self.list_code_review_jobs_filtered(limit, None, None)
+    }
+
+    pub fn list_code_review_jobs_filtered(
+        &self,
+        limit: usize,
+        status: Option<&str>,
+        repository: Option<&str>,
+    ) -> Result<Vec<trouve_protocol::CodeReviewJob>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(&format!(
             "SELECT {CODE_REVIEW_JOB_COLUMNS} FROM code_review_jobs
-             ORDER BY created_at DESC LIMIT ?1"
+             WHERE (?1 IS NULL OR status = ?1)
+               AND (?2 IS NULL OR repository = ?2)
+             ORDER BY
+               CASE status WHEN 'running' THEN 0 WHEN 'queued' THEN 1 ELSE 2 END,
+               CASE WHEN status = 'queued' THEN created_at END ASC,
+               CASE WHEN status NOT IN ('running', 'queued')
+                    THEN COALESCE(completed_at, created_at) END DESC,
+               created_at DESC
+             LIMIT ?3"
         ))?;
-        let rows = stmt.query_map(params![limit as i64], row_to_code_review_job)?;
+        let rows = stmt.query_map(
+            params![status, repository, limit as i64],
+            row_to_code_review_job,
+        )?;
         let records = rows.collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(records.into_iter().map(|record| record.job).collect())
     }
@@ -1879,12 +2448,26 @@ impl Store {
     }
 
     pub fn recover_code_review_jobs(&self) -> Result<()> {
-        self.conn.lock().unwrap().execute(
-            "UPDATE code_review_jobs SET status = 'queued', started_at = NULL,
-                    error = 'server restarted while review was running'
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        let now = chrono::Utc::now().to_rfc3339();
+        tx.execute(
+            "UPDATE code_review_tasks
+             SET status = 'failed', completed_at = ?1,
+                 error = 'server restarted while task was running'
+             WHERE status IN ('queued', 'running')
+               AND job_id IN (SELECT id FROM code_review_jobs WHERE status = 'running')",
+            params![now],
+        )?;
+        tx.execute(
+            "UPDATE code_review_jobs
+             SET status = 'queued', started_at = NULL, cancel_requested = 0,
+                 publication_claimed = 0,
+                 error = 'server restarted while review was running'
              WHERE status = 'running'",
             [],
         )?;
+        tx.commit()?;
         Ok(())
     }
 
@@ -1904,7 +2487,9 @@ impl Store {
             return Ok(None);
         };
         tx.execute(
-            "UPDATE code_review_jobs SET status = 'running', started_at = ?2, error = ''
+            "UPDATE code_review_jobs
+             SET status = 'running', started_at = ?2, completed_at = NULL,
+                 cancel_requested = 0, publication_claimed = 0, error = ''
              WHERE id = ?1 AND status = 'queued'",
             params![id, chrono::Utc::now().to_rfc3339()],
         )?;
@@ -1931,6 +2516,901 @@ impl Store {
         Ok(updated > 0)
     }
 
+    pub fn set_code_review_job_review_base(&self, id: &str, review_base_sha: &str) -> Result<bool> {
+        Ok(self.conn.lock().unwrap().execute(
+            "UPDATE code_review_jobs SET review_base_sha = ?2
+             WHERE id = ?1 AND status = 'running'",
+            params![id, review_base_sha],
+        )? > 0)
+    }
+
+    pub fn set_code_review_job_phase_elapsed(
+        &self,
+        id: &str,
+        phase: CodeReviewJobPhase,
+        elapsed_ms: u64,
+    ) -> Result<()> {
+        let column = match phase {
+            CodeReviewJobPhase::Preparation => "preparation_elapsed_ms",
+            CodeReviewJobPhase::Reviewers => "reviewer_elapsed_ms",
+            CodeReviewJobPhase::Coordinator => "coordinator_elapsed_ms",
+            CodeReviewJobPhase::Publication => "publication_elapsed_ms",
+        };
+        self.conn.lock().unwrap().execute(
+            &format!(
+                "UPDATE code_review_jobs SET {column} = ?2
+                 WHERE id = ?1 AND status = 'running'"
+            ),
+            params![id, elapsed_ms as i64],
+        )?;
+        Ok(())
+    }
+
+    pub fn create_code_review_task(
+        &self,
+        task: &NewCodeReviewTask,
+    ) -> Result<trouve_protocol::CodeReviewTask> {
+        let id = crate::new_id("rvt");
+        let now = chrono::Utc::now().to_rfc3339();
+        let conn = self.conn.lock().unwrap();
+        let inserted = conn.execute(
+            "INSERT INTO code_review_tasks
+                    (id, job_id, role, reviewer_id, reviewer_name, batch_index,
+                     batch_count, status, model, prompt, created_at)
+             SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, 'queued', ?8, ?9, ?10
+             WHERE EXISTS (
+               SELECT 1 FROM code_review_jobs WHERE id = ?2 AND status = 'running'
+             )",
+            params![
+                id,
+                task.job_id,
+                code_review_task_role_str(task.role),
+                task.reviewer_id,
+                task.reviewer_name,
+                task.batch_index as i64,
+                task.batch_count as i64,
+                task.model,
+                task.prompt,
+                now,
+            ],
+        )?;
+        if inserted == 0 {
+            anyhow::bail!(
+                "review job {} is no longer running; task creation was superseded",
+                task.job_id
+            );
+        }
+        conn.query_row(
+            &format!("SELECT {CODE_REVIEW_TASK_COLUMNS} FROM code_review_tasks WHERE id = ?1"),
+            params![id],
+            row_to_code_review_task,
+        )
+        .map_err(Into::into)
+    }
+
+    pub fn start_code_review_task(
+        &self,
+        id: &str,
+        session_id: &str,
+        thread_id: &str,
+        model: &str,
+    ) -> Result<Option<trouve_protocol::CodeReviewTask>> {
+        let conn = self.conn.lock().unwrap();
+        let updated = conn.execute(
+            "UPDATE code_review_tasks
+             SET status = 'running', session_id = ?2, thread_id = ?3,
+                 model = ?4, started_at = ?5, error = ''
+             WHERE id = ?1 AND status = 'queued'",
+            params![
+                id,
+                session_id,
+                thread_id,
+                model,
+                chrono::Utc::now().to_rfc3339()
+            ],
+        )?;
+        if updated == 0 {
+            return Ok(None);
+        }
+        Ok(Some(conn.query_row(
+            &format!("SELECT {CODE_REVIEW_TASK_COLUMNS} FROM code_review_tasks WHERE id = ?1"),
+            params![id],
+            row_to_code_review_task,
+        )?))
+    }
+
+    pub fn skip_code_review_task(
+        &self,
+        id: &str,
+        reason: &str,
+    ) -> Result<Option<trouve_protocol::CodeReviewTask>> {
+        let conn = self.conn.lock().unwrap();
+        let updated = conn.execute(
+            "UPDATE code_review_tasks
+             SET status = 'not_applicable', completed_at = ?2, error = ?3
+             WHERE id = ?1 AND status = 'queued'",
+            params![id, chrono::Utc::now().to_rfc3339(), reason],
+        )?;
+        if updated == 0 {
+            return Ok(None);
+        }
+        Ok(Some(conn.query_row(
+            &format!("SELECT {CODE_REVIEW_TASK_COLUMNS} FROM code_review_tasks WHERE id = ?1"),
+            params![id],
+            row_to_code_review_task,
+        )?))
+    }
+
+    pub fn is_code_review_thread(&self, thread_id: &str) -> Result<bool> {
+        Ok(self.conn.lock().unwrap().query_row(
+            "SELECT EXISTS(
+                   SELECT 1 FROM code_review_tasks
+                   WHERE thread_id = ?1 AND status IN ('running', 'queued')
+                 )",
+            params![thread_id],
+            |row| row.get(0),
+        )?)
+    }
+
+    pub fn set_code_review_task_provider_wait(
+        &self,
+        thread_id: &str,
+        provider_wait_ms: u64,
+    ) -> Result<()> {
+        self.conn.lock().unwrap().execute(
+            "UPDATE code_review_tasks SET provider_wait_ms = ?2
+             WHERE thread_id = ?1 AND status = 'running'",
+            params![thread_id, provider_wait_ms as i64],
+        )?;
+        Ok(())
+    }
+
+    pub fn set_code_review_task_metrics(
+        &self,
+        id: &str,
+        metrics: &CodeReviewTaskMetrics,
+    ) -> Result<()> {
+        self.conn.lock().unwrap().execute(
+            "UPDATE code_review_tasks
+             SET model_elapsed_ms = ?2, input_tokens = ?3,
+                 cached_input_tokens = ?4, output_tokens = ?5,
+                 tool_call_count = ?6
+             WHERE id = ?1 AND status = 'running'",
+            params![
+                id,
+                metrics.model_elapsed_ms as i64,
+                metrics.input_tokens as i64,
+                metrics.cached_input_tokens as i64,
+                metrics.output_tokens as i64,
+                metrics.tool_call_count as i64,
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn append_code_review_task_output(
+        &self,
+        id: &str,
+        stream: trouve_protocol::CodeReviewOutputStream,
+        text: &str,
+    ) -> Result<bool> {
+        let column = match stream {
+            trouve_protocol::CodeReviewOutputStream::Assistant => "output",
+            trouve_protocol::CodeReviewOutputStream::Thinking => "thinking",
+            trouve_protocol::CodeReviewOutputStream::Tool => "tool_output",
+        };
+        let sql = format!(
+            "UPDATE code_review_tasks SET {column} = {column} || ?2
+             WHERE id = ?1 AND status = 'running'"
+        );
+        Ok(self.conn.lock().unwrap().execute(&sql, params![id, text])? > 0)
+    }
+
+    pub fn finish_code_review_task(
+        &self,
+        id: &str,
+        status: &str,
+        output: &str,
+        candidate_issue_count: u64,
+        error: &str,
+    ) -> Result<Option<trouve_protocol::CodeReviewTask>> {
+        let conn = self.conn.lock().unwrap();
+        let updated = conn.execute(
+            "UPDATE code_review_tasks
+             SET status = ?2,
+                 output = CASE WHEN ?3 = '' THEN output ELSE ?3 END,
+                 candidate_issue_count = ?4, error = ?5, completed_at = ?6
+             WHERE id = ?1 AND status IN ('queued', 'running')",
+            params![
+                id,
+                status,
+                output,
+                candidate_issue_count as i64,
+                error,
+                chrono::Utc::now().to_rfc3339()
+            ],
+        )?;
+        if updated == 0 {
+            return Ok(None);
+        }
+        Ok(Some(conn.query_row(
+            &format!("SELECT {CODE_REVIEW_TASK_COLUMNS} FROM code_review_tasks WHERE id = ?1"),
+            params![id],
+            row_to_code_review_task,
+        )?))
+    }
+
+    pub fn code_review_tasks(&self, job_id: &str) -> Result<Vec<trouve_protocol::CodeReviewTask>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {CODE_REVIEW_TASK_COLUMNS} FROM code_review_tasks
+             WHERE job_id = ?1
+             ORDER BY CASE role WHEN 'reviewer' THEN 0 ELSE 1 END,
+                      reviewer_name, batch_index, created_at"
+        ))?;
+        let rows = stmt.query_map(params![job_id], row_to_code_review_task)?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    pub fn set_code_review_job_progress(
+        &self,
+        id: &str,
+        completed_reviewers: u64,
+        total_reviewers: u64,
+    ) -> Result<bool> {
+        Ok(self.conn.lock().unwrap().execute(
+            "UPDATE code_review_jobs
+             SET completed_reviewers = ?2, total_reviewers = ?3
+             WHERE id = ?1 AND status = 'running'
+               AND (completed_reviewers != ?2 OR total_reviewers != ?3)",
+            params![id, completed_reviewers as i64, total_reviewers as i64],
+        )? > 0)
+    }
+
+    pub fn completed_code_review_personas(&self, job_id: &str) -> Result<u64> {
+        let count = self.conn.lock().unwrap().query_row(
+            "SELECT COUNT(*) FROM (
+               SELECT reviewer_id
+               FROM code_review_tasks
+               WHERE job_id = ?1 AND role = 'reviewer' AND reviewer_id IS NOT NULL
+               GROUP BY reviewer_id
+               HAVING SUM(
+                 CASE WHEN status IN (
+                   'succeeded', 'failed', 'cancelled', 'not_applicable'
+                 ) THEN 0 ELSE 1 END
+               ) = 0
+               AND COUNT(*) >= MAX(batch_count)
+             )",
+            params![job_id],
+            |row| row.get::<_, i64>(0),
+        )?;
+        Ok(count as u64)
+    }
+
+    pub fn save_code_review_result(
+        &self,
+        job_id: &str,
+        summary: &str,
+        prompt_for_agents: &str,
+        candidate_issue_count: u64,
+        findings: &[NewCodeReviewFinding],
+    ) -> Result<Vec<trouve_protocol::CodeReviewFinding>> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        tx.execute(
+            "DELETE FROM code_review_finding_sources
+             WHERE finding_id IN (SELECT id FROM code_review_findings WHERE job_id = ?1)",
+            params![job_id],
+        )?;
+        tx.execute(
+            "DELETE FROM code_review_findings WHERE job_id = ?1",
+            params![job_id],
+        )?;
+        tx.execute(
+            "UPDATE code_review_tasks
+             SET confirmed_issue_count = 0
+             WHERE job_id = ?1",
+            params![job_id],
+        )?;
+        let now = chrono::Utc::now().to_rfc3339();
+        for finding in findings {
+            let finding_id = crate::new_id("rvf");
+            tx.execute(
+                "INSERT INTO code_review_findings
+                        (id, job_id, path, line, side, severity, body,
+                         prompt_for_agents, status, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'open', ?9)",
+                params![
+                    finding_id,
+                    job_id,
+                    finding.path,
+                    finding.line as i64,
+                    finding.side,
+                    finding.severity,
+                    finding.body,
+                    finding.prompt_for_agents,
+                    now,
+                ],
+            )?;
+            for source in &finding.sources {
+                tx.execute(
+                    "INSERT INTO code_review_finding_sources
+                            (finding_id, candidate_id, task_id, reviewer_id, reviewer_name)
+                     VALUES (?1, ?2, ?3, ?4, ?5)",
+                    params![
+                        finding_id,
+                        source.candidate_id,
+                        source.task_id,
+                        source.reviewer_id,
+                        source.reviewer_name,
+                    ],
+                )?;
+                if !source.task_id.is_empty() {
+                    tx.execute(
+                        "UPDATE code_review_tasks
+                         SET confirmed_issue_count = confirmed_issue_count + 1
+                         WHERE id = ?1 AND job_id = ?2",
+                        params![source.task_id, job_id],
+                    )?;
+                }
+            }
+        }
+        tx.execute(
+            "UPDATE code_review_jobs
+             SET summary = ?2, prompt_for_agents = ?3,
+                 candidate_issue_count = ?4, issue_count = ?5
+             WHERE id = ?1",
+            params![
+                job_id,
+                summary,
+                prompt_for_agents,
+                candidate_issue_count as i64,
+                findings.len() as i64
+            ],
+        )?;
+        tx.commit()?;
+        drop(conn);
+        self.code_review_findings(job_id)
+    }
+
+    pub fn update_code_review_finding_publication(
+        &self,
+        id: &str,
+        comment_id: Option<u64>,
+        comment_url: &str,
+        thread_id: Option<&str>,
+    ) -> Result<bool> {
+        Ok(self.conn.lock().unwrap().execute(
+            "UPDATE code_review_findings
+             SET github_comment_id = ?2, github_comment_url = ?3,
+                 github_thread_id = COALESCE(?4, github_thread_id)
+             WHERE id = ?1",
+            params![
+                id,
+                comment_id.map(|value| value as i64),
+                comment_url,
+                thread_id
+            ],
+        )? > 0)
+    }
+
+    pub fn resolve_code_review_finding(&self, id: &str, status: &str) -> Result<bool> {
+        Ok(self.conn.lock().unwrap().execute(
+            "UPDATE code_review_findings
+             SET status = ?2, resolved_at = ?3
+             WHERE id = ?1 AND status = 'open'",
+            params![id, status, chrono::Utc::now().to_rfc3339()],
+        )? > 0)
+    }
+
+    pub fn code_review_findings(
+        &self,
+        job_id: &str,
+    ) -> Result<Vec<trouve_protocol::CodeReviewFinding>> {
+        let conn = self.conn.lock().unwrap();
+        let base_rows: Vec<trouve_protocol::CodeReviewFinding> = {
+            let mut stmt = conn.prepare(
+                "SELECT id, job_id, path, line, side, severity, body,
+                        prompt_for_agents, status, github_comment_id,
+                        github_comment_url, github_thread_id, resolved_at
+                 FROM code_review_findings
+                 WHERE job_id = ?1 ORDER BY path, line, id",
+            )?;
+            stmt.query_map(params![job_id], |row| {
+                Ok(trouve_protocol::CodeReviewFinding {
+                    id: row.get(0)?,
+                    job_id: row.get(1)?,
+                    path: row.get(2)?,
+                    line: row.get::<_, i64>(3)? as u64,
+                    side: row.get(4)?,
+                    severity: row.get(5)?,
+                    body: row.get(6)?,
+                    prompt_for_agents: row.get(7)?,
+                    status: row.get(8)?,
+                    sources: Vec::new(),
+                    github_comment_id: row.get::<_, Option<i64>>(9)?.map(|value| value as u64),
+                    github_comment_url: row.get(10)?,
+                    github_thread_id: row.get(11)?,
+                    resolved_at: parse_optional_datetime(row.get(12)?),
+                })
+            })?
+            .collect::<rusqlite::Result<_>>()?
+        };
+        let mut findings = Vec::with_capacity(base_rows.len());
+        for mut finding in base_rows {
+            let mut stmt = conn.prepare(
+                "SELECT reviewer_id, reviewer_name, candidate_id, task_id
+                 FROM code_review_finding_sources
+                 WHERE finding_id = ?1 ORDER BY reviewer_name, candidate_id",
+            )?;
+            finding.sources = stmt
+                .query_map(params![finding.id], |row| {
+                    Ok(trouve_protocol::CodeReviewFindingSource {
+                        reviewer_id: row.get(0)?,
+                        reviewer_name: row.get(1)?,
+                        candidate_id: row.get(2)?,
+                        task_id: row.get(3)?,
+                    })
+                })?
+                .collect::<rusqlite::Result<_>>()?;
+            findings.push(finding);
+        }
+        Ok(findings)
+    }
+
+    pub fn open_code_review_findings(
+        &self,
+        repository: &str,
+        pull_number: u64,
+    ) -> Result<Vec<trouve_protocol::CodeReviewFinding>> {
+        let job_ids: Vec<String> = {
+            let conn = self.conn.lock().unwrap();
+            let mut stmt = conn.prepare(
+                "SELECT DISTINCT f.job_id
+                 FROM code_review_findings f
+                 JOIN code_review_jobs j ON j.id = f.job_id
+                 WHERE j.repository = ?1 AND j.pull_number = ?2 AND f.status = 'open'
+                 ORDER BY j.completed_at, f.job_id",
+            )?;
+            stmt.query_map(params![repository, pull_number as i64], |row| row.get(0))?
+                .collect::<rusqlite::Result<_>>()?
+        };
+        let mut findings = Vec::new();
+        for job_id in job_ids {
+            findings.extend(
+                self.code_review_findings(&job_id)?
+                    .into_iter()
+                    .filter(|finding| finding.status == "open"),
+            );
+        }
+        Ok(findings)
+    }
+
+    pub fn code_review_job_detail(
+        &self,
+        id: &str,
+    ) -> Result<Option<trouve_protocol::CodeReviewJobDetail>> {
+        let Some(record) = self.code_review_job(id)? else {
+            return Ok(None);
+        };
+        let tasks = self.code_review_tasks(id)?;
+        let personas = code_review_persona_results(&tasks);
+        let findings = self.code_review_findings(id)?;
+        Ok(Some(trouve_protocol::CodeReviewJobDetail {
+            job: record.job,
+            tasks,
+            personas,
+            findings,
+            summary: record.summary,
+            prompt_for_agents: record.prompt_for_agents,
+        }))
+    }
+
+    pub fn latest_code_review_for_pull(
+        &self,
+        repository: &str,
+        pull_number: u64,
+        head_sha: Option<&str>,
+        bot_login: &str,
+    ) -> Result<Option<trouve_protocol::FirstPartyCodeReview>> {
+        let id: Option<String> = self
+            .conn
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT id FROM code_review_jobs
+                 WHERE repository = ?1 AND pull_number = ?2
+                   AND status = 'succeeded'
+                   AND (?3 IS NULL OR head_sha = ?3)
+                 ORDER BY completed_at DESC LIMIT 1",
+                params![repository, pull_number as i64, head_sha],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let Some(id) = id else {
+            return Ok(None);
+        };
+        let detail = self
+            .code_review_job_detail(&id)?
+            .ok_or_else(|| anyhow::anyhow!("published review job disappeared"))?;
+        Ok(Some(trouve_protocol::FirstPartyCodeReview {
+            job_id: detail.job.id,
+            bot_login: bot_login.to_owned(),
+            status: detail.job.status,
+            summary: detail.summary,
+            prompt_for_agents: detail.prompt_for_agents,
+            review_url: detail.job.review_url,
+            findings: detail.findings,
+        }))
+    }
+
+    pub fn code_review_stats(
+        &self,
+        range: trouve_protocol::CodeReviewStatsRange,
+        repository: Option<&str>,
+    ) -> Result<trouve_protocol::CodeReviewStats> {
+        #[derive(Default)]
+        struct RepositoryAccumulator {
+            status: trouve_protocol::CodeReviewStatusCounts,
+            issues: u64,
+            pending: Vec<u64>,
+            running: Vec<u64>,
+            preparation: Vec<u64>,
+            reviewers: Vec<u64>,
+            coordinator: Vec<u64>,
+            publication: Vec<u64>,
+        }
+        #[derive(Default)]
+        struct BucketAccumulator {
+            status: trouve_protocol::CodeReviewStatusCounts,
+            issues: u64,
+            pending: Vec<u64>,
+            running: Vec<u64>,
+        }
+        struct JobStatsRow {
+            repository: String,
+            status: String,
+            created_at: chrono::DateTime<chrono::Utc>,
+            started_at: Option<chrono::DateTime<chrono::Utc>>,
+            completed_at: Option<chrono::DateTime<chrono::Utc>>,
+            issues: u64,
+            preparation_ms: u64,
+            reviewer_ms: u64,
+            coordinator_ms: u64,
+            publication_ms: u64,
+        }
+        #[derive(Default)]
+        struct PersonaExecution {
+            reviewer_name: String,
+            task_count: u64,
+            succeeded_tasks: u64,
+            failed_tasks: u64,
+            cancelled_tasks: u64,
+            not_applicable_tasks: u64,
+            terminal_tasks: u64,
+            candidates: u64,
+            confirmed: u64,
+            provider_wait_ms: u64,
+            model_elapsed_ms: u64,
+            input_tokens: u64,
+            cached_input_tokens: u64,
+            output_tokens: u64,
+            tool_call_count: u64,
+            started_at: Option<chrono::DateTime<chrono::Utc>>,
+            completed_at: Option<chrono::DateTime<chrono::Utc>>,
+        }
+        #[derive(Default)]
+        struct PersonaAccumulator {
+            reviewer_name: String,
+            task_count: u64,
+            succeeded: u64,
+            failed: u64,
+            cancelled: u64,
+            not_applicable: u64,
+            candidates: u64,
+            confirmed: u64,
+            durations: Vec<u64>,
+            provider_wait_durations: Vec<u64>,
+            model_durations: Vec<u64>,
+            input_tokens: u64,
+            cached_input_tokens: u64,
+            output_tokens: u64,
+            tool_call_count: u64,
+        }
+
+        let now = chrono::Utc::now();
+        let requested_start = code_review_stats_start(range, now);
+        let start_param = requested_start.map(|value| value.to_rfc3339());
+        let earliest_created_at = {
+            let conn = self.conn.lock().unwrap();
+            conn.query_row(
+                "SELECT MIN(created_at) FROM code_review_jobs
+                 WHERE (?1 IS NULL OR repository = ?1)
+                   AND (
+                     status IN ('queued', 'running')
+                     OR ?2 IS NULL
+                     OR completed_at >= ?2
+                   )",
+                params![repository, start_param],
+                |row| row.get::<_, Option<String>>(0),
+            )?
+            .and_then(|value| value.parse().ok())
+        };
+
+        let chart_start = requested_start
+            .or(earliest_created_at)
+            .unwrap_or(now - chrono::Duration::hours(1));
+        let total_seconds = now.signed_duration_since(chart_start).num_seconds().max(1);
+        let step_seconds = match range {
+            trouve_protocol::CodeReviewStatsRange::Hour => 60,
+            trouve_protocol::CodeReviewStatsRange::Day => 15 * 60,
+            trouve_protocol::CodeReviewStatsRange::Week => 2 * 60 * 60,
+            trouve_protocol::CodeReviewStatsRange::Month => 12 * 60 * 60,
+            trouve_protocol::CodeReviewStatsRange::Year => 7 * 24 * 60 * 60,
+            trouve_protocol::CodeReviewStatsRange::All => ((total_seconds + 119) / 120).max(60),
+        };
+        let bucket_count =
+            ((total_seconds + step_seconds - 1) / step_seconds).clamp(1, 120) as usize;
+        let mut bucket_accumulators: Vec<BucketAccumulator> = (0..bucket_count)
+            .map(|_| BucketAccumulator::default())
+            .collect();
+        let mut overall_status = trouve_protocol::CodeReviewStatusCounts::default();
+        let mut overall_pending = Vec::new();
+        let mut overall_running = Vec::new();
+        let mut overall_preparation = Vec::new();
+        let mut overall_reviewers = Vec::new();
+        let mut overall_coordinator = Vec::new();
+        let mut overall_publication = Vec::new();
+        let mut overall_issues = 0_u64;
+        let mut repositories: BTreeMap<String, RepositoryAccumulator> = BTreeMap::new();
+
+        {
+            let conn = self.conn.lock().unwrap();
+            let mut stmt = conn.prepare(
+                "SELECT repository, status, created_at, started_at, completed_at,
+                        issue_count, preparation_elapsed_ms, reviewer_elapsed_ms,
+                        coordinator_elapsed_ms, publication_elapsed_ms
+                 FROM code_review_jobs
+                 WHERE (?1 IS NULL OR repository = ?1)
+                   AND (
+                     status IN ('queued', 'running')
+                     OR ?2 IS NULL
+                     OR completed_at >= ?2
+                   )
+                 ORDER BY created_at",
+            )?;
+            let rows = stmt.query_map(params![repository, start_param], |row| {
+                Ok(JobStatsRow {
+                    repository: row.get(0)?,
+                    status: row.get(1)?,
+                    created_at: parse_datetime(row.get(2)?),
+                    started_at: parse_optional_datetime(row.get(3)?),
+                    completed_at: parse_optional_datetime(row.get(4)?),
+                    issues: row.get::<_, i64>(5)? as u64,
+                    preparation_ms: row.get::<_, i64>(6)? as u64,
+                    reviewer_ms: row.get::<_, i64>(7)? as u64,
+                    coordinator_ms: row.get::<_, i64>(8)? as u64,
+                    publication_ms: row.get::<_, i64>(9)? as u64,
+                })
+            })?;
+            for row in rows {
+                let job = row?;
+                code_review_status_add(&mut overall_status, &job.status);
+                let repository_stats = repositories.entry(job.repository.clone()).or_default();
+                code_review_status_add(&mut repository_stats.status, &job.status);
+                overall_issues += job.issues;
+                repository_stats.issues += job.issues;
+                let terminal = !matches!(job.status.as_str(), "queued" | "running");
+                if !terminal {
+                    continue;
+                }
+                let (pending_ms, running_ms) = job_elapsed_ms(
+                    &job.status,
+                    job.created_at,
+                    job.started_at,
+                    job.completed_at,
+                );
+                overall_pending.push(pending_ms);
+                repository_stats.pending.push(pending_ms);
+                if job.started_at.is_some() {
+                    overall_running.push(running_ms);
+                    repository_stats.running.push(running_ms);
+                }
+                push_nonzero_duration(&mut overall_preparation, job.preparation_ms);
+                push_nonzero_duration(&mut overall_reviewers, job.reviewer_ms);
+                push_nonzero_duration(&mut overall_coordinator, job.coordinator_ms);
+                push_nonzero_duration(&mut overall_publication, job.publication_ms);
+                push_nonzero_duration(&mut repository_stats.preparation, job.preparation_ms);
+                push_nonzero_duration(&mut repository_stats.reviewers, job.reviewer_ms);
+                push_nonzero_duration(&mut repository_stats.coordinator, job.coordinator_ms);
+                push_nonzero_duration(&mut repository_stats.publication, job.publication_ms);
+                if let Some(completed_at) = job.completed_at {
+                    let seconds = completed_at
+                        .signed_duration_since(chart_start)
+                        .num_seconds()
+                        .max(0);
+                    let index =
+                        ((seconds / step_seconds) as usize).min(bucket_accumulators.len() - 1);
+                    let bucket = &mut bucket_accumulators[index];
+                    code_review_status_add(&mut bucket.status, &job.status);
+                    bucket.issues += job.issues;
+                    bucket.pending.push(pending_ms);
+                    if job.started_at.is_some() {
+                        bucket.running.push(running_ms);
+                    }
+                }
+            }
+        }
+
+        let executions: Vec<(String, String, String, PersonaExecution)> = {
+            let conn = self.conn.lock().unwrap();
+            let mut stmt = conn.prepare(
+                "SELECT t.job_id, t.reviewer_id, MAX(t.reviewer_name),
+                        COALESCE(t.model, 'unknown (legacy)'), COUNT(*),
+                        SUM(CASE WHEN t.status = 'succeeded' THEN 1 ELSE 0 END),
+                        SUM(CASE WHEN t.status = 'failed' THEN 1 ELSE 0 END),
+                        SUM(CASE WHEN t.status = 'cancelled' THEN 1 ELSE 0 END),
+                        SUM(CASE WHEN t.status = 'not_applicable' THEN 1 ELSE 0 END),
+                        SUM(CASE WHEN t.status IN (
+                          'succeeded', 'failed', 'cancelled', 'not_applicable'
+                        ) THEN 1 ELSE 0 END),
+                        SUM(t.candidate_issue_count), SUM(t.confirmed_issue_count),
+                        SUM(t.provider_wait_ms), SUM(t.model_elapsed_ms),
+                        SUM(t.input_tokens), SUM(t.cached_input_tokens),
+                        SUM(t.output_tokens), SUM(t.tool_call_count),
+                        MIN(t.started_at), MAX(t.completed_at)
+                 FROM code_review_tasks t
+                 JOIN code_review_jobs j ON j.id = t.job_id
+                 WHERE t.role = 'reviewer' AND t.reviewer_id IS NOT NULL
+                   AND (?1 IS NULL OR j.repository = ?1)
+                   AND (
+                     t.status IN ('queued', 'running')
+                     OR ?2 IS NULL
+                     OR t.completed_at >= ?2
+                   )
+                 GROUP BY t.job_id, t.reviewer_id, COALESCE(t.model, 'unknown (legacy)')
+                 ORDER BY MIN(t.created_at)",
+            )?;
+            stmt.query_map(params![repository, start_param], |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(3)?,
+                    PersonaExecution {
+                        reviewer_name: row.get(2)?,
+                        task_count: row.get::<_, i64>(4)? as u64,
+                        succeeded_tasks: row.get::<_, i64>(5)? as u64,
+                        failed_tasks: row.get::<_, i64>(6)? as u64,
+                        cancelled_tasks: row.get::<_, i64>(7)? as u64,
+                        not_applicable_tasks: row.get::<_, i64>(8)? as u64,
+                        terminal_tasks: row.get::<_, i64>(9)? as u64,
+                        candidates: row.get::<_, i64>(10)? as u64,
+                        confirmed: row.get::<_, i64>(11)? as u64,
+                        provider_wait_ms: row.get::<_, i64>(12)? as u64,
+                        model_elapsed_ms: row.get::<_, i64>(13)? as u64,
+                        input_tokens: row.get::<_, i64>(14)? as u64,
+                        cached_input_tokens: row.get::<_, i64>(15)? as u64,
+                        output_tokens: row.get::<_, i64>(16)? as u64,
+                        tool_call_count: row.get::<_, i64>(17)? as u64,
+                        started_at: parse_optional_datetime(row.get(18)?),
+                        completed_at: parse_optional_datetime(row.get(19)?),
+                    },
+                ))
+            })?
+            .collect::<rusqlite::Result<_>>()?
+        };
+        let mut persona_stats: BTreeMap<(String, String), PersonaAccumulator> = BTreeMap::new();
+        for (_, reviewer_id, model, execution) in executions {
+            let persona = persona_stats.entry((reviewer_id, model)).or_default();
+            persona.reviewer_name = execution.reviewer_name;
+            persona.task_count += execution.task_count;
+            persona.candidates += execution.candidates;
+            persona.confirmed += execution.confirmed;
+            persona
+                .provider_wait_durations
+                .push(execution.provider_wait_ms);
+            persona.model_durations.push(execution.model_elapsed_ms);
+            persona.input_tokens += execution.input_tokens;
+            persona.cached_input_tokens += execution.cached_input_tokens;
+            persona.output_tokens += execution.output_tokens;
+            persona.tool_call_count += execution.tool_call_count;
+            let all_succeeded = execution.succeeded_tasks == execution.task_count;
+            if all_succeeded {
+                persona.succeeded += 1;
+            } else if execution.failed_tasks > 0 {
+                persona.failed += 1;
+            } else if execution.cancelled_tasks > 0 {
+                persona.cancelled += 1;
+            } else if execution.not_applicable_tasks == execution.task_count {
+                persona.not_applicable += 1;
+            }
+            let all_terminal = execution.terminal_tasks == execution.task_count;
+            if all_terminal
+                && let (Some(started), Some(completed)) =
+                    (execution.started_at, execution.completed_at)
+            {
+                persona.durations.push(elapsed_ms(started, completed));
+            }
+        }
+
+        let buckets = bucket_accumulators
+            .into_iter()
+            .enumerate()
+            .map(|(index, bucket)| {
+                let started_at =
+                    chart_start + chrono::Duration::seconds(step_seconds * index as i64);
+                let completed_at = (started_at + chrono::Duration::seconds(step_seconds)).min(now);
+                trouve_protocol::CodeReviewStatsBucket {
+                    started_at,
+                    completed_at,
+                    status: bucket.status,
+                    issue_count: bucket.issues,
+                    pending_average_ms: code_review_duration_stats(bucket.pending).average_ms,
+                    running_average_ms: code_review_duration_stats(bucket.running).average_ms,
+                }
+            })
+            .collect();
+        let personas = persona_stats
+            .into_iter()
+            .map(
+                |((reviewer_id, model), stats)| trouve_protocol::CodeReviewPersonaModelStats {
+                    reviewer_id,
+                    reviewer_name: stats.reviewer_name,
+                    model,
+                    task_count: stats.task_count,
+                    succeeded: stats.succeeded,
+                    failed: stats.failed,
+                    cancelled: stats.cancelled,
+                    not_applicable: stats.not_applicable,
+                    candidate_issue_count: stats.candidates,
+                    confirmed_issue_count: stats.confirmed,
+                    duration: code_review_duration_stats(stats.durations),
+                    provider_wait_duration: code_review_duration_stats(
+                        stats.provider_wait_durations,
+                    ),
+                    model_duration: code_review_duration_stats(stats.model_durations),
+                    input_tokens: stats.input_tokens,
+                    cached_input_tokens: stats.cached_input_tokens,
+                    output_tokens: stats.output_tokens,
+                    tool_call_count: stats.tool_call_count,
+                },
+            )
+            .collect();
+        let repositories = repositories
+            .into_iter()
+            .map(
+                |(repository, stats)| trouve_protocol::CodeReviewRepositoryStats {
+                    repository,
+                    status: stats.status,
+                    issue_count: stats.issues,
+                    pending_duration: code_review_duration_stats(stats.pending),
+                    running_duration: code_review_duration_stats(stats.running),
+                    preparation_duration: code_review_duration_stats(stats.preparation),
+                    reviewer_duration: code_review_duration_stats(stats.reviewers),
+                    coordinator_duration: code_review_duration_stats(stats.coordinator),
+                    publication_duration: code_review_duration_stats(stats.publication),
+                },
+            )
+            .collect();
+
+        Ok(trouve_protocol::CodeReviewStats {
+            range,
+            repository: repository.map(str::to_string),
+            generated_at: now,
+            status: overall_status,
+            pending_duration: code_review_duration_stats(overall_pending),
+            running_duration: code_review_duration_stats(overall_running),
+            preparation_duration: code_review_duration_stats(overall_preparation),
+            reviewer_duration: code_review_duration_stats(overall_reviewers),
+            coordinator_duration: code_review_duration_stats(overall_coordinator),
+            publication_duration: code_review_duration_stats(overall_publication),
+            issue_count: overall_issues,
+            buckets,
+            personas,
+            repositories,
+        })
+    }
+
     pub fn finish_code_review_job(
         &self,
         id: &str,
@@ -1953,11 +3433,283 @@ impl Store {
         Ok(updated > 0)
     }
 
+    pub fn request_code_review_job_cancel(
+        &self,
+        id: &str,
+    ) -> Result<Option<trouve_protocol::CodeReviewJob>> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        let state: Option<(String, bool)> = tx
+            .query_row(
+                "SELECT status, publication_claimed FROM code_review_jobs WHERE id = ?1",
+                params![id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        let Some((status, publication_claimed)) = state else {
+            tx.commit()?;
+            return Ok(None);
+        };
+        match status.as_str() {
+            "queued" => {
+                tx.execute(
+                    "UPDATE code_review_jobs
+                     SET status = 'cancelled', cancel_requested = 1,
+                         completed_at = ?2, error = 'cancelled by user'
+                     WHERE id = ?1 AND status = 'queued'",
+                    params![id, chrono::Utc::now().to_rfc3339()],
+                )?;
+            }
+            "running" if !publication_claimed => {
+                tx.execute(
+                    "UPDATE code_review_jobs SET cancel_requested = 1
+                     WHERE id = ?1 AND status = 'running'",
+                    params![id],
+                )?;
+            }
+            "running" => {
+                anyhow::bail!(
+                    "review publication has already started; wait for it to finish before cancelling"
+                );
+            }
+            _ => {}
+        }
+        let record = tx.query_row(
+            &format!("SELECT {CODE_REVIEW_JOB_COLUMNS} FROM code_review_jobs WHERE id = ?1"),
+            params![id],
+            row_to_code_review_job,
+        )?;
+        tx.commit()?;
+        Ok(Some(record.job))
+    }
+
+    /// Atomically cancel an active predecessor and enqueue a linked
+    /// replacement. Publication claiming and retrying serialize on the same
+    /// transaction, so at most one execution may cross the publication gate.
+    pub fn retry_code_review_job(
+        &self,
+        id: &str,
+    ) -> Result<Option<trouve_protocol::CodeReviewJob>> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        let old = tx
+            .query_row(
+                &format!("SELECT {CODE_REVIEW_JOB_COLUMNS} FROM code_review_jobs WHERE id = ?1"),
+                params![id],
+                row_to_code_review_job,
+            )
+            .optional()?;
+        let Some(old) = old else {
+            tx.commit()?;
+            return Ok(None);
+        };
+        if old.publication_claimed && old.job.status == "running" {
+            anyhow::bail!(
+                "review publication has already started; wait for it to finish before retrying"
+            );
+        }
+        if old.job.status == "queued" {
+            tx.execute(
+                "UPDATE code_review_jobs
+                 SET status = 'cancelled', cancel_requested = 1,
+                     completed_at = ?2, error = 'replaced by retry'
+                 WHERE id = ?1 AND status = 'queued'",
+                params![id, chrono::Utc::now().to_rfc3339()],
+            )?;
+        } else if old.job.status == "running" {
+            tx.execute(
+                "UPDATE code_review_jobs
+                 SET cancel_requested = 1, error = 'replaced by retry'
+                 WHERE id = ?1 AND status = 'running'",
+                params![id],
+            )?;
+        }
+        let new_id = crate::new_id("rv");
+        let now = chrono::Utc::now().to_rfc3339();
+        tx.execute(
+            "INSERT INTO code_review_jobs
+                    (id, dedupe_key, installation_id, repository, pull_number,
+                     pull_title, pull_url, head_sha, base_ref, head_ref, trigger,
+                     status, model, prompt, identities, config_hash, created_at,
+                     review_base_sha, review_scope, retry_of, total_reviewers)
+             SELECT ?2, ?3, installation_id, repository, pull_number,
+                    pull_title, pull_url, head_sha, base_ref, head_ref, 'retry',
+                    'queued', model, prompt, identities, config_hash, ?4,
+                    review_base_sha, review_scope, id, total_reviewers
+             FROM code_review_jobs WHERE id = ?1",
+            params![id, new_id, format!("retry:{id}:{new_id}"), now],
+        )?;
+        tx.execute(
+            "UPDATE code_review_jobs SET retried_by = ?2 WHERE id = ?1",
+            params![id, new_id],
+        )?;
+        let replacement = tx.query_row(
+            &format!("SELECT {CODE_REVIEW_JOB_COLUMNS} FROM code_review_jobs WHERE id = ?1"),
+            params![new_id],
+            row_to_code_review_job,
+        )?;
+        tx.commit()?;
+        Ok(Some(replacement.job))
+    }
+
+    pub fn code_review_job_cancel_requested(&self, id: &str) -> Result<bool> {
+        Ok(self
+            .conn
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT cancel_requested FROM code_review_jobs WHERE id = ?1",
+                params![id],
+                |row| row.get(0),
+            )
+            .optional()?
+            .unwrap_or(false))
+    }
+
+    pub fn cancel_active_code_review_tasks(&self, job_id: &str, error: &str) -> Result<()> {
+        self.conn.lock().unwrap().execute(
+            "UPDATE code_review_tasks
+             SET status = 'cancelled', completed_at = ?2, error = ?3
+             WHERE job_id = ?1 AND status IN ('queued', 'running')",
+            params![job_id, chrono::Utc::now().to_rfc3339(), error],
+        )?;
+        Ok(())
+    }
+
+    pub fn claim_code_review_publication(&self, id: &str) -> Result<bool> {
+        Ok(self.conn.lock().unwrap().execute(
+            "UPDATE code_review_jobs SET publication_claimed = 1
+             WHERE id = ?1 AND status = 'running'
+               AND cancel_requested = 0 AND publication_claimed = 0",
+            params![id],
+        )? > 0)
+    }
+
+    pub fn set_code_review_job_check_run(
+        &self,
+        id: &str,
+        check_run_id: Option<u64>,
+        check_run_url: &str,
+        sync_error: &str,
+    ) -> Result<bool> {
+        Ok(self.conn.lock().unwrap().execute(
+            "UPDATE code_review_jobs
+             SET check_run_id = COALESCE(?2, check_run_id),
+                 check_run_url = CASE WHEN ?3 = '' THEN check_run_url ELSE ?3 END,
+                 check_sync_error = ?4
+             WHERE id = ?1",
+            params![
+                id,
+                check_run_id.map(|value| value as i64),
+                check_run_url,
+                sync_error
+            ],
+        )? > 0)
+    }
+
+    pub fn set_code_review_job_lifecycle_comment_url(&self, id: &str, url: &str) -> Result<bool> {
+        Ok(self.conn.lock().unwrap().execute(
+            "UPDATE code_review_jobs SET lifecycle_comment_url = ?2 WHERE id = ?1",
+            params![id, url],
+        )? > 0)
+    }
+
+    pub fn code_review_pull_state(
+        &self,
+        repository: &str,
+        pull_number: u64,
+    ) -> Result<CodeReviewPullStateRecord> {
+        Ok(self
+            .conn
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT last_reviewed_head_sha, last_reviewed_base_sha,
+                        last_reviewed_at, lifecycle_comment_id, lifecycle_comment_url
+                 FROM code_review_pr_state
+                 WHERE repository = ?1 AND pull_number = ?2",
+                params![repository, pull_number as i64],
+                |row| {
+                    Ok(CodeReviewPullStateRecord {
+                        last_reviewed_head_sha: row.get(0)?,
+                        last_reviewed_base_sha: row.get(1)?,
+                        last_reviewed_at: parse_optional_datetime(row.get(2)?),
+                        lifecycle_comment_id: row
+                            .get::<_, Option<i64>>(3)?
+                            .map(|value| value as u64),
+                        lifecycle_comment_url: row.get(4)?,
+                    })
+                },
+            )
+            .optional()?
+            .unwrap_or_default())
+    }
+
+    pub fn set_code_review_lifecycle_comment(
+        &self,
+        repository: &str,
+        pull_number: u64,
+        comment_id: u64,
+        comment_url: &str,
+    ) -> Result<()> {
+        self.conn.lock().unwrap().execute(
+            "INSERT INTO code_review_pr_state
+                    (repository, pull_number, lifecycle_comment_id, lifecycle_comment_url)
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(repository, pull_number) DO UPDATE SET
+               lifecycle_comment_id = excluded.lifecycle_comment_id,
+               lifecycle_comment_url = excluded.lifecycle_comment_url",
+            params![
+                repository,
+                pull_number as i64,
+                comment_id as i64,
+                comment_url
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn mark_code_review_published(
+        &self,
+        repository: &str,
+        pull_number: u64,
+        base_sha: &str,
+        head_sha: &str,
+    ) -> Result<()> {
+        self.conn.lock().unwrap().execute(
+            "INSERT INTO code_review_pr_state
+                    (repository, pull_number, last_reviewed_head_sha,
+                     last_reviewed_base_sha, last_reviewed_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT(repository, pull_number) DO UPDATE SET
+               last_reviewed_head_sha = excluded.last_reviewed_head_sha,
+               last_reviewed_base_sha = excluded.last_reviewed_base_sha,
+               last_reviewed_at = excluded.last_reviewed_at",
+            params![
+                repository,
+                pull_number as i64,
+                head_sha,
+                base_sha,
+                chrono::Utc::now().to_rfc3339()
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn set_code_review_job_fixed_issue_count(&self, id: &str, count: u64) -> Result<()> {
+        self.conn.lock().unwrap().execute(
+            "UPDATE code_review_jobs SET fixed_issue_count = ?2 WHERE id = ?1",
+            params![id, count as i64],
+        )?;
+        Ok(())
+    }
+
     pub fn pending_code_review_job_cleanups(&self) -> Result<Vec<(String, String)>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
             "SELECT id, session_id FROM code_review_jobs
-             WHERE status IN ('succeeded', 'failed', 'stale') AND session_id IS NOT NULL
+             WHERE status IN ('succeeded', 'failed', 'cancelled', 'stale')
+               AND session_id IS NOT NULL
              ORDER BY completed_at",
         )?;
         let rows = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
@@ -1967,7 +3719,8 @@ impl Store {
     pub fn complete_code_review_job_cleanup(&self, id: &str, session_id: &str) -> Result<()> {
         self.conn.lock().unwrap().execute(
             "UPDATE code_review_jobs SET session_id = NULL, thread_id = NULL
-             WHERE id = ?1 AND status IN ('succeeded', 'failed', 'stale') AND session_id = ?2",
+             WHERE id = ?1 AND status IN ('succeeded', 'failed', 'cancelled', 'stale')
+               AND session_id = ?2",
             params![id, session_id],
         )?;
         Ok(())
@@ -3365,9 +5118,12 @@ mod tests {
             pull_title: "Ship widgets".into(),
             pull_url: "https://github.com/acme/widgets/pull/42".into(),
             head_sha: "1111111111111111111111111111111111111111".into(),
+            review_base_sha: "0000000000000000000000000000000000000000".into(),
             base_ref: "0000000000000000000000000000000000000000".into(),
             head_ref: "ship".into(),
+            scope: trouve_protocol::CodeReviewJobScope::Incremental,
             trigger: "automatic".into(),
+            retry_of: None,
             model: configured.model,
             prompt: configured.prompt,
             reviewers,
@@ -3389,12 +5145,35 @@ mod tests {
             .set_code_review_job_session(&queued.id, "se_review", "th_review")
             .unwrap();
         store
+            .set_code_review_job_phase_elapsed(&queued.id, CodeReviewJobPhase::Preparation, 100)
+            .unwrap();
+        store
+            .set_code_review_job_phase_elapsed(&queued.id, CodeReviewJobPhase::Reviewers, 200)
+            .unwrap();
+        store
+            .set_code_review_job_phase_elapsed(&queued.id, CodeReviewJobPhase::Coordinator, 300)
+            .unwrap();
+        store
+            .set_code_review_job_phase_elapsed(&queued.id, CodeReviewJobPhase::Publication, 400)
+            .unwrap();
+        store
             .finish_code_review_job(&queued.id, "succeeded", "https://review", "")
             .unwrap();
         let completed = store.list_code_review_jobs(10).unwrap().remove(0);
         assert_eq!(completed.status, "succeeded");
         assert_eq!(completed.session_id.as_deref(), Some("se_review"));
         assert_eq!(completed.thread_id.as_deref(), Some("th_review"));
+        assert_eq!(completed.preparation_elapsed_ms, 100);
+        assert_eq!(completed.reviewer_elapsed_ms, 200);
+        assert_eq!(completed.coordinator_elapsed_ms, 300);
+        assert_eq!(completed.publication_elapsed_ms, 400);
+        let stats = store
+            .code_review_stats(trouve_protocol::CodeReviewStatsRange::All, None)
+            .unwrap();
+        assert_eq!(stats.preparation_duration.average_ms, 100);
+        assert_eq!(stats.reviewer_duration.average_ms, 200);
+        assert_eq!(stats.coordinator_duration.average_ms, 300);
+        assert_eq!(stats.publication_duration.average_ms, 400);
         assert_eq!(
             store.pending_code_review_job_cleanups().unwrap(),
             vec![(queued.id.clone(), "se_review".into())]
@@ -3494,9 +5273,12 @@ mod tests {
                     pull_title: "Ship widgets".into(),
                     pull_url: "https://github.com/acme/widgets/pull/42".into(),
                     head_sha: "1111111111111111111111111111111111111111".into(),
+                    review_base_sha: "0000000000000000000000000000000000000000".into(),
                     base_ref: "0000000000000000000000000000000000000000".into(),
                     head_ref: "ship".into(),
+                    scope: trouve_protocol::CodeReviewJobScope::Incremental,
                     trigger: "automatic".into(),
+                    retry_of: None,
                     model: None,
                     prompt: String::new(),
                     reviewers: Vec::new(),
@@ -3590,6 +5372,215 @@ mod tests {
     }
 
     #[test]
+    fn code_review_artifacts_progress_retry_and_watermark_are_durable() {
+        let store = Store::open_in_memory().unwrap();
+        let reviewers = crate::reviewers::built_in_reviewers()
+            .into_iter()
+            .take(2)
+            .collect::<Vec<_>>();
+        let queued = store
+            .enqueue_code_review_job(&NewCodeReviewJob {
+                dedupe_key: "acme/widgets#42:artifacts".into(),
+                installation_id: 7,
+                repository: "acme/widgets".into(),
+                pull_number: 42,
+                pull_title: "Ship widgets".into(),
+                pull_url: "https://github.com/acme/widgets/pull/42".into(),
+                head_sha: "2222222222222222222222222222222222222222".into(),
+                review_base_sha: "1111111111111111111111111111111111111111".into(),
+                base_ref: "main".into(),
+                head_ref: "ship".into(),
+                scope: trouve_protocol::CodeReviewJobScope::Incremental,
+                trigger: "automatic".into(),
+                retry_of: None,
+                model: Some("provider/default".into()),
+                prompt: "Review it".into(),
+                reviewers,
+                config_hash: "config".into(),
+            })
+            .unwrap()
+            .unwrap();
+        let running = store.claim_code_review_job().unwrap().unwrap();
+        assert_eq!(running.job.id, queued.id);
+
+        let task = store
+            .create_code_review_task(&NewCodeReviewTask {
+                job_id: queued.id.clone(),
+                role: trouve_protocol::CodeReviewTaskRole::Reviewer,
+                reviewer_id: Some("correctness".into()),
+                reviewer_name: "Correctness".into(),
+                batch_index: 0,
+                batch_count: 2,
+                model: Some("provider/model".into()),
+                prompt: "Find defects".into(),
+            })
+            .unwrap();
+        store
+            .start_code_review_task(&task.id, "se_review", "th_review", "provider/model")
+            .unwrap()
+            .unwrap();
+        assert!(
+            store
+                .append_code_review_task_output(
+                    &task.id,
+                    trouve_protocol::CodeReviewOutputStream::Assistant,
+                    "candidate output",
+                )
+                .unwrap()
+        );
+        store
+            .finish_code_review_task(&task.id, "succeeded", "", 1, "")
+            .unwrap()
+            .unwrap();
+        let partial = store.code_review_job_detail(&queued.id).unwrap().unwrap();
+        assert_eq!(partial.personas[0].status, "queued");
+        assert_eq!(partial.personas[0].completed_batches, 1);
+        assert_eq!(partial.personas[0].total_batches, 2);
+        assert_eq!(store.completed_code_review_personas(&queued.id).unwrap(), 0);
+        let second_task = store
+            .create_code_review_task(&NewCodeReviewTask {
+                job_id: queued.id.clone(),
+                role: trouve_protocol::CodeReviewTaskRole::Reviewer,
+                reviewer_id: Some("correctness".into()),
+                reviewer_name: "Correctness".into(),
+                batch_index: 1,
+                batch_count: 2,
+                model: Some("provider/model".into()),
+                prompt: "Find defects in the next batch".into(),
+            })
+            .unwrap();
+        store
+            .start_code_review_task(
+                &second_task.id,
+                "se_review",
+                "th_review_2",
+                "provider/model",
+            )
+            .unwrap()
+            .unwrap();
+        store
+            .finish_code_review_task(&second_task.id, "succeeded", "clean", 0, "")
+            .unwrap()
+            .unwrap();
+        assert_eq!(store.completed_code_review_personas(&queued.id).unwrap(), 1);
+        assert!(
+            store
+                .set_code_review_job_progress(&queued.id, 1, 2)
+                .unwrap()
+        );
+        let findings = store
+            .save_code_review_result(
+                &queued.id,
+                "One issue",
+                "Fix every confirmed issue.",
+                1,
+                &[NewCodeReviewFinding {
+                    path: "src/lib.rs".into(),
+                    line: 12,
+                    side: "RIGHT".into(),
+                    severity: "high".into(),
+                    body: "The error is ignored.".into(),
+                    prompt_for_agents: "Handle the error at src/lib.rs:12.".into(),
+                    sources: vec![trouve_protocol::CodeReviewFindingSource {
+                        reviewer_id: "correctness".into(),
+                        reviewer_name: "Correctness".into(),
+                        candidate_id: "candidate-1".into(),
+                        task_id: task.id.clone(),
+                    }],
+                }],
+            )
+            .unwrap();
+        assert_eq!(findings.len(), 1);
+
+        let detail = store.code_review_job_detail(&queued.id).unwrap().unwrap();
+        assert_eq!(detail.job.progress.completed_reviewers, 1);
+        assert_eq!(detail.tasks[0].output, "candidate output");
+        assert_eq!(detail.personas[0].candidate_issue_count, 1);
+        assert_eq!(detail.personas[0].confirmed_issue_count, 1);
+        assert_eq!(detail.findings[0].sources[0].task_id, task.id);
+        assert_eq!(detail.prompt_for_agents, "Fix every confirmed issue.");
+
+        let replacement = store.retry_code_review_job(&queued.id).unwrap().unwrap();
+        assert_eq!(replacement.retry_of.as_deref(), Some(queued.id.as_str()));
+        let jobs = store.list_code_review_jobs(10).unwrap();
+        assert_eq!(jobs[0].id, queued.id);
+        assert_eq!(jobs[0].status, "running");
+        assert_eq!(jobs[1].id, replacement.id);
+        assert_eq!(jobs[1].status, "queued");
+        let superseded_task = store
+            .create_code_review_task(&NewCodeReviewTask {
+                job_id: replacement.id.clone(),
+                role: trouve_protocol::CodeReviewTaskRole::Reviewer,
+                reviewer_id: Some("correctness".into()),
+                reviewer_name: "Correctness".into(),
+                batch_index: 0,
+                batch_count: 1,
+                model: None,
+                prompt: String::new(),
+            })
+            .unwrap_err();
+        assert!(superseded_task.to_string().contains("no longer running"));
+
+        store
+            .mark_code_review_published(
+                "acme/widgets",
+                42,
+                "1111111111111111111111111111111111111111",
+                "2222222222222222222222222222222222222222",
+            )
+            .unwrap();
+        let watermark = store.code_review_pull_state("acme/widgets", 42).unwrap();
+        assert_eq!(
+            watermark.last_reviewed_head_sha,
+            "2222222222222222222222222222222222222222"
+        );
+        assert!(watermark.last_reviewed_at.is_some());
+
+        let stats = store
+            .code_review_stats(
+                trouve_protocol::CodeReviewStatsRange::All,
+                Some("acme/widgets"),
+            )
+            .unwrap();
+        assert_eq!(stats.status.running, 1);
+        assert_eq!(stats.status.queued, 1);
+        assert_eq!(stats.personas[0].candidate_issue_count, 1);
+        assert_eq!(stats.personas[0].confirmed_issue_count, 1);
+    }
+
+    #[test]
+    fn review_publication_rejects_cancellation_with_a_client_facing_reason() {
+        let store = Store::open_in_memory().unwrap();
+        let job = store
+            .enqueue_code_review_job(&NewCodeReviewJob {
+                dedupe_key: "acme/widgets#42:publishing".into(),
+                installation_id: 7,
+                repository: "acme/widgets".into(),
+                pull_number: 42,
+                pull_title: "Ship widgets".into(),
+                pull_url: "https://github.com/acme/widgets/pull/42".into(),
+                head_sha: "2222222222222222222222222222222222222222".into(),
+                review_base_sha: "1111111111111111111111111111111111111111".into(),
+                base_ref: "main".into(),
+                head_ref: "ship".into(),
+                scope: trouve_protocol::CodeReviewJobScope::Incremental,
+                trigger: "automatic".into(),
+                retry_of: None,
+                model: None,
+                prompt: String::new(),
+                reviewers: Vec::new(),
+                config_hash: "config".into(),
+            })
+            .unwrap()
+            .unwrap();
+        store.claim_code_review_job().unwrap().unwrap();
+        assert!(store.claim_code_review_publication(&job.id).unwrap());
+
+        let error = store.request_code_review_job_cancel(&job.id).unwrap_err();
+        assert!(error.to_string().contains("before cancelling"));
+    }
+
+    #[test]
     fn built_in_reviewer_defaults_are_durable_and_separate_from_custom_profiles() {
         let store = Store::open_in_memory().unwrap();
         let mut reviewer = crate::reviewers::built_in_reviewers().remove(0);
@@ -3623,9 +5614,12 @@ mod tests {
                     pull_title: "Ship widgets".into(),
                     pull_url: "https://github.com/acme/widgets/pull/42".into(),
                     head_sha: head_sha.into(),
+                    review_base_sha: base_ref.into(),
                     base_ref: base_ref.into(),
                     head_ref: "ship".into(),
+                    scope: trouve_protocol::CodeReviewJobScope::Incremental,
                     trigger: "automatic".into(),
+                    retry_of: None,
                     model: None,
                     prompt: String::new(),
                     reviewers: Vec::new(),
@@ -3701,5 +5695,37 @@ mod tests {
             store.pending_code_review_job_cleanups().unwrap(),
             vec![(old_head.id, "se_old".into())]
         );
+    }
+
+    #[tokio::test]
+    async fn scoped_live_subscriptions_only_receive_their_scope() {
+        let store = Store::open_in_memory().unwrap();
+        let first_scope = Scope::Thread("th_first".into());
+        let second_scope = Scope::Thread("th_second".into());
+        let mut first = store.subscribe_scope(&first_scope);
+        let mut second = store.subscribe_scope(&second_scope);
+        store
+            .append_event(
+                first_scope,
+                Event::TurnCapacityAcquired {
+                    turn: 1,
+                    wait_ms: 7,
+                    background: false,
+                },
+            )
+            .unwrap();
+        let received = first.recv().await.unwrap();
+        assert!(matches!(
+            received.event,
+            Event::TurnCapacityAcquired {
+                turn: 1,
+                wait_ms: 7,
+                background: false
+            }
+        ));
+        assert!(matches!(
+            second.try_recv(),
+            Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+        ));
     }
 }

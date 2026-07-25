@@ -704,6 +704,15 @@ pub fn set_prs(
     });
 }
 
+/// Plain-data mirror of the Slint PrReviewFindingItem struct.
+pub struct PrReviewFindingView {
+    pub location: String,
+    pub severity: String,
+    pub body: String,
+    pub prompt: String,
+    pub status: String,
+}
+
 /// Plain-data mirror of the Slint PrRowItem struct (one dashboard row).
 pub struct PrRowView {
     pub workspace_id: String,
@@ -730,6 +739,10 @@ pub struct PrRowView {
     /// A session for this branch exists (chat button jumps instead of
     /// offering a new chat).
     pub has_chat: bool,
+    pub has_trouve_review: bool,
+    pub trouve_review_summary: String,
+    pub trouve_review_prompt: String,
+    pub trouve_review_findings: Vec<PrReviewFindingView>,
 }
 
 /// Plain-data mirror of the Slint PrGroupItem struct.
@@ -792,6 +805,25 @@ pub fn set_pr_dashboard(
                             last_comment: SharedString::from(p.last_comment.as_str()),
                             url: SharedString::from(p.url.as_str()),
                             has_chat: p.has_chat,
+                            has_trouve_review: p.has_trouve_review,
+                            trouve_review_summary: SharedString::from(
+                                p.trouve_review_summary.as_str(),
+                            ),
+                            trouve_review_prompt: SharedString::from(
+                                p.trouve_review_prompt.as_str(),
+                            ),
+                            trouve_review_findings: ModelRc::new(VecModel::from(
+                                p.trouve_review_findings
+                                    .into_iter()
+                                    .map(|finding| crate::PrReviewFindingItem {
+                                        location: SharedString::from(finding.location.as_str()),
+                                        severity: SharedString::from(finding.severity.as_str()),
+                                        body: SharedString::from(finding.body.as_str()),
+                                        prompt: SharedString::from(finding.prompt.as_str()),
+                                        status: SharedString::from(finding.status.as_str()),
+                                    })
+                                    .collect::<Vec<_>>(),
+                            )),
                         })
                         .collect::<Vec<_>>(),
                 )),

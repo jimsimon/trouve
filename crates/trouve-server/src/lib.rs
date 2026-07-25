@@ -22,14 +22,16 @@ use trouve_core::Engine;
 use trouve_core::engine::EngineError;
 use trouve_protocol::{
     AddLocalModelRequest, AgentMode, Automation, BranchList, CliInfo, CliInstallStatus, CliList,
-    CodeReviewDashboard, CodeReviewRepository, CompleteLoginRequest, ConfigureGithubAppRequest,
-    CreatePrRequest, CreateSessionRequest, CreateThreadRequest, DirEntry, ErrorBody, FileContent,
-    GithubAppStatus, GithubIntegration, GithubPrList, KnownProvider, LocalSearchResult,
-    LocalStatus, LoginStarted, LoginStatus, McpLogs, McpServerInfo, MergePrRequest, ModeInfo,
-    ModelInfo, OpenTerminalRequest, PROTOCOL_VERSION, PrInfo, ProviderInfo, ProvidersResponse,
-    QueuedPrompt, RegisterWorkspaceRequest, ReorderQueueRequest, ResolveApprovalRequest,
-    ResolveQuestionRequest, ReviewerProfile, Scope, SendMessageRequest, ServerInfo, Session,
-    SessionDiff, SetDefaultModelRequest, SetDefaultPermissionModeRequest, SetLocalEnabledRequest,
+    CodeReviewDashboard, CodeReviewJob, CodeReviewJobDetail, CodeReviewJobList,
+    CodeReviewRepository, CodeReviewStats, CodeReviewStatsRange, CompleteLoginRequest,
+    ConfigureGithubAppRequest, CreatePrRequest, CreateSessionRequest, CreateThreadRequest,
+    DirEntry, ErrorBody, FileContent, GithubAppStatus, GithubIntegration, GithubPrList,
+    KnownProvider, LocalSearchResult, LocalStatus, LoginStarted, LoginStatus, McpLogs,
+    McpServerInfo, MergePrRequest, ModeInfo, ModelInfo, OpenTerminalRequest, PROTOCOL_VERSION,
+    PrInfo, ProviderInfo, ProvidersResponse, QueuedPrompt, RegisterWorkspaceRequest,
+    ReorderQueueRequest, RequestCodeReviewRequest, ResolveApprovalRequest, ResolveQuestionRequest,
+    ReviewerProfile, Scope, SendMessageRequest, ServerInfo, Session, SessionDiff,
+    SetDefaultModelRequest, SetDefaultPermissionModeRequest, SetLocalEnabledRequest,
     SubscriptionHealth, TerminalInfo, TerminalInputRequest, TerminalResizeRequest, Thread,
     TurnAccepted, UpdateCodeReviewRepositoryRequest, UpdateQueuedPromptRequest,
     UpdateSessionRequest, UpdateThreadRequest, UpsertAutomationRequest, UpsertMcpServerRequest,
@@ -166,6 +168,13 @@ impl IntoResponse for ApiError {
         delete_automation,
         run_automation,
         code_review_dashboard,
+        list_code_review_jobs,
+        get_code_review_job,
+        code_review_job_events,
+        request_code_review,
+        cancel_code_review_job,
+        retry_code_review_job,
+        code_review_stats,
         configure_github_review_app,
         upsert_reviewer_profile,
         delete_reviewer_profile,
@@ -221,6 +230,7 @@ impl IntoResponse for ApiError {
         TerminalInputRequest,
         TerminalResizeRequest,
         PrInfo,
+        trouve_protocol::FirstPartyCodeReview,
         GithubPrList,
         CreatePrRequest,
         MergePrRequest,
@@ -242,6 +252,24 @@ impl IntoResponse for ApiError {
         trouve_protocol::ReviewerPromptMode,
         CodeReviewRepository,
         trouve_protocol::CodeReviewJob,
+        trouve_protocol::CodeReviewJobScope,
+        trouve_protocol::CodeReviewProgress,
+        trouve_protocol::CodeReviewTaskRole,
+        trouve_protocol::CodeReviewOutputStream,
+        trouve_protocol::CodeReviewTask,
+        trouve_protocol::CodeReviewPersonaResult,
+        trouve_protocol::CodeReviewFindingSource,
+        trouve_protocol::CodeReviewFinding,
+        trouve_protocol::CodeReviewJobDetail,
+        trouve_protocol::CodeReviewJobList,
+        trouve_protocol::RequestCodeReviewRequest,
+        trouve_protocol::CodeReviewStatsRange,
+        trouve_protocol::CodeReviewStatusCounts,
+        trouve_protocol::CodeReviewDurationStats,
+        trouve_protocol::CodeReviewStatsBucket,
+        trouve_protocol::CodeReviewPersonaModelStats,
+        trouve_protocol::CodeReviewRepositoryStats,
+        trouve_protocol::CodeReviewStats,
         trouve_protocol::CodeReviewMode,
         GithubAppStatus,
         ConfigureGithubAppRequest,
@@ -485,6 +513,22 @@ pub fn build_router(engine: Arc<Engine>) -> Router {
         )
         .route("/v1/automations/{id}/run", post(run_automation))
         .route("/v1/code-review", get(code_review_dashboard))
+        .route("/v1/code-review/jobs", get(list_code_review_jobs))
+        .route("/v1/code-review/jobs/{id}", get(get_code_review_job))
+        .route(
+            "/v1/code-review/jobs/{id}/events",
+            get(code_review_job_events),
+        )
+        .route(
+            "/v1/code-review/jobs/{id}/cancel",
+            post(cancel_code_review_job),
+        )
+        .route(
+            "/v1/code-review/jobs/{id}/retry",
+            post(retry_code_review_job),
+        )
+        .route("/v1/code-review/requests", post(request_code_review))
+        .route("/v1/code-review/stats", get(code_review_stats))
         .route(
             "/v1/code-review/github-app",
             axum::routing::put(configure_github_review_app),
@@ -637,6 +681,99 @@ async fn code_review_dashboard(
     State(engine): State<Arc<Engine>>,
 ) -> Result<Json<CodeReviewDashboard>, ApiError> {
     Ok(Json(engine.code_review_dashboard()?))
+}
+
+#[derive(Debug, Deserialize)]
+struct CodeReviewJobsQuery {
+    #[serde(default = "default_review_job_limit")]
+    limit: usize,
+    status: Option<String>,
+    repository: Option<String>,
+}
+
+fn default_review_job_limit() -> usize {
+    100
+}
+
+#[derive(Debug, Deserialize)]
+struct CodeReviewStatsQuery {
+    #[serde(default)]
+    range: CodeReviewStatsRange,
+    repository: Option<String>,
+}
+
+#[utoipa::path(get, path = "/v1/code-review/jobs",
+    params(
+        ("limit" = Option<usize>, Query, description = "Maximum jobs, 1 through 500"),
+        ("status" = Option<String>, Query, description = "Exact job status"),
+        ("repository" = Option<String>, Query, description = "Exact owner/name repository")
+    ),
+    responses((status = 200, body = CodeReviewJobList), (status = 400, body = ErrorBody)))]
+async fn list_code_review_jobs(
+    State(engine): State<Arc<Engine>>,
+    Query(query): Query<CodeReviewJobsQuery>,
+) -> Result<Json<CodeReviewJobList>, ApiError> {
+    Ok(Json(engine.code_review_jobs(
+        query.limit,
+        query.status.as_deref(),
+        query.repository.as_deref(),
+    )?))
+}
+
+#[utoipa::path(get, path = "/v1/code-review/jobs/{id}",
+    params(("id" = String, Path, description = "Review job id")),
+    responses((status = 200, body = CodeReviewJobDetail), (status = 404, body = ErrorBody)))]
+async fn get_code_review_job(
+    State(engine): State<Arc<Engine>>,
+    Path(id): Path<String>,
+) -> Result<Json<CodeReviewJobDetail>, ApiError> {
+    Ok(Json(engine.code_review_job_detail(&id)?))
+}
+
+#[utoipa::path(post, path = "/v1/code-review/requests",
+    request_body = RequestCodeReviewRequest,
+    responses((status = 200, body = CodeReviewJob), (status = 400, body = ErrorBody)))]
+async fn request_code_review(
+    State(engine): State<Arc<Engine>>,
+    Json(request): Json<RequestCodeReviewRequest>,
+) -> Result<Json<CodeReviewJob>, ApiError> {
+    Ok(Json(engine.request_code_review(request).await?))
+}
+
+#[utoipa::path(post, path = "/v1/code-review/jobs/{id}/cancel",
+    params(("id" = String, Path, description = "Review job id")),
+    responses((status = 200, body = CodeReviewJob), (status = 400, body = ErrorBody), (status = 404, body = ErrorBody)))]
+async fn cancel_code_review_job(
+    State(engine): State<Arc<Engine>>,
+    Path(id): Path<String>,
+) -> Result<Json<CodeReviewJob>, ApiError> {
+    Ok(Json(engine.cancel_code_review_job(&id).await?))
+}
+
+#[utoipa::path(post, path = "/v1/code-review/jobs/{id}/retry",
+    params(("id" = String, Path, description = "Review job id")),
+    responses((status = 200, body = CodeReviewJob), (status = 400, body = ErrorBody), (status = 404, body = ErrorBody)))]
+async fn retry_code_review_job(
+    State(engine): State<Arc<Engine>>,
+    Path(id): Path<String>,
+) -> Result<Json<CodeReviewJob>, ApiError> {
+    Ok(Json(engine.retry_review_job(&id).await?))
+}
+
+#[utoipa::path(get, path = "/v1/code-review/stats",
+    params(
+        ("range" = Option<CodeReviewStatsRange>, Query, description = "hour, day, week, month, year, or all"),
+        ("repository" = Option<String>, Query, description = "Exact owner/name repository")
+    ),
+    responses((status = 200, body = CodeReviewStats), (status = 400, body = ErrorBody)))]
+async fn code_review_stats(
+    State(engine): State<Arc<Engine>>,
+    Query(query): Query<CodeReviewStatsQuery>,
+) -> Result<Json<CodeReviewStats>, ApiError> {
+    Ok(Json(engine.code_review_stats(
+        query.range,
+        query.repository.as_deref(),
+    )?))
 }
 
 #[utoipa::path(put, path = "/v1/code-review/github-app",
@@ -1752,7 +1889,7 @@ fn event_stream(
 ) -> Sse<impl Stream<Item = Result<SseEvent, Infallible>>> {
     let (tx, rx) = tokio::sync::mpsc::channel::<SseEvent>(256);
     tokio::spawn(async move {
-        let mut live = engine.store().subscribe();
+        let mut live = engine.store().subscribe_scope(&scope);
         let mut last = match replay_persisted_events(&engine, &scope, &tx, after).await {
             Ok(last) => last,
             Err(EventReplayError::Store(e)) => {
@@ -1826,4 +1963,20 @@ async fn thread_events(
 ) -> impl IntoResponse {
     let after = resume_cursor(&headers, &q);
     event_stream(engine, Scope::Thread(id), after)
+}
+
+#[utoipa::path(get, path = "/v1/code-review/jobs/{id}/events",
+    params(
+        ("id" = String, Path, description = "Review job id"),
+        ("after" = Option<u64>, Query, description = "Resume after this event cursor")
+    ),
+    responses((status = 200, description = "Cursor-addressed code-review job SSE stream")))]
+async fn code_review_job_events(
+    State(engine): State<Arc<Engine>>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+    Query(q): Query<EventsQuery>,
+) -> impl IntoResponse {
+    let after = resume_cursor(&headers, &q);
+    event_stream(engine, Scope::CodeReviewJob(id), after)
 }

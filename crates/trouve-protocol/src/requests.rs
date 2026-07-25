@@ -404,6 +404,21 @@ pub struct PrReview {
     pub state: String,
 }
 
+/// A review produced by trouve's first-party review service. The marker is
+/// joined from durable job/finding records rather than inferred from an
+/// untrusted comment author or body.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct FirstPartyCodeReview {
+    pub job_id: String,
+    pub bot_login: String,
+    pub status: String,
+    pub summary: String,
+    pub prompt_for_agents: String,
+    pub review_url: String,
+    #[serde(default)]
+    pub findings: Vec<CodeReviewFinding>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct PrInfo {
     /// GitHub instance that owns this PR.
@@ -427,6 +442,9 @@ pub struct PrInfo {
     pub head_sha: Option<String>,
     pub checks: Vec<CheckRun>,
     pub reviews: Vec<PrReview>,
+    /// Latest successfully published trouve review for this exact PR head.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trouve_review: Option<FirstPartyCodeReview>,
     /// PR author's login.
     #[serde(default)]
     pub author: String,
@@ -637,6 +655,14 @@ pub struct GithubAppStatus {
     pub bot_login: String,
     #[serde(default)]
     pub webhook_configured: bool,
+    /// Whether the installation token reports `checks: write`. Polling-only
+    /// deployments still create and update Check Runs when this is true.
+    #[serde(default)]
+    pub checks_write_configured: bool,
+    /// Whether `check_run` delivery is selected in the GitHub App. This is
+    /// optional unless interactive Re-run actions are desired.
+    #[serde(default)]
+    pub check_run_webhook_configured: bool,
     #[serde(default)]
     pub installation_count: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -762,6 +788,176 @@ pub struct UpdateCodeReviewRepositoryRequest {
     pub reviewer_overrides: Option<Vec<ReviewerOverride>>,
 }
 
+/// Whether a job reviews only changes since the last successfully published
+/// head, or the entire pull-request branch against its GitHub base.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum CodeReviewJobScope {
+    #[default]
+    Incremental,
+    Full,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct CodeReviewProgress {
+    pub completed_reviewers: u64,
+    pub total_reviewers: u64,
+    /// Integer percentage in the inclusive range 0..=100.
+    pub percent: u8,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum CodeReviewTaskRole {
+    Reviewer,
+    Coordinator,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum CodeReviewOutputStream {
+    Assistant,
+    Thinking,
+    Tool,
+}
+
+/// One durable reviewer/coordinator execution. Tasks survive cleanup of their
+/// implementation sessions and threads.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct CodeReviewTask {
+    pub id: String,
+    pub job_id: String,
+    pub role: CodeReviewTaskRole,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reviewer_id: Option<String>,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub reviewer_name: String,
+    #[serde(default)]
+    pub batch_index: u64,
+    #[serde(default)]
+    pub batch_count: u64,
+    /// `queued`, `running`, `succeeded`, `failed`, `cancelled`, or
+    /// `not_applicable`.
+    pub status: String,
+    /// The provider-qualified model actually used by the created thread.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thread_id: Option<String>,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub prompt: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub output: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub thinking: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub tool_output: String,
+    #[serde(default)]
+    pub candidate_issue_count: u64,
+    #[serde(default)]
+    pub confirmed_issue_count: u64,
+    /// Time spent waiting for shared/provider model capacity.
+    #[serde(default)]
+    pub provider_wait_ms: u64,
+    /// Wall time from model dispatch through tool iterations and completion.
+    #[serde(default)]
+    pub model_elapsed_ms: u64,
+    #[serde(default)]
+    pub input_tokens: u64,
+    #[serde(default)]
+    pub cached_input_tokens: u64,
+    #[serde(default)]
+    pub output_tokens: u64,
+    #[serde(default)]
+    pub tool_call_count: u64,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub error: String,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub started_at: Option<chrono::DateTime<chrono::Utc>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completed_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// Current elapsed time for active tasks and final elapsed time for
+    /// terminal tasks, as measured by the server.
+    #[serde(default)]
+    pub elapsed_ms: u64,
+}
+
+/// Reviewer-level rollup across one or more diff batches.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct CodeReviewPersonaResult {
+    pub reviewer_id: String,
+    pub reviewer_name: String,
+    pub status: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub models: Vec<String>,
+    #[serde(default)]
+    pub completed_batches: u64,
+    #[serde(default)]
+    pub total_batches: u64,
+    #[serde(default)]
+    pub candidate_issue_count: u64,
+    #[serde(default)]
+    pub confirmed_issue_count: u64,
+    #[serde(default)]
+    pub provider_wait_ms: u64,
+    #[serde(default)]
+    pub model_elapsed_ms: u64,
+    #[serde(default)]
+    pub input_tokens: u64,
+    #[serde(default)]
+    pub cached_input_tokens: u64,
+    #[serde(default)]
+    pub output_tokens: u64,
+    #[serde(default)]
+    pub tool_call_count: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub started_at: Option<chrono::DateTime<chrono::Utc>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completed_at: Option<chrono::DateTime<chrono::Utc>>,
+    #[serde(default)]
+    pub elapsed_ms: u64,
+}
+
+/// A persona/candidate that contributed to a confirmed published finding.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct CodeReviewFindingSource {
+    pub reviewer_id: String,
+    pub reviewer_name: String,
+    pub candidate_id: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub task_id: String,
+}
+
+/// A confirmed issue produced by the coordinator and, when possible,
+/// published as an inline GitHub review comment.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct CodeReviewFinding {
+    pub id: String,
+    pub job_id: String,
+    pub path: String,
+    pub line: u64,
+    pub side: String,
+    pub severity: String,
+    pub body: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub prompt_for_agents: String,
+    /// `open`, `fixed`, or `dismissed`.
+    pub status: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub sources: Vec<CodeReviewFindingSource>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub github_comment_id: Option<u64>,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub github_comment_url: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub github_thread_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolved_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
 /// A durable execution of one model review against one immutable PR head.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct CodeReviewJob {
@@ -772,12 +968,22 @@ pub struct CodeReviewJob {
     pub pull_title: String,
     pub pull_url: String,
     pub head_sha: String,
+    /// Commit used as the left side of this review's diff. For incremental
+    /// jobs this is normally the last successfully published head.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub review_base_sha: String,
     pub base_ref: String,
     pub head_ref: String,
+    #[serde(default)]
+    pub scope: CodeReviewJobScope,
     /// `automatic`, `manual`, or `retry`.
     pub trigger: String,
-    /// `queued`, `running`, `succeeded`, `failed`, or `stale`.
+    /// `queued`, `running`, `succeeded`, `failed`, `cancelled`, or `stale`.
     pub status: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retry_of: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retried_by: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
     /// Reviewer profiles are snapshotted internally; their stable ids are
@@ -791,12 +997,198 @@ pub struct CodeReviewJob {
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub review_url: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub lifecycle_comment_url: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub check_run_id: Option<u64>,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub check_run_url: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub check_sync_error: String,
+    #[serde(default)]
+    pub cancel_requested: bool,
+    #[serde(default)]
+    pub progress: CodeReviewProgress,
+    #[serde(default)]
+    pub candidate_issue_count: u64,
+    #[serde(default)]
+    pub issue_count: u64,
+    #[serde(default)]
+    pub fixed_issue_count: u64,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub error: String,
     pub created_at: chrono::DateTime<chrono::Utc>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub started_at: Option<chrono::DateTime<chrono::Utc>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub completed_at: Option<chrono::DateTime<chrono::Utc>>,
+    #[serde(default)]
+    pub pending_elapsed_ms: u64,
+    #[serde(default)]
+    pub running_elapsed_ms: u64,
+    #[serde(default)]
+    pub preparation_elapsed_ms: u64,
+    #[serde(default)]
+    pub reviewer_elapsed_ms: u64,
+    #[serde(default)]
+    pub coordinator_elapsed_ms: u64,
+    #[serde(default)]
+    pub publication_elapsed_ms: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct CodeReviewJobDetail {
+    pub job: CodeReviewJob,
+    #[serde(default)]
+    pub tasks: Vec<CodeReviewTask>,
+    #[serde(default)]
+    pub personas: Vec<CodeReviewPersonaResult>,
+    #[serde(default)]
+    pub findings: Vec<CodeReviewFinding>,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub summary: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub prompt_for_agents: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct CodeReviewJobList {
+    pub jobs: Vec<CodeReviewJob>,
+}
+
+/// Manual review request. Full scope always compares the current head with
+/// the pull request's GitHub base; incremental scope uses the saved watermark
+/// when it remains valid.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct RequestCodeReviewRequest {
+    pub installation_id: u64,
+    pub repository: String,
+    pub pull_number: u64,
+    #[serde(default)]
+    pub scope: CodeReviewJobScope,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum CodeReviewStatsRange {
+    Hour,
+    #[default]
+    Day,
+    Week,
+    Month,
+    Year,
+    All,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, ToSchema)]
+pub struct CodeReviewStatusCounts {
+    pub queued: u64,
+    pub running: u64,
+    pub succeeded: u64,
+    pub failed: u64,
+    pub cancelled: u64,
+    pub stale: u64,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, ToSchema)]
+pub struct CodeReviewDurationStats {
+    pub samples: u64,
+    pub average_ms: u64,
+    pub p50_ms: u64,
+    pub p95_ms: u64,
+    pub maximum_ms: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct CodeReviewStatsBucket {
+    pub started_at: chrono::DateTime<chrono::Utc>,
+    pub completed_at: chrono::DateTime<chrono::Utc>,
+    #[serde(default)]
+    pub status: CodeReviewStatusCounts,
+    #[serde(default)]
+    pub issue_count: u64,
+    #[serde(default)]
+    pub pending_average_ms: u64,
+    #[serde(default)]
+    pub running_average_ms: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct CodeReviewPersonaModelStats {
+    pub reviewer_id: String,
+    pub reviewer_name: String,
+    pub model: String,
+    pub task_count: u64,
+    pub succeeded: u64,
+    pub failed: u64,
+    pub cancelled: u64,
+    #[serde(default)]
+    pub not_applicable: u64,
+    pub candidate_issue_count: u64,
+    pub confirmed_issue_count: u64,
+    #[serde(default)]
+    pub duration: CodeReviewDurationStats,
+    #[serde(default)]
+    pub provider_wait_duration: CodeReviewDurationStats,
+    #[serde(default)]
+    pub model_duration: CodeReviewDurationStats,
+    #[serde(default)]
+    pub input_tokens: u64,
+    #[serde(default)]
+    pub cached_input_tokens: u64,
+    #[serde(default)]
+    pub output_tokens: u64,
+    #[serde(default)]
+    pub tool_call_count: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct CodeReviewRepositoryStats {
+    pub repository: String,
+    #[serde(default)]
+    pub status: CodeReviewStatusCounts,
+    pub issue_count: u64,
+    #[serde(default)]
+    pub pending_duration: CodeReviewDurationStats,
+    #[serde(default)]
+    pub running_duration: CodeReviewDurationStats,
+    #[serde(default)]
+    pub preparation_duration: CodeReviewDurationStats,
+    #[serde(default)]
+    pub reviewer_duration: CodeReviewDurationStats,
+    #[serde(default)]
+    pub coordinator_duration: CodeReviewDurationStats,
+    #[serde(default)]
+    pub publication_duration: CodeReviewDurationStats,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct CodeReviewStats {
+    pub range: CodeReviewStatsRange,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repository: Option<String>,
+    pub generated_at: chrono::DateTime<chrono::Utc>,
+    /// Current active work plus terminal outcomes in the selected range.
+    #[serde(default)]
+    pub status: CodeReviewStatusCounts,
+    #[serde(default)]
+    pub pending_duration: CodeReviewDurationStats,
+    #[serde(default)]
+    pub running_duration: CodeReviewDurationStats,
+    #[serde(default)]
+    pub preparation_duration: CodeReviewDurationStats,
+    #[serde(default)]
+    pub reviewer_duration: CodeReviewDurationStats,
+    #[serde(default)]
+    pub coordinator_duration: CodeReviewDurationStats,
+    #[serde(default)]
+    pub publication_duration: CodeReviewDurationStats,
+    pub issue_count: u64,
+    #[serde(default)]
+    pub buckets: Vec<CodeReviewStatsBucket>,
+    #[serde(default)]
+    pub personas: Vec<CodeReviewPersonaModelStats>,
+    #[serde(default)]
+    pub repositories: Vec<CodeReviewRepositoryStats>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]

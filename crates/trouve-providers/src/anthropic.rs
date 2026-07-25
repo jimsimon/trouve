@@ -249,18 +249,32 @@ impl Provider for AnthropicProvider {
             "stream": true,
         });
         if !system.is_empty() {
-            body["system"] = system.into();
+            // System instructions are stable across turns and personas. A
+            // provider-managed ephemeral breakpoint improves repeated
+            // desktop turns and parallel review prompts without changing
+            // transcript semantics.
+            body["system"] = json!([{
+                "type": "text",
+                "text": system,
+                "cache_control": {"type": "ephemeral"}
+            }]);
         }
         if !tools.is_empty() {
+            let last = tools.len() - 1;
             body["tools"] = Value::Array(
                 tools
                     .iter()
-                    .map(|t| {
-                        json!({
+                    .enumerate()
+                    .map(|(index, t)| {
+                        let mut tool = json!({
                             "name": t.name,
                             "description": t.description,
                             "input_schema": t.parameters,
-                        })
+                        });
+                        if index == last {
+                            tool["cache_control"] = json!({"type": "ephemeral"});
+                        }
+                        tool
                     })
                     .collect(),
             );

@@ -1050,6 +1050,7 @@ impl GraphqlPullRequest {
             head_sha: self.head_ref_oid,
             checks,
             reviews,
+            trouve_review: None,
             author: self.author.map(|author| author.login).unwrap_or_default(),
             requested_reviewers,
             comments,
@@ -1304,6 +1305,7 @@ impl GitHub {
             head_sha: Some(pr.head.sha),
             checks,
             reviews,
+            trouve_review: None,
             author: pr.user.map(|u| u.login).unwrap_or_default(),
             requested_reviewers: pr
                 .requested_reviewers
@@ -1575,6 +1577,7 @@ mod tests {
                     head_sha: pending.head_ref_oid.clone(),
                     checks: Vec::new(),
                     reviews: Vec::new(),
+                    trouve_review: None,
                     author: "alice".into(),
                     requested_reviewers: Vec::new(),
                     comments: 0,

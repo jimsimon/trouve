@@ -22,3 +22,6 @@ sequentially.
 | [0010](0010-account-centric-multi-instance-github.md) | Account-centric, multi-instance GitHub integration | Accepted |
 | [0011](0011-github-app-backed-code-review-service.md) | GitHub App-backed code review service | Accepted |
 | [0012](0012-single-version-monorepo-release-train.md) | Single-version monorepo release train | Accepted |
+| [0013](0013-preact-review-dashboard.md) | Preact application for the review dashboard | Accepted |
+| [0014](0014-durable-code-review-job-artifacts.md) | Durable code-review job artifacts and event streams | Accepted |
+| [0015](0015-read-shared-turns-and-prioritized-capacity.md) | Read-shared turns and prioritized model capacity | Accepted |

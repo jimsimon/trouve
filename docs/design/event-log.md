@@ -8,9 +8,9 @@ are protocol changes.
 
 ## Model
 
-- Events are **append-only** and **per-thread**. A thread is the unit of
-  conversation; sessions and workspaces have lifecycle events too, carried on
-  a synthetic per-scope stream (see "Scopes").
+- Events are **append-only** and **per-scope**. A thread is the unit of
+  conversation; sessions, code-review jobs, and workspaces have lifecycle
+  events too, carried on their own streams (see "Scopes").
 - Every event has a **cursor**: a `u64` strictly increasing *within its
   scope*, assigned at append time by the store (SQLite `AUTOINCREMENT`
   rowid). Cursors are opaque to clients except for ordering and resumption.
@@ -31,6 +31,7 @@ Each event row belongs to exactly one scope:
 | --- | --- | --- |
 | `thread:<id>` | `GET /v1/threads/:id/events` | deltas, tool calls, approvals, turns |
 | `session:<id>` | `GET /v1/sessions/:id/events` | checkpoints, undo/redo, worktree lifecycle |
+| `code_review_job:<id>` | `GET /v1/code-review/jobs/:id/events` | task state, agent output, progress |
 | `server` | `GET /v1/events` | workspace registered, session created/deleted |
 
 A client rendering a thread subscribes to the thread stream and its parent
@@ -64,6 +65,9 @@ requires a protocol version bump.
 
 Thread scope:
 
+- `turn.capacity_acquired` `{turn, wait_ms, background}` — shared/provider
+  capacity was acquired; background review work uses a lane that reserves
+  capacity for interactive desktop turns
 - `turn.started` `{turn, mode, model}` / `turn.completed` `{turn, usage,
   checkpoint_id?}` / `turn.failed` `{turn, error}`
 - `user.message` `{turn, content}`
@@ -98,6 +102,16 @@ Server scope:
   run without internet, and clients gate prompt entry on that list
   (`ServerInfo.online` carries the same state for initial fetches)
 
+Code-review-job scope:
+
+- `code_review.task_updated` `{job_id, task}` — a reviewer or coordinator task
+  changed status or accumulated durable output
+- `code_review.output_delta` `{job_id, task_id, stream, text}` — live
+  assistant, reasoning, or tool output projected from the underlying thread
+- `code_review.progress_updated` `{job_id, completed_reviewers,
+  total_reviewers, percent}` — reviewer-level progress changed
+- `code_review.job_updated` `{job_id}` — other durable job state changed
+
 ## Persistence
 
 One SQLite table:
@@ -105,7 +119,7 @@ One SQLite table:
 ```sql
 CREATE TABLE events (
   cursor     INTEGER PRIMARY KEY AUTOINCREMENT,
-  scope_kind TEXT NOT NULL,      -- 'thread' | 'session' | 'server'
+  scope_kind TEXT NOT NULL,      -- 'thread' | 'session' | 'code_review_job' | 'server'
   scope_id   TEXT NOT NULL,      -- '' for server scope
   ts         TEXT NOT NULL,      -- RFC 3339
   payload    TEXT NOT NULL       -- JSON event body
@@ -124,9 +138,10 @@ subscriber can never observe an event that would not survive a crash.
 ## Retention & privacy
 
 Events contain prompts, file contents, and command output. They stay local
-(SQLite in the user's data dir), are covered by the session-deletion flow
-(deleting a session deletes its threads' events), and a `retention_days`
-setting (default: keep forever) prunes old scopes. Nothing here is uploaded.
+(SQLite in the user's data dir). Deleting a session deletes its thread and
+session events; durable code-review-job events remain with review history.
+A `retention_days` setting (default: keep forever) prunes old scopes. Nothing
+here is uploaded except the deliberately published review result.
 
 ## Relationship to checkpoints and audit
 

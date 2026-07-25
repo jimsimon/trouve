@@ -343,6 +343,26 @@ impl ToolExecutor for LocalToolExecutor {
             .await?;
         }
 
+        // Retries and duplicate requests for an immutable revision can reuse
+        // objects already fetched into the shared review repository.
+        let base_present = run(vec![
+            "cat-file".into(),
+            "-e".into(),
+            format!("{}^{{commit}}", request.base_sha),
+        ])
+        .await
+        .is_ok();
+        let head_present = run(vec![
+            "cat-file".into(),
+            "-e".into(),
+            format!("{}^{{commit}}", request.head_sha),
+        ])
+        .await
+        .is_ok();
+        if base_present && head_present {
+            return Ok(repository_path);
+        }
+
         let pull_ref = format!("refs/remotes/origin/trouve-pr-{}", request.pull_number);
         run(vec![
             "fetch".into(),
