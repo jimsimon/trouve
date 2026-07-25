@@ -47,6 +47,7 @@ const REVIEW_BATCH_MAX_BYTES: usize = 128 * 1024;
 const REVIEW_BATCH_TARGET_TOKENS: usize = 24 * 1024;
 const REVIEW_BATCH_MAX_FILES: usize = 24;
 const REVIEW_COORDINATOR_CONTEXT_MAX_BYTES: usize = 128 * 1024;
+const REVIEW_DIFF_CACHE_MAX_BYTES: usize = 16 * 1024 * 1024;
 const MAX_CANDIDATE_FINDINGS: usize = 200;
 const MANUAL_REVIEW_MENTION: &str = "@trouve-ai";
 const REVIEW_COMMENT_PAGE_SIZE: usize = 100;
@@ -103,7 +104,7 @@ pub struct CodeReviewRuntime {
     job_wake: Notify,
     running: Mutex<HashMap<String, RunningReview>>,
     projection_queue: Mutex<HashMap<String, ProjectionQueueState>>,
-    diff_cache: Mutex<HashMap<String, Arc<Vec<ReviewDiffFile>>>>,
+    diff_cache: Mutex<ReviewDiffCache>,
 }
 
 #[derive(Clone)]
@@ -115,6 +116,57 @@ struct RunningReview {
 struct ProjectionQueueState {
     dirty: bool,
     running: bool,
+}
+
+#[derive(Clone)]
+struct CachedReviewDiff {
+    files: Arc<Vec<ReviewDiffFile>>,
+    bytes: usize,
+}
+
+#[derive(Default)]
+struct ReviewDiffCache {
+    entries: HashMap<String, CachedReviewDiff>,
+    order: VecDeque<String>,
+    bytes: usize,
+}
+
+impl ReviewDiffCache {
+    fn get(&mut self, key: &str) -> Option<Arc<Vec<ReviewDiffFile>>> {
+        let files = self.entries.get(key)?.files.clone();
+        self.order.retain(|candidate| candidate != key);
+        self.order.push_back(key.to_owned());
+        Some(files)
+    }
+
+    fn insert(&mut self, key: String, files: Arc<Vec<ReviewDiffFile>>) {
+        self.remove(&key);
+        let bytes = files
+            .iter()
+            .map(|file| file.path.len().saturating_add(file.diff.len()))
+            .sum();
+        if bytes > REVIEW_DIFF_CACHE_MAX_BYTES {
+            return;
+        }
+        while self.bytes.saturating_add(bytes) > REVIEW_DIFF_CACHE_MAX_BYTES {
+            let Some(oldest) = self.order.pop_front() else {
+                break;
+            };
+            if let Some(removed) = self.entries.remove(&oldest) {
+                self.bytes = self.bytes.saturating_sub(removed.bytes);
+            }
+        }
+        self.bytes = self.bytes.saturating_add(bytes);
+        self.order.push_back(key.clone());
+        self.entries.insert(key, CachedReviewDiff { files, bytes });
+    }
+
+    fn remove(&mut self, key: &str) {
+        self.order.retain(|candidate| candidate != key);
+        if let Some(removed) = self.entries.remove(key) {
+            self.bytes = self.bytes.saturating_sub(removed.bytes);
+        }
+    }
 }
 
 impl CodeReviewRuntime {
@@ -884,24 +936,15 @@ impl Engine {
     }
 
     async fn refresh_code_review_progress(self: &Arc<Self>, job_id: &str) -> Result<()> {
-        let detail = self
+        let job = self
             .store
-            .code_review_job_detail(job_id)?
+            .code_review_job(job_id)?
             .ok_or_else(|| anyhow!("review job disappeared while updating progress"))?;
-        let completed = detail
-            .personas
-            .iter()
-            .filter(|persona| {
-                matches!(
-                    persona.status.as_str(),
-                    "succeeded" | "failed" | "cancelled" | "not_applicable"
-                )
-            })
-            .count() as u64;
+        let completed = self.store.completed_code_review_personas(job_id)?;
         let changed = self.store.set_code_review_job_progress(
             job_id,
             completed,
-            detail.job.progress.total_reviewers,
+            job.job.progress.total_reviewers,
         )?;
         if !changed {
             return Ok(());
@@ -1094,7 +1137,8 @@ impl Engine {
     ) -> Result<trouve_protocol::CodeReviewJob, EngineError> {
         let job = self
             .store
-            .request_code_review_job_cancel(id)?
+            .request_code_review_job_cancel(id)
+            .map_err(|error| EngineError::BadRequest(error.to_string()))?
             .ok_or_else(|| EngineError::NotFound(format!("review job {id}")))?;
         self.code_review.cancel_job(id);
         self.emit_code_review_job_updated(id)?;
@@ -1140,6 +1184,11 @@ impl Engine {
                     "repository is not available to that GitHub App installation".into(),
                 )
             })?;
+        if repository.mode == CodeReviewMode::Off {
+            return Err(EngineError::BadRequest(
+                "automated review is disabled for this repository".into(),
+            ));
+        }
         validate_repository(&repository.repository)
             .map_err(|error| EngineError::BadRequest(error.to_string()))?;
         let api = self
@@ -1202,11 +1251,7 @@ impl Engine {
                 base_ref: pull.base.sha,
                 head_ref: pull.head.name,
                 scope: request.scope,
-                trigger: if request.scope == trouve_protocol::CodeReviewJobScope::Full {
-                    "manual-full".into()
-                } else {
-                    "manual".into()
-                },
+                trigger: "manual".into(),
                 retry_of: None,
                 model: repository.model,
                 prompt: repository.prompt,
@@ -2171,19 +2216,23 @@ impl Engine {
                 ),
             ),
         };
-        let finished = if let Err(finish_error) =
-            self.store
+        let finish_recorded =
+            match self
+                .store
                 .finish_code_review_job(&job_id, status, &review_url, &error)
-        {
-            self.record_review_error(format!("finishing review job: {finish_error:#}"));
-            false
-        } else {
-            true
-        };
-        if finished {
-            if let Ok(Some(completed)) = self.store.code_review_job(&job_id) {
-                self.sync_code_review_projection(&completed.job).await;
-            }
+            {
+                Ok(_) => true,
+                Err(finish_error) => {
+                    self.record_review_error(format!("finishing review job: {finish_error:#}"));
+                    false
+                }
+            };
+        // Superseding can make the guarded finish a no-op, but the already
+        // terminal row still needs its Check Run/comment projection.
+        if let Ok(Some(completed)) = self.store.code_review_job(&job_id) {
+            self.sync_code_review_projection(&completed.job).await;
+        }
+        if finish_recorded {
             self.retry_code_review_cleanup().await;
         }
         let _ = self.store.cancel_active_code_review_tasks(&job_id, &error);
@@ -2313,8 +2362,7 @@ impl Engine {
             .diff_cache
             .lock()
             .unwrap()
-            .get(&diff_cache_key)
-            .cloned();
+            .get(&diff_cache_key);
         let diff_files = if let Some(cached) = cached_diff {
             cached
         } else {
@@ -2328,9 +2376,6 @@ impl Engine {
                     .map_err(|error| anyhow!(error))?,
             );
             let mut cache = self.code_review.diff_cache.lock().unwrap();
-            if cache.len() >= 32 {
-                cache.clear();
-            }
             cache.insert(diff_cache_key, loaded.clone());
             loaded
         };
@@ -2350,6 +2395,11 @@ impl Engine {
         // batches for the first persona.
         for (batch_index, batch) in batches.iter().cloned().enumerate() {
             for reviewer in &reviewers {
+                let applies = reviewer_applies_to_batch(&reviewer.id, &batch);
+                if !applies {
+                    planned.push((reviewer.clone(), batch_index, String::new(), false));
+                    continue;
+                }
                 let mut execution_record = record.clone();
                 execution_record.job = job.clone();
                 let prompt = reviewer_prompt(
@@ -2359,12 +2409,7 @@ impl Engine {
                     batch_index,
                     batches.len(),
                 );
-                planned.push((
-                    reviewer.clone(),
-                    batch_index,
-                    prompt,
-                    reviewer_applies_to_batch(&reviewer.id, &batch),
-                ));
+                planned.push((reviewer.clone(), batch_index, prompt, true));
             }
         }
         self.store.set_code_review_job_phase_elapsed(
@@ -3868,7 +3913,7 @@ fn validation_prompt(
          findings, correct path/side/line metadata, normalize severity to high/medium/low, \
          and retain only findings a maintainer should act on. Exact relevant diff context is \
          supplied below; use tools only when surrounding unchanged code is necessary to settle \
-         a concrete ambiguity. Do not add a finding merely because an \
+         a concrete ambiguity. Do not add a finding merely because a \
          reviewer suggested it. Each retained finding must include every contributing \
          `candidate_id` in `source_candidate_ids`; never invent an id. Also inspect the \
          previously published open findings and include an id in `resolved_finding_ids` \
@@ -4118,6 +4163,25 @@ mod tests {
         assert!(cache.entries.contains_key(&key(1)));
         assert!(!cache.entries.contains_key(&key(2)));
         assert_eq!(cache.bytes, cache.entries.len() * 2);
+    }
+
+    #[test]
+    fn review_diff_cache_evicts_by_byte_budget() {
+        let mut cache = ReviewDiffCache::default();
+        let chunk = "x".repeat(REVIEW_DIFF_CACHE_MAX_BYTES / 2 + 1);
+        let files = |path: &str| {
+            Arc::new(vec![ReviewDiffFile {
+                path: path.into(),
+                diff: chunk.clone(),
+            }])
+        };
+
+        cache.insert("first".into(), files("first.rs"));
+        cache.insert("second".into(), files("second.rs"));
+
+        assert!(cache.get("first").is_none());
+        assert!(cache.get("second").is_some());
+        assert!(cache.bytes <= REVIEW_DIFF_CACHE_MAX_BYTES);
     }
 
     #[tokio::test]

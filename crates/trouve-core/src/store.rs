@@ -743,12 +743,6 @@ const CODE_REVIEW_TASK_COLUMNS: &str = "id, job_id, role, reviewer_id, reviewer_
      batch_count, status, model, session_id, thread_id, prompt, output, thinking, tool_output, \
      candidate_issue_count, confirmed_issue_count, provider_wait_ms, model_elapsed_ms, input_tokens, \
      cached_input_tokens, output_tokens, tool_call_count, error, created_at, started_at, completed_at";
-const CODE_REVIEW_TASK_COLUMNS_PREFIXED: &str = "t.id, t.job_id, t.role, t.reviewer_id, \
-     t.reviewer_name, t.batch_index, t.batch_count, t.status, t.model, t.session_id, t.thread_id, \
-     t.prompt, t.output, t.thinking, t.tool_output, t.candidate_issue_count, \
-     t.confirmed_issue_count, t.provider_wait_ms, t.model_elapsed_ms, t.input_tokens, \
-     t.cached_input_tokens, t.output_tokens, t.tool_call_count, t.error, t.created_at, \
-     t.started_at, t.completed_at";
 
 #[derive(Debug, Clone)]
 pub struct NewCodeReviewFinding {
@@ -2559,7 +2553,7 @@ impl Store {
         let id = crate::new_id("rvt");
         let now = chrono::Utc::now().to_rfc3339();
         let conn = self.conn.lock().unwrap();
-        conn.execute(
+        let inserted = conn.execute(
             "INSERT INTO code_review_tasks
                     (id, job_id, role, reviewer_id, reviewer_name, batch_index,
                      batch_count, status, model, prompt, created_at)
@@ -2580,6 +2574,12 @@ impl Store {
                 now,
             ],
         )?;
+        if inserted == 0 {
+            anyhow::bail!(
+                "review job {} is no longer running; task creation was superseded",
+                task.job_id
+            );
+        }
         conn.query_row(
             &format!("SELECT {CODE_REVIEW_TASK_COLUMNS} FROM code_review_tasks WHERE id = ?1"),
             params![id],
@@ -2765,6 +2765,26 @@ impl Store {
                AND (completed_reviewers != ?2 OR total_reviewers != ?3)",
             params![id, completed_reviewers as i64, total_reviewers as i64],
         )? > 0)
+    }
+
+    pub fn completed_code_review_personas(&self, job_id: &str) -> Result<u64> {
+        let count = self.conn.lock().unwrap().query_row(
+            "SELECT COUNT(*) FROM (
+               SELECT reviewer_id
+               FROM code_review_tasks
+               WHERE job_id = ?1 AND role = 'reviewer' AND reviewer_id IS NOT NULL
+               GROUP BY reviewer_id
+               HAVING SUM(
+                 CASE WHEN status IN (
+                   'succeeded', 'failed', 'cancelled', 'not_applicable'
+                 ) THEN 0 ELSE 1 END
+               ) = 0
+               AND COUNT(*) >= MAX(batch_count)
+             )",
+            params![job_id],
+            |row| row.get::<_, i64>(0),
+        )?;
+        Ok(count as u64)
     }
 
     pub fn save_code_review_result(
@@ -3047,11 +3067,27 @@ impl Store {
             pending: Vec<u64>,
             running: Vec<u64>,
         }
+        struct JobStatsRow {
+            repository: String,
+            status: String,
+            created_at: chrono::DateTime<chrono::Utc>,
+            started_at: Option<chrono::DateTime<chrono::Utc>>,
+            completed_at: Option<chrono::DateTime<chrono::Utc>>,
+            issues: u64,
+            preparation_ms: u64,
+            reviewer_ms: u64,
+            coordinator_ms: u64,
+            publication_ms: u64,
+        }
         #[derive(Default)]
         struct PersonaExecution {
             reviewer_name: String,
             task_count: u64,
-            statuses: Vec<String>,
+            succeeded_tasks: u64,
+            failed_tasks: u64,
+            cancelled_tasks: u64,
+            not_applicable_tasks: u64,
+            terminal_tasks: u64,
             candidates: u64,
             confirmed: u64,
             provider_wait_ms: u64,
@@ -3085,24 +3121,24 @@ impl Store {
         let now = chrono::Utc::now();
         let requested_start = code_review_stats_start(range, now);
         let start_param = requested_start.map(|value| value.to_rfc3339());
-        let records: Vec<CodeReviewJobRecord> = {
+        let earliest_created_at = {
             let conn = self.conn.lock().unwrap();
-            let mut stmt = conn.prepare(&format!(
-                "SELECT {CODE_REVIEW_JOB_COLUMNS} FROM code_review_jobs
+            conn.query_row(
+                "SELECT MIN(created_at) FROM code_review_jobs
                  WHERE (?1 IS NULL OR repository = ?1)
                    AND (
                      status IN ('queued', 'running')
                      OR ?2 IS NULL
                      OR completed_at >= ?2
-                   )
-                 ORDER BY created_at"
-            ))?;
-            stmt.query_map(params![repository, start_param], row_to_code_review_job)?
-                .collect::<rusqlite::Result<_>>()?
+                   )",
+                params![repository, start_param],
+                |row| row.get::<_, Option<String>>(0),
+            )?
+            .and_then(|value| value.parse().ok())
         };
 
         let chart_start = requested_start
-            .or_else(|| records.first().map(|record| record.job.created_at))
+            .or(earliest_created_at)
             .unwrap_or(now - chrono::Duration::hours(1));
         let total_seconds = now.signed_duration_since(chart_start).num_seconds().max(1);
         let step_seconds = match range {
@@ -3128,115 +3164,143 @@ impl Store {
         let mut overall_issues = 0_u64;
         let mut repositories: BTreeMap<String, RepositoryAccumulator> = BTreeMap::new();
 
-        for record in &records {
-            let job = &record.job;
-            code_review_status_add(&mut overall_status, &job.status);
-            let repository_stats = repositories.entry(job.repository.clone()).or_default();
-            code_review_status_add(&mut repository_stats.status, &job.status);
-            overall_issues += job.issue_count;
-            repository_stats.issues += job.issue_count;
-            let terminal = !matches!(job.status.as_str(), "queued" | "running");
-            if terminal {
-                overall_pending.push(job.pending_elapsed_ms);
-                repository_stats.pending.push(job.pending_elapsed_ms);
-                if job.started_at.is_some() {
-                    overall_running.push(job.running_elapsed_ms);
-                    repository_stats.running.push(job.running_elapsed_ms);
+        {
+            let conn = self.conn.lock().unwrap();
+            let mut stmt = conn.prepare(
+                "SELECT repository, status, created_at, started_at, completed_at,
+                        issue_count, preparation_elapsed_ms, reviewer_elapsed_ms,
+                        coordinator_elapsed_ms, publication_elapsed_ms
+                 FROM code_review_jobs
+                 WHERE (?1 IS NULL OR repository = ?1)
+                   AND (
+                     status IN ('queued', 'running')
+                     OR ?2 IS NULL
+                     OR completed_at >= ?2
+                   )
+                 ORDER BY created_at",
+            )?;
+            let rows = stmt.query_map(params![repository, start_param], |row| {
+                Ok(JobStatsRow {
+                    repository: row.get(0)?,
+                    status: row.get(1)?,
+                    created_at: parse_datetime(row.get(2)?),
+                    started_at: parse_optional_datetime(row.get(3)?),
+                    completed_at: parse_optional_datetime(row.get(4)?),
+                    issues: row.get::<_, i64>(5)? as u64,
+                    preparation_ms: row.get::<_, i64>(6)? as u64,
+                    reviewer_ms: row.get::<_, i64>(7)? as u64,
+                    coordinator_ms: row.get::<_, i64>(8)? as u64,
+                    publication_ms: row.get::<_, i64>(9)? as u64,
+                })
+            })?;
+            for row in rows {
+                let job = row?;
+                code_review_status_add(&mut overall_status, &job.status);
+                let repository_stats = repositories.entry(job.repository.clone()).or_default();
+                code_review_status_add(&mut repository_stats.status, &job.status);
+                overall_issues += job.issues;
+                repository_stats.issues += job.issues;
+                let terminal = !matches!(job.status.as_str(), "queued" | "running");
+                if !terminal {
+                    continue;
                 }
-                push_nonzero_duration(&mut overall_preparation, job.preparation_elapsed_ms);
-                push_nonzero_duration(&mut overall_reviewers, job.reviewer_elapsed_ms);
-                push_nonzero_duration(&mut overall_coordinator, job.coordinator_elapsed_ms);
-                push_nonzero_duration(&mut overall_publication, job.publication_elapsed_ms);
-                push_nonzero_duration(
-                    &mut repository_stats.preparation,
-                    job.preparation_elapsed_ms,
+                let (pending_ms, running_ms) = job_elapsed_ms(
+                    &job.status,
+                    job.created_at,
+                    job.started_at,
+                    job.completed_at,
                 );
-                push_nonzero_duration(&mut repository_stats.reviewers, job.reviewer_elapsed_ms);
-                push_nonzero_duration(
-                    &mut repository_stats.coordinator,
-                    job.coordinator_elapsed_ms,
-                );
-                push_nonzero_duration(
-                    &mut repository_stats.publication,
-                    job.publication_elapsed_ms,
-                );
+                overall_pending.push(pending_ms);
+                repository_stats.pending.push(pending_ms);
+                if job.started_at.is_some() {
+                    overall_running.push(running_ms);
+                    repository_stats.running.push(running_ms);
+                }
+                push_nonzero_duration(&mut overall_preparation, job.preparation_ms);
+                push_nonzero_duration(&mut overall_reviewers, job.reviewer_ms);
+                push_nonzero_duration(&mut overall_coordinator, job.coordinator_ms);
+                push_nonzero_duration(&mut overall_publication, job.publication_ms);
+                push_nonzero_duration(&mut repository_stats.preparation, job.preparation_ms);
+                push_nonzero_duration(&mut repository_stats.reviewers, job.reviewer_ms);
+                push_nonzero_duration(&mut repository_stats.coordinator, job.coordinator_ms);
+                push_nonzero_duration(&mut repository_stats.publication, job.publication_ms);
                 if let Some(completed_at) = job.completed_at {
                     let seconds = completed_at
                         .signed_duration_since(chart_start)
                         .num_seconds()
                         .max(0);
-                    let index = (seconds / step_seconds) as usize;
-                    let index = index.min(bucket_accumulators.len() - 1);
+                    let index =
+                        ((seconds / step_seconds) as usize).min(bucket_accumulators.len() - 1);
                     let bucket = &mut bucket_accumulators[index];
                     code_review_status_add(&mut bucket.status, &job.status);
-                    bucket.issues += job.issue_count;
-                    bucket.pending.push(job.pending_elapsed_ms);
+                    bucket.issues += job.issues;
+                    bucket.pending.push(pending_ms);
                     if job.started_at.is_some() {
-                        bucket.running.push(job.running_elapsed_ms);
+                        bucket.running.push(running_ms);
                     }
                 }
             }
         }
 
-        let tasks: Vec<trouve_protocol::CodeReviewTask> = {
+        let executions: Vec<(String, String, String, PersonaExecution)> = {
             let conn = self.conn.lock().unwrap();
-            let mut stmt = conn.prepare(&format!(
-                "SELECT {} FROM code_review_tasks t
+            let mut stmt = conn.prepare(
+                "SELECT t.job_id, t.reviewer_id, MAX(t.reviewer_name),
+                        COALESCE(t.model, 'unknown (legacy)'), COUNT(*),
+                        SUM(CASE WHEN t.status = 'succeeded' THEN 1 ELSE 0 END),
+                        SUM(CASE WHEN t.status = 'failed' THEN 1 ELSE 0 END),
+                        SUM(CASE WHEN t.status = 'cancelled' THEN 1 ELSE 0 END),
+                        SUM(CASE WHEN t.status = 'not_applicable' THEN 1 ELSE 0 END),
+                        SUM(CASE WHEN t.status IN (
+                          'succeeded', 'failed', 'cancelled', 'not_applicable'
+                        ) THEN 1 ELSE 0 END),
+                        SUM(t.candidate_issue_count), SUM(t.confirmed_issue_count),
+                        SUM(t.provider_wait_ms), SUM(t.model_elapsed_ms),
+                        SUM(t.input_tokens), SUM(t.cached_input_tokens),
+                        SUM(t.output_tokens), SUM(t.tool_call_count),
+                        MIN(t.started_at), MAX(t.completed_at)
+                 FROM code_review_tasks t
                  JOIN code_review_jobs j ON j.id = t.job_id
-                 WHERE t.role = 'reviewer'
+                 WHERE t.role = 'reviewer' AND t.reviewer_id IS NOT NULL
                    AND (?1 IS NULL OR j.repository = ?1)
                    AND (
                      t.status IN ('queued', 'running')
                      OR ?2 IS NULL
                      OR t.completed_at >= ?2
                    )
-                 ORDER BY t.created_at",
-                CODE_REVIEW_TASK_COLUMNS_PREFIXED
-            ))?;
-            stmt.query_map(params![repository, start_param], row_to_code_review_task)?
-                .collect::<rusqlite::Result<_>>()?
+                 GROUP BY t.job_id, t.reviewer_id, COALESCE(t.model, 'unknown (legacy)')
+                 ORDER BY MIN(t.created_at)",
+            )?;
+            stmt.query_map(params![repository, start_param], |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(3)?,
+                    PersonaExecution {
+                        reviewer_name: row.get(2)?,
+                        task_count: row.get::<_, i64>(4)? as u64,
+                        succeeded_tasks: row.get::<_, i64>(5)? as u64,
+                        failed_tasks: row.get::<_, i64>(6)? as u64,
+                        cancelled_tasks: row.get::<_, i64>(7)? as u64,
+                        not_applicable_tasks: row.get::<_, i64>(8)? as u64,
+                        terminal_tasks: row.get::<_, i64>(9)? as u64,
+                        candidates: row.get::<_, i64>(10)? as u64,
+                        confirmed: row.get::<_, i64>(11)? as u64,
+                        provider_wait_ms: row.get::<_, i64>(12)? as u64,
+                        model_elapsed_ms: row.get::<_, i64>(13)? as u64,
+                        input_tokens: row.get::<_, i64>(14)? as u64,
+                        cached_input_tokens: row.get::<_, i64>(15)? as u64,
+                        output_tokens: row.get::<_, i64>(16)? as u64,
+                        tool_call_count: row.get::<_, i64>(17)? as u64,
+                        started_at: parse_optional_datetime(row.get(18)?),
+                        completed_at: parse_optional_datetime(row.get(19)?),
+                    },
+                ))
+            })?
+            .collect::<rusqlite::Result<_>>()?
         };
-        let mut persona_executions: BTreeMap<(String, String, String), PersonaExecution> =
-            BTreeMap::new();
-        for task in tasks {
-            let Some(reviewer_id) = task.reviewer_id.clone() else {
-                continue;
-            };
-            let model = task
-                .model
-                .clone()
-                .unwrap_or_else(|| "unknown (legacy)".into());
-            let execution = persona_executions
-                .entry((task.job_id.clone(), reviewer_id, model))
-                .or_default();
-            execution.reviewer_name = task.reviewer_name.clone();
-            execution.task_count += 1;
-            execution.statuses.push(task.status.clone());
-            execution.candidates += task.candidate_issue_count;
-            execution.confirmed += task.confirmed_issue_count;
-            execution.provider_wait_ms += task.provider_wait_ms;
-            execution.model_elapsed_ms += task.model_elapsed_ms;
-            execution.input_tokens += task.input_tokens;
-            execution.cached_input_tokens += task.cached_input_tokens;
-            execution.output_tokens += task.output_tokens;
-            execution.tool_call_count += task.tool_call_count;
-            if let Some(started) = task.started_at {
-                execution.started_at = Some(
-                    execution
-                        .started_at
-                        .map_or(started, |current| current.min(started)),
-                );
-            }
-            if let Some(completed) = task.completed_at {
-                execution.completed_at = Some(
-                    execution
-                        .completed_at
-                        .map_or(completed, |current| current.max(completed)),
-                );
-            }
-        }
         let mut persona_stats: BTreeMap<(String, String), PersonaAccumulator> = BTreeMap::new();
-        for ((_, reviewer_id, model), execution) in persona_executions {
+        for (_, reviewer_id, model, execution) in executions {
             let persona = persona_stats.entry((reviewer_id, model)).or_default();
             persona.reviewer_name = execution.reviewer_name;
             persona.task_count += execution.task_count;
@@ -3250,33 +3314,17 @@ impl Store {
             persona.cached_input_tokens += execution.cached_input_tokens;
             persona.output_tokens += execution.output_tokens;
             persona.tool_call_count += execution.tool_call_count;
-            let all_succeeded = execution
-                .statuses
-                .iter()
-                .all(|status| status == "succeeded");
+            let all_succeeded = execution.succeeded_tasks == execution.task_count;
             if all_succeeded {
                 persona.succeeded += 1;
-            } else if execution.statuses.iter().any(|status| status == "failed") {
+            } else if execution.failed_tasks > 0 {
                 persona.failed += 1;
-            } else if execution
-                .statuses
-                .iter()
-                .any(|status| status == "cancelled")
-            {
+            } else if execution.cancelled_tasks > 0 {
                 persona.cancelled += 1;
-            } else if execution
-                .statuses
-                .iter()
-                .all(|status| status == "not_applicable")
-            {
+            } else if execution.not_applicable_tasks == execution.task_count {
                 persona.not_applicable += 1;
             }
-            let all_terminal = execution.statuses.iter().all(|status| {
-                matches!(
-                    status.as_str(),
-                    "succeeded" | "failed" | "cancelled" | "not_applicable"
-                )
-            });
+            let all_terminal = execution.terminal_tasks == execution.task_count;
             if all_terminal
                 && let (Some(started), Some(completed)) =
                     (execution.started_at, execution.completed_at)
@@ -3421,7 +3469,7 @@ impl Store {
             }
             "running" => {
                 anyhow::bail!(
-                    "review publication has already started; wait for it to finish before retrying"
+                    "review publication has already started; wait for it to finish before cancelling"
                 );
             }
             _ => {}
@@ -5388,6 +5436,7 @@ mod tests {
         assert_eq!(partial.personas[0].status, "queued");
         assert_eq!(partial.personas[0].completed_batches, 1);
         assert_eq!(partial.personas[0].total_batches, 2);
+        assert_eq!(store.completed_code_review_personas(&queued.id).unwrap(), 0);
         let second_task = store
             .create_code_review_task(&NewCodeReviewTask {
                 job_id: queued.id.clone(),
@@ -5413,6 +5462,7 @@ mod tests {
             .finish_code_review_task(&second_task.id, "succeeded", "clean", 0, "")
             .unwrap()
             .unwrap();
+        assert_eq!(store.completed_code_review_personas(&queued.id).unwrap(), 1);
         assert!(
             store
                 .set_code_review_job_progress(&queued.id, 1, 2)
@@ -5457,6 +5507,19 @@ mod tests {
         assert_eq!(jobs[0].status, "running");
         assert_eq!(jobs[1].id, replacement.id);
         assert_eq!(jobs[1].status, "queued");
+        let superseded_task = store
+            .create_code_review_task(&NewCodeReviewTask {
+                job_id: replacement.id.clone(),
+                role: trouve_protocol::CodeReviewTaskRole::Reviewer,
+                reviewer_id: Some("correctness".into()),
+                reviewer_name: "Correctness".into(),
+                batch_index: 0,
+                batch_count: 1,
+                model: None,
+                prompt: String::new(),
+            })
+            .unwrap_err();
+        assert!(superseded_task.to_string().contains("no longer running"));
 
         store
             .mark_code_review_published(
@@ -5483,6 +5546,38 @@ mod tests {
         assert_eq!(stats.status.queued, 1);
         assert_eq!(stats.personas[0].candidate_issue_count, 1);
         assert_eq!(stats.personas[0].confirmed_issue_count, 1);
+    }
+
+    #[test]
+    fn review_publication_rejects_cancellation_with_a_client_facing_reason() {
+        let store = Store::open_in_memory().unwrap();
+        let job = store
+            .enqueue_code_review_job(&NewCodeReviewJob {
+                dedupe_key: "acme/widgets#42:publishing".into(),
+                installation_id: 7,
+                repository: "acme/widgets".into(),
+                pull_number: 42,
+                pull_title: "Ship widgets".into(),
+                pull_url: "https://github.com/acme/widgets/pull/42".into(),
+                head_sha: "2222222222222222222222222222222222222222".into(),
+                review_base_sha: "1111111111111111111111111111111111111111".into(),
+                base_ref: "main".into(),
+                head_ref: "ship".into(),
+                scope: trouve_protocol::CodeReviewJobScope::Incremental,
+                trigger: "automatic".into(),
+                retry_of: None,
+                model: None,
+                prompt: String::new(),
+                reviewers: Vec::new(),
+                config_hash: "config".into(),
+            })
+            .unwrap()
+            .unwrap();
+        store.claim_code_review_job().unwrap().unwrap();
+        assert!(store.claim_code_review_publication(&job.id).unwrap());
+
+        let error = store.request_code_review_job_cancel(&job.id).unwrap_err();
+        assert!(error.to_string().contains("before cancelling"));
     }
 
     #[test]

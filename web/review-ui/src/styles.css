@@ -17,6 +17,7 @@
   --amber: #f5b84b;
   --red: #ff6b7d;
   --purple: #a98bff;
+
   background: var(--bg);
   color: var(--text);
 }
@@ -27,7 +28,7 @@ button, input, select, textarea { font: inherit; }
 button, select, input, textarea { color: var(--text); }
 a { color: var(--blue); text-decoration: none; }
 a:hover { text-decoration: underline; }
-code, pre { font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace; }
+code, pre { font-family: SFMono-Regular, Consolas, "Liberation Mono", monospace; }
 
 .shell { min-height: 100vh; display: grid; grid-template-columns: 244px minmax(0, 1fr); }
 .sidebar {
@@ -87,7 +88,7 @@ button.compact { padding: 6px 9px; font-size: 12px; }
 .panel-title p { margin: 3px 0 0; color: var(--muted); font-size: 12px; }
 .metric-grid { display: grid; grid-template-columns: repeat(4, minmax(150px, 1fr)); gap: 13px; margin-bottom: 22px; }
 .metric { position: relative; overflow: hidden; padding: 18px; border-radius: 10px; border: 1px solid var(--line-soft); background: var(--surface); }
-.metric::after { content: ""; position: absolute; inset: auto -25px -35px auto; width: 85px; height: 85px; border-radius: 50%; opacity: .12; background: currentColor; }
+.metric::after { content: ""; position: absolute; inset: auto -25px -35px auto; width: 85px; height: 85px; border-radius: 50%; opacity: .12; background: currentcolor; }
 .metric span, .metric small { display: block; color: var(--muted); }
 .metric strong { display: block; margin: 8px 0 2px; font-size: 31px; color: var(--text); }
 .metric.blue { color: var(--blue); border-top-color: var(--blue); }

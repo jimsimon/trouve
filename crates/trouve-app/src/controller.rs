@@ -3227,6 +3227,9 @@ impl Controller {
             .iter()
             .position(|candidate| candidate == branch)
             .unwrap_or(0);
+        // The reviewed branch chooses its model server-side. Do not carry the
+        // provisional form's model-specific thinking key into that thread.
+        self.new_chat_thinking_key = None;
         self.start_new_chat(
             NewChatSelection {
                 workspace_idx,
@@ -4290,6 +4293,7 @@ impl Controller {
             match &command {
                 UiCommand::SendMessage(_)
                 | UiCommand::StartNewChat { .. }
+                | UiCommand::PrFixClicked { .. }
                 | UiCommand::QueueEdit { .. }
                 | UiCommand::QueueDelete(_)
                 | UiCommand::QueueMove { .. }

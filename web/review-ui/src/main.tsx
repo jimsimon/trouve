@@ -1,5 +1,6 @@
 import { Chart, registerables } from "chart.js";
 import { render } from "preact";
+import type { ComponentChildren } from "preact";
 import { useEffect, useMemo, useRef, useState } from "preact/hooks";
 import "./styles.css";
 import {
@@ -157,20 +158,25 @@ function ProgressBar({ job }: { job: ReviewJob }) {
 }
 
 function CopyButton({ text, label = "Copy prompt" }: { text: string; label?: string }) {
-  const [copied, setCopied] = useState(false);
+  const [copyState, setCopyState] = useState<"idle" | "copied" | "failed">("idle");
   const copy = async (): Promise<void> => {
-    await navigator.clipboard.writeText(text);
-    setCopied(true);
-    window.setTimeout(() => setCopied(false), 1_500);
+    try {
+      if (!navigator.clipboard?.writeText) throw new Error("Clipboard access is unavailable");
+      await navigator.clipboard.writeText(text);
+      setCopyState("copied");
+    } catch {
+      setCopyState("failed");
+    }
+    window.setTimeout(() => setCopyState("idle"), 1_500);
   };
   return (
     <button class="ghost compact" type="button" onClick={() => void copy()} disabled={!text}>
-      {copied ? "Copied" : label}
+      {copyState === "copied" ? "Copied" : copyState === "failed" ? "Copy failed" : label}
     </button>
   );
 }
 
-function ExternalLink({ href, children }: { href: string; children: preact.ComponentChildren }) {
+function ExternalLink({ href, children }: { href: string; children: ComponentChildren }) {
   const safe = safeExternalUrl(href);
   return safe ? (
     <a href={safe} target="_blank" rel="noopener noreferrer">
@@ -401,7 +407,7 @@ function PageHeader({
   eyebrow: string;
   title: string;
   description: string;
-  action?: preact.ComponentChildren;
+  action?: ComponentChildren;
 }) {
   return (
     <header class="page-header">
@@ -563,8 +569,22 @@ function JobDetailPane({
   };
   useEffect(() => {
     setDetail(null);
-    void load();
-    return openJobEvents(jobId, (event) => {
+    let alive = true;
+    const timeouts = new Set<number>();
+    const reload = async (): Promise<void> => {
+      try {
+        const next = await getJob(jobId);
+        if (alive) {
+          setDetail(next);
+          setError("");
+        }
+      } catch (cause) {
+        if (alive) setError(cause instanceof Error ? cause.message : String(cause));
+      }
+    };
+    void reload();
+    const close = openJobEvents(jobId, (event) => {
+      if (!alive) return;
       if (event.type === "code_review.output_delta" && event.task_id && event.text) {
         setDetail((current) => {
           if (!current) return current;
@@ -594,17 +614,41 @@ function JobDetailPane({
               : [...current.tasks, event.task!],
           };
         });
-        window.setTimeout(() => void load(), 150);
+        const timeout = window.setTimeout(() => {
+          timeouts.delete(timeout);
+          void reload();
+        }, 150);
+        timeouts.add(timeout);
       } else {
-        void load();
+        void reload();
       }
     });
+    return () => {
+      alive = false;
+      for (const timeout of timeouts) window.clearTimeout(timeout);
+      close();
+    };
   }, [jobId]);
 
   useEffect(() => {
     if (detail?.job.status !== "running" && detail?.job.status !== "queued") return;
-    const timer = window.setInterval(() => void load(), 3_000);
-    return () => window.clearInterval(timer);
+    let alive = true;
+    const reload = async (): Promise<void> => {
+      try {
+        const next = await getJob(jobId);
+        if (alive) {
+          setDetail(next);
+          setError("");
+        }
+      } catch (cause) {
+        if (alive) setError(cause instanceof Error ? cause.message : String(cause));
+      }
+    };
+    const timer = window.setInterval(() => void reload(), 3_000);
+    return () => {
+      alive = false;
+      window.clearInterval(timer);
+    };
   }, [detail?.job.status, jobId]);
 
   const act = async (action: "cancel" | "retry" | "full"): Promise<void> => {
@@ -1481,7 +1525,8 @@ function GithubAppSettings({
       <form
         onSubmit={async (event) => {
           event.preventDefault();
-          const data = new FormData(event.currentTarget);
+          const form = event.currentTarget;
+          const data = new FormData(form);
           setBusy(true);
           try {
             await configureApp({
@@ -1489,6 +1534,7 @@ function GithubAppSettings({
               private_key_pem: String(data.get("private_key_pem")),
               webhook_secret: String(data.get("webhook_secret")),
             });
+            form.reset();
             flash("GitHub App saved");
             onChanged();
           } catch (cause) {
@@ -1602,28 +1648,35 @@ function ProviderSettings({
   const cliInstalling = Object.values(cliStatuses).some(
     (status) => status.status === "pending",
   );
+  const latestCliStatuses = useRef(cliStatuses);
+  useEffect(() => {
+    latestCliStatuses.current = cliStatuses;
+  }, [cliStatuses]);
   useEffect(() => {
     if (!cliInstalling) return;
     const timer = window.setInterval(async () => {
-      const pendingIds = Object.entries(cliStatuses)
+      const pendingIds = Object.entries(latestCliStatuses.current)
         .filter(([, status]) => status.status === "pending")
         .map(([id]) => id);
-      const next = { ...cliStatuses };
+      const fetched: Record<string, CliInstallStatus> = {};
       for (const id of pendingIds) {
         try {
-          next[id] = await getCliInstallStatus(id);
+          fetched[id] = await getCliInstallStatus(id);
         } catch {
           // A transient status error should not stop the next polling tick.
         }
       }
-      setCliStatuses(next);
-      if (!Object.values(next).some((status) => status.status === "pending")) {
+      setCliStatuses((current) => ({ ...current, ...fetched }));
+      if (
+        pendingIds.length > 0 &&
+        pendingIds.every((id) => fetched[id] && fetched[id].status !== "pending")
+      ) {
         setClis(await getClis());
         onChanged();
       }
     }, 1_000);
     return () => window.clearInterval(timer);
-  }, [cliInstalling, cliStatuses]);
+  }, [cliInstalling]);
   useEffect(() => {
     if (!login || login.status !== "pending") return;
     const timer = window.setInterval(async () => {
