@@ -197,6 +197,13 @@ struct RuntimeState {
     check_run_webhook_configured: bool,
 }
 
+impl RuntimeState {
+    fn set_app_health(&mut self, health: GithubAppHealth) {
+        self.checks_write_configured = health.checks_write_configured;
+        self.check_run_webhook_configured = health.check_run_webhook_configured;
+    }
+}
+
 #[derive(Clone)]
 struct CachedToken {
     token: String,
@@ -284,6 +291,24 @@ struct AppInfo {
     permissions: HashMap<String, String>,
     #[serde(default)]
     events: Vec<String>,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct GithubAppHealth {
+    checks_write_configured: bool,
+    check_run_webhook_configured: bool,
+}
+
+impl From<&AppInfo> for GithubAppHealth {
+    fn from(app: &AppInfo) -> Self {
+        Self {
+            checks_write_configured: app
+                .permissions
+                .get("checks")
+                .is_some_and(|permission| permission == "write"),
+            check_run_webhook_configured: app.events.iter().any(|event| event == "check_run"),
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -797,6 +822,11 @@ fn rate_info(headers: &reqwest::header::HeaderMap) -> RateInfo {
 }
 
 fn app_jwt(app_id: u64, private_key_pem: &str) -> Result<String> {
+    // `jsonwebtoken` has its own process-wide crypto provider, separate from
+    // Rustls. Select one here as well as through Cargo features so embedding
+    // trouve-core outside trouve-server cannot make GitHub reconciliation
+    // panic while signing the App JWT.
+    let _ = jsonwebtoken::crypto::rust_crypto::DEFAULT_PROVIDER.install_default();
     let now = Utc::now().timestamp();
     let claims = AppJwtClaims {
         iat: now - 60,
@@ -1014,11 +1044,7 @@ impl Engine {
         let (app, rate): (AppInfo, _) = api.get("/app").await.map_err(|error| {
             EngineError::BadRequest(format!("GitHub App validation failed: {error:#}"))
         })?;
-        let checks_write_configured = app
-            .permissions
-            .get("checks")
-            .is_some_and(|permission| permission == "write");
-        let check_run_webhook_configured = app.events.iter().any(|event| event == "check_run");
+        let app_health = GithubAppHealth::from(&app);
         self.secrets
             .set(PRIVATE_KEY_SECRET, &request.private_key_pem)?;
         if request.webhook_secret.is_empty() {
@@ -1042,8 +1068,7 @@ impl Engine {
             let mut state = self.code_review.state.lock().unwrap();
             state.installation_count = 0;
             state.last_error.clear();
-            state.checks_write_configured = checks_write_configured;
-            state.check_run_webhook_configured = check_run_webhook_configured;
+            state.set_app_health(app_health);
         }
         self.code_review.poll_wake.notify_one();
         self.emit_code_review_updated(None)?;
@@ -1579,6 +1604,26 @@ impl Engine {
         };
         let api = Self::app_api(config.app_id, &private_key)?;
         let mut had_errors = false;
+        match api
+            .get::<AppInfo>("/app")
+            .await
+            .context("reading GitHub App configuration")
+        {
+            Ok((app, rate)) => {
+                self.record_review_rate(rate);
+                self.code_review
+                    .state
+                    .lock()
+                    .unwrap()
+                    .set_app_health(GithubAppHealth::from(&app));
+            }
+            Err(error) => {
+                had_errors = true;
+                self.record_review_error(format!(
+                    "reading GitHub App configuration failed: {error:#}"
+                ));
+            }
+        }
         let mut installations = Vec::new();
         let mut installations_complete = true;
         let mut installation_page = 1;
@@ -4555,6 +4600,46 @@ mod tests {
         for value in ["", "0", "nope"] {
             assert_eq!(parse_code_review_poll_interval(value), None);
         }
+    }
+
+    #[test]
+    fn github_app_health_tracks_current_permissions_and_events() {
+        let configured: AppInfo = serde_json::from_value(serde_json::json!({
+            "slug": "trouve-ai",
+            "permissions": {"checks": "write"},
+            "events": ["check_run", "pull_request"]
+        }))
+        .unwrap();
+        let missing: AppInfo = serde_json::from_value(serde_json::json!({
+            "slug": "trouve-ai",
+            "permissions": {"checks": "read"},
+            "events": ["pull_request"]
+        }))
+        .unwrap();
+        let mut state = RuntimeState::default();
+
+        state.set_app_health(GithubAppHealth::from(&configured));
+        assert!(state.checks_write_configured);
+        assert!(state.check_run_webhook_configured);
+
+        state.set_app_health(GithubAppHealth::from(&missing));
+        assert!(!state.checks_write_configured);
+        assert!(!state.check_run_webhook_configured);
+    }
+
+    #[test]
+    fn github_app_jwt_signing_installs_a_crypto_provider() {
+        use rsa::pkcs1::{EncodeRsaPrivateKey, LineEnding};
+
+        let private_key = rsa::RsaPrivateKey::new(&mut rsa::rand_core::OsRng, 1024).unwrap();
+        let private_key_pem = private_key.to_pkcs1_pem(LineEnding::LF).unwrap();
+        let token = app_jwt(123, private_key_pem.as_str()).unwrap();
+
+        assert_eq!(token.split('.').count(), 3);
+        assert_eq!(
+            jsonwebtoken::decode_header(&token).unwrap().alg,
+            Algorithm::RS256
+        );
     }
 
     #[test]

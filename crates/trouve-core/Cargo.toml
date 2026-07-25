@@ -45,4 +45,5 @@ trouve-search.workspace = true
 uuid.workspace = true
 
 [dev-dependencies]
+rsa = { version = "0.9.10", features = ["getrandom"] }
 tempfile.workspace = true
