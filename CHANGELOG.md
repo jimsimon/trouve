@@ -4,6 +4,29 @@ All notable changes to this project are documented in this file. The format
 is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this
 project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [3.4.2] - 2026-07-26
+
+### Added
+
+- **Review decision transparency**: completed review details now retain and
+  display why the final editor rejected individual candidate findings, and
+  the review activity view makes persona batches, coordinator attempts,
+  metrics, prompts, and live output directly inspectable.
+
+### Changed
+
+- **Faster unattended reviews**: review mode now defaults to low thinking
+  unless a reviewer persona explicitly requests another level, while
+  documented provider and global concurrency controls make deployment
+  throttling easier to tune.
+
+### Fixed
+
+- **Automated review orchestration and reporting**: batched reviewer tasks,
+  JSON-repair attempts, final-editor selection, candidate accounting,
+  statistics, progress summaries, and tool-free finalization now remain
+  consistent across retries, failures, cancellation, and concurrent work.
+
 ## [3.4.1] - 2026-07-25
 
 ### Fixed
@@ -514,6 +537,7 @@ semble ([BENCHMARKS.md](BENCHMARKS.md)):
 - Incremental reindex (1 file touched): 0.86 s vs ~3 min (212x)
 - Warm query: 0.55 s vs 7.2 s (13x)
 
+[3.4.2]: https://github.com/jimsimon/trouve/compare/v3.4.1...v3.4.2
 [3.4.1]: https://github.com/jimsimon/trouve/compare/v3.4.0...v3.4.1
 [3.4.0]: https://github.com/jimsimon/trouve/compare/v3.3.3...v3.4.0
 [3.3.3]: https://github.com/jimsimon/trouve/compare/v3.3.2...v3.3.3
