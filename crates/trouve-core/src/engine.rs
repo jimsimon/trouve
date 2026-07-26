@@ -5756,6 +5756,9 @@ impl Engine {
                     args,
                     responder,
                 } => {
+                    if !tools_enabled {
+                        bail!("backend requested approval for {tool} during a tool-free turn");
+                    }
                     if !segment.is_empty() {
                         self.store.append_event(
                             scope.clone(),
