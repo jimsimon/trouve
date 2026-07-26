@@ -4688,9 +4688,9 @@ impl Engine {
         }
         self.emit_queue(&thread.id)?;
 
-        // Tool policy: empty allowed_tools = all registered tools. The
-        // engine-served ask_question tool always rides along (deferring to
-        // the user is an interaction primitive, not a capability).
+        // Tool policy: empty allowed_tools = all registered tools. Engine-
+        // served tools are added only when tools_enabled is true; tool-free
+        // JSON-repair turns receive no tools.
         let mut specs: Vec<ToolSpec> = if tools_enabled {
             self.executor
                 .specs(&ctx)
@@ -5847,8 +5847,10 @@ impl Engine {
                 reasoning: Vec::new(),
             })?,
         )?;
-        self.store
-            .mark_backend_seen(&thread.id, backend_id, seen_after)?;
+        if tools_enabled {
+            self.store
+                .mark_backend_seen(&thread.id, backend_id, seen_after)?;
+        }
 
         // Vendors report one usage per turn, so the totals already reflect
         // the last (only) request — use them as the context-size proxy.

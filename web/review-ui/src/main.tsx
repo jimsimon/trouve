@@ -116,6 +116,18 @@ function liveElapsed(
   return Math.max(baseline, liveAge);
 }
 
+function pickPreferredTask(tasks: ReviewTask[]): ReviewTask | undefined {
+  return (
+    tasks.find((task) => task.status === "running") ??
+    tasks.find((task) => task.status === "failed") ??
+    tasks
+      .slice()
+      .reverse()
+      .find((task) => task.role === "coordinator") ??
+    tasks[0]
+  );
+}
+
 function useClock(active = true): number {
   const [now, setNow] = useState(Date.now());
   useEffect(() => {
@@ -638,15 +650,7 @@ function JobDetailPane({
     }
     setSelectedTaskId((current) => {
       if (detail.tasks.some((task) => task.id === current)) return current;
-      return (
-        detail.tasks.find((task) => task.status === "running") ??
-        detail.tasks.find((task) => task.status === "failed") ??
-        detail.tasks
-          .slice()
-          .reverse()
-          .find((task) => task.role === "coordinator") ??
-        detail.tasks[0]
-      ).id;
+      return pickPreferredTask(detail.tasks)?.id ?? "";
     });
   }, [detail?.tasks]);
 
@@ -752,17 +756,20 @@ function JobDetailPane({
       (task) => !["queued", "running"].includes(task.status),
     ).length;
     const total = Math.max(tasks.length, ...tasks.map((task) => task.batch_count));
+    const elapsed = tasks.reduce((sum, task) => {
+      if (task.status === "queued") return sum;
+      return (
+        sum +
+        (task.status === "running"
+          ? liveElapsed(task.elapsed_ms, task.status, task.started_at, now)
+          : task.elapsed_ms)
+      );
+    }, 0);
     activityGroups.push({
       id: `task-reviewer:${reviewerId}`,
       name: latestTask.reviewer_name || latestTask.reviewer_id || "Reviewer",
       status,
-      subtitle: `${completed}/${total} batches · ${duration(
-        Math.max(
-          ...tasks.map((task) =>
-            liveElapsed(task.elapsed_ms, task.status, task.started_at, now),
-          ),
-        ),
-      )}`,
+      subtitle: `${completed}/${total} batches · ${duration(elapsed)}`,
       tasks,
     });
   });
@@ -790,14 +797,7 @@ function JobDetailPane({
     group.tasks.some((task) => task.id === selectedTask?.id),
   );
   const selectPreferredTask = (tasks: ReviewTask[]): void => {
-    const preferred =
-      tasks.find((task) => task.status === "running") ??
-      tasks.find((task) => task.status === "failed") ??
-      tasks
-        .slice()
-        .reverse()
-        .find((task) => task.role === "coordinator") ??
-      tasks[0];
+    const preferred = pickPreferredTask(tasks);
     if (preferred) setSelectedTaskId(preferred.id);
   };
   return (
