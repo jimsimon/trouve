@@ -5450,31 +5450,28 @@ impl Engine {
         // A vendor session retains the tools it was created with. Tool-free
         // repair turns therefore start fresh; their prompt carries the
         // malformed output explicitly, so they do not need vendor history.
-        let resume = if tools_enabled {
-            self.store.backend_session(&thread.id, backend_id)?
+        let (resume, handoff, seen_after) = if tools_enabled {
+            let resume = self.store.backend_session(&thread.id, backend_id)?;
+            let payloads = self.store.messages(&thread.id)?;
+            let unseen = match &resume {
+                // A compaction can shrink the transcript below the watermark;
+                // handing off the fresh summary again covers that.
+                Some((_, seen)) => payloads.get(*seen as usize..).unwrap_or(&payloads),
+                None => &payloads[..],
+            };
+            let messages: Vec<Message> = unseen
+                .iter()
+                .filter_map(|p| serde_json::from_value(p.clone()).ok())
+                .collect();
+            let handoff = render_history_digest(&messages, resume.is_some());
+            // After this turn the vendor has seen everything up to and
+            // including its own reply (appended below on completion).
+            let seen_after = payloads.len() as u64 + 2;
+            (resume, handoff, seen_after)
         } else {
-            None
+            (None, None, 0)
         };
-        let payloads = self.store.messages(&thread.id)?;
-        let unseen = match &resume {
-            // A compaction can shrink the transcript below the watermark;
-            // handing off the fresh summary again covers that.
-            Some((_, seen)) => payloads.get(*seen as usize..).unwrap_or(&payloads),
-            None => &payloads[..],
-        };
-        let handoff = tools_enabled
-            .then(|| {
-                let messages: Vec<Message> = unseen
-                    .iter()
-                    .filter_map(|p| serde_json::from_value(p.clone()).ok())
-                    .collect();
-                render_history_digest(&messages, resume.is_some())
-            })
-            .flatten();
         let vendor_session = resume.map(|(id, _)| id);
-        // After this turn the vendor has seen everything up to and
-        // including its own reply (appended below on completion).
-        let seen_after = payloads.len() as u64 + 2;
         self.store.append_event(
             scope.clone(),
             Event::TurnStarted {
