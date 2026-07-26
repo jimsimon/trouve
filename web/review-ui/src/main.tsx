@@ -754,6 +754,7 @@ function JobDetailPane({
     const preferred =
       tasks.find((task) => task.status === "running") ??
       tasks.find((task) => task.status === "failed") ??
+      tasks.find((task) => task.role === "coordinator") ??
       tasks[0];
     if (preferred) setSelectedTaskId(preferred.id);
   };

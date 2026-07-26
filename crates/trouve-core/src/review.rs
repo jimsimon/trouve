@@ -3742,12 +3742,14 @@ fn render_check_details(detail: &trouve_protocol::CodeReviewJobDetail) -> String
 }
 
 fn bounded_check_details(details: &str) -> String {
-    if details.chars().count() <= CHECK_DETAILS_MAX_CHARS {
+    if details.len() <= CHECK_DETAILS_MAX_CHARS {
         return details.to_owned();
     }
-    let keep =
-        CHECK_DETAILS_MAX_CHARS.saturating_sub(CHECK_DETAILS_TRUNCATION_MARKER.chars().count());
-    let mut bounded = details.chars().take(keep).collect::<String>();
+    let mut keep = CHECK_DETAILS_MAX_CHARS.saturating_sub(CHECK_DETAILS_TRUNCATION_MARKER.len());
+    while !details.is_char_boundary(keep) {
+        keep -= 1;
+    }
+    let mut bounded = details[..keep].to_owned();
     bounded.push_str(CHECK_DETAILS_TRUNCATION_MARKER);
     bounded
 }
@@ -4860,13 +4862,16 @@ mod tests {
     }
 
     #[test]
-    fn check_details_are_bounded_on_character_boundaries() {
+    fn check_details_are_bounded_in_utf8_bytes() {
         let short = "Complete details";
         assert_eq!(bounded_check_details(short), short);
 
         let long = "🦀".repeat(CHECK_DETAILS_MAX_CHARS + 1);
         let bounded = bounded_check_details(&long);
-        assert_eq!(bounded.chars().count(), CHECK_DETAILS_MAX_CHARS);
+        assert!(bounded.len() <= CHECK_DETAILS_MAX_CHARS);
+        let retained = bounded.len() - CHECK_DETAILS_TRUNCATION_MARKER.len();
+        assert!(long.is_char_boundary(retained));
+        assert_eq!(&bounded[..retained], &long[..retained]);
         assert!(bounded.ends_with(CHECK_DETAILS_TRUNCATION_MARKER));
     }
 
