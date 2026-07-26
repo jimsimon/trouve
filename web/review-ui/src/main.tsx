@@ -730,6 +730,42 @@ function JobDetailPane({
     tasks: detail.tasks.filter((task) => task.reviewer_id === persona.reviewer_id),
     persona,
   }));
+  const personaReviewerIds = new Set(detail.personas.map((persona) => persona.reviewer_id));
+  const unmatchedReviewerTasks = new Map<string, ReviewTask[]>();
+  detail.tasks
+    .filter(
+      (task) =>
+        task.role === "reviewer" &&
+        (!task.reviewer_id || !personaReviewerIds.has(task.reviewer_id)),
+    )
+    .forEach((task) => {
+      const key = task.reviewer_id || task.reviewer_name || task.id;
+      unmatchedReviewerTasks.set(key, [...(unmatchedReviewerTasks.get(key) ?? []), task]);
+    });
+  unmatchedReviewerTasks.forEach((tasks, reviewerId) => {
+    const latestTask = tasks[tasks.length - 1];
+    const status =
+      tasks.find((task) => task.status === "running")?.status ??
+      tasks.find((task) => task.status === "failed")?.status ??
+      latestTask.status;
+    const completed = tasks.filter(
+      (task) => !["queued", "running"].includes(task.status),
+    ).length;
+    const total = Math.max(tasks.length, ...tasks.map((task) => task.batch_count));
+    activityGroups.push({
+      id: `task-reviewer:${reviewerId}`,
+      name: latestTask.reviewer_name || latestTask.reviewer_id || "Reviewer",
+      status,
+      subtitle: `${completed}/${total} batches · ${duration(
+        Math.max(
+          ...tasks.map((task) =>
+            liveElapsed(task.elapsed_ms, task.status, task.started_at, now),
+          ),
+        ),
+      )}`,
+      tasks,
+    });
+  });
   const coordinatorTasks = detail.tasks.filter((task) => task.role === "coordinator");
   if (coordinatorTasks.length) {
     const coordinatorTask = coordinatorTasks[coordinatorTasks.length - 1];
@@ -925,7 +961,7 @@ function JobDetailPane({
           title="Review activity"
           subtitle="Select a persona and batch to inspect its metrics, retained output, and prompt"
         />
-        {activityGroups.length ? (
+        {detail.tasks.length ? (
           <div class="activity-layout">
             <nav class="activity-groups" aria-label="Review personas and batches">
               {activityGroups.map((group) => {

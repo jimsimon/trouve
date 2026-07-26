@@ -4131,10 +4131,28 @@ impl Engine {
         content: String,
         uploads: Vec<trouve_protocol::AttachmentUpload>,
     ) -> Result<TurnAccepted, EngineError> {
+        self.send_message_with_tools(thread_id, content, uploads, true)
+    }
+
+    pub(crate) fn send_message_without_tools(
+        self: &Arc<Self>,
+        thread_id: &str,
+        content: String,
+    ) -> Result<TurnAccepted, EngineError> {
+        self.send_message_with_tools(thread_id, content, Vec::new(), false)
+    }
+
+    fn send_message_with_tools(
+        self: &Arc<Self>,
+        thread_id: &str,
+        content: String,
+        uploads: Vec<trouve_protocol::AttachmentUpload>,
+        tools_enabled: bool,
+    ) -> Result<TurnAccepted, EngineError> {
         self.get_thread(thread_id)?; // 404 for unknown threads
         let attachments = self.save_attachments(thread_id, uploads)?;
         self.store
-            .enqueue_prompt(thread_id, &content, &attachments)?;
+            .enqueue_prompt_with_tools(thread_id, &content, &attachments, tools_enabled)?;
         self.emit_queue(thread_id)?;
         let turn = self.dispatch_queue(thread_id)?;
         Ok(TurnAccepted {
@@ -4530,6 +4548,7 @@ impl Engine {
     ) -> Result<()> {
         let content = prompt.content.clone();
         let attachments = prompt.attachments.clone();
+        let tools_enabled = self.store.queued_prompt_tools_enabled(&prompt.id)?;
         let session = self
             .store
             .session(&thread.session_id)?
@@ -4609,6 +4628,7 @@ impl Engine {
                     concurrent_child,
                     cancel,
                     &prompt.id,
+                    tools_enabled,
                 )
                 .await;
         }
@@ -4671,15 +4691,20 @@ impl Engine {
         // Tool policy: empty allowed_tools = all registered tools. The
         // engine-served ask_question tool always rides along (deferring to
         // the user is an interaction primitive, not a capability).
-        let mut specs: Vec<ToolSpec> = self
-            .executor
-            .specs(&ctx)
-            .await
-            .into_iter()
-            .filter(|s| mode.allowed_tools.is_empty() || mode.allowed_tools.contains(&s.name))
-            .collect();
-        specs.push(ask_question_spec());
-        specs.push(search_transcript_spec());
+        let mut specs: Vec<ToolSpec> = if tools_enabled {
+            self.executor
+                .specs(&ctx)
+                .await
+                .into_iter()
+                .filter(|s| mode.allowed_tools.is_empty() || mode.allowed_tools.contains(&s.name))
+                .collect()
+        } else {
+            Vec::new()
+        };
+        if tools_enabled {
+            specs.push(ask_question_spec());
+            specs.push(search_transcript_spec());
+        }
         // Spawn tools are for top-level agents only: children don't get to
         // spawn grandchildren (also enforced at execution). They also respect
         // the mode's tool policy, so restrictive/read-only modes that don't
@@ -4687,7 +4712,7 @@ impl Engine {
         let spawn_allowed = |name: &str| {
             mode.allowed_tools.is_empty() || mode.allowed_tools.iter().any(|t| t == name)
         };
-        if self.store.spawn_parent(&thread.id)?.is_none() {
+        if tools_enabled && self.store.spawn_parent(&thread.id)?.is_none() {
             if spawn_allowed("spawn_thread") {
                 specs.push(spawn_thread_spec());
             }
@@ -4812,6 +4837,14 @@ impl Engine {
             // e.g. a thinking-only or empty provider response): it serializes
             // to an empty content block that Anthropic rejects on the next
             // request, wedging the thread.
+            if !tools_enabled && !tool_calls.is_empty() {
+                tracing::warn!(
+                    thread_id = %thread.id,
+                    turn,
+                    "provider requested a tool during a tool-free turn; ignoring the request"
+                );
+                tool_calls.clear();
+            }
             if !text.is_empty() || !tool_calls.is_empty() {
                 self.store.append_message(
                     &thread.id,
@@ -5405,6 +5438,7 @@ impl Engine {
         concurrent_child: bool,
         cancel: tokio_util::sync::CancellationToken,
         queued_prompt_id: &str,
+        tools_enabled: bool,
     ) -> Result<()> {
         let scope = Scope::Thread(thread.id.clone());
         // Vendor sessions are per (thread, backend): each vendor keeps its
@@ -5413,7 +5447,14 @@ impl Engine {
         // thread's past this one hasn't seen — everything for a vendor
         // joining mid-conversation, the interleaved turns other models ran
         // for a resumed one — is handed off as a digest in the prompt.
-        let resume = self.store.backend_session(&thread.id, backend_id)?;
+        // A vendor session retains the tools it was created with. Tool-free
+        // repair turns therefore start fresh; their prompt carries the
+        // malformed output explicitly, so they do not need vendor history.
+        let resume = if tools_enabled {
+            self.store.backend_session(&thread.id, backend_id)?
+        } else {
+            None
+        };
         let payloads = self.store.messages(&thread.id)?;
         let unseen = match &resume {
             // A compaction can shrink the transcript below the watermark;
@@ -5421,13 +5462,15 @@ impl Engine {
             Some((_, seen)) => payloads.get(*seen as usize..).unwrap_or(&payloads),
             None => &payloads[..],
         };
-        let handoff = {
-            let messages: Vec<Message> = unseen
-                .iter()
-                .filter_map(|p| serde_json::from_value(p.clone()).ok())
-                .collect();
-            render_history_digest(&messages, resume.is_some())
-        };
+        let handoff = tools_enabled
+            .then(|| {
+                let messages: Vec<Message> = unseen
+                    .iter()
+                    .filter_map(|p| serde_json::from_value(p.clone()).ok())
+                    .collect();
+                render_history_digest(&messages, resume.is_some())
+            })
+            .flatten();
         let vendor_session = resume.map(|(id, _)| id);
         // After this turn the vendor has seen everything up to and
         // including its own reply (appended below on completion).
@@ -5482,7 +5525,9 @@ impl Engine {
             }
         };
 
-        let mcp_bridge = self.mcp_bridge_for(&thread.model, &thread.id);
+        let mcp_bridge = tools_enabled
+            .then(|| self.mcp_bridge_for(&thread.model, &thread.id))
+            .flatten();
         // Vendor agents get the mode prompt plus, when the bridge serves
         // trouve's search tools, guidance to prefer them over built-ins
         // (MCP instructions alone are too weak a signal).
@@ -5515,8 +5560,13 @@ impl Engine {
             attachments: turn_attachments,
             instructions: (!instructions.is_empty()).then_some(instructions),
             permission,
+            tool_free: !tools_enabled,
             mcp_bridge,
-            mcp_servers: self.mcp_servers_for(session)?,
+            mcp_servers: if tools_enabled {
+                self.mcp_servers_for(session)?
+            } else {
+                Vec::new()
+            },
         };
 
         let mut stream = backend
@@ -5563,8 +5613,10 @@ impl Engine {
             };
             match ev.map_err(|e| anyhow!("backend stream error: {e}"))? {
                 BackendEvent::SessionStarted { session_id } => {
-                    self.store
-                        .set_backend_session(&thread.id, backend_id, &session_id)?;
+                    if tools_enabled {
+                        self.store
+                            .set_backend_session(&thread.id, backend_id, &session_id)?;
+                    }
                 }
                 BackendEvent::TextDelta(delta) => {
                     text.push_str(&delta);
@@ -5595,6 +5647,9 @@ impl Engine {
                     tool,
                     mut args,
                 } => {
+                    if !tools_enabled {
+                        bail!("backend requested tool {tool} during a tool-free turn");
+                    }
                     tool_calls.insert(call_id.clone(), (tool.clone(), args.clone()));
                     if !segment.is_empty() {
                         self.store.append_event(

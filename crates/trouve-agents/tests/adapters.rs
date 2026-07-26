@@ -31,6 +31,7 @@ fn turn(worktree: PathBuf, session: Option<&str>, permission: BackendPermission)
         attachments: vec![],
         instructions: Some("mode prompt".into()),
         permission,
+        tool_free: false,
         mcp_bridge: None,
         mcp_servers: Vec::new(),
     }
@@ -147,6 +148,34 @@ EOF
     assert!(args.contains("--model"), "{args}");
     assert!(args.contains("--include-partial-messages"), "{args}");
     assert!(args.contains("--thinking-display"), "{args}");
+}
+
+#[tokio::test]
+async fn claude_adapter_disables_tools_for_tool_free_turns() {
+    let tmp = tempfile::tempdir().unwrap();
+    let stub = write_stub(
+        tmp.path(),
+        "claude-tool-free",
+        r#"#!/bin/bash
+printf '%s\n' "$@" > "$0.args"
+cat <<'EOF'
+{"type":"result","subtype":"success","session_id":"sess-1","result":"{}","usage":{"input_tokens":1,"output_tokens":1}}
+EOF
+"#,
+    );
+    let backend = ClaudeBackend::new("claude-code", Some(stub.clone()));
+    let mut stream = start_turn(&backend, || {
+        let mut turn = turn(tmp.path().to_path_buf(), None, BackendPermission::ReadOnly);
+        turn.tool_free = true;
+        turn
+    })
+    .await;
+    while let Some(event) = stream.next().await {
+        event.unwrap();
+    }
+
+    let args = std::fs::read_to_string(format!("{stub}.args")).unwrap();
+    assert!(args.contains("--tools\n\n"), "{args}");
 }
 
 #[tokio::test]

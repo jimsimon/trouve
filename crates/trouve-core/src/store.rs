@@ -90,6 +90,7 @@ CREATE TABLE IF NOT EXISTS queued_prompts (
   content TEXT NOT NULL,
   attachments TEXT NOT NULL DEFAULT '[]',  -- JSON [trouve_protocol::Attachment]
   claimed INTEGER NOT NULL DEFAULT 0,
+  tools_enabled INTEGER NOT NULL DEFAULT 1,
   created_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS queued_prompts_thread ON queued_prompts (thread_id, position);
@@ -324,6 +325,7 @@ const MIGRATIONS: &[&str] = &[
     "ALTER TABLE sessions ADD COLUMN archived INTEGER NOT NULL DEFAULT 0",
     "ALTER TABLE queued_prompts ADD COLUMN attachments TEXT NOT NULL DEFAULT '[]'",
     "ALTER TABLE queued_prompts ADD COLUMN claimed INTEGER NOT NULL DEFAULT 0",
+    "ALTER TABLE queued_prompts ADD COLUMN tools_enabled INTEGER NOT NULL DEFAULT 1",
     "ALTER TABLE automations ADD COLUMN permission_mode TEXT NOT NULL DEFAULT 'ask'",
     "ALTER TABLE threads ADD COLUMN todos TEXT NOT NULL DEFAULT '[]'",
     "ALTER TABLE code_review_repositories ADD COLUMN identity_ids TEXT NOT NULL DEFAULT '[\"correctness\",\"security\",\"api-compatibility\",\"testing\"]'",
@@ -1771,16 +1773,34 @@ impl Store {
         content: &str,
         attachments: &[trouve_protocol::Attachment],
     ) -> Result<trouve_protocol::QueuedPrompt> {
+        self.enqueue_prompt_with_tools(thread_id, content, attachments, true)
+    }
+
+    pub(crate) fn enqueue_prompt_with_tools(
+        &self,
+        thread_id: &str,
+        content: &str,
+        attachments: &[trouve_protocol::Attachment],
+        tools_enabled: bool,
+    ) -> Result<trouve_protocol::QueuedPrompt> {
         let conn = self.conn.lock().unwrap();
         let id = format!("qp_{}", uuid::Uuid::new_v4().simple());
         let created_at = chrono::Utc::now().to_rfc3339();
         let attachments_json = serde_json::to_string(attachments)?;
         conn.execute(
-            "INSERT INTO queued_prompts (id, thread_id, position, content, attachments, created_at)
+            "INSERT INTO queued_prompts
+               (id, thread_id, position, content, attachments, tools_enabled, created_at)
              VALUES (?1, ?2,
                (SELECT COALESCE(MAX(position), 0) + 1 FROM queued_prompts WHERE thread_id = ?2),
-               ?3, ?4, ?5)",
-            params![id, thread_id, content, attachments_json, created_at],
+               ?3, ?4, ?5, ?6)",
+            params![
+                id,
+                thread_id,
+                content,
+                attachments_json,
+                tools_enabled,
+                created_at
+            ],
         )?;
         let position: i64 = conn.query_row(
             "SELECT position FROM queued_prompts WHERE id = ?1",
@@ -1795,6 +1815,15 @@ impl Store {
             attachments: attachments.to_vec(),
             created_at,
         })
+    }
+
+    pub(crate) fn queued_prompt_tools_enabled(&self, id: &str) -> Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        Ok(conn.query_row(
+            "SELECT tools_enabled FROM queued_prompts WHERE id = ?1",
+            params![id],
+            |row| row.get(0),
+        )?)
     }
 
     pub fn queued_prompts(&self, thread_id: &str) -> Result<Vec<trouve_protocol::QueuedPrompt>> {
@@ -4912,7 +4941,11 @@ mod tests {
         let a = store.enqueue_prompt("th_1", "first", &[]).unwrap();
         let b = store.enqueue_prompt("th_1", "second", &[]).unwrap();
         let c = store.enqueue_prompt("th_1", "third", &[]).unwrap();
-        store.enqueue_prompt("th_2", "other thread", &[]).unwrap();
+        let tool_free = store
+            .enqueue_prompt_with_tools("th_2", "other thread", &[], false)
+            .unwrap();
+        assert!(store.queued_prompt_tools_enabled(&a.id).unwrap());
+        assert!(!store.queued_prompt_tools_enabled(&tool_free.id).unwrap());
 
         let q = store.queued_prompts("th_1").unwrap();
         assert_eq!(

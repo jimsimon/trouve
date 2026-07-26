@@ -654,6 +654,27 @@ struct ReviewTurnResult {
     metrics: CodeReviewTaskMetrics,
 }
 
+struct ReviewTurnRequest {
+    prompt: String,
+    tools_enabled: bool,
+}
+
+impl ReviewTurnRequest {
+    fn review(prompt: String) -> Self {
+        Self {
+            prompt,
+            tools_enabled: true,
+        }
+    }
+
+    fn json_repair(prompt: String) -> Self {
+        Self {
+            prompt,
+            tools_enabled: false,
+        }
+    }
+}
+
 struct ReviewOutputBuffer {
     assistant: String,
     thinking: String,
@@ -2888,13 +2909,13 @@ impl Engine {
         job: &trouve_protocol::CodeReviewJob,
         task_id: &str,
         thread_id: &str,
-        prompt: String,
+        request: ReviewTurnRequest,
         superseded: &CancellationToken,
         active_threads: &Arc<Mutex<HashSet<String>>>,
     ) -> Result<ReviewTurnResult> {
         active_threads.lock().unwrap().insert(thread_id.to_owned());
         let result = self
-            .run_code_review_turn(job, task_id, thread_id, prompt, superseded)
+            .run_code_review_turn(job, task_id, thread_id, request, superseded)
             .await;
         active_threads.lock().unwrap().remove(thread_id);
         result
@@ -2914,7 +2935,7 @@ impl Engine {
                 job,
                 task_id,
                 thread_id,
-                prompt,
+                ReviewTurnRequest::review(prompt),
                 superseded,
                 active_threads,
             )
@@ -2931,7 +2952,10 @@ impl Engine {
                 job,
                 task_id,
                 thread_id,
-                review_output_repair_prompt(&initial_error),
+                ReviewTurnRequest::json_repair(review_output_repair_prompt(
+                    &initial_error,
+                    &turn.output,
+                )),
                 superseded,
                 active_threads,
             )
@@ -2957,7 +2981,7 @@ impl Engine {
         job: &trouve_protocol::CodeReviewJob,
         task_id: &str,
         thread_id: &str,
-        prompt: String,
+        request: ReviewTurnRequest,
         superseded: &CancellationToken,
     ) -> Result<ReviewTurnResult> {
         ensure_review_current(superseded)?;
@@ -2970,7 +2994,11 @@ impl Engine {
             .map(|event| event.cursor)
             .unwrap_or(0);
         let mut replay = VecDeque::new();
-        let accepted = self.send_message(thread_id, prompt, Vec::new())?;
+        let accepted = if request.tools_enabled {
+            self.send_message(thread_id, request.prompt, Vec::new())?
+        } else {
+            self.send_message_without_tools(thread_id, request.prompt)?
+        };
         let turn = accepted.turn;
         let mut output = String::new();
         let usage;
@@ -4624,7 +4652,7 @@ fn parse_review_output(output: &str) -> Result<ReviewOutput> {
     serde_json::from_str(&trimmed[start..=end]).context("decoding model review JSON")
 }
 
-fn review_output_repair_prompt(error: &anyhow::Error) -> String {
+fn review_output_repair_prompt(error: &anyhow::Error, malformed_output: &str) -> String {
     format!(
         "Your previous review response could not be decoded as the required JSON: \
          {error:#}\n\nDo not perform more analysis and do not call tools. Reformat the \
@@ -4639,7 +4667,8 @@ fn review_output_repair_prompt(error: &anyhow::Error) -> String {
          Preserve every actionable finding from the previous response. Reviewer findings may \
          leave source_candidate_ids empty; a final review editor must retain the candidate ids \
          required by the original request and explain every rejected candidate. Use empty arrays \
-         when there are no findings, rejected candidates, or resolved findings."
+         when there are no findings, rejected candidates, or resolved findings.\n\n\
+         <malformed-review-output>\n{malformed_output}\n</malformed-review-output>"
     )
 }
 
@@ -5292,11 +5321,12 @@ mod tests {
     #[test]
     fn malformed_review_repair_prompt_repeats_the_json_contract() {
         let error = parse_review_output("Confirmed three performance issues.").unwrap_err();
-        let prompt = review_output_repair_prompt(&error);
+        let prompt = review_output_repair_prompt(&error, "Confirmed three performance issues.");
         assert!(prompt.contains("review did not contain JSON"));
         assert!(prompt.contains("\"findings\""));
         assert!(prompt.contains("\"source_candidate_ids\""));
         assert!(prompt.contains("do not call tools"));
+        assert!(prompt.contains("Confirmed three performance issues."));
     }
 
     #[test]
