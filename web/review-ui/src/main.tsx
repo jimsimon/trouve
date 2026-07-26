@@ -60,6 +60,7 @@ import type {
   ProvidersResponse,
   Repository,
   ReviewJob,
+  ReviewTask,
   ReviewStats,
   ReviewerProfile,
   StatsRange,
@@ -113,6 +114,18 @@ function liveElapsed(
   if (status !== "running" || !startedAt) return baseline;
   const liveAge = Math.max(0, now - new Date(startedAt).getTime());
   return Math.max(baseline, liveAge);
+}
+
+function pickPreferredTask(tasks: ReviewTask[]): ReviewTask | undefined {
+  return (
+    tasks.find((task) => task.status === "running") ??
+    tasks.find((task) => task.status === "failed") ??
+    tasks
+      .slice()
+      .reverse()
+      .find((task) => task.role === "coordinator") ??
+    tasks[0]
+  );
 }
 
 function useClock(active = true): number {
@@ -558,6 +571,7 @@ function JobDetailPane({
   const [detail, setDetail] = useState<JobDetail | null>(null);
   const [error, setError] = useState("");
   const [busy, setBusy] = useState("");
+  const [selectedTaskId, setSelectedTaskId] = useState("");
   const now = useClock(detail?.job.status === "running");
   const aliveRef = useRef<string | null>(jobId);
   const detailStatusRef = useRef(detail?.job.status);
@@ -579,6 +593,7 @@ function JobDetailPane({
   useEffect(() => {
     aliveRef.current = jobId;
     setDetail(null);
+    setSelectedTaskId("");
     const timeouts = new Set<number>();
     void load();
     const close = openJobEvents(jobId, (event) => {
@@ -627,6 +642,17 @@ function JobDetailPane({
       close();
     };
   }, [jobId, load]);
+
+  useEffect(() => {
+    if (!detail?.tasks.length) {
+      setSelectedTaskId("");
+      return;
+    }
+    setSelectedTaskId((current) => {
+      if (detail.tasks.some((task) => task.id === current)) return current;
+      return pickPreferredTask(detail.tasks)?.id ?? "";
+    });
+  }, [detail?.tasks]);
 
   useEffect(() => {
     aliveRef.current = jobId;
@@ -681,6 +707,99 @@ function JobDetailPane({
     job.started_at,
     now,
   );
+  const acceptedCandidateIds = new Set(
+    detail.findings.flatMap((finding) =>
+      finding.sources.map((source) => source.candidate_id).filter(Boolean),
+    ),
+  );
+  const candidateRejections = detail.candidate_rejections ?? [];
+  const unrecordedCandidateDecisions = Math.max(
+    0,
+    job.candidate_issue_count - acceptedCandidateIds.size - candidateRejections.length,
+  );
+  const activityGroups: Array<{
+    id: string;
+    name: string;
+    status: string;
+    subtitle: string;
+    tasks: ReviewTask[];
+    persona?: PersonaResult;
+  }> = detail.personas.map((persona) => ({
+    id: `persona:${persona.reviewer_id}`,
+    name: persona.reviewer_name,
+    status: persona.status,
+    subtitle: `${persona.completed_batches}/${persona.total_batches} batches · ${duration(
+      liveElapsed(persona.elapsed_ms, persona.status, persona.started_at, now),
+    )}`,
+    tasks: detail.tasks.filter((task) => task.reviewer_id === persona.reviewer_id),
+    persona,
+  }));
+  const personaReviewerIds = new Set(detail.personas.map((persona) => persona.reviewer_id));
+  const unmatchedReviewerTasks = new Map<string, ReviewTask[]>();
+  detail.tasks
+    .filter(
+      (task) =>
+        task.role === "reviewer" &&
+        (!task.reviewer_id || !personaReviewerIds.has(task.reviewer_id)),
+    )
+    .forEach((task) => {
+      const key = task.reviewer_id || task.reviewer_name || task.id;
+      unmatchedReviewerTasks.set(key, [...(unmatchedReviewerTasks.get(key) ?? []), task]);
+    });
+  unmatchedReviewerTasks.forEach((tasks, reviewerId) => {
+    const latestTask = tasks[tasks.length - 1];
+    const status =
+      tasks.find((task) => task.status === "running")?.status ??
+      tasks.find((task) => task.status === "failed")?.status ??
+      latestTask.status;
+    const completed = tasks.filter(
+      (task) => !["queued", "running"].includes(task.status),
+    ).length;
+    const total = Math.max(tasks.length, ...tasks.map((task) => task.batch_count));
+    const elapsed = tasks.reduce((sum, task) => {
+      if (task.status === "queued") return sum;
+      return (
+        sum +
+        (task.status === "running"
+          ? liveElapsed(task.elapsed_ms, task.status, task.started_at, now)
+          : task.elapsed_ms)
+      );
+    }, 0);
+    activityGroups.push({
+      id: `task-reviewer:${reviewerId}`,
+      name: latestTask.reviewer_name || latestTask.reviewer_id || "Reviewer",
+      status,
+      subtitle: `${completed}/${total} batches · ${duration(elapsed)}`,
+      tasks,
+    });
+  });
+  const coordinatorTasks = detail.tasks.filter((task) => task.role === "coordinator");
+  if (coordinatorTasks.length) {
+    const coordinatorTask = coordinatorTasks[coordinatorTasks.length - 1];
+    activityGroups.push({
+      id: "coordinator",
+      name: "Final review editor",
+      status: coordinatorTask.status,
+      subtitle: `Final selection · ${duration(
+        liveElapsed(
+          coordinatorTask.elapsed_ms,
+          coordinatorTask.status,
+          coordinatorTask.started_at,
+          now,
+        ),
+      )}`,
+      tasks: coordinatorTasks,
+    });
+  }
+  const selectedTask =
+    detail.tasks.find((task) => task.id === selectedTaskId) ?? detail.tasks[0];
+  const selectedGroup = activityGroups.find((group) =>
+    group.tasks.some((task) => task.id === selectedTask?.id),
+  );
+  const selectPreferredTask = (tasks: ReviewTask[]): void => {
+    const preferred = pickPreferredTask(tasks);
+    if (preferred) setSelectedTaskId(preferred.id);
+  };
   return (
     <aside class="panel job-detail">
       <header class="detail-header">
@@ -770,20 +889,13 @@ function JobDetailPane({
       </div>
       {job.check_sync_error && <p class="warning">Check sync: {job.check_sync_error}</p>}
       <section class="detail-section">
-        <PanelTitle title="Reviewer personas" subtitle="Wall-clock duration and issue attribution" />
-        <div class="persona-list">
-          {detail.personas.map((persona) => (
-            <PersonaCard persona={persona} now={now} key={persona.reviewer_id} />
-          ))}
-        </div>
-      </section>
-      <section class="detail-section">
         <div class="panel-title inline">
           <div>
-            <h2>Completed overview</h2>
+            <h2>{job.status === "running" || job.status === "queued" ? "Review overview" : "Completed overview"}</h2>
             <p>
-              {job.issue_count} confirmed · {job.candidate_issue_count} candidates ·{" "}
-              {job.fixed_issue_count} fixed
+              {job.issue_count} confirmed findings · {acceptedCandidateIds.size} selected candidates
+              {" · "}
+              {candidateRejections.length} rejected · {job.fixed_issue_count} fixed
             </p>
           </div>
           <CopyButton text={detail.prompt_for_agents} label="Copy fix-all prompt" />
@@ -807,87 +919,212 @@ function JobDetailPane({
             </div>
           </article>
         ))}
+        {candidateRejections.length > 0 && (
+          <details class="candidate-decisions">
+            <summary>
+              <strong>Why {candidateRejections.length} candidates were not selected</strong>
+              <span>Final-editor decisions</span>
+            </summary>
+            <div class="rejection-list">
+              {candidateRejections.map((rejection) => (
+                <article class="candidate-rejection" key={rejection.candidate_id}>
+                  <header>
+                    <strong>
+                      {rejection.severity.toUpperCase()} · {rejection.path}:{rejection.line}
+                    </strong>
+                    <span>{rejection.reviewer_name}</span>
+                  </header>
+                  <p>{rejection.body}</p>
+                  <div>
+                    <b>Not selected:</b> {rejection.reason}
+                  </div>
+                </article>
+              ))}
+            </div>
+          </details>
+        )}
+        {unrecordedCandidateDecisions > 0 &&
+          !["running", "queued"].includes(job.status) && (
+            <p class="decision-note">
+              {job.status === "succeeded"
+                ? `${unrecordedCandidateDecisions} candidate decision${
+                    unrecordedCandidateDecisions === 1 ? " was" : "s were"
+                  } not recorded by this older review run.`
+                : `Candidate selection did not complete, so ${unrecordedCandidateDecisions} decision${
+                    unrecordedCandidateDecisions === 1 ? " is" : "s are"
+                  } unavailable.`}
+            </p>
+          )}
       </section>
       <section class="detail-section">
-        <PanelTitle title="Agent output" subtitle="Live while running; retained after completion" />
-        {detail.tasks.map((task) => (
-          <details class="task-output" open={task.status === "running"} key={task.id}>
-            <summary>
-              <StatusPill status={task.status} />
-              <strong>{task.reviewer_name || "Final review editor"}</strong>
-              <span>
-                {task.role}
-                {task.batch_count > 1 ? ` · batch ${task.batch_index + 1}/${task.batch_count}` : ""}
-              </span>
-              <time>
-                {duration(
-                  liveElapsed(task.elapsed_ms, task.status, task.started_at, now),
+        <PanelTitle
+          title="Review activity"
+          subtitle="Select a persona and batch to inspect its metrics, retained output, and prompt"
+        />
+        {detail.tasks.length ? (
+          <div class="activity-layout">
+            <nav class="activity-groups" aria-label="Review personas and batches">
+              {activityGroups.map((group) => {
+                const active = group.id === selectedGroup?.id;
+                return (
+                  <div class={`activity-group${active ? " active" : ""}`} key={group.id}>
+                    <button type="button" onClick={() => selectPreferredTask(group.tasks)}>
+                      <span>
+                        <strong>{group.name}</strong>
+                        <small>{group.subtitle}</small>
+                      </span>
+                      <StatusPill status={group.status} />
+                    </button>
+                    {active && group.tasks.length > 1 && (
+                      <div class="batch-tabs">
+                        {group.tasks.map((task) => (
+                          <button
+                            class={task.id === selectedTask?.id ? "active" : ""}
+                            type="button"
+                            onClick={() => setSelectedTaskId(task.id)}
+                            key={task.id}
+                          >
+                            {task.role === "coordinator"
+                              ? "Attempt"
+                              : `Batch ${task.batch_index + 1}`}
+                            <StatusPill status={task.status} />
+                          </button>
+                        ))}
+                      </div>
+                    )}
+                  </div>
+                );
+              })}
+            </nav>
+            {selectedTask && (
+              <article class="activity-detail" key={selectedTask.id}>
+                <header>
+                  <div>
+                    <StatusPill status={selectedTask.status} />
+                    <h3>{selectedTask.reviewer_name || "Final review editor"}</h3>
+                    <p>
+                      {selectedTask.model || "Model not recorded"}
+                      {selectedTask.batch_count > 1
+                        ? ` · batch ${selectedTask.batch_index + 1}/${selectedTask.batch_count}`
+                        : ""}
+                    </p>
+                  </div>
+                  <time>
+                    {duration(
+                      liveElapsed(
+                        selectedTask.elapsed_ms,
+                        selectedTask.status,
+                        selectedTask.started_at,
+                        now,
+                      ),
+                    )}
+                  </time>
+                </header>
+                {selectedGroup?.persona && (
+                  <p class="persona-rollup">
+                    Persona total: {selectedGroup.persona.candidate_issue_count} candidates ·{" "}
+                    {selectedGroup.persona.confirmed_issue_count} confirmed ·{" "}
+                    {duration(selectedGroup.persona.provider_wait_ms)} capacity wait ·{" "}
+                    {duration(selectedGroup.persona.model_elapsed_ms)} model/tools
+                  </p>
                 )}
-              </time>
-            </summary>
-            <p class="task-metrics">
-              Capacity wait {duration(task.provider_wait_ms)} · model/tools{" "}
-              {duration(task.model_elapsed_ms)} · tokens{" "}
-              {task.input_tokens.toLocaleString()} in / {task.cached_input_tokens.toLocaleString()} cached /{" "}
-              {task.output_tokens.toLocaleString()} out · {task.tool_call_count} tool calls
-            </p>
-            <OutputBlock title="Assistant output" value={task.output} />
-            <OutputBlock title="Reasoning" value={task.thinking} />
-            <OutputBlock title="Tool output" value={task.tool_output} />
-            <details class="nested">
-              <summary>Prompt</summary>
-              <pre>{task.prompt}</pre>
-            </details>
-            {task.error && <p class="error-text">{task.error}</p>}
-          </details>
-        ))}
+                <dl class="task-facts">
+                  <div>
+                    <dt>Capacity wait</dt>
+                    <dd>{duration(selectedTask.provider_wait_ms)}</dd>
+                  </div>
+                  <div>
+                    <dt>Model/tools</dt>
+                    <dd>{duration(selectedTask.model_elapsed_ms)}</dd>
+                  </div>
+                  <div>
+                    <dt>Tokens</dt>
+                    <dd>
+                      {selectedTask.input_tokens.toLocaleString()} in ·{" "}
+                      {selectedTask.output_tokens.toLocaleString()} out
+                    </dd>
+                  </div>
+                  <div>
+                    <dt>Cached input</dt>
+                    <dd>{selectedTask.cached_input_tokens.toLocaleString()}</dd>
+                  </div>
+                  <div>
+                    <dt>Tool calls</dt>
+                    <dd>{selectedTask.tool_call_count}</dd>
+                  </div>
+                  <div>
+                    <dt>Candidates / confirmed</dt>
+                    <dd>
+                      {selectedTask.candidate_issue_count} / {selectedTask.confirmed_issue_count}
+                    </dd>
+                  </div>
+                </dl>
+                <OutputBlock
+                  title="Assistant output"
+                  value={selectedTask.output}
+                  followTail={selectedTask.status === "running"}
+                />
+                <OutputBlock
+                  title="Reasoning"
+                  value={selectedTask.thinking}
+                  followTail={selectedTask.status === "running"}
+                />
+                <OutputBlock
+                  title="Tool output"
+                  value={selectedTask.tool_output}
+                  followTail={selectedTask.status === "running"}
+                />
+                <details class="nested">
+                  <summary>Prompt</summary>
+                  <pre>{selectedTask.prompt}</pre>
+                </details>
+                {selectedTask.error && <p class="error-text">{selectedTask.error}</p>}
+              </article>
+            )}
+          </div>
+        ) : (
+          <p class="decision-note">Review tasks have not started yet.</p>
+        )}
       </section>
     </aside>
   );
 }
 
-function PersonaCard({ persona, now }: { persona: PersonaResult; now: number }) {
-  return (
-    <article>
-      <header>
-        <strong>{persona.reviewer_name}</strong>
-        <StatusPill status={persona.status} />
-      </header>
-      <p>{persona.models.join(", ") || "Model not recorded"}</p>
-      <dl>
-        <div>
-          <dt>Elapsed</dt>
-          <dd>{duration(liveElapsed(persona.elapsed_ms, persona.status, persona.started_at, now))}</dd>
-        </div>
-        <div>
-          <dt>Batches</dt>
-          <dd>
-            {persona.completed_batches}/{persona.total_batches}
-          </dd>
-        </div>
-        <div>
-          <dt>Model/tools</dt>
-          <dd>{duration(persona.model_elapsed_ms)}</dd>
-        </div>
-        <div>
-          <dt>Capacity wait</dt>
-          <dd>{duration(persona.provider_wait_ms)}</dd>
-        </div>
-        <div>
-          <dt>Issues</dt>
-          <dd>{persona.confirmed_issue_count}</dd>
-        </div>
-      </dl>
-    </article>
-  );
-}
-
-function OutputBlock({ title, value }: { title: string; value: string }) {
+function OutputBlock({
+  title,
+  value,
+  followTail = false,
+}: {
+  title: string;
+  value: string;
+  followTail?: boolean;
+}) {
+  const preRef = useRef<HTMLPreElement>(null);
+  const pinnedRef = useRef(true);
+  useEffect(() => {
+    if (!followTail || !pinnedRef.current) return;
+    const frame = window.requestAnimationFrame(() => {
+      const element = preRef.current;
+      if (element && pinnedRef.current) element.scrollTop = element.scrollHeight;
+    });
+    return () => window.cancelAnimationFrame(frame);
+  }, [followTail, value]);
   if (!value) return null;
   return (
     <section class="output-block">
       <h3>{title}</h3>
-      <pre>{value}</pre>
+      <pre
+        ref={preRef}
+        tabIndex={0}
+        aria-busy={followTail}
+        onScroll={(event) => {
+          const element = event.currentTarget;
+          pinnedRef.current =
+            element.scrollHeight - element.scrollTop - element.clientHeight <= 16;
+        }}
+      >
+        {value}
+      </pre>
     </section>
   );
 }
@@ -1328,19 +1565,24 @@ function StatsPage({ repositories }: { repositories: Repository[] }) {
             <DurationCard title="Publication phase" value={stats.publication_duration} />
           </div>
           <section class="panel table-panel">
-            <PanelTitle title="Persona and model performance" subtitle="Confirmed issue credits are many-to-many; totals may exceed unique issues." />
+            <PanelTitle
+              title="Persona and model performance"
+              subtitle="Batches are per-batch model tasks; outcomes and average durations are rolled up once per persona run. Confirmed issue credits are many-to-many."
+            />
             <div class="table-scroll">
               <table>
                 <thead>
                   <tr>
                     <th>Persona</th>
                     <th>Actual model</th>
-                    <th>Executions</th>
-                    <th>Success</th>
-                    <th>Failure</th>
-                    <th>Avg duration</th>
-                    <th>Avg capacity wait</th>
-                    <th>Avg model/tools</th>
+                    <th>Batches</th>
+                    <th>Successful runs</th>
+                    <th>Failed runs</th>
+                    <th>Cancelled runs</th>
+                    <th>N/A runs</th>
+                    <th>Avg run duration</th>
+                    <th>Avg run capacity wait</th>
+                    <th>Avg run model/tools</th>
                     <th>Cached input</th>
                     <th>Tool calls</th>
                     <th>Candidates</th>
@@ -1355,6 +1597,8 @@ function StatsPage({ repositories }: { repositories: Repository[] }) {
                       <td>{persona.task_count}</td>
                       <td>{persona.succeeded}</td>
                       <td>{persona.failed}</td>
+                      <td>{persona.cancelled}</td>
+                      <td>{persona.not_applicable}</td>
                       <td>{duration(persona.duration.average_ms)}</td>
                       <td>{duration(persona.provider_wait_duration.average_ms)}</td>
                       <td>{duration(persona.model_duration.average_ms)}</td>

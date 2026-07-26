@@ -1031,6 +1031,7 @@ mod tests {
             attachments: vec![],
             instructions: None,
             permission: crate::BackendPermission::Ask,
+            tool_free: false,
             mcp_bridge: None,
             mcp_servers: Vec::new(),
         }

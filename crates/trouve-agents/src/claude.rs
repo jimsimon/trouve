@@ -173,12 +173,13 @@ fn config_fingerprint(turn: &BackendTurn) -> String {
         .map(|s| format!("{}|{}|{:?}|{:?}", s.name, s.command, s.args, s.env))
         .collect();
     format!(
-        "{:?}|{}|{:?}|{:?}|{:?}|{:?}|{:?}",
+        "{:?}|{}|{:?}|{:?}|{:?}|{}|{:?}|{:?}",
         turn.worktree,
         turn.model,
         Value::Object(turn.model_options.clone()),
         turn.instructions,
         turn.permission,
+        turn.tool_free,
         bridge,
         servers,
     )
@@ -559,6 +560,9 @@ impl ClaudeBackend {
         }
         if let Some(instr) = &turn.instructions {
             cmd.args(["--append-system-prompt", instr]);
+        }
+        if turn.tool_free {
+            cmd.args(["--tools", ""]);
         }
         // MCP config: the trouve bridge plus any user-configured servers.
         // The bridge has two roles, both optional:

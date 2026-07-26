@@ -58,6 +58,10 @@ pub struct BackendTurn {
     /// the vendor protocol allows.
     pub instructions: Option<String>,
     pub permission: BackendPermission,
+    /// Request a tool-free turn. The engine omits mounted MCP tools and
+    /// rejects reported tool use; adapters also disable vendor built-ins
+    /// where their protocol supports it.
+    pub tool_free: bool,
     /// When set, the vendor agent runs with its built-in tools disabled and
     /// trouve's ToolExecutor bridged in over MCP (Claude Code only, v1).
     pub mcp_bridge: Option<McpBridgeConfig>,

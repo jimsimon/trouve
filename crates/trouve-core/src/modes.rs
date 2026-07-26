@@ -68,7 +68,10 @@ pub fn builtin_modes() -> Vec<AgentMode> {
             read_only: true,
             default_permission_mode: None,
             default_model: None,
-            default_thinking_level: None,
+            // Unattended review fans out across many focused agents. Keep
+            // the inherited default fast; an explicit persona setting still
+            // wins when deeper reasoning is worth the latency.
+            default_thinking_level: Some("low".into()),
         },
         AgentMode {
             id: "architect".into(),
@@ -286,6 +289,24 @@ pub fn delete_user_mode(config_dir: &Path, id: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn review_mode_defaults_to_low_thinking_without_changing_plan_mode() {
+        let modes = builtin_modes();
+        assert_eq!(
+            find_mode(&modes, "review")
+                .unwrap()
+                .default_thinking_level
+                .as_deref(),
+            Some("low")
+        );
+        assert!(
+            find_mode(&modes, "plan")
+                .unwrap()
+                .default_thinking_level
+                .is_none()
+        );
+    }
 
     #[test]
     fn workspace_mode_overrides_builtin() {

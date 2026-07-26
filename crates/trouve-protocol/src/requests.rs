@@ -931,6 +931,21 @@ pub struct CodeReviewFindingSource {
     pub task_id: String,
 }
 
+/// A reviewer candidate that the final editor chose not to publish.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct CodeReviewCandidateRejection {
+    pub candidate_id: String,
+    pub task_id: String,
+    pub reviewer_id: String,
+    pub reviewer_name: String,
+    pub path: String,
+    pub line: u64,
+    pub side: String,
+    pub severity: String,
+    pub body: String,
+    pub reason: String,
+}
+
 /// A confirmed issue produced by the coordinator and, when possible,
 /// published as an inline GitHub review comment.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -1044,6 +1059,8 @@ pub struct CodeReviewJobDetail {
     pub personas: Vec<CodeReviewPersonaResult>,
     #[serde(default)]
     pub findings: Vec<CodeReviewFinding>,
+    #[serde(default)]
+    pub candidate_rejections: Vec<CodeReviewCandidateRejection>,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub summary: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]

@@ -259,6 +259,7 @@ impl IntoResponse for ApiError {
         trouve_protocol::CodeReviewTask,
         trouve_protocol::CodeReviewPersonaResult,
         trouve_protocol::CodeReviewFindingSource,
+        trouve_protocol::CodeReviewCandidateRejection,
         trouve_protocol::CodeReviewFinding,
         trouve_protocol::CodeReviewJobDetail,
         trouve_protocol::CodeReviewJobList,

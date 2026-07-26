@@ -90,6 +90,7 @@ CREATE TABLE IF NOT EXISTS queued_prompts (
   content TEXT NOT NULL,
   attachments TEXT NOT NULL DEFAULT '[]',  -- JSON [trouve_protocol::Attachment]
   claimed INTEGER NOT NULL DEFAULT 0,
+  tools_enabled INTEGER NOT NULL DEFAULT 1,
   created_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS queued_prompts_thread ON queued_prompts (thread_id, position);
@@ -186,6 +187,9 @@ CREATE TABLE IF NOT EXISTS code_review_jobs (
   check_run_id INTEGER,
   check_run_url TEXT NOT NULL DEFAULT '',
   check_sync_error TEXT NOT NULL DEFAULT '',
+  projection_retry_count INTEGER NOT NULL DEFAULT 0,
+  projection_retry_at TEXT,
+  projection_retryable INTEGER NOT NULL DEFAULT 1,
   cancel_requested INTEGER NOT NULL DEFAULT 0,
   completed_reviewers INTEGER NOT NULL DEFAULT 0,
   total_reviewers INTEGER NOT NULL DEFAULT 0,
@@ -264,6 +268,21 @@ CREATE TABLE IF NOT EXISTS code_review_finding_sources (
   reviewer_name TEXT NOT NULL,
   PRIMARY KEY (finding_id, candidate_id)
 );
+CREATE TABLE IF NOT EXISTS code_review_candidate_rejections (
+  job_id TEXT NOT NULL REFERENCES code_review_jobs(id),
+  candidate_id TEXT NOT NULL,
+  task_id TEXT NOT NULL,
+  reviewer_id TEXT NOT NULL,
+  reviewer_name TEXT NOT NULL,
+  path TEXT NOT NULL,
+  line INTEGER NOT NULL,
+  side TEXT NOT NULL,
+  severity TEXT NOT NULL,
+  body TEXT NOT NULL,
+  reason TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  PRIMARY KEY (job_id, candidate_id)
+);
 CREATE TABLE IF NOT EXISTS code_review_pr_state (
   repository TEXT NOT NULL,
   pull_number INTEGER NOT NULL,
@@ -306,6 +325,7 @@ const MIGRATIONS: &[&str] = &[
     "ALTER TABLE sessions ADD COLUMN archived INTEGER NOT NULL DEFAULT 0",
     "ALTER TABLE queued_prompts ADD COLUMN attachments TEXT NOT NULL DEFAULT '[]'",
     "ALTER TABLE queued_prompts ADD COLUMN claimed INTEGER NOT NULL DEFAULT 0",
+    "ALTER TABLE queued_prompts ADD COLUMN tools_enabled INTEGER NOT NULL DEFAULT 1",
     "ALTER TABLE automations ADD COLUMN permission_mode TEXT NOT NULL DEFAULT 'ask'",
     "ALTER TABLE threads ADD COLUMN todos TEXT NOT NULL DEFAULT '[]'",
     "ALTER TABLE code_review_repositories ADD COLUMN identity_ids TEXT NOT NULL DEFAULT '[\"correctness\",\"security\",\"api-compatibility\",\"testing\"]'",
@@ -320,6 +340,9 @@ const MIGRATIONS: &[&str] = &[
     "ALTER TABLE code_review_jobs ADD COLUMN check_run_id INTEGER",
     "ALTER TABLE code_review_jobs ADD COLUMN check_run_url TEXT NOT NULL DEFAULT ''",
     "ALTER TABLE code_review_jobs ADD COLUMN check_sync_error TEXT NOT NULL DEFAULT ''",
+    "ALTER TABLE code_review_jobs ADD COLUMN projection_retry_count INTEGER NOT NULL DEFAULT 0",
+    "ALTER TABLE code_review_jobs ADD COLUMN projection_retry_at TEXT",
+    "ALTER TABLE code_review_jobs ADD COLUMN projection_retryable INTEGER NOT NULL DEFAULT 1",
     "ALTER TABLE code_review_jobs ADD COLUMN cancel_requested INTEGER NOT NULL DEFAULT 0",
     "ALTER TABLE code_review_jobs ADD COLUMN completed_reviewers INTEGER NOT NULL DEFAULT 0",
     "ALTER TABLE code_review_jobs ADD COLUMN total_reviewers INTEGER NOT NULL DEFAULT 0",
@@ -362,6 +385,15 @@ fn apply_migrations(conn: &Connection) -> Result<()> {
     }
     migrate_backend_sessions(conn)?;
     Ok(())
+}
+
+fn projection_retry_delay_seconds(attempt: u32) -> u64 {
+    const BASE_SECONDS: u64 = 60;
+    const MAX_SECONDS: u64 = 6 * 60 * 60;
+    let exponent = attempt.saturating_sub(1).min(9);
+    BASE_SECONDS
+        .saturating_mul(1_u64 << exponent)
+        .min(MAX_SECONDS)
 }
 
 /// Rebuild `backend_sessions` for databases created before it was keyed by
@@ -786,7 +818,8 @@ fn code_review_persona_results(
             let mut has_queued = false;
             let mut has_failed = false;
             let mut has_cancelled = false;
-            let mut all_succeeded = true;
+            let mut has_succeeded = false;
+            let mut all_successful_or_not_applicable = true;
             let mut completed_batches = 0_u64;
             let mut total_batches = 0_u64;
             let mut candidate_issue_count = 0_u64;
@@ -829,7 +862,9 @@ fn code_review_persona_results(
                 has_queued |= task.status == "queued";
                 has_failed |= task.status == "failed";
                 has_cancelled |= task.status == "cancelled";
-                all_succeeded &= task.status == "succeeded";
+                has_succeeded |= task.status == "succeeded";
+                all_successful_or_not_applicable &=
+                    matches!(task.status.as_str(), "succeeded" | "not_applicable");
                 candidate_issue_count += task.candidate_issue_count;
                 confirmed_issue_count += task.confirmed_issue_count;
                 provider_wait_ms += task.provider_wait_ms;
@@ -847,7 +882,7 @@ fn code_review_persona_results(
                 "running"
             } else if has_queued {
                 "queued"
-            } else if all_succeeded && all_terminal {
+            } else if all_successful_or_not_applicable && has_succeeded && all_terminal {
                 "succeeded"
             } else if all_terminal && tasks.iter().all(|task| task.status == "not_applicable") {
                 "not_applicable"
@@ -1738,16 +1773,34 @@ impl Store {
         content: &str,
         attachments: &[trouve_protocol::Attachment],
     ) -> Result<trouve_protocol::QueuedPrompt> {
+        self.enqueue_prompt_with_tools(thread_id, content, attachments, true)
+    }
+
+    pub(crate) fn enqueue_prompt_with_tools(
+        &self,
+        thread_id: &str,
+        content: &str,
+        attachments: &[trouve_protocol::Attachment],
+        tools_enabled: bool,
+    ) -> Result<trouve_protocol::QueuedPrompt> {
         let conn = self.conn.lock().unwrap();
         let id = format!("qp_{}", uuid::Uuid::new_v4().simple());
         let created_at = chrono::Utc::now().to_rfc3339();
         let attachments_json = serde_json::to_string(attachments)?;
         conn.execute(
-            "INSERT INTO queued_prompts (id, thread_id, position, content, attachments, created_at)
+            "INSERT INTO queued_prompts
+               (id, thread_id, position, content, attachments, tools_enabled, created_at)
              VALUES (?1, ?2,
                (SELECT COALESCE(MAX(position), 0) + 1 FROM queued_prompts WHERE thread_id = ?2),
-               ?3, ?4, ?5)",
-            params![id, thread_id, content, attachments_json, created_at],
+               ?3, ?4, ?5, ?6)",
+            params![
+                id,
+                thread_id,
+                content,
+                attachments_json,
+                tools_enabled,
+                created_at
+            ],
         )?;
         let position: i64 = conn.query_row(
             "SELECT position FROM queued_prompts WHERE id = ?1",
@@ -1762,6 +1815,15 @@ impl Store {
             attachments: attachments.to_vec(),
             created_at,
         })
+    }
+
+    pub(crate) fn queued_prompt_tools_enabled(&self, id: &str) -> Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        Ok(conn.query_row(
+            "SELECT tools_enabled FROM queued_prompts WHERE id = ?1",
+            params![id],
+            |row| row.get(0),
+        )?)
     }
 
     pub fn queued_prompts(&self, thread_id: &str) -> Result<Vec<trouve_protocol::QueuedPrompt>> {
@@ -2424,6 +2486,28 @@ impl Store {
         Ok(records.into_iter().map(|record| record.job).collect())
     }
 
+    pub fn code_review_jobs_with_projection_errors(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<trouve_protocol::CodeReviewJob>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {CODE_REVIEW_JOB_COLUMNS} FROM code_review_jobs
+             WHERE check_sync_error != ''
+               AND projection_retryable != 0
+               AND (projection_retry_at IS NULL OR projection_retry_at <= ?1)
+             ORDER BY projection_retry_at,
+                      COALESCE(completed_at, started_at, created_at)
+             LIMIT ?2"
+        ))?;
+        let rows = stmt.query_map(
+            params![chrono::Utc::now().to_rfc3339(), limit as i64],
+            row_to_code_review_job,
+        )?;
+        let records = rows.collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(records.into_iter().map(|record| record.job).collect())
+    }
+
     pub fn code_review_job(&self, id: &str) -> Result<Option<CodeReviewJobRecord>> {
         let conn = self.conn.lock().unwrap();
         Ok(conn
@@ -2794,6 +2878,7 @@ impl Store {
         prompt_for_agents: &str,
         candidate_issue_count: u64,
         findings: &[NewCodeReviewFinding],
+        candidate_rejections: &[trouve_protocol::CodeReviewCandidateRejection],
     ) -> Result<Vec<trouve_protocol::CodeReviewFinding>> {
         let mut conn = self.conn.lock().unwrap();
         let tx = conn.transaction()?;
@@ -2804,6 +2889,10 @@ impl Store {
         )?;
         tx.execute(
             "DELETE FROM code_review_findings WHERE job_id = ?1",
+            params![job_id],
+        )?;
+        tx.execute(
+            "DELETE FROM code_review_candidate_rejections WHERE job_id = ?1",
             params![job_id],
         )?;
         tx.execute(
@@ -2855,6 +2944,28 @@ impl Store {
                 }
             }
         }
+        for rejection in candidate_rejections {
+            tx.execute(
+                "INSERT INTO code_review_candidate_rejections
+                        (candidate_id, job_id, task_id, reviewer_id, reviewer_name,
+                         path, line, side, severity, body, reason, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+                params![
+                    rejection.candidate_id,
+                    job_id,
+                    rejection.task_id,
+                    rejection.reviewer_id,
+                    rejection.reviewer_name,
+                    rejection.path,
+                    rejection.line as i64,
+                    rejection.side,
+                    rejection.severity,
+                    rejection.body,
+                    rejection.reason,
+                    now,
+                ],
+            )?;
+        }
         tx.execute(
             "UPDATE code_review_jobs
              SET summary = ?2, prompt_for_agents = ?3,
@@ -2871,6 +2982,36 @@ impl Store {
         tx.commit()?;
         drop(conn);
         self.code_review_findings(job_id)
+    }
+
+    fn code_review_candidate_rejections(
+        &self,
+        job_id: &str,
+    ) -> Result<Vec<trouve_protocol::CodeReviewCandidateRejection>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT candidate_id, task_id, reviewer_id, reviewer_name,
+                    path, line, side, severity, body, reason
+             FROM code_review_candidate_rejections
+             WHERE job_id = ?1
+             ORDER BY reviewer_name, path, line, candidate_id",
+        )?;
+        Ok(stmt
+            .query_map(params![job_id], |row| {
+                Ok(trouve_protocol::CodeReviewCandidateRejection {
+                    candidate_id: row.get(0)?,
+                    task_id: row.get(1)?,
+                    reviewer_id: row.get(2)?,
+                    reviewer_name: row.get(3)?,
+                    path: row.get(4)?,
+                    line: row.get::<_, i64>(5)? as u64,
+                    side: row.get(6)?,
+                    severity: row.get(7)?,
+                    body: row.get(8)?,
+                    reason: row.get(9)?,
+                })
+            })?
+            .collect::<rusqlite::Result<_>>()?)
     }
 
     pub fn update_code_review_finding_publication(
@@ -2996,11 +3137,13 @@ impl Store {
         let tasks = self.code_review_tasks(id)?;
         let personas = code_review_persona_results(&tasks);
         let findings = self.code_review_findings(id)?;
+        let candidate_rejections = self.code_review_candidate_rejections(id)?;
         Ok(Some(trouve_protocol::CodeReviewJobDetail {
             job: record.job,
             tasks,
             personas,
             findings,
+            candidate_rejections,
             summary: record.summary,
             prompt_for_agents: record.prompt_for_agents,
         }))
@@ -3314,8 +3457,12 @@ impl Store {
             persona.cached_input_tokens += execution.cached_input_tokens;
             persona.output_tokens += execution.output_tokens;
             persona.tool_call_count += execution.tool_call_count;
-            let all_succeeded = execution.succeeded_tasks == execution.task_count;
-            if all_succeeded {
+            let succeeded_with_optional_skips = execution.succeeded_tasks > 0
+                && execution
+                    .succeeded_tasks
+                    .saturating_add(execution.not_applicable_tasks)
+                    == execution.task_count;
+            if succeeded_with_optional_skips {
                 persona.succeeded += 1;
             } else if execution.failed_tasks > 0 {
                 persona.failed += 1;
@@ -3596,7 +3743,13 @@ impl Store {
             "UPDATE code_review_jobs
              SET check_run_id = COALESCE(?2, check_run_id),
                  check_run_url = CASE WHEN ?3 = '' THEN check_run_url ELSE ?3 END,
-                 check_sync_error = ?4
+                 check_sync_error = ?4,
+                 projection_retry_count =
+                   CASE WHEN ?4 = '' THEN 0 ELSE projection_retry_count END,
+                 projection_retry_at =
+                   CASE WHEN ?4 = '' THEN NULL ELSE projection_retry_at END,
+                 projection_retryable =
+                   CASE WHEN ?4 = '' THEN 1 ELSE projection_retryable END
              WHERE id = ?1",
             params![
                 id,
@@ -3605,6 +3758,44 @@ impl Store {
                 sync_error
             ],
         )? > 0)
+    }
+
+    pub fn record_code_review_projection_failure(
+        &self,
+        id: &str,
+        error: &str,
+        retryable: bool,
+    ) -> Result<bool> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        let current_attempts = tx
+            .query_row(
+                "SELECT projection_retry_count FROM code_review_jobs WHERE id = ?1",
+                params![id],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()?;
+        let Some(current_attempts) = current_attempts else {
+            return Ok(false);
+        };
+        let attempts = u32::try_from(current_attempts)
+            .unwrap_or(u32::MAX)
+            .saturating_add(1);
+        let retry_at = retryable.then(|| {
+            let delay = projection_retry_delay_seconds(attempts);
+            (chrono::Utc::now() + chrono::Duration::seconds(delay as i64)).to_rfc3339()
+        });
+        tx.execute(
+            "UPDATE code_review_jobs
+             SET check_sync_error = ?2,
+                 projection_retry_count = ?3,
+                 projection_retry_at = ?4,
+                 projection_retryable = ?5
+             WHERE id = ?1",
+            params![id, error, i64::from(attempts), retry_at, retryable],
+        )?;
+        tx.commit()?;
+        Ok(true)
     }
 
     pub fn set_code_review_job_lifecycle_comment_url(&self, id: &str, url: &str) -> Result<bool> {
@@ -4750,7 +4941,11 @@ mod tests {
         let a = store.enqueue_prompt("th_1", "first", &[]).unwrap();
         let b = store.enqueue_prompt("th_1", "second", &[]).unwrap();
         let c = store.enqueue_prompt("th_1", "third", &[]).unwrap();
-        store.enqueue_prompt("th_2", "other thread", &[]).unwrap();
+        let tool_free = store
+            .enqueue_prompt_with_tools("th_2", "other thread", &[], false)
+            .unwrap();
+        assert!(store.queued_prompt_tools_enabled(&a.id).unwrap());
+        assert!(!store.queued_prompt_tools_enabled(&tool_free.id).unwrap());
 
         let q = store.queued_prompts("th_1").unwrap();
         assert_eq!(
@@ -5450,16 +5645,10 @@ mod tests {
             })
             .unwrap();
         store
-            .start_code_review_task(
+            .skip_code_review_task(
                 &second_task.id,
-                "se_review",
-                "th_review_2",
-                "provider/model",
+                "No changed files or hunks matched this focused persona.",
             )
-            .unwrap()
-            .unwrap();
-        store
-            .finish_code_review_task(&second_task.id, "succeeded", "clean", 0, "")
             .unwrap()
             .unwrap();
         assert_eq!(store.completed_code_review_personas(&queued.id).unwrap(), 1);
@@ -5488,6 +5677,18 @@ mod tests {
                         task_id: task.id.clone(),
                     }],
                 }],
+                &[trouve_protocol::CodeReviewCandidateRejection {
+                    candidate_id: "candidate-2".into(),
+                    task_id: task.id.clone(),
+                    reviewer_id: "correctness".into(),
+                    reviewer_name: "Correctness".into(),
+                    path: "src/lib.rs".into(),
+                    line: 18,
+                    side: "RIGHT".into(),
+                    severity: "low".into(),
+                    body: "This branch could be simplified.".into(),
+                    reason: "This is a non-actionable style preference.".into(),
+                }],
             )
             .unwrap();
         assert_eq!(findings.len(), 1);
@@ -5496,9 +5697,60 @@ mod tests {
         assert_eq!(detail.job.progress.completed_reviewers, 1);
         assert_eq!(detail.tasks[0].output, "candidate output");
         assert_eq!(detail.personas[0].candidate_issue_count, 1);
+        assert_eq!(detail.candidate_rejections.len(), 1);
+        assert_eq!(
+            detail.candidate_rejections[0].reason,
+            "This is a non-actionable style preference."
+        );
         assert_eq!(detail.personas[0].confirmed_issue_count, 1);
+        assert_eq!(detail.personas[0].status, "succeeded");
         assert_eq!(detail.findings[0].sources[0].task_id, task.id);
         assert_eq!(detail.prompt_for_agents, "Fix every confirmed issue.");
+
+        assert_eq!(projection_retry_delay_seconds(1), 60);
+        assert_eq!(projection_retry_delay_seconds(20), 6 * 60 * 60);
+        store
+            .record_code_review_projection_failure(&queued.id, "temporary failure", true)
+            .unwrap();
+        assert!(
+            store
+                .code_review_jobs_with_projection_errors(10)
+                .unwrap()
+                .is_empty()
+        );
+        store
+            .conn
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE code_review_jobs SET projection_retry_at = ?2 WHERE id = ?1",
+                params![
+                    queued.id,
+                    (chrono::Utc::now() - chrono::Duration::seconds(1)).to_rfc3339()
+                ],
+            )
+            .unwrap();
+        let projection_errors = store.code_review_jobs_with_projection_errors(10).unwrap();
+        assert_eq!(projection_errors.len(), 1);
+        assert_eq!(projection_errors[0].id, queued.id);
+        store
+            .set_code_review_job_check_run(&queued.id, None, "", "")
+            .unwrap();
+        assert!(
+            store
+                .code_review_jobs_with_projection_errors(10)
+                .unwrap()
+                .is_empty()
+        );
+        store
+            .record_code_review_projection_failure(&queued.id, "permanent failure", false)
+            .unwrap();
+        assert!(
+            store
+                .code_review_jobs_with_projection_errors(10)
+                .unwrap()
+                .is_empty()
+        );
 
         let replacement = store.retry_code_review_job(&queued.id).unwrap().unwrap();
         assert_eq!(replacement.retry_of.as_deref(), Some(queued.id.as_str()));
@@ -5546,6 +5798,16 @@ mod tests {
         assert_eq!(stats.status.queued, 1);
         assert_eq!(stats.personas[0].candidate_issue_count, 1);
         assert_eq!(stats.personas[0].confirmed_issue_count, 1);
+        assert_eq!(stats.personas[0].task_count, 2);
+        assert_eq!(stats.personas[0].succeeded, 1);
+        assert_eq!(
+            stats.personas[0].succeeded
+                + stats.personas[0].failed
+                + stats.personas[0].cancelled
+                + stats.personas[0].not_applicable,
+            1
+        );
+        assert_eq!(stats.personas[0].not_applicable, 0);
     }
 
     #[test]
