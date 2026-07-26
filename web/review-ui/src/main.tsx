@@ -641,7 +641,10 @@ function JobDetailPane({
       return (
         detail.tasks.find((task) => task.status === "running") ??
         detail.tasks.find((task) => task.status === "failed") ??
-        detail.tasks.find((task) => task.role === "coordinator") ??
+        detail.tasks
+          .slice()
+          .reverse()
+          .find((task) => task.role === "coordinator") ??
         detail.tasks[0]
       ).id;
     });
@@ -754,7 +757,10 @@ function JobDetailPane({
     const preferred =
       tasks.find((task) => task.status === "running") ??
       tasks.find((task) => task.status === "failed") ??
-      tasks.find((task) => task.role === "coordinator") ??
+      tasks
+        .slice()
+        .reverse()
+        .find((task) => task.role === "coordinator") ??
       tasks[0];
     if (preferred) setSelectedTaskId(preferred.id);
   };

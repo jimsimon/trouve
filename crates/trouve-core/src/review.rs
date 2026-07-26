@@ -3256,6 +3256,7 @@ impl Engine {
                 }
             }
         };
+        let check_summary = bounded_check_details(&check_summary);
         let check_details = bounded_check_details(&render_check_details(&detail));
         let mut check_body = serde_json::json!({
             "name": "trouve-code-review",
