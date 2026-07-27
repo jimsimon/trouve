@@ -31,6 +31,7 @@ pub fn system_prompt(
     mode: &AgentPersona,
     config_dir: Option<&Path>,
     workspace_root: &Path,
+    include_builtin_skills: bool,
 ) -> String {
     let mut sections = vec![BASE_PROMPT.to_string(), mode.system_prompt.clone()];
 
@@ -53,7 +54,7 @@ pub fn system_prompt(
             ));
         }
     }
-    let skills = crate::skills::discover(config_dir, Some(workspace_root));
+    let skills = crate::skills::discover(config_dir, Some(workspace_root), include_builtin_skills);
     if let Some(section) = crate::skills::prompt_section(&skills) {
         sections.push(section);
     }
@@ -77,7 +78,7 @@ mod tests {
         std::fs::write(repo.join(".agents/AGENTS.md"), "DOTAGENTS RULES").unwrap();
 
         let modes = builtin_personas();
-        let prompt = system_prompt(&modes[0], Some(&cfg), &repo);
+        let prompt = system_prompt(&modes[0], Some(&cfg), &repo, true);
         let g = prompt.find("GLOBAL RULES").unwrap();
         let r = prompt.find("REPO RULES").unwrap();
         let d = prompt.find("DOTAGENTS RULES").unwrap();
@@ -86,7 +87,23 @@ mod tests {
         // No files at all: still a usable prompt.
         let empty = tmp.path().join("empty");
         std::fs::create_dir_all(&empty).unwrap();
-        let prompt = system_prompt(&modes[0], None, &empty);
+        let prompt = system_prompt(&modes[0], None, &empty, true);
         assert!(prompt.contains("You are trouve"));
+    }
+
+    #[test]
+    fn builtins_can_be_excluded_without_hiding_workspace_skills() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(repo.join(".agents/skills/review")).unwrap();
+        std::fs::write(
+            repo.join(".agents/skills/review/SKILL.md"),
+            "---\nname: review\ndescription: Workspace review\n---\nReview it.",
+        )
+        .unwrap();
+
+        let prompt = system_prompt(&builtin_personas()[0], None, &repo, false);
+        assert!(prompt.contains("Workspace review"));
+        assert!(!prompt.contains("code-review"));
     }
 }

@@ -5,6 +5,7 @@
 //! serialized per session (threads share the session worktree, ADR 0003).
 
 use std::collections::{HashMap, HashSet};
+use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, RwLock, Weak};
@@ -2124,6 +2125,36 @@ fn resolved_cli_command(kind: &str, command: Option<String>, data_dir: &Path) ->
 /// Config kinds handled by the [`AgentBackend`] seam rather than a Provider.
 fn is_backend_kind(kind: &str) -> bool {
     matches!(kind, "codex-app-server" | "cursor-cli" | "claude-cli")
+}
+
+/// Instruction loading is a read-only harness primitive, like asking the
+/// user a question or searching the transcript. A mode may restrict
+/// executable workspace tools, but must not advertise skills the model is
+/// then unable to load.
+fn mode_allows_tool(mode: &AgentMode, name: &str) -> bool {
+    name == "load_skill"
+        || mode.allowed_tools.is_empty()
+        || mode.allowed_tools.iter().any(|allowed| allowed == name)
+}
+
+/// Stable-enough cache key for one process lifetime. Vendor harnesses cache
+/// MCP catalogs; changing this value in the bridge URL forces an adapter to
+/// remount when mode policy or a user MCP schema changes.
+fn tool_catalog_revision(specs: &[ToolSpec]) -> u64 {
+    let mut rows: Vec<_> = specs
+        .iter()
+        .map(|spec| {
+            (
+                spec.name.as_str(),
+                spec.description.as_str(),
+                spec.parameters.to_string(),
+            )
+        })
+        .collect();
+    rows.sort_unstable_by(|a, b| a.0.cmp(b.0));
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    rows.hash(&mut hasher);
+    hasher.finish()
 }
 
 /// Config kinds whose auth lives in a vendor CLI.
@@ -8184,6 +8215,470 @@ impl Engine {
         Ok(thread)
     }
 
+    fn command_catalog(&self, workspace_root: &Path) -> Vec<CommandInfo> {
+        crate::commands::catalog(crate::skills::command_catalog(
+            self.config_dir.as_deref(),
+            Some(workspace_root),
+            self.builtin_skills_enabled(),
+        ))
+    }
+
+    fn emit_command_catalog(&self, thread_id: &str, workspace_root: &Path) -> Result<()> {
+        self.store.append_event(
+            Scope::Thread(thread_id.to_string()),
+            Event::CommandCatalogUpdated {
+                commands: self.command_catalog(workspace_root),
+            },
+        )?;
+        Ok(())
+    }
+
+    /// Execute one Trouve-owned slash command. Prompt commands never enter
+    /// this path; clients send those through `send_message` so skills start a
+    /// normal model turn.
+    pub async fn execute_command(
+        self: &Arc<Self>,
+        thread_id: &str,
+        req: ExecuteCommandRequest,
+    ) -> Result<CommandResult, EngineError> {
+        let name = req.name.trim().trim_start_matches('/');
+        let Some(spec) = crate::commands::action_spec(name) else {
+            return Err(EngineError::BadRequest(format!(
+                "unknown action command: /{name}"
+            )));
+        };
+        let arguments = req.arguments.trim().to_string();
+        let thread = self.get_thread(thread_id)?;
+        let session = self.get_session(&thread.session_id)?;
+        let workspace = self
+            .store
+            .workspace(&session.workspace_id)?
+            .ok_or_else(|| EngineError::NotFound(format!("workspace {}", session.workspace_id)))?;
+        let workspace_root = Path::new(&workspace.path);
+
+        let (output, action) = match name {
+            "help" => {
+                let catalog = self.command_catalog(workspace_root);
+                let target = arguments.trim_start_matches('/');
+                if target.is_empty() {
+                    let mut output = String::from(
+                        "## Trouve commands\n\n| Command | Description |\n| --- | --- |\n",
+                    );
+                    for command in catalog {
+                        output.push_str(&format!(
+                            "| `{}` | {} |\n",
+                            command.usage.replace('|', "\\|"),
+                            command.description.replace('|', "\\|")
+                        ));
+                    }
+                    (output, CommandAction::None)
+                } else {
+                    let command = catalog
+                        .iter()
+                        .find(|command| command.name == target)
+                        .ok_or_else(|| {
+                            EngineError::BadRequest(format!("unknown command: /{target}"))
+                        })?;
+                    (
+                        format!(
+                            "## `{}`\n\n{}\n\nKind: **{}**",
+                            command.usage,
+                            command.description,
+                            match command.kind {
+                                trouve_protocol::CommandKind::Prompt => "model prompt",
+                                trouve_protocol::CommandKind::Action => "Trouve action",
+                            }
+                        ),
+                        CommandAction::None,
+                    )
+                }
+            }
+            "status" => {
+                require_no_command_arguments(spec, &arguments)?;
+                let providers = self.list_providers();
+                let provider_id = thread.model.split_once('/').map_or("", |(id, _)| id);
+                let provider = providers
+                    .providers
+                    .iter()
+                    .find(|provider| provider.id == provider_id);
+                let provider_line = provider.map_or_else(
+                    || "not configured".to_string(),
+                    |provider| format!("{} / {}", provider.kind, provider.auth),
+                );
+                let turn = if self.turn_cancels.lock().unwrap().contains_key(thread_id) {
+                    "running"
+                } else {
+                    "idle"
+                };
+                (
+                    format!(
+                        "## Status\n\n- Session: **{}** (`{}`)\n- Thread: `{}`\n- Mode: `{}`\n- Model: `{}`\n- Permissions: `{}`\n- Provider: {}\n- Current turn: **{}**\n- Session activity: **{}**",
+                        session.title,
+                        session.id,
+                        thread.id,
+                        thread.mode,
+                        thread.model,
+                        permission_name(thread.permission_mode),
+                        provider_line,
+                        turn,
+                        if session.active { "active" } else { "idle" }
+                    ),
+                    CommandAction::None,
+                )
+            }
+            "skills" => {
+                let skills = crate::skills::discover(
+                    self.config_dir.as_deref(),
+                    Some(workspace_root),
+                    self.builtin_skills_enabled(),
+                );
+                if arguments.is_empty() {
+                    let mut output = String::from(
+                        "## Available skills\n\n| Skill | Origin | Invocation | Description |\n| --- | --- | --- | --- |\n",
+                    );
+                    for skill in skills {
+                        let invocation = if skill.user_invocable {
+                            if skill.argument_hint.is_empty() {
+                                format!("/{}", skill.name)
+                            } else {
+                                format!("/{} {}", skill.name, skill.argument_hint)
+                            }
+                        } else {
+                            "model only".into()
+                        };
+                        output.push_str(&format!(
+                            "| `{}` | {} | `{}` | {} |\n",
+                            skill.name,
+                            skill.origin,
+                            invocation.replace('|', "\\|"),
+                            skill.description.replace('|', "\\|")
+                        ));
+                    }
+                    (output, CommandAction::None)
+                } else {
+                    let target = single_command_argument(spec, &arguments)?;
+                    let skill = skills
+                        .iter()
+                        .find(|skill| skill.name == target)
+                        .ok_or_else(|| {
+                            EngineError::BadRequest(format!("unknown skill: {target}"))
+                        })?;
+                    let invocation = if skill.user_invocable {
+                        if skill.argument_hint.is_empty() {
+                            format!("/{}", skill.name)
+                        } else {
+                            format!("/{} {}", skill.name, skill.argument_hint)
+                        }
+                    } else {
+                        "Not user-invocable".into()
+                    };
+                    (
+                        format!(
+                            "## `{}`\n\n{}\n\n- Origin: **{}**\n- Invocation: `{}`\n- Automatic model invocation: **{}**",
+                            skill.name,
+                            skill.description,
+                            skill.origin,
+                            invocation,
+                            if skill.disable_model_invocation {
+                                "disabled"
+                            } else {
+                                "enabled"
+                            }
+                        ),
+                        CommandAction::None,
+                    )
+                }
+            }
+            "mode" => {
+                let modes = self.list_modes(Some(&session.workspace_id))?;
+                if arguments.is_empty() {
+                    let mut output = format!("## Modes\n\nCurrent: `{}`\n", thread.mode);
+                    for mode in modes {
+                        let marker = if mode.id == thread.mode {
+                            " **(current)**"
+                        } else {
+                            ""
+                        };
+                        output.push_str(&format!(
+                            "\n- `{}` — {}{}",
+                            mode.id, mode.display_name, marker
+                        ));
+                    }
+                    (output, CommandAction::None)
+                } else {
+                    let mode = single_command_argument(spec, &arguments)?;
+                    let updated = self.update_thread(
+                        thread_id,
+                        &UpdateThreadRequest {
+                            mode: Some(mode.to_string()),
+                            ..Default::default()
+                        },
+                    )?;
+                    (
+                        format!("Mode changed to `{}`.", updated.mode),
+                        CommandAction::None,
+                    )
+                }
+            }
+            "model" => {
+                if arguments.is_empty() {
+                    let models = self.list_models().await;
+                    let mut output = format!("## Models\n\nCurrent: `{}`\n", thread.model);
+                    for model in models {
+                        let marker = if model.id == thread.model {
+                            " **(current)**"
+                        } else {
+                            ""
+                        };
+                        output.push_str(&format!(
+                            "\n- `{}` — {} ({} token context){}",
+                            model.id, model.display_name, model.context_window, marker
+                        ));
+                    }
+                    (output, CommandAction::None)
+                } else {
+                    let model = single_command_argument(spec, &arguments)?;
+                    let updated = self.update_thread(
+                        thread_id,
+                        &UpdateThreadRequest {
+                            model: Some(model.to_string()),
+                            ..Default::default()
+                        },
+                    )?;
+                    (
+                        format!("Model changed to `{}`.", updated.model),
+                        CommandAction::None,
+                    )
+                }
+            }
+            "permissions" => {
+                if arguments.is_empty() {
+                    (
+                        format!(
+                            "Current permission policy: `{}`.\n\nAvailable: `ask`, `allow-list`, `yolo`.",
+                            permission_name(thread.permission_mode)
+                        ),
+                        CommandAction::None,
+                    )
+                } else {
+                    let value = single_command_argument(spec, &arguments)?;
+                    let permission_mode = match value {
+                        "ask" => PermissionMode::Ask,
+                        "allow-list" | "allow_list" => PermissionMode::AllowList,
+                        "yolo" => PermissionMode::Yolo,
+                        _ => {
+                            return Err(EngineError::BadRequest(format!("usage: {}", spec.usage)));
+                        }
+                    };
+                    let updated = self.update_thread(
+                        thread_id,
+                        &UpdateThreadRequest {
+                            permission_mode: Some(permission_mode),
+                            ..Default::default()
+                        },
+                    )?;
+                    (
+                        format!(
+                            "Permission policy changed to `{}`.",
+                            permission_name(updated.permission_mode)
+                        ),
+                        CommandAction::None,
+                    )
+                }
+            }
+            "undo" => {
+                require_no_command_arguments(spec, &arguments)?;
+                self.undo(&session.id).await?;
+                (
+                    "Restored the previous checkpoint.".into(),
+                    CommandAction::None,
+                )
+            }
+            "redo" => {
+                require_no_command_arguments(spec, &arguments)?;
+                self.redo(&session.id).await?;
+                ("Restored the next checkpoint.".into(), CommandAction::None)
+            }
+            "cancel" => {
+                require_no_command_arguments(spec, &arguments)?;
+                self.cancel_turn(thread_id)?;
+                (
+                    "Cancellation requested for the current turn.".into(),
+                    CommandAction::None,
+                )
+            }
+            "new" => {
+                require_no_command_arguments(spec, &arguments)?;
+                let created = self.create_thread(CreateThreadRequest {
+                    session_id: session.id.clone(),
+                    mode: Some(thread.mode.clone()),
+                    model: Some(thread.model.clone()),
+                    model_options: thread.model_options.clone(),
+                    permission_mode: Some(thread.permission_mode),
+                })?;
+                (
+                    format!("Created thread `{}`.", created.id),
+                    CommandAction::SwitchThread {
+                        thread_id: created.id,
+                    },
+                )
+            }
+            "tools" => {
+                require_no_command_arguments(spec, &arguments)?;
+                let mut tools = self.bridged_tool_specs(thread_id).await?;
+                tools.sort_by(|left, right| left.name.cmp(&right.name));
+                let mut output = String::from(
+                    "## Available Trouve tools\n\n| Tool | Description |\n| --- | --- |\n",
+                );
+                for tool in tools {
+                    output.push_str(&format!(
+                        "| `{}` | {} |\n",
+                        tool.name,
+                        tool.description.replace('|', "\\|").replace('\n', " ")
+                    ));
+                }
+                (output, CommandAction::None)
+            }
+            "mcp" => {
+                require_no_command_arguments(spec, &arguments)?;
+                let servers = self.session_mcp_servers(&session.id)?;
+                let mut output = String::from(
+                    "## Session MCP servers\n\n| Server | Scope | Health | Detail |\n| --- | --- | --- | --- |\n",
+                );
+                if servers.is_empty() {
+                    output.push_str("| _None configured_ | | | |\n");
+                } else {
+                    for server in servers {
+                        output.push_str(&format!(
+                            "| `{}` | {} | {} | {} |\n",
+                            server.name,
+                            server.scope,
+                            server.health,
+                            server.detail.replace('|', "\\|").replace('\n', " ")
+                        ));
+                    }
+                }
+                (output, CommandAction::None)
+            }
+            "usage" => {
+                require_no_command_arguments(spec, &arguments)?;
+                let usage = self.thread_usage(thread_id)?;
+                (
+                    format!(
+                        "## Thread usage\n\n- Turns: {}\n- Input tokens: {}\n- Cached input tokens: {}\n- Output tokens: {}\n- Cost: ${:.4}",
+                        usage.turns,
+                        usage.input_tokens,
+                        usage.cached_input_tokens,
+                        usage.output_tokens,
+                        usage.cost_usd
+                    ),
+                    CommandAction::None,
+                )
+            }
+            "diff" => {
+                require_no_command_arguments(spec, &arguments)?;
+                let diff = self.session_diff(&session.id).await?;
+                let output = if diff.trim().is_empty() {
+                    "No changes against the session base revision.".into()
+                } else {
+                    format!("## Session diff\n\n````diff\n{}\n````", diff.trim_end())
+                };
+                (output, CommandAction::None)
+            }
+            "files" => {
+                require_no_command_arguments(spec, &arguments)?;
+                let paths = self.session_list_paths(&session.id).await?;
+                let total = paths.len();
+                let mut output = String::from("## Session files\n");
+                for path in paths.into_iter().take(500) {
+                    output.push_str(&format!("\n- `{}`", path.replace('`', "\\`")));
+                }
+                if total > 500 {
+                    output.push_str(&format!("\n\n_Showing 500 of {total} paths._"));
+                }
+                (output, CommandAction::None)
+            }
+            "queue" => {
+                require_no_command_arguments(spec, &arguments)?;
+                let prompts = self.list_queued_prompts(thread_id)?;
+                let mut output = String::from("## Prompt queue\n");
+                if prompts.is_empty() {
+                    output.push_str("\nThe queue is empty.");
+                } else {
+                    for (index, prompt) in prompts.iter().enumerate() {
+                        let preview = command_preview(&prompt.content, 160);
+                        output.push_str(&format!("\n{}. {}", index + 1, preview));
+                    }
+                }
+                (output, CommandAction::None)
+            }
+            "instructions" => {
+                require_no_command_arguments(spec, &arguments)?;
+                let all_modes =
+                    modes::resolve_modes(self.config_dir.as_deref(), Some(workspace_root));
+                let mode = modes::find_mode(&all_modes, &thread.mode)
+                    .cloned()
+                    .unwrap_or_else(modes::fallback_mode);
+                let instructions = context::system_prompt(
+                    &mode,
+                    self.config_dir.as_deref(),
+                    workspace_root,
+                    self.builtin_skills_enabled(),
+                );
+                (
+                    format!(
+                        "## Effective instructions\n\n````text\n{}\n````",
+                        instructions.trim_end()
+                    ),
+                    CommandAction::None,
+                )
+            }
+            "rename" => {
+                if arguments.is_empty() {
+                    return Err(EngineError::BadRequest(format!("usage: {}", spec.usage)));
+                }
+                let updated = self.update_session(
+                    &session.id,
+                    &UpdateSessionRequest {
+                        title: Some(arguments.clone()),
+                        archived: None,
+                    },
+                )?;
+                (
+                    format!("Session renamed to **{}**.", updated.title),
+                    CommandAction::None,
+                )
+            }
+            "terminal" => {
+                require_no_command_arguments(spec, &arguments)?;
+                (
+                    "Opening the integrated terminal for this session.".into(),
+                    CommandAction::OpenTerminal,
+                )
+            }
+            _ => {
+                return Err(EngineError::Internal(anyhow!(
+                    "action command registry and executor diverged: /{name}"
+                )));
+            }
+        };
+
+        let output = truncate_command_output(output);
+        self.store.append_event(
+            Scope::Thread(thread_id.to_string()),
+            Event::CommandExecuted {
+                name: name.to_string(),
+                arguments: arguments.clone(),
+                output: output.clone(),
+            },
+        )?;
+        Ok(CommandResult {
+            name: name.to_string(),
+            output,
+            action,
+        })
+    }
+
     pub fn get_thread(&self, id: &str) -> Result<Thread, EngineError> {
         self.store
             .thread(id)?
@@ -10060,6 +10555,7 @@ impl Engine {
                     backend,
                     model_name,
                     content,
+                    model_content,
                     attachments,
                     cancel,
                     &prompt.id,
@@ -10544,15 +11040,20 @@ impl Engine {
         &self,
         model: &str,
         thread_id: &str,
-    ) -> Option<trouve_agents::McpBridgeConfig> {
-        let backend_id = model.split_once('/')?.0;
-        let (kind, bridge_tools) = {
+    ) -> Result<Option<trouve_agents::McpBridgeConfig>> {
+        let Some((backend_id, _)) = model.split_once('/') else {
+            return Ok(None);
+        };
+        let kind = {
             let config = self.config.lock().unwrap();
             let pc = config.providers.get(backend_id)?;
             (pc.kind.clone(), pc.tool_bridge.unwrap_or(true))
         };
-        if kind != "claude-cli" && kind != "codex-app-server" {
-            return None;
+        if !matches!(
+            kind.as_str(),
+            "claude-cli" | "codex-app-server" | "cursor-cli"
+        ) {
+            return Ok(None);
         }
         let Some(base_url) = self.base_url.read().unwrap().clone() else {
             tracing::warn!(
@@ -10825,7 +11326,7 @@ impl Engine {
             .handle_tool_call(&session, &thread, turn, &mode, &ctx, &call, &cancel)
             .await
             .map_err(EngineError::Internal)?;
-        Ok(content)
+        Ok((content, images))
     }
 
     fn announce_trouve_bridge_wrapper(
@@ -11085,7 +11586,14 @@ impl Engine {
         if status != ToolStatus::Ok || !is_authoritative_todo_tool {
             return Ok(None);
         }
-        let result_todos = result.get("todos").and_then(Self::parse_todo_snapshot);
+        let snapshot = |value: &serde_json::Value| {
+            Self::parse_todo_snapshot(value).or_else(|| {
+                ["todos", "items", "plan"]
+                    .iter()
+                    .find_map(|field| value.get(*field).and_then(Self::parse_todo_snapshot))
+            })
+        };
+        let result_todos = snapshot(result);
         let (mut todos, merge) = match result_todos {
             // Native trouve tools return the authoritative full snapshot,
             // including after a merge update.
@@ -11097,7 +11605,7 @@ impl Engine {
                 let Some(args) = args else {
                     return Ok(None);
                 };
-                let Some(todos) = args.get("todos").and_then(Self::parse_todo_snapshot) else {
+                let Some(todos) = snapshot(args) else {
                     return Ok(None);
                 };
                 (
@@ -11972,6 +12480,7 @@ impl Engine {
         backend_id: &str,
         backend: Arc<dyn AgentBackend>,
         model_name: String,
+        display_content: String,
         content: String,
         attachments: Vec<trouve_protocol::Attachment>,
         cancel: tokio_util::sync::CancellationToken,
@@ -12078,13 +12587,15 @@ impl Engine {
             BackendPermission::Ask
         };
 
-        let mcp_bridge = tools_enabled
-            .then(|| self.mcp_bridge_for(&thread.model, &thread.id))
-            .flatten();
         // Vendor agents get the mode prompt plus, when the bridge serves
         // trouve's search tools, guidance to prefer them over built-ins
         // (MCP instructions alone are too weak a signal).
-        let mut instructions = mode.system_prompt.trim().to_string();
+        let mut instructions = context::system_prompt(
+            mode,
+            self.config_dir.as_deref(),
+            Path::new(&workspace.path),
+            self.builtin_skills_enabled(),
+        );
         if mcp_bridge.is_some() {
             if !instructions.is_empty() {
                 instructions.push_str("\n\n");
@@ -12626,7 +13137,7 @@ impl Engine {
                 BackendEvent::ToolStarted {
                     call_id,
                     tool,
-                    mut args,
+                    args,
                 } => {
                     if trouve_bridge_wrapper_call(&tool, &args).is_some() {
                         if suppressed_bridge_calls.insert(call_id.clone()) {
@@ -12682,6 +13193,16 @@ impl Engine {
                             content: std::mem::take(&mut segment),
                         });
                     }
+                    if is_trouve_bridge_tool_event(&tool, &args) {
+                        // The MCP request itself already produced the one
+                        // canonical ToolExecutor card. Vendor lifecycle
+                        // notifications have a different call id and would
+                        // otherwise duplicate it.
+                        ignored_bridge_call_ids.insert(call_id);
+                        continue;
+                    }
+                    tool_calls.insert(call_id.clone(), (tool.clone(), args.clone()));
+                    let (display_tool, mut display_args) = normalize_vendor_tool_call(&tool, &args);
                     // Snippet edits carry no position; the worktree file is
                     // still un-edited at announcement time, so resolve line
                     // hints now for the UI's diff gutter.
@@ -13037,6 +13558,13 @@ impl Engine {
                         flush_backend_event_batch(&self.store, &scope, &mut persisted).await?;
                         bail!("backend requested approval for {tool} during a tool-free turn");
                     }
+                    if is_trouve_bridge_tool_event(&tool, &args) {
+                        // ToolExecutor already applied the canonical gate.
+                        // Approving the vendor's transport-level echo avoids a
+                        // second, provider-specific permission prompt.
+                        let _ = responder.send(true);
+                        continue;
+                    }
                     if !segment.is_empty() {
                         persisted.push(Event::AssistantMessage {
                             turn,
@@ -13205,7 +13733,7 @@ impl Engine {
         if tools_enabled {
             let seen_after = self.store.messages(&thread.id)?.len() as u64;
             self.store
-                .mark_backend_seen(&thread.id, backend_id, seen_after)?;
+                .mark_backend_seen(&thread.id, &backend_session_key, seen_after)?;
         }
 
         // Vendor turns can contain several model calls. Their final usage is
@@ -13365,7 +13893,7 @@ impl Engine {
                 // nowhere to attach and the turn hangs forever.
                 let mut approval_events = Vec::with_capacity(2);
                 if !self.tool_card_exists(&thread.id, turn, call_id) {
-                    let mut display_args = args.clone();
+                    let (display_tool, mut display_args) = normalize_vendor_tool_call(tool, args);
                     annotate_edit_lines(Path::new(&session.worktree_path), &mut display_args);
                     approval_events.push(Event::ToolRequested {
                         turn,
@@ -13792,8 +14320,7 @@ impl Engine {
         }
 
         let known = self.executor.tool_mutates(&call.name);
-        let allowed_by_mode =
-            mode.allowed_tools.is_empty() || mode.allowed_tools.contains(&call.name);
+        let allowed_by_mode = mode_allows_tool(mode, &call.name);
         let mutates = known.unwrap_or(true);
         let key = allow_key(&call.name, &call.arguments);
         let decision = if known.is_none() || !allowed_by_mode {
@@ -14975,6 +15502,257 @@ fn annotate_attachments(
         out.push_str(&format!("\n- {} ({}): {}", a.name, a.mime, path.display()));
     }
     out
+}
+
+/// Identify the vendor lifecycle echo for a call already executed through
+/// Trouve's supplemental bridge. Claude reports the MCP function name
+/// directly; Codex reports a generic item with the server carried separately.
+fn is_trouve_bridge_tool_event(tool: &str, args: &serde_json::Value) -> bool {
+    tool.starts_with("mcp__trouve__")
+        || (tool == "mcpToolCall"
+            && args
+                .get("server")
+                .or_else(|| args.get("serverName"))
+                .and_then(serde_json::Value::as_str)
+                == Some("trouve"))
+}
+
+/// Map provider-native vocabulary onto Trouve's canonical operation families.
+fn canonical_vendor_tool(tool: &str) -> &str {
+    match tool {
+        "Bash" | "bash" | "execute" | "commandExecution" | "shell_command" | "exec_command" => {
+            "shell"
+        }
+        "Read" | "read" => "read_file",
+        "Write" | "write" => "write_file",
+        "Edit" | "edit" => "edit_file",
+        "MultiEdit" | "NotebookEdit" | "fileChange" => "apply_patch",
+        "delete" | "Delete" => "delete_file",
+        "Glob" | "glob_search" => "glob",
+        "Grep" | "codeSearch" => "grep",
+        "WebFetch" | "webFetch" => "web_fetch",
+        "WebSearch" | "webSearch" => "web_search",
+        "imageView" | "ViewImage" => "view_image",
+        "TodoWrite" | "createPlan" | "updatePlan" => "todo_write",
+        "Task" | "Agent" | "collabAgentToolCall" => "spawn_thread",
+        other => other,
+    }
+}
+
+/// Canonicalize the fields clients use for labels, diffs, file navigation,
+/// and approval cards while keeping execution in the provider's native
+/// dialect. Unknown calls retain their raw object unchanged.
+fn normalize_vendor_tool_call(tool: &str, args: &serde_json::Value) -> (String, serde_json::Value) {
+    use serde_json::{Map, Value};
+
+    let canonical = canonical_vendor_tool(tool);
+    let Some(source) = args.as_object() else {
+        return (canonical.to_string(), args.clone());
+    };
+    let known = matches!(
+        canonical,
+        "shell"
+            | "read_file"
+            | "write_file"
+            | "edit_file"
+            | "apply_patch"
+            | "delete_file"
+            | "glob"
+            | "grep"
+            | "search"
+            | "web_fetch"
+            | "web_search"
+            | "view_image"
+            | "todo_write"
+            | "spawn_thread"
+    );
+    if !known {
+        return (canonical.to_string(), args.clone());
+    }
+
+    let mut out = Map::new();
+    let mut copy_first = |target: &str, aliases: &[&str]| {
+        if let Some(value) = aliases.iter().find_map(|name| source.get(*name)) {
+            out.insert(target.to_string(), value.clone());
+        }
+    };
+    match canonical {
+        "shell" => {
+            copy_first("command", &["command", "cmd", "commandLine"]);
+            copy_first("timeout_ms", &["timeout_ms", "timeoutMs"]);
+        }
+        "read_file" => {
+            copy_first(
+                "path",
+                &["path", "file_path", "filePath", "abs_path", "target_file"],
+            );
+            copy_first("offset", &["offset", "start_line", "startLine", "start"]);
+            copy_first("limit", &["limit"]);
+            copy_first("end_line", &["end_line", "endLine", "end"]);
+        }
+        "write_file" => {
+            copy_first(
+                "path",
+                &["path", "file_path", "filePath", "abs_path", "target_file"],
+            );
+            copy_first("content", &["content", "contents", "file_text", "fileText"]);
+        }
+        "edit_file" => {
+            copy_first(
+                "path",
+                &["path", "file_path", "filePath", "abs_path", "target_file"],
+            );
+            copy_first(
+                "old_string",
+                &["old_string", "oldText", "old_text", "old_str"],
+            );
+            copy_first(
+                "new_string",
+                &["new_string", "newText", "new_text", "new_str"],
+            );
+            copy_first("replace_all", &["replace_all", "replaceAll"]);
+            copy_first("edits", &["edits"]);
+        }
+        "apply_patch" => {
+            copy_first(
+                "path",
+                &["path", "file_path", "filePath", "abs_path", "target_file"],
+            );
+            copy_first(
+                "input",
+                &["input", "patch", "diff", "unified_diff", "unifiedDiff"],
+            );
+            copy_first("changes", &["changes"]);
+            copy_first("edits", &["edits"]);
+        }
+        "delete_file" | "view_image" => copy_first(
+            "path",
+            &["path", "file_path", "filePath", "abs_path", "target_file"],
+        ),
+        "glob" => {
+            copy_first("pattern", &["pattern", "glob", "query"]);
+            copy_first("path", &["path", "directory", "cwd"]);
+        }
+        "grep" => {
+            copy_first("pattern", &["pattern", "query", "regex"]);
+            copy_first("path", &["path", "directory", "cwd"]);
+        }
+        "search" => {
+            copy_first("query", &["query", "pattern"]);
+            copy_first("path", &["path", "directory", "cwd"]);
+        }
+        "web_fetch" => {
+            copy_first("url", &["url", "uri"]);
+            copy_first("prompt", &["prompt", "query"]);
+        }
+        "web_search" => copy_first("query", &["query", "searchQuery", "pattern"]),
+        "todo_write" => copy_first("todos", &["todos", "items", "plan"]),
+        "spawn_thread" => {
+            copy_first("prompt", &["prompt", "description", "task"]);
+            copy_first("model", &["model"]);
+        }
+        _ => {}
+    }
+    // ACP titles are useful when the native payload omits a structured
+    // command/query, and line hints are added by the engine after this step.
+    if let Some(title) = source.get("title") {
+        out.insert("title".into(), title.clone());
+    }
+    (
+        canonical.to_string(),
+        if out.is_empty() {
+            Value::Object(source.clone())
+        } else {
+            Value::Object(out)
+        },
+    )
+}
+
+/// Normalize the result fields clients render or audit while leaving the
+/// provider's model-facing result untouched. Unknown shapes remain lossless.
+fn normalize_vendor_tool_result(tool: &str, result: &serde_json::Value) -> serde_json::Value {
+    use serde_json::{Map, Value};
+
+    let canonical = canonical_vendor_tool(tool);
+    let value = result.get("rawOutput").unwrap_or(result);
+    let text_blocks = |value: &Value| -> Option<String> {
+        let blocks = value.as_array()?;
+        let texts: Option<Vec<&str>> = blocks
+            .iter()
+            .map(|block| {
+                (block.get("type").and_then(Value::as_str) == Some("text"))
+                    .then(|| block.get("text").and_then(Value::as_str))
+                    .flatten()
+            })
+            .collect();
+        texts
+            .filter(|texts| !texts.is_empty())
+            .map(|texts| texts.join("\n"))
+    };
+    let content = |value: &Value, keys: &[&str]| -> Option<String> {
+        value
+            .as_str()
+            .map(str::to_string)
+            .or_else(|| text_blocks(value))
+            .or_else(|| {
+                let object = value.as_object()?;
+                keys.iter().find_map(|key| {
+                    let candidate = object.get(*key)?;
+                    candidate
+                        .as_str()
+                        .map(str::to_string)
+                        .or_else(|| text_blocks(candidate))
+                })
+            })
+    };
+
+    match canonical {
+        "shell" => {
+            let stdout = content(
+                value,
+                &["stdout", "output", "aggregatedOutput", "text", "content"],
+            );
+            let stderr = value.as_object().and_then(|object| {
+                object
+                    .get("stderr")
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+            });
+            let exit_code = value.as_object().and_then(|object| {
+                ["exit_code", "exitCode"]
+                    .iter()
+                    .find_map(|key| object.get(*key).and_then(Value::as_i64))
+            });
+            if stdout.is_none() && stderr.is_none() && exit_code.is_none() {
+                return result.clone();
+            }
+            let mut out = Map::new();
+            if let Some(stdout) = stdout {
+                out.insert("stdout".into(), Value::String(stdout));
+            }
+            if let Some(stderr) = stderr {
+                out.insert("stderr".into(), Value::String(stderr));
+            }
+            if let Some(exit_code) = exit_code {
+                out.insert("exit_code".into(), Value::Number(exit_code.into()));
+            }
+            if value.get("truncated").and_then(Value::as_bool) == Some(true) {
+                out.insert("truncated".into(), Value::Bool(true));
+            }
+            Value::Object(out)
+        }
+        "read_file" | "web_fetch" | "web_search" => {
+            let Some(content) = content(value, &["content", "output", "text"]) else {
+                return result.clone();
+            };
+            let mut out = Map::from_iter([("content".into(), Value::String(content))]);
+            if value.get("truncated").and_then(Value::as_bool) == Some(true) {
+                out.insert("truncated".into(), Value::Bool(true));
+            }
+            Value::Object(out)
+        }
+        _ => result.clone(),
+    }
 }
 
 /// Remove the `_images` vision payload from a tool result, leaving a small

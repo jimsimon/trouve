@@ -232,9 +232,7 @@ impl AgentBackend for CodexBackend {
     }
 
     fn status(&self) -> BackendStatus {
-        let auth = dirs::home_dir()
-            .map(|h| h.join(".codex").join("auth.json").exists())
-            .unwrap_or(false);
+        let auth = codex_auth_path().is_some_and(|path| path.exists());
         BackendStatus {
             installed: binary_on_path(&self.command),
             has_credentials: auth,
@@ -301,7 +299,28 @@ impl AgentBackend for CodexBackend {
     }
 
     async fn start_login(&self) -> Result<BackendLogin, BackendError> {
-        spawn_codex_login(&self.command).await
+        let BackendLogin {
+            verification_url,
+            user_code,
+            callback_sender,
+            done,
+        } = spawn_codex_login(&self.command).await?;
+        let server = self.server.clone();
+        Ok(BackendLogin {
+            verification_url,
+            user_code,
+            callback_sender,
+            done: Box::pin(async move {
+                let result = done.await;
+                if result.is_ok() {
+                    // AppServer snapshots auth into an isolated CODEX_HOME.
+                    // Force the next request to create a fresh snapshot after
+                    // login rather than retaining a pre-login process.
+                    *server.lock().await = None;
+                }
+                result
+            }),
+        })
     }
 
     async fn run_turn(&self, turn: BackendTurn) -> Result<BackendEventStream, BackendError> {
@@ -372,6 +391,7 @@ impl AgentBackend for CodexBackend {
             "approvalPolicy": approval_policy,
             "sandbox": sandbox,
             "serviceName": "trouve",
+            "developerInstructions": turn.instructions,
         }));
         if !model_name.is_empty() {
             start_params["model"] = json!(model_name);
@@ -585,7 +605,15 @@ fn codex_config_override(turn: &crate::BackendTurn) -> Value {
     if let Some(bridge) = &turn.mcp_bridge {
         // Streamable-HTTP server (`url` instead of `command` selects the
         // transport in codex's mcp_servers config shape).
-        servers.insert("trouve".into(), json!({ "url": bridge.url }));
+        servers.insert(
+            "trouve".into(),
+            json!({
+                "url": bridge.url,
+                // ToolExecutor already classifies and gates every call. Do
+                // not wrap it in Codex's separate MCP approval heuristic.
+                "default_tools_approval_mode": "approve",
+            }),
+        );
     }
     let mut config = json!({ "show_raw_agent_reasoning": true });
     if !servers.is_empty() {
@@ -3523,6 +3551,8 @@ impl AppServer {
         let mut command_process = crate::process_env::tokio_command(command);
         command_process
             .arg("app-server")
+            .arg("--strict-config")
+            .env("CODEX_HOME", isolated_home.path())
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null());
@@ -3769,6 +3799,7 @@ impl AppServer {
             "initialize",
             json!({
                 "clientInfo": { "name": "trouve", "version": env!("CARGO_PKG_VERSION") },
+                "capabilities": { "experimentalApi": true },
             }),
         )
         .await?;
@@ -7482,9 +7513,7 @@ cat > /dev/null
             env: vec![("TOKEN".into(), "sekrit".into())],
         });
         turn.mcp_bridge = Some(crate::McpBridgeConfig {
-            url: "http://127.0.0.1:1/internal/threads/th_1/mcp?tools=0&approval=0".into(),
-            bridge_tools: false,
-            disallowed_tools: Vec::new(),
+            url: "http://127.0.0.1:1/internal/threads/th_1/mcp?approval=0".into(),
         });
         let config = codex_config_override(&turn);
         let servers = &config["mcp_servers"];
@@ -7492,8 +7521,9 @@ cat > /dev/null
         assert_eq!(servers["jira"]["env"]["TOKEN"], "sekrit");
         assert_eq!(
             servers["trouve"]["url"],
-            "http://127.0.0.1:1/internal/threads/th_1/mcp?tools=0&approval=0"
+            "http://127.0.0.1:1/internal/threads/th_1/mcp?approval=0"
         );
+        assert_eq!(servers["trouve"]["default_tools_approval_mode"], "approve");
         assert!(servers["trouve"]["command"].is_null());
 
         // User servers alone (no bridge) still produce an override.
@@ -7610,6 +7640,55 @@ for line in sys.stdin:
             "released thread was still treated as loaded"
         );
         server.terminate_transport().await.unwrap();
+    }
+
+    #[test]
+    fn optimized_config_disables_product_surface_but_keeps_native_tools() {
+        let mut turn = bare_turn();
+        turn.mcp_bridge = Some(crate::McpBridgeConfig {
+            url: "http://127.0.0.1:1/internal/threads/th_1/mcp?approval=0".into(),
+        });
+
+        let config = mcp_config_override(&turn).unwrap();
+        assert!(config["web_search"].is_null());
+        assert_eq!(
+            config["mcp_servers"]
+                .as_object()
+                .unwrap()
+                .keys()
+                .collect::<Vec<_>>(),
+            vec!["trouve"]
+        );
+        for feature in [
+            "apps",
+            "browser_use",
+            "browser_use_external",
+            "computer_use",
+            "current_time_reminder",
+            "goals",
+            "hooks",
+            "image_generation",
+            "memories",
+            "multi_agent",
+            "plugins",
+            "remote_plugin",
+            "skill_mcp_dependency_install",
+            "tool_suggest",
+            "workspace_dependencies",
+        ] {
+            assert_eq!(
+                config["features"][feature], false,
+                "feature {feature} escaped product-surface isolation"
+            );
+        }
+        assert!(config["features"]["shell_tool"].is_null());
+        assert!(config["features"]["shell_snapshot"].is_null());
+        assert_eq!(config["agents"]["enabled"], false);
+        assert_eq!(config["experimental_request_user_input_enabled"], false);
+        assert_eq!(
+            config["mcp_servers"]["trouve"]["default_tools_approval_mode"],
+            "approve"
+        );
     }
 
     #[test]

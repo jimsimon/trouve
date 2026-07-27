@@ -176,7 +176,6 @@ impl Default for ProviderConfig {
             query_params: Default::default(),
             oauth: None,
             command: None,
-            tool_bridge: None,
         }
     }
 }
@@ -186,6 +185,13 @@ fn default_kind() -> String {
 }
 
 impl Config {
+    /// Built-in skills are an enabled-by-default capability. Keeping the
+    /// stored value optional preserves the default for existing configs
+    /// without rewriting them merely because another setting changed.
+    pub fn builtin_skills_enabled(&self) -> bool {
+        self.builtin_skills_enabled.unwrap_or(true)
+    }
+
     pub fn load() -> Self {
         Self::load_from(&config_path())
     }
@@ -300,5 +306,26 @@ mod tests {
         assert_eq!(cfg.code_review_timeout_seconds, Some(1_200));
         assert_eq!(cfg.code_review_reviewer_timeout_seconds, Some(720));
         assert_eq!(cfg.code_review_coordinator_timeout_seconds, Some(360));
+    }
+
+    #[test]
+    fn builtin_skills_default_on_and_round_trip_when_disabled() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("config.toml");
+
+        let default = Config::default();
+        assert!(default.builtin_skills_enabled());
+
+        let mut disabled = default;
+        disabled.builtin_skills_enabled = Some(false);
+        disabled.save_to(&path).unwrap();
+
+        let loaded = Config::load_from(&path);
+        assert!(!loaded.builtin_skills_enabled());
+        assert!(
+            std::fs::read_to_string(path)
+                .unwrap()
+                .contains("builtin_skills_enabled = false")
+        );
     }
 }

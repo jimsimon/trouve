@@ -138,9 +138,9 @@ locating implementations, or understanding how something works.
   a search result already located.
 - Call `find_related` on the `trouve` server with a result's file_path and \
   line to find similar implementations, callers, or tests.
-- Plain grep is appropriate only for exhaustive literal matches (e.g. every \
-  occurrence of an exact string before a rename) after `search` has located \
-  the primary definition.";
+- For exhaustive literal matches (for example every occurrence before a \
+  rename), call the dedicated `grep` tool after `search` has located the \
+  primary definition; do not run grep through `shell`.";
 
 /// Full-bridge execution guidance. Vendor-native mutation tools are disabled
 /// (Claude) or confined to a read-only sandbox (Codex); the MCP bridge is the

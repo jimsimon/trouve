@@ -455,12 +455,15 @@ impl AgentBackend for CursorBackend {
             }
         };
 
-        let text = match (&turn.instructions, fresh_session) {
-            (Some(instr), true) => format!(
-                "<mode-instructions>\n{instr}\n</mode-instructions>\n\n{}",
+        // ACP has no system-instruction update primitive. Include Trouve's
+        // current rules on every prompt so resumed Cursor sessions cannot
+        // retain a stale mode, skill catalog, or AGENTS.md snapshot.
+        let text = match &turn.instructions {
+            Some(instr) => format!(
+                "<trouve-instructions>\n{instr}\n</trouve-instructions>\n\n{}",
                 turn.prompt
             ),
-            _ => turn.prompt.clone(),
+            None => turn.prompt.clone(),
         };
 
         // Mode + model config, then the prompt, under the config lock:
@@ -1238,7 +1241,12 @@ fn map_update(update: &Value) -> Vec<BackendEvent> {
                             let name = c["name"].as_str()?.to_string();
                             let description =
                                 c["description"].as_str().unwrap_or_default().to_string();
-                            Some(trouve_protocol::CommandInfo { name, description })
+                            Some(trouve_protocol::CommandInfo {
+                                usage: format!("/{name}"),
+                                name,
+                                description,
+                                kind: trouve_protocol::CommandKind::Prompt,
+                            })
                         })
                         .collect()
                 })
@@ -1826,7 +1834,12 @@ impl AcpServer {
                 }),
             )
             .await?;
-        let _ = result;
+        self.mcp_http.store(
+            result["agentCapabilities"]["mcpCapabilities"]["http"]
+                .as_bool()
+                .unwrap_or(false),
+            Ordering::Relaxed,
+        );
         Ok(())
     }
 
@@ -1836,6 +1849,8 @@ impl AcpServer {
         mcp_servers: &[crate::McpServerLaunch],
         cancel: &tokio_util::sync::CancellationToken,
     ) -> Result<String, BackendError> {
+        let mcp_servers =
+            acp_mcp_servers(mcp_servers, bridge, self.mcp_http.load(Ordering::Relaxed))?;
         let result = self
             .request_cancellable(
                 "session/new",
@@ -1874,7 +1889,7 @@ impl AcpServer {
             json!({
                 "sessionId": session_id,
                 "cwd": worktree,
-                "mcpServers": acp_mcp_servers(mcp_servers),
+                "mcpServers": mcp_servers,
             }),
             cancel,
         )
@@ -2088,23 +2103,40 @@ fn auth_hint(e: BackendError) -> BackendError {
 
 /// User MCP servers in ACP `mcpServers` shape: stdio transport with env as
 /// an array of name/value pairs.
-fn acp_mcp_servers(servers: &[crate::McpServerLaunch]) -> Value {
-    Value::Array(
-        servers
-            .iter()
-            .map(|s| {
-                json!({
-                    "name": s.name,
-                    "command": s.command,
-                    "args": s.args,
-                    "env": s.env
-                        .iter()
-                        .map(|(name, value)| json!({ "name": name, "value": value }))
-                        .collect::<Vec<_>>(),
-                })
+fn acp_mcp_servers(
+    servers: &[crate::McpServerLaunch],
+    bridge: Option<&crate::McpBridgeConfig>,
+    supports_http: bool,
+) -> Result<Value, BackendError> {
+    let mut values: Vec<Value> = servers
+        .iter()
+        .map(|s| {
+            json!({
+                "name": s.name,
+                "command": s.command,
+                "args": s.args,
+                "env": s.env
+                    .iter()
+                    .map(|(name, value)| json!({ "name": name, "value": value }))
+                    .collect::<Vec<_>>(),
             })
-            .collect(),
-    )
+        })
+        .collect();
+    if let Some(bridge) = bridge {
+        if !supports_http {
+            return Err(BackendError::Protocol(
+                "cursor-agent did not advertise ACP HTTP MCP support; refusing to drop Trouve's tool bridge"
+                    .into(),
+            ));
+        }
+        values.push(json!({
+            "type": "http",
+            "name": "trouve",
+            "url": bridge.url,
+            "headers": [],
+        }));
+    }
+    Ok(Value::Array(values))
 }
 
 #[cfg(test)]
@@ -2236,7 +2268,7 @@ mod tests {
             args: vec!["--stdio".into()],
             env: vec![("TOKEN".into(), "sekrit".into())],
         }];
-        let value = acp_mcp_servers(&servers);
+        let value = acp_mcp_servers(&servers, None, false).unwrap();
         assert_eq!(
             value,
             json!([{
@@ -2246,7 +2278,21 @@ mod tests {
                 "env": [{ "name": "TOKEN", "value": "sekrit" }],
             }])
         );
-        assert_eq!(acp_mcp_servers(&[]), json!([]));
+        assert_eq!(acp_mcp_servers(&[], None, false).unwrap(), json!([]));
+
+        let bridge = crate::McpBridgeConfig {
+            url: "http://127.0.0.1:7433/internal/threads/th_1/mcp?approval=0".into(),
+        };
+        assert_eq!(
+            acp_mcp_servers(&[], Some(&bridge), true).unwrap(),
+            json!([{
+                "type": "http",
+                "name": "trouve",
+                "url": bridge.url,
+                "headers": [],
+            }])
+        );
+        assert!(acp_mcp_servers(&[], Some(&bridge), false).is_err());
     }
 
     #[test]

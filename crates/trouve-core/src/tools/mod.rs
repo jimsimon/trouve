@@ -1,9 +1,13 @@
 //! Tools and the `ToolExecutor` chokepoint (invariant 3).
 //!
-//! The agent loop never performs side effects itself: it gates each call
-//! through the permission layer and hands execution to a `ToolExecutor`.
+//! Trouve's native agent loop never performs side effects itself: it gates
+//! each call through the permission layer and hands execution to a
+//! `ToolExecutor`. Supplemental capabilities mounted into subscription CLIs
+//! return through this same boundary. Certified vendor-native core tools are
+//! the deliberate exception recorded by ADR 0019; their adapters normalize
+//! lifecycle and approval events without re-executing the operation here.
 //! Local mode uses [`LocalToolExecutor`]; cloud isolation later swaps in a
-//! container-backed implementation without touching the loop.
+//! container-backed implementation without touching the native loop.
 
 mod diff;
 mod edit_strategy;
@@ -14,6 +18,7 @@ mod hashline;
 mod patch;
 mod search;
 mod shell;
+mod skill;
 mod todo;
 mod web;
 

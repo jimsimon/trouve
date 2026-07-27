@@ -1,14 +1,15 @@
 //! Agent skills: reusable instruction files discovered from the workspace
 //! and the user's config dir.
 //!
-//! A skill is a directory containing `SKILL.md` with optional YAML-ish
-//! front matter (`name:`, `description:`). Skills are advertised in the
-//! system prompt with their path; the agent reads the file with its normal
-//! tools when a skill is relevant, so skill content never bloats the prompt.
+//! A skill is a `SKILL.md` with optional YAML-ish front matter. Skills are advertised in the
+//! system prompt by stable name; the agent loads content through Trouve's
+//! `load_skill` tool when relevant, so skill content never bloats the prompt
+//! and host paths never become part of the model-facing contract.
 //!
 //! Discovery locations (later wins on name collision, workspace > global):
-//!   1. `<config>/skills/*/SKILL.md`
-//!   2. `<workspace>/.agents/skills/*/SKILL.md`
+//!   1. Trouve's compiled-in provider-neutral skills
+//!   2. `<config>/skills/*/SKILL.md`
+//!   3. `<workspace>/.agents/skills/*/SKILL.md`
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -22,75 +23,185 @@ pub struct Skill {
     /// Directory name unless front matter overrides it.
     pub name: String,
     pub description: String,
-    /// Absolute path to the SKILL.md file.
-    pub path: PathBuf,
+    /// Whether the model may discover and load the skill implicitly.
+    pub disable_model_invocation: bool,
+    /// Whether the skill is shown as a slash command and may be explicitly
+    /// invoked by a user.
+    pub user_invocable: bool,
+    /// Optional syntax shown after the command name.
+    pub argument_hint: String,
+    /// `builtin`, `user`, or `workspace`.
+    pub origin: &'static str,
+    source: SkillSource,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SkillSource {
+    BuiltIn(&'static str),
+    File(PathBuf),
+}
+
+#[derive(Debug, Default)]
+struct FrontMatter {
+    name: Option<String>,
+    description: Option<String>,
+    disable_model_invocation: bool,
+    user_invocable: Option<bool>,
+    argument_hint: Option<String>,
 }
 
 /// Parse `key: value` front matter between `---` fences at the top of a
-/// SKILL.md. Returns (name, description) if present.
-fn parse_front_matter(text: &str) -> (Option<String>, Option<String>) {
+/// SKILL.md.
+fn parse_front_matter(text: &str) -> FrontMatter {
     let mut lines = text.lines();
     if lines.next().map(str::trim) != Some("---") {
-        return (None, None);
+        return FrontMatter::default();
     }
-    let mut name = None;
-    let mut description = None;
+    let mut front = FrontMatter::default();
     for line in lines {
         let trimmed = line.trim();
         if trimmed == "---" {
             break;
         }
         if let Some((key, value)) = trimmed.split_once(':') {
-            let value = value.trim().trim_matches('"').to_string();
+            let value = value.trim().trim_matches(['"', '\'']).to_string();
             match key.trim() {
-                "name" => name = Some(value),
-                "description" => description = Some(value),
+                "name" => front.name = Some(value),
+                "description" => front.description = Some(value),
+                "disable-model-invocation" => {
+                    front.disable_model_invocation = value.eq_ignore_ascii_case("true")
+                }
+                "user-invocable" => {
+                    front.user_invocable = if value.eq_ignore_ascii_case("true") {
+                        Some(true)
+                    } else if value.eq_ignore_ascii_case("false") {
+                        Some(false)
+                    } else {
+                        None
+                    }
+                }
+                "argument-hint" => front.argument_hint = Some(value),
                 _ => {}
             }
         }
     }
-    (name, description)
+    front
 }
 
-fn load_dir(dir: &Path, out: &mut BTreeMap<String, Skill>) {
+fn skill_from_text(
+    directory: &str,
+    text: &str,
+    origin: &'static str,
+    source: SkillSource,
+) -> Option<Skill> {
+    let front = parse_front_matter(text);
+    let name = front.name.unwrap_or_else(|| directory.to_string());
+    if !valid_skill_name(&name) {
+        return None;
+    }
+    let description = front
+        .description
+        .unwrap_or_else(|| fallback_description(text));
+    Some(Skill {
+        name,
+        description: description
+            .chars()
+            .take(MAX_SKILL_DESCRIPTION_CHARS)
+            .collect(),
+        disable_model_invocation: front.disable_model_invocation,
+        user_invocable: front.user_invocable.unwrap_or(true),
+        argument_hint: front.argument_hint.unwrap_or_default(),
+        origin,
+        source,
+    })
+}
+
+fn fallback_description(text: &str) -> String {
+    let mut lines = text.lines();
+    let front_matter = lines.next().is_some_and(|line| line.trim() == "---");
+    let body: Vec<_> = if front_matter {
+        lines
+            .skip_while(|line| line.trim() != "---")
+            .skip(1)
+            .collect()
+    } else {
+        text.lines().collect()
+    };
+    body.into_iter()
+        .map(str::trim)
+        .find(|line| !line.is_empty() && !line.starts_with('#'))
+        .unwrap_or("")
+        .to_string()
+}
+
+fn load_dir(dir: &Path, origin: &'static str, out: &mut BTreeMap<String, Skill>) {
+    let Ok(canonical_dir) = dir.canonicalize() else {
+        return;
+    };
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
     };
     for entry in entries.flatten() {
         let skill_md = entry.path().join("SKILL.md");
-        let Ok(text) = std::fs::read_to_string(&skill_md) else {
+        // Repositories can contain symlinks. A skill is allowed to read only
+        // a SKILL.md physically contained by its declared skill root.
+        let Ok(canonical_skill) = skill_md.canonicalize() else {
             continue;
         };
-        let dir_name = entry.file_name().to_string_lossy().to_string();
-        let (name, description) = parse_front_matter(&text);
-        let name = name.unwrap_or(dir_name);
-        let description = description.unwrap_or_else(|| {
-            // Fall back to the first non-heading, non-empty line.
-            text.lines()
-                .map(str::trim)
-                .find(|l| !l.is_empty() && !l.starts_with('#') && *l != "---")
-                .unwrap_or("")
-                .to_string()
-        });
-        out.insert(
-            name.clone(),
-            Skill {
-                name,
-                description,
-                path: skill_md,
-            },
-        );
+        if !canonical_skill.starts_with(&canonical_dir) {
+            continue;
+        }
+        if std::fs::metadata(&canonical_skill).is_ok_and(|m| m.len() > MAX_SKILL_BYTES) {
+            continue;
+        }
+        let Ok(text) = std::fs::read_to_string(&canonical_skill) else {
+            continue;
+        };
+        if text.len() as u64 > MAX_SKILL_BYTES {
+            continue;
+        }
+        let directory = entry.file_name().to_string_lossy().to_string();
+        if let Some(skill) = skill_from_text(
+            &directory,
+            &text,
+            origin,
+            SkillSource::File(canonical_skill),
+        ) {
+            out.insert(skill.name.clone(), skill);
+        }
     }
 }
 
-/// Discover all skills visible to a thread.
-pub fn discover(config_dir: Option<&Path>, workspace_root: Option<&Path>) -> Vec<Skill> {
+/// Discover all skills visible to a thread. The built-in layer can be
+/// disabled independently; user and workspace layers still resolve with
+/// their normal precedence.
+pub fn discover(
+    config_dir: Option<&Path>,
+    workspace_root: Option<&Path>,
+    include_builtins: bool,
+) -> Vec<Skill> {
     let mut skills = BTreeMap::new();
+    if include_builtins {
+        for builtin in BUILTIN_SKILLS {
+            if let Some(skill) = skill_from_text(
+                builtin.directory,
+                builtin.text,
+                "builtin",
+                SkillSource::BuiltIn(builtin.text),
+            ) {
+                skills.insert(skill.name.clone(), skill);
+            }
+        }
+    }
     if let Some(dir) = config_dir {
-        load_dir(&dir.join("skills"), &mut skills);
+        load_dir(&dir.join("skills"), "user", &mut skills);
     }
     if let Some(root) = workspace_root {
-        load_dir(&root.join(".agents").join("skills"), &mut skills);
+        load_dir(
+            &root.join(".agents").join("skills"),
+            "workspace",
+            &mut skills,
+        );
     }
     skills.into_values().collect()
 }
@@ -159,20 +270,19 @@ pub fn trusted_read_roots(
 /// Render the "available skills" section of the system prompt, or None when
 /// there are no skills.
 pub fn prompt_section(skills: &[Skill]) -> Option<String> {
-    if skills.is_empty() {
+    let advertised: Vec<_> = skills
+        .iter()
+        .filter(|skill| !skill.disable_model_invocation)
+        .collect();
+    if advertised.is_empty() {
         return None;
     }
     let mut section = String::from(
-        "## Available skills\n\nWhen a task matches a skill below, read its SKILL.md with the \
-         read_file tool and follow it before proceeding.\n",
+        "## Available skills\n\nWhen a task matches a skill below, call `load_skill` with its \
+         name and follow the returned instructions before proceeding.\n",
     );
-    for skill in skills {
-        section.push_str(&format!(
-            "\n- **{}** — {} ({})",
-            skill.name,
-            skill.description,
-            skill.path.display()
-        ));
+    for skill in advertised {
+        section.push_str(&format!("\n- **{}** — {}", skill.name, skill.description));
     }
     Some(section)
 }
@@ -208,11 +318,16 @@ mod tests {
             "# Review\n\nHow to review PRs here.",
         );
 
-        let skills = discover(Some(&cfg), Some(&repo));
-        assert_eq!(skills.len(), 2);
+        let skills = discover(Some(&cfg), Some(&repo), true);
+        assert_eq!(skills.len(), BUILTIN_SKILLS.len() + 2);
         let deploy = skills.iter().find(|s| s.name == "deploy").unwrap();
         assert_eq!(deploy.description, "Repo deploy skill");
-        assert!(deploy.path.starts_with(repo.join(".agents")));
+        assert_eq!(deploy.origin, "workspace");
+        let workspace_skill_root = repo.join(".agents").canonicalize().unwrap();
+        assert!(matches!(
+            &deploy.source,
+            SkillSource::File(path) if path.starts_with(&workspace_skill_root)
+        ));
         let review = skills.iter().find(|s| s.name == "review").unwrap();
         assert_eq!(review.description, "How to review PRs here.");
     }
@@ -222,11 +337,16 @@ mod tests {
         let skills = vec![Skill {
             name: "write-adr".into(),
             description: "Write an ADR".into(),
-            path: "/x/SKILL.md".into(),
+            disable_model_invocation: false,
+            user_invocable: true,
+            argument_hint: String::new(),
+            origin: "workspace",
+            source: SkillSource::File("/x/SKILL.md".into()),
         }];
         let section = prompt_section(&skills).unwrap();
         assert!(section.contains("write-adr"));
-        assert!(section.contains("/x/SKILL.md"));
+        assert!(section.contains("load_skill"));
+        assert!(!section.contains("/x/SKILL.md"));
         assert!(prompt_section(&[]).is_none());
     }
 

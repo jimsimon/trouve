@@ -673,6 +673,42 @@ pub struct TurnAccepted {
     pub queued_prompt: Option<QueuedPrompt>,
 }
 
+// --- slash commands -------------------------------------------------------
+
+/// Execute one deterministic Trouve slash command. Prompt commands from the
+/// catalog continue to use `SendMessageRequest` so they start a model turn.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct ExecuteCommandRequest {
+    /// Catalog name without the leading slash.
+    pub name: String,
+    /// Everything following the command name, without leading whitespace.
+    #[serde(default)]
+    pub arguments: String,
+}
+
+/// Result of a deterministic slash command.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct CommandResult {
+    pub name: String,
+    pub output: String,
+    /// Optional client navigation requested by the command.
+    #[serde(default)]
+    pub action: CommandAction,
+}
+
+/// Client-side action that follows a completed command. Persistent state is
+/// still reported through the event log; these are navigation hints only.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum CommandAction {
+    #[default]
+    None,
+    /// Select a newly created thread.
+    SwitchThread { thread_id: ThreadId },
+    /// Reveal and attach the current session's integrated terminal.
+    OpenTerminal,
+}
+
 // --- queued prompts --------------------------------------------------------
 
 /// A prompt waiting its turn. Queued prompts persist on disk and run in
@@ -2716,6 +2752,20 @@ pub struct ProviderConfigField {
     pub secret: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub default_value: Option<String>,
+}
+
+/// Global skill settings. Built-in skills are enabled by default; user and
+/// workspace skills are independent of this switch.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct SkillsSettings {
+    #[serde(default = "default_true")]
+    pub builtin_skills_enabled: bool,
+}
+
+/// Update the global skill settings persisted in `config.toml`.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct SetSkillsSettingsRequest {
+    pub builtin_skills_enabled: bool,
 }
 
 /// A well-known provider preset: clients offer these for one-click setup

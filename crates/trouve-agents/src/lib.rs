@@ -3,11 +3,13 @@
 //! trouve's session worktrees.
 //!
 //! Unlike a `trouve_providers::Provider` (raw model inference inside
-//! trouve's own agent loop), an [`AgentBackend`] owns the whole turn: the
-//! vendor harness plans, calls its own tools, and edits files. Trouve
-//! translates its event stream into the trouve protocol and bridges its
-//! approval requests through the engine's permission layer. Subscription
-//! auth stays inside the vendor binary — we never touch vendor OAuth tokens.
+//! trouve's own agent loop), an [`AgentBackend`] owns the vendor-side turn,
+//! conversation state, and optimized native execution tools. Trouve still
+//! owns the user-facing control plane: native tool events are normalized,
+//! permissions route through Trouve, and Trouve-only capabilities are mounted
+//! through a thread-scoped MCP bridge. Subscription auth stays inside the
+//! vendor binary — Trouve only stages the minimum credential file an isolated
+//! process needs.
 
 pub mod claude;
 pub mod codex;
@@ -72,11 +74,13 @@ pub struct BackendTurn {
     /// rejects reported tool use; adapters also disable vendor built-ins
     /// where their protocol supports it.
     pub tool_free: bool,
-    /// When set, the vendor agent runs with its built-in tools disabled and
-    /// trouve's ToolExecutor bridged in over MCP (Claude Code only, v1).
+    /// Thread-scoped Trouve MCP surface for capabilities the vendor harness
+    /// does not own (semantic search, skills, interactions, todos, subagents,
+    /// and user MCP).
     pub mcp_bridge: Option<McpBridgeConfig>,
-    /// User-configured MCP servers (user/workspace/worktree scopes, already
-    /// merged and env-expanded by the engine) to mount alongside the bridge.
+    /// Direct vendor MCP mounts are adapter-only escape hatches. Normal engine
+    /// turns leave this empty because user MCP is resolved and executed by
+    /// Trouve's `ToolExecutor` through the bridge.
     pub mcp_servers: Vec<McpServerLaunch>,
 }
 
@@ -135,8 +139,8 @@ pub struct McpServerLaunch {
 /// mutation-capable tool so the engine can enforce worktree serialization.
 #[derive(Debug, Clone)]
 pub struct McpBridgeConfig {
-    /// Full endpoint URL, thread-scoped, with the tool/approval surface
-    /// selected via query parameters.
+    /// Full endpoint URL, thread-scoped, with the approval surface selected
+    /// via query parameters.
     pub url: String,
     /// When true the bridge serves trouve's ToolExecutor tools and vendor
     /// mutations are disabled or sandbox-confined; when false it only serves

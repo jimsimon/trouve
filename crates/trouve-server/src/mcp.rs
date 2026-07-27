@@ -1,5 +1,5 @@
-//! Streamable-HTTP MCP endpoint bridging external vendor agents (Claude
-//! Code, Codex) back into trouve — the successor to the old spawned
+//! Streamable-HTTP MCP endpoint bridging external vendor agents (Claude,
+//! Codex, and Cursor) back into trouve — the successor to the old spawned
 //! `mcp-bridge` subprocess.
 //!
 //! The engine points vendor agents at
@@ -26,11 +26,19 @@ use trouve_core::Engine;
 
 const MCP_PROTOCOL_VERSION: &str = "2025-03-26";
 
-/// Tools served even without full tool bridging: the vendor agent keeps its
-/// own built-ins, but trouve's native semantic search and the interactive
-/// question tool (harness features the vendor has no equivalent of) are
-/// always offered.
-const ALWAYS_BRIDGED: &[&str] = &["search", "find_related", "ask_question"];
+/// Trouve-owned capabilities that supplement the vendor's optimized core
+/// tools. User MCP tools are included dynamically by their `mcp__` prefix.
+const SUPPLEMENTAL_TOOLS: &[&str] = &[
+    "search",
+    "find_related",
+    "ask_question",
+    "load_skill",
+    "todo_write",
+    "search_transcript",
+    "spawn_thread",
+    "spawn_session",
+    "spawn_output",
+];
 
 #[derive(serde::Deserialize)]
 pub(crate) struct McpQuery {
@@ -50,6 +58,14 @@ fn tool_call_is_available(name: &str, bridge_tools: bool, serve_approval: bool) 
         serve_approval
     } else {
         bridge_tools || ALWAYS_BRIDGED.contains(&name)
+    }
+}
+
+fn tool_available_for_bridge(name: &str, serve_approval: bool) -> bool {
+    if name == "approval_prompt" {
+        serve_approval
+    } else {
+        SUPPLEMENTAL_TOOLS.contains(&name) || name.starts_with("mcp__")
     }
 }
 
@@ -151,7 +167,6 @@ pub(crate) async fn mcp_endpoint(
 async fn tools_list(
     engine: &Engine,
     thread_id: &str,
-    bridge_tools: bool,
     serve_approval: bool,
 ) -> Result<Value, String> {
     // The approval gate is served for Claude (its permission-prompt tool is
@@ -226,6 +241,9 @@ async fn tools_call(
     correlate_codex_owner: bool,
 ) -> Result<Value, String> {
     let name = params["name"].as_str().unwrap_or_default();
+    if !tool_available_for_bridge(name, false) {
+        return Err(format!("tool {name:?} is disabled for this bridge"));
+    }
     let arguments = params.get("arguments").cloned().unwrap_or(json!({}));
     let result = if correlate_codex_owner {
         let (vendor_thread_id, vendor_call_id) = codex_tool_call_metadata(params)?;
