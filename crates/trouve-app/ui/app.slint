@@ -559,6 +559,7 @@ global Tip {
     in-out property <string> text;
     in-out property <length> tip-x;
     in-out property <length> tip-y;
+    in-out property <bool> above;
     in-out property <bool> armed;
     in-out property <bool> shown;
     in-out property <int> seq: 0;
@@ -566,6 +567,16 @@ global Tip {
         self.text = t;
         self.tip-x = x;
         self.tip-y = y;
+        self.above = false;
+        self.armed = true;
+        self.seq += 1;
+        return self.seq;
+    }
+    public function show-above(x: length, y: length, t: string) -> int {
+        self.text = t;
+        self.tip-x = x;
+        self.tip-y = y;
+        self.above = true;
         self.armed = true;
         self.seq += 1;
         return self.seq;
@@ -589,6 +600,7 @@ component IconButton inherits Rectangle {
     in property <image> icon-image;
     in property <bool> use-icon-image: false;
     in property <string> tip;
+    in property <bool> tip-above: false;
     in property <string> accessibility-label;
     in property <bool> enabled: true;
     in property <length> icon-size: Theme.fs(12px);
@@ -617,8 +629,11 @@ component IconButton inherits Rectangle {
     property <int> tip-token: -1;
     function tip-changed(on: bool) {
         if (on) {
-            root.tip-token = Tip.show(root.absolute-position.x,
-                root.absolute-position.y + root.height + 4px, root.tip);
+            root.tip-token = root.tip-above
+                ? Tip.show-above(root.absolute-position.x + root.width,
+                    root.absolute-position.y - 6px, root.tip)
+                : Tip.show(root.absolute-position.x,
+                    root.absolute-position.y + root.height + 4px, root.tip);
         } else {
             Tip.unshow(root.tip-token);
         }
@@ -4347,6 +4362,7 @@ export component AppWindow inherits Window {
                                     IconButton {
                                         icon: "✕";
                                         tip: "Remove attachment";
+                                        tip-above: true;
                                         y: (parent.height - self.height) / 2;
                                         clicked => { root.attachment-removed(i); }
                                     }
@@ -4506,6 +4522,7 @@ export component AppWindow inherits Window {
                                 hover-icon-color: Theme.c.err-soft;
                                 hover-bg: Theme.c.err-bg;
                                 tip: "YOLO: changes run without approval";
+                                tip-above: true;
                                 accessibility-label: "Warning: YOLO changes run without approval";
                             }
                         }
@@ -4555,6 +4572,7 @@ export component AppWindow inherits Window {
                         IconButton {
                             icon: "📎";
                             tip: "Attach files (or paste an image with Ctrl+V)";
+                            tip-above: true;
                             icon-size: Theme.fs(14px);
                             width: Theme.fs(30px);
                             height: Theme.fs(30px);
@@ -4572,6 +4590,27 @@ export component AppWindow inherits Window {
                     dial := Rectangle {
                         width: 30px;
                         height: 30px;
+                        property <int> tip-token: -1;
+                        property <string> tip-text: root.context-compacting
+                            ? "compacting context…\n" + root.context-tooltip
+                            : root.context-tooltip;
+                        function tip-changed(on: bool) {
+                            if (dial.tip-token >= 0) {
+                                Tip.unshow(dial.tip-token);
+                                dial.tip-token = -1;
+                            }
+                            if (on) {
+                                dial.tip-token = Tip.show-above(
+                                    dial.absolute-position.x + dial.width,
+                                    dial.absolute-position.y - 6px,
+                                    dial.tip-text);
+                            }
+                        }
+                        changed tip-text => {
+                            if (dial-ta.has-hover) {
+                                dial.tip-changed(true);
+                            }
+                        }
                         if !root.context-unavailable && root.context-compacting && !Theme.reduce-motion: ActivitySpinner {
                             width: 26px;
                             height: 26px;
@@ -4613,27 +4652,8 @@ export component AppWindow inherits Window {
                                 vertical-alignment: center;
                             }
                         }
-                        dial-ta := TouchArea { }
-                        if dial-ta.has-hover: Rectangle {
-                            x: dial.width - self.width;
-                            y: -self.height - 6px;
-                            width: min(tooltip-text.preferred-width + 16px, 340px);
-                            height: tooltip-text.preferred-height + 12px;
-                            background: Theme.c.popup-bg;
-                            border-radius: 6px;
-                            border-width: 1px;
-                            border-color: Theme.c.border;
-                            tooltip-text := Text {
-                                x: 8px;
-                                y: 6px;
-                                width: parent.width - 16px;
-                                text: root.context-compacting
-                                    ? "compacting context…\n" + root.context-tooltip
-                                    : root.context-tooltip;
-                                color: Theme.c.text;
-                                font-size: Theme.fs(11px);
-                                wrap: word-wrap;
-                            }
+                        dial-ta := TouchArea {
+                            changed has-hover => { dial.tip-changed(self.has-hover); }
                         }
                     }
                     }
@@ -5926,8 +5946,10 @@ export component AppWindow inherits Window {
         triggered => { Tip.shown = true; }
     }
     if Tip.shown && Tip.text != "": Rectangle {
-        x: clamp(Tip.tip-x, 4px, root.width - self.width - 4px);
-        y: clamp(Tip.tip-y, 4px, root.height - self.height - 4px);
+        x: clamp(Tip.above ? Tip.tip-x - self.width : Tip.tip-x,
+            4px, root.width - self.width - 4px);
+        y: clamp(Tip.above ? Tip.tip-y - self.height : Tip.tip-y,
+            4px, root.height - self.height - 4px);
         width: tip-label.preferred-width + 12px;
         height: tip-label.preferred-height + 8px;
         background: Theme.c.hover-bg;
