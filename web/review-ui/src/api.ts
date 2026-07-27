@@ -12,6 +12,7 @@ import type {
   ReviewJob,
   ReviewScope,
   ReviewStats,
+  ReviewTask,
   ReviewerProfile,
   StatsRange,
 } from "./types";
@@ -35,7 +36,11 @@ export async function api<T>(path: string, init: RequestInit = {}): Promise<T> {
 
 export const getDashboard = (): Promise<Dashboard> => api("/code-review");
 export const getJob = (id: string): Promise<JobDetail> =>
-  api(`/code-review/jobs/${encodeURIComponent(id)}`);
+  api(`/code-review/jobs/${encodeURIComponent(id)}?include_task_content=false`);
+export const getTask = (jobId: string, taskId: string): Promise<ReviewTask> =>
+  api(
+    `/code-review/jobs/${encodeURIComponent(jobId)}/tasks/${encodeURIComponent(taskId)}`,
+  );
 export const getJobs = (
   status: string,
   repository: string,
@@ -183,10 +188,11 @@ export function openServerEvents(onReviewUpdate: () => void): () => void {
 
 export function openJobEvents(
   jobId: string,
+  after: number,
   onEvent: (event: EventEnvelope) => void,
 ): () => void {
   const source = new EventSource(
-    `/v1/code-review/jobs/${encodeURIComponent(jobId)}/events`,
+    `/v1/code-review/jobs/${encodeURIComponent(jobId)}/events?after=${encodeURIComponent(after)}`,
   );
   source.onmessage = (message) => {
     try {

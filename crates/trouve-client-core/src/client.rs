@@ -785,6 +785,22 @@ impl ProtocolClient {
         self.get_json(&format!("/code-review/jobs/{id}")).await
     }
 
+    pub async fn code_review_job_overview(&self, id: &str) -> Result<CodeReviewJobDetail> {
+        self.get_json(&format!(
+            "/code-review/jobs/{id}?include_task_content=false"
+        ))
+        .await
+    }
+
+    pub async fn code_review_task(
+        &self,
+        job_id: &str,
+        task_id: &str,
+    ) -> Result<trouve_protocol::CodeReviewTask> {
+        self.get_json(&format!("/code-review/jobs/{job_id}/tasks/{task_id}"))
+            .await
+    }
+
     pub async fn code_review_jobs(
         &self,
         limit: usize,

@@ -1225,6 +1225,25 @@ impl Engine {
             .ok_or_else(|| EngineError::NotFound(format!("review job {id}")))
     }
 
+    pub fn code_review_job_overview(
+        &self,
+        id: &str,
+    ) -> Result<trouve_protocol::CodeReviewJobDetail, EngineError> {
+        self.store
+            .code_review_job_overview(id)?
+            .ok_or_else(|| EngineError::NotFound(format!("review job {id}")))
+    }
+
+    pub fn code_review_task(
+        &self,
+        job_id: &str,
+        task_id: &str,
+    ) -> Result<trouve_protocol::CodeReviewTask, EngineError> {
+        self.store
+            .code_review_task(job_id, task_id)?
+            .ok_or_else(|| EngineError::NotFound(format!("review task {task_id}")))
+    }
+
     pub fn code_review_jobs(
         &self,
         limit: usize,

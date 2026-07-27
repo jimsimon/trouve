@@ -7,7 +7,7 @@
       "name": "MIT",
       "identifier": "MIT"
     },
-    "version": "1.10"
+    "version": "1.11"
   },
   "paths": {
     "/v1/approvals": {
@@ -582,6 +582,15 @@
             "schema": {
               "type": "string"
             }
+          },
+          {
+            "name": "include_task_content",
+            "in": "query",
+            "description": "Include retained task prompts and output; defaults to true",
+            "required": false,
+            "schema": {
+              "type": "boolean"
+            }
           }
         ],
         "responses": {
@@ -722,6 +731,54 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/code-review/jobs/{job_id}/tasks/{task_id}": {
+      "get": {
+        "tags": [],
+        "operationId": "get_code_review_task",
+        "parameters": [
+          {
+            "name": "job_id",
+            "in": "path",
+            "description": "Review job id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "task_id",
+            "in": "path",
+            "description": "Review task id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CodeReviewTask"
                 }
               }
             }
@@ -4434,6 +4491,12 @@
             "items": {
               "$ref": "#/components/schemas/CodeReviewCandidateRejection"
             }
+          },
+          "event_cursor": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Latest persisted job event included by or predating this snapshot.\nClients can resume the job event stream after this cursor instead of\nreplaying the complete retained output history.",
+            "minimum": 0
           },
           "findings": {
             "type": "array",
