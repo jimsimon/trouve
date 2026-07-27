@@ -23,20 +23,20 @@ use trouve_core::engine::EngineError;
 use trouve_protocol::{
     AddLocalModelRequest, AgentMode, Automation, BranchList, CliInfo, CliInstallStatus, CliList,
     CodeReviewDashboard, CodeReviewJob, CodeReviewJobDetail, CodeReviewJobList,
-    CodeReviewRepository, CodeReviewStats, CodeReviewStatsRange, CompleteLoginRequest,
-    ConfigureGithubAppRequest, CreatePrRequest, CreateSessionRequest, CreateThreadRequest,
-    DirEntry, ErrorBody, FileContent, GithubAppStatus, GithubIntegration, GithubPrList,
-    KnownProvider, LocalSearchResult, LocalStatus, LoginStarted, LoginStatus, McpLogs,
-    McpServerInfo, MergePrRequest, ModeInfo, ModelInfo, OpenTerminalRequest, PROTOCOL_VERSION,
-    PrInfo, ProviderInfo, ProvidersResponse, QueuedPrompt, RegisterWorkspaceRequest,
-    ReorderQueueRequest, RequestCodeReviewRequest, ResolveApprovalRequest, ResolveQuestionRequest,
-    ReviewerProfile, Scope, SendMessageRequest, ServerInfo, Session, SessionDiff,
-    SetDefaultModelRequest, SetDefaultPermissionModeRequest, SetLocalEnabledRequest,
-    SubscriptionHealth, TerminalInfo, TerminalInputRequest, TerminalResizeRequest, Thread,
-    TurnAccepted, UpdateCodeReviewRepositoryRequest, UpdateQueuedPromptRequest,
-    UpdateSessionRequest, UpdateThreadRequest, UpsertAutomationRequest, UpsertMcpServerRequest,
-    UpsertModeRequest, UpsertProviderRequest, UpsertReviewerProfileRequest, UsageSummary,
-    Workspace,
+    CodeReviewRepository, CodeReviewStats, CodeReviewStatsRange, CodeReviewTask,
+    CompleteLoginRequest, ConfigureGithubAppRequest, CreatePrRequest, CreateSessionRequest,
+    CreateThreadRequest, DirEntry, ErrorBody, FileContent, GithubAppStatus, GithubIntegration,
+    GithubPrList, KnownProvider, LocalSearchResult, LocalStatus, LoginStarted, LoginStatus,
+    McpLogs, McpServerInfo, MergePrRequest, ModeInfo, ModelInfo, OpenTerminalRequest,
+    PROTOCOL_VERSION, PrInfo, ProviderInfo, ProvidersResponse, QueuedPrompt,
+    RegisterWorkspaceRequest, ReorderQueueRequest, RequestCodeReviewRequest,
+    ResolveApprovalRequest, ResolveQuestionRequest, ReviewerProfile, Scope, SendMessageRequest,
+    ServerInfo, Session, SessionDiff, SetDefaultModelRequest, SetDefaultPermissionModeRequest,
+    SetLocalEnabledRequest, SubscriptionHealth, TerminalInfo, TerminalInputRequest,
+    TerminalResizeRequest, Thread, TurnAccepted, UpdateCodeReviewRepositoryRequest,
+    UpdateQueuedPromptRequest, UpdateSessionRequest, UpdateThreadRequest, UpsertAutomationRequest,
+    UpsertMcpServerRequest, UpsertModeRequest, UpsertProviderRequest, UpsertReviewerProfileRequest,
+    UsageSummary, Workspace,
 };
 use utoipa::OpenApi;
 
@@ -170,6 +170,7 @@ impl IntoResponse for ApiError {
         code_review_dashboard,
         list_code_review_jobs,
         get_code_review_job,
+        get_code_review_task,
         code_review_job_events,
         request_code_review,
         cancel_code_review_job,
@@ -517,6 +518,10 @@ pub fn build_router(engine: Arc<Engine>) -> Router {
         .route("/v1/code-review/jobs", get(list_code_review_jobs))
         .route("/v1/code-review/jobs/{id}", get(get_code_review_job))
         .route(
+            "/v1/code-review/jobs/{job_id}/tasks/{task_id}",
+            get(get_code_review_task),
+        )
+        .route(
             "/v1/code-review/jobs/{id}/events",
             get(code_review_job_events),
         )
@@ -692,6 +697,16 @@ struct CodeReviewJobsQuery {
     repository: Option<String>,
 }
 
+#[derive(Debug, Deserialize)]
+struct CodeReviewJobQuery {
+    #[serde(default = "default_true")]
+    include_task_content: bool,
+}
+
+fn default_true() -> bool {
+    true
+}
+
 fn default_review_job_limit() -> usize {
     100
 }
@@ -722,13 +737,39 @@ async fn list_code_review_jobs(
 }
 
 #[utoipa::path(get, path = "/v1/code-review/jobs/{id}",
-    params(("id" = String, Path, description = "Review job id")),
+    params(
+        ("id" = String, Path, description = "Review job id"),
+        (
+            "include_task_content" = Option<bool>,
+            Query,
+            description = "Include retained task prompts and output; defaults to true"
+        )
+    ),
     responses((status = 200, body = CodeReviewJobDetail), (status = 404, body = ErrorBody)))]
 async fn get_code_review_job(
     State(engine): State<Arc<Engine>>,
     Path(id): Path<String>,
+    Query(query): Query<CodeReviewJobQuery>,
 ) -> Result<Json<CodeReviewJobDetail>, ApiError> {
-    Ok(Json(engine.code_review_job_detail(&id)?))
+    let detail = if query.include_task_content {
+        engine.code_review_job_detail(&id)?
+    } else {
+        engine.code_review_job_overview(&id)?
+    };
+    Ok(Json(detail))
+}
+
+#[utoipa::path(get, path = "/v1/code-review/jobs/{job_id}/tasks/{task_id}",
+    params(
+        ("job_id" = String, Path, description = "Review job id"),
+        ("task_id" = String, Path, description = "Review task id")
+    ),
+    responses((status = 200, body = CodeReviewTask), (status = 404, body = ErrorBody)))]
+async fn get_code_review_task(
+    State(engine): State<Arc<Engine>>,
+    Path((job_id, task_id)): Path<(String, String)>,
+) -> Result<Json<CodeReviewTask>, ApiError> {
+    Ok(Json(engine.code_review_task(&job_id, &task_id)?))
 }
 
 #[utoipa::path(post, path = "/v1/code-review/requests",

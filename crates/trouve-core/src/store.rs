@@ -776,6 +776,16 @@ const CODE_REVIEW_TASK_COLUMNS: &str = "id, job_id, role, reviewer_id, reviewer_
      candidate_issue_count, confirmed_issue_count, provider_wait_ms, model_elapsed_ms, input_tokens, \
      cached_input_tokens, output_tokens, tool_call_count, error, created_at, started_at, completed_at";
 
+/// Same wire shape as a full task, but without the potentially large retained
+/// prompt/transcript fields. Keeping the column order aligned lets the compact
+/// job-detail path reuse the normal row mapper without materializing content
+/// the caller did not request.
+const CODE_REVIEW_TASK_SUMMARY_COLUMNS: &str = "id, job_id, role, reviewer_id, reviewer_name, \
+     batch_index, batch_count, status, model, session_id, thread_id, '' AS prompt, '' AS output, \
+     '' AS thinking, '' AS tool_output, candidate_issue_count, confirmed_issue_count, \
+     provider_wait_ms, model_elapsed_ms, input_tokens, cached_input_tokens, output_tokens, \
+     tool_call_count, error, created_at, started_at, completed_at";
+
 #[derive(Debug, Clone)]
 pub struct NewCodeReviewFinding {
     pub path: String,
@@ -2836,6 +2846,39 @@ impl Store {
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
+    pub fn code_review_task(
+        &self,
+        job_id: &str,
+        task_id: &str,
+    ) -> Result<Option<trouve_protocol::CodeReviewTask>> {
+        let conn = self.conn.lock().unwrap();
+        Ok(conn
+            .query_row(
+                &format!(
+                    "SELECT {CODE_REVIEW_TASK_COLUMNS} FROM code_review_tasks
+                     WHERE job_id = ?1 AND id = ?2"
+                ),
+                params![job_id, task_id],
+                row_to_code_review_task,
+            )
+            .optional()?)
+    }
+
+    fn code_review_task_summaries(
+        &self,
+        job_id: &str,
+    ) -> Result<Vec<trouve_protocol::CodeReviewTask>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {CODE_REVIEW_TASK_SUMMARY_COLUMNS} FROM code_review_tasks
+             WHERE job_id = ?1
+             ORDER BY CASE role WHEN 'reviewer' THEN 0 ELSE 1 END,
+                      reviewer_name, batch_index, created_at"
+        ))?;
+        let rows = stmt.query_map(params![job_id], row_to_code_review_task)?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
     pub fn set_code_review_job_progress(
         &self,
         id: &str,
@@ -3131,15 +3174,37 @@ impl Store {
         &self,
         id: &str,
     ) -> Result<Option<trouve_protocol::CodeReviewJobDetail>> {
+        self.code_review_job_detail_with_task_content(id, true)
+    }
+
+    pub fn code_review_job_overview(
+        &self,
+        id: &str,
+    ) -> Result<Option<trouve_protocol::CodeReviewJobDetail>> {
+        self.code_review_job_detail_with_task_content(id, false)
+    }
+
+    fn code_review_job_detail_with_task_content(
+        &self,
+        id: &str,
+        include_task_content: bool,
+    ) -> Result<Option<trouve_protocol::CodeReviewJobDetail>> {
         let Some(record) = self.code_review_job(id)? else {
             return Ok(None);
         };
-        let tasks = self.code_review_tasks(id)?;
+        let tasks = if include_task_content {
+            self.code_review_tasks(id)?
+        } else {
+            self.code_review_task_summaries(id)?
+        };
         let personas = code_review_persona_results(&tasks);
         let findings = self.code_review_findings(id)?;
         let candidate_rejections = self.code_review_candidate_rejections(id)?;
+        let event_cursor =
+            self.latest_event_cursor(&trouve_protocol::Scope::CodeReviewJob(id.to_owned()))?;
         Ok(Some(trouve_protocol::CodeReviewJobDetail {
             job: record.job,
+            event_cursor,
             tasks,
             personas,
             findings,
@@ -5706,6 +5771,36 @@ mod tests {
         assert_eq!(detail.personas[0].status, "succeeded");
         assert_eq!(detail.findings[0].sources[0].task_id, task.id);
         assert_eq!(detail.prompt_for_agents, "Fix every confirmed issue.");
+
+        let overview = store.code_review_job_overview(&queued.id).unwrap().unwrap();
+        assert_eq!(overview.tasks.len(), detail.tasks.len());
+        assert_eq!(overview.tasks[0].id, task.id);
+        assert_eq!(overview.tasks[0].status, "succeeded");
+        assert_eq!(overview.tasks[0].candidate_issue_count, 1);
+        assert!(overview.tasks[0].prompt.is_empty());
+        assert!(overview.tasks[0].output.is_empty());
+        assert!(overview.tasks[0].thinking.is_empty());
+        assert!(overview.tasks[0].tool_output.is_empty());
+        assert_eq!(overview.personas.len(), detail.personas.len());
+        assert_eq!(
+            overview.personas[0].confirmed_issue_count,
+            detail.personas[0].confirmed_issue_count
+        );
+        assert_eq!(overview.findings.len(), detail.findings.len());
+        assert_eq!(overview.findings[0].id, detail.findings[0].id);
+
+        let retained_task = store
+            .code_review_task(&queued.id, &task.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(retained_task.prompt, "Find defects");
+        assert_eq!(retained_task.output, "candidate output");
+        assert!(
+            store
+                .code_review_task("another-job", &task.id)
+                .unwrap()
+                .is_none()
+        );
 
         assert_eq!(projection_retry_delay_seconds(1), 60);
         assert_eq!(projection_retry_delay_seconds(20), 6 * 60 * 60);

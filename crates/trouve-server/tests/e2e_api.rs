@@ -11,7 +11,7 @@ use std::time::Duration;
 use futures::StreamExt;
 use trouve_core::Engine;
 use trouve_core::config::Config;
-use trouve_core::store::Store;
+use trouve_core::store::{NewCodeReviewJob, NewCodeReviewTask, Store};
 use trouve_protocol::Usage;
 use trouve_providers::{
     EventStream, Message, Provider, ProviderError, ProviderEvent, ToolCallRequest, ToolSpec,
@@ -3889,6 +3889,127 @@ async fn code_review_dashboard_and_repository_policy_round_trip() {
             .len(),
         1
     );
+}
+
+#[tokio::test]
+async fn code_review_job_overview_loads_task_content_separately() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Store::open(&tmp.path().join("db/trouve.db")).unwrap();
+    let engine = Arc::new(
+        Engine::new(store, tmp.path().join("data"), &Config::default()).with_config_dir(None),
+    );
+    let queued = engine
+        .store()
+        .enqueue_code_review_job(&NewCodeReviewJob {
+            dedupe_key: "acme/widgets#42:lazy-detail".into(),
+            installation_id: 7,
+            repository: "acme/widgets".into(),
+            pull_number: 42,
+            pull_title: "Ship widgets".into(),
+            pull_url: "https://github.com/acme/widgets/pull/42".into(),
+            head_sha: "2222222222222222222222222222222222222222".into(),
+            review_base_sha: "1111111111111111111111111111111111111111".into(),
+            base_ref: "main".into(),
+            head_ref: "ship".into(),
+            scope: trouve_protocol::CodeReviewJobScope::Incremental,
+            trigger: "automatic".into(),
+            retry_of: None,
+            model: Some("provider/model".into()),
+            prompt: "Review it".into(),
+            reviewers: Vec::new(),
+            config_hash: "config".into(),
+        })
+        .unwrap()
+        .unwrap();
+    engine.store().claim_code_review_job().unwrap().unwrap();
+    let task = engine
+        .store()
+        .create_code_review_task(&NewCodeReviewTask {
+            job_id: queued.id.clone(),
+            role: trouve_protocol::CodeReviewTaskRole::Reviewer,
+            reviewer_id: Some("correctness".into()),
+            reviewer_name: "Correctness".into(),
+            batch_index: 0,
+            batch_count: 1,
+            model: Some("provider/model".into()),
+            prompt: "Retained task prompt".into(),
+        })
+        .unwrap();
+    engine
+        .store()
+        .start_code_review_task(&task.id, "session", "thread", "provider/model")
+        .unwrap()
+        .unwrap();
+    engine
+        .store()
+        .append_code_review_task_output(
+            &task.id,
+            trouve_protocol::CodeReviewOutputStream::Assistant,
+            "retained assistant output",
+        )
+        .unwrap();
+    let snapshot_event = engine
+        .store()
+        .append_event(
+            trouve_protocol::Scope::CodeReviewJob(queued.id.clone()),
+            trouve_protocol::Event::CodeReviewJobUpdated {
+                job_id: queued.id.clone(),
+            },
+        )
+        .unwrap();
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let router = trouve_server::build_router(engine);
+    tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+    let base = format!("http://{addr}/v1/code-review/jobs/{}", queued.id);
+    let client = reqwest::Client::new();
+
+    let overview: serde_json::Value = client
+        .get(format!("{base}?include_task_content=false"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(overview["tasks"][0]["id"], task.id);
+    assert_eq!(overview["tasks"][0]["status"], "running");
+    assert_eq!(overview["event_cursor"], snapshot_event.cursor);
+    assert!(overview["tasks"][0]["prompt"].is_null());
+    assert!(overview["tasks"][0]["output"].is_null());
+
+    let full: serde_json::Value = client
+        .get(&base)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(full["tasks"][0]["prompt"], "Retained task prompt");
+    assert_eq!(full["tasks"][0]["output"], "retained assistant output");
+
+    let retained: serde_json::Value = client
+        .get(format!("{base}/tasks/{}", task.id))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(retained["prompt"], "Retained task prompt");
+    assert_eq!(retained["output"], "retained assistant output");
+
+    let wrong_job = client
+        .get(format!(
+            "http://{addr}/v1/code-review/jobs/not-this-job/tasks/{}",
+            task.id
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(wrong_job.status(), reqwest::StatusCode::NOT_FOUND);
 }
 
 #[tokio::test]

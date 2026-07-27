@@ -18,6 +18,7 @@ import {
   getModels,
   getProviders,
   getStats,
+  getTask,
   installCli,
   loginStatus,
   openJobEvents,
@@ -203,62 +204,76 @@ function App() {
   const [dashboard, setDashboard] = useState<Dashboard | null>(null);
   const [providers, setProviders] = useState<ProvidersResponse | null>(null);
   const [models, setModels] = useState<Model[]>([]);
-  const [error, setError] = useState("");
+  const [dashboardError, setDashboardError] = useState("");
+  const [configurationError, setConfigurationError] = useState("");
   const [loading, setLoading] = useState(true);
 
-  const load = async (quiet = false): Promise<void> => {
+  const loadDashboard = async (quiet = false): Promise<void> => {
     if (!quiet) setLoading(true);
     try {
-      const [nextDashboard, nextProviders, nextModels] = await Promise.all([
-        getDashboard(),
-        getProviders(),
-        getModels(),
-      ]);
-      setDashboard(nextDashboard);
-      setProviders(nextProviders);
-      setModels(nextModels);
-      setError("");
+      setDashboard(await getDashboard());
+      setDashboardError("");
     } catch (cause) {
-      setError(cause instanceof Error ? cause.message : String(cause));
+      setDashboardError(cause instanceof Error ? cause.message : String(cause));
     } finally {
       if (!quiet) setLoading(false);
     }
+  };
+
+  const loadConfiguration = async (): Promise<void> => {
+    const results = await Promise.allSettled([
+      getProviders().then(setProviders),
+      getModels().then(setModels),
+    ]);
+    const errors = results
+      .filter((result): result is PromiseRejectedResult => result.status === "rejected")
+      .map(({ reason }) => (reason instanceof Error ? reason.message : String(reason)));
+    setConfigurationError(errors.join("; "));
   };
 
   useEffect(() => {
     const onHash = (): void => setRoute(routeFromHash());
     window.addEventListener("hashchange", onHash);
     if (!window.location.hash) navigate("overview");
-    void load();
+    void loadDashboard();
     return () => window.removeEventListener("hashchange", onHash);
   }, []);
 
-  useEffect(() => openServerEvents(() => void load(true)), []);
+  const needsConfiguration =
+    route.section === "repositories" ||
+    route.section === "reviewers" ||
+    route.section === "settings";
+  useEffect(() => {
+    if (needsConfiguration) void loadConfiguration();
+  }, [needsConfiguration]);
+
+  useEffect(() => openServerEvents(() => void loadDashboard(true)), []);
 
   const active = dashboard?.jobs.some((job) => job.status === "running" || job.status === "queued");
   useEffect(() => {
     if (!active) return;
-    const timer = window.setInterval(() => void load(true), 5_000);
+    const timer = window.setInterval(() => void loadDashboard(true), 5_000);
     return () => window.clearInterval(timer);
   }, [active]);
 
+  const error = dashboardError || (needsConfiguration ? configurationError : "");
   const content = dashboard ? (
     <>
       {route.section === "overview" && (
-        <Overview dashboard={dashboard} onRefresh={() => void load(true)} />
+        <Overview dashboard={dashboard} onRefresh={() => void loadDashboard(true)} />
       )}
       {route.section === "jobs" && (
         <JobsPage
           dashboard={dashboard}
           selectedId={route.jobId}
-          onChanged={() => void load(true)}
+          onChanged={() => void loadDashboard(true)}
         />
       )}
       {route.section === "repositories" && (
         <RepositoriesPage
           dashboard={dashboard}
           models={models}
-          onChanged={() => void load(true)}
+          onChanged={() => void loadDashboard(true)}
         />
       )}
       {route.section === "reviewers" && (
@@ -266,7 +281,7 @@ function App() {
           reviewers={dashboard.reviewers}
           models={models}
           defaultModel={providers?.default_model}
-          onChanged={() => void load(true)}
+          onChanged={() => void loadDashboard(true)}
         />
       )}
       {route.section === "stats" && (
@@ -277,7 +292,10 @@ function App() {
           app={dashboard.app}
           providers={providers}
           models={models}
-          onChanged={() => void load(true)}
+          onChanged={() => {
+            void loadDashboard(true);
+            void loadConfiguration();
+          }}
         />
       )}
     </>
@@ -320,7 +338,13 @@ function App() {
         {error && (
           <div class="banner error" role="alert">
             {error}
-            <button type="button" onClick={() => void load()}>
+            <button
+              type="button"
+              onClick={() => {
+                void loadDashboard();
+                if (needsConfiguration) void loadConfiguration();
+              }}
+            >
               Retry
             </button>
           </div>
@@ -572,8 +596,13 @@ function JobDetailPane({
   const [error, setError] = useState("");
   const [busy, setBusy] = useState("");
   const [selectedTaskId, setSelectedTaskId] = useState("");
+  const [taskDetails, setTaskDetails] = useState<Record<string, ReviewTask>>({});
+  const [taskLoading, setTaskLoading] = useState("");
+  const [taskErrors, setTaskErrors] = useState<Record<string, string>>({});
+  const [eventCursor, setEventCursor] = useState<number | null>(null);
   const now = useClock(detail?.job.status === "running");
   const aliveRef = useRef<string | null>(jobId);
+  const taskRequestsRef = useRef(new Set<string>());
   const detailStatusRef = useRef(detail?.job.status);
   detailStatusRef.current = detail?.job.status;
   const load = useCallback(async (): Promise<void> => {
@@ -582,6 +611,7 @@ function JobDetailPane({
       const next = await getJob(requestedJobId);
       if (aliveRef.current === requestedJobId) {
         setDetail(next);
+        setEventCursor((current) => current ?? next.event_cursor ?? 0);
         setError("");
       }
     } catch (cause) {
@@ -590,13 +620,53 @@ function JobDetailPane({
       }
     }
   }, [jobId]);
+  const loadTask = useCallback(
+    async (taskId: string): Promise<void> => {
+      if (taskRequestsRef.current.has(taskId)) return;
+      taskRequestsRef.current.add(taskId);
+      setTaskLoading(taskId);
+      setTaskErrors((current) => {
+        if (!(taskId in current)) return current;
+        const next = { ...current };
+        delete next[taskId];
+        return next;
+      });
+      try {
+        const next = await getTask(jobId, taskId);
+        if (aliveRef.current === jobId && next.job_id === jobId) {
+          setTaskDetails((current) => ({ ...current, [taskId]: next }));
+        }
+      } catch (cause) {
+        if (aliveRef.current === jobId) {
+          const message = cause instanceof Error ? cause.message : String(cause);
+          setTaskErrors((current) => ({ ...current, [taskId]: message }));
+        }
+      } finally {
+        taskRequestsRef.current.delete(taskId);
+        setTaskLoading((current) => (current === taskId ? "" : current));
+      }
+    },
+    [jobId],
+  );
   useEffect(() => {
     aliveRef.current = jobId;
     setDetail(null);
     setSelectedTaskId("");
-    const timeouts = new Set<number>();
+    setTaskDetails({});
+    setTaskLoading("");
+    setTaskErrors({});
+    setEventCursor(null);
+    taskRequestsRef.current.clear();
     void load();
-    const close = openJobEvents(jobId, (event) => {
+    return () => {
+      if (aliveRef.current === jobId) aliveRef.current = null;
+    };
+  }, [jobId, load]);
+
+  useEffect(() => {
+    if (eventCursor === null) return;
+    const timeouts = new Set<number>();
+    const close = openJobEvents(jobId, eventCursor, (event) => {
       if (aliveRef.current !== jobId) return;
       if (event.type === "code_review.output_delta" && event.task_id && event.text) {
         setDetail((current) => {
@@ -616,6 +686,20 @@ function JobDetailPane({
             ),
           };
         });
+        setTaskDetails((current) => {
+          const task = current[event.task_id!];
+          if (!task) return current;
+          const field =
+            event.stream === "thinking"
+              ? "thinking"
+              : event.stream === "tool"
+                ? "tool_output"
+                : "output";
+          return {
+            ...current,
+            [task.id]: { ...task, [field]: `${task[field]}${event.text}` },
+          };
+        });
       } else if (event.type === "code_review.task_updated" && event.task) {
         setDetail((current) => {
           if (!current) return current;
@@ -627,6 +711,10 @@ function JobDetailPane({
               : [...current.tasks, event.task!],
           };
         });
+        setTaskDetails((current) => ({
+          ...current,
+          [event.task!.id]: event.task!,
+        }));
         const timeout = window.setTimeout(() => {
           timeouts.delete(timeout);
           void load();
@@ -637,11 +725,10 @@ function JobDetailPane({
       }
     });
     return () => {
-      if (aliveRef.current === jobId) aliveRef.current = null;
       for (const timeout of timeouts) window.clearTimeout(timeout);
       close();
     };
-  }, [jobId, load]);
+  }, [jobId, eventCursor, load]);
 
   useEffect(() => {
     if (!detail?.tasks.length) {
@@ -653,6 +740,11 @@ function JobDetailPane({
       return pickPreferredTask(detail.tasks)?.id ?? "";
     });
   }, [detail?.tasks]);
+
+  useEffect(() => {
+    if (!selectedTaskId || taskDetails[selectedTaskId] || taskErrors[selectedTaskId]) return;
+    void loadTask(selectedTaskId);
+  }, [selectedTaskId, taskDetails, taskErrors, loadTask]);
 
   useEffect(() => {
     aliveRef.current = jobId;
@@ -791,8 +883,19 @@ function JobDetailPane({
       tasks: coordinatorTasks,
     });
   }
-  const selectedTask =
+  const selectedTaskSummary =
     detail.tasks.find((task) => task.id === selectedTaskId) ?? detail.tasks[0];
+  const retainedTask = selectedTaskSummary ? taskDetails[selectedTaskSummary.id] : undefined;
+  const selectedTask =
+    selectedTaskSummary && retainedTask
+      ? {
+          ...selectedTaskSummary,
+          prompt: retainedTask.prompt,
+          output: retainedTask.output,
+          thinking: retainedTask.thinking,
+          tool_output: retainedTask.tool_output,
+        }
+      : selectedTaskSummary;
   const selectedGroup = activityGroups.find((group) =>
     group.tasks.some((task) => task.id === selectedTask?.id),
   );
@@ -1059,6 +1162,17 @@ function JobDetailPane({
                     </dd>
                   </div>
                 </dl>
+                {taskLoading === selectedTask.id && (
+                  <p class="decision-note">Loading retained task output…</p>
+                )}
+                {taskErrors[selectedTask.id] && (
+                  <div class="banner error">
+                    {taskErrors[selectedTask.id]}
+                    <button type="button" onClick={() => void loadTask(selectedTask.id)}>
+                      Retry
+                    </button>
+                  </div>
+                )}
                 <OutputBlock
                   title="Assistant output"
                   value={selectedTask.output}
@@ -1074,10 +1188,12 @@ function JobDetailPane({
                   value={selectedTask.tool_output}
                   followTail={selectedTask.status === "running"}
                 />
-                <details class="nested">
-                  <summary>Prompt</summary>
-                  <pre>{selectedTask.prompt}</pre>
-                </details>
+                {selectedTask.prompt && (
+                  <details class="nested">
+                    <summary>Prompt</summary>
+                    <pre>{selectedTask.prompt}</pre>
+                  </details>
+                )}
                 {selectedTask.error && <p class="error-text">{selectedTask.error}</p>}
               </article>
             )}

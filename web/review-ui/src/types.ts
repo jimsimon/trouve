@@ -189,6 +189,7 @@ export interface CandidateRejection {
 
 export interface JobDetail {
   job: ReviewJob;
+  event_cursor: number;
   tasks: ReviewTask[];
   personas: PersonaResult[];
   findings: Finding[];

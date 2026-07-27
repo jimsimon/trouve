@@ -1053,6 +1053,11 @@ pub struct CodeReviewJob {
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct CodeReviewJobDetail {
     pub job: CodeReviewJob,
+    /// Latest persisted job event included by or predating this snapshot.
+    /// Clients can resume the job event stream after this cursor instead of
+    /// replaying the complete retained output history.
+    #[serde(default)]
+    pub event_cursor: u64,
     #[serde(default)]
     pub tasks: Vec<CodeReviewTask>,
     #[serde(default)]
