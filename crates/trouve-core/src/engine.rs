@@ -2570,25 +2570,13 @@ impl Engine {
         &self,
         prompt: &str,
     ) -> trouve_protocol::GeneratedSessionTitle {
-        let result = tokio::time::timeout(
-            std::time::Duration::from_secs(8),
-            self.title_model.generate(prompt),
-        )
-        .await;
-        match result {
-            Ok(Ok(title)) => trouve_protocol::GeneratedSessionTitle {
+        match self.title_model.generate(prompt).await {
+            Ok(title) => trouve_protocol::GeneratedSessionTitle {
                 title,
                 source: "model".into(),
             },
-            Ok(Err(error)) => {
+            Err(error) => {
                 tracing::debug!("using heuristic session title: {error:#}");
-                trouve_protocol::GeneratedSessionTitle {
-                    title: crate::title::summarize_session_title(prompt),
-                    source: "heuristic".into(),
-                }
-            }
-            Err(_) => {
-                tracing::debug!("using heuristic session title: model exceeded 8-second budget");
                 trouve_protocol::GeneratedSessionTitle {
                     title: crate::title::summarize_session_title(prompt),
                     source: "heuristic".into(),

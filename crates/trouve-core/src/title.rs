@@ -9,6 +9,9 @@
 const MAX_WORDS: usize = 16;
 const MAX_CHARS: usize = 96;
 const MAX_SCANNED_WORDS: usize = MAX_WORDS + 16;
+/// Conservative one-character-per-token budget for the 1,024-token title
+/// sidecar, leaving room for its system prompt, chat template, and response.
+pub(crate) const MAX_PROMPT_CHARS: usize = 768;
 const REQUEST_MARKERS: &[&str] = &[
     "is there a way ",
     "what is the best way to ",
@@ -34,6 +37,7 @@ const REQUEST_MARKERS: &[&str] = &[
 /// request-shaped sentence, removes conversational framing, and keeps at most
 /// sixteen meaningful words.
 pub fn summarize_session_title(prompt: &str) -> String {
+    let prompt = cap_prompt(prompt);
     let candidate = pick_candidate(prompt);
     let request = strip_request_framing(&candidate);
     let lower = request.to_ascii_lowercase();
@@ -93,6 +97,14 @@ pub fn summarize_session_title(prompt: &str) -> String {
         return "Untitled task".into();
     }
     truncate_title(&sentence_case(&words.join(" ")), MAX_CHARS)
+}
+
+pub(crate) fn cap_prompt(prompt: &str) -> &str {
+    prompt
+        .char_indices()
+        .nth(MAX_PROMPT_CHARS)
+        .map(|(index, _)| &prompt[..index])
+        .unwrap_or(prompt)
 }
 
 fn pick_candidate(prompt: &str) -> String {
@@ -288,13 +300,54 @@ fn compact_phrases(words: &mut Vec<String>) {
         &["appears", "to", "do", "nothing"],
         &["does", "nothing"],
     );
-    replace_phrase(
-        words,
-        &[
-            "in", "one", "session", "is", "carried", "over", "when", "clicking", "into", "another",
-            "session",
-        ],
-        &["carries", "over", "between", "sessions"],
+    compact_session_carryover(words);
+}
+
+fn compact_session_carryover(words: &mut Vec<String>) {
+    let normalized: Vec<String> = words
+        .iter()
+        .map(|word| clean_word(word).to_ascii_lowercase())
+        .collect();
+    let sessions: Vec<usize> = normalized
+        .iter()
+        .enumerate()
+        .filter_map(|(index, word)| {
+            matches!(word.as_str(), "session" | "sessions").then_some(index)
+        })
+        .collect();
+    let Some((&first_session, &last_session)) = sessions.first().zip(sessions.last()) else {
+        return;
+    };
+    if first_session == last_session {
+        return;
+    }
+    let Some(carry) = normalized[..=last_session].iter().position(|word| {
+        matches!(
+            word.as_str(),
+            "carry" | "carried" | "carried-over" | "carries" | "carrying"
+        )
+    }) else {
+        return;
+    };
+
+    // When the carry verb follows the first session, absorb its short
+    // location phrase ("in/from one session") as well. When it leads, retain
+    // the subject and replace from the verb.
+    let start = if carry > first_session {
+        (first_session.saturating_sub(3)..first_session)
+            .find(|index| {
+                matches!(
+                    normalized[*index].as_str(),
+                    "across" | "between" | "from" | "in" | "within"
+                )
+            })
+            .unwrap_or(carry)
+    } else {
+        carry
+    };
+    words.splice(
+        start..=last_session,
+        ["carries", "over", "between", "sessions"].map(String::from),
     );
 }
 
@@ -455,7 +508,7 @@ fn truncate_title(title: &str, max_chars: usize) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{MAX_CHARS, MAX_WORDS, summarize_session_title};
+    use super::{MAX_CHARS, MAX_PROMPT_CHARS, MAX_WORDS, summarize_session_title};
 
     #[test]
     fn extracts_request_instead_of_copying_prompt() {
@@ -522,6 +575,22 @@ mod tests {
     }
 
     #[test]
+    fn compacts_session_carryover_across_rewordings() {
+        assert_eq!(
+            summarize_session_title(
+                "Prompt text from one session gets carried into another session"
+            ),
+            "Prompt text carries over between sessions"
+        );
+        assert_eq!(
+            summarize_session_title(
+                "A draft carried from the first session into the second session"
+            ),
+            "Draft carries over between sessions"
+        );
+    }
+
+    #[test]
     fn preserves_repeated_nouns_and_grammatical_prepositions() {
         assert_eq!(
             summarize_session_title("Move state from one thread to another thread"),
@@ -541,5 +610,14 @@ mod tests {
         );
         assert!(title.split_whitespace().count() <= MAX_WORDS);
         assert!(title.chars().count() <= MAX_CHARS + 1);
+    }
+
+    #[test]
+    fn caps_prompt_before_candidate_selection() {
+        let prompt = format!(
+            "Fix the first issue. {} Could you replace this with a late request?",
+            "background ".repeat(MAX_PROMPT_CHARS)
+        );
+        assert_eq!(summarize_session_title(&prompt), "Fix first issue");
     }
 }

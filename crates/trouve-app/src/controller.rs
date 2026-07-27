@@ -3560,7 +3560,16 @@ impl Controller {
                     .get(selection.workspace_idx)
                     .context("no workspace selected")?
                     .clone();
-                let title = self.client.generate_session_title(&prompt).await?.title;
+                let title = match self.client.generate_session_title(&prompt).await {
+                    Ok(generated) => generated.title,
+                    Err(error) => {
+                        tracing::warn!(
+                            "session title generation failed; creating session with raw prompt: \
+                             {error:#}"
+                        );
+                        prompt.clone()
+                    }
+                };
                 let session = self
                     .client
                     .create_session(&CreateSessionRequest {

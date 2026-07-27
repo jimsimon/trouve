@@ -18,7 +18,7 @@ use trouve_protocol::{TitleModelLoadBehavior, TitleModelStatus};
 
 const AUTO_PRELOAD_AVAILABLE_RAM: u64 = 4 * 1024 * 1024 * 1024;
 const IDLE_RELEASE: std::time::Duration = std::time::Duration::from_secs(120);
-const GENERATION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+const GENERATION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(8);
 const STAGE_RUNTIME: u8 = 1;
 const STAGE_MODEL: u8 = 2;
 
@@ -41,8 +41,8 @@ pub struct TitleModelManager {
     store: crate::store::Store,
 }
 
-/// Makes the public load state cancellation-safe: the engine deliberately
-/// drops a slow naming future at its eight-second budget.
+/// Makes the public load state cancellation-safe if a preload or request is
+/// dropped while llama.cpp is still starting.
 struct LoadingGuard<'a>(&'a TitleModelManager);
 
 impl Drop for LoadingGuard<'_> {
@@ -167,9 +167,8 @@ impl TitleModelManager {
         // Once a sidecar has been started, on-demand policies must release it
         // even if the HTTP request times out or its output is rejected.
         self.schedule_idle_release();
-        let prompt = cap_chars(prompt, 4_000);
-        let response = tokio::time::timeout(
-            GENERATION_TIMEOUT,
+        let prompt = crate::title::cap_prompt(prompt);
+        let response = tokio::time::timeout(GENERATION_TIMEOUT, async {
             reqwest::Client::new()
                 .post(format!("{base_url}/chat/completions"))
                 .json(&serde_json::json!({
@@ -185,13 +184,14 @@ impl TitleModelManager {
                         { "role": "user", "content": prompt }
                     ]
                 }))
-                .send(),
-        )
+                .send()
+                .await?
+                .error_for_status()?
+                .json::<serde_json::Value>()
+                .await
+        })
         .await
-        .context("session title generation timed out")??
-        .error_for_status()?
-        .json::<serde_json::Value>()
-        .await?;
+        .context("session title generation timed out")??;
         let raw = response
             .pointer("/choices/0/message/content")
             .and_then(serde_json::Value::as_str)
@@ -446,14 +446,6 @@ async fn download_title_model(
     }
     std::fs::rename(part, target)?;
     Ok(())
-}
-
-fn cap_chars(value: &str, max_chars: usize) -> &str {
-    value
-        .char_indices()
-        .nth(max_chars)
-        .map(|(index, _)| &value[..index])
-        .unwrap_or(value)
 }
 
 fn sanitize_title(raw: &str) -> Result<String> {
