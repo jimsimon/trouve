@@ -1021,13 +1021,28 @@ pub fn set_settings_section(ui: &Ui, section: SectionId) {
     let _ = ui.upgrade_in_event_loop(move |ui| ui.set_settings_section(section));
 }
 
-pub fn set_git_worktree_settings(ui: &Ui, settings: trouve_protocol::GitWorktreeSettings) {
-    let behavior = match settings.title_model_load_behavior {
+pub(crate) fn title_model_load_behavior_of(index: i32) -> trouve_protocol::TitleModelLoadBehavior {
+    match index {
+        1 => trouve_protocol::TitleModelLoadBehavior::Always,
+        2 => trouve_protocol::TitleModelLoadBehavior::OnDemand,
+        3 => trouve_protocol::TitleModelLoadBehavior::Off,
+        _ => trouve_protocol::TitleModelLoadBehavior::Auto,
+    }
+}
+
+pub(crate) fn title_model_load_behavior_index(
+    behavior: trouve_protocol::TitleModelLoadBehavior,
+) -> i32 {
+    match behavior {
         trouve_protocol::TitleModelLoadBehavior::Auto => 0,
         trouve_protocol::TitleModelLoadBehavior::Always => 1,
         trouve_protocol::TitleModelLoadBehavior::OnDemand => 2,
         trouve_protocol::TitleModelLoadBehavior::Off => 3,
-    };
+    }
+}
+
+pub fn set_git_worktree_settings(ui: &Ui, settings: trouve_protocol::GitWorktreeSettings) {
+    let behavior = title_model_load_behavior_index(settings.title_model_load_behavior);
     let status = settings.title_model;
     let installed = status.runtime_installed && status.model_downloaded;
     let installing = status.state == "installing";
@@ -1763,6 +1778,17 @@ mod tests {
 
         assert_eq!(queue_preview(prompt), "If we support multiple users:");
         assert_eq!(queue_preview(" \r\n\t\n"), "");
+    }
+
+    #[test]
+    fn title_model_load_behavior_indices_round_trip() {
+        use trouve_protocol::TitleModelLoadBehavior::{Always, Auto, Off, OnDemand};
+
+        for (index, behavior) in [(0, Auto), (1, Always), (2, OnDemand), (3, Off)] {
+            assert_eq!(title_model_load_behavior_of(index), behavior);
+            assert_eq!(title_model_load_behavior_index(behavior), index);
+        }
+        assert_eq!(title_model_load_behavior_of(99), Auto);
     }
 
     fn workspace_rows(ids: &[&str]) -> Vec<NavRowData> {

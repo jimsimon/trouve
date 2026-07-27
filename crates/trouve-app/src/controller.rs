@@ -17,8 +17,8 @@ use trouve_client_core::viewmodel::ThreadViewModel;
 use trouve_protocol::{
     AddLocalModelRequest, AgentMode, ApprovalDecision, CompleteLoginRequest, CreateSessionRequest,
     CreateThreadRequest, DirEntry, EventEnvelope, ModelInfo, PermissionMode, Session, Thread,
-    TitleModelLoadBehavior, TodoStatus, UpdateSessionRequest, UpdateThreadRequest,
-    UpsertModeRequest, UpsertProviderRequest, Workspace,
+    TodoStatus, UpdateSessionRequest, UpdateThreadRequest, UpsertModeRequest,
+    UpsertProviderRequest, Workspace,
 };
 
 use crate::render;
@@ -5487,12 +5487,7 @@ impl Controller {
                 self.refresh_subscriptions(SubscriptionRefresh::Force);
             }
             UiCommand::SetTitleModelLoadBehavior(index) => {
-                let behavior = match index {
-                    1 => TitleModelLoadBehavior::Always,
-                    2 => TitleModelLoadBehavior::OnDemand,
-                    3 => TitleModelLoadBehavior::Off,
-                    _ => TitleModelLoadBehavior::Auto,
-                };
+                let behavior = ui::title_model_load_behavior_of(index);
                 match self.client.set_git_worktree_settings(behavior).await {
                     Ok(settings) => ui::set_git_worktree_settings(&self.ui, settings),
                     Err(error) => {
