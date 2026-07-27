@@ -723,10 +723,15 @@ fn turn_stream(
         if route_overloaded {
             // Cursor supports per-session cancellation, so stop only this
             // overloaded turn while the shared ACP process keeps serving
-            // the worktree's other sessions.
-            server
-                .notify("session/cancel", json!({ "sessionId": session_id }))
-                .await;
+            // the worktree's other sessions. Do not let ACP stdin backpressure
+            // delay the overload error reaching the caller.
+            let cancel_server = server.clone();
+            let cancel_session_id = session_id.clone();
+            tokio::spawn(async move {
+                cancel_server
+                    .notify("session/cancel", json!({ "sessionId": cancel_session_id }))
+                    .await;
+            });
             let _ = tx
                 .send(Err(BackendError::Protocol(format!(
                     "cursor-agent event backlog exceeded the per-turn limit of \
