@@ -1348,6 +1348,22 @@ impl AcpServer {
                             {
                                 routes.remove(&session_id);
                             }
+                            drop(routes);
+                            if has_id {
+                                // The agent blocks its turn on server requests.
+                                // Reject a request that could not reach its
+                                // session instead of leaving it unresolved.
+                                let reply = json!({
+                                    "jsonrpc": "2.0", "id": msg["id"],
+                                    "error": { "code": -32603,
+                                               "message": "session event route unavailable" },
+                                });
+                                let mut line = serde_json::to_vec(&reply).expect("serializable");
+                                line.push(b'\n');
+                                let mut stdin = stdin.lock().await;
+                                let _ = stdin.write_all(&line).await;
+                                let _ = stdin.flush().await;
+                            }
                         }
                     } else if has_id {
                         // A request nobody can answer must still get a

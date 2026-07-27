@@ -610,7 +610,10 @@ echo '{"jsonrpc":"2.0","id":9,"result":{"stopReason":"end_turn"}}'
     .expect("a burst on one route must not block another session");
 
     let mut second_text = String::new();
-    while let Some(event) = second.next().await {
+    while let Some(event) = tokio::time::timeout(deadline, second.next())
+        .await
+        .expect("second session must keep streaming")
+    {
         if let BackendEvent::TextDelta(text) = event.unwrap() {
             second_text.push_str(&text);
         }
@@ -618,7 +621,10 @@ echo '{"jsonrpc":"2.0","id":9,"result":{"stopReason":"end_turn"}}'
     assert_eq!(second_text, "second");
 
     let mut first_error = None;
-    while let Some(event) = first.next().await {
+    while let Some(event) = tokio::time::timeout(deadline, first.next())
+        .await
+        .expect("overloaded first session must terminate")
+    {
         if let Err(error) = event {
             first_error = Some(error.to_string());
         }
@@ -628,6 +634,87 @@ echo '{"jsonrpc":"2.0","id":9,"result":{"stopReason":"end_turn"}}'
             .as_deref()
             .is_some_and(|error| error.contains("event backlog exceeded")),
         "{first_error:?}"
+    );
+}
+
+#[tokio::test]
+async fn cursor_adapter_rejects_request_that_overflows_its_route() {
+    let tmp = tempfile::tempdir().unwrap();
+    let stub = write_stub(
+        tmp.path(),
+        "cursor-agent-request-overload",
+        r#"#!/bin/bash
+IFS= read -r line # initialize
+echo '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":1}}'
+IFS= read -r line # session/new
+echo '{"jsonrpc":"2.0","id":2,"result":{"sessionId":"sess-1"}}'
+IFS= read -r line # set mode
+echo '{"jsonrpc":"2.0","id":3,"result":{"configOptions":[{"id":"mode","currentValue":"agent"}]}}'
+IFS= read -r line # set model
+echo '{"jsonrpc":"2.0","id":4,"result":{"configOptions":[{"id":"model","currentValue":"test-model"}]}}'
+IFS= read -r line # session/prompt
+echo '{"jsonrpc":"2.0","id":100,"method":"session/request_permission","params":{"sessionId":"sess-1","toolCall":{"toolCallId":"c1","title":"first","kind":"execute"},"options":[{"optionId":"allow-once","kind":"allow_once"},{"optionId":"reject-once","kind":"reject_once"}]}}'
+while [[ ! -f "$0.continue" ]]; do sleep 0.01; done
+for sequence in $(seq 1 1024); do
+    printf '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"sess-1","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"%s"}}}}\n' "$sequence"
+done
+echo '{"jsonrpc":"2.0","id":101,"method":"session/request_permission","params":{"sessionId":"sess-1","toolCall":{"toolCallId":"c2","title":"overflow","kind":"execute"},"options":[{"optionId":"allow-once","kind":"allow_once"},{"optionId":"reject-once","kind":"reject_once"}]}}'
+IFS= read -r dropped
+printf '%s\n' "$dropped" > "$0.dropped"
+cat > /dev/null
+"#,
+    );
+    let backend = CursorBackend::new("cursor", Some(stub.clone()), None);
+    let deadline = std::time::Duration::from_secs(2);
+    let mut stream = start_turn(&backend, || {
+        turn(tmp.path().to_path_buf(), None, BackendPermission::Ask)
+    })
+    .await;
+
+    let held_responder = loop {
+        let event = tokio::time::timeout(deadline, stream.next())
+            .await
+            .expect("first permission request must arrive")
+            .expect("stream must remain open")
+            .expect("first permission request must be valid");
+        if let BackendEvent::ApprovalNeeded { responder, .. } = event {
+            break responder;
+        }
+    };
+    std::fs::write(format!("{stub}.continue"), "").unwrap();
+
+    let dropped_path = std::path::PathBuf::from(format!("{stub}.dropped"));
+    tokio::time::timeout(deadline, async {
+        while !dropped_path.exists() {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("overflowed request must receive a JSON-RPC error");
+    let dropped: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(dropped_path).unwrap()).unwrap();
+    assert_eq!(dropped["id"], 101);
+    assert_eq!(dropped["error"]["code"], -32603);
+    assert_eq!(
+        dropped["error"]["message"],
+        "session event route unavailable"
+    );
+
+    let mut overload_error = None;
+    while let Some(event) = tokio::time::timeout(deadline, stream.next())
+        .await
+        .expect("overloaded Cursor stream must terminate")
+    {
+        if let Err(error) = event {
+            overload_error = Some(error.to_string());
+        }
+    }
+    drop(held_responder);
+    assert!(
+        overload_error
+            .as_deref()
+            .is_some_and(|error| error.contains("event backlog exceeded")),
+        "{overload_error:?}"
     );
 }
 
@@ -868,6 +955,69 @@ cat > /dev/null
     let reply = std::fs::read_to_string(format!("{stub}.approval")).unwrap();
     assert!(reply.contains("\"id\":100"), "{reply}");
     assert!(reply.contains("\"decision\":\"decline\""), "{reply}");
+}
+
+#[tokio::test]
+async fn codex_adapter_interrupts_overloaded_turn_with_pending_approval() {
+    let tmp = tempfile::tempdir().unwrap();
+    let stub = write_stub(
+        tmp.path(),
+        "codex-overload",
+        r#"#!/bin/bash
+IFS= read -r line # initialize
+echo '{"jsonrpc":"2.0","id":1,"result":{}}'
+IFS= read -r line # initialized notification
+IFS= read -r line # thread/start
+echo '{"jsonrpc":"2.0","id":2,"result":{"thread":{"id":"thr-1"}}}'
+IFS= read -r line # turn/start
+echo '{"jsonrpc":"2.0","id":3,"result":{"turn":{"id":"turn-1"}}}'
+echo '{"jsonrpc":"2.0","id":100,"method":"item/commandExecution/requestApproval","params":{"threadId":"thr-1","turnId":"turn-1","itemId":"c1","command":"ls"}}'
+for sequence in $(seq 1 2048); do
+    printf '{"jsonrpc":"2.0","method":"item/agentMessage/delta","params":{"threadId":"thr-1","turnId":"turn-1","delta":"%s"}}\n' "$sequence"
+done
+IFS= read -r interrupt
+printf '%s\n' "$interrupt" > "$0.interrupt"
+echo '{"jsonrpc":"2.0","id":4,"result":{}}'
+cat > /dev/null
+"#,
+    );
+    let backend = CodexBackend::new("codex", Some(stub.clone()));
+    let deadline = std::time::Duration::from_secs(2);
+    let mut stream = start_turn(&backend, || {
+        turn(tmp.path().to_path_buf(), None, BackendPermission::Ask)
+    })
+    .await;
+
+    let interrupt_path = std::path::PathBuf::from(format!("{stub}.interrupt"));
+    tokio::time::timeout(deadline, async {
+        while !interrupt_path.exists() {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("overloaded Codex turn must be interrupted");
+
+    let interrupt: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(interrupt_path).unwrap()).unwrap();
+    assert_eq!(interrupt["method"], "turn/interrupt");
+    assert_eq!(interrupt["params"]["threadId"], "thr-1");
+    assert_eq!(interrupt["params"]["turnId"], "turn-1");
+
+    let mut overload_error = None;
+    while let Some(event) = tokio::time::timeout(deadline, stream.next())
+        .await
+        .expect("overloaded Codex stream must terminate")
+    {
+        if let Err(error) = event {
+            overload_error = Some(error.to_string());
+        }
+    }
+    assert!(
+        overload_error
+            .as_deref()
+            .is_some_and(|error| error.contains("event backlog exceeded")),
+        "{overload_error:?}"
+    );
 }
 
 #[tokio::test]

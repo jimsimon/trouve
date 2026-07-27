@@ -291,11 +291,13 @@ impl AgentBackend for CodexBackend {
             turn_params["model"] = json!(model_name);
         }
         apply_reasoning_options(&mut turn_params, effort);
-        server.request("turn/start", turn_params).await?;
+        let started_turn = server.request("turn/start", turn_params).await?;
+        let codex_turn_id = turn_id_of(&started_turn)?;
 
         let stream = turn_stream(
             server.clone(),
             codex_thread_id.clone(),
+            codex_turn_id,
             route,
             fresh_session,
             model_name.to_string(),
@@ -412,11 +414,19 @@ fn thread_id_of(result: &Value) -> Result<String, BackendError> {
         .ok_or_else(|| BackendError::Protocol("thread/start result missing thread.id".into()))
 }
 
+fn turn_id_of(result: &Value) -> Result<String, BackendError> {
+    result["turn"]["id"]
+        .as_str()
+        .map(str::to_string)
+        .ok_or_else(|| BackendError::Protocol("turn/start result missing turn.id".into()))
+}
+
 /// Translate routed app-server messages into `BackendEvent`s until the turn
 /// completes.
 fn turn_stream(
     server: Arc<AppServer>,
     codex_thread_id: String,
+    codex_turn_id: String,
     mut route: RouteReceiver<ServerMsg>,
     fresh_session: bool,
     model_name: String,
@@ -632,6 +642,23 @@ fn turn_stream(
             _ = process_route => {}
         }
         if route_overloaded {
+            // Interrupting the turn clears any server-initiated approval
+            // request that `process_route` may have been awaiting when the
+            // overload signal won the select.
+            if let Err(error) = server
+                .request(
+                    "turn/interrupt",
+                    json!({
+                        "threadId": codex_thread_id.clone(),
+                        "turnId": codex_turn_id.clone(),
+                    }),
+                )
+                .await
+            {
+                tracing::warn!(
+                    "codex: failed to interrupt overloaded turn {codex_turn_id}: {error}"
+                );
+            }
             let _ = tx
                 .send(Err(BackendError::Protocol(format!(
                     "app-server event backlog exceeded the per-turn limit of \
@@ -865,43 +892,45 @@ async fn read_stdout<R: AsyncRead + Unpin>(
             } else {
                 ServerMsg::Notification { method, params }
             };
-            let routed = {
-                let routes = routes.lock().await;
-                routes.get(&thread_id).cloned()
-            };
-            match routed {
-                Some(tx) => match tx.try_send(m) {
-                    Ok(()) => {
-                        failed_routes.remove(&thread_id);
-                    }
-                    Err(error) => {
-                        // The stdout reader is shared by every Codex turn. A
-                        // closed or overloaded route must fail independently
-                        // rather than blocking every concurrent turn and
-                        // JSON-RPC response on this transport.
-                        tracing::warn!(
-                            "codex: dropping {thread_id} event route: {}",
-                            match error {
-                                RouteSendError::Closed => "receiver is closed",
-                                RouteSendError::Overloaded => "event backlog limit exceeded",
-                            }
-                        );
-                        let mut routes = routes.lock().await;
-                        if routes
-                            .get(&thread_id)
-                            .is_some_and(|active| active.same_channel(&tx))
-                        {
-                            routes.remove(&thread_id);
+            let routes_guard = routes.lock().await;
+            match routes_guard.get(&thread_id).cloned() {
+                Some(tx) => {
+                    drop(routes_guard);
+                    match tx.try_send(m) {
+                        Ok(()) => {
+                            failed_routes.remove(&thread_id);
                         }
-                        // Do not reinterpret later events from this failed
-                        // turn as pre-subscription events. A future route for
-                        // the same thread clears this marker on delivery.
-                        failed_routes.insert(thread_id);
+                        Err(error) => {
+                            // The stdout reader is shared by every Codex turn. A
+                            // closed or overloaded route must fail independently
+                            // rather than blocking every concurrent turn and
+                            // JSON-RPC response on this transport.
+                            tracing::warn!(
+                                "codex: dropping {thread_id} event route: {}",
+                                match error {
+                                    RouteSendError::Closed => "receiver is closed",
+                                    RouteSendError::Overloaded => "event backlog limit exceeded",
+                                }
+                            );
+                            let mut routes = routes.lock().await;
+                            if routes
+                                .get(&thread_id)
+                                .is_some_and(|active| active.same_channel(&tx))
+                            {
+                                routes.remove(&thread_id);
+                            }
+                            // Do not reinterpret later events from this failed
+                            // turn as pre-subscription events. A future route for
+                            // the same thread clears this marker on delivery.
+                            failed_routes.insert(thread_id);
+                        }
                     }
-                },
+                }
                 // No subscriber yet: buffer for a thread id we've seen named
                 // (skip the empty catch-all) so nothing emitted between
-                // thread/start and subscribe is lost.
+                // thread/start and subscribe is lost. Keep the routes lock
+                // until the buffer write completes so subscribe cannot miss a
+                // reader that already observed the route as absent.
                 None if !thread_id.is_empty() && !failed_routes.contains(&thread_id) => {
                     let mut buffered = buffered.lock().await;
                     let route = buffered.entry(thread_id.clone()).or_default();
@@ -1028,20 +1057,23 @@ impl AppServer {
 
     async fn subscribe(&self, thread_id: &str) -> RouteReceiver<ServerMsg> {
         let (tx, rx) = route_channel();
-        self.routes
-            .lock()
-            .await
-            .insert(thread_id.to_string(), tx.clone());
-        // Flush anything the reader buffered for this thread before we
-        // subscribed (notifications emitted right after thread/start).
-        if let Some(buffered) = self.buffered.lock().await.remove(thread_id) {
-            for message in buffered.messages {
-                if tx.try_send(message).is_err() {
-                    break;
+        {
+            // The reader takes these locks in the same order when it has no
+            // active route. Holding both through registration and draining
+            // keeps older buffered notifications ahead of newly routed ones.
+            let mut routes = self.routes.lock().await;
+            let mut buffered_routes = self.buffered.lock().await;
+            let buffered = buffered_routes.remove(thread_id);
+            routes.insert(thread_id.to_string(), tx.clone());
+            if let Some(buffered) = buffered {
+                for message in buffered.messages {
+                    if tx.try_send(message).is_err() {
+                        break;
+                    }
                 }
-            }
-            if buffered.overloaded {
-                tx.mark_overloaded();
+                if buffered.overloaded {
+                    tx.mark_overloaded();
+                }
             }
         }
         rx
