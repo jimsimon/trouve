@@ -261,6 +261,12 @@ impl AgentBackend for CodexBackend {
             }
         };
 
+        // A cancelled trouve stream may still have a live vendor turn if the
+        // app-server was blocked in a model or tool request when its consumer
+        // disappeared. Await its interruption before starting a replacement;
+        // otherwise Codex folds the new prompt into the old turn and its late
+        // completion is misattributed to the replacement.
+        server.interrupt_active_turn(&codex_thread_id).await;
         let route = server.subscribe(&codex_thread_id).await;
 
         // Mode instructions (which include the search-tool guidance when
@@ -305,6 +311,9 @@ impl AgentBackend for CodexBackend {
                 return Err(error);
             }
         };
+        server
+            .register_active_turn(&codex_thread_id, &codex_turn_id)
+            .await;
 
         let stream = turn_stream(
             server.clone(),
@@ -464,10 +473,15 @@ fn turn_stream(
         // twice.
         let mut streamed_reasoning = HashSet::new();
         let mut turn_finished = false;
+        let mut client_gone = false;
         let mut route_overloaded = false;
         let mut overload_signal = rx.overload_signal();
         let process_route = async {
             while let Some(msg) = rx.recv().await {
+                if message_turn_id(&msg).is_some_and(|turn_id| turn_id != codex_turn_id) {
+                    tracing::warn!("codex: ignoring event for stale turn on {codex_thread_id}");
+                    continue;
+                }
                 match msg {
                     ServerMsg::Notification { method, params } => match method.as_str() {
                         "item/agentMessage/delta" => {
@@ -652,12 +666,19 @@ fn turn_stream(
         };
         tokio::select! {
             biased;
+            _ = tx.closed() => {
+                client_gone = true;
+            }
             _ = overload_signal.wait() => {
                 route_overloaded = true;
             }
             _ = process_route => {}
         }
-        if route_overloaded {
+        if client_gone {
+            server
+                .interrupt_turn(&codex_thread_id, &codex_turn_id, "cancelled")
+                .await;
+        } else if route_overloaded {
             let _ = tx
                 .send(Err(BackendError::Protocol(format!(
                     "app-server event backlog exceeded the per-turn limit of \
@@ -668,20 +689,9 @@ fn turn_stream(
             // request that `process_route` may have been awaiting when the
             // overload signal won the select. Report the overload first so
             // an unresponsive app-server cannot suppress the stream error.
-            if let Err(error) = server
-                .request(
-                    "turn/interrupt",
-                    json!({
-                        "threadId": codex_thread_id.clone(),
-                        "turnId": codex_turn_id.clone(),
-                    }),
-                )
-                .await
-            {
-                tracing::warn!(
-                    "codex: failed to interrupt overloaded turn {codex_turn_id}: {error}"
-                );
-            }
+            server
+                .interrupt_turn(&codex_thread_id, &codex_turn_id, "overloaded")
+                .await;
         } else if !turn_finished {
             let reason = if server.is_closed() {
                 "app-server closed before turn completed"
@@ -690,8 +700,21 @@ fn turn_stream(
             };
             let _ = tx.send(Err(BackendError::Protocol(reason.into()))).await;
         }
+        server
+            .clear_active_turn(&codex_thread_id, &codex_turn_id)
+            .await;
         server.unsubscribe(&codex_thread_id, &route_tx).await;
     })
+}
+
+fn message_turn_id(message: &ServerMsg) -> Option<&str> {
+    let params = match message {
+        ServerMsg::Notification { params, .. } | ServerMsg::Request { params, .. } => params,
+    };
+    params["turnId"]
+        .as_str()
+        .or_else(|| params["turn"]["id"].as_str())
+        .or_else(|| params["item"]["turnId"].as_str())
 }
 
 fn json_rpc_id(id: &Value) -> String {
@@ -839,6 +862,7 @@ enum ServerMsg {
 
 type Pending = Arc<Mutex<HashMap<i64, oneshot::Sender<Result<Value, String>>>>>;
 type Routes = Arc<Mutex<HashMap<String, RouteSender<ServerMsg>>>>;
+type ActiveTurns = Arc<Mutex<HashMap<String, String>>>;
 
 #[derive(Default)]
 struct BufferedRoute {
@@ -979,6 +1003,10 @@ struct AppServer {
     /// app-server can emit notifications in the gap before `subscribe`.
     /// Delivered when the route is registered instead of being dropped.
     buffered: Buffered,
+    /// Vendor turn currently running for each Codex thread. A replacement
+    /// turn interrupts this first so Codex cannot merge prompts across trouve
+    /// turn boundaries after cancellation.
+    active_turns: ActiveTurns,
     /// Held so the child (kill_on_drop) lives as long as the server handle.
     _child: Child,
     closed: Arc<std::sync::atomic::AtomicBool>,
@@ -1006,6 +1034,7 @@ impl AppServer {
             pending: Arc::new(Mutex::new(HashMap::new())),
             routes: Arc::new(Mutex::new(HashMap::new())),
             buffered: Arc::new(Mutex::new(HashMap::new())),
+            active_turns: Arc::new(Mutex::new(HashMap::new())),
             _child: child,
             closed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         };
@@ -1062,6 +1091,46 @@ impl AppServer {
         let _ = self
             .write(json!({ "jsonrpc": "2.0", "id": id, "result": result }))
             .await;
+    }
+
+    async fn register_active_turn(&self, thread_id: &str, turn_id: &str) {
+        self.active_turns
+            .lock()
+            .await
+            .insert(thread_id.to_string(), turn_id.to_string());
+    }
+
+    async fn clear_active_turn(&self, thread_id: &str, expected_turn_id: &str) {
+        let mut active = self.active_turns.lock().await;
+        if active
+            .get(thread_id)
+            .is_some_and(|turn_id| turn_id == expected_turn_id)
+        {
+            active.remove(thread_id);
+        }
+    }
+
+    async fn interrupt_active_turn(&self, thread_id: &str) {
+        let turn_id = self.active_turns.lock().await.get(thread_id).cloned();
+        if let Some(turn_id) = turn_id {
+            self.interrupt_turn(thread_id, &turn_id, "superseded").await;
+            self.clear_active_turn(thread_id, &turn_id).await;
+        }
+    }
+
+    async fn interrupt_turn(&self, thread_id: &str, turn_id: &str, reason: &str) {
+        if let Err(error) = self
+            .request(
+                "turn/interrupt",
+                json!({
+                    "threadId": thread_id,
+                    "turnId": turn_id,
+                }),
+            )
+            .await
+        {
+            tracing::warn!("codex: failed to interrupt {reason} turn {turn_id}: {error}");
+        }
     }
 
     async fn write(&self, msg: Value) -> Result<(), BackendError> {
@@ -1152,6 +1221,27 @@ mod tests {
     fn json_rpc_ids_make_stable_approval_ids() {
         assert_eq!(json_rpc_id(&json!(42)), "42");
         assert_eq!(json_rpc_id(&json!("request-7")), "request-7");
+    }
+
+    #[test]
+    fn extracts_turn_identity_from_codex_event_shapes() {
+        let direct = ServerMsg::Notification {
+            method: "item/agentMessage/delta".into(),
+            params: json!({ "threadId": "thread-1", "turnId": "turn-1" }),
+        };
+        assert_eq!(message_turn_id(&direct), Some("turn-1"));
+
+        let completed = ServerMsg::Notification {
+            method: "turn/completed".into(),
+            params: json!({ "threadId": "thread-1", "turn": { "id": "turn-2" } }),
+        };
+        assert_eq!(message_turn_id(&completed), Some("turn-2"));
+
+        let thread_scoped = ServerMsg::Notification {
+            method: "thread/tokenUsage/updated".into(),
+            params: json!({ "threadId": "thread-1" }),
+        };
+        assert_eq!(message_turn_id(&thread_scoped), None);
     }
 
     #[test]
