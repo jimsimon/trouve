@@ -1139,6 +1139,14 @@ enum ServerMsg {
 type Pending = Arc<Mutex<HashMap<i64, oneshot::Sender<Result<Value, String>>>>>;
 type Routes = Arc<Mutex<HashMap<String, RouteSender<ServerMsg>>>>;
 
+async fn write_reply(stdin: &Mutex<ChildStdin>, reply: Value) {
+    let mut line = serde_json::to_vec(&reply).expect("serializable");
+    line.push(b'\n');
+    let mut stdin = stdin.lock().await;
+    let _ = stdin.write_all(&line).await;
+    let _ = stdin.flush().await;
+}
+
 struct AcpServer {
     stdin: Arc<Mutex<ChildStdin>>,
     next_id: AtomicI64,
@@ -1274,11 +1282,7 @@ impl AcpServer {
                                 .insert(call_id.to_string(), params.clone());
                         }
                         let reply = json!({ "jsonrpc": "2.0", "id": msg["id"], "result": {} });
-                        let mut line = serde_json::to_vec(&reply).expect("serializable");
-                        line.push(b'\n');
-                        let mut stdin = stdin.lock().await;
-                        let _ = stdin.write_all(&line).await;
-                        let _ = stdin.flush().await;
+                        write_reply(stdin.as_ref(), reply).await;
                         continue;
                     }
                     let mut session_id = params["sessionId"].as_str().unwrap_or("").to_string();
@@ -1358,11 +1362,7 @@ impl AcpServer {
                                     "error": { "code": -32603,
                                                "message": "session event route unavailable" },
                                 });
-                                let mut line = serde_json::to_vec(&reply).expect("serializable");
-                                line.push(b'\n');
-                                let mut stdin = stdin.lock().await;
-                                let _ = stdin.write_all(&line).await;
-                                let _ = stdin.flush().await;
+                                write_reply(stdin.as_ref(), reply).await;
                             }
                         }
                     } else if has_id {
@@ -1374,11 +1374,7 @@ impl AcpServer {
                             "error": { "code": -32601,
                                        "message": format!("unsupported method {method}") },
                         });
-                        let mut line = serde_json::to_vec(&reply).expect("serializable");
-                        line.push(b'\n');
-                        let mut stdin = stdin.lock().await;
-                        let _ = stdin.write_all(&line).await;
-                        let _ = stdin.flush().await;
+                        write_reply(stdin.as_ref(), reply).await;
                     }
                 }
             }

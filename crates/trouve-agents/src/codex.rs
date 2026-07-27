@@ -642,9 +642,16 @@ fn turn_stream(
             _ = process_route => {}
         }
         if route_overloaded {
+            let _ = tx
+                .send(Err(BackendError::Protocol(format!(
+                    "app-server event backlog exceeded the per-turn limit of \
+                     {ROUTE_EVENT_BUDGET} messages"
+                ))))
+                .await;
             // Interrupting the turn clears any server-initiated approval
             // request that `process_route` may have been awaiting when the
-            // overload signal won the select.
+            // overload signal won the select. Report the overload first so
+            // an unresponsive app-server cannot suppress the stream error.
             if let Err(error) = server
                 .request(
                     "turn/interrupt",
@@ -659,12 +666,6 @@ fn turn_stream(
                     "codex: failed to interrupt overloaded turn {codex_turn_id}: {error}"
                 );
             }
-            let _ = tx
-                .send(Err(BackendError::Protocol(format!(
-                    "app-server event backlog exceeded the per-turn limit of \
-                     {ROUTE_EVENT_BUDGET} messages"
-                ))))
-                .await;
         } else if !turn_finished {
             let reason = if server.is_closed() {
                 "app-server closed before turn completed"
