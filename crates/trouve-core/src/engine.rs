@@ -353,6 +353,8 @@ pub struct Engine {
     /// Where provider configuration changes are persisted. `None` disables
     /// persistence (tests).
     config_file: Option<PathBuf>,
+    /// Serializes persistence and runtime application of title-model behavior.
+    title_model_behavior_transition: tokio::sync::Mutex<()>,
     default_model: RwLock<String>,
     /// Canonical thinking-level token inherited by modes without an
     /// override. It is translated through the selected model's schema when
@@ -372,6 +374,9 @@ pub struct Engine {
     /// A separate, CPU-only sidecar for session titles. It never displaces
     /// the local coding model from memory.
     title_model: Arc<crate::title_model::TitleModelManager>,
+    /// A timed-out generation stays tracked while its cold start finishes.
+    /// The next request cancels and joins it before starting another.
+    title_model_generation: tokio::sync::Mutex<Option<tokio::task::JoinHandle<Result<String>>>>,
     /// The built-in "local" provider, kept around so enabling re-injects
     /// the same instance after a disable removed it from the registry.
     local_provider: Arc<dyn Provider>,
@@ -695,6 +700,7 @@ impl Engine {
             // let test/embedded engines built from synthetic configs
             // clobber the user's config.toml on any provider change.
             config_file: None,
+            title_model_behavior_transition: tokio::sync::Mutex::new(()),
             default_model: RwLock::new(
                 config
                     .default_model
@@ -711,6 +717,7 @@ impl Engine {
             cli_installs: Mutex::new(HashMap::new()),
             local_manager,
             title_model,
+            title_model_generation: tokio::sync::Mutex::new(None),
             local_provider,
             local_downloads: Mutex::new(HashMap::new()),
             hardware: std::sync::OnceLock::new(),
@@ -2549,6 +2556,7 @@ impl Engine {
         &self,
         behavior: trouve_protocol::TitleModelLoadBehavior,
     ) -> Result<trouve_protocol::GitWorktreeSettings, EngineError> {
+        let _transition = self.title_model_behavior_transition.lock().await;
         {
             let mut config = self.config.lock().unwrap();
             config.title_model_load_behavior = Some(behavior);
@@ -2599,11 +2607,25 @@ impl Engine {
     ) -> trouve_protocol::GeneratedSessionTitle {
         let title_model = self.title_model.clone();
         let prompt_owned = prompt.to_string();
-        // Dropping a JoinHandle detaches rather than cancels its task. If the
-        // short request budget expires during cold startup, llama.cpp keeps
-        // warming and its guards remain alive for the next naming request.
-        let generation = tokio::spawn(async move { title_model.generate(&prompt_owned).await });
-        let generated = match tokio::time::timeout(SESSION_TITLE_TIMEOUT, generation).await {
+        let mut generation = self.title_model_generation.lock().await;
+        if let Some(previous) = generation.take() {
+            previous.abort();
+            let _ = previous.await;
+        }
+        *generation = Some(tokio::spawn(async move {
+            title_model.generate(&prompt_owned).await
+        }));
+        let result = tokio::time::timeout(
+            SESSION_TITLE_TIMEOUT,
+            generation
+                .as_mut()
+                .expect("title generation was just inserted"),
+        )
+        .await;
+        if result.is_ok() {
+            generation.take();
+        }
+        let generated = match result {
             Ok(Ok(result)) => result,
             Ok(Err(error)) => Err(anyhow!("session title task failed: {error}")),
             Err(_) => Err(anyhow!("session title generation timed out")),
