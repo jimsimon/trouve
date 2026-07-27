@@ -546,6 +546,111 @@ async fn cursor_adapter_speaks_acp_and_bridges_approvals() {
 }
 
 #[tokio::test]
+async fn cursor_adapter_keeps_other_sessions_moving_during_an_unread_burst() {
+    let tmp = tempfile::tempdir().unwrap();
+    let stub = write_stub(
+        tmp.path(),
+        "cursor-agent-burst",
+        r#"#!/bin/bash
+IFS= read -r line # initialize
+echo '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":1}}'
+
+IFS= read -r line # first session/new
+echo '{"jsonrpc":"2.0","id":2,"result":{"sessionId":"sess-1"}}'
+IFS= read -r line # first set mode
+echo '{"jsonrpc":"2.0","id":3,"result":{"configOptions":[{"id":"mode","currentValue":"agent"}]}}'
+IFS= read -r line # first set model
+echo '{"jsonrpc":"2.0","id":4,"result":{"configOptions":[{"id":"model","currentValue":"test-model"}]}}'
+IFS= read -r line # first session/prompt
+for sequence in $(seq 1 1024); do
+    printf '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"sess-1","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"%s"}}}}\n' "$sequence"
+done
+echo '{"jsonrpc":"2.0","id":5,"result":{"stopReason":"end_turn"}}'
+
+IFS= read -r line # second session/new
+echo '{"jsonrpc":"2.0","id":6,"result":{"sessionId":"sess-2"}}'
+IFS= read -r line # second set mode
+echo '{"jsonrpc":"2.0","id":7,"result":{"configOptions":[{"id":"mode","currentValue":"agent"}]}}'
+IFS= read -r line # second set model
+echo '{"jsonrpc":"2.0","id":8,"result":{"configOptions":[{"id":"model","currentValue":"test-model"}]}}'
+IFS= read -r line # second session/prompt
+echo '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"sess-2","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"second"}}}}'
+echo '{"jsonrpc":"2.0","id":9,"result":{"stopReason":"end_turn"}}'
+"#,
+    );
+    let backend = CursorBackend::new("cursor", Some(stub), None);
+    let deadline = std::time::Duration::from_secs(2);
+
+    // Leave the first stream unread. Its translated-event queue fills after
+    // 64 events, which used to let the 256-message ACP route block the one
+    // stdout reader shared by every session in this worktree.
+    let mut first = tokio::time::timeout(
+        deadline,
+        start_turn(&backend, || {
+            turn(tmp.path().to_path_buf(), None, BackendPermission::Ask)
+        }),
+    )
+    .await
+    .expect("first turn should start");
+    let mut second = tokio::time::timeout(
+        deadline,
+        start_turn(&backend, || {
+            turn(tmp.path().to_path_buf(), None, BackendPermission::Ask)
+        }),
+    )
+    .await
+    .expect("a burst on one route must not block another session");
+
+    let mut second_text = String::new();
+    while let Some(event) = second.next().await {
+        if let BackendEvent::TextDelta(text) = event.unwrap() {
+            second_text.push_str(&text);
+        }
+    }
+    assert_eq!(second_text, "second");
+
+    let mut first_chunks = 0;
+    while let Some(event) = first.next().await {
+        if matches!(event.unwrap(), BackendEvent::TextDelta(_)) {
+            first_chunks += 1;
+        }
+    }
+    assert_eq!(first_chunks, 1_024);
+}
+
+#[tokio::test]
+async fn cursor_adapter_releases_requests_when_the_transport_exits() {
+    let tmp = tempfile::tempdir().unwrap();
+    let stub = write_stub(
+        tmp.path(),
+        "cursor-agent-exits",
+        r#"#!/bin/bash
+IFS= read -r line # initialize
+echo '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":1}}'
+IFS= read -r line # session/new, then exit without responding
+"#,
+    );
+    let backend = CursorBackend::new("cursor", Some(stub), None);
+    let result = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        backend.run_turn(turn(tmp.path().to_path_buf(), None, BackendPermission::Ask)),
+    )
+    .await
+    .expect("transport EOF must release the pending session/new request");
+
+    let error = match result {
+        Err(error) => error,
+        Ok(_) => panic!("the interrupted request should fail"),
+    };
+    assert!(
+        error
+            .to_string()
+            .contains("cursor-agent closed before responding"),
+        "{error}"
+    );
+}
+
+#[tokio::test]
 async fn cursor_adapter_routes_yolo_through_guard_and_maps_read_only_to_plan() {
     let tmp = tempfile::tempdir().unwrap();
     let stub = cursor_acp_stub(tmp.path());

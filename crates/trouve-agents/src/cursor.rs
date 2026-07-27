@@ -655,7 +655,7 @@ fn config_snapshot_value(result: &Value, id: &str) -> Option<String> {
 fn turn_stream(
     server: Arc<AcpServer>,
     session_id: String,
-    mut route: mpsc::Receiver<ServerMsg>,
+    mut route: mpsc::UnboundedReceiver<ServerMsg>,
     mut prompt_rx: oneshot::Receiver<Result<Value, String>>,
     fresh_session: bool,
 ) -> impl futures::Stream<Item = Result<BackendEvent, BackendError>> {
@@ -1111,12 +1111,13 @@ enum ServerMsg {
 }
 
 type Pending = Arc<Mutex<HashMap<i64, oneshot::Sender<Result<Value, String>>>>>;
+type Routes = Arc<Mutex<HashMap<String, mpsc::UnboundedSender<ServerMsg>>>>;
 
 struct AcpServer {
     stdin: Arc<Mutex<ChildStdin>>,
     next_id: AtomicI64,
     pending: Pending,
-    routes: Arc<Mutex<HashMap<String, mpsc::Sender<ServerMsg>>>>,
+    routes: Routes,
     /// Sessions this process has created or loaded (session/prompt on an
     /// unknown session fails, so resumes go through session/load first).
     sessions: Mutex<HashSet<String>>,
@@ -1303,7 +1304,19 @@ impl AcpServer {
                         } else {
                             ServerMsg::Notification { method, params }
                         };
-                        let _ = tx.send(m).await;
+                        // This reader serves every session in the worktree,
+                        // including their JSON-RPC responses. A slow session
+                        // must not apply backpressure here and wedge the
+                        // entire shared ACP transport.
+                        if tx.send(m).is_err() {
+                            let mut routes = routes.lock().await;
+                            if routes
+                                .get(&session_id)
+                                .is_some_and(|active| active.same_channel(&tx))
+                            {
+                                routes.remove(&session_id);
+                            }
+                        }
                     } else if has_id {
                         // A request nobody can answer must still get a
                         // response — the agent blocks its turn on it.
@@ -1321,7 +1334,10 @@ impl AcpServer {
                     }
                 }
             }
+            // Release every waiter the dead transport left behind.
             closed.store(true, Ordering::Relaxed);
+            pending.lock().await.clear();
+            routes.lock().await.clear();
         });
     }
 
@@ -1456,8 +1472,8 @@ impl AcpServer {
         stdin.flush().await.map_err(BackendError::Io)
     }
 
-    async fn subscribe(&self, session_id: &str) -> mpsc::Receiver<ServerMsg> {
-        let (tx, rx) = mpsc::channel(256);
+    async fn subscribe(&self, session_id: &str) -> mpsc::UnboundedReceiver<ServerMsg> {
+        let (tx, rx) = mpsc::unbounded_channel();
         self.routes.lock().await.insert(session_id.to_string(), tx);
         rx
     }
