@@ -174,7 +174,8 @@ impl EmbeddingModel {
                 return Ok(found.clone());
             }
         }
-        let model = Self::from_files(&resolve_model_files(&id)?, id.clone())
+        let files = resolve_model_files(&id)?;
+        let model = load_model_with_refresh(&id, &files, || refresh_model_files(&id, &files))
             .with_context(|| format!("failed to load embedding model {id:?}"))?;
         let loaded = Arc::new(model);
         cache.lock().unwrap().push(loaded.clone());
@@ -574,10 +575,43 @@ fn decode_mapping(tensor: &safetensors::tensor::TensorView<'_>, rows: usize) -> 
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ModelOrigin {
+    Local,
+    Hub,
+}
+
+#[derive(Debug, Clone)]
 struct ModelFiles {
     tokenizer: PathBuf,
     model: PathBuf,
     config: PathBuf,
+    origin: ModelOrigin,
+}
+
+/// Load a resolved model and, when offered by the caller, retry once with a
+/// freshly downloaded set of files. Local model directories deliberately pass
+/// `Ok(None)` so a validation error never mutates user-owned files.
+fn load_model_with_refresh<F>(id: &str, files: &ModelFiles, refresh: F) -> Result<EmbeddingModel>
+where
+    F: FnOnce() -> Result<Option<ModelFiles>>,
+{
+    match EmbeddingModel::from_files(files, id.to_string()) {
+        Ok(model) => Ok(model),
+        Err(initial_error) => {
+            let Some(refreshed) = refresh().with_context(|| {
+                format!("cached model was invalid ({initial_error:#}); forced download also failed")
+            })?
+            else {
+                return Err(initial_error);
+            };
+            EmbeddingModel::from_files(&refreshed, id.to_string()).with_context(|| {
+                format!(
+                    "model is still invalid after a forced download; initial error: {initial_error:#}"
+                )
+            })
+        }
+    }
 }
 
 fn match_local_layout(
@@ -592,6 +626,7 @@ fn match_local_layout(
         tokenizer,
         model,
         config,
+        origin: ModelOrigin::Local,
     })
 }
 
@@ -612,9 +647,22 @@ fn resolve_model_files(id: &str) -> Result<ModelFiles> {
             .ok_or_else(|| anyhow!("no valid model layout found in {base:?}"));
     }
 
-    let api = hf_hub::api::sync::Api::new().context("hf-hub API init failed")?;
+    resolve_hub_model_files(id, false)
+}
+
+/// Resolve all Hub artifacts, optionally bypassing existing cache pointers.
+fn resolve_hub_model_files(id: &str, force_download: bool) -> Result<ModelFiles> {
+    let api = hf_hub::api::sync::ApiBuilder::from_env()
+        .build()
+        .context("hf-hub API init failed")?;
     let repo = api.model(id.to_string());
-    let fetch = |name: &str| repo.get(name);
+    let fetch = |name: &str| {
+        if force_download {
+            repo.download(name)
+        } else {
+            repo.get(name)
+        }
+    };
     let config = fetch("config.json")
         .or_else(|_| fetch("config_sentence_transformers.json"))
         .with_context(|| format!("could not load '{id}' from HuggingFace Hub"))?;
@@ -624,7 +672,36 @@ fn resolve_model_files(id: &str) -> Result<ModelFiles> {
         tokenizer,
         model,
         config,
+        origin: ModelOrigin::Hub,
     })
+}
+
+/// Remove only the Hub snapshot pointers returned by the failed load. This is
+/// necessary before `ApiRepo::download`: on Windows without symlink support,
+/// hf-hub otherwise downloads a new blob but keeps returning the old regular
+/// pointer file. Blob targets are deliberately left to hf-hub's own locking
+/// and atomic replacement.
+fn invalidate_hub_model_files(files: &ModelFiles) -> Result<()> {
+    debug_assert_eq!(files.origin, ModelOrigin::Hub);
+    for path in [&files.config, &files.tokenizer, &files.model] {
+        match std::fs::remove_file(path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("failed to invalidate cached model file {path:?}"));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn refresh_model_files(id: &str, files: &ModelFiles) -> Result<Option<ModelFiles>> {
+    if files.origin == ModelOrigin::Local {
+        return Ok(None);
+    }
+    invalidate_hub_model_files(files)?;
+    resolve_hub_model_files(id, true).map(Some)
 }
 
 #[cfg(test)]
@@ -685,6 +762,7 @@ mod tests {
             tokenizer: dir.join("tokenizer.json"),
             model: dir.join("model.safetensors"),
             config: dir.join("config.json"),
+            origin: ModelOrigin::Local,
         }
     }
 
@@ -694,6 +772,64 @@ mod tests {
         let files = write_model(dir.path(), &["alpha", "beta"], 3, None);
         let model = EmbeddingModel::from_files(&files, "test".into()).unwrap();
         assert_eq!(model.encode_one("alpha beta").len(), 2);
+    }
+
+    #[test]
+    fn retries_invalid_cached_model_with_refreshed_files() {
+        let cached = tempfile::tempdir().unwrap();
+        let refreshed = tempfile::tempdir().unwrap();
+        let cached_files = write_model(cached.path(), &["alpha"], 2, None);
+        std::fs::write(&cached_files.model, b"incomplete").unwrap();
+        let refreshed_files = write_model(refreshed.path(), &["alpha"], 2, None);
+
+        let mut attempted_refresh = false;
+        let model = load_model_with_refresh("test", &cached_files, || {
+            attempted_refresh = true;
+            Ok(Some(refreshed_files))
+        })
+        .unwrap();
+
+        assert!(attempted_refresh);
+        assert_eq!(model.encode_one("alpha").len(), 2);
+    }
+
+    #[test]
+    fn valid_cached_model_does_not_refresh() {
+        let cached = tempfile::tempdir().unwrap();
+        let cached_files = write_model(cached.path(), &["alpha"], 2, None);
+
+        load_model_with_refresh("test", &cached_files, || {
+            panic!("valid cached model should not be refreshed")
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn invalid_local_model_is_not_replaced() {
+        let cached = tempfile::tempdir().unwrap();
+        let cached_files = write_model(cached.path(), &["alpha"], 2, None);
+        let incomplete = b"incomplete";
+        std::fs::write(&cached_files.model, incomplete).unwrap();
+
+        let error = EmbeddingModel::load(cached.path().to_str())
+            .map(|_| ())
+            .unwrap_err();
+
+        assert!(format!("{error:#}").contains("safetensors"), "{error:#}");
+        assert_eq!(std::fs::read(&cached_files.model).unwrap(), incomplete);
+    }
+
+    #[test]
+    fn invalidating_hub_files_removes_snapshot_pointers() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut files = write_model(dir.path(), &["alpha"], 2, None);
+        files.origin = ModelOrigin::Hub;
+
+        invalidate_hub_model_files(&files).unwrap();
+
+        assert!(!files.config.exists());
+        assert!(!files.tokenizer.exists());
+        assert!(!files.model.exists());
     }
 
     #[test]

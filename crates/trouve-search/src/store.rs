@@ -1,11 +1,10 @@
 //! Content-addressed chunk store.
 //!
-//! The central design change from upstream Semble: instead of an all-or-nothing
-//! cached index per path, every per-file artifact (chunks, embedding rows, BM25
-//! token lists) is stored keyed by *content hash* in a per-repository store.
-//! All branches and worktrees of one git repository share a store, so branch
-//! switches and incremental edits only pay for content that has never been
-//! embedded before.
+//! Every per-file artifact (chunks, embedding rows, BM25 token lists) is stored
+//! by *content hash* in a per-repository store. Unlike Semble's checkout-local
+//! partial reuse, all branches and worktrees of one git repository share the
+//! store, so branch switches and incremental edits only pay for content that
+//! has never been embedded before.
 
 use std::collections::HashSet;
 use std::fs;
@@ -66,6 +65,60 @@ pub struct FileEntry {
     pub tokens: crate::tokens::TokenDocs,
 }
 
+impl FileEntry {
+    /// Whether every flattened component has exactly one row/document per
+    /// chunk and all nested offsets are safe to dereference.
+    fn is_well_formed(&self) -> bool {
+        let n_chunks = self.chunks.len();
+        let dim = self.dim as usize;
+        if (n_chunks > 0 && dim == 0)
+            || n_chunks
+                .checked_mul(dim)
+                .is_none_or(|len| len != self.embeddings.len())
+            || self.embeddings.iter().any(|value| !value.is_finite())
+            || self.tokens.doc_ends.len() != n_chunks
+        {
+            return false;
+        }
+
+        let Ok(blob_text) = std::str::from_utf8(&self.tokens.blob) else {
+            return false;
+        };
+        let Ok(blob_len) = u32::try_from(self.tokens.blob.len()) else {
+            return false;
+        };
+        let mut previous = 0u32;
+        for &end in &self.tokens.token_ends {
+            // Empty UTF-8 tokens are supported by TokenDocs' public builder.
+            if end < previous || end > blob_len || !blob_text.is_char_boundary(end as usize) {
+                return false;
+            }
+            previous = end;
+        }
+        if previous != blob_len {
+            return false;
+        }
+
+        let Ok(token_count) = u32::try_from(self.tokens.token_ends.len()) else {
+            return false;
+        };
+        previous = 0;
+        for &end in &self.tokens.doc_ends {
+            // Empty token documents are valid, hence non-decreasing rather
+            // than strictly increasing offsets here.
+            if end < previous || end > token_count {
+                return false;
+            }
+            previous = end;
+        }
+        previous == token_count
+            && self
+                .chunks
+                .iter()
+                .all(|chunk| chunk.start_line > 0 && chunk.end_line >= chunk.start_line)
+    }
+}
+
 /// A content-addressed store rooted in the trouve cache folder, one per
 /// repository identity (git common dir, remote URL, or plain path).
 pub struct ChunkStore {
@@ -117,13 +170,14 @@ impl ChunkStore {
     pub fn get(&self, key: &str) -> Option<FileEntry> {
         let path = self.entry_path(key);
         let bytes = fs::read(path).ok()?;
-        bincode::serde::decode_from_slice(&bytes, bincode::config::standard())
-            .ok()
-            .map(|(entry, _)| entry)
+        let (entry, consumed): (FileEntry, usize) =
+            bincode::serde::decode_from_slice(&bytes, bincode::config::standard()).ok()?;
+        (consumed == bytes.len() && entry.is_well_formed()).then_some(entry)
     }
 
     /// Persist an entry atomically (write to temp file, then rename).
     pub fn put(&self, key: &str, entry: &FileEntry) -> Result<()> {
+        anyhow::ensure!(entry.is_well_formed(), "refusing malformed store entry");
         let path = self.entry_path(key);
         fs::create_dir_all(path.parent().unwrap())?;
         let bytes = bincode::serde::encode_to_vec(entry, bincode::config::standard())?;
@@ -307,6 +361,87 @@ mod tests {
     }
 
     #[test]
+    fn malformed_entries_are_cache_misses() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = ChunkStore::open_at(dir.path().join("s")).unwrap();
+        let valid = FileEntry {
+            chunks: vec![StoredChunk {
+                content: "fn main() {}".into(),
+                start_line: 1,
+                end_line: 1,
+            }],
+            embeddings: vec![0.1, 0.2],
+            dim: 2,
+            tokens: crate::tokens::TokenDocs::from_nested(&[vec!["fn".into(), "main".into()]]),
+        };
+
+        let mut wrong_embedding_count = valid.clone();
+        wrong_embedding_count.embeddings.pop();
+        let mut missing_token_doc = valid.clone();
+        missing_token_doc.tokens.doc_ends.clear();
+        let mut bad_token_offset = valid.clone();
+        bad_token_offset.tokens.token_ends[0] = u32::MAX;
+        let mut bad_line_range = valid;
+        bad_line_range.chunks[0].end_line = 0;
+
+        for (i, malformed) in [
+            wrong_embedding_count,
+            missing_token_doc,
+            bad_token_offset,
+            bad_line_range,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let key = ChunkStore::entry_key(&format!("b3:bad-{i}"), Some("rust"), "model-x");
+            let path = store.entry_path(&key);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            let bytes =
+                bincode::serde::encode_to_vec(&malformed, bincode::config::standard()).unwrap();
+            fs::write(path, bytes).unwrap();
+
+            assert!(store.get(&key).is_none(), "malformed case {i} was accepted");
+            assert!(store.put(&key, &malformed).is_err());
+        }
+    }
+
+    #[test]
+    fn empty_entry_may_retain_batch_dimension() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = ChunkStore::open_at(dir.path().join("s")).unwrap();
+        let entry = FileEntry {
+            dim: 256,
+            ..FileEntry::default()
+        };
+        let key = ChunkStore::entry_key("b3:empty", Some("rust"), "model-x");
+        store.put(&key, &entry).unwrap();
+        assert!(store.get(&key).is_some());
+    }
+
+    #[test]
+    fn utf8_and_empty_tokens_roundtrip() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = ChunkStore::open_at(dir.path().join("s")).unwrap();
+        let entry = FileEntry {
+            chunks: vec![StoredChunk {
+                content: "fn café() {}".into(),
+                start_line: 1,
+                end_line: 1,
+            }],
+            embeddings: vec![1.0],
+            dim: 1,
+            tokens: crate::tokens::TokenDocs::from_nested(&[vec!["".into(), "café".into()]]),
+        };
+        let key = ChunkStore::entry_key("b3:utf8", Some("rust"), "model-x");
+
+        store.put(&key, &entry).unwrap();
+        let loaded = store.get(&key).unwrap();
+
+        assert_eq!(loaded.tokens.token(0), b"");
+        assert_eq!(loaded.tokens.token(1), "café".as_bytes());
+    }
+
+    #[test]
     fn keys_differ_by_language_and_model() {
         let a = ChunkStore::entry_key("b3:abc", Some("rust"), "m1");
         let b = ChunkStore::entry_key("b3:abc", Some("python"), "m1");
@@ -326,7 +461,7 @@ mod tests {
             }],
             embeddings: vec![0.5],
             dim: 1,
-            tokens: crate::tokens::TokenDocs::default(),
+            tokens: crate::tokens::TokenDocs::from_nested(&[Vec::new()]),
         }
     }
 

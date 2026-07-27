@@ -22,7 +22,7 @@
 //! bm25 doc lengths u32
 //! ```
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::Write;
 use std::marker::PhantomData;
 use std::ops::Deref;
@@ -157,6 +157,22 @@ struct SnapshotMeta {
 
 fn align8(n: usize) -> usize {
     (n + 7) & !7
+}
+
+fn checked_align8(n: usize) -> Result<usize> {
+    Ok(n.checked_add(7)
+        .context("snapshot section alignment overflow")?
+        & !7)
+}
+
+fn checked_usize(value: u64, field: &str) -> Result<usize> {
+    usize::try_from(value).with_context(|| format!("snapshot {field} does not fit in memory"))
+}
+
+fn checked_bytes(count: usize, item_size: usize, section: &str) -> Result<usize> {
+    count
+        .checked_mul(item_size)
+        .with_context(|| format!("snapshot {section} length overflow"))
 }
 
 fn snapshot_path(dir: &Path, manifest_hash: &[u8; 32]) -> PathBuf {
@@ -363,12 +379,19 @@ impl RawSnapshot {
         {
             bail!("snapshot hash mismatch");
         }
-        let meta_len = u64::from_le_bytes(map[40..48].try_into().unwrap()) as usize;
-        need(48 + meta_len)?;
-        let (meta, _): (SnapshotMeta, usize) = bincode::serde::decode_from_slice(
-            &map[48..48 + meta_len],
-            bincode::config::standard(),
+        let meta_len = checked_usize(
+            u64::from_le_bytes(map[40..48].try_into().unwrap()),
+            "metadata length",
         )?;
+        let meta_end = 48usize
+            .checked_add(meta_len)
+            .context("snapshot metadata length overflow")?;
+        need(meta_end)?;
+        let (meta, consumed): (SnapshotMeta, usize) =
+            bincode::serde::decode_from_slice(&map[48..meta_end], bincode::config::standard())?;
+        if consumed != meta_len {
+            bail!("snapshot metadata has trailing bytes");
+        }
         if meta.version != SNAPSHOT_VERSION {
             bail!("snapshot version mismatch");
         }
@@ -381,27 +404,55 @@ impl RawSnapshot {
             bail!("snapshot store parameters mismatch");
         }
 
-        let mut cursor = align8(48 + meta_len);
+        let mut cursor = checked_align8(meta_end)?;
         let mut section = |len_bytes: usize| -> Result<usize> {
             let offset = cursor;
-            need(offset + len_bytes)?;
-            cursor = align8(offset + len_bytes);
+            let end = offset
+                .checked_add(len_bytes)
+                .context("snapshot section length overflow")?;
+            need(end)?;
+            cursor = checked_align8(end)?;
             Ok(offset)
         };
 
-        let n_chunks = meta.n_chunks as usize;
-        let dim = meta.dim as usize;
-        let n_offsets = meta.n_terms as usize + 1;
-        let records_off = section(n_chunks * std::mem::size_of::<ChunkRecord>())?;
-        let texts_off = section(meta.texts_len as usize)?;
-        let embed_off = section(n_chunks * dim * 4)?;
-        let term_blob_off = section(meta.term_blob_len as usize)?;
-        let term_offsets_off = section(n_offsets * 4)?;
-        let posting_offsets_off = section(n_offsets * 8)?;
-        let postings_off = section(meta.n_postings as usize * std::mem::size_of::<Posting>())?;
-        let doc_lengths_off = section(meta.num_docs as usize * 4)?;
+        let n_chunks = checked_usize(meta.n_chunks, "chunk count")?;
+        let dim = checked_usize(meta.dim, "embedding dimension")?;
+        let n_terms = checked_usize(meta.n_terms, "term count")?;
+        let n_offsets = n_terms
+            .checked_add(1)
+            .context("snapshot offset count overflow")?;
+        let n_postings = checked_usize(meta.n_postings, "posting count")?;
+        let num_docs = checked_usize(meta.num_docs, "document count")?;
+        let texts_len = checked_usize(meta.texts_len, "text length")?;
+        let term_blob_len = checked_usize(meta.term_blob_len, "term blob length")?;
+        let records_off = section(checked_bytes(
+            n_chunks,
+            std::mem::size_of::<ChunkRecord>(),
+            "chunk records",
+        )?)?;
+        let texts_off = section(texts_len)?;
+        let vector_values = n_chunks
+            .checked_mul(dim)
+            .context("snapshot embedding value count overflow")?;
+        let embed_off = section(checked_bytes(vector_values, 4, "embeddings")?)?;
+        let term_blob_off = section(term_blob_len)?;
+        let term_offsets_off = section(checked_bytes(n_offsets, 4, "term offsets")?)?;
+        let posting_offsets_off = section(checked_bytes(n_offsets, 8, "posting offsets")?)?;
+        let postings_off = section(checked_bytes(
+            n_postings,
+            std::mem::size_of::<Posting>(),
+            "postings",
+        )?)?;
+        let doc_lengths_len = checked_bytes(num_docs, 4, "document lengths")?;
+        let doc_lengths_off = section(doc_lengths_len)?;
+        let file_end = doc_lengths_off
+            .checked_add(doc_lengths_len)
+            .context("snapshot file length overflow")?;
+        if file_end != map.len() {
+            bail!("snapshot has trailing bytes");
+        }
 
-        Ok(RawSnapshot {
+        let snapshot = RawSnapshot {
             map,
             meta,
             records_off,
@@ -412,7 +463,9 @@ impl RawSnapshot {
             posting_offsets_off,
             postings_off,
             doc_lengths_off,
-        })
+        };
+        snapshot.validate_structure()?;
+        Ok(snapshot)
     }
 
     pub fn manifest(&self) -> &[ManifestEntry] {
@@ -452,25 +505,164 @@ impl RawSnapshot {
         self.meta.n_terms as usize
     }
 
-    fn term_bytes(&self, i: usize) -> &[u8] {
-        let offsets: &[u32] = bytemuck::cast_slice(
+    fn term_offsets(&self) -> &[u32] {
+        bytemuck::cast_slice(
             &self.map[self.term_offsets_off..self.term_offsets_off + (self.n_terms() + 1) * 4],
-        );
+        )
+    }
+
+    fn posting_offsets(&self) -> &[u64] {
+        bytemuck::cast_slice(
+            &self.map
+                [self.posting_offsets_off..self.posting_offsets_off + (self.n_terms() + 1) * 8],
+        )
+    }
+
+    fn postings(&self) -> &[Posting] {
+        bytemuck::cast_slice(
+            &self.map[self.postings_off
+                ..self.postings_off
+                    + self.meta.n_postings as usize * std::mem::size_of::<Posting>()],
+        )
+    }
+
+    fn term_bytes(&self, i: usize) -> &[u8] {
+        let offsets = self.term_offsets();
         &self.map
             [self.term_blob_off + offsets[i] as usize..self.term_blob_off + offsets[i + 1] as usize]
     }
 
     fn term_postings(&self, i: usize) -> &[Posting] {
-        let offsets: &[u64] = bytemuck::cast_slice(
-            &self.map
-                [self.posting_offsets_off..self.posting_offsets_off + (self.n_terms() + 1) * 8],
-        );
-        let all: &[Posting] = bytemuck::cast_slice(
-            &self.map[self.postings_off
-                ..self.postings_off
-                    + self.meta.n_postings as usize * std::mem::size_of::<Posting>()],
-        );
+        let offsets = self.posting_offsets();
+        let all = self.postings();
         &all[offsets[i] as usize..offsets[i + 1] as usize]
+    }
+
+    /// Validate relationships bincode and section bounds cannot express.
+    /// These checks keep corrupt-but-decodable cache files from reaching
+    /// unchecked zero-copy slices in query and patch code.
+    fn validate_structure(&self) -> Result<()> {
+        let n_chunks = self.meta.n_chunks as usize;
+        if self.meta.num_docs != self.meta.n_chunks {
+            bail!("snapshot chunk/document count mismatch");
+        }
+        if n_chunks > 0 && self.meta.dim == 0 {
+            bail!("snapshot has chunks but no embedding dimension");
+        }
+
+        let mut file_paths = HashSet::with_capacity(self.meta.files.len());
+        if self
+            .meta
+            .files
+            .iter()
+            .any(|path| !file_paths.insert(path.as_str()))
+        {
+            bail!("snapshot contains duplicate file paths");
+        }
+
+        let records = self.records();
+        let texts = self.texts();
+        let mut expected_text_off = 0u64;
+        let mut referenced_files = vec![false; self.meta.files.len()];
+        for record in records {
+            if record.file_id as usize >= self.meta.files.len() {
+                bail!("snapshot file_id out of range");
+            }
+            referenced_files[record.file_id as usize] = true;
+            if record.text_off != expected_text_off {
+                bail!("snapshot text records are not contiguous");
+            }
+            expected_text_off = record
+                .text_off
+                .checked_add(u64::from(record.text_len))
+                .context("snapshot text range overflow")?;
+            if expected_text_off > self.meta.texts_len {
+                bail!("snapshot text range out of bounds");
+            }
+            let start = record.text_off as usize;
+            let end = expected_text_off as usize;
+            std::str::from_utf8(&texts[start..end]).context("snapshot text not utf-8")?;
+            if record.start_line == 0 || record.end_line < record.start_line {
+                bail!("snapshot chunk line range is invalid");
+            }
+        }
+        if expected_text_off != self.meta.texts_len {
+            bail!("snapshot text records do not cover the text blob");
+        }
+        if referenced_files.iter().any(|referenced| !referenced) {
+            bail!("snapshot file table contains an unreferenced path");
+        }
+
+        let mut manifest_paths = HashSet::with_capacity(self.meta.manifest.len());
+        let mut ranges: Vec<(usize, usize, &str)> = Vec::new();
+        for entry in &self.meta.manifest {
+            if !manifest_paths.insert(entry.rel_path.as_str()) {
+                bail!("snapshot manifest contains duplicate paths");
+            }
+            let start = entry.first_row as usize;
+            let end = start
+                .checked_add(entry.n_rows as usize)
+                .context("snapshot manifest row range overflow")?;
+            if end > n_chunks {
+                bail!("snapshot manifest row range out of bounds");
+            }
+            if entry.n_rows > 0 {
+                ranges.push((start, end, entry.rel_path.as_str()));
+            }
+        }
+        ranges.sort_unstable_by_key(|range| range.0);
+        let mut expected_row = 0usize;
+        for (start, end, path) in ranges {
+            if start != expected_row {
+                bail!("snapshot manifest row ranges overlap or have gaps");
+            }
+            for record in &records[start..end] {
+                if self.meta.files[record.file_id as usize] != path {
+                    bail!("snapshot manifest path does not own its chunk rows");
+                }
+            }
+            expected_row = end;
+        }
+        if expected_row != n_chunks {
+            bail!("snapshot manifest does not cover every chunk row");
+        }
+
+        let term_offsets = self.term_offsets();
+        if term_offsets.first() != Some(&0)
+            || term_offsets.last().copied().map(u64::from) != Some(self.meta.term_blob_len)
+            || term_offsets.windows(2).any(|pair| pair[0] > pair[1])
+        {
+            bail!("snapshot term offsets are invalid");
+        }
+        let mut previous_term: Option<&[u8]> = None;
+        for term_id in 0..self.n_terms() {
+            let term = self.term_bytes(term_id);
+            if previous_term.is_some_and(|previous| previous >= term) {
+                bail!("snapshot terms are not strictly sorted");
+            }
+            previous_term = Some(term);
+        }
+
+        let posting_offsets = self.posting_offsets();
+        if posting_offsets.first() != Some(&0)
+            || posting_offsets.last().copied() != Some(self.meta.n_postings)
+            || posting_offsets.windows(2).any(|pair| pair[0] > pair[1])
+        {
+            bail!("snapshot posting offsets are invalid");
+        }
+        for term_id in 0..self.n_terms() {
+            let mut previous_doc: Option<u32> = None;
+            for posting in self.term_postings(term_id) {
+                if u64::from(posting.doc) >= self.meta.num_docs || posting.tf == 0 {
+                    bail!("snapshot posting is invalid");
+                }
+                if previous_doc.is_some_and(|previous| previous >= posting.doc) {
+                    bail!("snapshot postings are not strictly sorted");
+                }
+                previous_doc = Some(posting.doc);
+            }
+        }
+        Ok(())
     }
 
     /// Materialize a chunk from its row index.
@@ -884,6 +1076,34 @@ mod tests {
         (chunks, dense, bm25)
     }
 
+    fn rewrite_meta(path: &Path, edit: impl FnOnce(&mut SnapshotMeta)) {
+        let mut bytes = std::fs::read(path).unwrap();
+        let meta_len = u64::from_le_bytes(bytes[40..48].try_into().unwrap()) as usize;
+        let (mut meta, _): (SnapshotMeta, usize) = bincode::serde::decode_from_slice(
+            &bytes[48..48 + meta_len],
+            bincode::config::standard(),
+        )
+        .unwrap();
+        edit(&mut meta);
+        let encoded = bincode::serde::encode_to_vec(&meta, bincode::config::standard()).unwrap();
+        assert_eq!(encoded.len(), meta_len, "test mutation changed meta size");
+        bytes[48..48 + meta_len].copy_from_slice(&encoded);
+        std::fs::write(path, bytes).unwrap();
+    }
+
+    fn rewrite_sections(path: &Path, hash: &[u8; 32], edit: impl FnOnce(&RawSnapshot, &mut [u8])) {
+        let raw = RawSnapshot::open(path, Some(hash)).unwrap();
+        let mut bytes = std::fs::read(path).unwrap();
+        edit(&raw, &mut bytes);
+        drop(raw);
+        std::fs::write(path, bytes).unwrap();
+    }
+
+    fn assert_rejected(dir: &Path, path: &Path, hash: &[u8; 32]) {
+        assert!(RawSnapshot::open(path, Some(hash)).is_err());
+        assert!(load(dir, hash, "model-x").is_none());
+    }
+
     #[test]
     fn roundtrips_chunks_dense_and_bm25() {
         let dir = tempfile::tempdir().unwrap();
@@ -935,6 +1155,81 @@ mod tests {
     }
 
     #[test]
+    fn rejects_cross_section_and_manifest_mismatches() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let count_hash = [10u8; 32];
+        save_sample(dir.path(), &count_hash);
+        let count_path = snapshot_path(dir.path(), &count_hash);
+        rewrite_meta(&count_path, |meta| meta.num_docs -= 1);
+        assert_rejected(dir.path(), &count_path, &count_hash);
+
+        let manifest_hash = [11u8; 32];
+        save_sample(dir.path(), &manifest_hash);
+        let manifest_path = snapshot_path(dir.path(), &manifest_hash);
+        rewrite_meta(&manifest_path, |meta| {
+            // The first sorted manifest entry originally owns row 2. Moving
+            // it to row 0 overlaps the other entry and leaves row 2 uncovered.
+            meta.manifest[0].first_row = 0;
+        });
+        assert_rejected(dir.path(), &manifest_path, &manifest_hash);
+    }
+
+    #[test]
+    fn zero_row_manifest_roundtrips_but_trailing_bytes_do_not() {
+        let dir = tempfile::tempdir().unwrap();
+        let hash = [14u8; 32];
+        let (chunks, dense, bm25) = sample();
+        let mut manifest = manifest_for(&chunks);
+        manifest.push(ManifestEntry {
+            rel_path: "empty.rs".into(),
+            content_key: "b3:empty".into(),
+            first_row: chunks.len() as u32,
+            n_rows: 0,
+        });
+        let path = save(
+            dir.path(),
+            &hash,
+            "model-x",
+            &["code".to_string()],
+            manifest,
+            &chunks,
+            &dense,
+            &bm25,
+        )
+        .unwrap();
+        assert!(load(dir.path(), &hash, "model-x").is_some());
+
+        let mut bytes = std::fs::read(&path).unwrap();
+        bytes.push(0);
+        std::fs::write(&path, bytes).unwrap();
+        assert_rejected(dir.path(), &path, &hash);
+    }
+
+    #[test]
+    fn rejects_invalid_bm25_offsets_and_posting_docs() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let offset_hash = [12u8; 32];
+        save_sample(dir.path(), &offset_hash);
+        let offset_path = snapshot_path(dir.path(), &offset_hash);
+        rewrite_sections(&offset_path, &offset_hash, |raw, bytes| {
+            let last = raw.term_offsets_off + raw.n_terms() * std::mem::size_of::<u32>();
+            bytes[last..last + 4].copy_from_slice(&u32::MAX.to_le_bytes());
+        });
+        assert_rejected(dir.path(), &offset_path, &offset_hash);
+
+        let posting_hash = [13u8; 32];
+        save_sample(dir.path(), &posting_hash);
+        let posting_path = snapshot_path(dir.path(), &posting_hash);
+        rewrite_sections(&posting_path, &posting_hash, |raw, bytes| {
+            assert!(raw.meta.n_postings > 0);
+            bytes[raw.postings_off..raw.postings_off + 4].copy_from_slice(&u32::MAX.to_le_bytes());
+        });
+        assert_rejected(dir.path(), &posting_path, &posting_hash);
+    }
+
+    #[test]
     fn prunes_old_snapshots() {
         let dir = tempfile::tempdir().unwrap();
         for i in 0..(KEEP_SNAPSHOTS as u8 + 3) {
@@ -980,6 +1275,45 @@ mod tests {
                 .iter()
                 .all(|s| *s == 0.0)
         );
+    }
+
+    #[test]
+    fn empty_terms_and_posting_ranges_roundtrip() {
+        let dir = tempfile::tempdir().unwrap();
+        let chunks = vec![Chunk {
+            content: "x".into(),
+            file_path: "a.rs".into(),
+            start_line: 1,
+            end_line: 1,
+            language: None,
+        }];
+        let dense = DenseIndex::new(vec![vec![1.0]]);
+        let indexes = [
+            Bm25Index::build(&[vec![String::new()]]),
+            Bm25Index::from_parts(
+                vec![b'a'].into(),
+                vec![0, 1].into(),
+                vec![0, 0].into(),
+                Vec::<Posting>::new().into(),
+                vec![0].into(),
+            ),
+        ];
+
+        for (i, bm25) in indexes.into_iter().enumerate() {
+            let hash = [20 + i as u8; 32];
+            save(
+                dir.path(),
+                &hash,
+                "m",
+                &["code".to_string()],
+                manifest_for(&chunks),
+                &chunks,
+                &dense,
+                &bm25,
+            )
+            .unwrap();
+            assert!(load(dir.path(), &hash, "m").is_some());
+        }
     }
 
     #[test]
