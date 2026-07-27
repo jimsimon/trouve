@@ -14,6 +14,10 @@ slint::include_modules!();
 use controller::UiCommand;
 use slint::{ComponentHandle, Model};
 
+fn provider_fields_valid(mut fields: impl Iterator<Item = ProviderConfigFieldItem>) -> bool {
+    fields.all(|field| !field.required || !field.value.is_empty() || field.has_saved_value)
+}
+
 /// Indices into `items` fuzzy-matching `query`, best score first (stable by
 /// position on ties). An empty query keeps the full list in its own order.
 fn fuzzy_match_indices(items: &[String], query: &str) -> Vec<i32> {
@@ -944,7 +948,7 @@ fn main() -> anyhow::Result<()> {
     // --- settings screen callbacks -------------------------------------------
     let provider_fields = std::rc::Rc::new(std::cell::RefCell::new(std::collections::BTreeMap::<
         String,
-        (String, bool, bool, bool),
+        (String, bool),
     >::new()));
     {
         let provider_fields = provider_fields.clone();
@@ -955,9 +959,6 @@ fn main() -> anyhow::Result<()> {
                 field.0 = value;
                 field.1 = secret;
             }
-            fields
-                .values()
-                .all(|(value, _, required, saved)| !required || !value.is_empty() || *saved)
         });
     }
     {
@@ -966,21 +967,11 @@ fn main() -> anyhow::Result<()> {
             let mut fields = provider_fields.borrow_mut();
             fields.clear();
             for item in items.iter() {
-                fields.insert(
-                    item.id.to_string(),
-                    (
-                        item.value.to_string(),
-                        item.secret,
-                        item.required,
-                        item.has_saved_value,
-                    ),
-                );
+                fields.insert(item.id.to_string(), (item.value.to_string(), item.secret));
             }
-            fields
-                .values()
-                .all(|(value, _, required, saved)| !required || !value.is_empty() || *saved)
         });
     }
+    window.on_provider_fields_valid(|items| provider_fields_valid(items.iter()));
     {
         let tx = tx.clone();
         let provider_fields = provider_fields.clone();
@@ -988,7 +979,7 @@ fn main() -> anyhow::Result<()> {
             let fields = std::mem::take(&mut *provider_fields.borrow_mut());
             let mut settings = std::collections::BTreeMap::new();
             let mut secret_values = std::collections::BTreeMap::new();
-            for (name, (value, secret, _, _)) in fields {
+            for (name, (value, secret)) in fields {
                 if secret {
                     if !value.is_empty() {
                         secret_values.insert(name, value);
@@ -1478,9 +1469,41 @@ fn pr_group_drag_id(data: &slint::DataTransfer) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        at_token, chat_file_link, pr_group_drag_id, pr_group_drag_payload, workspace_drag_id,
-        workspace_drag_payload,
+        ProviderConfigFieldItem, at_token, chat_file_link, pr_group_drag_id, pr_group_drag_payload,
+        provider_fields_valid, workspace_drag_id, workspace_drag_payload,
     };
+
+    fn provider_field(
+        required: bool,
+        value: &str,
+        has_saved_value: bool,
+    ) -> ProviderConfigFieldItem {
+        ProviderConfigFieldItem {
+            id: "AZURE_OPENAI_DEPLOYMENT_NAME".into(),
+            label: "Deployment name".into(),
+            description: Default::default(),
+            required,
+            secret: false,
+            value: value.into(),
+            has_saved_value,
+        }
+    }
+
+    #[test]
+    fn provider_form_requires_values_only_for_unsatisfied_required_fields() {
+        assert!(!provider_fields_valid(
+            vec![provider_field(true, "", false)].into_iter()
+        ));
+        assert!(provider_fields_valid(
+            vec![provider_field(true, "gpt-5", false)].into_iter()
+        ));
+        assert!(provider_fields_valid(
+            vec![provider_field(false, "", false)].into_iter()
+        ));
+        assert!(provider_fields_valid(
+            vec![provider_field(true, "", true)].into_iter()
+        ));
+    }
 
     #[test]
     fn codex_file_links_open_in_the_files_panel() {

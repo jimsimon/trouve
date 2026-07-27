@@ -1538,8 +1538,9 @@ export component AppWindow inherits Window {
     callback mcp-logs-closed();
     callback provider-saved(/* id */ string, /* kind */ string,
                             /* base-url */ string, /* api-key */ string);
-    callback provider-field-changed(string, string, bool) -> bool;
-    callback provider-fields-reset([ProviderConfigFieldItem]) -> bool;
+    callback provider-field-changed(string, string, bool);
+    callback provider-fields-reset([ProviderConfigFieldItem]);
+    pure callback provider-fields-valid([ProviderConfigFieldItem]) -> bool;
     callback provider-deleted(string);
     callback provider-login(/* id */ string, /* kind */ string);
     callback provider-login-response(/* id */ string, /* response */ string);
@@ -5372,9 +5373,10 @@ export component AppWindow inherits Window {
             root.provider-saved(id, kind, url, key);
         }
         provider-field-changed(id, value, secret) => {
-            root.provider-field-changed(id, value, secret)
+            root.provider-field-changed(id, value, secret);
         }
-        provider-fields-reset(fields) => { root.provider-fields-reset(fields) }
+        provider-fields-reset(fields) => { root.provider-fields-reset(fields); }
+        provider-fields-valid(fields) => { root.provider-fields-valid(fields) }
         provider-deleted(id) => { root.provider-deleted(id); }
         provider-login(id, kind) => { root.provider-login(id, kind); }
         provider-login-response(id, response) => {

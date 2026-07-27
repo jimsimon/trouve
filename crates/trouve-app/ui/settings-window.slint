@@ -344,7 +344,6 @@ export component SettingsScreen inherits Rectangle {
     in-out property <string> form-hint: "";
     in-out property <bool> form-warning: false;
     in-out property <[ProviderConfigFieldItem]> form-config-fields;
-    in-out property <bool> form-config-valid: true;
     // Index into known-provider-names: a preset (fields hidden, prefilled
     // from known-providers[index]) or the trailing "Custom" entry (id/kind/
     // url fields shown). The controller points it at Custom on load.
@@ -395,8 +394,9 @@ export component SettingsScreen inherits Rectangle {
     callback provider-saved(/* id */ string, /* kind */ string,
                             /* base-url */ string, /* api-key */ string);
     callback provider-field-changed(/* id */ string, /* value */ string,
-                                    /* secret */ bool) -> bool;
-    callback provider-fields-reset([ProviderConfigFieldItem]) -> bool;
+                                    /* secret */ bool);
+    callback provider-fields-reset([ProviderConfigFieldItem]);
+    pure callback provider-fields-valid([ProviderConfigFieldItem]) -> bool;
     callback provider-deleted(string);
     callback provider-login(/* id */ string, /* kind */ string);
     callback provider-login-response(/* id */ string, /* response */ string);
@@ -782,8 +782,7 @@ export component SettingsScreen inherits Rectangle {
                                                 text: "Edit";
                                                 clicked => {
                                                     root.form-config-fields = provider.config-fields;
-                                                    root.form-config-valid =
-                                                        root.provider-fields-reset(provider.config-fields);
+                                                    root.provider-fields-reset(provider.config-fields);
                                                     root.preset-index = root.active-known-providers.length;
                                                     root.form-id = provider.id;
                                                     root.form-base-url = provider.base-url;
@@ -825,8 +824,7 @@ export component SettingsScreen inherits Rectangle {
                                         root.form-warning = root.active-known-providers[root.preset-index].experimental;
                                         root.form-config-fields =
                                             root.active-known-providers[root.preset-index].config-fields;
-                                        root.form-config-valid = root.provider-fields-reset(
-                                            root.form-config-fields);
+                                        root.provider-fields-reset(root.form-config-fields);
                                         root.form-hint =
                                             root.active-known-providers[root.preset-index].experimental
                                             ? "Experimental: talks to an undocumented vendor endpoint using your `codex login` token. OpenAI may break or restrict it at any time — use at your own risk. Save, then log in via the Codex CLI."
@@ -845,8 +843,7 @@ export component SettingsScreen inherits Rectangle {
                                                                 : "No API key needed — just save.")))));
                                     } else {
                                         root.form-config-fields = [];
-                                        root.form-config-valid =
-                                            root.provider-fields-reset(root.form-config-fields);
+                                        root.provider-fields-reset(root.form-config-fields);
                                         root.form-kind = root.form-kind-index == 1 ? "anthropic" : "openai-compat";
                                         root.form-hint = "";
                                         root.form-warning = false;
@@ -883,12 +880,11 @@ export component SettingsScreen inherits Rectangle {
                                 }
                                 LineEdit {
                                     horizontal-stretch: 1;
-                                    text: field.value;
+                                    text <=> field.value;
                                     placeholder-text: field.id;
                                     input-type: field.secret ? password : text;
                                     edited(value) => {
-                                        root.form-config-valid =
-                                            root.provider-field-changed(field.id, value, field.secret);
+                                        root.provider-field-changed(field.id, value, field.secret);
                                     }
                                 }
                                 if field.description != "": Text {
@@ -909,7 +905,8 @@ export component SettingsScreen inherits Rectangle {
                                 Button {
                                     text: "Save provider";
                                     primary: true;
-                                    enabled: root.form-id != "" && root.form-config-valid;
+                                    enabled: root.form-id != ""
+                                        && root.provider-fields-valid(root.form-config-fields);
                                     clicked => {
                                         root.provider-saved(
                                             root.form-id,
