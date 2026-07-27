@@ -25,13 +25,14 @@ use futures::StreamExt;
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin};
-use tokio::sync::{Mutex, mpsc, oneshot};
+use tokio::sync::{Mutex, oneshot};
 use trouve_protocol::{ModelInfo, Usage};
 use trouve_providers::codex::completed_reasoning_text;
 
 use crate::{
     AgentBackend, BackendError, BackendEvent, BackendEventStream, BackendLogin, BackendPermission,
     BackendStatus, BackendTurn, async_stream, binary_on_path, format_reset, model,
+    route::{ROUTE_EVENT_BUDGET, RouteReceiver, RouteSendError, RouteSender, route_channel},
     spawn_codex_login,
 };
 
@@ -416,7 +417,7 @@ fn thread_id_of(result: &Value) -> Result<String, BackendError> {
 fn turn_stream(
     server: Arc<AppServer>,
     codex_thread_id: String,
-    mut route: mpsc::UnboundedReceiver<ServerMsg>,
+    mut route: RouteReceiver<ServerMsg>,
     fresh_session: bool,
     model_name: String,
     observed_windows: Arc<std::sync::Mutex<HashMap<String, u64>>>,
@@ -437,189 +438,207 @@ fn turn_stream(
         // twice.
         let mut streamed_reasoning = HashSet::new();
         let mut turn_finished = false;
-        while let Some(msg) = route.recv().await {
-            match msg {
-                ServerMsg::Notification { method, params } => match method.as_str() {
-                    "item/agentMessage/delta" => {
-                        if let Some(d) = params["delta"].as_str() {
-                            let _ = tx.send(Ok(BackendEvent::TextDelta(d.into()))).await;
-                        }
-                    }
-                    // Reasoning summaries (all OpenAI models) and raw
-                    // reasoning (open-source models).
-                    "item/reasoning/summaryTextDelta" | "item/reasoning/textDelta" => {
-                        if let Some(d) = params["delta"].as_str() {
-                            if let Some(id) = params["itemId"].as_str() {
-                                streamed_reasoning.insert(id.to_string());
+        let mut route_overloaded = false;
+        let mut overload_signal = route.overload_signal();
+        let process_route = async {
+            while let Some(msg) = route.recv().await {
+                match msg {
+                    ServerMsg::Notification { method, params } => match method.as_str() {
+                        "item/agentMessage/delta" => {
+                            if let Some(d) = params["delta"].as_str() {
+                                let _ = tx.send(Ok(BackendEvent::TextDelta(d.into()))).await;
                             }
-                            let _ = tx.send(Ok(BackendEvent::ThinkingDelta(d.into()))).await;
                         }
-                    }
-                    // Boundary between summary sections.
-                    "item/reasoning/summaryPartAdded" => {
-                        let _ = tx
-                            .send(Ok(BackendEvent::ThinkingDelta("\n\n".into())))
-                            .await;
-                    }
-                    "item/started" => {
-                        let item = &params["item"];
-                        let ty = item["type"].as_str().unwrap_or("");
-                        if !matches!(
-                            ty,
-                            "" | "agentMessage" | "userMessage" | "plan" | "reasoning"
-                        ) {
+                        // Reasoning summaries (all OpenAI models) and raw
+                        // reasoning (open-source models).
+                        "item/reasoning/summaryTextDelta" | "item/reasoning/textDelta" => {
+                            if let Some(d) = params["delta"].as_str() {
+                                if let Some(id) = params["itemId"].as_str() {
+                                    streamed_reasoning.insert(id.to_string());
+                                }
+                                let _ = tx.send(Ok(BackendEvent::ThinkingDelta(d.into()))).await;
+                            }
+                        }
+                        // Boundary between summary sections.
+                        "item/reasoning/summaryPartAdded" => {
                             let _ = tx
-                                .send(Ok(BackendEvent::ToolStarted {
-                                    call_id: item["id"].as_str().unwrap_or("").into(),
-                                    tool: ty.into(),
-                                    args: item.clone(),
-                                }))
+                                .send(Ok(BackendEvent::ThinkingDelta("\n\n".into())))
                                 .await;
                         }
-                    }
-                    "item/commandExecution/outputDelta" => {
-                        if let (Some(id), Some(d)) =
-                            (params["itemId"].as_str(), params["delta"].as_str())
-                        {
+                        "item/started" => {
+                            let item = &params["item"];
+                            let ty = item["type"].as_str().unwrap_or("");
+                            if !matches!(
+                                ty,
+                                "" | "agentMessage" | "userMessage" | "plan" | "reasoning"
+                            ) {
+                                let _ = tx
+                                    .send(Ok(BackendEvent::ToolStarted {
+                                        call_id: item["id"].as_str().unwrap_or("").into(),
+                                        tool: ty.into(),
+                                        args: item.clone(),
+                                    }))
+                                    .await;
+                            }
+                        }
+                        "item/commandExecution/outputDelta" => {
+                            if let (Some(id), Some(d)) =
+                                (params["itemId"].as_str(), params["delta"].as_str())
+                            {
+                                let _ = tx
+                                    .send(Ok(BackendEvent::ToolOutput {
+                                        call_id: id.into(),
+                                        chunk: d.into(),
+                                    }))
+                                    .await;
+                            }
+                        }
+                        "item/completed" => {
+                            let item = &params["item"];
+                            let ty = item["type"].as_str().unwrap_or("");
+                            if ty == "reasoning"
+                                && item["id"]
+                                    .as_str()
+                                    .is_none_or(|id| !streamed_reasoning.contains(id))
+                                && let Some(text) = completed_reasoning_text(item)
+                            {
+                                let _ = tx.send(Ok(BackendEvent::ThinkingDelta(text))).await;
+                            }
+                            if !matches!(
+                                ty,
+                                "" | "agentMessage" | "userMessage" | "plan" | "reasoning"
+                            ) {
+                                let failed = item["status"].as_str() == Some("failed");
+                                let _ = tx
+                                    .send(Ok(BackendEvent::ToolCompleted {
+                                        call_id: item["id"].as_str().unwrap_or("").into(),
+                                        ok: !failed,
+                                        result: item.clone(),
+                                    }))
+                                    .await;
+                            }
+                        }
+                        "thread/tokenUsage/updated" => {
+                            // One update per model call. The input span of the
+                            // newest call is the whole conversation context, so
+                            // it replaces; output is per-call, so it accumulates
+                            // across the calls of a multi-step turn.
+                            let u = parse_usage(&params);
+                            usage.input_tokens = u.input_tokens;
+                            usage.cached_input_tokens = u.cached_input_tokens;
+                            usage.output_tokens += u.output_tokens;
+                            if let Some(n) = u.context_window {
+                                usage.context_window = Some(n);
+                                observed_windows
+                                    .lock()
+                                    .unwrap()
+                                    .insert(model_name.clone(), n);
+                            }
+                        }
+                        "turn/completed" => {
+                            turn_finished = true;
+                            let status = params["turn"]["status"].as_str().unwrap_or("completed");
+                            if status == "failed" {
+                                let msg = params["turn"]["error"]["message"]
+                                    .as_str()
+                                    .unwrap_or("turn failed")
+                                    .to_string();
+                                let _ = tx.send(Err(BackendError::Protocol(msg))).await;
+                            } else {
+                                let _ = tx
+                                    .send(Ok(BackendEvent::Completed {
+                                        usage: usage.clone(),
+                                    }))
+                                    .await;
+                            }
+                            break;
+                        }
+                        _ => {}
+                    },
+                    ServerMsg::Request { id, method, params } => {
+                        // MCP tool-call permission elicitation (codex's rmcp
+                        // client asks before every MCP tool call). The trouve
+                        // bridge's tools are gated inside trouve's own
+                        // permission layer, so auto-accept those; other MCP
+                        // servers go through the normal approval flow.
+                        if method == "mcpServer/elicitation/request" {
+                            if params["serverName"] == "trouve" {
+                                server
+                                    .respond(id, json!({ "action": "accept", "content": {} }))
+                                    .await;
+                                continue;
+                            }
+                            let (ok_tx, ok_rx) = oneshot::channel();
+                            // JSON-RPC request ids are unique for this app-server
+                            // process. Preserve that identity in trouve so
+                            // concurrent MCP approvals cannot overwrite the same
+                            // empty ApprovalHub key.
+                            let call_id = format!("codex-mcp-{}", json_rpc_id(&id));
                             let _ = tx
-                                .send(Ok(BackendEvent::ToolOutput {
-                                    call_id: id.into(),
-                                    chunk: d.into(),
+                                .send(Ok(BackendEvent::ApprovalNeeded {
+                                    call_id,
+                                    tool: "mcpToolCall".into(),
+                                    args: params.clone(),
+                                    responder: ok_tx,
                                 }))
                                 .await;
-                        }
-                    }
-                    "item/completed" => {
-                        let item = &params["item"];
-                        let ty = item["type"].as_str().unwrap_or("");
-                        if ty == "reasoning"
-                            && item["id"]
-                                .as_str()
-                                .is_none_or(|id| !streamed_reasoning.contains(id))
-                            && let Some(text) = completed_reasoning_text(item)
-                        {
-                            let _ = tx.send(Ok(BackendEvent::ThinkingDelta(text))).await;
-                        }
-                        if !matches!(
-                            ty,
-                            "" | "agentMessage" | "userMessage" | "plan" | "reasoning"
-                        ) {
-                            let failed = item["status"].as_str() == Some("failed");
-                            let _ = tx
-                                .send(Ok(BackendEvent::ToolCompleted {
-                                    call_id: item["id"].as_str().unwrap_or("").into(),
-                                    ok: !failed,
-                                    result: item.clone(),
-                                }))
-                                .await;
-                        }
-                    }
-                    "thread/tokenUsage/updated" => {
-                        // One update per model call. The input span of the
-                        // newest call is the whole conversation context, so
-                        // it replaces; output is per-call, so it accumulates
-                        // across the calls of a multi-step turn.
-                        let u = parse_usage(&params);
-                        usage.input_tokens = u.input_tokens;
-                        usage.cached_input_tokens = u.cached_input_tokens;
-                        usage.output_tokens += u.output_tokens;
-                        if let Some(n) = u.context_window {
-                            usage.context_window = Some(n);
-                            observed_windows
-                                .lock()
-                                .unwrap()
-                                .insert(model_name.clone(), n);
-                        }
-                    }
-                    "turn/completed" => {
-                        turn_finished = true;
-                        let status = params["turn"]["status"].as_str().unwrap_or("completed");
-                        if status == "failed" {
-                            let msg = params["turn"]["error"]["message"]
-                                .as_str()
-                                .unwrap_or("turn failed")
-                                .to_string();
-                            let _ = tx.send(Err(BackendError::Protocol(msg))).await;
-                        } else {
-                            let _ = tx
-                                .send(Ok(BackendEvent::Completed {
-                                    usage: usage.clone(),
-                                }))
-                                .await;
-                        }
-                        break;
-                    }
-                    _ => {}
-                },
-                ServerMsg::Request { id, method, params } => {
-                    // MCP tool-call permission elicitation (codex's rmcp
-                    // client asks before every MCP tool call). The trouve
-                    // bridge's tools are gated inside trouve's own
-                    // permission layer, so auto-accept those; other MCP
-                    // servers go through the normal approval flow.
-                    if method == "mcpServer/elicitation/request" {
-                        if params["serverName"] == "trouve" {
+                            let action = if ok_rx.await.unwrap_or(false) {
+                                "accept"
+                            } else {
+                                "decline"
+                            };
                             server
-                                .respond(id, json!({ "action": "accept", "content": {} }))
+                                .respond(id, json!({ "action": action, "content": {} }))
                                 .await;
                             continue;
                         }
+                        let tool = match method.as_str() {
+                            "item/commandExecution/requestApproval" => "commandExecution",
+                            "item/fileChange/requestApproval" => "fileChange",
+                            _ => {
+                                // Unknown server request: deny rather than hang.
+                                tracing::warn!(
+                                    "codex: denying unknown server request {method}: {}",
+                                    serde_json::to_string(&params).unwrap_or_default()
+                                );
+                                server.respond(id, json!({ "decision": "decline" })).await;
+                                continue;
+                            }
+                        };
                         let (ok_tx, ok_rx) = oneshot::channel();
-                        // JSON-RPC request ids are unique for this app-server
-                        // process. Preserve that identity in trouve so
-                        // concurrent MCP approvals cannot overwrite the same
-                        // empty ApprovalHub key.
-                        let call_id = format!("codex-mcp-{}", json_rpc_id(&id));
+                        let call_id = params["itemId"].as_str().unwrap_or("").to_string();
                         let _ = tx
                             .send(Ok(BackendEvent::ApprovalNeeded {
                                 call_id,
-                                tool: "mcpToolCall".into(),
+                                tool: tool.into(),
                                 args: params.clone(),
                                 responder: ok_tx,
                             }))
                             .await;
-                        let action = if ok_rx.await.unwrap_or(false) {
-                            "accept"
-                        } else {
-                            "decline"
-                        };
-                        server
-                            .respond(id, json!({ "action": action, "content": {} }))
-                            .await;
-                        continue;
+                        let approved = ok_rx.await.unwrap_or(false);
+                        // ReviewDecision: "decline" (vs "abort") lets the agent
+                        // continue and explain instead of killing the turn.
+                        let decision = if approved { "accept" } else { "decline" };
+                        server.respond(id, json!({ "decision": decision })).await;
                     }
-                    let tool = match method.as_str() {
-                        "item/commandExecution/requestApproval" => "commandExecution",
-                        "item/fileChange/requestApproval" => "fileChange",
-                        _ => {
-                            // Unknown server request: deny rather than hang.
-                            tracing::warn!(
-                                "codex: denying unknown server request {method}: {}",
-                                serde_json::to_string(&params).unwrap_or_default()
-                            );
-                            server.respond(id, json!({ "decision": "decline" })).await;
-                            continue;
-                        }
-                    };
-                    let (ok_tx, ok_rx) = oneshot::channel();
-                    let call_id = params["itemId"].as_str().unwrap_or("").to_string();
-                    let _ = tx
-                        .send(Ok(BackendEvent::ApprovalNeeded {
-                            call_id,
-                            tool: tool.into(),
-                            args: params.clone(),
-                            responder: ok_tx,
-                        }))
-                        .await;
-                    let approved = ok_rx.await.unwrap_or(false);
-                    // ReviewDecision: "decline" (vs "abort") lets the agent
-                    // continue and explain instead of killing the turn.
-                    let decision = if approved { "accept" } else { "decline" };
-                    server.respond(id, json!({ "decision": decision })).await;
                 }
             }
+        };
+        tokio::select! {
+            biased;
+            _ = overload_signal.wait() => {
+                route_overloaded = true;
+            }
+            _ = process_route => {}
         }
-        if !turn_finished {
+        if route_overloaded {
+            let _ = tx
+                .send(Err(BackendError::Protocol(format!(
+                    "app-server event backlog exceeded the per-turn limit of \
+                     {ROUTE_EVENT_BUDGET} messages"
+                ))))
+                .await;
+        } else if !turn_finished {
             let reason = if server.is_closed() {
                 "app-server closed before turn completed"
             } else {
@@ -775,8 +794,15 @@ enum ServerMsg {
 }
 
 type Pending = Arc<Mutex<HashMap<i64, oneshot::Sender<Result<Value, String>>>>>;
-type Routes = Arc<Mutex<HashMap<String, mpsc::UnboundedSender<ServerMsg>>>>;
-type Buffered = Arc<Mutex<HashMap<String, Vec<ServerMsg>>>>;
+type Routes = Arc<Mutex<HashMap<String, RouteSender<ServerMsg>>>>;
+
+#[derive(Default)]
+struct BufferedRoute {
+    messages: Vec<ServerMsg>,
+    overloaded: bool,
+}
+
+type Buffered = Arc<Mutex<HashMap<String, BufferedRoute>>>;
 
 async fn close_transport(
     pending: &Pending,
@@ -844,19 +870,21 @@ async fn read_stdout<R: AsyncRead + Unpin>(
                 routes.get(&thread_id).cloned()
             };
             match routed {
-                Some(tx) => match tx.send(m) {
+                Some(tx) => match tx.try_send(m) {
                     Ok(()) => {
                         failed_routes.remove(&thread_id);
                     }
-                    Err(_) => {
+                    Err(error) => {
                         // The stdout reader is shared by every Codex turn. A
-                        // closed route must fail independently. Routes are
-                        // unbounded because this task also delivers JSON-RPC
-                        // responses for every concurrent turn and therefore
-                        // can never wait for a slow route without wedging the
-                        // entire app-server transport.
+                        // closed or overloaded route must fail independently
+                        // rather than blocking every concurrent turn and
+                        // JSON-RPC response on this transport.
                         tracing::warn!(
-                            "codex: dropping {thread_id} event route: receiver is closed"
+                            "codex: dropping {thread_id} event route: {}",
+                            match error {
+                                RouteSendError::Closed => "receiver is closed",
+                                RouteSendError::Overloaded => "event backlog limit exceeded",
+                            }
                         );
                         let mut routes = routes.lock().await;
                         if routes
@@ -875,7 +903,14 @@ async fn read_stdout<R: AsyncRead + Unpin>(
                 // (skip the empty catch-all) so nothing emitted between
                 // thread/start and subscribe is lost.
                 None if !thread_id.is_empty() && !failed_routes.contains(&thread_id) => {
-                    buffered.lock().await.entry(thread_id).or_default().push(m);
+                    let mut buffered = buffered.lock().await;
+                    let route = buffered.entry(thread_id.clone()).or_default();
+                    if route.messages.len() < ROUTE_EVENT_BUDGET {
+                        route.messages.push(m);
+                    } else {
+                        route.overloaded = true;
+                        failed_routes.insert(thread_id);
+                    }
                 }
                 None => {}
             }
@@ -991,17 +1026,22 @@ impl AppServer {
         stdin.flush().await.map_err(BackendError::Io)
     }
 
-    async fn subscribe(&self, thread_id: &str) -> mpsc::UnboundedReceiver<ServerMsg> {
-        let (tx, rx) = mpsc::unbounded_channel();
+    async fn subscribe(&self, thread_id: &str) -> RouteReceiver<ServerMsg> {
+        let (tx, rx) = route_channel();
         self.routes
             .lock()
             .await
             .insert(thread_id.to_string(), tx.clone());
         // Flush anything the reader buffered for this thread before we
         // subscribed (notifications emitted right after thread/start).
-        if let Some(msgs) = self.buffered.lock().await.remove(thread_id) {
-            for m in msgs {
-                let _ = tx.send(m);
+        if let Some(buffered) = self.buffered.lock().await.remove(thread_id) {
+            for message in buffered.messages {
+                if tx.try_send(message).is_err() {
+                    break;
+                }
+            }
+            if buffered.overloaded {
+                tx.mark_overloaded();
             }
         }
         rx
@@ -1095,7 +1135,7 @@ mod tests {
         let closed = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let (request_tx, request_rx) = oneshot::channel();
         pending.lock().await.insert(1, request_tx);
-        let (route_tx, mut route_rx) = mpsc::unbounded_channel();
+        let (route_tx, mut route_rx) = route_channel();
         routes.lock().await.insert("thread-1".into(), route_tx);
 
         let (mut writer, reader) = tokio::io::duplex(16);
@@ -1134,7 +1174,7 @@ mod tests {
         let routes: Routes = Arc::new(Mutex::new(HashMap::new()));
         let buffered: Buffered = Arc::new(Mutex::new(HashMap::new()));
         let closed = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let (route_tx, mut route_rx) = mpsc::unbounded_channel();
+        let (route_tx, mut route_rx) = route_channel();
         routes.lock().await.insert("thread-1".into(), route_tx);
 
         let (mut writer, reader) = tokio::io::duplex(256);
@@ -1145,7 +1185,7 @@ mod tests {
             buffered.clone(),
             closed.clone(),
         ));
-        let event_count = 1_024;
+        let event_count = ROUTE_EVENT_BUDGET;
         for sequence in 0..event_count {
             writer
                 .write_all(

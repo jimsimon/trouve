@@ -546,12 +546,20 @@ async fn cursor_adapter_speaks_acp_and_bridges_approvals() {
 }
 
 #[tokio::test]
-async fn cursor_adapter_keeps_other_sessions_moving_during_an_unread_burst() {
+async fn cursor_adapter_overload_fails_only_the_affected_session() {
     let tmp = tempfile::tempdir().unwrap();
     let stub = write_stub(
         tmp.path(),
         "cursor-agent-burst",
         r#"#!/bin/bash
+read_request() {
+    local expected="$1"
+    while IFS= read -r line; do
+        if [[ "$line" == *"\"id\":$expected"* ]]; then
+            return
+        fi
+    done
+}
 IFS= read -r line # initialize
 echo '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":1}}'
 
@@ -562,18 +570,18 @@ echo '{"jsonrpc":"2.0","id":3,"result":{"configOptions":[{"id":"mode","currentVa
 IFS= read -r line # first set model
 echo '{"jsonrpc":"2.0","id":4,"result":{"configOptions":[{"id":"model","currentValue":"test-model"}]}}'
 IFS= read -r line # first session/prompt
-for sequence in $(seq 1 1024); do
+for sequence in $(seq 1 2048); do
     printf '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"sess-1","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"%s"}}}}\n' "$sequence"
 done
 echo '{"jsonrpc":"2.0","id":5,"result":{"stopReason":"end_turn"}}'
 
-IFS= read -r line # second session/new
+read_request 6 # second session/new; ignore first session's cancel notification
 echo '{"jsonrpc":"2.0","id":6,"result":{"sessionId":"sess-2"}}'
-IFS= read -r line # second set mode
+read_request 7 # second set mode
 echo '{"jsonrpc":"2.0","id":7,"result":{"configOptions":[{"id":"mode","currentValue":"agent"}]}}'
-IFS= read -r line # second set model
+read_request 8 # second set model
 echo '{"jsonrpc":"2.0","id":8,"result":{"configOptions":[{"id":"model","currentValue":"test-model"}]}}'
-IFS= read -r line # second session/prompt
+read_request 9 # second session/prompt
 echo '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"sess-2","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"second"}}}}'
 echo '{"jsonrpc":"2.0","id":9,"result":{"stopReason":"end_turn"}}'
 "#,
@@ -581,9 +589,9 @@ echo '{"jsonrpc":"2.0","id":9,"result":{"stopReason":"end_turn"}}'
     let backend = CursorBackend::new("cursor", Some(stub), None);
     let deadline = std::time::Duration::from_secs(2);
 
-    // Leave the first stream unread. Its translated-event queue fills after
-    // 64 events, which used to let the 256-message ACP route block the one
-    // stdout reader shared by every session in this worktree.
+    // Leave the first stream unread and drive it past the route budget. Its
+    // translated-event queue fills after 64 events, but neither that nor the
+    // route overload may block the reader shared by this worktree.
     let mut first = tokio::time::timeout(
         deadline,
         start_turn(&backend, || {
@@ -609,13 +617,18 @@ echo '{"jsonrpc":"2.0","id":9,"result":{"stopReason":"end_turn"}}'
     }
     assert_eq!(second_text, "second");
 
-    let mut first_chunks = 0;
+    let mut first_error = None;
     while let Some(event) = first.next().await {
-        if matches!(event.unwrap(), BackendEvent::TextDelta(_)) {
-            first_chunks += 1;
+        if let Err(error) = event {
+            first_error = Some(error.to_string());
         }
     }
-    assert_eq!(first_chunks, 1_024);
+    assert!(
+        first_error
+            .as_deref()
+            .is_some_and(|error| error.contains("event backlog exceeded")),
+        "{first_error:?}"
+    );
 }
 
 #[tokio::test]

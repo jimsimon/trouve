@@ -57,7 +57,9 @@ use trouve_protocol::{ModelInfo, Usage};
 
 use crate::{
     AgentBackend, BackendError, BackendEvent, BackendEventStream, BackendLogin, BackendPermission,
-    BackendStatus, BackendTurn, async_stream, binary_on_path, format_reset, model, spawn_login,
+    BackendStatus, BackendTurn, async_stream, binary_on_path, format_reset, model,
+    route::{ROUTE_EVENT_BUDGET, RouteReceiver, RouteSendError, RouteSender, route_channel},
+    spawn_login,
 };
 
 pub struct CursorBackend {
@@ -655,7 +657,7 @@ fn config_snapshot_value(result: &Value, id: &str) -> Option<String> {
 fn turn_stream(
     server: Arc<AcpServer>,
     session_id: String,
-    mut route: mpsc::UnboundedReceiver<ServerMsg>,
+    mut route: RouteReceiver<ServerMsg>,
     mut prompt_rx: oneshot::Receiver<Result<Value, String>>,
     fresh_session: bool,
 ) -> impl futures::Stream<Item = Result<BackendEvent, BackendError>> {
@@ -668,45 +670,69 @@ fn turn_stream(
                 .await;
         }
         let mut client_gone = false;
-        loop {
-            tokio::select! {
-                msg = route.recv() => {
-                    let Some(msg) = msg else { break };
-                    if handle_msg(&server, msg, &tx).await.is_err() {
-                        // Receiver dropped (turn cancelled): stop cursor's
-                        // generation instead of letting it run headless.
-                        client_gone = true;
-                        server.notify("session/cancel", json!({ "sessionId": session_id })).await;
-                        break;
-                    }
-                }
-                result = &mut prompt_rx => {
-                    // Reader delivers in wire order, so any updates sent
-                    // before the response are already queued; drain them.
-                    while let Ok(msg) = route.try_recv() {
-                        if handle_msg(&server, msg, &tx).await.is_err() {
-                            client_gone = true;
+        let mut route_overloaded = false;
+        let mut overload_signal = route.overload_signal();
+        tokio::select! {
+            biased;
+            _ = overload_signal.wait() => {
+                route_overloaded = true;
+            }
+            _ = async {
+                loop {
+                    tokio::select! {
+                        msg = route.recv() => {
+                            let Some(msg) = msg else { break };
+                            if handle_msg(&server, msg, &tx).await.is_err() {
+                                // Receiver dropped (turn cancelled): stop cursor's
+                                // generation instead of letting it run headless.
+                                client_gone = true;
+                                server.notify("session/cancel", json!({ "sessionId": session_id })).await;
+                                break;
+                            }
+                        }
+                        result = &mut prompt_rx => {
+                            // Reader delivers in wire order, so any updates sent
+                            // before the response are already queued; drain them.
+                            while let Ok(msg) = route.try_recv() {
+                                if handle_msg(&server, msg, &tx).await.is_err() {
+                                    client_gone = true;
+                                    break;
+                                }
+                            }
+                            match result {
+                                Ok(Ok(value)) => {
+                                    let _ = tx.send(Ok(BackendEvent::Completed {
+                                        usage: parse_usage(&value["usage"]),
+                                    })).await;
+                                }
+                                Ok(Err(e)) => {
+                                    let _ = tx.send(Err(BackendError::Protocol(
+                                        format!("session/prompt: {e}")))).await;
+                                }
+                                Err(_) => {
+                                    let _ = tx.send(Err(BackendError::Protocol(
+                                        "cursor-agent closed before the turn completed".into()))).await;
+                                }
+                            }
                             break;
                         }
                     }
-                    match result {
-                        Ok(Ok(value)) => {
-                            let _ = tx.send(Ok(BackendEvent::Completed {
-                                usage: parse_usage(&value["usage"]),
-                            })).await;
-                        }
-                        Ok(Err(e)) => {
-                            let _ = tx.send(Err(BackendError::Protocol(
-                                format!("session/prompt: {e}")))).await;
-                        }
-                        Err(_) => {
-                            let _ = tx.send(Err(BackendError::Protocol(
-                                "cursor-agent closed before the turn completed".into()))).await;
-                        }
-                    }
-                    break;
                 }
-            }
+            } => {}
+        }
+        if route_overloaded {
+            // Cursor supports per-session cancellation, so stop only this
+            // overloaded turn while the shared ACP process keeps serving
+            // the worktree's other sessions.
+            server
+                .notify("session/cancel", json!({ "sessionId": session_id }))
+                .await;
+            let _ = tx
+                .send(Err(BackendError::Protocol(format!(
+                    "cursor-agent event backlog exceeded the per-turn limit of \
+                     {ROUTE_EVENT_BUDGET} messages"
+                ))))
+                .await;
         }
         if client_gone {
             // Best effort; the vendor process keeps running for other threads.
@@ -1111,7 +1137,7 @@ enum ServerMsg {
 }
 
 type Pending = Arc<Mutex<HashMap<i64, oneshot::Sender<Result<Value, String>>>>>;
-type Routes = Arc<Mutex<HashMap<String, mpsc::UnboundedSender<ServerMsg>>>>;
+type Routes = Arc<Mutex<HashMap<String, RouteSender<ServerMsg>>>>;
 
 struct AcpServer {
     stdin: Arc<Mutex<ChildStdin>>,
@@ -1306,9 +1332,15 @@ impl AcpServer {
                         };
                         // This reader serves every session in the worktree,
                         // including their JSON-RPC responses. A slow session
-                        // must not apply backpressure here and wedge the
+                        // must fail independently rather than wedge the
                         // entire shared ACP transport.
-                        if tx.send(m).is_err() {
+                        if let Err(error) = tx.try_send(m) {
+                            if error == RouteSendError::Overloaded {
+                                tracing::warn!(
+                                    "cursor acp: dropping {session_id} event route: \
+                                     event backlog limit exceeded"
+                                );
+                            }
                             let mut routes = routes.lock().await;
                             if routes
                                 .get(&session_id)
@@ -1472,8 +1504,8 @@ impl AcpServer {
         stdin.flush().await.map_err(BackendError::Io)
     }
 
-    async fn subscribe(&self, session_id: &str) -> mpsc::UnboundedReceiver<ServerMsg> {
-        let (tx, rx) = mpsc::unbounded_channel();
+    async fn subscribe(&self, session_id: &str) -> RouteReceiver<ServerMsg> {
+        let (tx, rx) = route_channel();
         self.routes.lock().await.insert(session_id.to_string(), tx);
         rx
     }

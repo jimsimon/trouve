@@ -14,6 +14,7 @@ pub mod codex;
 pub mod cursor;
 pub mod install;
 mod login;
+mod route;
 
 use std::path::PathBuf;
 
