@@ -765,6 +765,8 @@ struct Controller {
     /// Newest applied snapshot cursor per host. A debounce flush and a fresh
     /// event may race; cursors prevent an older replay snapshot winning.
     pr_dash_cursors: HashMap<String, u64>,
+    /// Newest applied Git & Worktrees settings snapshot cursor.
+    git_worktree_settings_cursor: Option<u64>,
     /// Multi-instance account refresh failures.
     pr_dash_errors: HashMap<String, String>,
     /// Shared GitHub refreshes in flight (the `github` key is the guard).
@@ -988,6 +990,7 @@ pub async fn run(
         pr_error: String::new(),
         pr_dash: HashMap::new(),
         pr_dash_cursors: HashMap::new(),
+        git_worktree_settings_cursor: None,
         pr_dash_errors: HashMap::new(),
         pr_dash_loading: HashSet::new(),
         pr_dash_last_refreshed: None,
@@ -4160,6 +4163,21 @@ impl Controller {
         true
     }
 
+    fn apply_git_worktree_settings(
+        &mut self,
+        cursor: u64,
+        settings: trouve_protocol::GitWorktreeSettings,
+    ) {
+        if self
+            .git_worktree_settings_cursor
+            .is_some_and(|seen| seen >= cursor)
+        {
+            return;
+        }
+        ui::set_git_worktree_settings(&self.ui, settings);
+        self.git_worktree_settings_cursor = Some(cursor);
+    }
+
     fn handle_server_replay(&mut self, envelopes: Vec<trouve_protocol::EventEnvelope>) {
         let mut changed = false;
         for envelope in envelopes {
@@ -4168,7 +4186,7 @@ impl Controller {
                     changed |= self.apply_github_pr_snapshot(envelope.cursor, pull_requests);
                 }
                 trouve_protocol::Event::GitWorktreeSettingsUpdated { settings } => {
-                    ui::set_git_worktree_settings(&self.ui, settings);
+                    self.apply_git_worktree_settings(envelope.cursor, settings);
                 }
                 _ => {}
             }
@@ -4197,7 +4215,7 @@ impl Controller {
                 return;
             }
             Event::GitWorktreeSettingsUpdated { settings } => {
-                ui::set_git_worktree_settings(&self.ui, settings);
+                self.apply_git_worktree_settings(cursor, settings);
                 return;
             }
             event => event,
