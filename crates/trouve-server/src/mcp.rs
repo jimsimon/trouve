@@ -1,16 +1,15 @@
-//! Streamable-HTTP MCP endpoint bridging external vendor agents (Claude
-//! Code, Codex) back into trouve — the successor to the old spawned
+//! Streamable-HTTP MCP endpoint bridging external vendor agents (Claude,
+//! Codex, and Cursor) back into trouve — the successor to the old spawned
 //! `mcp-bridge` subprocess.
 //!
 //! The engine points vendor agents at
-//! `/internal/threads/{id}/mcp?tools=0|1&approval=0|1` as an HTTP MCP
-//! server. It always serves trouve's read-only semantic search tools and
-//! the interactive question tool; with `approval=1` it serves
-//! `approval_prompt` (Claude's `--permission-prompt-tool` target: permission
-//! requests become trouve approvals); with `tools=1` it additionally serves
-//! the full ToolExecutor tool set. Every `tools/call` goes straight into
-//! the engine, so bridged calls flow through the same permission gate,
-//! approval hub, and event log as native tool calls.
+//! `/internal/threads/{id}/mcp?approval=0|1` as an HTTP MCP server. It serves
+//! capabilities that supplement vendor-native core tools: semantic search,
+//! skills, questions, todos, subagents, transcript search, and user MCP.
+//! With `approval=1` it also serves `approval_prompt` (Claude's
+//! `--permission-prompt-tool` target). Every ordinary `tools/call` goes
+//! through the engine, so bridged calls share the native permission gate,
+//! approval hub, and event log.
 //!
 //! Stateless per the MCP streamable-HTTP transport: plain JSON responses
 //! (no SSE upgrade, no session ids), notifications get `202 Accepted`.
@@ -26,17 +25,22 @@ use trouve_core::Engine;
 
 const MCP_PROTOCOL_VERSION: &str = "2025-03-26";
 
-/// Tools served even without full tool bridging: the vendor agent keeps its
-/// own built-ins, but trouve's native semantic search and the interactive
-/// question tool (harness features the vendor has no equivalent of) are
-/// always offered.
-const ALWAYS_BRIDGED: &[&str] = &["search", "find_related", "ask_question"];
+/// Trouve-owned capabilities that supplement the vendor's optimized core
+/// tools. User MCP tools are included dynamically by their `mcp__` prefix.
+const SUPPLEMENTAL_TOOLS: &[&str] = &[
+    "search",
+    "find_related",
+    "ask_question",
+    "load_skill",
+    "todo_write",
+    "search_transcript",
+    "spawn_thread",
+    "spawn_session",
+    "spawn_output",
+];
 
 #[derive(serde::Deserialize)]
 pub(crate) struct McpQuery {
-    /// Serve the full ToolExecutor tool set (vendor built-ins stand down).
-    #[serde(default)]
-    tools: u8,
     /// Serve the `approval_prompt` permission gate (Claude needs it; agents
     /// with native approval flows like Codex turn it off).
     #[serde(default = "default_approval")]
@@ -45,6 +49,14 @@ pub(crate) struct McpQuery {
 
 fn default_approval() -> u8 {
     1
+}
+
+fn tool_available_for_bridge(name: &str, serve_approval: bool) -> bool {
+    if name == "approval_prompt" {
+        serve_approval
+    } else {
+        SUPPLEMENTAL_TOOLS.contains(&name) || name.starts_with("mcp__")
+    }
 }
 
 pub(crate) async fn mcp_endpoint(
@@ -75,9 +87,15 @@ pub(crate) async fn mcp_endpoint(
                 result's file_path and line to discover similar code.",
         })),
         "ping" => Ok(json!({})),
-        "tools/list" => tools_list(&engine, &thread_id, q.tools == 1, q.approval != 0).await,
-        "tools/call" if msg["params"]["name"] == "approval_prompt" => {
+        "tools/list" => tools_list(&engine, &thread_id, q.approval != 0).await,
+        "tools/call"
+            if msg["params"]["name"] == "approval_prompt"
+                && tool_available_for_bridge("approval_prompt", q.approval != 0) =>
+        {
             approval_prompt(&engine, &thread_id, &msg["params"]).await
+        }
+        "tools/call" if msg["params"]["name"] == "approval_prompt" => {
+            Err("approval_prompt is disabled for this bridge".into())
         }
         "tools/call" => tools_call(&engine, &thread_id, &msg["params"]).await,
         _ => Err(format!("method not supported: {method}")),
@@ -96,7 +114,6 @@ pub(crate) async fn mcp_endpoint(
 async fn tools_list(
     engine: &Engine,
     thread_id: &str,
-    bridge_tools: bool,
     serve_approval: bool,
 ) -> Result<Value, String> {
     // The approval gate is served for Claude (its permission-prompt tool is
@@ -118,23 +135,22 @@ async fn tools_list(
             },
         }));
     }
-    // Best-effort: the approval gate must exist even when the thread lookup
-    // fails, so a failed spec fetch just serves fewer tools.
-    match engine.bridged_tool_specs(thread_id).await {
-        Ok(specs) => tools.extend(
-            specs
-                .iter()
-                .filter(|s| bridge_tools || ALWAYS_BRIDGED.contains(&s.name.as_str()))
-                .map(|s| {
-                    json!({
-                        "name": s.name,
-                        "description": s.description,
-                        "inputSchema": s.parameters,
-                    })
-                }),
-        ),
-        Err(e) => tracing::warn!("mcp bridge: tool specs unavailable for {thread_id}: {e}"),
-    }
+    let specs = engine
+        .bridged_tool_specs(thread_id)
+        .await
+        .map_err(|e| format!("supplemental tool catalog unavailable for {thread_id}: {e}"))?;
+    tools.extend(
+        specs
+            .iter()
+            .filter(|s| tool_available_for_bridge(&s.name, serve_approval))
+            .map(|s| {
+                json!({
+                    "name": s.name,
+                    "description": s.description,
+                    "inputSchema": s.parameters,
+                })
+            }),
+    );
     Ok(json!({ "tools": tools }))
 }
 
@@ -170,17 +186,43 @@ async fn tools_call(
     params: &Value,
 ) -> Result<Value, String> {
     let name = params["name"].as_str().unwrap_or_default();
+    if !tool_available_for_bridge(name, false) {
+        return Err(format!("tool {name:?} is disabled for this bridge"));
+    }
     let arguments = params.get("arguments").cloned().unwrap_or(json!({}));
     match engine.bridged_tool_call(thread_id, name, &arguments).await {
-        Ok(content) => Ok(json!({
-            "content": [ { "type": "text", "text": content } ],
-            "isError": false,
-        })),
+        Ok((content, images)) => {
+            let mut blocks = vec![json!({ "type": "text", "text": content })];
+            blocks.extend(images.into_iter().map(|image| {
+                json!({
+                    "type": "image",
+                    "data": image.data,
+                    "mimeType": image.mime,
+                })
+            }));
+            Ok(json!({ "content": blocks, "isError": false }))
+        }
         // Errors surface as tool results (isError) so the agent can react
         // instead of the whole turn failing.
         Err(e) => Ok(json!({
             "content": [ { "type": "text", "text": format!("tool call failed: {e}") } ],
             "isError": true,
         })),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn supplemental_catalog_gates_calls_not_only_tool_discovery() {
+        for name in SUPPLEMENTAL_TOOLS {
+            assert!(tool_available_for_bridge(name, false));
+        }
+        assert!(tool_available_for_bridge("mcp__github__create_pr", false));
+        assert!(!tool_available_for_bridge("shell", false));
+        assert!(!tool_available_for_bridge("approval_prompt", false));
+        assert!(tool_available_for_bridge("approval_prompt", true));
     }
 }

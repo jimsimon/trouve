@@ -23,21 +23,22 @@ use trouve_core::engine::EngineError;
 use trouve_protocol::{
     AddLocalModelRequest, AgentMode, Automation, BranchList, CliInfo, CliInstallStatus, CliList,
     CodeReviewDashboard, CodeReviewJob, CodeReviewJobDetail, CodeReviewJobList,
-    CodeReviewRepository, CodeReviewStats, CodeReviewStatsRange, CodeReviewTask,
+    CodeReviewRepository, CodeReviewStats, CodeReviewStatsRange, CodeReviewTask, CommandResult,
     CompleteLoginRequest, ConfigureGithubAppRequest, CreatePrRequest, CreateSessionRequest,
-    CreateThreadRequest, DirEntry, EVENT_CURSOR_HEADER, ErrorBody, FileContent,
-    GenerateSessionTitleRequest, GeneratedSessionTitle, GitWorktreeSettings, GithubAppStatus,
-    GithubIntegration, GithubPrList, KnownProvider, LocalSearchResult, LocalStatus, LoginStarted,
-    LoginStatus, McpLogs, McpServerInfo, MergePrRequest, ModeInfo, ModelInfo, OpenTerminalRequest,
-    PROTOCOL_VERSION, PrInfo, ProviderInfo, ProvidersResponse, QueuedPrompt,
-    RegisterWorkspaceRequest, ReorderQueueRequest, RequestCodeReviewRequest,
+    CreateThreadRequest, DirEntry, EVENT_CURSOR_HEADER, ErrorBody, ExecuteCommandRequest,
+    FileContent, GenerateSessionTitleRequest, GeneratedSessionTitle, GitWorktreeSettings,
+    GithubAppStatus, GithubIntegration, GithubPrList, KnownProvider, LocalSearchResult,
+    LocalStatus, LoginStarted, LoginStatus, McpLogs, McpServerInfo, MergePrRequest, ModeInfo,
+    ModelInfo, OpenTerminalRequest, PROTOCOL_VERSION, PrInfo, ProviderInfo, ProvidersResponse,
+    QueuedPrompt, RegisterWorkspaceRequest, ReorderQueueRequest, RequestCodeReviewRequest,
     ResolveApprovalRequest, ResolveQuestionRequest, ReviewerProfile, Scope, SendMessageRequest,
     ServerInfo, Session, SessionDiff, SetDefaultModelRequest, SetDefaultPermissionModeRequest,
-    SetGitWorktreeSettingsRequest, SetLocalEnabledRequest, SubscriptionHealth, TerminalInfo,
-    TerminalInputRequest, TerminalResizeRequest, Thread, TurnAccepted,
-    UpdateCodeReviewRepositoryRequest, UpdateQueuedPromptRequest, UpdateSessionRequest,
-    UpdateThreadRequest, UpsertAutomationRequest, UpsertMcpServerRequest, UpsertModeRequest,
-    UpsertProviderRequest, UpsertReviewerProfileRequest, UsageSummary, Workspace,
+    SetGitWorktreeSettingsRequest, SetLocalEnabledRequest, SetSkillsSettingsRequest,
+    SkillsSettings, SubscriptionHealth, TerminalInfo, TerminalInputRequest, TerminalResizeRequest,
+    Thread, TurnAccepted, UpdateCodeReviewRepositoryRequest, UpdateQueuedPromptRequest,
+    UpdateSessionRequest, UpdateThreadRequest, UpsertAutomationRequest, UpsertMcpServerRequest,
+    UpsertModeRequest, UpsertProviderRequest, UpsertReviewerProfileRequest, UsageSummary,
+    Workspace,
 };
 use utoipa::OpenApi;
 
@@ -101,6 +102,7 @@ impl IntoResponse for ApiError {
         list_threads,
         get_thread,
         update_thread,
+        execute_command,
         send_message,
         get_attachment,
         list_queue,
@@ -143,6 +145,8 @@ impl IntoResponse for ApiError {
         set_git_worktree_settings,
         install_title_model,
         cancel_title_model_install,
+        get_skills_settings,
+        set_skills_settings,
         thread_usage,
         session_usage,
         session_mcp_servers,
@@ -213,6 +217,10 @@ impl IntoResponse for ApiError {
         trouve_protocol::QuestionOption,
         trouve_protocol::QuestionAnswer,
         trouve_protocol::CommandInfo,
+        trouve_protocol::CommandKind,
+        ExecuteCommandRequest,
+        CommandResult,
+        trouve_protocol::CommandAction,
         ModelInfo,
         ProviderInfo,
         ProvidersResponse,
@@ -237,6 +245,8 @@ impl IntoResponse for ApiError {
         SetGitWorktreeSettingsRequest,
         GenerateSessionTitleRequest,
         GeneratedSessionTitle,
+        SkillsSettings,
+        SetSkillsSettingsRequest,
         UsageSummary,
         SessionDiff,
         DirEntry,
@@ -613,8 +623,13 @@ pub fn build_router(engine: Arc<Engine>) -> Router {
             "/v1/config/git-worktrees/title-model/install",
             post(install_title_model).delete(cancel_title_model_install),
         )
+        .route(
+            "/v1/config/skills",
+            get(get_skills_settings).put(set_skills_settings),
+        )
         .route("/v1/threads", post(create_thread).get(list_threads))
         .route("/v1/threads/{id}", get(get_thread).patch(update_thread))
+        .route("/v1/threads/{id}/commands", post(execute_command))
         .route("/v1/threads/{id}/messages", post(send_message))
         .route("/v1/attachments/{id}", get(get_attachment))
         .route("/v1/threads/{id}/queue", get(list_queue).put(reorder_queue))
@@ -1112,6 +1127,18 @@ async fn update_thread(
     Ok(Json(engine.update_thread(&id, &req)?))
 }
 
+#[utoipa::path(post, path = "/v1/threads/{id}/commands",
+    params(("id" = String, Path,)), request_body = ExecuteCommandRequest,
+    responses((status = 200, body = CommandResult), (status = 400, body = ErrorBody),
+              (status = 404, body = ErrorBody), (status = 409, body = ErrorBody)))]
+async fn execute_command(
+    State(engine): State<Arc<Engine>>,
+    Path(id): Path<String>,
+    Json(req): Json<ExecuteCommandRequest>,
+) -> Result<Json<CommandResult>, ApiError> {
+    Ok(Json(engine.execute_command(&id, req).await?))
+}
+
 #[utoipa::path(post, path = "/v1/threads/{id}/messages",
     params(("id" = String, Path,)), request_body = SendMessageRequest,
     responses((status = 202, body = TurnAccepted), (status = 404, body = ErrorBody)))]
@@ -1570,6 +1597,23 @@ async fn cancel_title_model_install(
     State(engine): State<Arc<Engine>>,
 ) -> Result<StatusCode, ApiError> {
     engine.cancel_title_model_install()?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+#[utoipa::path(get, path = "/v1/config/skills",
+    responses((status = 200, body = SkillsSettings)))]
+async fn get_skills_settings(State(engine): State<Arc<Engine>>) -> Json<SkillsSettings> {
+    Json(engine.skills_settings())
+}
+
+#[utoipa::path(put, path = "/v1/config/skills",
+    request_body = SetSkillsSettingsRequest,
+    responses((status = 204), (status = 500, body = ErrorBody)))]
+async fn set_skills_settings(
+    State(engine): State<Arc<Engine>>,
+    Json(req): Json<SetSkillsSettingsRequest>,
+) -> Result<StatusCode, ApiError> {
+    engine.set_builtin_skills_enabled(req.builtin_skills_enabled)?;
     Ok(StatusCode::NO_CONTENT)
 }
 

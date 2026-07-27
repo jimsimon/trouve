@@ -441,7 +441,9 @@ pub fn chat_rows(
         for (i, item) in vm.items.iter().enumerate() {
             match item {
                 ChatItem::Assistant { .. } => prev = Some(i),
-                ChatItem::User { .. } | ChatItem::TurnStatus { .. } => prev = None,
+                ChatItem::User { .. } | ChatItem::Command { .. } | ChatItem::TurnStatus { .. } => {
+                    prev = None
+                }
                 ChatItem::ToolCall { .. }
                 | ChatItem::Thinking { .. }
                 | ChatItem::Questions { .. } => {
@@ -455,7 +457,9 @@ pub fn chat_rows(
         for (i, item) in vm.items.iter().enumerate().rev() {
             match item {
                 ChatItem::Assistant { .. } => next = Some(i),
-                ChatItem::User { .. } | ChatItem::TurnStatus { .. } => next = None,
+                ChatItem::User { .. } | ChatItem::Command { .. } | ChatItem::TurnStatus { .. } => {
+                    next = None
+                }
                 ChatItem::ToolCall { .. }
                 | ChatItem::Thinking { .. }
                 | ChatItem::Questions { .. } => {
@@ -516,6 +520,40 @@ pub fn chat_rows(
                         preview(content)
                     },
                     detail: content.clone(),
+                    expanded: open,
+                    card_key: key,
+                    ..Default::default()
+                };
+                push_card(&mut rows, &mut call_ids, header, body);
+            }
+            ChatItem::Command {
+                name,
+                arguments,
+                output,
+            } => {
+                if !rows.is_empty() {
+                    rows.push(ChatRowData {
+                        kind: 8,
+                        ..Default::default()
+                    });
+                    call_ids.push(None);
+                }
+                let key = format!("c:{i}");
+                let open = !collapsed.contains(&key);
+                let mut body = Vec::new();
+                if open {
+                    push_blocks(&mut body, output);
+                }
+                let invocation = if arguments.is_empty() {
+                    format!("/{name}")
+                } else {
+                    format!("/{name} {arguments}")
+                };
+                let header = ChatRowData {
+                    tool_name: "Trouve".into(),
+                    subtitle: invocation.clone(),
+                    text: preview(output),
+                    detail: output.clone(),
                     expanded: open,
                     card_key: key,
                     ..Default::default()
@@ -1131,13 +1169,14 @@ fn activity_summary(vm: &ThreadViewModel, segments: &[Segment]) -> String {
                     .and_then(serde_json::Value::as_str);
                 match base {
                     "edit" | "Edit" | "MultiEdit" | "NotebookEdit" | "Write" | "write"
-                    | "edit_file" | "write_file" | "create_file" | "apply_patch" | "delete"
-                    | "delete_file" => match path {
-                        Some(p) => {
-                            edited.insert(p);
+                    | "edit_file" | "write_file" | "create_file" | "delete" | "delete_file" => {
+                        match path {
+                            Some(p) => {
+                                edited.insert(p);
+                            }
+                            None => edits_unpathed += 1,
                         }
-                        None => edits_unpathed += 1,
-                    },
+                    }
                     "read" | "Read" | "read_file" => match path {
                         Some(p) => {
                             read.insert(p);
@@ -1146,11 +1185,14 @@ fn activity_summary(vm: &ThreadViewModel, segments: &[Segment]) -> String {
                     },
                     // Codex app-server's built-in shell item.
                     "shell" | "bash" | "Bash" | "execute" | "commandExecution" => commands += 1,
-                    // A single Codex fileChange can contain changes to
+                    // A native file-change/apply-patch event can contain
                     // several files, so count its distinct paths rather than
                     // treating the whole item as one generic tool call.
-                    "fileChange" => {
-                        let mut found = false;
+                    "apply_patch" | "fileChange" => {
+                        let mut found = path.is_some();
+                        if let Some(path) = path {
+                            edited.insert(path);
+                        }
                         if let Some(changes) = args.get("changes").and_then(|v| v.as_array()) {
                             for change in changes {
                                 if let Some(path) = change.get("path").and_then(|v| v.as_str()) {
@@ -1511,10 +1553,7 @@ fn tool_row(
             detail.push('\n');
         }
         detail.push_str("── result ──\n");
-        match text_blocks(result) {
-            Some(text) => detail.push_str(&text),
-            None => humanize_json(result, 0, &mut detail),
-        }
+        render_tool_result(tool, result, &mut detail);
     }
     let mut detail = detail.trim_end().to_string();
     if detail.len() > 4000 {
@@ -1737,6 +1776,77 @@ fn text_blocks(v: &serde_json::Value) -> Option<String> {
     (!texts.is_empty()).then(|| texts.join("\n"))
 }
 
+/// Render equivalent provider result envelopes with one user-facing shape.
+/// The persisted event remains canonical JSON; this strips vendor wrapper
+/// noise from expanded cards without changing what the model received.
+fn render_tool_result(tool: &str, result: &serde_json::Value, out: &mut String) {
+    use serde_json::Value;
+
+    let base = tool.rsplit("__").next().unwrap_or(tool);
+    let normalized: String = base
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .flat_map(char::to_lowercase)
+        .collect();
+    if matches!(
+        normalized.as_str(),
+        "shell" | "bash" | "execute" | "commandexecution"
+    ) {
+        let value = result.get("rawOutput").unwrap_or(result);
+        if let Some(object) = value.as_object() {
+            let text = |keys: &[&str]| {
+                keys.iter()
+                    .find_map(|key| object.get(*key).and_then(Value::as_str))
+                    .filter(|text| !text.is_empty())
+            };
+            let stdout = text(&["stdout", "output", "aggregatedOutput", "text"]);
+            let stderr = text(&["stderr"]);
+            let exit_code = ["exit_code", "exitCode"]
+                .iter()
+                .find_map(|key| object.get(*key).and_then(Value::as_i64));
+            if stdout.is_some() || stderr.is_some() || exit_code.is_some() {
+                if let Some(stdout) = stdout {
+                    out.push_str(stdout);
+                    if !stdout.ends_with('\n') {
+                        out.push('\n');
+                    }
+                }
+                if let Some(stderr) = stderr {
+                    out.push_str("stderr:\n");
+                    out.push_str(stderr);
+                    if !stderr.ends_with('\n') {
+                        out.push('\n');
+                    }
+                }
+                if let Some(code) = exit_code {
+                    out.push_str(&format!("exit code: {code}"));
+                }
+                return;
+            }
+        }
+    }
+
+    if matches!(
+        normalized.as_str(),
+        "read" | "readfile" | "webfetch" | "websearch"
+    ) && let Some(content) = result.get("content").and_then(Value::as_str)
+    {
+        out.push_str(content);
+        if result.get("truncated").and_then(Value::as_bool) == Some(true) {
+            if !content.ends_with('\n') {
+                out.push('\n');
+            }
+            out.push_str("[truncated]");
+        }
+        return;
+    }
+
+    match text_blocks(result) {
+        Some(text) => out.push_str(&text),
+        None => humanize_json(result, 0, out),
+    }
+}
+
 /// "📎 screenshot.png (34 KB) · log.txt (2 KB)" — shown under the prompt
 /// text (and as the header teaser for attachment-only prompts).
 fn attachment_line(attachments: &[trouve_protocol::Attachment]) -> String {
@@ -1792,7 +1902,9 @@ fn latest_turn(vm: &ThreadViewModel) -> u64 {
             | ChatItem::Assistant { turn, .. }
             | ChatItem::Thinking { turn, .. }
             | ChatItem::TurnStatus { turn, .. } => Some(*turn),
-            ChatItem::ToolCall { .. } | ChatItem::Questions { .. } => None,
+            ChatItem::ToolCall { .. } | ChatItem::Questions { .. } | ChatItem::Command { .. } => {
+                None
+            }
         })
         .max()
         .unwrap_or(0)
@@ -2012,6 +2124,30 @@ fn highlight_lines(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn trouve_command_output_renders_as_its_own_card() {
+        let vm = ThreadViewModel {
+            items: vec![ChatItem::Command {
+                name: "status".into(),
+                arguments: String::new(),
+                output: "## Status\n\nReady".into(),
+            }],
+            ..Default::default()
+        };
+        let (rows, call_ids) = chat_rows(
+            &vm,
+            &HashSet::new(),
+            &HashSet::new(),
+            &HashSet::new(),
+            &HashMap::new(),
+        );
+        assert_eq!(rows[0].kind, 7);
+        assert_eq!(rows[0].tool_name, "Trouve");
+        assert_eq!(rows[0].subtitle, "/status");
+        assert!(rows.iter().any(|row| row.text == "Ready"));
+        assert!(call_ids.iter().all(Option::is_none));
+    }
 
     #[test]
     fn fenced_code_is_highlighted_before_ui_mapping() {
@@ -3001,9 +3137,8 @@ mod tests {
         let vm = ThreadViewModel {
             items: vec![
                 tool(
-                    "fileChange",
+                    "apply_patch",
                     serde_json::json!({
-                        "type": "fileChange",
                         "changes": [
                             {"path": "a.rs", "kind": "update", "diff": "..."},
                             {"path": "a.rs", "kind": "update", "diff": "..."},
@@ -3171,9 +3306,34 @@ mod tests {
         );
         assert!(row.detail.contains("command: ls -la"));
         assert!(row.detail.contains("── result ──"));
-        assert!(row.detail.contains("stdout:\n  a\n  b"), "{}", row.detail);
+        assert!(
+            row.detail.contains("── result ──\na\nb\nexit code: 0"),
+            "{}",
+            row.detail
+        );
         assert!(!row.detail.contains("stderr"), "empty values dropped");
         assert!(!row.detail.contains("cwd"), "nulls dropped");
+
+        // Cursor and Codex result envelopes render identically to Trouve's.
+        for result in [
+            serde_json::json!({"exitCode": 0, "stdout": "a\nb"}),
+            serde_json::json!({"exitCode": 0, "aggregatedOutput": "a\nb"}),
+            serde_json::json!({"rawOutput": {"exitCode": 0, "stdout": "a\nb"}}),
+        ] {
+            let vendor = tool_row(
+                "vendor",
+                "shell",
+                &args,
+                ToolCallStatus::Ok,
+                &Some(result),
+                &HashSet::new(),
+            );
+            assert!(
+                vendor.detail.contains("── result ──\na\nb\nexit code: 0"),
+                "{}",
+                vendor.detail
+            );
+        }
 
         // Claude-style text-block results unwrap to the plain text.
         let blocks = serde_json::json!([{"type": "text", "text": "42 files"}]);

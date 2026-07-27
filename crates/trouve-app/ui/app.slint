@@ -1616,9 +1616,10 @@ export component AppWindow inherits Window {
     in property <string> settings-status: "";
     in property <string> settings-login-provider-id: "";
     in property <bool> settings-login-code-required: false;
+    in-out property <bool> settings-builtin-skills-enabled: true;
     in-out property <int> settings-preset-index: 0;
     // Which settings section shows when the screen opens (0 general …
-    // 5 integrations); the controller sets it before flipping center-screen.
+    // integrations); the controller sets it before flipping center-screen.
     in-out property <SectionId> settings-section: SectionId.general;
     in-out property <int> settings-title-model-load-index: 0;
     in property <string> settings-title-model-state: "not_installed";
@@ -1664,6 +1665,7 @@ export component AppWindow inherits Window {
     callback default-model-picked(int, string);
     callback default-permission-picked(int);
     callback mode-saved(string, string, string, string, bool, int, int, string);
+    callback builtin-skills-toggled(bool);
     callback mode-deleted(string);
     callback mode-model-picked(string, int);
     callback mode-thinking-picked(string, string);
@@ -5650,6 +5652,7 @@ export component AppWindow inherits Window {
         settings-status: root.settings-status;
         login-provider-id: root.settings-login-provider-id;
         login-code-required: root.settings-login-code-required;
+        builtin-skills-enabled <=> root.settings-builtin-skills-enabled;
         preset-index <=> root.settings-preset-index;
         section <=> root.settings-section;
         prevent-sleep-while-running <=> root.prevent-sleep-while-running;
@@ -5712,6 +5715,7 @@ export component AppWindow inherits Window {
         }
         default-model-picked(i, thinking) => { root.default-model-picked(i, thinking); }
         default-permission-picked(i) => { root.default-permission-picked(i); }
+        builtin-skills-toggled(enabled) => { root.builtin-skills-toggled(enabled); }
         mode-saved(id, name, prompt, tools, ro, perm, model, thinking) => {
             root.mode-saved(id, name, prompt, tools, ro, perm, model, thinking);
         }

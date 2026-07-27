@@ -39,7 +39,7 @@ use crate::{
 pub struct CodexBackend {
     id: String,
     command: String,
-    server: Mutex<Option<Arc<AppServer>>>,
+    server: Arc<Mutex<Option<Arc<AppServer>>>>,
     /// `model/list` result, cached for [`MODELS_TTL`].
     models_cache: Mutex<Option<(std::time::Instant, Vec<ModelInfo>)>>,
     /// Real context windows by model name, learned from
@@ -74,7 +74,7 @@ impl CodexBackend {
         Self {
             id: id.into(),
             command: command.unwrap_or_else(|| "codex".into()),
-            server: Mutex::new(None),
+            server: Arc::new(Mutex::new(None)),
             models_cache: Mutex::new(None),
             observed_windows: Arc::new(std::sync::Mutex::new(HashMap::new())),
         }
@@ -161,9 +161,7 @@ impl AgentBackend for CodexBackend {
     }
 
     fn status(&self) -> BackendStatus {
-        let auth = dirs::home_dir()
-            .map(|h| h.join(".codex").join("auth.json").exists())
-            .unwrap_or(false);
+        let auth = codex_auth_path().is_some_and(|path| path.exists());
         BackendStatus {
             installed: binary_on_path(&self.command),
             has_credentials: auth,
@@ -190,10 +188,37 @@ impl AgentBackend for CodexBackend {
     }
 
     async fn start_login(&self) -> Result<BackendLogin, BackendError> {
-        spawn_codex_login(&self.command).await
+        let BackendLogin {
+            verification_url,
+            user_code,
+            callback_sender,
+            done,
+        } = spawn_codex_login(&self.command).await?;
+        let server = self.server.clone();
+        Ok(BackendLogin {
+            verification_url,
+            user_code,
+            callback_sender,
+            done: Box::pin(async move {
+                let result = done.await;
+                if result.is_ok() {
+                    // AppServer snapshots auth into an isolated CODEX_HOME.
+                    // Force the next request to create a fresh snapshot after
+                    // login rather than retaining a pre-login process.
+                    *server.lock().await = None;
+                }
+                result
+            }),
+        })
     }
 
     async fn run_turn(&self, turn: BackendTurn) -> Result<BackendEventStream, BackendError> {
+        if turn.mcp_bridge.is_some() && !turn.mcp_servers.is_empty() {
+            return Err(BackendError::Protocol(
+                "optimized Codex turns mount user MCP only through Trouve's capability bridge"
+                    .into(),
+            ));
+        }
         let server = self.server().await?;
 
         // Effort comes from the thread's model options; `@effort` model ids
@@ -231,6 +256,7 @@ impl AgentBackend for CodexBackend {
             "approvalPolicy": approval_policy,
             "sandbox": sandbox,
             "serviceName": "trouve",
+            "developerInstructions": turn.instructions,
         }));
         if !model_name.is_empty() {
             start_params["model"] = json!(model_name);
@@ -239,7 +265,13 @@ impl AgentBackend for CodexBackend {
         let codex_thread_id = match &turn.session {
             Some(sid) => {
                 let resumed = server
-                    .request("thread/resume", with_config(json!({ "threadId": sid })))
+                    .request(
+                        "thread/resume",
+                        with_config(json!({
+                            "threadId": sid,
+                            "developerInstructions": turn.instructions,
+                        })),
+                    )
                     .await;
                 match resumed {
                     Ok(v) => thread_id_of(&v)?,
@@ -267,16 +299,7 @@ impl AgentBackend for CodexBackend {
         server.interrupt_active_turn(&codex_thread_id).await?;
         let route = server.subscribe(&codex_thread_id).await;
 
-        // Mode instructions (which include the search-tool guidance when
-        // the bridge is mounted) ride along in the first user message of a
-        // fresh vendor session (app-server owns the system prompt).
-        let text = match (&turn.instructions, fresh_session) {
-            (Some(instr), true) => format!(
-                "<mode-instructions>\n{instr}\n</mode-instructions>\n\n{}",
-                turn.prompt
-            ),
-            _ => turn.prompt.clone(),
-        };
+        let text = turn.prompt.clone();
 
         // Images ride as localImage items (app-server reads the file
         // itself); the engine already turned non-image uploads into path
@@ -349,7 +372,15 @@ fn codex_config_override(turn: &crate::BackendTurn) -> Value {
     if let Some(bridge) = &turn.mcp_bridge {
         // Streamable-HTTP server (`url` instead of `command` selects the
         // transport in codex's mcp_servers config shape).
-        servers.insert("trouve".into(), json!({ "url": bridge.url }));
+        servers.insert(
+            "trouve".into(),
+            json!({
+                "url": bridge.url,
+                // ToolExecutor already classifies and gates every call. Do
+                // not wrap it in Codex's separate MCP approval heuristic.
+                "default_tools_approval_mode": "approve",
+            }),
+        );
     }
     let mut config = json!({ "show_raw_agent_reasoning": true });
     if !servers.is_empty() {
@@ -1089,13 +1120,29 @@ struct AppServer {
     turn_lifecycles: TurnLifecycles,
     /// Held so the child (kill_on_drop) lives as long as the server handle.
     _child: Child,
+    /// A clean Codex home containing credentials only. Keeping the TempDir
+    /// alive prevents ambient config, skills, plugins, hooks, and MCP servers
+    /// from becoming a second capability source.
+    _isolated_home: tempfile::TempDir,
     closed: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl AppServer {
     async fn spawn(command: &str) -> Result<Self, BackendError> {
+        let isolated_home = tempfile::Builder::new()
+            .prefix("trouve-codex-home-")
+            .tempdir()
+            .map_err(BackendError::Io)?;
+        if let Some(source) = codex_auth_path()
+            && source.is_file()
+        {
+            std::fs::copy(&source, isolated_home.path().join("auth.json"))
+                .map_err(BackendError::Io)?;
+        }
         let mut child = tokio::process::Command::new(command)
             .arg("app-server")
+            .arg("--strict-config")
+            .env("CODEX_HOME", isolated_home.path())
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
@@ -1117,6 +1164,7 @@ impl AppServer {
             active_turns: Arc::new(Mutex::new(HashMap::new())),
             turn_lifecycles: Arc::new(std::sync::Mutex::new(HashMap::new())),
             _child: child,
+            _isolated_home: isolated_home,
             closed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         };
         server.start_reader(stdout);
@@ -1140,6 +1188,7 @@ impl AppServer {
             "initialize",
             json!({
                 "clientInfo": { "name": "trouve", "version": env!("CARGO_PKG_VERSION") },
+                "capabilities": { "experimentalApi": true },
             }),
         )
         .await?;
@@ -1613,9 +1662,7 @@ mod tests {
             env: vec![("TOKEN".into(), "sekrit".into())],
         });
         turn.mcp_bridge = Some(crate::McpBridgeConfig {
-            url: "http://127.0.0.1:1/internal/threads/th_1/mcp?tools=0&approval=0".into(),
-            bridge_tools: false,
-            disallowed_tools: Vec::new(),
+            url: "http://127.0.0.1:1/internal/threads/th_1/mcp?approval=0".into(),
         });
         let config = codex_config_override(&turn);
         let servers = &config["mcp_servers"];
@@ -1623,8 +1670,9 @@ mod tests {
         assert_eq!(servers["jira"]["env"]["TOKEN"], "sekrit");
         assert_eq!(
             servers["trouve"]["url"],
-            "http://127.0.0.1:1/internal/threads/th_1/mcp?tools=0&approval=0"
+            "http://127.0.0.1:1/internal/threads/th_1/mcp?approval=0"
         );
+        assert_eq!(servers["trouve"]["default_tools_approval_mode"], "approve");
         assert!(servers["trouve"]["command"].is_null());
 
         // User servers alone (no bridge) still produce an override.
@@ -1632,6 +1680,55 @@ mod tests {
         let config = codex_config_override(&turn);
         assert!(config["mcp_servers"]["jira"].is_object());
         assert!(config["mcp_servers"]["trouve"].is_null());
+    }
+
+    #[test]
+    fn optimized_config_disables_product_surface_but_keeps_native_tools() {
+        let mut turn = bare_turn();
+        turn.mcp_bridge = Some(crate::McpBridgeConfig {
+            url: "http://127.0.0.1:1/internal/threads/th_1/mcp?approval=0".into(),
+        });
+
+        let config = mcp_config_override(&turn).unwrap();
+        assert!(config["web_search"].is_null());
+        assert_eq!(
+            config["mcp_servers"]
+                .as_object()
+                .unwrap()
+                .keys()
+                .collect::<Vec<_>>(),
+            vec!["trouve"]
+        );
+        for feature in [
+            "apps",
+            "browser_use",
+            "browser_use_external",
+            "computer_use",
+            "current_time_reminder",
+            "goals",
+            "hooks",
+            "image_generation",
+            "memories",
+            "multi_agent",
+            "plugins",
+            "remote_plugin",
+            "skill_mcp_dependency_install",
+            "tool_suggest",
+            "workspace_dependencies",
+        ] {
+            assert_eq!(
+                config["features"][feature], false,
+                "feature {feature} escaped product-surface isolation"
+            );
+        }
+        assert!(config["features"]["shell_tool"].is_null());
+        assert!(config["features"]["shell_snapshot"].is_null());
+        assert_eq!(config["agents"]["enabled"], false);
+        assert_eq!(config["experimental_request_user_input_enabled"], false);
+        assert_eq!(
+            config["mcp_servers"]["trouve"]["default_tools_approval_mode"],
+            "approve"
+        );
     }
 
     #[test]
