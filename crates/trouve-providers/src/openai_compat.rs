@@ -31,6 +31,10 @@ pub struct OpenAiCompatProvider {
 }
 
 const MODELS_TTL: std::time::Duration = std::time::Duration::from_secs(300);
+#[cfg(not(test))]
+const MODELS_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+#[cfg(test)]
+const MODELS_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(100);
 
 #[derive(Clone, Copy)]
 enum NativeModelApi {
@@ -503,7 +507,16 @@ impl Provider for OpenAiCompatProvider {
             return models.clone();
         }
         let stale = cache.as_ref().map(|(_, models)| models.clone());
-        match self.fetch_models().await {
+        let fetched = tokio::time::timeout(MODELS_REQUEST_TIMEOUT, self.fetch_models())
+            .await
+            .map_err(|_| {
+                ProviderError::Request(format!(
+                    "model list timed out after {}s",
+                    MODELS_REQUEST_TIMEOUT.as_secs_f64()
+                ))
+            })
+            .and_then(|result| result);
+        match fetched {
             Ok(models) if !models.is_empty() => {
                 *cache = Some((std::time::Instant::now(), models.clone()));
                 models
@@ -839,5 +852,36 @@ mod tests {
         let models = provider.models();
         assert!(models.iter().any(|model| model.id == "openai/gpt-5.6"));
         assert!(models.iter().all(|model| !model.id.contains("embedding")));
+    }
+
+    #[tokio::test]
+    async fn model_list_timeout_uses_stale_cache() {
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let address = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            let _connection = listener.accept().unwrap();
+            std::thread::sleep(std::time::Duration::from_secs(1));
+        });
+
+        let provider =
+            OpenAiCompatProvider::new("custom", format!("http://{address}/v1"), "unused");
+        let stale = trouve_protocol::ModelInfo {
+            id: "custom/stale".into(),
+            display_name: "Stale".into(),
+            context_window: 8_192,
+            supports_tools: true,
+            input_price_per_mtok: None,
+            output_price_per_mtok: None,
+            options_schema: json!({}),
+        };
+        *provider.models_cache.lock().await =
+            Some((std::time::Instant::now() - MODELS_TTL, vec![stale.clone()]));
+
+        let started = std::time::Instant::now();
+        let models = provider.list_models().await;
+        assert_eq!(models.len(), 1);
+        assert_eq!(models[0].id, stale.id);
+        assert_eq!(models[0].context_window, stale.context_window);
+        assert!(started.elapsed() < std::time::Duration::from_secs(1));
     }
 }

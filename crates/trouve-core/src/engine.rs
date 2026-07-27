@@ -345,6 +345,9 @@ pub struct Engine {
     /// publication against host removal without holding the cache map lock
     /// across event-log writes.
     github_dashboard_publication: Mutex<()>,
+    /// Serializes provider upserts and deletions across config, secret-store,
+    /// and registry mutations without blocking unrelated provider ids.
+    provider_locks: Mutex<HashMap<String, Arc<Mutex<()>>>>,
     pub(crate) config: Mutex<Config>,
     /// Where provider configuration changes are persisted. `None` disables
     /// persistence (tests).
@@ -675,6 +678,7 @@ impl Engine {
             turn_cancels: Mutex::new(std::collections::HashMap::new()),
             github_dashboard_caches: Mutex::new(HashMap::new()),
             github_dashboard_publication: Mutex::new(()),
+            provider_locks: Mutex::new(HashMap::new()),
             config: Mutex::new(config.clone()),
             // No write-back by default: only a caller that loaded `config`
             // from disk should enable persisting to that file (see
@@ -1097,6 +1101,8 @@ impl Engine {
                 "provider id must be non-empty ascii alphanumeric/dashes".into(),
             ));
         }
+        let provider_lock = self.provider_lock(id);
+        let _provider_guard = provider_lock.lock().unwrap();
         if let Some(key) = req.api_key.as_deref().filter(|k| !k.is_empty()) {
             self.secrets
                 .set(&trouve_providers::secrets::api_key_secret(id), key)
@@ -1178,6 +1184,8 @@ impl Engine {
 
     /// Remove a provider from the config and its stored API key.
     pub fn delete_provider(&self, id: &str) -> Result<(), EngineError> {
+        let provider_lock = self.provider_lock(id);
+        let _provider_guard = provider_lock.lock().unwrap();
         let secret_names = {
             let mut config = self.config.lock().unwrap();
             let removed = config
@@ -1200,6 +1208,15 @@ impl Engine {
         }
         self.reload_providers();
         Ok(())
+    }
+
+    fn provider_lock(&self, id: &str) -> Arc<Mutex<()>> {
+        self.provider_locks
+            .lock()
+            .unwrap()
+            .entry(id.to_string())
+            .or_insert_with(|| Arc::new(Mutex::new(())))
+            .clone()
     }
 
     // --- OAuth login (subscription providers) ---------------------------------
@@ -8126,6 +8143,45 @@ fn expand_provider_template(
 mod tests {
     use super::*;
 
+    struct BlockingProviderSecretStore {
+        values: Mutex<HashMap<String, String>>,
+        delete_started: std::sync::Barrier,
+        allow_delete: std::sync::Barrier,
+    }
+
+    impl BlockingProviderSecretStore {
+        fn new() -> Self {
+            Self {
+                values: Mutex::new(HashMap::new()),
+                delete_started: std::sync::Barrier::new(2),
+                allow_delete: std::sync::Barrier::new(2),
+            }
+        }
+    }
+
+    impl trouve_providers::secrets::SecretStore for BlockingProviderSecretStore {
+        fn get(&self, key: &str) -> anyhow::Result<Option<String>> {
+            Ok(self.values.lock().unwrap().get(key).cloned())
+        }
+
+        fn set(&self, key: &str, value: &str) -> anyhow::Result<()> {
+            self.values
+                .lock()
+                .unwrap()
+                .insert(key.to_string(), value.to_string());
+            Ok(())
+        }
+
+        fn delete(&self, key: &str) -> anyhow::Result<()> {
+            if key == trouve_providers::secrets::api_key_secret("serialized") {
+                self.delete_started.wait();
+                self.allow_delete.wait();
+            }
+            self.values.lock().unwrap().remove(key);
+            Ok(())
+        }
+    }
+
     #[tokio::test]
     async fn removing_github_host_discards_its_dashboard_cache() {
         const HOST: &str = "github.example.com";
@@ -9004,5 +9060,89 @@ mod tests {
         let provider = config.providers.get("azure").unwrap();
         assert_eq!(provider.headers, custom_headers);
         assert_eq!(provider.query_params, custom_query);
+    }
+
+    #[test]
+    fn provider_upsert_waits_for_in_flight_delete() {
+        const ID: &str = "serialized";
+
+        let data = tempfile::tempdir().unwrap();
+        let mut config = Config {
+            local_enabled: Some(false),
+            ..Default::default()
+        };
+        config.providers.insert(
+            ID.into(),
+            ProviderConfig {
+                kind: "openai-compat".into(),
+                base_url: Some("https://old.example.test/v1".into()),
+                ..Default::default()
+            },
+        );
+        let secret_store = Arc::new(BlockingProviderSecretStore::new());
+        secret_store
+            .values
+            .lock()
+            .unwrap()
+            .insert(trouve_providers::secrets::api_key_secret(ID), "old".into());
+        let mut engine = Engine::new(
+            Store::open_in_memory().unwrap(),
+            data.path().to_path_buf(),
+            &config,
+        );
+        engine.secrets = secret_store.clone();
+        let engine = Arc::new(engine);
+
+        let deleting = {
+            let engine = engine.clone();
+            std::thread::spawn(move || engine.delete_provider(ID))
+        };
+        secret_store.delete_started.wait();
+
+        let (started_tx, started_rx) = std::sync::mpsc::sync_channel(0);
+        let (done_tx, done_rx) = std::sync::mpsc::sync_channel(1);
+        let upserting = {
+            let engine = engine.clone();
+            std::thread::spawn(move || {
+                started_tx.send(()).unwrap();
+                let result = engine.upsert_provider(
+                    ID,
+                    &UpsertProviderRequest {
+                        kind: "openai-compat".into(),
+                        base_url: Some("https://new.example.test/v1".into()),
+                        api_key: Some("new".into()),
+                        ..Default::default()
+                    },
+                );
+                done_tx.send(result).unwrap();
+            })
+        };
+        started_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+        assert!(matches!(
+            done_rx.recv_timeout(std::time::Duration::from_millis(100)),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+        ));
+
+        secret_store.allow_delete.wait();
+        deleting.join().unwrap().unwrap();
+        let info = done_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap()
+            .unwrap();
+        upserting.join().unwrap();
+
+        assert_eq!(info.id, ID);
+        assert!(engine.config.lock().unwrap().providers.contains_key(ID));
+        assert_eq!(
+            secret_store
+                .values
+                .lock()
+                .unwrap()
+                .get(&trouve_providers::secrets::api_key_secret(ID))
+                .map(String::as_str),
+            Some("new")
+        );
     }
 }

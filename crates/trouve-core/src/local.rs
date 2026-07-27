@@ -1005,19 +1005,11 @@ impl LlamaManager {
             .await
             .ok()
             .and_then(|resp| resp.error_for_status().ok());
-        let context_window = match context_window {
-            Some(resp) => resp
-                .json::<serde_json::Value>()
-                .await
-                .ok()
-                .and_then(|props| {
-                    props
-                        .pointer("/default_generation_settings/n_ctx")
-                        .and_then(serde_json::Value::as_u64)
-                })
-                .unwrap_or(0),
-            None => 0,
+        let props = match context_window {
+            Some(resp) => resp.json::<serde_json::Value>().await.ok(),
+            None => None,
         };
+        let context_window = effective_context_window(props.as_ref(), requested_context);
 
         Ok((port, child, context_window))
     }
@@ -1057,6 +1049,17 @@ fn launch_context(native_context: u64, model_size: u64, hardware: &Hardware) -> 
     } else {
         ceiling
     }
+}
+
+fn effective_context_window(props: Option<&serde_json::Value>, launched_context: u64) -> u64 {
+    props
+        .and_then(|props| {
+            props
+                .pointer("/default_generation_settings/n_ctx")
+                .and_then(serde_json::Value::as_u64)
+        })
+        .filter(|context| *context > 0)
+        .unwrap_or(launched_context)
 }
 
 fn log_tail(path: &Path) -> String {
@@ -1286,6 +1289,32 @@ mod tests {
         let ceiling = launch_context(1_000_000, model_size, &hw);
         assert!(ceiling < 1_000_000);
         assert_eq!(launch_context(4_096, model_size, &hw), 4_096);
+    }
+
+    #[test]
+    fn launched_context_is_the_fallback_for_unusable_props() {
+        const LAUNCHED: u64 = 32_768;
+        for props in [
+            None,
+            Some(serde_json::json!({})),
+            Some(serde_json::json!({
+                "default_generation_settings": {"n_ctx": "invalid"}
+            })),
+            Some(serde_json::json!({
+                "default_generation_settings": {"n_ctx": 0}
+            })),
+        ] {
+            assert_eq!(effective_context_window(props.as_ref(), LAUNCHED), LAUNCHED);
+        }
+        assert_eq!(
+            effective_context_window(
+                Some(&serde_json::json!({
+                    "default_generation_settings": {"n_ctx": 16_384}
+                })),
+                LAUNCHED
+            ),
+            16_384
+        );
     }
 
     #[test]
