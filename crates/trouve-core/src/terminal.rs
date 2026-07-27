@@ -131,7 +131,9 @@ impl TerminalManager {
             })
             .map_err(|e| anyhow!("openpty: {e}"))?;
 
-        let mut cmd = CommandBuilder::new(default_shell());
+        let shell = default_shell();
+        let mut cmd = CommandBuilder::new(&shell);
+        cmd.args(shell_args(&shell));
         cmd.cwd(worktree);
         cmd.env("TERM", "xterm-256color");
         cmd.env("COLORTERM", "truecolor");
@@ -261,9 +263,37 @@ fn default_shell() -> String {
     }
 }
 
+fn shell_args(shell: &str) -> &'static [&'static str] {
+    let executable = shell.rsplit(['/', '\\']).next().unwrap_or(shell);
+    let is_fish =
+        executable.eq_ignore_ascii_case("fish") || executable.eq_ignore_ascii_case("fish.exe");
+    if is_fish {
+        // fish 4.1+ waits for terminal capability replies before processing
+        // input. trouve renders PTY output but does not answer those optional
+        // queries, so disable them for this shell instance.
+        &["--features", "no-query-term"]
+    } else {
+        &[]
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fish_shell_disables_terminal_queries() {
+        assert_eq!(shell_args("/usr/bin/fish"), ["--features", "no-query-term"]);
+        assert_eq!(
+            shell_args(r"C:\Program Files\fish\fish.exe"),
+            ["--features", "no-query-term"]
+        );
+        assert_eq!(
+            shell_args(r"C:\Program Files\fish\FISH.EXE"),
+            ["--features", "no-query-term"]
+        );
+        assert!(shell_args("/bin/bash").is_empty());
+    }
 
     #[tokio::test]
     async fn shell_roundtrip_backlog_and_live() {

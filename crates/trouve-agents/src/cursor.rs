@@ -57,7 +57,9 @@ use trouve_protocol::{ModelInfo, Usage};
 
 use crate::{
     AgentBackend, BackendError, BackendEvent, BackendEventStream, BackendLogin, BackendPermission,
-    BackendStatus, BackendTurn, async_stream, binary_on_path, format_reset, model, spawn_login,
+    BackendStatus, BackendTurn, async_stream, binary_on_path, format_reset, model,
+    route::{ROUTE_EVENT_BUDGET, RouteReceiver, RouteSendError, RouteSender, route_channel},
+    spawn_login,
 };
 
 pub struct CursorBackend {
@@ -655,7 +657,7 @@ fn config_snapshot_value(result: &Value, id: &str) -> Option<String> {
 fn turn_stream(
     server: Arc<AcpServer>,
     session_id: String,
-    mut route: mpsc::Receiver<ServerMsg>,
+    mut route: RouteReceiver<ServerMsg>,
     mut prompt_rx: oneshot::Receiver<Result<Value, String>>,
     fresh_session: bool,
 ) -> impl futures::Stream<Item = Result<BackendEvent, BackendError>> {
@@ -668,45 +670,74 @@ fn turn_stream(
                 .await;
         }
         let mut client_gone = false;
-        loop {
-            tokio::select! {
-                msg = route.recv() => {
-                    let Some(msg) = msg else { break };
-                    if handle_msg(&server, msg, &tx).await.is_err() {
-                        // Receiver dropped (turn cancelled): stop cursor's
-                        // generation instead of letting it run headless.
-                        client_gone = true;
-                        server.notify("session/cancel", json!({ "sessionId": session_id })).await;
-                        break;
-                    }
-                }
-                result = &mut prompt_rx => {
-                    // Reader delivers in wire order, so any updates sent
-                    // before the response are already queued; drain them.
-                    while let Ok(msg) = route.try_recv() {
-                        if handle_msg(&server, msg, &tx).await.is_err() {
-                            client_gone = true;
+        let mut route_overloaded = false;
+        let mut overload_signal = route.overload_signal();
+        tokio::select! {
+            biased;
+            _ = overload_signal.wait() => {
+                route_overloaded = true;
+            }
+            _ = async {
+                loop {
+                    tokio::select! {
+                        msg = route.recv() => {
+                            let Some(msg) = msg else { break };
+                            if handle_msg(&server, msg, &tx).await.is_err() {
+                                // Receiver dropped (turn cancelled): stop cursor's
+                                // generation instead of letting it run headless.
+                                client_gone = true;
+                                server.notify("session/cancel", json!({ "sessionId": session_id })).await;
+                                break;
+                            }
+                        }
+                        result = &mut prompt_rx => {
+                            // Reader delivers in wire order, so any updates sent
+                            // before the response are already queued; drain them.
+                            while let Ok(msg) = route.try_recv() {
+                                if handle_msg(&server, msg, &tx).await.is_err() {
+                                    client_gone = true;
+                                    break;
+                                }
+                            }
+                            match result {
+                                Ok(Ok(value)) => {
+                                    let _ = tx.send(Ok(BackendEvent::Completed {
+                                        usage: parse_usage(&value["usage"]),
+                                    })).await;
+                                }
+                                Ok(Err(e)) => {
+                                    let _ = tx.send(Err(BackendError::Protocol(
+                                        format!("session/prompt: {e}")))).await;
+                                }
+                                Err(_) => {
+                                    let _ = tx.send(Err(BackendError::Protocol(
+                                        "cursor-agent closed before the turn completed".into()))).await;
+                                }
+                            }
                             break;
                         }
                     }
-                    match result {
-                        Ok(Ok(value)) => {
-                            let _ = tx.send(Ok(BackendEvent::Completed {
-                                usage: parse_usage(&value["usage"]),
-                            })).await;
-                        }
-                        Ok(Err(e)) => {
-                            let _ = tx.send(Err(BackendError::Protocol(
-                                format!("session/prompt: {e}")))).await;
-                        }
-                        Err(_) => {
-                            let _ = tx.send(Err(BackendError::Protocol(
-                                "cursor-agent closed before the turn completed".into()))).await;
-                        }
-                    }
-                    break;
                 }
-            }
+            } => {}
+        }
+        if route_overloaded {
+            // Cursor supports per-session cancellation, so stop only this
+            // overloaded turn while the shared ACP process keeps serving
+            // the worktree's other sessions. Do not let ACP stdin backpressure
+            // delay the overload error reaching the caller.
+            let cancel_server = server.clone();
+            let cancel_session_id = session_id.clone();
+            tokio::spawn(async move {
+                cancel_server
+                    .notify("session/cancel", json!({ "sessionId": cancel_session_id }))
+                    .await;
+            });
+            let _ = tx
+                .send(Err(BackendError::Protocol(format!(
+                    "cursor-agent event backlog exceeded the per-turn limit of \
+                     {ROUTE_EVENT_BUDGET} messages"
+                ))))
+                .await;
         }
         if client_gone {
             // Best effort; the vendor process keeps running for other threads.
@@ -1111,12 +1142,21 @@ enum ServerMsg {
 }
 
 type Pending = Arc<Mutex<HashMap<i64, oneshot::Sender<Result<Value, String>>>>>;
+type Routes = Arc<Mutex<HashMap<String, RouteSender<ServerMsg>>>>;
+
+async fn write_reply(stdin: &Mutex<ChildStdin>, reply: Value) {
+    let mut line = serde_json::to_vec(&reply).expect("serializable");
+    line.push(b'\n');
+    let mut stdin = stdin.lock().await;
+    let _ = stdin.write_all(&line).await;
+    let _ = stdin.flush().await;
+}
 
 struct AcpServer {
     stdin: Arc<Mutex<ChildStdin>>,
     next_id: AtomicI64,
     pending: Pending,
-    routes: Arc<Mutex<HashMap<String, mpsc::Sender<ServerMsg>>>>,
+    routes: Routes,
     /// Sessions this process has created or loaded (session/prompt on an
     /// unknown session fails, so resumes go through session/load first).
     sessions: Mutex<HashSet<String>>,
@@ -1247,11 +1287,7 @@ impl AcpServer {
                                 .insert(call_id.to_string(), params.clone());
                         }
                         let reply = json!({ "jsonrpc": "2.0", "id": msg["id"], "result": {} });
-                        let mut line = serde_json::to_vec(&reply).expect("serializable");
-                        line.push(b'\n');
-                        let mut stdin = stdin.lock().await;
-                        let _ = stdin.write_all(&line).await;
-                        let _ = stdin.flush().await;
+                        write_reply(stdin.as_ref(), reply).await;
                         continue;
                     }
                     let mut session_id = params["sessionId"].as_str().unwrap_or("").to_string();
@@ -1303,25 +1339,54 @@ impl AcpServer {
                         } else {
                             ServerMsg::Notification { method, params }
                         };
-                        let _ = tx.send(m).await;
+                        // This reader serves every session in the worktree,
+                        // including their JSON-RPC responses. A slow session
+                        // must fail independently rather than wedge the
+                        // entire shared ACP transport.
+                        if let Err(error) = tx.try_send(m) {
+                            if error == RouteSendError::Overloaded {
+                                tracing::warn!(
+                                    "cursor acp: dropping {session_id} event route: \
+                                     event backlog limit exceeded"
+                                );
+                            }
+                            let mut routes = routes.lock().await;
+                            if routes
+                                .get(&session_id)
+                                .is_some_and(|active| active.same_channel(&tx))
+                            {
+                                routes.remove(&session_id);
+                            }
+                            drop(routes);
+                            if has_id {
+                                // The agent blocks its turn on server requests.
+                                // Reject a request that could not reach its
+                                // session instead of leaving it unresolved.
+                                let reply = json!({
+                                    "jsonrpc": "2.0", "id": msg["id"],
+                                    "error": { "code": -32603,
+                                               "message": "session event route unavailable" },
+                                });
+                                write_reply(stdin.as_ref(), reply).await;
+                            }
+                        }
                     } else if has_id {
                         // A request nobody can answer must still get a
                         // response — the agent blocks its turn on it.
                         tracing::warn!("cursor acp: refusing unroutable request {method}");
                         let reply = json!({
                             "jsonrpc": "2.0", "id": msg["id"],
-                            "error": { "code": -32601,
-                                       "message": format!("unsupported method {method}") },
+                            "error": { "code": -32603,
+                                       "message": "session event route unavailable" },
                         });
-                        let mut line = serde_json::to_vec(&reply).expect("serializable");
-                        line.push(b'\n');
-                        let mut stdin = stdin.lock().await;
-                        let _ = stdin.write_all(&line).await;
-                        let _ = stdin.flush().await;
+                        write_reply(stdin.as_ref(), reply).await;
                     }
                 }
             }
+            // Release every waiter the dead transport left behind.
             closed.store(true, Ordering::Relaxed);
+            pending.lock().await.clear();
+            routes.lock().await.clear();
         });
     }
 
@@ -1456,8 +1521,8 @@ impl AcpServer {
         stdin.flush().await.map_err(BackendError::Io)
     }
 
-    async fn subscribe(&self, session_id: &str) -> mpsc::Receiver<ServerMsg> {
-        let (tx, rx) = mpsc::channel(256);
+    async fn subscribe(&self, session_id: &str) -> RouteReceiver<ServerMsg> {
+        let (tx, rx) = route_channel();
         self.routes.lock().await.insert(session_id.to_string(), tx);
         rx
     }
