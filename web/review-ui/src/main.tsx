@@ -26,6 +26,7 @@ import {
   refreshReviews,
   requestReview,
   retryJob,
+  retryPersona,
   saveDefaultModel,
   saveProvider,
   saveRepository,
@@ -118,15 +119,40 @@ function liveElapsed(
 }
 
 function pickPreferredTask(tasks: ReviewTask[]): ReviewTask | undefined {
+  const latestByBatch = new Map<string, ReviewTask>();
+  tasks.forEach((task) => {
+    const key = `${task.role}:${task.batch_index}`;
+    const current = latestByBatch.get(key);
+    if (
+      !current ||
+      task.created_at > current.created_at ||
+      (task.created_at === current.created_at && task.id > current.id)
+    ) {
+      latestByBatch.set(key, task);
+    }
+  });
+  const latest = [...latestByBatch.values()];
   return (
-    tasks.find((task) => task.status === "running") ??
-    tasks.find((task) => task.status === "failed") ??
-    tasks
+    latest.find((task) => task.status === "running") ??
+    latest.find((task) => task.status === "queued") ??
+    latest.find((task) => task.status === "failed") ??
+    latest
       .slice()
       .reverse()
       .find((task) => task.role === "coordinator") ??
+    latest[0] ??
     tasks[0]
   );
+}
+
+function taskAttemptLabel(tasks: ReviewTask[], task: ReviewTask): string {
+  const attempts = tasks.filter(
+    (candidate) =>
+      candidate.role === task.role && candidate.batch_index === task.batch_index,
+  );
+  const base = task.role === "coordinator" ? "Attempt" : `Batch ${task.batch_index + 1}`;
+  if (attempts.length === 1) return base;
+  return `${base} · attempt ${attempts.indexOf(task) + 1}`;
 }
 
 function useClock(active = true): number {
@@ -782,6 +808,21 @@ function JobDetailPane({
     }
   };
 
+  const retryFailedPersona = async (reviewerId: string): Promise<void> => {
+    if (!detail) return;
+    const action = `persona:${reviewerId}`;
+    setBusy(action);
+    try {
+      await retryPersona(detail.job.id, reviewerId);
+      onChanged();
+      await load();
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : String(cause));
+    } finally {
+      setBusy("");
+    }
+  };
+
   if (!detail) {
     return (
       <aside class="panel job-detail">
@@ -1071,13 +1112,30 @@ function JobDetailPane({
                 const active = group.id === selectedGroup?.id;
                 return (
                   <div class={`activity-group${active ? " active" : ""}`} key={group.id}>
-                    <button type="button" onClick={() => selectPreferredTask(group.tasks)}>
-                      <span>
-                        <strong>{group.name}</strong>
-                        <small>{group.subtitle}</small>
-                      </span>
-                      <StatusPill status={group.status} />
-                    </button>
+                    <div class="activity-group-summary">
+                      <button type="button" onClick={() => selectPreferredTask(group.tasks)}>
+                        <span>
+                          <strong>{group.name}</strong>
+                          <small>{group.subtitle}</small>
+                        </span>
+                        <StatusPill status={group.status} />
+                      </button>
+                      {job.status === "failed" &&
+                        group.status === "failed" &&
+                        group.persona && (
+                          <button
+                            class="compact ghost retry-persona"
+                            type="button"
+                            disabled={Boolean(busy)}
+                            onClick={() => void retryFailedPersona(group.persona!.reviewer_id)}
+                            aria-label={`Retry ${group.name}`}
+                          >
+                            {busy === `persona:${group.persona.reviewer_id}`
+                              ? "Retrying…"
+                              : "Retry"}
+                          </button>
+                        )}
+                    </div>
                     {active && group.tasks.length > 1 && (
                       <div class="batch-tabs">
                         {group.tasks.map((task) => (
@@ -1087,9 +1145,7 @@ function JobDetailPane({
                             onClick={() => setSelectedTaskId(task.id)}
                             key={task.id}
                           >
-                            {task.role === "coordinator"
-                              ? "Attempt"
-                              : `Batch ${task.batch_index + 1}`}
+                            {taskAttemptLabel(group.tasks, task)}
                             <StatusPill status={task.status} />
                           </button>
                         ))}
