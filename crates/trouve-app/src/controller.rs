@@ -43,6 +43,121 @@ const SERVER_EVENT_FRESH_WINDOW: std::time::Duration = std::time::Duration::from
 const SERVER_REPLAY_IDLE_FLUSH: std::time::Duration = std::time::Duration::from_millis(250);
 /// Session creation must not wait indefinitely for the optional title sidecar.
 const SESSION_TITLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+/// Render only this many transcript rows when a thread is first opened.
+/// Slint virtualizes delegates, but giving its ListView the complete model
+/// still makes it estimate and settle every historical row before reaching
+/// the tail.
+const CHAT_WINDOW_ROWS: usize = 160;
+/// Refill history before the reader lands exactly on the first loaded row.
+const CHAT_HISTORY_REFILL_ROWS: usize = 20;
+
+/// The absolute rendered-row interval currently installed in the chat list.
+///
+/// Bookmarks remain absolute within the complete rendered transcript, while
+/// the Slint model sees only `start..end`. This keeps existing resume state
+/// stable and lets prepending a page preserve the visible row precisely.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct ChatWindow {
+    start: usize,
+    end: usize,
+    total: usize,
+    initialized: bool,
+    following_tail: bool,
+}
+
+impl ChatWindow {
+    fn update(&mut self, total: usize, bookmark: Option<usize>) {
+        if total == 0 {
+            self.start = 0;
+            self.end = 0;
+            self.total = 0;
+            return;
+        }
+        if !self.initialized {
+            if let Some(row) = bookmark {
+                if row >= total {
+                    // Persisted replay may arrive in more than one batch.
+                    // Show its current bounded tail, but keep initialization
+                    // pending until the absolute bookmark exists.
+                    self.end = total;
+                    self.start = self.end.saturating_sub(CHAT_WINDOW_ROWS);
+                    self.total = total;
+                    self.following_tail = false;
+                    return;
+                }
+                self.start = row.saturating_sub(CHAT_HISTORY_REFILL_ROWS);
+                self.end = (self.start + CHAT_WINDOW_ROWS).min(total);
+                self.following_tail = false;
+            } else {
+                self.end = total;
+                self.start = self.end.saturating_sub(CHAT_WINDOW_ROWS);
+                self.following_tail = true;
+            }
+            self.total = total;
+            self.initialized = true;
+            return;
+        }
+
+        let covered_tail = self.end >= self.total;
+        if covered_tail {
+            self.end = total;
+            if self.following_tail {
+                self.start = self.end.saturating_sub(CHAT_WINDOW_ROWS);
+            }
+        } else {
+            self.end = self.end.min(total);
+        }
+        self.start = self.start.min(self.end);
+        if self.start == self.end {
+            self.start = self.end.saturating_sub(CHAT_WINDOW_ROWS);
+        }
+        self.total = total;
+    }
+
+    fn range(&self) -> std::ops::Range<usize> {
+        self.start..self.end
+    }
+
+    fn absolute_row(&self, local_row: usize) -> usize {
+        (self.start + local_row).min(self.end.saturating_sub(1))
+    }
+
+    fn local_row(&self, absolute_row: usize) -> Option<usize> {
+        (self.start..self.end)
+            .contains(&absolute_row)
+            .then_some(absolute_row - self.start)
+    }
+
+    fn prepend(&mut self) -> bool {
+        let next = self.start.saturating_sub(CHAT_WINDOW_ROWS);
+        if next == self.start {
+            return false;
+        }
+        self.start = next;
+        self.following_tail = false;
+        true
+    }
+
+    fn append(&mut self) -> bool {
+        let next = self.end.saturating_add(CHAT_WINDOW_ROWS).min(self.total);
+        if next == self.end {
+            return false;
+        }
+        self.end = next;
+        self.following_tail = false;
+        true
+    }
+
+    fn reveal_tail(&mut self) -> bool {
+        let end = self.total;
+        let start = end.saturating_sub(CHAT_WINDOW_ROWS);
+        let changed = self.start != start || self.end != end;
+        self.start = start;
+        self.end = end;
+        self.following_tail = true;
+        changed
+    }
+}
 
 /// During global history replay, only the newest state snapshot for each
 /// GitHub host matters. Lifecycle events are edge-triggered and stale ones are
@@ -829,6 +944,9 @@ struct Controller {
     raw_turns: HashSet<(String, u64)>,
     /// (thread id, card key) pairs whose card body is collapsed.
     collapsed_cards: HashSet<(String, String)>,
+    /// Per-thread slice of the fully rendered transcript installed in Slint.
+    /// Older rows are prepended on demand as the reader approaches the top.
+    chat_windows: HashMap<String, ChatWindow>,
     row_call_ids: Vec<Option<String>>,
     /// Question-wizard state per pending request id (page, selections,
     /// "Other" texts); dropped once the request resolves.
@@ -1015,6 +1133,7 @@ pub async fn run(
         last_delta_render: None,
         raw_turns: HashSet::new(),
         collapsed_cards: HashSet::new(),
+        chat_windows: HashMap::new(),
         row_call_ids: Vec::new(),
         wizards: HashMap::new(),
         resume: crate::winstate::load_resume(),
@@ -1737,6 +1856,7 @@ impl Controller {
         let attention_changed =
             self.update_session_attention(thread_id, before, AttentionCounts::default());
         self.vms.remove(thread_id);
+        self.chat_windows.remove(thread_id);
         self.thread_sessions.remove(thread_id);
         attention_changed
     }
@@ -2118,10 +2238,41 @@ impl Controller {
             if self.resume.thread_scroll.remove(&thread_id).is_some() {
                 crate::winstate::save_resume(&self.resume);
             }
+            let window_changed = self
+                .chat_windows
+                .get_mut(&thread_id)
+                .is_some_and(ChatWindow::reveal_tail);
+            if window_changed {
+                self.render_chat(false);
+            }
             ui::scroll_chat_to_end(&self.ui);
         } else if let Some(bookmark) = bookmark {
-            self.restoring_thread = Some(thread_id);
-            ui::restore_chat_position(&self.ui, bookmark.row, bookmark.offset);
+            let window = self.chat_windows.get(&thread_id);
+            let local_row = window.and_then(|window| window.local_row(bookmark.row));
+            if let Some(local_row) = local_row {
+                self.restoring_thread = Some(thread_id);
+                ui::restore_chat_position(&self.ui, local_row, bookmark.offset);
+            } else if window.is_none_or(|window| window.total == 0) {
+                // The first follower render is intentionally empty while
+                // persisted events are replayed. Keep the absolute bookmark
+                // pending; render_chat applies it once rows exist.
+                self.restoring_thread = Some(thread_id);
+            } else {
+                // Row structure can change across app versions or card
+                // expansion state. An invalid absolute bookmark falls back
+                // to the bounded live tail.
+                self.restoring_thread = None;
+                self.resume.thread_scroll.remove(&thread_id);
+                crate::winstate::save_resume(&self.resume);
+                let window_changed = self
+                    .chat_windows
+                    .get_mut(&thread_id)
+                    .is_some_and(ChatWindow::reveal_tail);
+                if window_changed {
+                    self.render_chat(false);
+                }
+                ui::scroll_chat_to_end(&self.ui);
+            }
         }
     }
 
@@ -2559,7 +2710,18 @@ impl Controller {
             &collapsed,
             &self.wizards,
         );
-        self.row_call_ids = call_ids;
+        let bookmark = self
+            .resume
+            .thread_scroll
+            .get(&thread_id)
+            .map(|bookmark| bookmark.row);
+        let range = {
+            let window = self.chat_windows.entry(thread_id.clone()).or_default();
+            window.update(rows.len(), bookmark);
+            window.range()
+        };
+        self.row_call_ids = call_ids[range.clone()].to_vec();
+        let rows = rows[range].to_vec();
         ui::set_slash_commands(
             &self.ui,
             vm.commands
@@ -2567,8 +2729,20 @@ impl Controller {
                 .map(|c| (c.name.clone(), c.description.clone()))
                 .collect(),
         );
-        ui::set_chat(&self.ui, rows, thread_id, scroll);
+        ui::set_chat(&self.ui, rows, thread_id.clone(), scroll);
         ui::set_composer_enabled(&self.ui, true);
+        // A session can be selected before its event follower has replayed
+        // any rows. Complete the deferred absolute-bookmark restore after
+        // the bounded window has been installed.
+        if self.restoring_thread.as_deref() == Some(&thread_id)
+            && let Some(bookmark) = self.resume.thread_scroll.get(&thread_id)
+            && let Some(local_row) = self
+                .chat_windows
+                .get(&thread_id)
+                .and_then(|window| window.local_row(bookmark.row))
+        {
+            ui::restore_chat_position(&self.ui, local_row, bookmark.offset);
+        }
     }
 
     /// Push the current thread's prompt queue to the composer's queue panel.
@@ -4667,14 +4841,31 @@ impl Controller {
                 if self.restoring_thread.as_deref() == Some(&thread_id) {
                     self.restoring_thread = None;
                 }
-                let changed = if at_bottom {
+                let (absolute_row, at_transcript_tail, refill) = {
+                    let Some(window) = self.chat_windows.get_mut(&thread_id) else {
+                        return Ok(());
+                    };
+                    let absolute_row = window.absolute_row(row);
+                    let refilled = (row <= CHAT_HISTORY_REFILL_ROWS && window.prepend())
+                        || (at_bottom && window.append());
+                    let refill = refilled.then_some(absolute_row);
+                    let at_transcript_tail = at_bottom && window.end >= window.total;
+                    window.following_tail = at_transcript_tail;
+                    (absolute_row, at_transcript_tail, refill)
+                };
+                let changed = if at_transcript_tail {
                     self.resume.thread_scroll.remove(&thread_id).is_some()
                 } else if offset.is_finite() && offset >= 0.0 {
-                    let bookmark = crate::winstate::ChatScrollBookmark { row, offset };
+                    let bookmark = crate::winstate::ChatScrollBookmark {
+                        row: absolute_row,
+                        offset,
+                    };
                     if self.resume.thread_scroll.get(&thread_id) == Some(&bookmark) {
                         false
                     } else {
-                        self.resume.thread_scroll.insert(thread_id, bookmark);
+                        self.resume
+                            .thread_scroll
+                            .insert(thread_id.clone(), bookmark);
                         true
                     }
                 } else {
@@ -4682,6 +4873,17 @@ impl Controller {
                 };
                 if changed {
                     crate::winstate::save_resume(&self.resume);
+                }
+                if let Some(anchor) = refill {
+                    self.render_chat(false);
+                    if let Some(local_row) = self
+                        .chat_windows
+                        .get(&thread_id)
+                        .and_then(|window| window.local_row(anchor))
+                    {
+                        self.restoring_thread = Some(thread_id);
+                        ui::restore_chat_position(&self.ui, local_row, offset.max(0.0));
+                    }
                 }
             }
             UiCommand::SendMessage(text) => {
@@ -7401,8 +7603,8 @@ fn session_title_fallback(prompt: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        ServerReplayBuffer, SubscriptionRefresh, SubscriptionRefreshState, approval_pill,
-        attention_badge, check_pill, classify_pr, download_progress,
+        ChatWindow, ServerReplayBuffer, SubscriptionRefresh, SubscriptionRefreshState,
+        approval_pill, attention_badge, check_pill, classify_pr, download_progress,
         format_pr_dashboard_refresh_status, human_age, human_rate, merge_pill, model_health_view,
         pr_badge, project_session_prs, provider_login_requires_code, reconcile_pr_group_order,
         reconcile_workspace_order, reorder_id, session_title_fallback, should_open_chat_at_tail,
@@ -7920,6 +8122,57 @@ mod tests {
         assert!(should_open_chat_at_tail(false, false, true));
         assert!(should_open_chat_at_tail(true, false, false));
         assert!(!should_open_chat_at_tail(false, false, false));
+    }
+
+    #[test]
+    fn chat_window_opens_at_tail_and_prepends_history() {
+        let mut window = ChatWindow::default();
+        window.update(500, None);
+        assert_eq!(window.range(), 340..500);
+        assert_eq!(window.local_row(475), Some(135));
+
+        assert!(window.prepend());
+        assert_eq!(window.range(), 180..500);
+        assert_eq!(window.local_row(340), Some(160));
+        assert_eq!(window.absolute_row(160), 340);
+    }
+
+    #[test]
+    fn chat_window_restores_absolute_bookmark_without_rendering_tail() {
+        let mut window = ChatWindow::default();
+        window.update(2_000, Some(410));
+        assert_eq!(window.range(), 390..550);
+        assert_eq!(window.local_row(410), Some(20));
+        assert!(!window.following_tail);
+
+        assert!(window.append());
+        assert_eq!(window.range(), 390..710);
+        assert_eq!(window.local_row(410), Some(20));
+    }
+
+    #[test]
+    fn chat_window_waits_for_bookmark_during_batched_replay() {
+        let mut window = ChatWindow::default();
+        window.update(200, Some(410));
+        assert!(!window.initialized);
+        assert_eq!(window.range(), 40..200);
+
+        window.update(500, Some(410));
+        assert!(window.initialized);
+        assert_eq!(window.range(), 390..500);
+        assert_eq!(window.local_row(410), Some(20));
+    }
+
+    #[test]
+    fn following_chat_tail_stays_bounded_as_rows_arrive() {
+        let mut window = ChatWindow::default();
+        window.update(500, None);
+        window.update(540, None);
+        assert_eq!(window.range(), 380..540);
+
+        window.following_tail = false;
+        window.update(560, None);
+        assert_eq!(window.range(), 380..560);
     }
 
     #[test]
