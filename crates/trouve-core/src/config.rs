@@ -94,8 +94,6 @@ pub struct ProviderConfig {
     /// - "anthropic" (Messages API)
     /// - "codex-app-server", "cursor-cli", "claude-cli" (vendor agent
     ///   backends driven through their CLIs; auth lives in the vendor CLI)
-    /// - "codex-responses" (EXPERIMENTAL direct ChatGPT-backend client using
-    ///   the `codex login` token)
     #[serde(default = "default_kind")]
     pub kind: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -105,6 +103,18 @@ pub struct ProviderConfig {
     /// Environment variable to read the key from when `api_key` is unset.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub api_key_env: Option<String>,
+    /// Non-secret values used by `${NAME}` templates.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub settings: std::collections::BTreeMap<String, String>,
+    /// Named values held in the secret store. Only their names are persisted
+    /// so they can be resolved after restart.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub secret_names: Vec<String>,
+    /// Extra request header/query templates for compatible HTTP transports.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub headers: std::collections::BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub query_params: std::collections::BTreeMap<String, String>,
     /// OAuth endpoints for subscription auth (`trouve auth login <id>`).
     /// When set and no API key is available, requests use the stored OAuth
     /// tokens (refreshed automatically).
@@ -129,6 +139,10 @@ impl Default for ProviderConfig {
             base_url: None,
             api_key: None,
             api_key_env: None,
+            settings: Default::default(),
+            secret_names: Vec::new(),
+            headers: Default::default(),
+            query_params: Default::default(),
             oauth: None,
             command: None,
             tool_bridge: None,

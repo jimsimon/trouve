@@ -302,6 +302,9 @@ pub struct Engine {
     pub(crate) store: Store,
     pub(crate) data_dir: PathBuf,
     config_dir: Option<PathBuf>,
+    /// Public model metadata catalog shared by API providers and CLI
+    /// backends. Live vendor listings still own availability.
+    model_catalog: Arc<trouve_providers::models_dev::ModelsDevCatalog>,
     providers: RwLock<HashMap<String, Arc<dyn Provider>>>,
     /// Providers registered programmatically (`with_provider`); preserved
     /// across config-driven registry reloads.
@@ -342,6 +345,9 @@ pub struct Engine {
     /// publication against host removal without holding the cache map lock
     /// across event-log writes.
     github_dashboard_publication: Mutex<()>,
+    /// Serializes provider upserts and deletions across config, secret-store,
+    /// and registry mutations without blocking unrelated provider ids.
+    provider_locks: Mutex<HashMap<String, Arc<Mutex<()>>>>,
     pub(crate) config: Mutex<Config>,
     /// Where provider configuration changes are persisted. `None` disables
     /// persistence (tests).
@@ -369,6 +375,9 @@ pub struct Engine {
     local_downloads: Mutex<HashMap<String, LocalDownloadState>>,
     /// RAM/VRAM probe, run once on first use.
     hardware: std::sync::OnceLock<crate::local::Hardware>,
+    /// Models already reported as lacking a context window. Missing metadata
+    /// disables automatic compaction, but should not spam every turn.
+    compaction_warnings: Mutex<std::collections::HashSet<String>>,
     /// Latest-version lookups, cached per CLI (network is best-effort).
     cli_latest: Mutex<HashMap<String, (std::time::Instant, Option<String>)>>,
     /// This server's reachable base URL (e.g. "http://127.0.0.1:7433"), set
@@ -458,7 +467,7 @@ fn cli_for_kind(kind: &str) -> Option<trouve_agents::install::CliId> {
     match kind {
         "cursor-cli" => Some(CliId::CursorAgent),
         "claude-cli" => Some(CliId::Claude),
-        "codex-app-server" | "codex-responses" => Some(CliId::Codex),
+        "codex-app-server" => Some(CliId::Codex),
         _ => None,
     }
 }
@@ -479,17 +488,23 @@ fn is_backend_kind(kind: &str) -> bool {
     matches!(kind, "codex-app-server" | "cursor-cli" | "claude-cli")
 }
 
-/// Config kinds whose auth lives in a vendor CLI (backends plus the
-/// experimental direct-Codex provider, which reads `codex login`'s token).
+/// Config kinds whose auth lives in a vendor CLI.
 fn is_cli_auth_kind(kind: &str) -> bool {
-    is_backend_kind(kind) || kind == "codex-responses"
+    is_backend_kind(kind)
 }
 
 /// Credential style for a configured provider: "cli" for vendor-CLI-backed
 /// kinds, "oauth" when subscription endpoints are configured (and no inline
 /// key wins), "none" for keyless local endpoints, "api-key" otherwise.
 fn provider_auth_kind(pc: &ProviderConfig) -> String {
-    if is_cli_auth_kind(&pc.kind) {
+    if pc.kind == "amazon-bedrock" {
+        "aws".into()
+    } else if matches!(
+        pc.kind.as_str(),
+        "google-vertex" | "google-vertex-anthropic"
+    ) {
+        "gcp".into()
+    } else if is_cli_auth_kind(&pc.kind) {
         // cursor-cli works both ways: subscription login ("cursor" preset)
         // or an API key ("cursor-api" preset, usage-based billing).
         if pc.kind == "cursor-cli" && (pc.api_key.is_some() || pc.api_key_env.is_some()) {
@@ -536,13 +551,14 @@ fn is_loopback_base_url(url: &str) -> bool {
 fn build_all_providers(
     config: &Config,
     secrets: &Arc<dyn trouve_providers::secrets::SecretStore>,
+    catalog: &Arc<trouve_providers::models_dev::ModelsDevCatalog>,
 ) -> HashMap<String, Arc<dyn Provider>> {
     let mut providers: HashMap<String, Arc<dyn Provider>> = HashMap::new();
     for (id, pc) in &config.providers {
         if is_backend_kind(&pc.kind) {
             continue; // handled by build_all_backends
         }
-        match build_provider(id, pc, secrets) {
+        match build_provider(id, pc, secrets, catalog) {
             Ok(p) => {
                 providers.insert(id.clone(), p);
             }
@@ -553,18 +569,21 @@ fn build_all_providers(
     if !providers.contains_key("openai")
         && let Ok(p) = trouve_providers::openai_compat::OpenAiCompatProvider::openai_from_env()
     {
-        providers.insert("openai".into(), Arc::new(p));
+        providers.insert("openai".into(), Arc::new(p.with_catalog(catalog.clone())));
     }
     if !providers.contains_key("anthropic")
         && let Ok(key) = std::env::var("ANTHROPIC_API_KEY")
     {
         providers.insert(
             "anthropic".into(),
-            Arc::new(trouve_providers::anthropic::AnthropicProvider::new(
-                "anthropic",
-                None,
-                Arc::new(trouve_providers::auth::StaticToken(key)),
-            )),
+            Arc::new(
+                trouve_providers::anthropic::AnthropicProvider::new(
+                    "anthropic",
+                    None,
+                    Arc::new(trouve_providers::auth::StaticToken(key)),
+                )
+                .with_catalog(catalog.clone()),
+            ),
         );
     }
     providers
@@ -575,6 +594,7 @@ fn build_all_backends(
     config: &Config,
     secrets: &Arc<dyn trouve_providers::secrets::SecretStore>,
     data_dir: &Path,
+    catalog: &Arc<trouve_providers::models_dev::ModelsDevCatalog>,
 ) -> HashMap<String, Arc<dyn AgentBackend>> {
     let mut backends: HashMap<String, Arc<dyn AgentBackend>> = HashMap::new();
     for (id, pc) in &config.providers {
@@ -601,7 +621,10 @@ fn build_all_backends(
                     id, command, api_key,
                 ))
             }
-            "claude-cli" => Arc::new(trouve_agents::claude::ClaudeBackend::new(id, command)),
+            "claude-cli" => Arc::new(
+                trouve_agents::claude::ClaudeBackend::new(id, command)
+                    .with_catalog(catalog.clone()),
+            ),
             _ => continue,
         };
         backends.insert(id.clone(), backend);
@@ -613,8 +636,10 @@ impl Engine {
     pub fn new(store: Store, data_dir: PathBuf, config: &Config) -> Self {
         let secrets: Arc<dyn trouve_providers::secrets::SecretStore> =
             Arc::from(trouve_providers::secrets::default_store(&data_dir));
-        let mut providers = build_all_providers(config, &secrets);
-        let backends = build_all_backends(config, &secrets, &data_dir);
+        let model_catalog =
+            Arc::new(trouve_providers::models_dev::ModelsDevCatalog::for_data_dir(&data_dir));
+        let mut providers = build_all_providers(config, &secrets, &model_catalog);
+        let backends = build_all_backends(config, &secrets, &data_dir, &model_catalog);
         let mcp_logs = crate::mcp::McpLogStore::default();
         let config_dir = dirs::config_dir().map(|d| d.join("trouve"));
         // The built-in "local" provider (managed llama-server). Registered
@@ -638,6 +663,7 @@ impl Engine {
             store,
             data_dir,
             config_dir,
+            model_catalog,
             providers: RwLock::new(providers),
             injected_providers: Mutex::new(injected_providers),
             backends: RwLock::new(backends),
@@ -652,6 +678,7 @@ impl Engine {
             turn_cancels: Mutex::new(std::collections::HashMap::new()),
             github_dashboard_caches: Mutex::new(HashMap::new()),
             github_dashboard_publication: Mutex::new(()),
+            provider_locks: Mutex::new(HashMap::new()),
             config: Mutex::new(config.clone()),
             // No write-back by default: only a caller that loaded `config`
             // from disk should enable persisting to that file (see
@@ -677,6 +704,7 @@ impl Engine {
             local_provider,
             local_downloads: Mutex::new(HashMap::new()),
             hardware: std::sync::OnceLock::new(),
+            compaction_warnings: Mutex::new(std::collections::HashSet::new()),
             cli_latest: Mutex::new(HashMap::new()),
             base_url: RwLock::new(None),
             bridge_token: RwLock::new(None),
@@ -740,6 +768,9 @@ impl Engine {
     pub async fn init_connectivity(&self) {
         if let Some(probe) = self.connectivity_probe.clone() {
             let online = probe().await;
+            if online && let Err(error) = self.model_catalog.refresh_if_stale().await {
+                tracing::debug!("models.dev refresh failed; using cached snapshot: {error:#}");
+            }
             self.transition_connectivity(online);
         }
     }
@@ -762,6 +793,10 @@ impl Engine {
                 };
                 tokio::time::sleep(interval).await;
                 let online = probe().await;
+                let recovering = online && !engine.is_online();
+                if recovering && let Err(error) = engine.model_catalog.refresh_if_stale().await {
+                    tracing::debug!("models.dev refresh failed; using cached snapshot: {error:#}");
+                }
                 engine.transition_connectivity(online);
             }
         });
@@ -862,6 +897,15 @@ impl Engine {
     /// fail on; clients gate prompt entry on this list being non-empty.
     pub async fn list_models(&self) -> Vec<trouve_protocol::ModelInfo> {
         let online = self.is_online();
+        // A model-list request is an explicit synchronization point. Refresh
+        // here rather than mutating UI-visible metadata silently from the
+        // background connectivity poll.
+        if online
+            && self.connectivity_probe.is_some()
+            && let Err(error) = self.model_catalog.refresh_if_stale().await
+        {
+            tracing::debug!("models.dev refresh failed; using cached snapshot: {error:#}");
+        }
         let offline_capable = if online {
             std::collections::HashSet::new()
         } else {
@@ -914,8 +958,14 @@ impl Engine {
     // --- provider configuration ----------------------------------------------
 
     /// Well-known provider presets for one-click setup in clients.
-    pub fn known_providers(&self) -> Vec<trouve_protocol::KnownProvider> {
-        trouve_providers::catalog::known_providers()
+    pub async fn known_providers(&self) -> Vec<trouve_protocol::KnownProvider> {
+        if self.is_online()
+            && self.connectivity_probe.is_some()
+            && let Err(error) = self.model_catalog.refresh_if_stale().await
+        {
+            tracing::debug!("models.dev refresh failed; using cached snapshot: {error:#}");
+        }
+        trouve_providers::catalog::known_providers(&self.model_catalog)
     }
 
     /// Configured providers (secrets elided) plus the default model.
@@ -932,6 +982,7 @@ impl Engine {
                     id: id.clone(),
                     kind: pc.kind.clone(),
                     base_url: pc.base_url.clone(),
+                    settings: pc.settings.clone(),
                     has_credentials,
                     category: trouve_providers::catalog::provider_category(
                         id,
@@ -939,7 +990,7 @@ impl Engine {
                         pc.base_url.as_deref(),
                     ),
                     auth,
-                    experimental: pc.kind == "codex-responses",
+                    experimental: false,
                 }
             })
             .collect();
@@ -955,6 +1006,7 @@ impl Engine {
                         "openai-compat".into()
                     },
                     base_url: None,
+                    settings: Default::default(),
                     has_credentials: true,
                     auth: if local { "none" } else { "api-key" }.into(),
                     category: if local { "local" } else { "api" }.into(),
@@ -981,26 +1033,16 @@ impl Engine {
     ) -> bool {
         match auth {
             // Vendor CLI holds the auth; adapters do cheap fs checks.
-            "cli" => {
-                if is_backend_kind(&pc.kind) {
-                    self.backends
-                        .read()
-                        .unwrap()
-                        .get(id)
-                        .map(|b| {
-                            let s = b.status();
-                            s.installed && s.has_credentials
-                        })
-                        .unwrap_or(false)
-                } else {
-                    // codex-responses: needs the Codex CLI's auth file.
-                    let home = std::env::var("CODEX_HOME")
-                        .map(PathBuf::from)
-                        .ok()
-                        .or_else(|| dirs::home_dir().map(|h| h.join(".codex")));
-                    home.map(|h| h.join("auth.json").exists()).unwrap_or(false)
-                }
-            }
+            "cli" => self
+                .backends
+                .read()
+                .unwrap()
+                .get(id)
+                .map(|b| {
+                    let s = b.status();
+                    s.installed && s.has_credentials
+                })
+                .unwrap_or(false),
             // OAuth providers build lazily, so registry membership alone
             // doesn't prove credentials — check for stored tokens.
             "oauth" => self
@@ -1036,12 +1078,21 @@ impl Engine {
         id: &str,
         req: &UpsertProviderRequest,
     ) -> Result<ProviderInfo, EngineError> {
-        if !matches!(req.kind.as_str(), "openai-compat" | "anthropic")
-            && !is_cli_auth_kind(&req.kind)
+        if !matches!(
+            req.kind.as_str(),
+            "openai-compat"
+                | "anthropic"
+                | "azure-openai"
+                | "amazon-bedrock"
+                | "google-vertex"
+                | "google-vertex-anthropic"
+        ) && !is_cli_auth_kind(&req.kind)
         {
             return Err(EngineError::BadRequest(format!(
                 "unknown provider kind {:?} (expected openai-compat, anthropic, \
-                 codex-app-server, cursor-cli, claude-cli, or codex-responses)",
+                 azure-openai, amazon-bedrock, google-vertex, \
+                 google-vertex-anthropic, codex-app-server, \
+                 cursor-cli, or claude-cli)",
                 req.kind
             )));
         }
@@ -1050,22 +1101,64 @@ impl Engine {
                 "provider id must be non-empty ascii alphanumeric/dashes".into(),
             ));
         }
+        let provider_lock = self.provider_lock(id);
+        let _provider_guard = provider_lock.lock().unwrap();
         if let Some(key) = req.api_key.as_deref().filter(|k| !k.is_empty()) {
             self.secrets
                 .set(&trouve_providers::secrets::api_key_secret(id), key)
+                .map_err(EngineError::Internal)?;
+        }
+        for (name, value) in req
+            .secret_values
+            .iter()
+            .filter(|(_, value)| !value.is_empty())
+        {
+            self.secrets
+                .set(&trouve_providers::secrets::provider_secret(id, name), value)
                 .map_err(EngineError::Internal)?;
         }
         {
             let mut config = self.config.lock().unwrap();
             let entry = config.providers.entry(id.to_string()).or_default();
             entry.kind = req.kind.clone();
-            entry.base_url = req.base_url.clone().filter(|u| !u.is_empty());
-            // Known preset: honor the conventional env var as a key fallback.
-            if entry.api_key_env.is_none() {
-                entry.api_key_env = trouve_providers::catalog::known_providers()
-                    .into_iter()
-                    .find(|k| k.id == id)
-                    .and_then(|k| k.api_key_env);
+            if let Some(base_url) = req.base_url.clone().filter(|url| !url.is_empty()) {
+                entry.base_url = Some(base_url);
+            }
+            if !req.settings.is_empty() {
+                entry.settings = req.settings.clone();
+            }
+            for name in req.secret_values.keys() {
+                if !entry.secret_names.contains(name) {
+                    entry.secret_names.push(name.clone());
+                }
+            }
+            let preset = trouve_providers::catalog::known_providers(&self.model_catalog)
+                .into_iter()
+                .find(|known| known.id == id && known.kind == req.kind);
+            if let Some(preset) = preset {
+                if entry.api_key_env.is_none() {
+                    entry.api_key_env = preset.api_key_env;
+                }
+                if entry.base_url.is_none() {
+                    entry.base_url = preset.base_url;
+                }
+                if !req.headers.is_empty() {
+                    entry.headers = req.headers.clone();
+                } else if entry.headers.is_empty() {
+                    entry.headers = preset.headers;
+                }
+                if !req.query_params.is_empty() {
+                    entry.query_params = req.query_params.clone();
+                } else if entry.query_params.is_empty() {
+                    entry.query_params = preset.query_params;
+                }
+            } else {
+                if !req.headers.is_empty() {
+                    entry.headers = req.headers.clone();
+                }
+                if !req.query_params.is_empty() {
+                    entry.query_params = req.query_params.clone();
+                }
             }
             self.persist_config(&config);
         }
@@ -1078,7 +1171,8 @@ impl Engine {
         Ok(ProviderInfo {
             id: id.to_string(),
             kind: req.kind.clone(),
-            base_url: req.base_url.clone().filter(|u| !u.is_empty()),
+            base_url: pc.base_url.clone(),
+            settings: pc.settings.clone(),
             has_credentials,
             category: trouve_providers::catalog::provider_category(
                 id,
@@ -1086,27 +1180,45 @@ impl Engine {
                 req.base_url.as_deref(),
             ),
             auth,
-            experimental: req.kind == "codex-responses",
+            experimental: false,
         })
     }
 
     /// Remove a provider from the config and its stored API key.
     pub fn delete_provider(&self, id: &str) -> Result<(), EngineError> {
-        {
+        let provider_lock = self.provider_lock(id);
+        let _provider_guard = provider_lock.lock().unwrap();
+        let secret_names = {
             let mut config = self.config.lock().unwrap();
-            if config.providers.remove(id).is_none() {
-                return Err(EngineError::NotFound(format!("provider {id}")));
-            }
+            let removed = config
+                .providers
+                .remove(id)
+                .ok_or_else(|| EngineError::NotFound(format!("provider {id}")))?;
             self.persist_config(&config);
-        }
+            removed.secret_names
+        };
         let _ = self
             .secrets
             .delete(&trouve_providers::secrets::api_key_secret(id));
         let _ = self
             .secrets
             .delete(&trouve_providers::secrets::oauth_secret(id));
+        for name in secret_names {
+            let _ = self
+                .secrets
+                .delete(&trouve_providers::secrets::provider_secret(id, &name));
+        }
         self.reload_providers();
         Ok(())
+    }
+
+    fn provider_lock(&self, id: &str) -> Arc<Mutex<()>> {
+        self.provider_locks
+            .lock()
+            .unwrap()
+            .entry(id.to_string())
+            .or_insert_with(|| Arc::new(Mutex::new(())))
+            .clone()
     }
 
     // --- OAuth login (subscription providers) ---------------------------------
@@ -1122,16 +1234,15 @@ impl Engine {
 
         // Vendor-CLI logins (subscription backends) go through the vendor's
         // own flow; everything else uses our generic OAuth machinery.
-        let cli_kind = {
+        let cli_auth = {
             let config = self.config.lock().unwrap();
             config
                 .providers
                 .get(id)
-                .map(|pc| (pc.kind.clone(), pc.command.clone()))
-                .filter(|(k, _)| is_cli_auth_kind(k))
+                .is_some_and(|pc| is_cli_auth_kind(&pc.kind))
         };
-        if let Some((kind, command)) = cli_kind {
-            return self.start_cli_login(id, &kind, command).await;
+        if cli_auth {
+            return self.start_cli_login(id).await;
         }
 
         // "Sign in with GitHub" (Integrations, not a model provider): id
@@ -1261,8 +1372,6 @@ impl Engine {
     async fn start_cli_login(
         self: &Arc<Self>,
         id: &str,
-        kind: &str,
-        command: Option<String>,
     ) -> Result<trouve_protocol::LoginStarted, EngineError> {
         // The vendor CLI is still waiting on its verification URL (the
         // user may have closed the browser tab): hand the same URL back
@@ -1270,22 +1379,17 @@ impl Engine {
         if let Some(LoginState::Pending { started, .. }) = self.logins.lock().unwrap().get(id) {
             return Ok(started.clone());
         }
-        let login = if is_backend_kind(kind) {
-            let backend = self
-                .backends
-                .read()
-                .unwrap()
-                .get(id)
-                .cloned()
-                .ok_or_else(|| EngineError::NotFound(format!("provider {id}")))?;
-            backend.start_login().await
-        } else {
-            // codex-responses: credentials come from the Codex CLI login.
-            let cmd = resolved_cli_command(kind, command, &self.data_dir)
-                .unwrap_or_else(|| "codex".into());
-            trouve_agents::spawn_codex_login(&cmd).await
-        }
-        .map_err(|e| EngineError::BadRequest(e.to_string()))?;
+        let backend = self
+            .backends
+            .read()
+            .unwrap()
+            .get(id)
+            .cloned()
+            .ok_or_else(|| EngineError::NotFound(format!("provider {id}")))?;
+        let login = backend
+            .start_login()
+            .await
+            .map_err(|e| EngineError::BadRequest(e.to_string()))?;
 
         let trouve_agents::BackendLogin {
             verification_url,
@@ -1932,7 +2036,13 @@ impl Engine {
         let models = crate::local::all_entries(self.config_dir.as_deref())
             .into_iter()
             .map(|entry| {
-                let downloaded = crate::local::gguf_path(&self.data_dir, &entry).exists();
+                let path = crate::local::gguf_path(&self.data_dir, &entry);
+                let downloaded = path.exists();
+                let metadata = if downloaded {
+                    crate::local::model_metadata(&path)
+                } else {
+                    Default::default()
+                };
                 let (download_status, download_bytes, download_error) =
                     match downloads.get(&entry.id) {
                         Some(LocalDownloadState::Pending { bytes, .. }) => (
@@ -1950,7 +2060,10 @@ impl Engine {
                     file: entry.file.clone(),
                     size_bytes: entry.size_bytes,
                     params: entry.params.clone(),
-                    context_window: crate::local::SERVE_CONTEXT,
+                    context_window: self
+                        .local_manager
+                        .context_window(&entry.id)
+                        .unwrap_or(metadata.context_window),
                     fit: crate::local::fit(entry.size_bytes, &hw).to_string(),
                     notes: entry.notes.clone(),
                     downloaded,
@@ -2415,12 +2528,13 @@ impl Engine {
     /// CRUD), preserving programmatically injected providers.
     fn reload_providers(&self) {
         let config = self.config.lock().unwrap().clone();
-        let mut rebuilt = build_all_providers(&config, &self.secrets);
+        let mut rebuilt = build_all_providers(&config, &self.secrets, &self.model_catalog);
         for (id, p) in self.injected_providers.lock().unwrap().iter() {
             rebuilt.insert(id.clone(), p.clone());
         }
         *self.providers.write().unwrap() = rebuilt;
-        let mut backends = build_all_backends(&config, &self.secrets, &self.data_dir);
+        let mut backends =
+            build_all_backends(&config, &self.secrets, &self.data_dir, &self.model_catalog);
         for (id, b) in self.injected_backends.lock().unwrap().iter() {
             backends.insert(id.clone(), b.clone());
         }
@@ -4725,7 +4839,32 @@ impl Engine {
         }
 
         let system = context::system_prompt(&mode, self.config_dir.as_deref(), Path::new(&ws.path));
+        let live_models = provider.list_models().await;
+        let known_models = provider.models();
+        let pricing_model = live_models
+            .iter()
+            .chain(known_models.iter())
+            .find(|m| m.id == thread.model)
+            .cloned();
         let mut usage_total = Usage::default();
+        let mut accumulate_usage = |usage: &Usage| {
+            let cost = usage.cost_usd.or_else(|| {
+                pricing_model.as_ref().and_then(|model| {
+                    self.model_catalog.cost_usd(
+                        model,
+                        usage.input_tokens,
+                        usage.cached_input_tokens,
+                        usage.output_tokens,
+                    )
+                })
+            });
+            usage_total.input_tokens += usage.input_tokens;
+            usage_total.output_tokens += usage.output_tokens;
+            usage_total.cached_input_tokens += usage.cached_input_tokens;
+            if let Some(cost) = cost {
+                usage_total.cost_usd = Some(usage_total.cost_usd.unwrap_or(0.0) + cost);
+            }
+        };
         // The last request's input size — the context-size proxy for
         // compaction. Summing per-iteration inputs (usage_total) would
         // over-count a multi-tool turn many-fold; the final request carries
@@ -4791,9 +4930,7 @@ impl Engine {
                     ProviderEvent::Reasoning(block) => reasoning.push(block),
                     ProviderEvent::ToolCall(call) => tool_calls.push(call),
                     ProviderEvent::Completed { usage } => {
-                        usage_total.input_tokens += usage.input_tokens;
-                        usage_total.output_tokens += usage.output_tokens;
-                        usage_total.cached_input_tokens += usage.cached_input_tokens;
+                        accumulate_usage(&usage);
                         context_input_tokens = usage.input_tokens + usage.cached_input_tokens;
                     }
                 }
@@ -4915,9 +5052,7 @@ impl Engine {
                             }
                             Ok(ProviderEvent::Reasoning(block)) => final_reasoning.push(block),
                             Ok(ProviderEvent::Completed { usage }) => {
-                                usage_total.input_tokens += usage.input_tokens;
-                                usage_total.output_tokens += usage.output_tokens;
-                                usage_total.cached_input_tokens += usage.cached_input_tokens;
+                                accumulate_usage(&usage);
                                 context_input_tokens =
                                     usage.input_tokens + usage.cached_input_tokens;
                             }
@@ -4957,14 +5092,6 @@ impl Engine {
             )?;
         }
 
-        // Dollar cost from the model catalog, when pricing is known.
-        if let Some(model) = provider.models().iter().find(|m| m.id == thread.model) {
-            usage_total.cost_usd = trouve_providers::catalog::cost_usd(
-                model,
-                usage_total.input_tokens,
-                usage_total.output_tokens,
-            );
-        }
         self.store.record_usage(
             &session.id,
             &thread.id,
@@ -6000,19 +6127,31 @@ impl Engine {
         model_name: &str,
     ) -> Result<()> {
         // The live listing knows gateway models (kilocode, openrouter, ...)
-        // the static catalog doesn't; it is cached, so this is cheap. A
-        // model absent from both still compacts, against a conservative
-        // default window — never compacting would let the transcript grow
-        // until requests fail or the model degrades.
+        // the static catalog doesn't; it is cached, so this is cheap. Never
+        // compact against a guessed window: an early lossy summary is worse
+        // than surfacing that the provider omitted the required metadata.
         let live = provider.list_models().await;
         let known = provider.models();
-        let context_window = live
+        let Some(context_window) = live
             .iter()
             .chain(known.iter())
             .find(|m| m.id == thread.model)
             .map(|m| m.context_window)
             .filter(|w| *w > 0)
-            .unwrap_or(100_000);
+        else {
+            if self
+                .compaction_warnings
+                .lock()
+                .unwrap()
+                .insert(thread.model.clone())
+            {
+                tracing::warn!(
+                    model = %thread.model,
+                    "automatic compaction disabled for this model: provider did not report a context window"
+                );
+            }
+            return Ok(());
+        };
         let payloads = self.store.messages(&thread.id)?;
         if payloads.len() < 2 {
             return Ok(());
@@ -7774,21 +7913,107 @@ fn build_provider(
     id: &str,
     pc: &ProviderConfig,
     secrets: &Arc<dyn trouve_providers::secrets::SecretStore>,
+    catalog: &Arc<trouve_providers::models_dev::ModelsDevCatalog>,
 ) -> Result<Arc<dyn Provider>> {
     use trouve_providers::auth::{StaticToken, StoredOAuthToken, TokenSource};
     use trouve_providers::secrets::oauth_secret;
 
-    // EXPERIMENTAL direct-Codex client: credentials come from the Codex
-    // CLI's auth file, not from our credential resolution below.
-    if pc.kind == "codex-responses" {
-        return Ok(Arc::new(
-            trouve_providers::codex_responses::CodexResponsesProvider::new(id),
-        ));
+    let api_key = resolved_api_key(id, pc, secrets);
+    let mut values = pc.settings.clone();
+    for name in &pc.secret_names {
+        if let Some(value) = secrets.get(&trouve_providers::secrets::provider_secret(id, name))? {
+            values.insert(name.clone(), value);
+        }
+    }
+    let known_preset = catalog
+        .provider_presets()
+        .into_iter()
+        .find(|provider| provider.id == id && provider.kind == pc.kind);
+    if let Some(preset) = &known_preset {
+        for field in &preset.config_fields {
+            if !values.contains_key(&field.id)
+                && let Some(value) = field
+                    .env
+                    .as_ref()
+                    .and_then(|name| std::env::var(name).ok())
+                    .filter(|value| !value.is_empty())
+            {
+                values.insert(field.id.clone(), value);
+            }
+        }
+    }
+    if let Some(key) = &api_key {
+        values.insert("API_KEY".into(), key.clone());
+    }
+    let expand = |template: &str| expand_provider_template(template, &values);
+    let base_url = pc.base_url.as_deref().map(expand).transpose()?;
+    let mut headers = pc
+        .headers
+        .iter()
+        .map(|(name, value)| Ok((name.clone(), expand(value)?)))
+        .collect::<Result<std::collections::BTreeMap<_, _>>>()?;
+    if pc.kind == "azure-openai" && !headers.contains_key("api-key") {
+        headers.insert(
+            "api-key".into(),
+            api_key
+                .clone()
+                .ok_or_else(|| anyhow::anyhow!("azure-openai requires an API key"))?,
+        );
+    }
+    let query_params = pc
+        .query_params
+        .iter()
+        .map(|(name, value)| Ok((name.clone(), expand(value)?)))
+        .collect::<Result<std::collections::BTreeMap<_, _>>>()?;
+
+    if let Some(endpoint) = &base_url {
+        let parsed = reqwest::Url::parse(endpoint)
+            .with_context(|| format!("provider {id} endpoint is not a valid URL"))?;
+        anyhow::ensure!(
+            matches!(parsed.scheme(), "http" | "https"),
+            "provider {id} endpoint must use http or https"
+        );
     }
 
-    let api_key = resolved_api_key(id, pc, secrets);
+    if pc.kind == "amazon-bedrock" {
+        return Ok(Arc::new(trouve_providers::bedrock::BedrockProvider::new(
+            id,
+            values
+                .get("AWS_REGION")
+                .cloned()
+                .or_else(|| std::env::var("AWS_REGION").ok()),
+            values
+                .get("AWS_PROFILE")
+                .cloned()
+                .or_else(|| std::env::var("AWS_PROFILE").ok()),
+            catalog.clone(),
+        )));
+    }
+    if pc.kind == "google-vertex" {
+        let endpoint =
+            base_url.ok_or_else(|| anyhow::anyhow!("google-vertex requires an endpoint"))?;
+        return Ok(Arc::new(trouve_providers::vertex::VertexProvider::new(
+            id,
+            endpoint,
+            values.get("GOOGLE_APPLICATION_CREDENTIALS").cloned(),
+            catalog.clone(),
+        )));
+    }
+    if pc.kind == "google-vertex-anthropic" {
+        let endpoint = base_url
+            .ok_or_else(|| anyhow::anyhow!("google-vertex-anthropic requires an endpoint"))?;
+        let token = Arc::new(trouve_providers::vertex::GoogleAccessToken::new(
+            values.get("GOOGLE_APPLICATION_CREDENTIALS").cloned(),
+        ));
+        return Ok(Arc::new(
+            trouve_providers::anthropic::AnthropicProvider::new(id, Some(endpoint), token)
+                .with_catalog(catalog.clone())
+                .with_catalog_provider(id)
+                .with_vertex_bearer(),
+        ));
+    }
     // Local endpoints (e.g. Ollama) don't need a key; send an empty token.
-    let local = pc.base_url.as_deref().is_some_and(is_loopback_base_url);
+    let local = base_url.as_deref().is_some_and(is_loopback_base_url);
     let mut oauth_bearer = false;
     let token: Arc<dyn TokenSource> = match (api_key, &pc.oauth) {
         (Some(key), _) => Arc::new(StaticToken(key)),
@@ -7806,22 +8031,51 @@ fn build_provider(
              `trouve auth set-key {id}`, or configure [providers.{id}.oauth]"
         ),
     };
+    let bearer_auth = !pc
+        .headers
+        .values()
+        .chain(pc.query_params.values())
+        .any(|value| value.contains("${API_KEY}"));
+    let known_catalog_provider = known_preset.map(|provider| provider.id);
     match pc.kind.as_str() {
-        "openai-compat" => Ok(Arc::new(
-            trouve_providers::openai_compat::OpenAiCompatProvider::with_token(
+        "openai-compat" => {
+            let mut provider = trouve_providers::openai_compat::OpenAiCompatProvider::with_token(
                 id.to_string(),
-                pc.base_url
-                    .clone()
-                    .unwrap_or_else(|| "https://api.openai.com/v1".into()),
+                base_url.unwrap_or_else(|| "https://api.openai.com/v1".into()),
                 token,
-            ),
-        )),
+            )
+            .with_catalog(catalog.clone())
+            .with_http_options(bearer_auth, headers, query_params);
+            if let Some(catalog_provider) = known_catalog_provider {
+                provider = provider.with_catalog_provider(catalog_provider);
+            }
+            Ok(Arc::new(provider))
+        }
+        "azure-openai" => {
+            let endpoint =
+                base_url.ok_or_else(|| anyhow::anyhow!("azure-openai requires an endpoint"))?;
+            let catalog_provider = known_catalog_provider.unwrap_or_else(|| "azure".into());
+            Ok(Arc::new(trouve_providers::azure::AzureOpenAiProvider::new(
+                id,
+                endpoint,
+                token,
+                catalog.clone(),
+                catalog_provider,
+                headers,
+                query_params,
+            )))
+        }
         "anthropic" => {
             let mut provider = trouve_providers::anthropic::AnthropicProvider::new(
                 id.to_string(),
-                pc.base_url.clone(),
+                base_url,
                 token,
-            );
+            )
+            .with_catalog(catalog.clone())
+            .with_http_options(bearer_auth, headers, query_params);
+            if let Some(catalog_provider) = known_catalog_provider {
+                provider = provider.with_catalog_provider(catalog_provider);
+            }
             if oauth_bearer {
                 provider = provider.with_oauth_bearer();
             }
@@ -7853,9 +8107,82 @@ fn resolved_api_key(
         })
 }
 
+/// Expand only literal `${NAME}` placeholders. This deliberately does not
+/// invoke a shell or implement shell parameter syntax.
+fn expand_provider_template(
+    template: &str,
+    values: &std::collections::BTreeMap<String, String>,
+) -> Result<String> {
+    let mut output = String::with_capacity(template.len());
+    let mut rest = template;
+    while let Some(start) = rest.find("${") {
+        output.push_str(&rest[..start]);
+        rest = &rest[start + 2..];
+        let end = rest
+            .find('}')
+            .ok_or_else(|| anyhow::anyhow!("unterminated provider template placeholder"))?;
+        let name = &rest[..end];
+        anyhow::ensure!(
+            !name.is_empty()
+                && name
+                    .chars()
+                    .all(|character| character.is_ascii_alphanumeric() || character == '_'),
+            "invalid provider template placeholder {name:?}"
+        );
+        let value = values
+            .get(name)
+            .cloned()
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| anyhow::anyhow!("missing provider setting {name}"))?;
+        output.push_str(&value);
+        rest = &rest[end + 1..];
+    }
+    output.push_str(rest);
+    Ok(output)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct BlockingProviderSecretStore {
+        values: Mutex<HashMap<String, String>>,
+        delete_started: std::sync::Barrier,
+        allow_delete: std::sync::Barrier,
+    }
+
+    impl BlockingProviderSecretStore {
+        fn new() -> Self {
+            Self {
+                values: Mutex::new(HashMap::new()),
+                delete_started: std::sync::Barrier::new(2),
+                allow_delete: std::sync::Barrier::new(2),
+            }
+        }
+    }
+
+    impl trouve_providers::secrets::SecretStore for BlockingProviderSecretStore {
+        fn get(&self, key: &str) -> anyhow::Result<Option<String>> {
+            Ok(self.values.lock().unwrap().get(key).cloned())
+        }
+
+        fn set(&self, key: &str, value: &str) -> anyhow::Result<()> {
+            self.values
+                .lock()
+                .unwrap()
+                .insert(key.to_string(), value.to_string());
+            Ok(())
+        }
+
+        fn delete(&self, key: &str) -> anyhow::Result<()> {
+            if key == trouve_providers::secrets::api_key_secret("serialized") {
+                self.delete_started.wait();
+                self.allow_delete.wait();
+            }
+            self.values.lock().unwrap().remove(key);
+            Ok(())
+        }
+    }
 
     #[tokio::test]
     async fn removing_github_host_discards_its_dashboard_cache() {
@@ -8216,12 +8543,12 @@ mod tests {
         std::fs::write(&managed, b"stub").unwrap();
 
         assert_eq!(
-            resolved_cli_command("codex-responses", None, tmp.path()),
+            resolved_cli_command("codex-app-server", None, tmp.path()),
             Some(managed.to_string_lossy().into_owned())
         );
         assert_eq!(
             resolved_cli_command(
-                "codex-responses",
+                "codex-app-server",
                 Some("/opt/custom/codex".into()),
                 tmp.path()
             )
@@ -8668,5 +8995,159 @@ mod tests {
         drop(second_reader);
         drop(first_reader);
         assert!(lock.try_write().is_ok());
+    }
+
+    #[test]
+    fn provider_templates_expand_without_shell_semantics() {
+        let values = std::collections::BTreeMap::from([
+            ("ACCOUNT".into(), "tenant-1".into()),
+            ("API_KEY".into(), "secret".into()),
+        ]);
+        assert_eq!(
+            expand_provider_template(
+                "https://${ACCOUNT}.example.test/v1?literal=$HOME&key=${API_KEY}",
+                &values,
+            )
+            .unwrap(),
+            "https://tenant-1.example.test/v1?literal=$HOME&key=secret"
+        );
+        assert!(expand_provider_template("${MISSING}", &values).is_err());
+        assert!(expand_provider_template("${BAD-NAME}", &values).is_err());
+
+        // Only catalog-declared env fallbacks are copied into `values`;
+        // arbitrary process environment variables are never template input.
+        const ENV_ONLY: &str = "TROUVE_PROVIDER_TEMPLATE_ENV_ONLY_TEST";
+        // Safety: this test owns a unique process variable name.
+        unsafe { std::env::set_var(ENV_ONLY, "must-not-expand") };
+        assert!(
+            expand_provider_template("${TROUVE_PROVIDER_TEMPLATE_ENV_ONLY_TEST}", &values).is_err()
+        );
+        // Safety: restore the unique test variable.
+        unsafe { std::env::remove_var(ENV_ONLY) };
+    }
+
+    #[test]
+    fn preset_upsert_preserves_existing_transport_templates_when_omitted() {
+        let data = tempfile::tempdir().unwrap();
+        let custom_base_url = "https://custom.azure.test/openai".to_string();
+        let custom_headers =
+            std::collections::BTreeMap::from([("x-custom".into(), "${RESOURCE}".into())]);
+        let custom_query =
+            std::collections::BTreeMap::from([("custom".into(), "${DEPLOYMENT}".into())]);
+        let mut config = Config::default();
+        config.providers.insert(
+            "azure".into(),
+            crate::config::ProviderConfig {
+                kind: "azure-openai".into(),
+                base_url: Some(custom_base_url.clone()),
+                headers: custom_headers.clone(),
+                query_params: custom_query.clone(),
+                ..Default::default()
+            },
+        );
+        let engine = Engine::new(
+            Store::open_in_memory().unwrap(),
+            data.path().to_path_buf(),
+            &config,
+        );
+        engine
+            .upsert_provider(
+                "azure",
+                &UpsertProviderRequest {
+                    kind: "azure-openai".into(),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+
+        let config = engine.config.lock().unwrap();
+        let provider = config.providers.get("azure").unwrap();
+        assert_eq!(provider.base_url.as_deref(), Some(custom_base_url.as_str()));
+        assert_eq!(provider.headers, custom_headers);
+        assert_eq!(provider.query_params, custom_query);
+    }
+
+    #[test]
+    fn provider_upsert_waits_for_in_flight_delete() {
+        const ID: &str = "serialized";
+
+        let data = tempfile::tempdir().unwrap();
+        let mut config = Config {
+            local_enabled: Some(false),
+            ..Default::default()
+        };
+        config.providers.insert(
+            ID.into(),
+            ProviderConfig {
+                kind: "openai-compat".into(),
+                base_url: Some("https://old.example.test/v1".into()),
+                ..Default::default()
+            },
+        );
+        let secret_store = Arc::new(BlockingProviderSecretStore::new());
+        secret_store
+            .values
+            .lock()
+            .unwrap()
+            .insert(trouve_providers::secrets::api_key_secret(ID), "old".into());
+        let mut engine = Engine::new(
+            Store::open_in_memory().unwrap(),
+            data.path().to_path_buf(),
+            &config,
+        );
+        engine.secrets = secret_store.clone();
+        let engine = Arc::new(engine);
+
+        let deleting = {
+            let engine = engine.clone();
+            std::thread::spawn(move || engine.delete_provider(ID))
+        };
+        secret_store.delete_started.wait();
+
+        let (started_tx, started_rx) = std::sync::mpsc::sync_channel(0);
+        let (done_tx, done_rx) = std::sync::mpsc::sync_channel(1);
+        let upserting = {
+            let engine = engine.clone();
+            std::thread::spawn(move || {
+                started_tx.send(()).unwrap();
+                let result = engine.upsert_provider(
+                    ID,
+                    &UpsertProviderRequest {
+                        kind: "openai-compat".into(),
+                        base_url: Some("https://new.example.test/v1".into()),
+                        api_key: Some("new".into()),
+                        ..Default::default()
+                    },
+                );
+                done_tx.send(result).unwrap();
+            })
+        };
+        started_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+        assert!(matches!(
+            done_rx.recv_timeout(std::time::Duration::from_millis(100)),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+        ));
+
+        secret_store.allow_delete.wait();
+        deleting.join().unwrap().unwrap();
+        let info = done_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap()
+            .unwrap();
+        upserting.join().unwrap();
+
+        assert_eq!(info.id, ID);
+        assert!(engine.config.lock().unwrap().providers.contains_key(ID));
+        assert_eq!(
+            secret_store
+                .values
+                .lock()
+                .unwrap()
+                .get(&trouve_providers::secrets::api_key_secret(ID))
+                .map(String::as_str),
+            Some("new")
+        );
     }
 }

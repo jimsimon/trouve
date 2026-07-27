@@ -13,7 +13,7 @@ import { DiffView, DiffRow } from "diff-view.slint";
 import { CodeView, TextSegment } from "code-view.slint";
 import { TerminalGrid, TermSpan } from "terminal-grid.slint";
 import {
-    SettingsScreen, ProviderItem, CliItem, KnownProviderItem, McpServerItem,
+    SettingsScreen, ProviderItem, CliItem, KnownProviderItem, ProviderConfigFieldItem, McpServerItem,
     SubscriptionItem, ModeItem, ThinkingItem, LocalModelItem, LocalSearchItem, GithubHostItem
 } from "settings-window.slint";
 import { AutomationsScreen, AutomationItem, AutomationTemplateItem } from "automations-screen.slint";
@@ -27,7 +27,7 @@ import { Palette } from "std-widgets.slint";
 
 // Theme re-exported so Rust can push the selected palette.
 export {
-    DiffRow, TextSegment, TermSpan, ProviderItem, CliItem, KnownProviderItem, McpServerItem,
+    DiffRow, TextSegment, TermSpan, ProviderItem, CliItem, KnownProviderItem, ProviderConfigFieldItem, McpServerItem,
     SubscriptionItem, ModeItem, LocalModelItem, LocalSearchItem, AutomationItem, GithubHostItem,
     PrGroupItem, PrReviewFindingItem, PrRowItem
 }
@@ -1538,6 +1538,9 @@ export component AppWindow inherits Window {
     callback mcp-logs-closed();
     callback provider-saved(/* id */ string, /* kind */ string,
                             /* base-url */ string, /* api-key */ string);
+    callback provider-field-changed(string, string, bool);
+    callback provider-fields-reset([ProviderConfigFieldItem]);
+    pure callback provider-fields-valid([ProviderConfigFieldItem]) -> bool;
     callback provider-deleted(string);
     callback provider-login(/* id */ string, /* kind */ string);
     callback provider-login-response(/* id */ string, /* response */ string);
@@ -1804,6 +1807,7 @@ export component AppWindow inherits Window {
     in property <string> usage-text: "";
     in property <float> context-fill: 0.0;
     in property <bool> context-compacting: false;
+    in property <bool> context-unavailable: false;
     in property <string> context-tooltip: "no usage yet";
 
     // --- new-chat screen -------------------------------------------------------
@@ -4393,7 +4397,9 @@ export component AppWindow inherits Window {
                         }
                     }
                     // Context usage dial; compacting uses determinate,
-                    // phase-driven progress.
+                    // phase-driven progress. A red exclamation replaces it
+                    // when the provider did not report a window and automatic
+                    // compaction is disabled.
                     VerticalLayout {
                         spacing: 2px;
                         Text { text: " "; font-size: Theme.fs(10px); }
@@ -4402,7 +4408,7 @@ export component AppWindow inherits Window {
                         height: 30px;
                         // Reduce motion: freeze the compacting animation at a
                         // full ring (the tooltip still says "compacting…").
-                        Spinner {
+                        if !root.context-unavailable: Spinner {
                             width: 26px;
                             height: 26px;
                             x: 2px;
@@ -4413,6 +4419,23 @@ export component AppWindow inherits Window {
                                     ? (root.activity-phase + 1) / 12.0
                                     : root.context-fill;
                             indeterminate: false;
+                        }
+                        if root.context-unavailable: Rectangle {
+                            width: 22px;
+                            height: 22px;
+                            x: 4px;
+                            y: 4px;
+                            border-width: 2px;
+                            border-color: Theme.c.err;
+                            border-radius: self.width / 2;
+                            Text {
+                                text: "!";
+                                color: Theme.c.err;
+                                font-size: Theme.fs(14px);
+                                font-weight: 700;
+                                horizontal-alignment: center;
+                                vertical-alignment: center;
+                            }
                         }
                         dial-ta := TouchArea { }
                         if dial-ta.has-hover: Rectangle {
@@ -5349,6 +5372,11 @@ export component AppWindow inherits Window {
         provider-saved(id, kind, url, key) => {
             root.provider-saved(id, kind, url, key);
         }
+        provider-field-changed(id, value, secret) => {
+            root.provider-field-changed(id, value, secret);
+        }
+        provider-fields-reset(fields) => { root.provider-fields-reset(fields); }
+        provider-fields-valid(fields) => { root.provider-fields-valid(fields) }
         provider-deleted(id) => { root.provider-deleted(id); }
         provider-login(id, kind) => { root.provider-login(id, kind); }
         provider-login-response(id, response) => {

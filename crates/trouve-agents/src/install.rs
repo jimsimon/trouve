@@ -73,7 +73,7 @@ impl CliId {
         match self {
             Self::CursorAgent => &["cursor-cli"],
             Self::Claude => &["claude-cli"],
-            Self::Codex => &["codex-app-server", "codex-responses"],
+            Self::Codex => &["codex-app-server"],
             Self::LlamaServer => &["local"],
         }
     }

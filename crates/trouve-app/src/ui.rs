@@ -7,7 +7,8 @@ use slint::{Model, ModelRc, SharedString, VecModel};
 use crate::render::ChatRowData;
 use crate::{
     AppWindow, ChatRow, ChatTableCell, CliItem, DiffRow, FileItem, KnownProviderItem,
-    ModelHealthItem, NavRow, ProviderItem, QOption, QPair, TextSegment, ThreadTabItem, TodoUiItem,
+    ModelHealthItem, NavRow, ProviderConfigFieldItem, ProviderItem, QOption, QPair, TextSegment,
+    ThreadTabItem, TodoUiItem,
 };
 
 type Ui = slint::Weak<AppWindow>;
@@ -647,11 +648,12 @@ pub fn set_branches(ui: &Ui, branches: Vec<String>, branch_index: i32) {
     });
 }
 
-/// Context dial state: fill in 0..=1, busy flag, tooltip stats.
-pub fn set_context(ui: &Ui, fill: f32, compacting: bool, tooltip: String) {
+/// Context dial state: fill in 0..=1, busy flag, unavailable warning, stats.
+pub fn set_context(ui: &Ui, fill: f32, compacting: bool, unavailable: bool, tooltip: String) {
     let _ = ui.upgrade_in_event_loop(move |ui| {
         ui.set_context_fill(fill);
         ui.set_context_compacting(compacting);
+        ui.set_context_unavailable(unavailable);
         ui.set_context_tooltip(SharedString::from(tooltip.as_str()));
     });
 }
@@ -1153,10 +1155,14 @@ pub fn set_file_view(ui: &Ui, name: String, content: String, lines: Vec<Vec<(Str
 
 // --- settings screen ---------------------------------------------------------
 
-/// (id, kind, base_url, has_credentials, auth, category, experimental) per provider.
+pub struct ProviderSettingsView {
+    pub configured: Vec<trouve_protocol::ProviderInfo>,
+    pub known: Vec<trouve_protocol::KnownProvider>,
+}
+
 pub fn set_settings_data(
     ui: &Ui,
-    providers: Vec<(String, String, String, bool, String, String, bool)>,
+    providers: ProviderSettingsView,
     models: Vec<String>,
     thinking: Vec<ModelThinkingView>,
     default_model_index: i32,
@@ -1164,21 +1170,31 @@ pub fn set_settings_data(
     default_permission_index: i32,
 ) {
     let _ = ui.upgrade_in_event_loop(move |ui| {
-        let items: Vec<ProviderItem> = providers
+        let ProviderSettingsView { configured, known } = providers;
+        let items: Vec<ProviderItem> = configured
             .into_iter()
-            .map(
-                |(id, kind, base_url, has_credentials, auth, category, experimental)| {
-                    ProviderItem {
-                        id: id.into(),
-                        kind: kind.into(),
-                        base_url: base_url.into(),
-                        has_credentials,
-                        auth: auth.into(),
-                        category: category.into(),
-                        experimental,
-                    }
-                },
-            )
+            .map(|provider| {
+                let fields = known
+                    .iter()
+                    .find(|preset| preset.id == provider.id && preset.kind == provider.kind)
+                    .map(|preset| preset.config_fields.clone())
+                    .unwrap_or_default();
+                let config_fields = provider_config_field_items(
+                    fields,
+                    &provider.settings,
+                    provider.has_credentials,
+                );
+                ProviderItem {
+                    id: provider.id.into(),
+                    kind: provider.kind.into(),
+                    base_url: provider.base_url.unwrap_or_default().into(),
+                    has_credentials: provider.has_credentials,
+                    auth: provider.auth.into(),
+                    category: provider.category.into(),
+                    experimental: provider.experimental,
+                    config_fields,
+                }
+            })
             .collect();
         let subscription: Vec<ProviderItem> = items
             .iter()
@@ -1549,7 +1565,43 @@ pub fn set_local_search(ui: &Ui, results: Vec<LocalSearchView>, status: String) 
     });
 }
 
-pub fn set_known_providers(ui: &Ui, mut known: Vec<trouve_protocol::KnownProvider>) {
+fn provider_config_field_items(
+    fields: Vec<trouve_protocol::ProviderConfigField>,
+    settings: &std::collections::BTreeMap<String, String>,
+    has_credentials: bool,
+) -> ModelRc<ProviderConfigFieldItem> {
+    ModelRc::new(VecModel::from(
+        fields
+            .into_iter()
+            .map(|field| {
+                let value = if field.secret {
+                    String::new()
+                } else {
+                    settings
+                        .get(&field.id)
+                        .cloned()
+                        .or(field.default_value)
+                        .unwrap_or_default()
+                };
+                ProviderConfigFieldItem {
+                    id: field.id.into(),
+                    label: field.label.into(),
+                    description: field.description.into(),
+                    required: field.required,
+                    secret: field.secret,
+                    value: value.into(),
+                    has_saved_value: field.secret && has_credentials,
+                }
+            })
+            .collect::<Vec<_>>(),
+    ))
+}
+
+pub fn set_known_providers(
+    ui: &Ui,
+    mut known: Vec<trouve_protocol::KnownProvider>,
+    configured: Vec<trouve_protocol::ProviderInfo>,
+) {
     let _ = ui.upgrade_in_event_loop(move |ui| {
         // Presets alphabetically, then "Custom" (hand-entered details) last;
         // preset-index i maps to known-providers[i], Custom is index == len.
@@ -1569,15 +1621,26 @@ pub fn set_known_providers(ui: &Ui, mut known: Vec<trouve_protocol::KnownProvide
         let items: Vec<KnownProviderItem> = known
             .iter()
             .cloned()
-            .map(|k| KnownProviderItem {
-                id: k.id.into(),
-                display_name: k.display_name.into(),
-                kind: k.kind.into(),
-                base_url: k.base_url.unwrap_or_default().into(),
-                api_key_env: k.api_key_env.unwrap_or_default().into(),
-                auth: k.auth.into(),
-                category: k.category.into(),
-                experimental: k.experimental,
+            .map(|k| {
+                let saved = configured
+                    .iter()
+                    .find(|provider| provider.id == k.id && provider.kind == k.kind);
+                let empty = std::collections::BTreeMap::new();
+                KnownProviderItem {
+                    id: k.id.into(),
+                    display_name: k.display_name.into(),
+                    kind: k.kind.into(),
+                    base_url: k.base_url.unwrap_or_default().into(),
+                    api_key_env: k.api_key_env.unwrap_or_default().into(),
+                    auth: k.auth.into(),
+                    category: k.category.into(),
+                    experimental: k.experimental,
+                    config_fields: provider_config_field_items(
+                        k.config_fields,
+                        saved.map(|provider| &provider.settings).unwrap_or(&empty),
+                        saved.is_some_and(|provider| provider.has_credentials),
+                    ),
+                }
             })
             .collect();
         let category_items = |category: &str| {

@@ -8,13 +8,16 @@
 
 pub mod anthropic;
 pub mod auth;
+pub mod azure;
+pub mod bedrock;
 pub mod catalog;
 pub mod codex;
-pub mod codex_responses;
 pub mod kimi_usage;
+pub mod models_dev;
 pub mod openai_compat;
 pub mod secrets;
 pub(crate) mod sse;
+pub mod vertex;
 
 use futures::stream::BoxStream;
 use serde::{Deserialize, Serialize};
