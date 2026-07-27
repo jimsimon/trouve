@@ -47,6 +47,8 @@ fuzzy-matcher = "0.3"
 shlex = "2.0.1"
 # Desktop notifications (turn finished / needs attention).
 notify-rust = "4.18.0"
+# Hold the platform sleep-inhibition assertion while agents are active.
+keepawake = "0.6.0"
 # Automations: local-time rendering of schedule timestamps.
 chrono.workspace = true
 

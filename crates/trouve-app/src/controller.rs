@@ -688,6 +688,9 @@ struct Controller {
     /// Seeded from `Session.active`, kept live by `session.activity`
     /// server events; drives the sidebar activity indicator.
     busy_sessions: HashSet<String>,
+    /// Prevents automatic system sleep from suspending active agent work.
+    /// Uses the same server-authoritative activity state as quit-when-idle.
+    sleep_inhibitor: crate::sleep::SleepInhibitor,
     /// The server can't reach the internet (seeded from `ServerInfo.online`,
     /// kept live by `server.connectivity_changed` events). While set, the
     /// model list holds only offline-capable (local) models; when it is
@@ -939,6 +942,7 @@ pub async fn run(
         github_hosts: Vec::new(),
         download_rates: HashMap::new(),
         busy_sessions: HashSet::new(),
+        sleep_inhibitor: crate::sleep::SleepInhibitor::default(),
         offline: false,
         connectivity_notice_seq: 0,
         server_unreachable: false,
@@ -1827,6 +1831,7 @@ impl Controller {
         // activity is seeded by the sessions endpoint and updated by the
         // global event stream, so it is the source of truth for app quit.
         let running = self.busy_sessions.len() as i32;
+        self.sleep_inhibitor.set_active(running > 0);
         ui::set_agents_running(&self.ui, running);
         if self
             .quit_when_idle

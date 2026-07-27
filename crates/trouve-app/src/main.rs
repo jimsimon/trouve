@@ -5,6 +5,7 @@ mod controller;
 mod notify;
 mod opener;
 mod render;
+mod sleep;
 mod theme;
 mod ui;
 mod winstate;
