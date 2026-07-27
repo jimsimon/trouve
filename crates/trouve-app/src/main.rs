@@ -5,6 +5,7 @@ mod controller;
 mod notify;
 mod opener;
 mod render;
+mod sleep;
 mod theme;
 mod ui;
 mod winstate;
@@ -260,6 +261,20 @@ fn main() -> anyhow::Result<()> {
         let on_appearance = on_appearance.clone();
         window.on_appearance_reduce_motion_toggled(move |on| {
             on_appearance(&|a| a.reduce_motion = on);
+        });
+    }
+
+    // --- general settings: restore, wire the toggles -------------------------
+    {
+        let prefs = winstate::load_general();
+        window.set_prevent_sleep_while_running(prefs.prevent_sleep_while_running);
+        let prefs = std::rc::Rc::new(std::cell::RefCell::new(prefs));
+        let tx_prefs = tx.clone();
+        window.on_prevent_sleep_while_running_toggled(move |on| {
+            let mut prefs = prefs.borrow_mut();
+            prefs.prevent_sleep_while_running = on;
+            winstate::save_general(&prefs);
+            let _ = tx_prefs.send(UiCommand::GeneralPrefsChanged(prefs.clone()));
         });
     }
 

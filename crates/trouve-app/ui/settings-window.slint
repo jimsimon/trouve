@@ -334,6 +334,10 @@ export component SettingsScreen inherits Rectangle {
     in property <string> login-provider-id: "";
     in property <bool> login-code-required: false;
 
+    // General frontend behavior preferences.
+    in-out property <bool> prevent-sleep-while-running: true;
+    callback prevent-sleep-while-running-toggled(bool);
+
     // Provider form state (prefilled by "Edit" or a preset).
     in-out property <string> form-id: "";
     in-out property <string> form-base-url: "";
@@ -526,12 +530,13 @@ export component SettingsScreen inherits Rectangle {
     property <int> mode-form-thinking-model-index: root.mode-form-model >= 0
         ? root.mode-form-model : root.default-model-index;
 
-    // Side-nav selection: 0 providers, 1 modes & models, 2 mcp servers,
-    // 3 integrations, 4 appearance, 5 notifications, 6 about. in-out so
+    // Side-nav selection: 0 general, 1 providers, 2 modes & models,
+    // 3 mcp servers, 4 integrations, 5 appearance, 6 notifications,
+    // 7 about. in-out so
     // the app can open straight to a section (e.g. the
     // PR tab's "set up GitHub" button).
     in-out property <int> section: 0;
-    property <[string]> section-names: ["Providers", "Modes & Models", "MCP Servers", "Integrations", "Appearance", "Notifications", "About"];
+    property <[string]> section-names: ["General", "Providers", "Modes & Models", "MCP Servers", "Integrations", "Appearance", "Notifications", "About"];
 
     VerticalLayout {
         // Header: title + a way back to wherever the user came from.
@@ -611,8 +616,36 @@ export component SettingsScreen inherits Rectangle {
                         spacing: 12px;
                         alignment: start;
 
-                        // ---------------- providers ----------------
+                        // ---------------- general ----------------
                         if root.section == 0: VerticalLayout {
+                            spacing: 12px;
+
+                            Text {
+                                text: "General";
+                                color: Theme.c.text-hi;
+                                font-size: Theme.fs(16px);
+                                font-weight: 700;
+                            }
+
+                            CheckBox {
+                                text: "Prevent the computer from sleeping while agents are running";
+                                checked <=> root.prevent-sleep-while-running;
+                                toggled => {
+                                    root.prevent-sleep-while-running-toggled(
+                                        root.prevent-sleep-while-running);
+                                }
+                            }
+
+                            Text {
+                                text: "The display may still turn off, and manually requested sleep is not blocked.";
+                                color: Theme.c.text-soft;
+                                font-size: Theme.fs(11px);
+                                wrap: word-wrap;
+                            }
+                        }
+
+                        // ---------------- providers ----------------
+                        if root.section == 1: VerticalLayout {
                             spacing: 12px;
 
                             HorizontalLayout {
@@ -1112,7 +1145,7 @@ export component SettingsScreen inherits Rectangle {
                         }
 
                         // ---------------- modes & models ----------------
-                        if root.section == 1: VerticalLayout {
+                        if root.section == 2: VerticalLayout {
                             spacing: 12px;
 
                             Text {
@@ -1142,7 +1175,7 @@ export component SettingsScreen inherits Rectangle {
                                     Button {
                                         text: "Configure providers";
                                         primary: true;
-                                        clicked => { root.section = 0; }
+                                        clicked => { root.section = 1; }
                                     }
                                 }
                             }
@@ -1501,7 +1534,7 @@ export component SettingsScreen inherits Rectangle {
                         }
 
                         // ---------------- local models (Providers → Local) ----------------
-                        if root.section == 0 && root.provider-tab == 2: VerticalLayout {
+                        if root.section == 1 && root.provider-tab == 2: VerticalLayout {
                             spacing: 12px;
 
                             HorizontalLayout {
@@ -1872,7 +1905,7 @@ export component SettingsScreen inherits Rectangle {
                         }
 
                         // ---------------- mcp servers ----------------
-                        if root.section == 2: VerticalLayout {
+                        if root.section == 3: VerticalLayout {
                             spacing: 12px;
 
                             HorizontalLayout {
@@ -2169,7 +2202,7 @@ export component SettingsScreen inherits Rectangle {
                         }
 
                         // ---------------- integrations ----------------
-                        if root.section == 3: VerticalLayout {
+                        if root.section == 4: VerticalLayout {
                             spacing: 12px;
 
                             Text {
@@ -2301,7 +2334,7 @@ export component SettingsScreen inherits Rectangle {
                         }
 
                         // ---------------- appearance ----------------
-                        if root.section == 4: VerticalLayout {
+                        if root.section == 5: VerticalLayout {
                             spacing: 12px;
 
                             Text {
@@ -2381,7 +2414,7 @@ export component SettingsScreen inherits Rectangle {
                         }
 
                         // ---------------- notifications ----------------
-                        if root.section == 5: VerticalLayout {
+                        if root.section == 6: VerticalLayout {
                             spacing: 12px;
 
                             Text {
@@ -2439,7 +2472,7 @@ export component SettingsScreen inherits Rectangle {
                         }
 
                         // ---------------- about ----------------
-                        if root.section == 6: VerticalLayout {
+                        if root.section == 7: VerticalLayout {
                             spacing: 12px;
 
                             Text {

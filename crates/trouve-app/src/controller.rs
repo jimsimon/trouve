@@ -176,6 +176,8 @@ pub enum UiCommand {
     /// (syntax-highlight segments, inline-code tints). The palette itself
     /// was already swapped on the UI thread.
     AppearanceChanged,
+    /// General preferences changed (already persisted on the UI thread).
+    GeneralPrefsChanged(crate::winstate::General),
     /// Notification preferences toggled (already persisted on the UI
     /// thread); the controller keeps a copy to gate event notifications.
     NotifyPrefsChanged(crate::winstate::Notifications),
@@ -690,6 +692,11 @@ struct Controller {
     /// Seeded from `Session.active`, kept live by `session.activity`
     /// server events; drives the sidebar activity indicator.
     busy_sessions: HashSet<String>,
+    /// Prevents automatic system sleep from suspending active agent work.
+    /// Uses the same server-authoritative activity state as quit-when-idle.
+    sleep_inhibitor: crate::sleep::SleepInhibitor,
+    /// User preference gating the sleep inhibitor; enabled by default.
+    prevent_sleep_while_running: bool,
     /// The server can't reach the internet (seeded from `ServerInfo.online`,
     /// kept live by `server.connectivity_changed` events). While set, the
     /// model list holds only offline-capable (local) models; when it is
@@ -941,6 +948,8 @@ pub async fn run(
         github_hosts: Vec::new(),
         download_rates: HashMap::new(),
         busy_sessions: HashSet::new(),
+        sleep_inhibitor: crate::sleep::SleepInhibitor::default(),
+        prevent_sleep_while_running: crate::winstate::load_general().prevent_sleep_while_running,
         offline: false,
         connectivity_notice_seq: 0,
         server_unreachable: false,
@@ -1483,6 +1492,7 @@ impl Controller {
         tracing::warn!("embedded trouve-server exited ({status})");
         self.server_unreachable = true;
         self.clear_connectivity_notice();
+        self.sleep_inhibitor.set_active(false);
         if self
             .last_respawn
             .is_some_and(|at| at.elapsed() < std::time::Duration::from_secs(60))
@@ -1829,6 +1839,7 @@ impl Controller {
         // activity is seeded by the sessions endpoint and updated by the
         // global event stream, so it is the source of truth for app quit.
         let running = self.busy_sessions.len() as i32;
+        self.sync_sleep_inhibitor();
         ui::set_agents_running(&self.ui, running);
         if self
             .quit_when_idle
@@ -1837,6 +1848,11 @@ impl Controller {
         {
             ui::quit(&self.ui);
         }
+    }
+
+    fn sync_sleep_inhibitor(&mut self) {
+        self.sleep_inhibitor
+            .set_active(self.prevent_sleep_while_running && !self.busy_sessions.is_empty());
     }
 
     /// Pop a desktop notification for events the user would miss: the
@@ -5222,7 +5238,7 @@ impl Controller {
                 }
             }
             UiCommand::OpenIntegrationsSettings => {
-                ui::set_settings_section(&self.ui, 3);
+                ui::set_settings_section(&self.ui, 4);
                 self.refresh_settings().await;
                 self.refresh_mcp();
                 self.refresh_subscriptions(SubscriptionRefresh::IfStale);
@@ -6335,6 +6351,10 @@ impl Controller {
                     self.push_nav();
                 }
                 self.push_agents_running();
+            }
+            UiCommand::GeneralPrefsChanged(prefs) => {
+                self.prevent_sleep_while_running = prefs.prevent_sleep_while_running;
+                self.sync_sleep_inhibitor();
             }
             UiCommand::NotifyPrefsChanged(prefs) => self.notify = prefs,
             UiCommand::WindowFocusChanged(focused) => {
