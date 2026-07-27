@@ -1376,8 +1376,8 @@ impl AcpServer {
                         tracing::warn!("cursor acp: refusing unroutable request {method}");
                         let reply = json!({
                             "jsonrpc": "2.0", "id": msg["id"],
-                            "error": { "code": -32601,
-                                       "message": format!("unsupported method {method}") },
+                            "error": { "code": -32603,
+                                       "message": "session event route unavailable" },
                         });
                         write_reply(stdin.as_ref(), reply).await;
                     }
