@@ -34,6 +34,25 @@ fn rrf_scores(scores: &HashMap<usize, f64>) -> HashMap<usize, f64> {
         .collect()
 }
 
+/// Blend two RRF score maps, dropping candidates whose selected retrieval
+/// source contributes nothing (for example semantic-only candidates at
+/// `alpha = 0`).
+fn combine_scores(
+    semantic: &HashMap<usize, f64>,
+    bm25: &HashMap<usize, f64>,
+    alpha: f64,
+) -> ScoreMap {
+    let mut combined = ScoreMap::new();
+    for i in semantic.keys().chain(bm25.keys()) {
+        combined.entry(*i).or_insert_with(|| {
+            alpha * semantic.get(i).copied().unwrap_or(0.0)
+                + (1.0 - alpha) * bm25.get(i).copied().unwrap_or(0.0)
+        });
+    }
+    combined.retain(|_, score| *score != 0.0);
+    combined
+}
+
 /// Run semantic search for a query, returning `(chunk index, similarity)` pairs.
 pub fn search_semantic(
     query: &str,
@@ -111,13 +130,7 @@ pub fn search(
     let normalized_semantic = rrf_scores(&semantic);
     let normalized_bm25 = rrf_scores(&bm25_scores);
 
-    let mut combined: ScoreMap = HashMap::new();
-    for i in normalized_semantic.keys().chain(normalized_bm25.keys()) {
-        combined.entry(*i).or_insert_with(|| {
-            alpha_weight * normalized_semantic.get(i).copied().unwrap_or(0.0)
-                + (1.0 - alpha_weight) * normalized_bm25.get(i).copied().unwrap_or(0.0)
-        });
-    }
+    let mut combined = combine_scores(&normalized_semantic, &normalized_bm25, alpha_weight);
 
     let ranked: Vec<(usize, f64)> = if rerank {
         boost_multi_chunk_files(&mut combined, chunks);
@@ -178,5 +191,15 @@ mod tests {
         assert!((rrf[&10] - 1.0 / 61.0).abs() < 1e-12);
         assert!((rrf[&30] - 1.0 / 62.0).abs() < 1e-12);
         assert!((rrf[&20] - 1.0 / 63.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn zero_weight_candidates_are_removed_after_fusion() {
+        let semantic = HashMap::from([(0, 1.0 / 61.0)]);
+        let bm25 = HashMap::from([(1, 1.0 / 61.0)]);
+
+        assert_eq!(combine_scores(&semantic, &bm25, 0.0), bm25);
+        assert_eq!(combine_scores(&semantic, &bm25, 1.0), semantic);
+        assert_eq!(combine_scores(&semantic, &bm25, 0.5).len(), 2);
     }
 }
