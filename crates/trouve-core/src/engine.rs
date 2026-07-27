@@ -1121,7 +1121,9 @@ impl Engine {
             let mut config = self.config.lock().unwrap();
             let entry = config.providers.entry(id.to_string()).or_default();
             entry.kind = req.kind.clone();
-            entry.base_url = req.base_url.clone().filter(|u| !u.is_empty());
+            if let Some(base_url) = req.base_url.clone().filter(|url| !url.is_empty()) {
+                entry.base_url = Some(base_url);
+            }
             if !req.settings.is_empty() {
                 entry.settings = req.settings.clone();
             }
@@ -9027,6 +9029,7 @@ mod tests {
     #[test]
     fn preset_upsert_preserves_existing_transport_templates_when_omitted() {
         let data = tempfile::tempdir().unwrap();
+        let custom_base_url = "https://custom.azure.test/openai".to_string();
         let custom_headers =
             std::collections::BTreeMap::from([("x-custom".into(), "${RESOURCE}".into())]);
         let custom_query =
@@ -9036,6 +9039,7 @@ mod tests {
             "azure".into(),
             crate::config::ProviderConfig {
                 kind: "azure-openai".into(),
+                base_url: Some(custom_base_url.clone()),
                 headers: custom_headers.clone(),
                 query_params: custom_query.clone(),
                 ..Default::default()
@@ -9058,6 +9062,7 @@ mod tests {
 
         let config = engine.config.lock().unwrap();
         let provider = config.providers.get("azure").unwrap();
+        assert_eq!(provider.base_url.as_deref(), Some(custom_base_url.as_str()));
         assert_eq!(provider.headers, custom_headers);
         assert_eq!(provider.query_params, custom_query);
     }

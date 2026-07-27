@@ -247,25 +247,32 @@ type MetadataCache = std::collections::HashMap<PathBuf, (MetadataStamp, ModelMet
 static GGUF_METADATA: std::sync::OnceLock<std::sync::Mutex<MetadataCache>> =
     std::sync::OnceLock::new();
 
+fn metadata_cache_path(path: &Path) -> PathBuf {
+    std::fs::canonicalize(path)
+        .or_else(|_| std::path::absolute(path))
+        .unwrap_or_else(|_| path.to_path_buf())
+}
+
 pub fn model_metadata(path: &Path) -> ModelMetadata {
-    let Ok(fs) = std::fs::metadata(path) else {
+    let cache_path = metadata_cache_path(path);
+    let Ok(fs) = std::fs::metadata(&cache_path) else {
         return ModelMetadata::default();
     };
     let stamp = (fs.len(), fs.modified().ok());
     let cache = GGUF_METADATA.get_or_init(|| std::sync::Mutex::new(MetadataCache::new()));
-    if let Some((cached_stamp, metadata)) = cache.lock().unwrap().get(path)
+    if let Some((cached_stamp, metadata)) = cache.lock().unwrap().get(&cache_path)
         && *cached_stamp == stamp
     {
         return metadata.clone();
     }
-    let metadata = read_gguf_metadata(path).unwrap_or_else(|e| {
-        tracing::warn!(path = %path.display(), "could not read GGUF metadata: {e:#}");
+    let metadata = read_gguf_metadata(&cache_path).unwrap_or_else(|e| {
+        tracing::warn!(path = %cache_path.display(), "could not read GGUF metadata: {e:#}");
         ModelMetadata::default()
     });
     cache
         .lock()
         .unwrap()
-        .insert(path.to_path_buf(), (stamp, metadata.clone()));
+        .insert(cache_path, (stamp, metadata.clone()));
     metadata
 }
 
@@ -1420,6 +1427,13 @@ mod tests {
         );
         assert_eq!(metadata.context_window, 262_144);
         assert_eq!(metadata.thinking, Thinking::Toggle);
+        let nested = tmp.path().join("nested");
+        std::fs::create_dir(&nested).unwrap();
+        let alias = nested.join("..").join("model.gguf");
+        assert_eq!(model_metadata(&alias), metadata);
+        let cache = GGUF_METADATA.get().unwrap().lock().unwrap();
+        assert!(cache.contains_key(&std::fs::canonicalize(&path).unwrap()));
+        assert!(!cache.contains_key(&alias));
     }
 
     #[test]
