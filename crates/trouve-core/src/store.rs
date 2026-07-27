@@ -777,14 +777,22 @@ const CODE_REVIEW_TASK_COLUMNS: &str = "id, job_id, role, reviewer_id, reviewer_
      cached_input_tokens, output_tokens, tool_call_count, error, created_at, started_at, completed_at";
 
 /// Same wire shape as a full task, but without the potentially large retained
-/// prompt/transcript fields. Keeping the column order aligned lets the compact
-/// job-detail path reuse the normal row mapper without materializing content
-/// the caller did not request.
-const CODE_REVIEW_TASK_SUMMARY_COLUMNS: &str = "id, job_id, role, reviewer_id, reviewer_name, \
-     batch_index, batch_count, status, model, session_id, thread_id, '' AS prompt, '' AS output, \
-     '' AS thinking, '' AS tool_output, candidate_issue_count, confirmed_issue_count, \
-     provider_wait_ms, model_elapsed_ms, input_tokens, cached_input_tokens, output_tokens, \
-     tool_call_count, error, created_at, started_at, completed_at";
+/// prompt/transcript fields. Deriving this projection from the full column list
+/// keeps the order aligned with the shared row mapper.
+fn code_review_task_summary_columns() -> String {
+    CODE_REVIEW_TASK_COLUMNS
+        .split(',')
+        .map(str::trim)
+        .map(|column| match column {
+            "prompt" => "'' AS prompt",
+            "output" => "'' AS output",
+            "thinking" => "'' AS thinking",
+            "tool_output" => "'' AS tool_output",
+            _ => column,
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
 
 #[derive(Debug, Clone)]
 pub struct NewCodeReviewFinding {
@@ -2869,8 +2877,9 @@ impl Store {
         job_id: &str,
     ) -> Result<Vec<trouve_protocol::CodeReviewTask>> {
         let conn = self.conn.lock().unwrap();
+        let columns = code_review_task_summary_columns();
         let mut stmt = conn.prepare(&format!(
-            "SELECT {CODE_REVIEW_TASK_SUMMARY_COLUMNS} FROM code_review_tasks
+            "SELECT {columns} FROM code_review_tasks
              WHERE job_id = ?1
              ORDER BY CASE role WHEN 'reviewer' THEN 0 ELSE 1 END,
                       reviewer_name, batch_index, created_at"
@@ -3189,6 +3198,8 @@ impl Store {
         id: &str,
         include_task_content: bool,
     ) -> Result<Option<trouve_protocol::CodeReviewJobDetail>> {
+        let event_cursor =
+            self.latest_event_cursor(&trouve_protocol::Scope::CodeReviewJob(id.to_owned()))?;
         let Some(record) = self.code_review_job(id)? else {
             return Ok(None);
         };
@@ -3200,8 +3211,6 @@ impl Store {
         let personas = code_review_persona_results(&tasks);
         let findings = self.code_review_findings(id)?;
         let candidate_rejections = self.code_review_candidate_rejections(id)?;
-        let event_cursor =
-            self.latest_event_cursor(&trouve_protocol::Scope::CodeReviewJob(id.to_owned()))?;
         Ok(Some(trouve_protocol::CodeReviewJobDetail {
             job: record.job,
             event_cursor,
@@ -4470,6 +4479,18 @@ fn row_to_checkpoint(r: &rusqlite::Row<'_>) -> rusqlite::Result<CheckpointRow> {
 mod tests {
     use super::*;
     use trouve_protocol::Event;
+
+    #[test]
+    fn code_review_task_summary_columns_preserve_full_row_shape() {
+        let summary = code_review_task_summary_columns();
+        let full_columns = CODE_REVIEW_TASK_COLUMNS.split(',').map(str::trim);
+        let summary_columns = summary
+            .split(',')
+            .map(str::trim)
+            .map(|column| column.strip_prefix("'' AS ").unwrap_or(column));
+
+        assert!(full_columns.eq(summary_columns));
+    }
 
     #[test]
     fn append_and_replay_events() {
