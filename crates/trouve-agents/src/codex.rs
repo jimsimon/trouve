@@ -416,7 +416,7 @@ fn thread_id_of(result: &Value) -> Result<String, BackendError> {
 fn turn_stream(
     server: Arc<AppServer>,
     codex_thread_id: String,
-    mut route: mpsc::Receiver<ServerMsg>,
+    mut route: mpsc::UnboundedReceiver<ServerMsg>,
     fresh_session: bool,
     model_name: String,
     observed_windows: Arc<std::sync::Mutex<HashMap<String, u64>>>,
@@ -775,9 +775,8 @@ enum ServerMsg {
 }
 
 type Pending = Arc<Mutex<HashMap<i64, oneshot::Sender<Result<Value, String>>>>>;
-type Routes = Arc<Mutex<HashMap<String, mpsc::Sender<ServerMsg>>>>;
+type Routes = Arc<Mutex<HashMap<String, mpsc::UnboundedSender<ServerMsg>>>>;
 type Buffered = Arc<Mutex<HashMap<String, Vec<ServerMsg>>>>;
-const ROUTE_CAPACITY: usize = 256;
 
 async fn close_transport(
     pending: &Pending,
@@ -845,21 +844,19 @@ async fn read_stdout<R: AsyncRead + Unpin>(
                 routes.get(&thread_id).cloned()
             };
             match routed {
-                Some(tx) => match tx.try_send(m) {
+                Some(tx) => match tx.send(m) {
                     Ok(()) => {
                         failed_routes.remove(&thread_id);
                     }
-                    Err(error) => {
+                    Err(_) => {
                         // The stdout reader is shared by every Codex turn. A
-                        // stalled route must fail independently rather than
-                        // applying backpressure that wedges all turns and
-                        // prevents this task from ever observing EOF.
+                        // closed route must fail independently. Routes are
+                        // unbounded because this task also delivers JSON-RPC
+                        // responses for every concurrent turn and therefore
+                        // can never wait for a slow route without wedging the
+                        // entire app-server transport.
                         tracing::warn!(
-                            "codex: dropping {thread_id} event route: {}",
-                            match error {
-                                mpsc::error::TrySendError::Full(_) => "route buffer is full",
-                                mpsc::error::TrySendError::Closed(_) => "route receiver is closed",
-                            }
+                            "codex: dropping {thread_id} event route: receiver is closed"
                         );
                         let mut routes = routes.lock().await;
                         if routes
@@ -994,8 +991,8 @@ impl AppServer {
         stdin.flush().await.map_err(BackendError::Io)
     }
 
-    async fn subscribe(&self, thread_id: &str) -> mpsc::Receiver<ServerMsg> {
-        let (tx, rx) = mpsc::channel(ROUTE_CAPACITY);
+    async fn subscribe(&self, thread_id: &str) -> mpsc::UnboundedReceiver<ServerMsg> {
+        let (tx, rx) = mpsc::unbounded_channel();
         self.routes
             .lock()
             .await
@@ -1004,7 +1001,7 @@ impl AppServer {
         // subscribed (notifications emitted right after thread/start).
         if let Some(msgs) = self.buffered.lock().await.remove(thread_id) {
             for m in msgs {
-                let _ = tx.send(m).await;
+                let _ = tx.send(m);
             }
         }
         rx
@@ -1098,7 +1095,7 @@ mod tests {
         let closed = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let (request_tx, request_rx) = oneshot::channel();
         pending.lock().await.insert(1, request_tx);
-        let (route_tx, mut route_rx) = mpsc::channel(1);
+        let (route_tx, mut route_rx) = mpsc::unbounded_channel();
         routes.lock().await.insert("thread-1".into(), route_tx);
 
         let (mut writer, reader) = tokio::io::duplex(16);
@@ -1131,19 +1128,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn full_turn_route_does_not_block_stdout_eof_cleanup() {
+    async fn turn_route_burst_is_lossless_and_does_not_block_stdout_eof_cleanup() {
         let deadline = std::time::Duration::from_secs(1);
         let pending: Pending = Arc::new(Mutex::new(HashMap::new()));
         let routes: Routes = Arc::new(Mutex::new(HashMap::new()));
         let buffered: Buffered = Arc::new(Mutex::new(HashMap::new()));
         let closed = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let (route_tx, mut route_rx) = mpsc::channel(1);
-        route_tx
-            .try_send(ServerMsg::Notification {
-                method: "already/queued".into(),
-                params: json!({}),
-            })
-            .unwrap();
+        let (route_tx, mut route_rx) = mpsc::unbounded_channel();
         routes.lock().await.insert("thread-1".into(), route_tx);
 
         let (mut writer, reader) = tokio::io::duplex(256);
@@ -1154,13 +1145,18 @@ mod tests {
             buffered.clone(),
             closed.clone(),
         ));
-        writer
-            .write_all(
-                br#"{"jsonrpc":"2.0","method":"item/agentMessage/delta","params":{"threadId":"thread-1","delta":"blocked"}}
-"#,
-            )
-            .await
-            .unwrap();
+        let event_count = 1_024;
+        for sequence in 0..event_count {
+            writer
+                .write_all(
+                    format!(
+                        "{{\"jsonrpc\":\"2.0\",\"method\":\"item/agentMessage/delta\",\"params\":{{\"threadId\":\"thread-1\",\"delta\":\"{sequence}\"}}}}\n"
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+        }
         writer.shutdown().await.unwrap();
         tokio::time::timeout(deadline, task)
             .await
@@ -1170,16 +1166,21 @@ mod tests {
         assert!(closed.load(Ordering::Relaxed));
         assert!(routes.lock().await.is_empty());
         assert!(buffered.lock().await.is_empty());
+        for sequence in 0..event_count {
+            let msg = tokio::time::timeout(deadline, route_rx.recv())
+                .await
+                .expect("routed event should be available")
+                .expect("route should retain every event in the burst");
+            let ServerMsg::Notification { method, params } = msg else {
+                panic!("expected notification");
+            };
+            assert_eq!(method, "item/agentMessage/delta");
+            assert_eq!(params["delta"], sequence.to_string());
+        }
         assert!(
             tokio::time::timeout(deadline, route_rx.recv())
                 .await
-                .expect("pre-existing route event should remain available")
-                .is_some()
-        );
-        assert!(
-            tokio::time::timeout(deadline, route_rx.recv())
-                .await
-                .expect("saturated route should close")
+                .expect("route should close after stdout EOF")
                 .is_none()
         );
     }
