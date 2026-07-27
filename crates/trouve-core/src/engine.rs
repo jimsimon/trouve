@@ -2532,6 +2532,18 @@ impl Engine {
         self.title_model.settings()
     }
 
+    /// Current settings paired with the server cursor they are at least as
+    /// fresh as. Read the cursor first so a concurrent status change can only
+    /// make the returned settings newer than the cursor, never older.
+    pub fn git_worktree_settings_snapshot(
+        &self,
+    ) -> Result<(u64, trouve_protocol::GitWorktreeSettings), EngineError> {
+        let cursor = self
+            .store
+            .latest_event_cursor(&trouve_protocol::Scope::Server)?;
+        Ok((cursor, self.git_worktree_settings()))
+    }
+
     /// Persist and immediately apply the session-title model lifecycle.
     pub async fn set_title_model_load_behavior(
         &self,

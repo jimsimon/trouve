@@ -113,7 +113,10 @@ pub use requests::*;
 // settings.git_worktrees_updated carries lifecycle snapshots (additive).
 // 1.14: cancelling a missing title-model installation returns Not Found,
 // matching the managed CLI installation lifecycle (additive).
-pub const PROTOCOL_VERSION: &str = "1.14";
+// 1.15: Git & Worktrees settings responses include the corresponding server
+// event cursor so clients can order snapshots against SSE replay (additive).
+pub const PROTOCOL_VERSION: &str = "1.15";
+pub const EVENT_CURSOR_HEADER: &str = "x-trouve-event-cursor";
 
 pub type WorkspaceId = String;
 pub type SessionId = String;

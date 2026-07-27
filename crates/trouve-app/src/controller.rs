@@ -3725,9 +3725,11 @@ impl Controller {
         self.refresh_local();
     }
 
-    async fn refresh_title_model(&self) {
+    async fn refresh_title_model(&mut self) {
         match self.client.git_worktree_settings().await {
-            Ok(settings) => ui::set_git_worktree_settings(&self.ui, settings),
+            Ok((cursor, settings)) => {
+                self.apply_git_worktree_settings_snapshot(cursor, settings);
+            }
             Err(error) => {
                 ui::set_settings_status(
                     &self.ui,
@@ -4171,6 +4173,21 @@ impl Controller {
         if self
             .git_worktree_settings_cursor
             .is_some_and(|seen| seen >= cursor)
+        {
+            return;
+        }
+        ui::set_git_worktree_settings(&self.ui, settings);
+        self.git_worktree_settings_cursor = Some(cursor);
+    }
+
+    fn apply_git_worktree_settings_snapshot(
+        &mut self,
+        cursor: u64,
+        settings: trouve_protocol::GitWorktreeSettings,
+    ) {
+        if self
+            .git_worktree_settings_cursor
+            .is_some_and(|seen| seen > cursor)
         {
             return;
         }
@@ -5507,7 +5524,9 @@ impl Controller {
             UiCommand::SetTitleModelLoadBehavior(index) => {
                 let behavior = ui::title_model_load_behavior_of(index);
                 match self.client.set_git_worktree_settings(behavior).await {
-                    Ok(settings) => ui::set_git_worktree_settings(&self.ui, settings),
+                    Ok((cursor, settings)) => {
+                        self.apply_git_worktree_settings_snapshot(cursor, settings);
+                    }
                     Err(error) => {
                         ui::set_settings_status(&self.ui, format!("{error:#}"));
                         self.refresh_title_model().await;

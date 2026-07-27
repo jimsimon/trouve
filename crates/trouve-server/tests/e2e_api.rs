@@ -2788,26 +2788,32 @@ async fn session_title_settings_and_fallback() {
     let base = format!("http://{addr}/v1");
     let client = reqwest::Client::new();
 
-    let settings: serde_json::Value = client
+    let response = client
         .get(format!("{base}/config/git-worktrees"))
         .send()
         .await
-        .unwrap()
-        .json()
-        .await
         .unwrap();
+    assert!(
+        response
+            .headers()
+            .contains_key(trouve_protocol::EVENT_CURSOR_HEADER)
+    );
+    let settings: serde_json::Value = response.json().await.unwrap();
     assert_eq!(settings["title_model_load_behavior"], "auto");
     assert_eq!(settings["title_model"]["state"], "not_installed");
 
-    let settings: serde_json::Value = client
+    let response = client
         .put(format!("{base}/config/git-worktrees"))
         .json(&serde_json::json!({"title_model_load_behavior": "off"}))
         .send()
         .await
-        .unwrap()
-        .json()
-        .await
         .unwrap();
+    assert!(
+        response
+            .headers()
+            .contains_key(trouve_protocol::EVENT_CURSOR_HEADER)
+    );
+    let settings: serde_json::Value = response.json().await.unwrap();
     assert_eq!(settings["title_model_load_behavior"], "off");
     let response = client
         .delete(format!("{base}/config/git-worktrees/title-model/install"))

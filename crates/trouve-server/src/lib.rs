@@ -25,19 +25,19 @@ use trouve_protocol::{
     CodeReviewDashboard, CodeReviewJob, CodeReviewJobDetail, CodeReviewJobList,
     CodeReviewRepository, CodeReviewStats, CodeReviewStatsRange, CodeReviewTask,
     CompleteLoginRequest, ConfigureGithubAppRequest, CreatePrRequest, CreateSessionRequest,
-    CreateThreadRequest, DirEntry, ErrorBody, FileContent, GenerateSessionTitleRequest,
-    GeneratedSessionTitle, GitWorktreeSettings, GithubAppStatus, GithubIntegration, GithubPrList,
-    KnownProvider, LocalSearchResult, LocalStatus, LoginStarted, LoginStatus, McpLogs,
-    McpServerInfo, MergePrRequest, ModeInfo, ModelInfo, OpenTerminalRequest, PROTOCOL_VERSION,
-    PrInfo, ProviderInfo, ProvidersResponse, QueuedPrompt, RegisterWorkspaceRequest,
-    ReorderQueueRequest, RequestCodeReviewRequest, ResolveApprovalRequest, ResolveQuestionRequest,
-    ReviewerProfile, Scope, SendMessageRequest, ServerInfo, Session, SessionDiff,
-    SetDefaultModelRequest, SetDefaultPermissionModeRequest, SetGitWorktreeSettingsRequest,
-    SetLocalEnabledRequest, SubscriptionHealth, TerminalInfo, TerminalInputRequest,
-    TerminalResizeRequest, Thread, TurnAccepted, UpdateCodeReviewRepositoryRequest,
-    UpdateQueuedPromptRequest, UpdateSessionRequest, UpdateThreadRequest, UpsertAutomationRequest,
-    UpsertMcpServerRequest, UpsertModeRequest, UpsertProviderRequest, UpsertReviewerProfileRequest,
-    UsageSummary, Workspace,
+    CreateThreadRequest, DirEntry, EVENT_CURSOR_HEADER, ErrorBody, FileContent,
+    GenerateSessionTitleRequest, GeneratedSessionTitle, GitWorktreeSettings, GithubAppStatus,
+    GithubIntegration, GithubPrList, KnownProvider, LocalSearchResult, LocalStatus, LoginStarted,
+    LoginStatus, McpLogs, McpServerInfo, MergePrRequest, ModeInfo, ModelInfo, OpenTerminalRequest,
+    PROTOCOL_VERSION, PrInfo, ProviderInfo, ProvidersResponse, QueuedPrompt,
+    RegisterWorkspaceRequest, ReorderQueueRequest, RequestCodeReviewRequest,
+    ResolveApprovalRequest, ResolveQuestionRequest, ReviewerProfile, Scope, SendMessageRequest,
+    ServerInfo, Session, SessionDiff, SetDefaultModelRequest, SetDefaultPermissionModeRequest,
+    SetGitWorktreeSettingsRequest, SetLocalEnabledRequest, SubscriptionHealth, TerminalInfo,
+    TerminalInputRequest, TerminalResizeRequest, Thread, TurnAccepted,
+    UpdateCodeReviewRepositoryRequest, UpdateQueuedPromptRequest, UpdateSessionRequest,
+    UpdateThreadRequest, UpsertAutomationRequest, UpsertMcpServerRequest, UpsertModeRequest,
+    UpsertProviderRequest, UpsertReviewerProfileRequest, UsageSummary, Workspace,
 };
 use utoipa::OpenApi;
 
@@ -1523,23 +1523,28 @@ async fn set_default_permission_mode(
 }
 
 #[utoipa::path(get, path = "/v1/config/git-worktrees",
-    responses((status = 200, body = GitWorktreeSettings)))]
-async fn get_git_worktree_settings(State(engine): State<Arc<Engine>>) -> Json<GitWorktreeSettings> {
-    Json(engine.git_worktree_settings())
+    responses((status = 200, body = GitWorktreeSettings,
+        headers(("x-trouve-event-cursor" = u64, description = "Server event cursor for this snapshot")))))]
+async fn get_git_worktree_settings(
+    State(engine): State<Arc<Engine>>,
+) -> Result<impl IntoResponse, ApiError> {
+    let (cursor, settings) = engine.git_worktree_settings_snapshot()?;
+    Ok(([(EVENT_CURSOR_HEADER, cursor.to_string())], Json(settings)))
 }
 
 #[utoipa::path(put, path = "/v1/config/git-worktrees",
     request_body = SetGitWorktreeSettingsRequest,
-    responses((status = 200, body = GitWorktreeSettings)))]
+    responses((status = 200, body = GitWorktreeSettings,
+        headers(("x-trouve-event-cursor" = u64, description = "Server event cursor for this snapshot")))))]
 async fn set_git_worktree_settings(
     State(engine): State<Arc<Engine>>,
     Json(req): Json<SetGitWorktreeSettingsRequest>,
-) -> Result<Json<GitWorktreeSettings>, ApiError> {
-    Ok(Json(
-        engine
-            .set_title_model_load_behavior(req.title_model_load_behavior)
-            .await?,
-    ))
+) -> Result<impl IntoResponse, ApiError> {
+    engine
+        .set_title_model_load_behavior(req.title_model_load_behavior)
+        .await?;
+    let (cursor, settings) = engine.git_worktree_settings_snapshot()?;
+    Ok(([(EVENT_CURSOR_HEADER, cursor.to_string())], Json(settings)))
 }
 
 #[utoipa::path(post, path = "/v1/config/git-worktrees/title-model/install",
