@@ -121,7 +121,7 @@ function liveElapsed(
 function pickPreferredTask(tasks: ReviewTask[]): ReviewTask | undefined {
   const latestByBatch = new Map<string, ReviewTask>();
   tasks.forEach((task) => {
-    const key = `${task.role}:${task.batch_index}`;
+    const key = `${task.role}:${task.reviewer_id ?? ""}:${task.batch_index}`;
     const current = latestByBatch.get(key);
     if (
       !current ||
@@ -1121,7 +1121,7 @@ function JobDetailPane({
                         <StatusPill status={group.status} />
                       </button>
                       {job.status === "failed" &&
-                        group.status === "failed" &&
+                        (group.status === "failed" || group.status === "cancelled") &&
                         group.persona && (
                           <button
                             class="compact ghost retry-persona"
