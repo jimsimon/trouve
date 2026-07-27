@@ -291,8 +291,20 @@ impl AgentBackend for CodexBackend {
             turn_params["model"] = json!(model_name);
         }
         apply_reasoning_options(&mut turn_params, effort);
-        let started_turn = server.request("turn/start", turn_params).await?;
-        let codex_turn_id = turn_id_of(&started_turn)?;
+        let started_turn = match server.request("turn/start", turn_params).await {
+            Ok(started) => started,
+            Err(error) => {
+                server.unsubscribe(&codex_thread_id, &route.tx).await;
+                return Err(error);
+            }
+        };
+        let codex_turn_id = match turn_id_of(&started_turn) {
+            Ok(turn_id) => turn_id,
+            Err(error) => {
+                server.unsubscribe(&codex_thread_id, &route.tx).await;
+                return Err(error);
+            }
+        };
 
         let stream = turn_stream(
             server.clone(),
@@ -427,12 +439,16 @@ fn turn_stream(
     server: Arc<AppServer>,
     codex_thread_id: String,
     codex_turn_id: String,
-    mut route: RouteReceiver<ServerMsg>,
+    route: RouteSubscription,
     fresh_session: bool,
     model_name: String,
     observed_windows: Arc<std::sync::Mutex<HashMap<String, u64>>>,
 ) -> impl futures::Stream<Item = Result<BackendEvent, BackendError>> {
     async_stream(move |tx| async move {
+        let RouteSubscription {
+            tx: route_tx,
+            mut rx,
+        } = route;
         if fresh_session {
             let _ = tx
                 .send(Ok(BackendEvent::SessionStarted {
@@ -449,9 +465,9 @@ fn turn_stream(
         let mut streamed_reasoning = HashSet::new();
         let mut turn_finished = false;
         let mut route_overloaded = false;
-        let mut overload_signal = route.overload_signal();
+        let mut overload_signal = rx.overload_signal();
         let process_route = async {
-            while let Some(msg) = route.recv().await {
+            while let Some(msg) = rx.recv().await {
                 match msg {
                     ServerMsg::Notification { method, params } => match method.as_str() {
                         "item/agentMessage/delta" => {
@@ -674,7 +690,7 @@ fn turn_stream(
             };
             let _ = tx.send(Err(BackendError::Protocol(reason.into()))).await;
         }
-        server.unsubscribe(&codex_thread_id).await;
+        server.unsubscribe(&codex_thread_id, &route_tx).await;
     })
 }
 
@@ -1056,7 +1072,7 @@ impl AppServer {
         stdin.flush().await.map_err(BackendError::Io)
     }
 
-    async fn subscribe(&self, thread_id: &str) -> RouteReceiver<ServerMsg> {
+    async fn subscribe(&self, thread_id: &str) -> RouteSubscription {
         let (tx, rx) = route_channel();
         {
             // The reader takes these locks in the same order when it has no
@@ -1077,13 +1093,38 @@ impl AppServer {
                 }
             }
         }
-        rx
+        RouteSubscription { tx, rx }
     }
 
-    async fn unsubscribe(&self, thread_id: &str) {
-        self.routes.lock().await.remove(thread_id);
-        self.buffered.lock().await.remove(thread_id);
+    async fn unsubscribe(&self, thread_id: &str, expected: &RouteSender<ServerMsg>) {
+        remove_route(&self.routes, &self.buffered, thread_id, expected).await;
     }
+}
+
+struct RouteSubscription {
+    tx: RouteSender<ServerMsg>,
+    rx: RouteReceiver<ServerMsg>,
+}
+
+async fn remove_route(
+    routes: &Routes,
+    buffered: &Buffered,
+    thread_id: &str,
+    expected: &RouteSender<ServerMsg>,
+) {
+    let mut routes = routes.lock().await;
+    if !routes
+        .get(thread_id)
+        .is_some_and(|active| active.same_channel(expected))
+    {
+        return;
+    }
+    routes.remove(thread_id);
+    // Keep the lock order aligned with subscribe and the stdout reader.
+    // Buffered events belong to the route being removed only when it is
+    // still the active route; stale turn cleanup must not erase events for
+    // a replacement subscription.
+    buffered.lock().await.remove(thread_id);
 }
 
 #[cfg(test)]
@@ -1198,6 +1239,37 @@ mod tests {
                 .expect("turn route should be released")
                 .is_none()
         );
+    }
+
+    #[tokio::test]
+    async fn stale_turn_cleanup_preserves_replacement_route() {
+        let routes: Routes = Arc::new(Mutex::new(HashMap::new()));
+        let buffered: Buffered = Arc::new(Mutex::new(HashMap::new()));
+        let (stale_tx, _stale_rx) = route_channel();
+        let (replacement_tx, mut replacement_rx) = route_channel();
+        routes
+            .lock()
+            .await
+            .insert("thread-1".into(), replacement_tx.clone());
+
+        remove_route(&routes, &buffered, "thread-1", &stale_tx).await;
+
+        let active = routes
+            .lock()
+            .await
+            .get("thread-1")
+            .cloned()
+            .expect("stale cleanup must preserve the replacement route");
+        active
+            .try_send(ServerMsg::Notification {
+                method: "turn/started".into(),
+                params: json!({ "threadId": "thread-1" }),
+            })
+            .unwrap();
+        assert!(replacement_rx.recv().await.is_some());
+
+        remove_route(&routes, &buffered, "thread-1", &replacement_tx).await;
+        assert!(routes.lock().await.is_empty());
     }
 
     #[tokio::test]
