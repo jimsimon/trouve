@@ -2580,7 +2580,7 @@ impl Engine {
             record.reviewers.clone()
         };
         let reviewer_count = reviewers.len();
-        let existing_tasks = self.store.code_review_tasks(&job.id)?;
+        let existing_tasks = self.store.latest_code_review_reviewer_tasks(&job.id)?;
         let mut latest_tasks = HashMap::new();
         for task in existing_tasks {
             if task.role == trouve_protocol::CodeReviewTaskRole::Reviewer
@@ -3387,7 +3387,8 @@ impl Engine {
             }
         };
         let check_summary = bounded_check_details(&check_summary);
-        let check_details = bounded_check_details(&render_check_details(&detail));
+        let latest_tasks = self.store.latest_code_review_reviewer_tasks(&job.id)?;
+        let check_details = bounded_check_details(&render_check_details(&detail, &latest_tasks));
         let mut check_body = serde_json::json!({
             "name": "trouve-code-review",
             "head_sha": job.head_sha,
@@ -3803,7 +3804,10 @@ fn lifecycle_comment_marker(job_id: &str) -> String {
     format!("<!-- trouve-code-review lifecycle job:{job_id} -->")
 }
 
-fn render_check_details(detail: &trouve_protocol::CodeReviewJobDetail) -> String {
+fn render_check_details(
+    detail: &trouve_protocol::CodeReviewJobDetail,
+    latest_reviewer_tasks: &[trouve_protocol::CodeReviewTask],
+) -> String {
     let job = &detail.job;
     let mut body = String::new();
     if !detail.summary.trim().is_empty() {
@@ -3856,13 +3860,10 @@ fn render_check_details(detail: &trouve_protocol::CodeReviewJobDetail) -> String
         .iter()
         .filter(|task| task.status == "failed" && !task.error.trim().is_empty())
         .filter(|task| {
-            !detail.tasks.iter().any(|candidate| {
-                candidate.role == task.role
-                    && candidate.reviewer_id == task.reviewer_id
-                    && candidate.batch_index == task.batch_index
-                    && (candidate.created_at, candidate.id.as_str())
-                        > (task.created_at, task.id.as_str())
-            })
+            task.role != trouve_protocol::CodeReviewTaskRole::Reviewer
+                || latest_reviewer_tasks
+                    .iter()
+                    .any(|latest| latest.id == task.id)
         })
         .collect::<Vec<_>>();
     if !failed_tasks.is_empty() {
@@ -4971,7 +4972,8 @@ mod tests {
             .unwrap();
 
         let detail = store.code_review_job_detail(&queued.id).unwrap().unwrap();
-        let running = render_check_details(&detail);
+        let latest_tasks = store.latest_code_review_reviewer_tasks(&queued.id).unwrap();
+        let running = render_check_details(&detail, &latest_tasks);
         assert!(running.contains("Reviewers are examining the current revision."));
         assert!(running.contains("### Reviewer status"));
         assert!(running.contains("Reliability & Error Handling"));
@@ -4994,12 +4996,23 @@ mod tests {
             .unwrap();
 
         let detail = store.code_review_job_detail(&queued.id).unwrap().unwrap();
-        let failed = render_check_details(&detail);
+        let latest_tasks = store.latest_code_review_reviewer_tasks(&queued.id).unwrap();
+        let failed = render_check_details(&detail, &latest_tasks);
         assert!(failed.contains("### Error"));
         assert!(failed.contains("reviewer output was invalid"));
         assert!(failed.contains("### Failed reviewer tasks"));
         assert!(failed.contains("review did not contain JSON<br>repair also failed"));
         assert!(!failed.trim().is_empty());
+
+        store
+            .retry_code_review_persona(&queued.id, "reliability")
+            .unwrap()
+            .unwrap();
+        let detail = store.code_review_job_detail(&queued.id).unwrap().unwrap();
+        let latest_tasks = store.latest_code_review_reviewer_tasks(&queued.id).unwrap();
+        let retried = render_check_details(&detail, &latest_tasks);
+        assert!(!retried.contains("### Failed reviewer tasks"));
+        assert!(!retried.contains("review did not contain JSON"));
     }
 
     #[test]

@@ -775,6 +775,7 @@ const CODE_REVIEW_TASK_COLUMNS: &str = "id, job_id, role, reviewer_id, reviewer_
      batch_count, status, model, session_id, thread_id, prompt, output, thinking, tool_output, \
      candidate_issue_count, confirmed_issue_count, provider_wait_ms, model_elapsed_ms, input_tokens, \
      cached_input_tokens, output_tokens, tool_call_count, error, created_at, started_at, completed_at";
+const CODE_REVIEW_TASK_INSERTION_ORDER_COLUMN: &str = "task_insertion_order";
 
 /// Same wire shape as a full task, but without the potentially large retained
 /// prompt/transcript fields. Deriving this projection from the full column list
@@ -805,7 +806,7 @@ fn row_to_code_review_task_attempt(
 ) -> rusqlite::Result<CodeReviewTaskAttempt> {
     Ok(CodeReviewTaskAttempt {
         task: row_to_code_review_task(r)?,
-        insertion_order: r.get(27)?,
+        insertion_order: r.get(CODE_REVIEW_TASK_INSERTION_ORDER_COLUMN)?,
     })
 }
 
@@ -2919,7 +2920,9 @@ impl Store {
     fn code_review_task_attempts(&self, job_id: &str) -> Result<Vec<CodeReviewTaskAttempt>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(&format!(
-            "SELECT {CODE_REVIEW_TASK_COLUMNS}, rowid FROM code_review_tasks
+            "SELECT {CODE_REVIEW_TASK_COLUMNS},
+                    rowid AS {CODE_REVIEW_TASK_INSERTION_ORDER_COLUMN}
+             FROM code_review_tasks
              WHERE job_id = ?1
              ORDER BY CASE role WHEN 'reviewer' THEN 0 ELSE 1 END,
                       reviewer_name, batch_index, created_at, rowid"
@@ -2950,7 +2953,9 @@ impl Store {
         let conn = self.conn.lock().unwrap();
         let columns = code_review_task_summary_columns();
         let mut stmt = conn.prepare(&format!(
-            "SELECT {columns}, rowid FROM code_review_tasks
+            "SELECT {columns},
+                    rowid AS {CODE_REVIEW_TASK_INSERTION_ORDER_COLUMN}
+             FROM code_review_tasks
              WHERE job_id = ?1
              ORDER BY CASE role WHEN 'reviewer' THEN 0 ELSE 1 END,
                       reviewer_name, batch_index, created_at, rowid"
@@ -2964,6 +2969,17 @@ impl Store {
             .code_review_task_attempts(job_id)?
             .into_iter()
             .map(|attempt| attempt.task)
+            .collect())
+    }
+
+    pub(crate) fn latest_code_review_reviewer_tasks(
+        &self,
+        job_id: &str,
+    ) -> Result<Vec<trouve_protocol::CodeReviewTask>> {
+        let attempts = self.code_review_task_attempts(job_id)?;
+        Ok(latest_code_review_task_attempts(&attempts)
+            .into_iter()
+            .map(|attempt| attempt.task.clone())
             .collect())
     }
 
@@ -3038,7 +3054,9 @@ impl Store {
 
         let attempts = {
             let mut stmt = tx.prepare(&format!(
-                "SELECT {CODE_REVIEW_TASK_COLUMNS}, rowid FROM code_review_tasks
+                "SELECT {CODE_REVIEW_TASK_COLUMNS},
+                        rowid AS {CODE_REVIEW_TASK_INSERTION_ORDER_COLUMN}
+                 FROM code_review_tasks
                  WHERE job_id = ?1 AND role = 'reviewer' AND reviewer_id = ?2
                  ORDER BY rowid"
             ))?;
@@ -6203,6 +6221,15 @@ mod tests {
             )
             .unwrap();
 
+        let latest_tasks = store.latest_code_review_reviewer_tasks(&queued.id).unwrap();
+        assert_eq!(
+            latest_tasks
+                .iter()
+                .find(|task| task.batch_index == 0)
+                .unwrap()
+                .id,
+            "rvt_a_new"
+        );
         let detail = store.code_review_job_detail(&queued.id).unwrap().unwrap();
         assert_eq!(detail.tasks.len(), 5);
         assert_eq!(detail.personas[0].status, "queued");

@@ -748,6 +748,64 @@
         }
       }
     },
+    "/v1/code-review/jobs/{id}/reviewers/{reviewer_id}/retry": {
+      "post": {
+        "tags": [],
+        "operationId": "retry_code_review_persona",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Review job id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "reviewer_id",
+            "in": "path",
+            "description": "Reviewer persona id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CodeReviewJob"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/v1/code-review/jobs/{job_id}/tasks/{task_id}": {
       "get": {
         "tags": [],

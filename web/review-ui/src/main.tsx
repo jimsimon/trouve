@@ -121,7 +121,8 @@ function liveElapsed(
 function pickPreferredTask(tasks: ReviewTask[]): ReviewTask | undefined {
   const latestByBatch = new Map<string, ReviewTask>();
   tasks.forEach((task) => {
-    const key = `${task.role}:${task.reviewer_id ?? ""}:${task.batch_index}`;
+    const reviewerKey = task.reviewer_id || task.reviewer_name || task.id;
+    const key = `${task.role}:${reviewerKey}:${task.batch_index}`;
     const current = latestByBatch.get(key);
     if (
       !current ||
@@ -631,7 +632,7 @@ function JobDetailPane({
   const taskRequestsRef = useRef(new Set<string>());
   const detailStatusRef = useRef(detail?.job.status);
   detailStatusRef.current = detail?.job.status;
-  const load = useCallback(async (): Promise<void> => {
+  const load = useCallback(async (): Promise<JobDetail | undefined> => {
     const requestedJobId = jobId;
     try {
       const next = await getJob(requestedJobId);
@@ -639,12 +640,14 @@ function JobDetailPane({
         setDetail(next);
         setEventCursor((current) => current ?? next.event_cursor ?? 0);
         setError("");
+        return next;
       }
     } catch (cause) {
       if (aliveRef.current === requestedJobId) {
         setError(cause instanceof Error ? cause.message : String(cause));
       }
     }
+    return undefined;
   }, [jobId]);
   const loadTask = useCallback(
     async (taskId: string): Promise<void> => {
@@ -815,7 +818,11 @@ function JobDetailPane({
     try {
       await retryPersona(detail.job.id, reviewerId);
       onChanged();
-      await load();
+      const refreshed = await load();
+      const retriedTask = pickPreferredTask(
+        refreshed?.tasks.filter((task) => task.reviewer_id === reviewerId) ?? [],
+      );
+      setSelectedTaskId(retriedTask?.id ?? "");
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : String(cause));
     } finally {
