@@ -265,8 +265,8 @@ fn default_shell() -> String {
 
 fn shell_args(shell: &str) -> &'static [&'static str] {
     let executable = shell.rsplit(['/', '\\']).next().unwrap_or(shell);
-    let executable = executable.strip_suffix(".exe").unwrap_or(executable);
-    let is_fish = executable.eq_ignore_ascii_case("fish");
+    let is_fish =
+        executable.eq_ignore_ascii_case("fish") || executable.eq_ignore_ascii_case("fish.exe");
     if is_fish {
         // fish 4.1+ waits for terminal capability replies before processing
         // input. trouve renders PTY output but does not answer those optional
@@ -286,6 +286,10 @@ mod tests {
         assert_eq!(shell_args("/usr/bin/fish"), ["--features", "no-query-term"]);
         assert_eq!(
             shell_args(r"C:\Program Files\fish\fish.exe"),
+            ["--features", "no-query-term"]
+        );
+        assert_eq!(
+            shell_args(r"C:\Program Files\fish\FISH.EXE"),
             ["--features", "no-query-term"]
         );
         assert!(shell_args("/bin/bash").is_empty());
