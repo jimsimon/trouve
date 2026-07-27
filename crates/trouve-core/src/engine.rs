@@ -376,7 +376,7 @@ pub struct Engine {
     title_model: Arc<crate::title_model::TitleModelManager>,
     /// A timed-out generation stays tracked while its cold start finishes.
     /// The next request cancels and joins it before starting another.
-    title_model_generation: tokio::sync::Mutex<Option<tokio::task::JoinHandle<Result<String>>>>,
+    title_model_generation: tokio::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
     /// The built-in "local" provider, kept around so enabling re-injects
     /// the same instance after a disable removed it from the registry.
     local_provider: Arc<dyn Provider>,
@@ -2607,27 +2607,27 @@ impl Engine {
     ) -> trouve_protocol::GeneratedSessionTitle {
         let title_model = self.title_model.clone();
         let prompt_owned = prompt.to_string();
-        let mut generation = self.title_model_generation.lock().await;
-        if let Some(previous) = generation.take() {
-            previous.abort();
-            let _ = previous.await;
-        }
-        *generation = Some(tokio::spawn(async move {
-            title_model.generate(&prompt_owned).await
-        }));
-        let result = tokio::time::timeout(
-            SESSION_TITLE_TIMEOUT,
-            generation
-                .as_mut()
-                .expect("title generation was just inserted"),
-        )
-        .await;
-        if result.is_ok() {
+        let generated = match tokio::time::timeout(SESSION_TITLE_TIMEOUT, async {
+            let mut generation = self.title_model_generation.lock().await;
+            if let Some(previous) = generation.as_mut() {
+                previous.abort();
+                let _ = previous.await;
+            }
             generation.take();
-        }
-        let generated = match result {
-            Ok(Ok(result)) => result,
-            Ok(Err(error)) => Err(anyhow!("session title task failed: {error}")),
+
+            let (result_tx, result_rx) = tokio::sync::oneshot::channel();
+            *generation = Some(tokio::spawn(async move {
+                let _ = result_tx.send(title_model.generate(&prompt_owned).await);
+            }));
+            drop(generation);
+
+            result_rx
+                .await
+                .map_err(|error| anyhow!("session title task failed: {error}"))?
+        })
+        .await
+        {
+            Ok(result) => result,
             Err(_) => Err(anyhow!("session title generation timed out")),
         };
         match generated {
