@@ -842,6 +842,18 @@ impl ProtocolClient {
         .await
     }
 
+    pub async fn retry_code_review_persona(
+        &self,
+        id: &str,
+        reviewer_id: &str,
+    ) -> Result<CodeReviewJob> {
+        self.post_json(
+            &format!("/code-review/jobs/{id}/reviewers/{reviewer_id}/retry"),
+            &serde_json::json!({}),
+        )
+        .await
+    }
+
     pub async fn code_review_stats(
         &self,
         range: CodeReviewStatsRange,

@@ -65,6 +65,14 @@ export const retryJob = (id: string): Promise<ReviewJob> =>
     method: "POST",
     body: "{}",
   });
+export const retryPersona = (id: string, reviewerId: string): Promise<ReviewJob> =>
+  api(
+    `/code-review/jobs/${encodeURIComponent(id)}/reviewers/${encodeURIComponent(reviewerId)}/retry`,
+    {
+      method: "POST",
+      body: "{}",
+    },
+  );
 export const requestReview = (
   job: ReviewJob,
   scope: ReviewScope,

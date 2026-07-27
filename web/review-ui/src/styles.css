@@ -158,11 +158,13 @@ dd { margin: 5px 0 0; }
 .activity-groups { display: flex; min-width: 0; flex-direction: column; gap: 6px; }
 .activity-group { overflow: hidden; border: 1px solid var(--line-soft); border-radius: 8px; background: #0e131d; }
 .activity-group.active { border-color: #315f94; }
-.activity-group > button { width: 100%; display: flex; justify-content: space-between; align-items: center; gap: 9px; padding: 10px; border: 0; border-radius: 0; background: transparent; text-align: left; }
-.activity-group > button:hover { background: var(--surface-2); filter: none; }
-.activity-group > button > span:first-child { min-width: 0; }
-.activity-group > button strong, .activity-group > button small { display: block; overflow: hidden; text-overflow: ellipsis; }
-.activity-group > button small { margin-top: 3px; color: var(--muted); font-size: 10px; white-space: nowrap; }
+.activity-group-summary { display: flex; align-items: center; }
+.activity-group-summary > button:first-child { flex: 1; min-width: 0; display: flex; justify-content: space-between; align-items: center; gap: 9px; padding: 10px; border: 0; border-radius: 0; background: transparent; text-align: left; }
+.activity-group-summary > button:first-child:hover { background: var(--surface-2); filter: none; }
+.activity-group-summary > button:first-child > span:first-child { min-width: 0; }
+.activity-group-summary > button:first-child strong, .activity-group-summary > button:first-child small { display: block; overflow: hidden; text-overflow: ellipsis; }
+.activity-group-summary > button:first-child small { margin-top: 3px; color: var(--muted); font-size: 10px; white-space: nowrap; }
+.retry-persona { flex: 0 0 auto; margin-right: 8px; }
 .batch-tabs { display: grid; gap: 3px; padding: 0 7px 7px; }
 .batch-tabs button { display: flex; justify-content: space-between; align-items: center; padding: 6px 7px; border-color: transparent; background: #080c12; color: var(--muted); font-size: 10px; }
 .batch-tabs button.active { border-color: #315f94; color: var(--text); background: #12243b; }

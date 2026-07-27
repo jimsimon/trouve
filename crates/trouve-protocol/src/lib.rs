@@ -105,7 +105,9 @@ pub use requests::*;
 // 1.11: code-review job details can omit large retained task content, which
 // is available on a new job-scoped task endpoint for lazy loading, and expose
 // the snapshot's event cursor so clients can skip redundant history (additive).
-pub const PROTOCOL_VERSION: &str = "1.11";
+// 1.12: failed code-review personas can be retried independently while
+// retaining successful reviewer task outputs (additive).
+pub const PROTOCOL_VERSION: &str = "1.12";
 
 pub type WorkspaceId = String;
 pub type SessionId = String;

@@ -1313,6 +1313,27 @@ impl Engine {
         Ok(replacement)
     }
 
+    pub async fn retry_review_persona(
+        self: &Arc<Self>,
+        id: &str,
+        reviewer_id: &str,
+    ) -> Result<trouve_protocol::CodeReviewJob, EngineError> {
+        // A terminal job normally has already cleaned up its disposable
+        // session. Retry cleanup once more here so a transient cleanup delay
+        // does not unnecessarily block a persona retry.
+        self.retry_code_review_cleanup().await;
+        let job = self
+            .store
+            .retry_code_review_persona(id, reviewer_id)
+            .map_err(|error| EngineError::BadRequest(error.to_string()))?
+            .ok_or_else(|| EngineError::NotFound(format!("review job {id}")))?;
+        self.emit_code_review_job_updated(id)?;
+        self.emit_code_review_updated(Some(id.to_owned()))?;
+        self.sync_code_review_projection(&job).await;
+        self.code_review.job_wake.notify_one();
+        Ok(job)
+    }
+
     pub async fn request_code_review(
         self: &Arc<Self>,
         request: trouve_protocol::RequestCodeReviewRequest,
@@ -2559,30 +2580,86 @@ impl Engine {
             record.reviewers.clone()
         };
         let reviewer_count = reviewers.len();
-        self.store
-            .set_code_review_job_progress(&job.id, 0, reviewer_count as u64)?;
+        let existing_tasks = self.store.latest_code_review_reviewer_tasks(&job.id)?;
+        let mut latest_tasks = HashMap::new();
+        for task in existing_tasks {
+            if task.role == trouve_protocol::CodeReviewTaskRole::Reviewer
+                && let Some(reviewer_id) = task.reviewer_id.clone()
+            {
+                latest_tasks.insert((reviewer_id, task.batch_index), task);
+            }
+        }
+        let completed_reviewers = self.store.completed_code_review_personas(&job.id)?;
+        self.store.set_code_review_job_progress(
+            &job.id,
+            completed_reviewers,
+            reviewer_count as u64,
+        )?;
         self.emit_code_review_progress(&job.id)?;
         let mut planned = Vec::new();
+        let mut task_results = Vec::new();
         // Interleave personas by batch so the first concurrency window makes
         // progress on every focused reviewer instead of serializing all
         // batches for the first persona.
         for (batch_index, batch) in batches.iter().cloned().enumerate() {
             for reviewer in &reviewers {
                 let applies = reviewer_applies_to_batch(&reviewer.id, &batch);
-                if !applies {
-                    planned.push((reviewer.clone(), batch_index, String::new(), false));
-                    continue;
+                let prompt = if applies {
+                    let mut execution_record = record.clone();
+                    execution_record.job = job.clone();
+                    reviewer_prompt(
+                        &execution_record,
+                        reviewer,
+                        &batch,
+                        batch_index,
+                        batches.len(),
+                    )
+                } else {
+                    String::new()
+                };
+                let existing = latest_tasks.remove(&(reviewer.id.clone(), batch_index as u64));
+                match existing {
+                    Some(task) if task.status == "queued" => {
+                        planned.push((reviewer.clone(), batch_index, prompt, applies, Some(task)));
+                    }
+                    Some(task) if task.status == "succeeded" => {
+                        let reused = parse_review_output(&task.output)
+                            .with_context(|| {
+                                format!(
+                                    "parsing retained output for reviewer {} batch {}",
+                                    reviewer.name,
+                                    batch_index + 1
+                                )
+                            })
+                            .map(|parsed| {
+                                parsed
+                                    .findings
+                                    .into_iter()
+                                    .enumerate()
+                                    .map(|(index, finding)| CandidateFinding {
+                                        candidate_id: format!("{}:{}", task.id, index + 1),
+                                        task_id: task.id.clone(),
+                                        reviewer_id: reviewer.id.clone(),
+                                        reviewer_name: reviewer.name.clone(),
+                                        finding,
+                                    })
+                                    .collect::<Vec<_>>()
+                            });
+                        task_results.push(reused);
+                    }
+                    Some(task) if task.status == "not_applicable" => {
+                        task_results.push(Ok(Vec::new()));
+                    }
+                    Some(task) => task_results.push(Err(anyhow!(
+                        "reviewer {} batch {} remains {}; retry that persona to continue",
+                        reviewer.name,
+                        batch_index + 1,
+                        task.status
+                    ))),
+                    None => {
+                        planned.push((reviewer.clone(), batch_index, prompt, applies, None));
+                    }
                 }
-                let mut execution_record = record.clone();
-                execution_record.job = job.clone();
-                let prompt = reviewer_prompt(
-                    &execution_record,
-                    reviewer,
-                    &batch,
-                    batch_index,
-                    batches.len(),
-                );
-                planned.push((reviewer.clone(), batch_index, prompt, true));
             }
         }
         self.store.set_code_review_job_phase_elapsed(
@@ -2595,8 +2672,8 @@ impl Engine {
             REVIEW_TASK_CONCURRENCY_ENV,
             DEFAULT_REVIEW_TASK_CONCURRENCY,
         );
-        let task_results = stream::iter(planned.into_iter().map(
-            |(reviewer, batch_index, prompt, applies)| {
+        let executed_results = stream::iter(planned.into_iter().map(
+            |(reviewer, batch_index, prompt, applies, existing_task)| {
                 let engine = self.clone();
                 let job = job.clone();
                 let session_id = session.id.clone();
@@ -2605,17 +2682,22 @@ impl Engine {
                 let batch_count = batches.len();
                 async move {
                     ensure_review_current(&superseded)?;
-                    let task = engine.store.create_code_review_task(&NewCodeReviewTask {
-                        job_id: job.id.clone(),
-                        role: trouve_protocol::CodeReviewTaskRole::Reviewer,
-                        reviewer_id: Some(reviewer.id.clone()),
-                        reviewer_name: reviewer.name.clone(),
-                        batch_index: batch_index as u64,
-                        batch_count: batch_count as u64,
-                        model: reviewer.model.clone().or_else(|| job.model.clone()),
-                        prompt: prompt.clone(),
-                    })?;
-                    engine.emit_code_review_task(&job.id, task.clone())?;
+                    let task = if let Some(task) = existing_task {
+                        task
+                    } else {
+                        let task = engine.store.create_code_review_task(&NewCodeReviewTask {
+                            job_id: job.id.clone(),
+                            role: trouve_protocol::CodeReviewTaskRole::Reviewer,
+                            reviewer_id: Some(reviewer.id.clone()),
+                            reviewer_name: reviewer.name.clone(),
+                            batch_index: batch_index as u64,
+                            batch_count: batch_count as u64,
+                            model: reviewer.model.clone().or_else(|| job.model.clone()),
+                            prompt: prompt.clone(),
+                        })?;
+                        engine.emit_code_review_task(&job.id, task.clone())?;
+                        task
+                    };
                     if !applies {
                         let skipped = engine
                             .store
@@ -2705,6 +2787,7 @@ impl Engine {
         .buffer_unordered(task_concurrency)
         .collect::<Vec<_>>()
         .await;
+        task_results.extend(executed_results);
         self.store.set_code_review_job_phase_elapsed(
             &job.id,
             CodeReviewJobPhase::Reviewers,
@@ -3304,7 +3387,8 @@ impl Engine {
             }
         };
         let check_summary = bounded_check_details(&check_summary);
-        let check_details = bounded_check_details(&render_check_details(&detail));
+        let latest_tasks = self.store.latest_code_review_reviewer_tasks(&job.id)?;
+        let check_details = bounded_check_details(&render_check_details(&detail, &latest_tasks));
         let mut check_body = serde_json::json!({
             "name": "trouve-code-review",
             "head_sha": job.head_sha,
@@ -3720,7 +3804,10 @@ fn lifecycle_comment_marker(job_id: &str) -> String {
     format!("<!-- trouve-code-review lifecycle job:{job_id} -->")
 }
 
-fn render_check_details(detail: &trouve_protocol::CodeReviewJobDetail) -> String {
+fn render_check_details(
+    detail: &trouve_protocol::CodeReviewJobDetail,
+    latest_reviewer_tasks: &[trouve_protocol::CodeReviewTask],
+) -> String {
     let job = &detail.job;
     let mut body = String::new();
     if !detail.summary.trim().is_empty() {
@@ -3772,6 +3859,12 @@ fn render_check_details(detail: &trouve_protocol::CodeReviewJobDetail) -> String
         .tasks
         .iter()
         .filter(|task| task.status == "failed" && !task.error.trim().is_empty())
+        .filter(|task| {
+            task.role != trouve_protocol::CodeReviewTaskRole::Reviewer
+                || latest_reviewer_tasks
+                    .iter()
+                    .any(|latest| latest.id == task.id)
+        })
         .collect::<Vec<_>>();
     if !failed_tasks.is_empty() {
         body.push_str("### Failed reviewer tasks\n\n");
@@ -4879,7 +4972,8 @@ mod tests {
             .unwrap();
 
         let detail = store.code_review_job_detail(&queued.id).unwrap().unwrap();
-        let running = render_check_details(&detail);
+        let latest_tasks = store.latest_code_review_reviewer_tasks(&queued.id).unwrap();
+        let running = render_check_details(&detail, &latest_tasks);
         assert!(running.contains("Reviewers are examining the current revision."));
         assert!(running.contains("### Reviewer status"));
         assert!(running.contains("Reliability & Error Handling"));
@@ -4902,12 +4996,23 @@ mod tests {
             .unwrap();
 
         let detail = store.code_review_job_detail(&queued.id).unwrap().unwrap();
-        let failed = render_check_details(&detail);
+        let latest_tasks = store.latest_code_review_reviewer_tasks(&queued.id).unwrap();
+        let failed = render_check_details(&detail, &latest_tasks);
         assert!(failed.contains("### Error"));
         assert!(failed.contains("reviewer output was invalid"));
         assert!(failed.contains("### Failed reviewer tasks"));
         assert!(failed.contains("review did not contain JSON<br>repair also failed"));
         assert!(!failed.trim().is_empty());
+
+        store
+            .retry_code_review_persona(&queued.id, "reliability")
+            .unwrap()
+            .unwrap();
+        let detail = store.code_review_job_detail(&queued.id).unwrap().unwrap();
+        let latest_tasks = store.latest_code_review_reviewer_tasks(&queued.id).unwrap();
+        let retried = render_check_details(&detail, &latest_tasks);
+        assert!(!retried.contains("### Failed reviewer tasks"));
+        assert!(!retried.contains("review did not contain JSON"));
     }
 
     #[test]
