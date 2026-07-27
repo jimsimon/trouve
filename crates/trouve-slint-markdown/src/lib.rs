@@ -115,6 +115,18 @@ fn split_fence(s: &str) -> Option<(usize, &str)> {
     (ticks >= 3 && !info.contains('`')).then(|| (ticks, info.trim()))
 }
 
+fn is_closing_fence(s: &str, ticks: usize) -> bool {
+    s.len() >= ticks && s.bytes().all(|byte| byte == b'`')
+}
+
+fn is_markdown_language(info: &str) -> bool {
+    matches!(
+        info.split_whitespace().next(),
+        Some(language) if language.eq_ignore_ascii_case("markdown")
+            || language.eq_ignore_ascii_case("md")
+    )
+}
+
 /// Heading level from a run of '#' followed by a space; #### and deeper
 /// render like ###.
 fn split_heading(s: &str) -> Option<(BlockKind, &str)> {
@@ -232,7 +244,12 @@ pub fn parse_blocks(text: &str) -> Vec<Block> {
     // Open fence: (fence length, language, content lines). The length
     // matters for nesting — a ```` fence can contain ``` fences as content
     // and only closes on a fence at least as long.
-    let mut code: Option<(usize, String, Vec<&str>)> = None;
+    // The final flag records a possible same-length nested fence in a
+    // markdown example. Models occasionally emit an outer ```markdown fence
+    // containing a ```text example instead of using a longer outer fence.
+    // That is invalid CommonMark, but when another outer closer follows we
+    // can recover the unambiguous intended structure.
+    let mut code: Option<(usize, String, Vec<&str>, bool)> = None;
     // True while the last block is a list item with no blank line after it
     // yet; indented lines then continue that item.
     let mut list_open = false;
@@ -246,18 +263,37 @@ pub fn parse_blocks(text: &str) -> Vec<Block> {
 
     let mut input = text.lines().peekable();
     while let Some(line) = input.next() {
-        if let Some((ticks, lang, lines)) = code.as_mut() {
+        if let Some((ticks, lang, lines, nested_opener)) = code.as_mut() {
             // Only a closing fence at least as long as the opener (and
             // nothing but backticks) ends the block; shorter fences are
             // content (raw-markdown examples).
             let trimmed = line.trim();
-            let closing = trimmed.len() >= *ticks && trimmed.bytes().all(|b| b == b'`');
+            let closing = is_closing_fence(trimmed, *ticks);
             if closing {
-                let mut block = Block::new(BlockKind::Code, lines.join("\n"));
-                block.language = std::mem::take(lang);
-                blocks.push(block);
-                code = None;
+                // Recover a same-length inner fence only when a later fence
+                // remains to close the outer markdown example. Without that
+                // lookahead, valid CommonMark keeps its standard meaning.
+                let closes_nested = *nested_opener
+                    && input
+                        .clone()
+                        .any(|candidate| is_closing_fence(candidate.trim(), *ticks));
+                if closes_nested {
+                    lines.push(line);
+                    *nested_opener = false;
+                } else {
+                    let mut block = Block::new(BlockKind::Code, lines.join("\n"));
+                    block.language = std::mem::take(lang);
+                    blocks.push(block);
+                    code = None;
+                }
             } else {
+                if is_markdown_language(lang)
+                    && split_fence(trimmed).is_some_and(|(inner_ticks, inner_info)| {
+                        inner_ticks == *ticks && !inner_info.is_empty()
+                    })
+                {
+                    *nested_opener = true;
+                }
                 lines.push(line);
             }
             continue;
@@ -289,7 +325,7 @@ pub fn parse_blocks(text: &str) -> Vec<Block> {
             list_open = false;
         } else if let Some((ticks, lang)) = split_fence(trimmed) {
             flush_paragraph(&mut blocks, &mut paragraph);
-            code = Some((ticks, lang.to_string(), Vec::new()));
+            code = Some((ticks, lang.to_string(), Vec::new(), false));
             list_open = false;
         } else if let Some((kind, h)) = split_heading(trimmed) {
             flush_paragraph(&mut blocks, &mut paragraph);
@@ -325,7 +361,7 @@ pub fn parse_blocks(text: &str) -> Vec<Block> {
         }
     }
     // An unterminated fence is still rendered as code (it is mid-stream).
-    if let Some((_, lang, lines)) = code {
+    if let Some((_, lang, lines, _)) = code {
         let mut block = Block::new(BlockKind::Code, lines.join("\n"));
         block.language = lang;
         blocks.push(block);
@@ -364,22 +400,36 @@ fn to_widget_block(b: &Block) -> MarkdownBlock {
 fn stable_prefix_len(text: &str) -> usize {
     let mut offset = 0;
     let mut stable = 0;
-    let mut code_ticks = None;
+    // (outer ticks, markdown example, possible same-length nested opener).
+    // Be conservative after a possible nested opener: the complete parser
+    // uses lookahead to disambiguate it, so freezing the first closer would
+    // make a later streamed outer closer impossible to recover.
+    let mut code = None;
 
     for raw_line in text.split_inclusive('\n') {
         offset += raw_line.len();
         let line = raw_line.strip_suffix('\n').unwrap_or(raw_line);
-        if let Some(ticks) = code_ticks {
+        if let Some((ticks, markdown_example, nested_opener)) = code.as_mut() {
             let trimmed = line.trim();
-            if trimmed.len() >= ticks && trimmed.bytes().all(|byte| byte == b'`') {
-                code_ticks = None;
+            if is_closing_fence(trimmed, *ticks) {
+                if *nested_opener {
+                    *nested_opener = false;
+                } else {
+                    code = None;
+                }
+            } else if *markdown_example
+                && split_fence(trimmed).is_some_and(|(inner_ticks, inner_info)| {
+                    inner_ticks == *ticks && !inner_info.is_empty()
+                })
+            {
+                *nested_opener = true;
             }
             continue;
         }
 
         let trimmed = line.trim_start();
-        if let Some((ticks, _)) = split_fence(trimmed) {
-            code_ticks = Some(ticks);
+        if let Some((ticks, info)) = split_fence(trimmed) {
+            code = Some((ticks, is_markdown_language(info), false));
         } else if trimmed.is_empty() {
             stable = offset;
         }
@@ -510,6 +560,46 @@ mod tests {
         );
         assert_eq!(blocks[1].text, "```rust\nfn main() {}\n```");
         assert_eq!(blocks[1].language, "markdown");
+    }
+
+    #[test]
+    fn recovers_same_length_nested_fence_in_markdown_examples() {
+        // Models sometimes forget to lengthen the outer fence when showing
+        // markdown that itself contains a fenced block. A later outer closer
+        // makes the intended structure unambiguous.
+        let markdown = "before\n\n```markdown\n\
+### Finding\n\n\
+<details>\n\
+<summary>Prompt</summary>\n\n\
+```text\n\
+Agent-ready prompt...\n\
+```\n\n\
+</details>\n\
+```\n\n\
+after";
+        let blocks = parse_blocks(markdown);
+        assert_eq!(
+            blocks.iter().map(|block| block.kind).collect::<Vec<_>>(),
+            vec![BlockKind::Paragraph, BlockKind::Code, BlockKind::Paragraph]
+        );
+        assert_eq!(blocks[1].language, "markdown");
+        assert_eq!(
+            blocks[1].text,
+            "### Finding\n\n<details>\n<summary>Prompt</summary>\n\n\
+```text\nAgent-ready prompt...\n```\n\n</details>"
+        );
+        assert_eq!(blocks[2].text, "after");
+    }
+
+    #[test]
+    fn same_length_fence_without_later_outer_closer_keeps_commonmark_meaning() {
+        let blocks = parse_blocks("```markdown\n```text\n```\nafter");
+        assert_eq!(
+            blocks.iter().map(|block| block.kind).collect::<Vec<_>>(),
+            vec![BlockKind::Code, BlockKind::Paragraph]
+        );
+        assert_eq!(blocks[0].text, "```text");
+        assert_eq!(blocks[1].text, "after");
     }
 
     #[test]
@@ -670,5 +760,22 @@ mod tests {
         streaming.push("more\n```\n\nlast");
         assert_eq!(streaming.blocks, parse_blocks(streaming.text()));
         assert!(streaming.stable_text_len > "first\n\nsecond\n\n".len());
+    }
+
+    #[test]
+    fn streaming_recovers_same_length_nested_markdown_fences() {
+        let full = "before\n\n```markdown\n### Finding\n\n```text\nprompt\n```\n\n</details>\n```\n\nafter";
+        let mut streaming = StreamingMarkdown::new();
+        let mut streamed_text = String::new();
+
+        for chunk in full.as_bytes().chunks(5) {
+            let chunk = std::str::from_utf8(chunk).unwrap_or("");
+            streamed_text.push_str(chunk);
+            streaming.push(chunk);
+            assert_eq!(streaming.blocks, parse_blocks(&streamed_text));
+        }
+
+        assert_eq!(streaming.blocks, parse_blocks(full));
+        assert!(streaming.stable_text_len > "before\n\n".len());
     }
 }
