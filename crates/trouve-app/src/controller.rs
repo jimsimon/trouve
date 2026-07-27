@@ -41,6 +41,8 @@ const SERVER_EVENT_FRESH_WINDOW: std::time::Duration = std::time::Duration::from
 /// A quiet period marks the end of a server-history burst when no fresh event
 /// arrives to provide a natural boundary.
 const SERVER_REPLAY_IDLE_FLUSH: std::time::Duration = std::time::Duration::from_millis(250);
+/// Session creation must not wait indefinitely for the optional title sidecar.
+const SESSION_TITLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
 
 /// During global history replay, only the newest state snapshot for each
 /// GitHub host matters. Lifecycle events are edge-triggered and stale ones are
@@ -3560,14 +3562,26 @@ impl Controller {
                     .get(selection.workspace_idx)
                     .context("no workspace selected")?
                     .clone();
-                let title = match self.client.generate_session_title(&prompt).await {
+                let generated_title = match tokio::time::timeout(
+                    SESSION_TITLE_TIMEOUT,
+                    self.client.generate_session_title(&prompt),
+                )
+                .await
+                {
+                    Ok(result) => result,
+                    Err(error) => Err(anyhow::anyhow!(
+                        "session title generation timed out: {error}"
+                    )),
+                };
+                let title = match generated_title {
                     Ok(generated) => generated.title,
                     Err(error) => {
                         tracing::warn!(
-                            "session title generation failed; creating session with raw prompt: \
+                            "session title generation failed; creating session with prompt \
+                             fallback: \
                              {error:#}"
                         );
-                        prompt.clone()
+                        session_title_fallback(&prompt)
                     }
                 };
                 let session = self
@@ -7341,6 +7355,17 @@ fn should_open_chat_at_tail(force_tail: bool, turn_running: bool, has_queue: boo
     force_tail || turn_running || has_queue
 }
 
+fn session_title_fallback(prompt: &str) -> String {
+    prompt
+        .trim()
+        .lines()
+        .next()
+        .unwrap_or("")
+        .chars()
+        .take(48)
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -7348,7 +7373,8 @@ mod tests {
         attention_badge, check_pill, classify_pr, download_progress,
         format_pr_dashboard_refresh_status, human_age, human_rate, merge_pill, model_health_view,
         pr_badge, project_session_prs, provider_login_requires_code, reconcile_pr_group_order,
-        reconcile_workspace_order, reorder_id, should_open_chat_at_tail, thinking_property,
+        reconcile_workspace_order, reorder_id, session_title_fallback, should_open_chat_at_tail,
+        thinking_property,
     };
     use chrono::{Duration, TimeZone, Utc};
     use trouve_protocol::{
@@ -7446,6 +7472,13 @@ mod tests {
         let changed2 = reconcile_workspace_order(&mut order2, &list);
         assert_eq!(order2, ["c", "a", "b", "d"]);
         assert!(!changed2); // No changes when order already matches
+    }
+
+    #[test]
+    fn session_title_fallback_uses_a_bounded_first_line() {
+        let first_line = "é".repeat(52);
+        let prompt = format!("  {first_line}\nignore this line");
+        assert_eq!(session_title_fallback(&prompt), "é".repeat(48));
     }
 
     #[test]
