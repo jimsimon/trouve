@@ -3616,23 +3616,13 @@ impl Controller {
             .and_then(|i| thinking_views.get(i))
             .map(|item| item.configured_index)
             .unwrap_or(-1);
+        let known = self.client.known_providers().await.unwrap_or_default();
         ui::set_settings_data(
             &self.ui,
-            providers
-                .providers
-                .into_iter()
-                .map(|p| {
-                    (
-                        p.id,
-                        p.kind,
-                        p.base_url.unwrap_or_default(),
-                        p.has_credentials,
-                        p.auth,
-                        p.category,
-                        p.experimental,
-                    )
-                })
-                .collect(),
+            ui::ProviderSettingsView {
+                configured: providers.providers.clone(),
+                known: known.clone(),
+            },
             model_ids.clone(),
             thinking_views,
             default_index,
@@ -3670,10 +3660,7 @@ impl Controller {
             })
             .collect();
         ui::set_settings_modes(&self.ui, mode_views, model_ids);
-        // Preset catalog is static server data; fetch alongside the rest.
-        if let Ok(known) = self.client.known_providers().await {
-            ui::set_known_providers(&self.ui, known);
-        }
+        ui::set_known_providers(&self.ui, known, providers.providers);
         self.refresh_clis().await;
         self.refresh_local();
     }

@@ -1293,8 +1293,8 @@ pub struct UpsertProviderRequest {
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub secret_values: std::collections::BTreeMap<String, String>,
     /// Additional HTTP header templates for compatible transports. Values
-    /// may reference `${API_KEY}`, settings, named secrets, or environment
-    /// variables.
+    /// may reference `${API_KEY}`, settings, named secrets, or
+    /// catalog-declared environment-backed settings.
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub headers: std::collections::BTreeMap<String, String>,
     /// Additional query-parameter templates, with the same expansion rules
@@ -1321,8 +1321,7 @@ pub struct SetDefaultPermissionModeRequest {
     pub permission_mode: PermissionMode,
 }
 
-/// A well-known provider preset: clients offer these for one-click setup
-/// instead of hand-typed base URLs.
+/// One configuration field advertised by a well-known provider preset.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct ProviderConfigField {
     /// Placeholder name used in templates and in `UpsertProviderRequest`.
@@ -1342,6 +1341,8 @@ pub struct ProviderConfigField {
     pub default_value: Option<String>,
 }
 
+/// A well-known provider preset: clients offer these for one-click setup
+/// instead of hand-typed base URLs.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct KnownProvider {
     /// Suggested provider id, e.g. "openrouter".

@@ -100,17 +100,17 @@ impl VertexProvider {
                     reasoning,
                 } => {
                     let mut parts = Vec::new();
-                    let mut replayed_calls = HashSet::new();
+                    let mut replayed_ids = HashSet::new();
+                    let mut replayed_names_without_id = HashSet::new();
                     for block in reasoning {
                         if block["transport"].as_str() == Some("google-vertex")
                             && let Some(part) = block.get("part")
                         {
                             if let Some(call) = part.get("functionCall") {
                                 if let Some(id) = call["id"].as_str() {
-                                    replayed_calls.insert(id.to_string());
-                                }
-                                if let Some(name) = call["name"].as_str() {
-                                    replayed_calls.insert(name.to_string());
+                                    replayed_ids.insert(id.to_string());
+                                } else if let Some(name) = call["name"].as_str() {
+                                    replayed_names_without_id.insert(name.to_string());
                                 }
                             }
                             parts.push(part.clone());
@@ -121,7 +121,8 @@ impl VertexProvider {
                     }
                     for call in tool_calls {
                         tool_names.insert(call.id.clone(), call.name.clone());
-                        if replayed_calls.contains(&call.id) || replayed_calls.contains(&call.name)
+                        if replayed_ids.contains(&call.id)
+                            || replayed_names_without_id.contains(&call.name)
                         {
                             continue;
                         }
@@ -428,5 +429,38 @@ mod tests {
                 .iter()
                 .all(|model| model.id.starts_with("google-vertex/gemini-"))
         );
+    }
+
+    #[test]
+    fn replayed_call_id_does_not_hide_parallel_call_with_same_name() {
+        let messages = [Message::Assistant {
+            content: String::new(),
+            reasoning: vec![json!({
+                "transport": "google-vertex",
+                "part": {
+                    "functionCall": {
+                        "id": "call-1",
+                        "name": "read",
+                        "args": {"path": "one"}
+                    }
+                }
+            })],
+            tool_calls: vec![
+                ToolCallRequest {
+                    id: "call-1".into(),
+                    name: "read".into(),
+                    arguments: json!({"path": "one"}),
+                },
+                ToolCallRequest {
+                    id: "call-2".into(),
+                    name: "read".into(),
+                    arguments: json!({"path": "two"}),
+                },
+            ],
+        }];
+        let (_, wire) = VertexProvider::wire_messages(&messages);
+        let parts = wire[0]["parts"].as_array().unwrap();
+        assert_eq!(parts.len(), 2);
+        assert_eq!(parts[1]["functionCall"]["id"], "call-2");
     }
 }

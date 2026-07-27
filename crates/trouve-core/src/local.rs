@@ -272,18 +272,20 @@ pub fn model_metadata(path: &Path) -> ModelMetadata {
 fn read_gguf_metadata(path: &Path) -> Result<ModelMetadata> {
     use std::io::{Read as _, Seek as _, SeekFrom};
 
-    fn bytes<const N: usize>(r: &mut std::fs::File) -> std::io::Result<[u8; N]> {
+    type Reader = std::io::BufReader<std::fs::File>;
+
+    fn bytes<const N: usize>(r: &mut Reader) -> std::io::Result<[u8; N]> {
         let mut bytes = [0; N];
         r.read_exact(&mut bytes)?;
         Ok(bytes)
     }
-    fn u32_le(r: &mut std::fs::File) -> std::io::Result<u32> {
+    fn u32_le(r: &mut Reader) -> std::io::Result<u32> {
         Ok(u32::from_le_bytes(bytes(r)?))
     }
-    fn u64_le(r: &mut std::fs::File) -> std::io::Result<u64> {
+    fn u64_le(r: &mut Reader) -> std::io::Result<u64> {
         Ok(u64::from_le_bytes(bytes(r)?))
     }
-    fn string(r: &mut std::fs::File, max: u64) -> Result<String> {
+    fn string(r: &mut Reader, max: u64) -> Result<String> {
         let len = u64_le(r)?;
         if len > max {
             bail!("GGUF string length {len} exceeds metadata limit {max}");
@@ -292,19 +294,21 @@ fn read_gguf_metadata(path: &Path) -> Result<ModelMetadata> {
         r.read_exact(&mut value)?;
         String::from_utf8(value).context("GGUF metadata string is not UTF-8")
     }
-    fn skip(r: &mut std::fs::File, value_type: u32, depth: u8) -> Result<()> {
-        if depth > 4 {
-            bail!("nested GGUF metadata arrays are too deep");
-        }
-        let width = match value_type {
+    fn scalar_width(value_type: u32) -> Option<u64> {
+        match value_type {
             0 | 1 | 7 => Some(1),
             2 | 3 => Some(2),
             4..=6 => Some(4),
             10..=12 => Some(8),
             _ => None,
-        };
-        if let Some(width) = width {
-            r.seek(SeekFrom::Current(width))?;
+        }
+    }
+    fn skip(r: &mut Reader, value_type: u32, depth: u8) -> Result<()> {
+        if depth > 4 {
+            bail!("nested GGUF metadata arrays are too deep");
+        }
+        if let Some(width) = scalar_width(value_type) {
+            r.seek(SeekFrom::Current(i64::try_from(width)?))?;
             return Ok(());
         }
         match value_type {
@@ -319,6 +323,13 @@ fn read_gguf_metadata(path: &Path) -> Result<ModelMetadata> {
                 if count > 100_000_000 {
                     bail!("implausible GGUF metadata array length {count}");
                 }
+                if let Some(width) = scalar_width(element_type) {
+                    let bytes = width
+                        .checked_mul(count)
+                        .ok_or_else(|| anyhow::anyhow!("GGUF metadata array size overflow"))?;
+                    r.seek(SeekFrom::Current(i64::try_from(bytes)?))?;
+                    return Ok(());
+                }
                 for _ in 0..count {
                     skip(r, element_type, depth + 1)?;
                 }
@@ -327,7 +338,7 @@ fn read_gguf_metadata(path: &Path) -> Result<ModelMetadata> {
             other => bail!("unknown GGUF metadata value type {other}"),
         }
     }
-    fn positive_integer(r: &mut std::fs::File, value_type: u32) -> Result<Option<u64>> {
+    fn positive_integer(r: &mut Reader, value_type: u32) -> Result<Option<u64>> {
         let value = match value_type {
             0 => u64::from(bytes::<1>(r)?[0]),
             1 => i8::from_le_bytes(bytes(r)?).try_into().unwrap_or(0),
@@ -345,7 +356,7 @@ fn read_gguf_metadata(path: &Path) -> Result<ModelMetadata> {
         Ok((value > 0).then_some(value))
     }
 
-    let mut file = std::fs::File::open(path)?;
+    let mut file = std::io::BufReader::new(std::fs::File::open(path)?);
     if &bytes::<4>(&mut file)? != b"GGUF" {
         bail!("not a GGUF file");
     }
@@ -760,6 +771,8 @@ pub struct LlamaManager {
     pids: PathBuf,
     /// Effective context reported by `/props` for models loaded this run.
     effective_contexts: std::sync::Mutex<std::collections::HashMap<String, u64>>,
+    /// Hardware probe shared by local model launches.
+    hardware: std::sync::OnceLock<Hardware>,
 }
 
 impl LlamaManager {
@@ -774,6 +787,7 @@ impl LlamaManager {
             state: std::sync::Mutex::new(ServerState::Stopped),
             pids,
             effective_contexts: std::sync::Mutex::new(std::collections::HashMap::new()),
+            hardware: std::sync::OnceLock::new(),
         }
     }
 
@@ -902,6 +916,12 @@ impl LlamaManager {
         gguf: &Path,
         log_path: &Path,
     ) -> Result<(u16, tokio::process::Child, u64)> {
+        let native_context = model_metadata(gguf).context_window;
+        let model_size = std::fs::metadata(gguf)
+            .map(|metadata| metadata.len())
+            .unwrap_or(0);
+        let hardware = self.hardware.get_or_init(probe_hardware);
+        let requested_context = launch_context(native_context, model_size, hardware);
         let port = free_port()?;
         let log = std::fs::File::create(log_path)
             .with_context(|| format!("creating {}", log_path.display()))?;
@@ -911,10 +931,11 @@ impl LlamaManager {
             .arg(gguf)
             .args(["--host", "127.0.0.1", "--port"])
             .arg(port.to_string())
-            // Zero asks llama.cpp to load the native context length embedded
-            // in the GGUF instead of imposing a trouve-wide fixed window.
+            // Loading a model's full native 128k–1M context can exhaust the
+            // machine's KV-cache budget. Clamp it to a conservative estimate
+            // derived from the memory left after loading the weights.
             .arg("-c")
-            .arg("0")
+            .arg(requested_context.to_string())
             // No -ngl: llama.cpp then auto-fits n_gpu_layers to *free* VRAM,
             // spilling gracefully to CPU instead of into GTT/system memory
             // over PCIe (forcing 999 disables the fit and runs at ~5 tok/s
@@ -979,6 +1000,7 @@ impl LlamaManager {
 
         let context_window = http
             .get(format!("http://127.0.0.1:{port}/props"))
+            .timeout(std::time::Duration::from_secs(10))
             .send()
             .await
             .ok()
@@ -1004,6 +1026,37 @@ impl LlamaManager {
 fn free_port() -> Result<u16> {
     let listener = std::net::TcpListener::bind(("127.0.0.1", 0))?;
     Ok(listener.local_addr()?.port())
+}
+
+/// Conservative context ceiling from the memory left after model weights.
+/// A 128 KiB/token KV estimate covers common 7B–70B GQA architectures; the
+/// native GGUF value remains the hard upper bound.
+fn launch_context(native_context: u64, model_size: u64, hardware: &Hardware) -> u64 {
+    const KV_BYTES_PER_TOKEN: u64 = 128 * 1024;
+    const FALLBACK_CONTEXT: u64 = 8 * 1024;
+    const MIN_CONTEXT: u64 = 512;
+
+    let weights = model_size.saturating_add(model_size / 7);
+    let gpu_budget = hardware
+        .gpus
+        .iter()
+        .map(|gpu| gpu.vram_bytes)
+        .filter(|budget| *budget > weights)
+        .max();
+    let cpu_budget =
+        (hardware.ram_bytes * 85 / 100 > weights).then_some(hardware.ram_bytes * 85 / 100);
+    let ceiling = gpu_budget
+        .or(cpu_budget)
+        .map(|budget| budget.saturating_sub(weights) / KV_BYTES_PER_TOKEN)
+        .filter(|tokens| *tokens > 0)
+        .unwrap_or(FALLBACK_CONTEXT)
+        .max(MIN_CONTEXT);
+
+    if native_context > 0 {
+        native_context.min(ceiling)
+    } else {
+        ceiling
+    }
 }
 
 fn log_tail(path: &Path) -> String {
@@ -1221,6 +1274,18 @@ mod tests {
         };
         assert_eq!(fit(2_100_000_000, &cpu_only), "cpu");
         assert_eq!(fit(12_000_000_000, &cpu_only), "too-large");
+    }
+
+    #[test]
+    fn launch_context_respects_native_and_memory_limits() {
+        let hw = Hardware {
+            ram_bytes: 16 * 1024 * 1024 * 1024,
+            gpus: Vec::new(),
+        };
+        let model_size = 8 * 1024 * 1024 * 1024;
+        let ceiling = launch_context(1_000_000, model_size, &hw);
+        assert!(ceiling < 1_000_000);
+        assert_eq!(launch_context(4_096, model_size, &hw), 4_096);
     }
 
     #[test]

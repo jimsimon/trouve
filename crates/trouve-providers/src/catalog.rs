@@ -38,8 +38,8 @@ pub fn known_providers(models_dev: &crate::models_dev::ModelsDevCatalog) -> Vec<
         }
     }
 
-    let mut providers = models_dev.provider_presets();
-    providers.extend([
+    let providers = models_dev.provider_presets();
+    let trouve_integrations = [
         // Kimi Code is billed as a subscription even though it authenticates
         // with an API-key-shaped token.
         p(
@@ -93,7 +93,21 @@ pub fn known_providers(models_dev: &crate::models_dev::ModelsDevCatalog) -> Vec<
             None,
             "cli",
         ),
-    ]);
+    ];
+    merge_provider_presets(providers, trouve_integrations)
+}
+
+fn merge_provider_presets(
+    mut providers: Vec<KnownProvider>,
+    trouve_integrations: impl IntoIterator<Item = KnownProvider>,
+) -> Vec<KnownProvider> {
+    let trouve_integrations: Vec<_> = trouve_integrations.into_iter().collect();
+    let explicit_ids: std::collections::HashSet<_> = trouve_integrations
+        .iter()
+        .map(|provider| provider.id.as_str())
+        .collect();
+    providers.retain(|provider| !explicit_ids.contains(provider.id.as_str()));
+    providers.extend(trouve_integrations);
     providers
 }
 
@@ -186,6 +200,31 @@ mod tests {
         assert!(ids.contains("codex"));
         assert!(ids.contains("claude-code"));
         assert!(!ids.contains("codex-api"));
+    }
+
+    #[test]
+    fn trouve_integrations_replace_catalog_entries_with_the_same_id() {
+        let catalog_entry = KnownProvider {
+            id: "collision".into(),
+            display_name: "Catalog".into(),
+            kind: "openai-compat".into(),
+            base_url: Some("https://catalog.example".into()),
+            api_key_env: None,
+            config_fields: Vec::new(),
+            headers: Default::default(),
+            query_params: Default::default(),
+            auth: "api-key".into(),
+            category: "api".into(),
+            experimental: false,
+        };
+        let explicit = KnownProvider {
+            display_name: "Trouve".into(),
+            base_url: Some("https://trouve.example".into()),
+            ..catalog_entry.clone()
+        };
+        let merged = merge_provider_presets(vec![catalog_entry], [explicit]);
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].display_name, "Trouve");
     }
 
     #[test]

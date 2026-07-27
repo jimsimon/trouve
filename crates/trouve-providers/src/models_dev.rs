@@ -13,6 +13,7 @@ use std::sync::RwLock;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
+use futures::StreamExt as _;
 use reqwest::header::{ETAG, IF_NONE_MATCH};
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{Map, Value, json};
@@ -261,13 +262,27 @@ impl ModelsDevCatalog {
             .get(ETAG)
             .and_then(|value| value.to_str().ok())
             .map(String::from);
-        let text = response
-            .text()
-            .await
-            .context("reading models.dev catalog")?;
-        if text.len() > 16 * 1024 * 1024 {
+        const MAX_CATALOG_BYTES: usize = 16 * 1024 * 1024;
+        if response
+            .content_length()
+            .is_some_and(|length| length > MAX_CATALOG_BYTES as u64)
+        {
             bail!("models.dev catalog exceeds the 16 MiB safety limit");
         }
+        let mut body = Vec::new();
+        let mut stream = response.bytes_stream();
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.context("reading models.dev catalog")?;
+            if body
+                .len()
+                .checked_add(chunk.len())
+                .is_none_or(|length| length > MAX_CATALOG_BYTES)
+            {
+                bail!("models.dev catalog exceeds the 16 MiB safety limit");
+            }
+            body.extend_from_slice(&chunk);
+        }
+        let text = String::from_utf8(body).context("reading models.dev catalog")?;
         let catalog = parse_catalog(&text)?;
         validate_catalog(&catalog)?;
         let cache = DiskCache {

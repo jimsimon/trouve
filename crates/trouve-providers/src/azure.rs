@@ -39,6 +39,24 @@ impl AzureOpenAiProvider {
             id,
         }
     }
+
+    fn compatible_models(
+        &self,
+        models: Vec<trouve_protocol::ModelInfo>,
+    ) -> Vec<trouve_protocol::ModelInfo> {
+        let prefix = format!("{}/", self.id);
+        models
+            .into_iter()
+            // Azure-hosted Claude deployments use the Anthropic Messages
+            // transport, not this OpenAI v1 transport.
+            .filter(|model| {
+                !model
+                    .id
+                    .strip_prefix(&prefix)
+                    .is_some_and(|id| id.starts_with("claude-"))
+            })
+            .collect()
+    }
 }
 
 #[async_trait::async_trait]
@@ -48,25 +66,12 @@ impl Provider for AzureOpenAiProvider {
     }
 
     fn models(&self) -> Vec<trouve_protocol::ModelInfo> {
-        let prefix = format!("{}/", self.id);
-        self.inner
-            .models()
-            .into_iter()
-            // Azure-hosted Claude deployments use the Anthropic Messages
-            // transport, not this OpenAI v1 transport. Live `/models`
-            // results remain authoritative and are not filtered because
-            // deployment names are user-defined.
-            .filter(|model| {
-                !model
-                    .id
-                    .strip_prefix(&prefix)
-                    .is_some_and(|id| id.starts_with("claude-"))
-            })
-            .collect()
+        self.compatible_models(self.inner.models())
     }
 
     async fn list_models(&self) -> Vec<trouve_protocol::ModelInfo> {
-        self.inner.list_models().await
+        let models = self.inner.list_models().await;
+        self.compatible_models(models)
     }
 
     async fn stream_chat(
@@ -99,6 +104,22 @@ mod tests {
             Default::default(),
         );
         let models = provider.models();
+        assert!(!models.is_empty());
+        assert!(!models.iter().any(|model| model.id.contains("/claude-")));
+    }
+
+    #[tokio::test]
+    async fn failed_live_listing_keeps_the_filtered_fallback() {
+        let provider = AzureOpenAiProvider::new(
+            "azure",
+            "http://127.0.0.1:9",
+            Arc::new(StaticToken("test".into())),
+            Arc::new(ModelsDevCatalog::embedded()),
+            "azure",
+            Default::default(),
+            Default::default(),
+        );
+        let models = provider.list_models().await;
         assert!(!models.is_empty());
         assert!(!models.iter().any(|model| model.id.contains("/claude-")));
     }

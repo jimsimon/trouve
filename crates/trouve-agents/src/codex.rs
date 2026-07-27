@@ -286,6 +286,9 @@ impl AgentBackend for CodexBackend {
             "sandboxPolicy": sandbox_policy,
             "input": input,
         });
+        if !model_name.is_empty() {
+            turn_params["model"] = json!(model_name);
+        }
         apply_reasoning_options(&mut turn_params, effort);
         server.request("turn/start", turn_params).await?;
 

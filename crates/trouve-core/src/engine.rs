@@ -372,6 +372,9 @@ pub struct Engine {
     local_downloads: Mutex<HashMap<String, LocalDownloadState>>,
     /// RAM/VRAM probe, run once on first use.
     hardware: std::sync::OnceLock<crate::local::Hardware>,
+    /// Models already reported as lacking a context window. Missing metadata
+    /// disables automatic compaction, but should not spam every turn.
+    compaction_warnings: Mutex<std::collections::HashSet<String>>,
     /// Latest-version lookups, cached per CLI (network is best-effort).
     cli_latest: Mutex<HashMap<String, (std::time::Instant, Option<String>)>>,
     /// This server's reachable base URL (e.g. "http://127.0.0.1:7433"), set
@@ -697,6 +700,7 @@ impl Engine {
             local_provider,
             local_downloads: Mutex::new(HashMap::new()),
             hardware: std::sync::OnceLock::new(),
+            compaction_warnings: Mutex::new(std::collections::HashSet::new()),
             cli_latest: Mutex::new(HashMap::new()),
             base_url: RwLock::new(None),
             bridge_token: RwLock::new(None),
@@ -1130,16 +1134,16 @@ impl Engine {
                 if entry.base_url.is_none() {
                     entry.base_url = preset.base_url;
                 }
-                entry.headers = if req.headers.is_empty() {
-                    preset.headers
-                } else {
-                    req.headers.clone()
-                };
-                entry.query_params = if req.query_params.is_empty() {
-                    preset.query_params
-                } else {
-                    req.query_params.clone()
-                };
+                if !req.headers.is_empty() {
+                    entry.headers = req.headers.clone();
+                } else if entry.headers.is_empty() {
+                    entry.headers = preset.headers;
+                }
+                if !req.query_params.is_empty() {
+                    entry.query_params = req.query_params.clone();
+                } else if entry.query_params.is_empty() {
+                    entry.query_params = preset.query_params;
+                }
             } else {
                 if !req.headers.is_empty() {
                     entry.headers = req.headers.clone();
@@ -4824,6 +4828,24 @@ impl Engine {
             .find(|m| m.id == thread.model)
             .cloned();
         let mut usage_total = Usage::default();
+        let mut accumulate_usage = |usage: &Usage| {
+            let cost = usage.cost_usd.or_else(|| {
+                pricing_model.as_ref().and_then(|model| {
+                    self.model_catalog.cost_usd(
+                        model,
+                        usage.input_tokens,
+                        usage.cached_input_tokens,
+                        usage.output_tokens,
+                    )
+                })
+            });
+            usage_total.input_tokens += usage.input_tokens;
+            usage_total.output_tokens += usage.output_tokens;
+            usage_total.cached_input_tokens += usage.cached_input_tokens;
+            if let Some(cost) = cost {
+                usage_total.cost_usd = Some(usage_total.cost_usd.unwrap_or(0.0) + cost);
+            }
+        };
         // The last request's input size — the context-size proxy for
         // compaction. Summing per-iteration inputs (usage_total) would
         // over-count a multi-tool turn many-fold; the final request carries
@@ -4889,22 +4911,7 @@ impl Engine {
                     ProviderEvent::Reasoning(block) => reasoning.push(block),
                     ProviderEvent::ToolCall(call) => tool_calls.push(call),
                     ProviderEvent::Completed { usage } => {
-                        let cost = usage.cost_usd.or_else(|| {
-                            pricing_model.as_ref().and_then(|model| {
-                                self.model_catalog.cost_usd(
-                                    model,
-                                    usage.input_tokens,
-                                    usage.cached_input_tokens,
-                                    usage.output_tokens,
-                                )
-                            })
-                        });
-                        usage_total.input_tokens += usage.input_tokens;
-                        usage_total.output_tokens += usage.output_tokens;
-                        usage_total.cached_input_tokens += usage.cached_input_tokens;
-                        if let Some(cost) = cost {
-                            usage_total.cost_usd = Some(usage_total.cost_usd.unwrap_or(0.0) + cost);
-                        }
+                        accumulate_usage(&usage);
                         context_input_tokens = usage.input_tokens + usage.cached_input_tokens;
                     }
                 }
@@ -5026,23 +5033,7 @@ impl Engine {
                             }
                             Ok(ProviderEvent::Reasoning(block)) => final_reasoning.push(block),
                             Ok(ProviderEvent::Completed { usage }) => {
-                                let cost = usage.cost_usd.or_else(|| {
-                                    pricing_model.as_ref().and_then(|model| {
-                                        self.model_catalog.cost_usd(
-                                            model,
-                                            usage.input_tokens,
-                                            usage.cached_input_tokens,
-                                            usage.output_tokens,
-                                        )
-                                    })
-                                });
-                                usage_total.input_tokens += usage.input_tokens;
-                                usage_total.output_tokens += usage.output_tokens;
-                                usage_total.cached_input_tokens += usage.cached_input_tokens;
-                                if let Some(cost) = cost {
-                                    usage_total.cost_usd =
-                                        Some(usage_total.cost_usd.unwrap_or(0.0) + cost);
-                                }
+                                accumulate_usage(&usage);
                                 context_input_tokens =
                                     usage.input_tokens + usage.cached_input_tokens;
                             }
@@ -6129,10 +6120,17 @@ impl Engine {
             .map(|m| m.context_window)
             .filter(|w| *w > 0)
         else {
-            tracing::debug!(
-                model = %thread.model,
-                "automatic compaction disabled: provider did not report a context window"
-            );
+            if self
+                .compaction_warnings
+                .lock()
+                .unwrap()
+                .insert(thread.model.clone())
+            {
+                tracing::warn!(
+                    model = %thread.model,
+                    "automatic compaction disabled for this model: provider did not report a context window"
+                );
+            }
             return Ok(());
         };
         let payloads = self.store.messages(&thread.id)?;
@@ -8115,7 +8113,6 @@ fn expand_provider_template(
         let value = values
             .get(name)
             .cloned()
-            .or_else(|| std::env::var(name).ok())
             .filter(|value| !value.is_empty())
             .ok_or_else(|| anyhow::anyhow!("missing provider setting {name}"))?;
         output.push_str(&value);
@@ -8958,5 +8955,54 @@ mod tests {
         );
         assert!(expand_provider_template("${MISSING}", &values).is_err());
         assert!(expand_provider_template("${BAD-NAME}", &values).is_err());
+
+        // Only catalog-declared env fallbacks are copied into `values`;
+        // arbitrary process environment variables are never template input.
+        const ENV_ONLY: &str = "TROUVE_PROVIDER_TEMPLATE_ENV_ONLY_TEST";
+        // Safety: this test owns a unique process variable name.
+        unsafe { std::env::set_var(ENV_ONLY, "must-not-expand") };
+        assert!(
+            expand_provider_template("${TROUVE_PROVIDER_TEMPLATE_ENV_ONLY_TEST}", &values).is_err()
+        );
+        // Safety: restore the unique test variable.
+        unsafe { std::env::remove_var(ENV_ONLY) };
+    }
+
+    #[test]
+    fn preset_upsert_preserves_existing_transport_templates_when_omitted() {
+        let data = tempfile::tempdir().unwrap();
+        let custom_headers =
+            std::collections::BTreeMap::from([("x-custom".into(), "${RESOURCE}".into())]);
+        let custom_query =
+            std::collections::BTreeMap::from([("custom".into(), "${DEPLOYMENT}".into())]);
+        let mut config = Config::default();
+        config.providers.insert(
+            "azure".into(),
+            crate::config::ProviderConfig {
+                kind: "azure-openai".into(),
+                headers: custom_headers.clone(),
+                query_params: custom_query.clone(),
+                ..Default::default()
+            },
+        );
+        let engine = Engine::new(
+            Store::open_in_memory().unwrap(),
+            data.path().to_path_buf(),
+            &config,
+        );
+        engine
+            .upsert_provider(
+                "azure",
+                &UpsertProviderRequest {
+                    kind: "azure-openai".into(),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+
+        let config = engine.config.lock().unwrap();
+        let provider = config.providers.get("azure").unwrap();
+        assert_eq!(provider.headers, custom_headers);
+        assert_eq!(provider.query_params, custom_query);
     }
 }

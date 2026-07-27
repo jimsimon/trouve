@@ -35,7 +35,7 @@ pub struct AnthropicProvider {
     models_cache: tokio::sync::Mutex<Option<(std::time::Instant, Vec<trouve_protocol::ModelInfo>)>>,
     /// Model-specific maximum output from the same API. ModelInfo does not
     /// expose output limits, but Messages requires us to send max_tokens.
-    output_limits: tokio::sync::Mutex<HashMap<String, u64>>,
+    output_limits: tokio::sync::Mutex<HashMap<String, Option<u64>>>,
 }
 
 /// How long a fetched model list stays fresh.
@@ -144,7 +144,11 @@ impl AnthropicProvider {
             .map_err(|e| ProviderError::Request(e.to_string()))?;
         let limits = parse_output_limits(&body);
         if !limits.is_empty() {
-            self.output_limits.lock().await.extend(limits);
+            self.output_limits.lock().await.extend(
+                limits
+                    .into_iter()
+                    .map(|(model, limit)| (model, Some(limit))),
+            );
         }
         let catalog_provider = self.catalog_provider_id();
         Ok(parse_model_list(
@@ -160,7 +164,7 @@ impl AnthropicProvider {
     /// retrieves just the selected model.
     async fn output_limit(&self, model: &str, key: &str) -> Option<u64> {
         if let Some(limit) = self.output_limits.lock().await.get(model).copied() {
-            return Some(limit);
+            return limit;
         }
         let fetched = async {
             if self.vertex_bearer {
@@ -184,12 +188,12 @@ impl AnthropicProvider {
         let limit = fetched.or_else(|| {
             self.catalog_provider_id()
                 .and_then(|provider| self.catalog.output_limit(&provider, model))
-        })?;
+        });
         self.output_limits
             .lock()
             .await
             .insert(model.to_string(), limit);
-        Some(limit)
+        limit
     }
 
     pub fn with_oauth_bearer(mut self) -> Self {

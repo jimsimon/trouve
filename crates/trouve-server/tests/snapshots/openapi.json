@@ -6596,6 +6596,7 @@
       },
       "KnownProvider": {
         "type": "object",
+        "description": "A well-known provider preset: clients offer these for one-click setup\ninstead of hand-typed base URLs.",
         "required": [
           "id",
           "display_name",
@@ -7264,7 +7265,7 @@
       },
       "ProviderConfigField": {
         "type": "object",
-        "description": "A well-known provider preset: clients offer these for one-click setup\ninstead of hand-typed base URLs.",
+        "description": "One configuration field advertised by a well-known provider preset.",
         "required": [
           "id",
           "label"
@@ -8358,7 +8359,7 @@
           },
           "headers": {
             "type": "object",
-            "description": "Additional HTTP header templates for compatible transports. Values\nmay reference `${API_KEY}`, settings, named secrets, or environment\nvariables.",
+            "description": "Additional HTTP header templates for compatible transports. Values\nmay reference `${API_KEY}`, settings, named secrets, or\ncatalog-declared environment-backed settings.",
             "additionalProperties": {
               "type": "string"
             },

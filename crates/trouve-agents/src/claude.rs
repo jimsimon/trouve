@@ -1044,7 +1044,7 @@ mod tests {
         let catalog = trouve_providers::models_dev::ModelsDevCatalog::embedded();
         configure_thinking(
             &mut cmd,
-            &turn("claude-fable-5", "effort", "xhigh"),
+            &turn("claude-fable-5", "thinking_level", "xhigh"),
             &catalog,
         );
         let args: Vec<String> = cmd

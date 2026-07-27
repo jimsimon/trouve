@@ -65,7 +65,7 @@ impl BedrockProvider {
         messages: &[Message],
     ) -> Result<(Vec<aws::SystemContentBlock>, Vec<aws::Message>), ProviderError> {
         let mut system = Vec::new();
-        let mut wire = Vec::new();
+        let mut turns: Vec<(aws::ConversationRole, Vec<aws::ContentBlock>)> = Vec::new();
         for message in messages {
             let (role, blocks) = match message {
                 Message::System(text) => {
@@ -141,14 +141,24 @@ impl BedrockProvider {
             if blocks.is_empty() {
                 continue;
             }
-            wire.push(
+            if let Some((previous_role, previous_blocks)) = turns.last_mut()
+                && *previous_role == role
+            {
+                previous_blocks.extend(blocks);
+            } else {
+                turns.push((role, blocks));
+            }
+        }
+        let wire = turns
+            .into_iter()
+            .map(|(role, blocks)| {
                 aws::Message::builder()
                     .role(role)
                     .set_content(Some(blocks))
                     .build()
-                    .map_err(build_error)?,
-            );
-        }
+                    .map_err(build_error)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
         Ok((system, wire))
     }
 
@@ -500,6 +510,25 @@ mod tests {
             redacted: Vec::new(),
         });
         assert!(replay_reasoning(&value).unwrap().is_some());
+    }
+
+    #[test]
+    fn adjacent_tool_results_share_one_user_turn() {
+        let messages = vec![
+            Message::ToolResult {
+                call_id: "first".into(),
+                content: "one".into(),
+                images: Vec::new(),
+            },
+            Message::ToolResult {
+                call_id: "second".into(),
+                content: "two".into(),
+                images: Vec::new(),
+            },
+        ];
+        let (_, wire) = BedrockProvider::wire_messages(&messages).unwrap();
+        assert_eq!(wire.len(), 1);
+        assert_eq!(wire[0].content().len(), 2);
     }
 
     #[test]

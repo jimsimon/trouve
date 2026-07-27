@@ -494,18 +494,18 @@ impl Provider for OpenAiCompatProvider {
     }
 
     async fn list_models(&self) -> Vec<trouve_protocol::ModelInfo> {
-        let stale = {
-            let cache = self.models_cache.lock().await;
-            if let Some((at, models)) = cache.as_ref()
-                && at.elapsed() < MODELS_TTL
-            {
-                return models.clone();
-            }
-            cache.as_ref().map(|(_, models)| models.clone())
-        };
+        // Keep the lock through the refresh so concurrent callers share one
+        // network request instead of stampeding an endpoint as the TTL turns.
+        let mut cache = self.models_cache.lock().await;
+        if let Some((at, models)) = cache.as_ref()
+            && at.elapsed() < MODELS_TTL
+        {
+            return models.clone();
+        }
+        let stale = cache.as_ref().map(|(_, models)| models.clone());
         match self.fetch_models().await {
             Ok(models) if !models.is_empty() => {
-                *self.models_cache.lock().await = Some((std::time::Instant::now(), models.clone()));
+                *cache = Some((std::time::Instant::now(), models.clone()));
                 models
             }
             Ok(_) => stale.unwrap_or_else(|| self.models()),

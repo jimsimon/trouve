@@ -52,10 +52,20 @@ def main() -> None:
         }
         snapshot[provider_id]["models"] = models
 
-    DESTINATION.write_text(
-        json.dumps(snapshot, ensure_ascii=False, separators=(",", ":")) + "\n",
+    total_models = sum(len(provider["models"]) for provider in snapshot.values())
+    if not snapshot or total_models == 0:
+        raise SystemExit(
+            f"refusing to write an empty snapshot: {len(snapshot)} providers, "
+            f"{total_models} models"
+        )
+
+    serialized = json.dumps(snapshot, ensure_ascii=False, separators=(",", ":")) + "\n"
+    temporary = DESTINATION.with_suffix(".json.tmp")
+    temporary.write_text(
+        serialized,
         encoding="utf-8",
     )
+    temporary.replace(DESTINATION)
     print(f"updated {DESTINATION.relative_to(ROOT)} from {SOURCE}")
 
 

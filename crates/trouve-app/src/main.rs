@@ -944,23 +944,42 @@ fn main() -> anyhow::Result<()> {
     // --- settings screen callbacks -------------------------------------------
     let provider_fields = std::rc::Rc::new(std::cell::RefCell::new(std::collections::BTreeMap::<
         String,
-        (String, bool),
+        (String, bool, bool, bool),
     >::new()));
     {
         let provider_fields = provider_fields.clone();
         window.on_provider_field_changed(move |id, value, secret| {
             let value = value.to_string();
             let mut fields = provider_fields.borrow_mut();
-            if value.is_empty() {
-                fields.remove(id.as_str());
-            } else {
-                fields.insert(id.to_string(), (value, secret));
+            if let Some(field) = fields.get_mut(id.as_str()) {
+                field.0 = value;
+                field.1 = secret;
             }
+            fields
+                .values()
+                .all(|(value, _, required, saved)| !required || !value.is_empty() || *saved)
         });
     }
     {
         let provider_fields = provider_fields.clone();
-        window.on_provider_fields_reset(move || provider_fields.borrow_mut().clear());
+        window.on_provider_fields_reset(move |items| {
+            let mut fields = provider_fields.borrow_mut();
+            fields.clear();
+            for item in items.iter() {
+                fields.insert(
+                    item.id.to_string(),
+                    (
+                        item.value.to_string(),
+                        item.secret,
+                        item.required,
+                        item.has_saved_value,
+                    ),
+                );
+            }
+            fields
+                .values()
+                .all(|(value, _, required, saved)| !required || !value.is_empty() || *saved)
+        });
     }
     {
         let tx = tx.clone();
@@ -969,9 +988,11 @@ fn main() -> anyhow::Result<()> {
             let fields = std::mem::take(&mut *provider_fields.borrow_mut());
             let mut settings = std::collections::BTreeMap::new();
             let mut secret_values = std::collections::BTreeMap::new();
-            for (name, (value, secret)) in fields {
+            for (name, (value, secret, _, _)) in fields {
                 if secret {
-                    secret_values.insert(name, value);
+                    if !value.is_empty() {
+                        secret_values.insert(name, value);
+                    }
                 } else {
                     settings.insert(name, value);
                 }
