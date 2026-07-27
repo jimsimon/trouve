@@ -2809,6 +2809,12 @@ async fn session_title_settings_and_fallback() {
         .await
         .unwrap();
     assert_eq!(settings["title_model_load_behavior"], "off");
+    let response = client
+        .delete(format!("{base}/config/git-worktrees/title-model/install"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), reqwest::StatusCode::NOT_FOUND);
     assert!(
         std::fs::read_to_string(&config_file)
             .unwrap()

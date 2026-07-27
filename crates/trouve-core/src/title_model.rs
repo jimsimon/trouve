@@ -19,23 +19,31 @@ use trouve_protocol::{TitleModelLoadBehavior, TitleModelStatus};
 const AUTO_PRELOAD_AVAILABLE_RAM: u64 = 4 * 1024 * 1024 * 1024;
 const IDLE_RELEASE: std::time::Duration = std::time::Duration::from_secs(120);
 const GENERATION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(8);
+const DOWNLOAD_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 const STAGE_RUNTIME: u8 = 1;
 const STAGE_MODEL: u8 = 2;
 
 #[derive(Debug)]
 enum InstallState {
     Pending {
+        generation: u64,
         stage: Arc<AtomicU8>,
         progress: Arc<trouve_agents::install::Progress>,
     },
     Failed(String),
 }
 
+#[derive(Debug, thiserror::Error)]
+#[error("the session naming model is not being installed")]
+pub(crate) struct NoInstallInProgress;
+
 pub struct TitleModelManager {
     data_dir: PathBuf,
     llama: Arc<crate::local::LlamaManager>,
+    http: reqwest::Client,
     behavior: RwLock<TitleModelLoadBehavior>,
     install: Mutex<Option<InstallState>>,
+    install_generation: AtomicU64,
     use_generation: AtomicU64,
     loading: AtomicBool,
     store: crate::store::Store,
@@ -60,9 +68,15 @@ impl TitleModelManager {
     ) -> Self {
         Self {
             llama: Arc::new(crate::local::LlamaManager::title(&data_dir)),
+            http: reqwest::Client::builder()
+                .user_agent(concat!("trouve/", env!("CARGO_PKG_VERSION")))
+                .connect_timeout(std::time::Duration::from_secs(15))
+                .build()
+                .expect("valid session title HTTP client"),
             data_dir,
             behavior: RwLock::new(behavior),
             install: Mutex::new(None),
+            install_generation: AtomicU64::new(0),
             use_generation: AtomicU64::new(0),
             loading: AtomicBool::new(false),
             store,
@@ -117,6 +131,11 @@ impl TitleModelManager {
         }
     }
 
+    pub async fn stop(&self) {
+        self.llama.stop().await;
+        self.emit_status();
+    }
+
     pub async fn set_behavior(self: &Arc<Self>, behavior: TitleModelLoadBehavior) {
         *self.behavior.write().unwrap() = behavior;
         self.use_generation.fetch_add(1, Ordering::Relaxed);
@@ -169,7 +188,7 @@ impl TitleModelManager {
         self.schedule_idle_release();
         let prompt = crate::title::cap_prompt(prompt);
         let response = tokio::time::timeout(GENERATION_TIMEOUT, async {
-            reqwest::Client::new()
+            self.http
                 .post(format!("{base_url}/chat/completions"))
                 .json(&serde_json::json!({
                     "model": crate::local::TITLE_MODEL_ID,
@@ -221,7 +240,10 @@ impl TitleModelManager {
         let runtime_installed = crate::local::runtime_bin(&self.data_dir).is_some();
         let model_downloaded = self.model_downloaded();
         let install = self.install.lock().unwrap();
-        if let Some(InstallState::Pending { stage, progress }) = install.as_ref() {
+        if let Some(InstallState::Pending {
+            stage, progress, ..
+        }) = install.as_ref()
+        {
             return TitleModelStatus {
                 state: "installing".into(),
                 detail: match stage.load(Ordering::Relaxed) {
@@ -291,7 +313,10 @@ impl TitleModelManager {
         }
     }
 
-    pub fn start_install(self: &Arc<Self>) -> Result<()> {
+    pub fn start_install(
+        self: &Arc<Self>,
+        on_runtime_installed: impl FnOnce() + Send + 'static,
+    ) -> Result<()> {
         if self.installed() {
             bail!("the session naming model is already installed");
         }
@@ -302,23 +327,38 @@ impl TitleModelManager {
             if matches!(install.as_ref(), Some(InstallState::Pending { .. })) {
                 bail!("the session naming model is already being installed");
             }
+            let generation = self.install_generation.fetch_add(1, Ordering::Relaxed) + 1;
             *install = Some(InstallState::Pending {
+                generation,
                 stage: stage.clone(),
                 progress: progress.clone(),
             });
         }
+        let generation = self.install_generation.load(Ordering::Relaxed);
         self.emit_status();
 
         let reporter = self.clone();
+        let reporter_stage = stage.clone();
+        let reporter_progress = progress.clone();
         tokio::spawn(async move {
+            let mut last_reported = install_progress_key(&reporter_stage, &reporter_progress);
             loop {
                 tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-                reporter.emit_status();
                 if !matches!(
                     reporter.install.lock().unwrap().as_ref(),
-                    Some(InstallState::Pending { .. })
+                    Some(InstallState::Pending {
+                        generation: current,
+                        ..
+                    }) if *current == generation
                 ) {
                     return;
+                }
+                let current = install_progress_key(&reporter_stage, &reporter_progress);
+                if current != last_reported
+                    && reporter.install_generation.load(Ordering::Relaxed) == generation
+                {
+                    reporter.emit_status();
+                    last_reported = current;
                 }
             }
         });
@@ -326,26 +366,42 @@ impl TitleModelManager {
         let manager = self.clone();
         tokio::spawn(async move {
             let result = manager
-                .install_assets(stage.clone(), progress.clone())
+                .install_assets(
+                    stage.clone(),
+                    progress.clone(),
+                    Box::new(on_runtime_installed),
+                )
                 .await;
-            match result {
-                Ok(()) => {
-                    *manager.install.lock().unwrap() = None;
-                    manager.emit_status();
-                    if manager.keep_ready_for(manager.behavior()) {
-                        manager.preload();
+            let preload = {
+                let mut install = manager.install.lock().unwrap();
+                if !matches!(
+                    install.as_ref(),
+                    Some(InstallState::Pending {
+                        generation: current,
+                        ..
+                    }) if *current == generation
+                ) {
+                    return;
+                }
+                match result {
+                    Ok(()) => {
+                        *install = None;
+                        true
+                    }
+                    Err(_) if progress.cancelled() => {
+                        *install = None;
+                        tracing::info!("session naming model installation cancelled");
+                        false
+                    }
+                    Err(error) => {
+                        *install = Some(InstallState::Failed(format!("{error:#}")));
+                        false
                     }
                 }
-                Err(_) if progress.cancelled() => {
-                    *manager.install.lock().unwrap() = None;
-                    tracing::info!("session naming model installation cancelled");
-                    manager.emit_status();
-                }
-                Err(error) => {
-                    *manager.install.lock().unwrap() =
-                        Some(InstallState::Failed(format!("{error:#}")));
-                    manager.emit_status();
-                }
+            };
+            manager.emit_status();
+            if preload && manager.keep_ready_for(manager.behavior()) {
+                manager.preload();
             }
         });
         Ok(())
@@ -355,6 +411,7 @@ impl TitleModelManager {
         &self,
         stage: Arc<AtomicU8>,
         progress: Arc<trouve_agents::install::Progress>,
+        on_runtime_installed: Box<dyn FnOnce() + Send>,
     ) -> Result<()> {
         use trouve_agents::install::{CliId, InstallError};
 
@@ -368,7 +425,7 @@ impl TitleModelManager {
             )
             .await
             {
-                Ok(_) => {}
+                Ok(_) => on_runtime_installed(),
                 Err(InstallError::Cancelled) => bail!("installation cancelled"),
                 Err(error) => return Err(error.into()),
             }
@@ -380,20 +437,33 @@ impl TitleModelManager {
             crate::local::title_model_entry().size_bytes,
             Ordering::Relaxed,
         );
-        download_title_model(&self.data_dir, &progress).await
+        download_title_model(&self.http, &self.data_dir, &progress).await
     }
 
     pub fn cancel_install(&self) -> Result<()> {
         let install = self.install.lock().unwrap();
         let Some(InstallState::Pending { progress, .. }) = install.as_ref() else {
-            bail!("the session naming model is not being installed");
+            bail!(NoInstallInProgress);
         };
         progress.cancel.store(true, Ordering::Relaxed);
         Ok(())
     }
 }
 
+fn install_progress_key(
+    stage: &AtomicU8,
+    progress: &trouve_agents::install::Progress,
+) -> (u8, Option<u8>) {
+    let total = progress.total.load(Ordering::Relaxed);
+    let percent = (total > 0).then(|| {
+        let received = progress.received.load(Ordering::Relaxed);
+        (((received as u128) * 100 / (total as u128)).min(100)) as u8
+    });
+    (stage.load(Ordering::Relaxed), percent)
+}
+
 async fn download_title_model(
+    http: &reqwest::Client,
     data_dir: &Path,
     progress: &trouve_agents::install::Progress,
 ) -> Result<()> {
@@ -401,27 +471,52 @@ async fn download_title_model(
     let target = crate::local::gguf_path(data_dir, &entry);
     std::fs::create_dir_all(target.parent().unwrap())?;
     let part = target.with_extension("gguf.title-part");
-    let response = reqwest::Client::builder()
-        .user_agent(concat!("trouve/", env!("CARGO_PKG_VERSION")))
-        .connect_timeout(std::time::Duration::from_secs(15))
-        .timeout(std::time::Duration::from_secs(900))
-        .build()?
-        .get(crate::local::download_url(&entry.repo, &entry.file))
-        .send()
-        .await?
-        .error_for_status()?;
-    if let Some(total) = response.content_length() {
-        progress.total.store(total, Ordering::Relaxed);
-    }
+    let result = async {
+        let response = tokio::time::timeout(
+            DOWNLOAD_IDLE_TIMEOUT,
+            http.get(crate::local::download_url(&entry.repo, &entry.file))
+                .send(),
+        )
+        .await
+        .context("session naming model download stalled")??
+            .error_for_status()?;
+        if let Some(total) = response.content_length() {
+            progress.total.store(total, Ordering::Relaxed);
+        }
 
+        let (downloaded, digest) = stream_to_part(response, &part, progress).await?;
+        if downloaded != entry.size_bytes || digest != crate::local::TITLE_MODEL_SHA256 {
+            bail!(
+                "session naming model failed integrity verification (got {downloaded} bytes, sha256 {digest})"
+            );
+        }
+        tokio::fs::rename(&part, &target).await?;
+        Ok(())
+    }
+    .await;
+    if result.is_err() {
+        let _ = tokio::fs::remove_file(&part).await;
+    }
+    result
+}
+
+async fn stream_to_part(
+    response: reqwest::Response,
+    part: &Path,
+    progress: &trouve_agents::install::Progress,
+) -> Result<(u64, String)> {
     let mut stream = response.bytes_stream();
-    let mut file = tokio::fs::File::create(&part).await?;
+    let mut file = tokio::fs::File::create(part).await?;
     let mut hash = Sha256::new();
     let mut downloaded = 0_u64;
-    while let Some(chunk) = stream.try_next().await? {
+    loop {
+        let chunk = tokio::time::timeout(DOWNLOAD_IDLE_TIMEOUT, stream.try_next())
+            .await
+            .context("session naming model download stalled")??;
+        let Some(chunk) = chunk else {
+            break;
+        };
         if progress.cancelled() {
-            drop(file);
-            let _ = std::fs::remove_file(&part);
             bail!("installation cancelled");
         }
         file.write_all(&chunk).await?;
@@ -430,22 +525,10 @@ async fn download_title_model(
         progress.received.store(downloaded, Ordering::Relaxed);
     }
     if progress.cancelled() {
-        drop(file);
-        let _ = std::fs::remove_file(&part);
         bail!("installation cancelled");
     }
     file.flush().await?;
-    drop(file);
-
-    let digest = format!("{:x}", hash.finalize());
-    if downloaded != entry.size_bytes || digest != crate::local::TITLE_MODEL_SHA256 {
-        let _ = std::fs::remove_file(&part);
-        bail!(
-            "session naming model failed integrity verification (got {downloaded} bytes, sha256 {digest})"
-        );
-    }
-    std::fs::rename(part, target)?;
-    Ok(())
+    Ok((downloaded, format!("{:x}", hash.finalize())))
 }
 
 fn sanitize_title(raw: &str) -> Result<String> {
@@ -475,7 +558,9 @@ fn sanitize_title(raw: &str) -> Result<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::sanitize_title;
+    use std::sync::atomic::{AtomicU8, Ordering};
+
+    use super::{install_progress_key, sanitize_title};
 
     #[test]
     fn sanitizes_constrained_model_output() {
@@ -485,5 +570,20 @@ mod tests {
         );
         assert!(sanitize_title("one").is_err());
         assert!(sanitize_title("<tool_call>bad title</tool_call>").is_err());
+    }
+
+    #[test]
+    fn install_progress_reports_only_stage_or_percentage_changes() {
+        let stage = AtomicU8::new(1);
+        let progress = trouve_agents::install::Progress::default();
+        progress.total.store(1_000, Ordering::Relaxed);
+        progress.received.store(1, Ordering::Relaxed);
+        assert_eq!(install_progress_key(&stage, &progress), (1, Some(0)));
+        progress.received.store(9, Ordering::Relaxed);
+        assert_eq!(install_progress_key(&stage, &progress), (1, Some(0)));
+        progress.received.store(10, Ordering::Relaxed);
+        assert_eq!(install_progress_key(&stage, &progress), (1, Some(1)));
+        stage.store(2, Ordering::Relaxed);
+        assert_eq!(install_progress_key(&stage, &progress), (2, Some(1)));
     }
 }

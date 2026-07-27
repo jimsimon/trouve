@@ -36,6 +36,7 @@ const COMPACTION_THRESHOLD: f64 = 0.8;
 /// End-to-end budget for refreshing one GitHub host. This bounds how long a
 /// stalled GraphQL request can retain the shared dashboard-cache lock.
 const GITHUB_DASHBOARD_REFRESH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+const SESSION_TITLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(8);
 
 const TURN_CONCURRENCY_ENV: &str = "TROUVE_TURN_CONCURRENCY";
 const DEFAULT_TURN_CONCURRENCY: usize = 26;
@@ -1616,6 +1617,7 @@ impl Engine {
         }
         if cli == trouve_agents::install::CliId::LlamaServer {
             self.local_manager.stop().await;
+            self.title_model.stop().await;
         }
         trouve_agents::install::uninstall(&self.data_dir, cli)
             .map_err(|e| EngineError::Internal(e.into()))?;
@@ -2550,18 +2552,31 @@ impl Engine {
         self.title_model.warm_on_start();
     }
 
-    pub fn install_title_model(&self) -> Result<(), EngineError> {
+    pub fn install_title_model(self: &Arc<Self>) -> Result<(), EngineError> {
+        let engine = Arc::downgrade(self);
         self.title_model
-            .start_install()
+            .start_install(move || {
+                if let Some(engine) = engine.upgrade() {
+                    engine.reload_providers();
+                    engine
+                        .cli_latest
+                        .lock()
+                        .unwrap()
+                        .remove(trouve_agents::install::CliId::LlamaServer.as_str());
+                }
+            })
             .map_err(|error| EngineError::Conflict(error.to_string()))?;
         Ok(())
     }
 
     pub fn cancel_title_model_install(&self) -> Result<(), EngineError> {
-        self.title_model
-            .cancel_install()
-            .map_err(|error| EngineError::Conflict(error.to_string()))?;
-        Ok(())
+        match self.title_model.cancel_install() {
+            Ok(()) => Ok(()),
+            Err(error) if error.is::<crate::title_model::NoInstallInProgress>() => {
+                Err(EngineError::NotFound(error.to_string()))
+            }
+            Err(error) => Err(EngineError::Conflict(error.to_string())),
+        }
     }
 
     /// Derive a title without ever blocking session creation on optional
@@ -2570,7 +2585,18 @@ impl Engine {
         &self,
         prompt: &str,
     ) -> trouve_protocol::GeneratedSessionTitle {
-        match self.title_model.generate(prompt).await {
+        let title_model = self.title_model.clone();
+        let prompt_owned = prompt.to_string();
+        // Dropping a JoinHandle detaches rather than cancels its task. If the
+        // short request budget expires during cold startup, llama.cpp keeps
+        // warming and its guards remain alive for the next naming request.
+        let generation = tokio::spawn(async move { title_model.generate(&prompt_owned).await });
+        let generated = match tokio::time::timeout(SESSION_TITLE_TIMEOUT, generation).await {
+            Ok(Ok(result)) => result,
+            Ok(Err(error)) => Err(anyhow!("session title task failed: {error}")),
+            Err(_) => Err(anyhow!("session title generation timed out")),
+        };
+        match generated {
             Ok(title) => trouve_protocol::GeneratedSessionTitle {
                 title,
                 source: "model".into(),

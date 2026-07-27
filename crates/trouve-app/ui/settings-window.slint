@@ -13,6 +13,23 @@ import {
 import { ScrollKeys } from "scroll-keys.slint";
 import { Theme } from "theme.slint";
 
+export enum SectionId {
+    general,
+    providers,
+    modes-models,
+    git-worktrees,
+    mcp-servers,
+    integrations,
+    appearance,
+    notifications,
+    about,
+}
+
+export struct SectionItem {
+    id: SectionId,
+    name: string,
+}
+
 // A provider-specific setting derived from the catalog transport template.
 // Values are reported as they are edited; secrets never enter the normal
 // provider config payload.
@@ -553,13 +570,20 @@ export component SettingsScreen inherits Rectangle {
     property <int> mode-form-thinking-model-index: root.mode-form-model >= 0
         ? root.mode-form-model : root.default-model-index;
 
-    // Side-nav selection: 0 general, 1 providers, 2 modes & models,
-    // 3 git & worktrees, 4 mcp servers, 5 integrations, 6 appearance,
-    // 7 notifications, 8 about. in-out so
-    // the app can open straight to a section (e.g. the
-    // PR tab's "set up GitHub" button).
-    in-out property <int> section: 0;
-    property <[string]> section-names: ["General", "Providers", "Modes & Models", "Git & Worktrees", "MCP Servers", "Integrations", "Appearance", "Notifications", "About"];
+    // in-out so the app can open straight to a section (e.g. the PR tab's
+    // "set up GitHub" button).
+    in-out property <SectionId> section: SectionId.general;
+    property <[SectionItem]> sections: [
+        { id: SectionId.general, name: "General" },
+        { id: SectionId.providers, name: "Providers" },
+        { id: SectionId.modes-models, name: "Modes & Models" },
+        { id: SectionId.git-worktrees, name: "Git & Worktrees" },
+        { id: SectionId.mcp-servers, name: "MCP Servers" },
+        { id: SectionId.integrations, name: "Integrations" },
+        { id: SectionId.appearance, name: "Appearance" },
+        { id: SectionId.notifications, name: "Notifications" },
+        { id: SectionId.about, name: "About" },
+    ];
 
     VerticalLayout {
         // Header: title + a way back to wherever the user came from.
@@ -601,22 +625,22 @@ export component SettingsScreen inherits Rectangle {
                 padding-right: 12px;
                 spacing: 2px;
                 alignment: start;
-                for name[i] in root.section-names: Rectangle {
+                for item in root.sections: Rectangle {
                     height: Theme.fs(32px);
                     border-radius: 6px;
-                    background: root.section == i ? Theme.c.accent-bg
+                    background: root.section == item.id ? Theme.c.accent-bg
                         : section-ta.has-hover ? Theme.c.raised-bg : transparent;
                     section-ta := TouchArea {
-                        clicked => { root.section = i; }
+                        clicked => { root.section = item.id; }
                     }
                     Text {
                         x: 12px;
                         width: parent.width - 24px;
                         height: 100%;
-                        text: name;
+                        text: item.name;
                         // accent-bg pairs with the normal text ramp (not
                         // on-accent, which is tuned for primary-bg).
-                        color: root.section == i ? Theme.c.text-hi : Theme.c.text-mid;
+                        color: root.section == item.id ? Theme.c.text-hi : Theme.c.text-mid;
                         font-size: Theme.fs(13px);
                         vertical-alignment: center;
                         overflow: elide;
@@ -640,7 +664,7 @@ export component SettingsScreen inherits Rectangle {
                         alignment: start;
 
                         // ---------------- general ----------------
-                        if root.section == 0: VerticalLayout {
+                        if root.section == SectionId.general: VerticalLayout {
                             spacing: 12px;
 
                             Text {
@@ -668,7 +692,7 @@ export component SettingsScreen inherits Rectangle {
                         }
 
                         // ---------------- providers ----------------
-                        if root.section == 1: VerticalLayout {
+                        if root.section == SectionId.providers: VerticalLayout {
                             spacing: 12px;
 
                             HorizontalLayout {
@@ -1168,7 +1192,7 @@ export component SettingsScreen inherits Rectangle {
                         }
 
                         // ---------------- modes & models ----------------
-                        if root.section == 2: VerticalLayout {
+                        if root.section == SectionId.modes-models: VerticalLayout {
                             spacing: 12px;
 
                             Text {
@@ -1198,7 +1222,7 @@ export component SettingsScreen inherits Rectangle {
                                     Button {
                                         text: "Configure providers";
                                         primary: true;
-                                        clicked => { root.section = 1; }
+                                        clicked => { root.section = SectionId.providers; }
                                     }
                                 }
                             }
@@ -1557,7 +1581,7 @@ export component SettingsScreen inherits Rectangle {
                         }
 
                         // ---------------- local models (Providers → Local) ----------------
-                        if root.section == 1 && root.provider-tab == 2: VerticalLayout {
+                        if root.section == SectionId.providers && root.provider-tab == 2: VerticalLayout {
                             spacing: 12px;
 
                             HorizontalLayout {
@@ -1928,7 +1952,7 @@ export component SettingsScreen inherits Rectangle {
                         }
 
                         // ---------------- git & worktrees ----------------
-                        if root.section == 3: VerticalLayout {
+                        if root.section == SectionId.git-worktrees: VerticalLayout {
                             spacing: 12px;
 
                             Text {
@@ -2025,7 +2049,7 @@ export component SettingsScreen inherits Rectangle {
                         }
 
                         // ---------------- mcp servers ----------------
-                        if root.section == 4: VerticalLayout {
+                        if root.section == SectionId.mcp-servers: VerticalLayout {
                             spacing: 12px;
 
                             HorizontalLayout {
@@ -2322,7 +2346,7 @@ export component SettingsScreen inherits Rectangle {
                         }
 
                         // ---------------- integrations ----------------
-                        if root.section == 5: VerticalLayout {
+                        if root.section == SectionId.integrations: VerticalLayout {
                             spacing: 12px;
 
                             Text {
@@ -2454,7 +2478,7 @@ export component SettingsScreen inherits Rectangle {
                         }
 
                         // ---------------- appearance ----------------
-                        if root.section == 6: VerticalLayout {
+                        if root.section == SectionId.appearance: VerticalLayout {
                             spacing: 12px;
 
                             Text {
@@ -2534,7 +2558,7 @@ export component SettingsScreen inherits Rectangle {
                         }
 
                         // ---------------- notifications ----------------
-                        if root.section == 7: VerticalLayout {
+                        if root.section == SectionId.notifications: VerticalLayout {
                             spacing: 12px;
 
                             Text {
@@ -2592,7 +2616,7 @@ export component SettingsScreen inherits Rectangle {
                         }
 
                         // ---------------- about ----------------
-                        if root.section == 8: VerticalLayout {
+                        if root.section == SectionId.about: VerticalLayout {
                             spacing: 12px;
 
                             Text {

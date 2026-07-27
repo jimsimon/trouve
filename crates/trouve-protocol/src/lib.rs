@@ -111,7 +111,9 @@ pub use requests::*;
 // title-model status/install endpoints and POST /v1/session-title provide
 // synchronous model-assisted naming with a deterministic fallback, while
 // settings.git_worktrees_updated carries lifecycle snapshots (additive).
-pub const PROTOCOL_VERSION: &str = "1.13";
+// 1.14: cancelling a missing title-model installation returns Not Found,
+// matching the managed CLI installation lifecycle (additive).
+pub const PROTOCOL_VERSION: &str = "1.14";
 
 pub type WorkspaceId = String;
 pub type SessionId = String;

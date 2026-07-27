@@ -7,8 +7,8 @@ use slint::{Model, ModelRc, SharedString, VecModel};
 use crate::render::ChatRowData;
 use crate::{
     AppWindow, ChatRow, ChatTableCell, CliItem, DiffRow, FileItem, KnownProviderItem,
-    ModelHealthItem, NavRow, ProviderConfigFieldItem, ProviderItem, QOption, QPair, TextSegment,
-    ThreadTabItem, TodoUiItem,
+    ModelHealthItem, NavRow, ProviderConfigFieldItem, ProviderItem, QOption, QPair, SectionId,
+    TextSegment, ThreadTabItem, TodoUiItem,
 };
 
 type Ui = slint::Weak<AppWindow>;
@@ -1017,7 +1017,7 @@ pub fn set_github_integration(ui: &Ui, hosts: Vec<GithubHostView>) {
     });
 }
 
-pub fn set_settings_section(ui: &Ui, section: i32) {
+pub fn set_settings_section(ui: &Ui, section: SectionId) {
     let _ = ui.upgrade_in_event_loop(move |ui| ui.set_settings_section(section));
 }
 

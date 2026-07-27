@@ -352,16 +352,22 @@ fn compact_session_carryover(words: &mut Vec<String>) {
 }
 
 fn replace_phrase(words: &mut Vec<String>, pattern: &[&str], replacement: &[&str]) {
-    while let Some(start) = words.windows(pattern.len()).position(|window| {
-        window
-            .iter()
-            .zip(pattern)
-            .all(|(word, expected)| clean_word(word).eq_ignore_ascii_case(expected))
-    }) {
+    let mut position = 0;
+    while position + pattern.len() <= words.len() {
+        let Some(offset) = words[position..].windows(pattern.len()).position(|window| {
+            window
+                .iter()
+                .zip(pattern)
+                .all(|(word, expected)| clean_word(word).eq_ignore_ascii_case(expected))
+        }) else {
+            break;
+        };
+        let start = position + offset;
         words.splice(
             start..start + pattern.len(),
             replacement.iter().map(|word| (*word).to_string()),
         );
+        position = start + replacement.len();
     }
 }
 
@@ -508,7 +514,7 @@ fn truncate_title(title: &str, max_chars: usize) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{MAX_CHARS, MAX_PROMPT_CHARS, MAX_WORDS, summarize_session_title};
+    use super::{MAX_CHARS, MAX_PROMPT_CHARS, MAX_WORDS, replace_phrase, summarize_session_title};
 
     #[test]
     fn extracts_request_instead_of_copying_prompt() {
@@ -619,5 +625,24 @@ mod tests {
             "background ".repeat(MAX_PROMPT_CHARS)
         );
         assert_eq!(summarize_session_title(&prompt), "Fix first issue");
+    }
+
+    #[test]
+    fn caps_non_ascii_prompts_and_titles_on_character_boundaries() {
+        let prompt = format!(
+            "Please {} {}",
+            "é".repeat(MAX_CHARS + 24),
+            "界".repeat(MAX_PROMPT_CHARS)
+        );
+        let title = summarize_session_title(&prompt);
+        assert!(title.ends_with('…'));
+        assert!(title.chars().count() <= MAX_CHARS + 1);
+    }
+
+    #[test]
+    fn phrase_replacement_advances_past_inserted_matches() {
+        let mut words = vec!["loop".into(), "loop".into()];
+        replace_phrase(&mut words, &["loop"], &["loop", "done"]);
+        assert_eq!(words, ["loop", "done", "loop", "done"]);
     }
 }

@@ -14,7 +14,8 @@ import { CodeView, TextSegment } from "code-view.slint";
 import { TerminalGrid, TermSpan } from "terminal-grid.slint";
 import {
     SettingsScreen, ProviderItem, CliItem, KnownProviderItem, ProviderConfigFieldItem, McpServerItem,
-    SubscriptionItem, ModeItem, ThinkingItem, LocalModelItem, LocalSearchItem, GithubHostItem
+    SubscriptionItem, ModeItem, ThinkingItem, LocalModelItem, LocalSearchItem, GithubHostItem,
+    SectionId
 } from "settings-window.slint";
 import { AutomationsScreen, AutomationItem, AutomationTemplateItem } from "automations-screen.slint";
 import {
@@ -29,7 +30,7 @@ import { Palette } from "std-widgets.slint";
 export {
     DiffRow, TextSegment, TermSpan, ProviderItem, CliItem, KnownProviderItem, ProviderConfigFieldItem, McpServerItem,
     SubscriptionItem, ModeItem, LocalModelItem, LocalSearchItem, AutomationItem, GithubHostItem,
-    PrGroupItem, PrReviewFindingItem, PrRowItem
+    PrGroupItem, PrReviewFindingItem, PrRowItem, SectionId
 }
 export { ThinkingItem }
 export { Theme, ThemePalette }
@@ -1511,7 +1512,7 @@ export component AppWindow inherits Window {
     in-out property <int> settings-preset-index: 0;
     // Which settings section shows when the screen opens (0 general …
     // 5 integrations); the controller sets it before flipping center-screen.
-    in-out property <int> settings-section: 0;
+    in-out property <SectionId> settings-section: SectionId.general;
     in-out property <int> settings-title-model-load-index: 0;
     in property <string> settings-title-model-state: "not_installed";
     in property <string> settings-title-model-detail: "";

@@ -5299,7 +5299,7 @@ impl Controller {
                 }
             }
             UiCommand::OpenIntegrationsSettings => {
-                ui::set_settings_section(&self.ui, 5);
+                ui::set_settings_section(&self.ui, crate::SectionId::Integrations);
                 self.refresh_settings().await;
                 self.refresh_mcp();
                 self.refresh_subscriptions(SubscriptionRefresh::IfStale);

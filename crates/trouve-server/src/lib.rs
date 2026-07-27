@@ -1550,7 +1550,7 @@ async fn install_title_model(State(engine): State<Arc<Engine>>) -> Result<Status
 }
 
 #[utoipa::path(delete, path = "/v1/config/git-worktrees/title-model/install",
-    responses((status = 204), (status = 409, body = ErrorBody)))]
+    responses((status = 204), (status = 404, body = ErrorBody), (status = 409, body = ErrorBody)))]
 async fn cancel_title_model_install(
     State(engine): State<Arc<Engine>>,
 ) -> Result<StatusCode, ApiError> {
