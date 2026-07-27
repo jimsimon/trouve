@@ -186,6 +186,22 @@ impl Appearance {
     }
 }
 
+/// General frontend behavior preferences.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct General {
+    /// Hold an OS idle-sleep inhibitor while at least one agent is active.
+    #[serde(default = "default_true")]
+    pub prevent_sleep_while_running: bool,
+}
+
+impl Default for General {
+    fn default() -> Self {
+        Self {
+            prevent_sleep_while_running: true,
+        }
+    }
+}
+
 fn config_path(file: &str) -> Option<PathBuf> {
     dirs::config_dir().map(|d| d.join("trouve").join(file))
 }
@@ -220,6 +236,18 @@ pub fn load_appearance() -> Appearance {
 
 pub fn save_appearance(appearance: &Appearance) {
     write_json(config_path("appearance.json"), appearance);
+}
+
+pub fn load_general() -> General {
+    let read = || {
+        let text = std::fs::read_to_string(config_path("general.json")?).ok()?;
+        serde_json::from_str::<General>(&text).ok()
+    };
+    read().unwrap_or_default()
+}
+
+pub fn save_general(general: &General) {
+    write_json(config_path("general.json"), general);
 }
 
 pub fn load_notifications() -> Notifications {
@@ -287,6 +315,13 @@ fn write_json<T: Serialize>(path: Option<PathBuf>, value: &T) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn general_sleep_prevention_defaults_to_enabled() {
+        assert!(General::default().prevent_sleep_while_running);
+        let restored: General = serde_json::from_str("{}").unwrap();
+        assert!(restored.prevent_sleep_while_running);
+    }
 
     #[test]
     fn old_flat_resume_format_still_parses() {

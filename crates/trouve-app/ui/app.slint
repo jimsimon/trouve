@@ -1509,8 +1509,8 @@ export component AppWindow inherits Window {
     in property <string> settings-login-provider-id: "";
     in property <bool> settings-login-code-required: false;
     in-out property <int> settings-preset-index: 0;
-    // Which settings section shows when the screen opens (0 providers …
-    // 3 integrations); the controller sets it before flipping center-screen.
+    // Which settings section shows when the screen opens (0 general …
+    // 4 integrations); the controller sets it before flipping center-screen.
     in-out property <int> settings-section: 0;
     in property <[GithubHostItem]> settings-github-hosts;
     callback github-host-added(/* host */ string, /* client-id */ string);
@@ -1552,6 +1552,10 @@ export component AppWindow inherits Window {
     callback cli-cancel(/* id */ string);
     callback cli-uninstall(/* id */ string);
     callback close-settings();
+
+    // General frontend behavior preferences (persisted in general.json).
+    in-out property <bool> prevent-sleep-while-running: true;
+    callback prevent-sleep-while-running-toggled(bool);
 
     // Local (offline) models — state pushed by the controller, actions out.
     in property <[LocalModelItem]> local-models;
@@ -5314,6 +5318,10 @@ export component AppWindow inherits Window {
         login-code-required: root.settings-login-code-required;
         preset-index <=> root.settings-preset-index;
         section <=> root.settings-section;
+        prevent-sleep-while-running <=> root.prevent-sleep-while-running;
+        prevent-sleep-while-running-toggled(on) => {
+            root.prevent-sleep-while-running-toggled(on);
+        }
         github-hosts: root.settings-github-hosts;
         github-host-added(host, client-id) => { root.github-host-added(host, client-id); }
         github-host-removed(host) => { root.github-host-removed(host); }
