@@ -1237,6 +1237,9 @@ impl BridgeEchoTracker {
         tool: &str,
         args: &serde_json::Value,
     ) -> Option<String> {
+        // Vendor-native calls can never correlate with an MCP request and
+        // must not pay the bridge dispatch grace period.
+        trouve_bridge_echo_payload(tool, args)?;
         // Some harnesses announce a tool immediately before dispatching its
         // HTTP MCP request. Give that independently-running request a brief
         // chance to establish trusted state, without indefinitely stalling
