@@ -367,6 +367,9 @@ pub struct Engine {
     /// while present just enqueue. The session ids feed `Session.active`
     /// and the `session.activity` server event.
     active_threads: Mutex<std::collections::HashMap<String, String>>,
+    /// Orders active-thread transitions with their persisted session activity
+    /// events without holding `active_threads` across durable event appends.
+    session_activity_publication: Mutex<()>,
     /// Sessions currently being deleted. Dispatch checks this while holding
     /// `active_threads`, making "no active turns" and "no new turns" one
     /// atomic state transition before destructive cleanup begins.
@@ -729,6 +732,7 @@ impl Engine {
             turn_scheduler: TurnScheduler::new(),
             session_locks: Mutex::new(HashMap::new()),
             active_threads: Mutex::new(std::collections::HashMap::new()),
+            session_activity_publication: Mutex::new(()),
             deleting_sessions: Mutex::new(std::collections::HashSet::new()),
             turn_cancels: Mutex::new(std::collections::HashMap::new()),
             resume_after_cancel: Mutex::new(HashSet::new()),
@@ -4640,6 +4644,7 @@ impl Engine {
     /// turn is already running or the queue is empty.
     pub fn dispatch_queue(self: &Arc<Self>, thread_id: &str) -> Result<Option<u64>, EngineError> {
         let thread = self.get_thread(thread_id)?;
+        let activity_publication = self.session_activity_publication.lock().unwrap();
         // Claim the thread and take the queue front atomically so two
         // concurrent sends can't both start a dispatcher.
         let (prompt, session_woke) = {
@@ -4685,6 +4690,7 @@ impl Engine {
         if session_woke {
             self.emit_session_activity(&thread.session_id, true);
         }
+        drop(activity_publication);
         // If setup fails after claiming, release the claim — otherwise the
         // thread stays "active" forever and can never dispatch again.
         if let Err(e) = self.emit_queue(thread_id) {
@@ -4808,14 +4814,18 @@ impl Engine {
             // Pop the next prompt; releasing the claim and inspecting the
             // queue must be atomic against concurrent send_message calls.
             let next = {
-                let mut active = self.active_threads.lock().unwrap();
-                match self.store.claim_queued_prompt(&thread.id) {
-                    Ok(Some(p)) => Some(p),
-                    _ => {
-                        self.release_thread_claim(&mut active, &thread.id);
-                        None
+                let _activity_publication = self.session_activity_publication.lock().unwrap();
+                let (next, idle_session) = {
+                    let mut active = self.active_threads.lock().unwrap();
+                    match self.store.claim_queued_prompt(&thread.id) {
+                        Ok(Some(p)) => (Some(p), None),
+                        _ => (None, Self::remove_thread_claim(&mut active, &thread.id)),
                     }
+                };
+                if let Some(session_id) = idle_session {
+                    self.emit_session_activity(&session_id, false);
                 }
+                next
             };
             let Some(next) = next else { return Ok(()) };
             let _ = self.emit_queue(&thread.id);
@@ -4840,26 +4850,25 @@ impl Engine {
     /// Drop a thread's dispatcher claim; when it was the session's last
     /// active thread, announce the session going idle.
     fn release_thread(&self, thread_id: &str) {
-        let mut active = self.active_threads.lock().unwrap();
-        self.release_thread_claim(&mut active, thread_id);
+        let _activity_publication = self.session_activity_publication.lock().unwrap();
+        let idle_session = {
+            let mut active = self.active_threads.lock().unwrap();
+            Self::remove_thread_claim(&mut active, thread_id)
+        };
+        if let Some(session_id) = idle_session {
+            self.emit_session_activity(&session_id, false);
+        }
     }
 
-    /// Publish the idle transition before removing the claim. Callers hold
-    /// `active_threads`, so a new dispatcher cannot publish the matching
-    /// active transition first.
-    fn release_thread_claim(
-        &self,
+    /// Remove a claim and return its session only when it was the session's
+    /// last active thread. A missing claim never produces an idle transition.
+    fn remove_thread_claim(
         active: &mut std::collections::HashMap<String, String>,
         thread_id: &str,
-    ) {
-        if let Some(session_id) = active.get(thread_id)
-            && !active
-                .iter()
-                .any(|(id, candidate)| id != thread_id && candidate == session_id)
-        {
-            self.emit_session_activity(session_id, false);
-        }
-        active.remove(thread_id);
+    ) -> Option<String> {
+        active
+            .remove(thread_id)
+            .filter(|session| !active.values().any(|candidate| candidate == session))
     }
 
     /// Register a fresh cancellation token for a turn about to run.
@@ -4881,13 +4890,18 @@ impl Engine {
     /// waiting on the same active-thread claim. Returns true when one of
     /// those sends requested that the queue continue draining.
     fn finish_cancelled_turn(&self, thread_id: &str) -> bool {
-        // Lock ordering matches `dispatch_queue`: active thread, cancel
-        // token, then resume marker.
-        let mut active = self.active_threads.lock().unwrap();
-        self.turn_cancels.lock().unwrap().remove(thread_id);
-        let resume = self.resume_after_cancel.lock().unwrap().remove(thread_id);
-        if !resume {
-            self.release_thread_claim(&mut active, thread_id);
+        // Lock ordering matches `dispatch_queue`: activity publication,
+        // active thread, cancel token, then resume marker.
+        let _activity_publication = self.session_activity_publication.lock().unwrap();
+        let (resume, idle_session) = {
+            let mut active = self.active_threads.lock().unwrap();
+            self.turn_cancels.lock().unwrap().remove(thread_id);
+            let resume = self.resume_after_cancel.lock().unwrap().remove(thread_id);
+            let idle_session = (!resume).then(|| Self::remove_thread_claim(&mut active, thread_id));
+            (resume, idle_session.flatten())
+        };
+        if let Some(session_id) = idle_session {
+            self.emit_session_activity(&session_id, false);
         }
         resume
     }
