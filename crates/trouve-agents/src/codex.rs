@@ -1324,19 +1324,21 @@ impl AppServer {
         self.pending.lock().await.insert(id, tx);
         self.write(json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params }))
             .await?;
-        let result = match rx.await {
+        match rx.await {
             Ok(Ok(v)) => Ok(v),
             Ok(Err(e)) => Err(BackendError::Protocol(format!("{method}: {e}"))),
             Err(_) => Err(BackendError::Protocol(format!(
                 "{method}: app-server closed before responding"
             ))),
-        };
+        }
+    }
+
+    async fn sync_auth(&self) {
         if let Some(auth_sync) = self.auth_sync.clone()
             && let Err(error) = tokio::task::spawn_blocking(move || auth_sync.sync()).await
         {
             tracing::warn!("Codex credential sync task failed: {error}");
         }
-        result
     }
 
     async fn notify(&self, method: &str, params: Value) {

@@ -394,14 +394,13 @@ impl ToolExecutor for LocalToolExecutor {
             .await?;
             run(vec![
                 "update-ref".into(),
-                pull_ref,
+                pull_ref.clone(),
                 request.head_sha.clone(),
             ])
             .await?;
             return Ok(repository_path);
         }
 
-        let pull_ref = format!("refs/remotes/origin/trouve-pr-{}", request.pull_number);
         run(vec![
             "fetch".into(),
             "--force".into(),
@@ -517,11 +516,16 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().join("reviews");
         let repository = root.join("owner/repo");
+        let git_config = temp.path().join("empty-gitconfig");
         std::fs::create_dir_all(&repository).unwrap();
+        std::fs::write(&git_config, "").unwrap();
         let git = |args: &[&str]| {
             let output = std::process::Command::new("git")
                 .args(args)
                 .current_dir(&repository)
+                .env("GIT_CONFIG_GLOBAL", &git_config)
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .env_remove("GIT_CONFIG_COUNT")
                 .output()
                 .unwrap();
             assert!(

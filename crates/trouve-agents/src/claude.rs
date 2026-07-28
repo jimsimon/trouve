@@ -145,6 +145,8 @@ async fn certify_optimized_cli(command: &str) -> Result<(), String> {
         "--setting-sources",
         "--settings",
         "--disable-slash-commands",
+        "--no-chrome",
+        "--prompt-suggestions",
         "--strict-mcp-config",
         "--tools",
     ] {

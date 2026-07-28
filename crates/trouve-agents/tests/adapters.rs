@@ -1239,7 +1239,7 @@ async fn claude_adapter_wires_mcp_tool_bridge() {
         "claude",
         r#"#!/bin/bash
 if [[ "$1" == "--version" ]]; then echo '2.1.201 (Claude Code)'; exit 0; fi
-if [[ "$1" == "--help" ]]; then echo '--setting-sources --settings --disable-slash-commands --strict-mcp-config --tools'; exit 0; fi
+if [[ "$1" == "--help" ]]; then echo '--setting-sources --settings --disable-slash-commands --no-chrome --prompt-suggestions --strict-mcp-config --tools'; exit 0; fi
 printf '%s\n' "$@" > "$0.args"
 printf '%s\n' "$CLAUDE_CODE_DISABLE_CLAUDE_MDS" "$CLAUDE_CODE_DISABLE_AUTO_MEMORY" "$CLAUDE_AGENT_SDK_DISABLE_BUILTIN_AGENTS" "$ENABLE_CLAUDEAI_MCP_SERVERS" > "$0.isolation"
 cat <<'EOF'
@@ -1269,6 +1269,8 @@ EOF
     assert!(args.contains("--setting-sources"), "{args}");
     assert!(args.contains("{\"disableAllHooks\":true}"), "{args}");
     assert!(args.contains("--disable-slash-commands"), "{args}");
+    assert!(args.contains("--no-chrome"), "{args}");
+    assert!(args.contains("--prompt-suggestions"), "{args}");
     assert!(args.contains("--tools"), "{args}");
     assert!(args.contains("Bash,Edit,Write"), "{args}");
     assert!(args.contains("Read,Glob,Grep"), "{args}");
@@ -1351,7 +1353,7 @@ async fn claude_adapter_routes_yolo_through_gate_with_native_tools() {
         "claude",
         r#"#!/bin/bash
 if [[ "$1" == "--version" ]]; then echo '2.1.201 (Claude Code)'; exit 0; fi
-if [[ "$1" == "--help" ]]; then echo '--setting-sources --settings --disable-slash-commands --strict-mcp-config --tools'; exit 0; fi
+if [[ "$1" == "--help" ]]; then echo '--setting-sources --settings --disable-slash-commands --no-chrome --prompt-suggestions --strict-mcp-config --tools'; exit 0; fi
 printf '%s\n' "$@" > "$0.args"
 cat <<'EOF'
 {"type":"result","subtype":"success","session_id":"s","usage":{"input_tokens":1,"output_tokens":1}}
