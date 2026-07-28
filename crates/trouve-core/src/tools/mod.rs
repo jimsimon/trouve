@@ -3031,7 +3031,11 @@ impl ToolExecutor for LocalToolExecutor {
         .await?;
 
         // Retries and duplicate requests for an immutable revision can reuse
-        // objects already fetched into the shared review repository.
+        // objects already fetched into the shared review repository. Anchor
+        // both objects before returning so later git maintenance cannot prune
+        // commits that arrived only through a now-expired FETCH_HEAD.
+        let base_ref = "refs/remotes/origin/trouve-base";
+        let pull_ref = format!("refs/remotes/origin/trouve-pr-{}", request.pull_number);
         let base_present = run(vec![
             "cat-file".into(),
             "-e".into(),
@@ -3046,7 +3050,20 @@ impl ToolExecutor for LocalToolExecutor {
         ])
         .await
         .is_ok();
-        if !base_present || !head_present {
+        if base_present && head_present {
+            run(vec![
+                "update-ref".into(),
+                base_ref.into(),
+                request.base_sha.clone(),
+            ])
+            .await?;
+            run(vec![
+                "update-ref".into(),
+                pull_ref.clone(),
+                request.head_sha.clone(),
+            ])
+            .await?;
+        } else {
             let pull_ref = format!("refs/remotes/origin/trouve-pr-{}", request.pull_number);
             let fetch_args = vec![
                 "fetch".into(),

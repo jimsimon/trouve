@@ -638,6 +638,24 @@ fn loaded_thread_settings_match(
     })
 }
 
+fn parse_supported_features(result: &Value) -> HashSet<String> {
+    result
+        .get("data")
+        .or_else(|| result.get("features"))
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|feature| {
+            feature
+                .get("name")
+                .or_else(|| feature.get("key"))
+                .or_else(|| feature.get("feature"))
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        })
+        .collect()
+}
+
 /// Split a `<model>@<effort>` id into its parts. Threads created before the
 /// options split stored the chosen effort as an `@` suffix; the effort now
 /// travels in the thread's model options instead.
@@ -3792,6 +3810,29 @@ impl AppServer {
             }
         }
         Ok(())
+    }
+
+    async fn supported_features(&self) -> HashSet<String> {
+        match self
+            .supported_features
+            .get_or_try_init(|| async {
+                self.request("experimentalFeature/list", json!({ "limit": 100 }))
+                    .await
+                    .map(|result| parse_supported_features(&result))
+            })
+            .await
+        {
+            Ok(features) => features.clone(),
+            Err(error) => {
+                // Old app-server schemas may not expose this method. In that
+                // case omit all speculative feature overrides; the isolated
+                // CODEX_HOME still excludes ambient skills/plugins/config.
+                tracing::debug!(
+                    "Codex feature catalog unavailable; omitting feature overrides: {error}"
+                );
+                HashSet::new()
+            }
+        }
     }
 
     async fn handshake(&self) -> Result<(), BackendError> {
@@ -7648,8 +7689,19 @@ for line in sys.stdin:
         turn.mcp_bridge = Some(crate::McpBridgeConfig {
             url: "http://127.0.0.1:1/internal/threads/th_1/mcp?approval=0".into(),
         });
+        let supported_features = [
+            "apps",
+            "hooks",
+            "multi_agent",
+            "plugins",
+            "shell_tool",
+            "unknown_future_feature",
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect();
 
-        let config = mcp_config_override(&turn).unwrap();
+        let config = mcp_config_override(&turn, &supported_features).unwrap();
         assert!(config["web_search"].is_null());
         assert_eq!(
             config["mcp_servers"]
@@ -7659,36 +7711,67 @@ for line in sys.stdin:
                 .collect::<Vec<_>>(),
             vec!["trouve"]
         );
-        for feature in [
-            "apps",
-            "browser_use",
-            "browser_use_external",
-            "computer_use",
-            "current_time_reminder",
-            "goals",
-            "hooks",
-            "image_generation",
-            "memories",
-            "multi_agent",
-            "plugins",
-            "remote_plugin",
-            "skill_mcp_dependency_install",
-            "tool_suggest",
-            "workspace_dependencies",
-        ] {
+        for feature in ["apps", "hooks", "multi_agent", "plugins"] {
             assert_eq!(
                 config["features"][feature], false,
                 "feature {feature} escaped product-surface isolation"
             );
         }
+        // Unsupported schema keys are omitted under --strict-config, while
+        // model-optimized native tools remain enabled by omission.
+        assert!(config["features"]["browser_use"].is_null());
         assert!(config["features"]["shell_tool"].is_null());
-        assert!(config["features"]["shell_snapshot"].is_null());
-        assert_eq!(config["agents"]["enabled"], false);
-        assert_eq!(config["experimental_request_user_input_enabled"], false);
+        assert!(config["features"]["unknown_future_feature"].is_null());
+        assert!(config["agents"].is_null());
+        assert!(config["experimental_request_user_input_enabled"].is_null());
         assert_eq!(
             config["mcp_servers"]["trouve"]["default_tools_approval_mode"],
             "approve"
         );
+    }
+
+    #[test]
+    fn parses_version_specific_feature_catalog_shapes() {
+        assert_eq!(
+            parse_supported_features(&json!({
+                "data": [{"name": "plugins"}, {"key": "multi_agent"}]
+            })),
+            ["plugins", "multi_agent"]
+                .into_iter()
+                .map(str::to_string)
+                .collect()
+        );
+        assert_eq!(
+            parse_supported_features(&json!({
+                "features": [{"feature": "apps"}, {"name": 42}, "bad"]
+            })),
+            ["apps"].into_iter().map(str::to_string).collect()
+        );
+    }
+
+    #[test]
+    fn auth_sync_preserves_refreshes_and_never_overwrites_newer_login() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("source-auth.json");
+        let isolated = temp.path().join("isolated-auth.json");
+        std::fs::write(&source, b"old").unwrap();
+        std::fs::write(&isolated, b"old").unwrap();
+        let sync = AuthSync::new(source.clone(), isolated.clone(), b"old".to_vec());
+
+        std::fs::write(&isolated, b"refreshed").unwrap();
+        sync.sync();
+        assert_eq!(std::fs::read(&source).unwrap(), b"refreshed");
+
+        std::fs::write(&source, b"new-login").unwrap();
+        std::fs::write(&isolated, b"stale-refresh").unwrap();
+        sync.sync();
+        assert_eq!(std::fs::read(&source).unwrap(), b"new-login");
+
+        // Once an external login wins, later isolated changes remain unable
+        // to overwrite it.
+        std::fs::write(&isolated, b"later-stale-refresh").unwrap();
+        sync.sync();
+        assert_eq!(std::fs::read(&source).unwrap(), b"new-login");
     }
 
     #[test]

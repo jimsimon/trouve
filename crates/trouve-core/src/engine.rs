@@ -1123,6 +1123,137 @@ struct ProviderBackoff {
     delay: std::time::Duration,
 }
 
+#[derive(Debug)]
+struct BridgeEchoCall {
+    turn: u64,
+    canonical_call_id: String,
+    tool: String,
+    args: serde_json::Value,
+    vendor_call_id: Option<String>,
+}
+
+/// Trusted correlation state between the MCP request Trouve executes and the
+/// lifecycle echo a vendor harness reports for that same call. Vendor event
+/// names and arguments alone are not authority to suppress cards or approve.
+#[derive(Default)]
+struct BridgeEchoTracker {
+    calls: Mutex<HashMap<String, Vec<BridgeEchoCall>>>,
+    changed: tokio::sync::Notify,
+}
+
+struct BridgeEchoTurn<'a> {
+    tracker: &'a BridgeEchoTracker,
+    thread_id: String,
+    turn: u64,
+}
+
+impl Drop for BridgeEchoTurn<'_> {
+    fn drop(&mut self) {
+        let mut calls = self.tracker.calls.lock().unwrap();
+        if calls
+            .get(&self.thread_id)
+            .is_some_and(|entries| entries.iter().all(|entry| entry.turn == self.turn))
+        {
+            calls.remove(&self.thread_id);
+        } else if let Some(entries) = calls.get_mut(&self.thread_id) {
+            entries.retain(|entry| entry.turn != self.turn);
+            if entries.is_empty() {
+                calls.remove(&self.thread_id);
+            }
+        }
+    }
+}
+
+impl BridgeEchoTracker {
+    fn begin_turn(&self, thread_id: &str, turn: u64) -> BridgeEchoTurn<'_> {
+        self.calls
+            .lock()
+            .unwrap()
+            .insert(thread_id.to_string(), Vec::new());
+        BridgeEchoTurn {
+            tracker: self,
+            thread_id: thread_id.to_string(),
+            turn,
+        }
+    }
+
+    fn register(
+        &self,
+        thread_id: &str,
+        turn: u64,
+        canonical_call_id: &str,
+        tool: &str,
+        args: &serde_json::Value,
+    ) {
+        self.calls
+            .lock()
+            .unwrap()
+            .entry(thread_id.to_string())
+            .or_default()
+            .push(BridgeEchoCall {
+                turn,
+                canonical_call_id: canonical_call_id.to_string(),
+                tool: tool.to_string(),
+                args: args.clone(),
+                vendor_call_id: None,
+            });
+        self.changed.notify_waiters();
+    }
+
+    fn try_claim(
+        &self,
+        thread_id: &str,
+        turn: u64,
+        vendor_call_id: &str,
+        tool: &str,
+        args: &serde_json::Value,
+    ) -> Option<String> {
+        let (tool, args) = trouve_bridge_echo_payload(tool, args)?;
+        self.calls
+            .lock()
+            .unwrap()
+            .get_mut(thread_id)?
+            .iter_mut()
+            .find(|entry| {
+                entry.turn == turn
+                    && entry.tool == tool
+                    && entry.args == args
+                    && entry
+                        .vendor_call_id
+                        .as_deref()
+                        .is_none_or(|claimed| claimed == vendor_call_id)
+            })
+            .map(|entry| {
+                entry.vendor_call_id = Some(vendor_call_id.to_string());
+                entry.canonical_call_id.clone()
+            })
+    }
+
+    async fn claim(
+        &self,
+        thread_id: &str,
+        turn: u64,
+        vendor_call_id: &str,
+        tool: &str,
+        args: &serde_json::Value,
+    ) -> Option<String> {
+        // Some harnesses announce a tool immediately before dispatching its
+        // HTTP MCP request. Give that independently-running request a brief
+        // chance to establish trusted state, without indefinitely stalling
+        // an unmatched vendor-native event.
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            let changed = self.changed.notified();
+            if let Some(call_id) = self.try_claim(thread_id, turn, vendor_call_id, tool, args) {
+                return Some(call_id);
+            }
+            if tokio::time::timeout_at(deadline, changed).await.is_err() {
+                return None;
+            }
+        }
+    }
+}
+
 /// Capacity shared by interactive desktop turns, spawned agents, and
 /// background review personas. Background work has a smaller second gate, so
 /// it can never occupy all global/provider slots and starve the desktop.
@@ -1895,6 +2026,7 @@ pub struct Engine {
     pub(crate) executor: Arc<dyn ToolExecutor>,
     approvals: Arc<ApprovalHub>,
     questions: Arc<QuestionHub>,
+    bridge_echoes: BridgeEchoTracker,
     turn_scheduler: TurnScheduler,
     /// Per-session worktree access. Read-only turns share a read guard;
     /// mutating turns and checkpoint restoration take the
@@ -2358,6 +2490,7 @@ impl Engine {
             executor: Arc::new(LocalToolExecutor::with_mcp_logs(mcp_logs.clone())),
             approvals: Arc::new(ApprovalHub::default()),
             questions: Arc::new(QuestionHub::default()),
+            bridge_echoes: BridgeEchoTracker::default(),
             turn_scheduler: TurnScheduler::new(),
             session_locks: Mutex::new(HashMap::new()),
             session_create_locks: Mutex::new(HashMap::new()),
@@ -13193,11 +13326,16 @@ impl Engine {
                             content: std::mem::take(&mut segment),
                         });
                     }
-                    if is_trouve_bridge_tool_event(&tool, &args) {
+                    if self
+                        .bridge_echoes
+                        .claim(&thread.id, turn, &call_id, &tool, &args)
+                        .await
+                        .is_some()
+                    {
                         // The MCP request itself already produced the one
                         // canonical ToolExecutor card. Vendor lifecycle
-                        // notifications have a different call id and would
-                        // otherwise duplicate it.
+                        // notifications have a different call id; only an
+                        // exact trusted correlation suppresses the echo.
                         ignored_bridge_call_ids.insert(call_id);
                         continue;
                     }
@@ -13558,10 +13696,17 @@ impl Engine {
                         flush_backend_event_batch(&self.store, &scope, &mut persisted).await?;
                         bail!("backend requested approval for {tool} during a tool-free turn");
                     }
-                    if is_trouve_bridge_tool_event(&tool, &args) {
+                    if ignored_bridge_call_ids.contains(&call_id)
+                        || self
+                            .bridge_echoes
+                            .claim(&thread.id, turn, &call_id, &tool, &args)
+                            .await
+                            .is_some()
+                    {
                         // ToolExecutor already applied the canonical gate.
-                        // Approving the vendor's transport-level echo avoids a
-                        // second, provider-specific permission prompt.
+                        // Approve only the correlated transport-level echo,
+                        // never a vendor event that merely claims this shape.
+                        ignored_bridge_call_ids.insert(call_id);
                         let _ = responder.send(true);
                         continue;
                     }
@@ -15504,17 +15649,41 @@ fn annotate_attachments(
     out
 }
 
-/// Identify the vendor lifecycle echo for a call already executed through
-/// Trouve's supplemental bridge. Claude reports the MCP function name
-/// directly; Codex reports a generic item with the server carried separately.
-fn is_trouve_bridge_tool_event(tool: &str, args: &serde_json::Value) -> bool {
-    tool.starts_with("mcp__trouve__")
-        || (tool == "mcpToolCall"
-            && args
-                .get("server")
-                .or_else(|| args.get("serverName"))
-                .and_then(serde_json::Value::as_str)
-                == Some("trouve"))
+/// Extract the canonical MCP tool and arguments from a vendor lifecycle echo.
+/// This only parses the envelope; callers must still correlate it against
+/// [`BridgeEchoTracker`] state established by the trusted MCP execution path.
+fn trouve_bridge_echo_payload(
+    tool: &str,
+    args: &serde_json::Value,
+) -> Option<(String, serde_json::Value)> {
+    if let Some(name) = tool
+        .strip_prefix("mcp__trouve__")
+        .filter(|name| !name.is_empty())
+    {
+        return Some((name.to_string(), args.clone()));
+    }
+    if tool != "mcpToolCall"
+        || args
+            .get("server")
+            .or_else(|| args.get("serverName"))
+            .and_then(serde_json::Value::as_str)
+            != Some("trouve")
+    {
+        return None;
+    }
+    let name = args
+        .get("tool")
+        .or_else(|| args.get("toolName"))
+        .and_then(serde_json::Value::as_str)?;
+    let arguments = args
+        .get("arguments")
+        .cloned()
+        .unwrap_or_else(|| serde_json::json!({}));
+    let arguments = arguments
+        .as_str()
+        .and_then(|encoded| serde_json::from_str(encoded).ok())
+        .unwrap_or(arguments);
+    Some((name.to_string(), arguments))
 }
 
 /// Map provider-native vocabulary onto Trouve's canonical operation families.
@@ -15653,6 +15822,7 @@ fn normalize_vendor_tool_call(tool: &str, args: &serde_json::Value) -> (String, 
         }
         _ => {}
     }
+    let matched_payload = !out.is_empty();
     // ACP titles are useful when the native payload omits a structured
     // command/query, and line hints are added by the engine after this step.
     if let Some(title) = source.get("title") {
@@ -15660,7 +15830,7 @@ fn normalize_vendor_tool_call(tool: &str, args: &serde_json::Value) -> (String, 
     }
     (
         canonical.to_string(),
-        if out.is_empty() {
+        if !matched_payload {
             Value::Object(source.clone())
         } else {
             Value::Object(out)

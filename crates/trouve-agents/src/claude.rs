@@ -123,13 +123,12 @@ fn parse_cli_version(text: &str) -> Option<(u64, u64, u64)> {
 
 async fn certify_optimized_cli(command: &str) -> Result<(), String> {
     let invoke = |arg: &'static str| async move {
-        tokio::time::timeout(
-            Duration::from_secs(5),
-            Command::new(command).arg(arg).stdin(Stdio::null()).output(),
-        )
-        .await
-        .map_err(|_| format!("{command} {arg} timed out"))?
-        .map_err(|e| format!("cannot run {command} {arg}: {e}"))
+        let mut probe = Command::new(command);
+        probe.arg(arg).stdin(Stdio::null()).kill_on_drop(true);
+        tokio::time::timeout(Duration::from_secs(5), probe.output())
+            .await
+            .map_err(|_| format!("{command} {arg} timed out"))?
+            .map_err(|e| format!("cannot run {command} {arg}: {e}"))
     };
     let version_output = invoke("--version").await?;
     if !version_output.status.success() {
