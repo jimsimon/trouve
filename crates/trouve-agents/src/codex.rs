@@ -50,6 +50,10 @@ pub struct CodexBackend {
 
 /// How long a fetched vendor model list stays fresh.
 const MODELS_TTL: std::time::Duration = std::time::Duration::from_secs(300);
+/// A shared credential operation is normally only a read or atomic rename.
+/// If an interactive login owns the lock, callers yield instead of occupying
+/// Tokio's blocking pool until the user finishes the browser flow.
+const AUTH_LOCK_WAIT: std::time::Duration = std::time::Duration::from_millis(100);
 
 /// Product-level capabilities Trouve suppresses when the running Codex
 /// app-server advertises them. The dynamic feature catalog is the schema
@@ -1171,7 +1175,7 @@ struct AuthFileLock {
 }
 
 impl AuthFileLock {
-    fn acquire(source: &Path) -> std::io::Result<Self> {
+    fn open(source: &Path) -> std::io::Result<std::fs::File> {
         let parent = source.parent().ok_or_else(|| {
             std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
@@ -1197,9 +1201,28 @@ impl AuthFileLock {
             use std::os::unix::fs::OpenOptionsExt as _;
             options.mode(0o600);
         }
-        let file = options.open(path)?;
+        options.open(path)
+    }
+
+    fn acquire(source: &Path) -> std::io::Result<Self> {
+        let file = Self::open(source)?;
         file.lock()?;
         Ok(Self { _file: file })
+    }
+
+    fn try_acquire_for(source: &Path, wait: std::time::Duration) -> std::io::Result<Option<Self>> {
+        let file = Self::open(source)?;
+        let deadline = std::time::Instant::now() + wait;
+        loop {
+            match file.try_lock() {
+                Ok(()) => return Ok(Some(Self { _file: file })),
+                Err(std::fs::TryLockError::WouldBlock) if std::time::Instant::now() < deadline => {
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                Err(std::fs::TryLockError::WouldBlock) => return Ok(None),
+                Err(std::fs::TryLockError::Error(error)) => return Err(error),
+            }
+        }
     }
 }
 
@@ -1222,7 +1245,19 @@ fn stage_auth_snapshot(isolated_home: &Path) -> std::io::Result<Option<AuthSync>
     let Some(source) = codex_auth_path() else {
         return Ok(None);
     };
-    let _lock = AuthFileLock::acquire(&source)?;
+    stage_auth_snapshot_from(source, isolated_home)
+}
+
+fn stage_auth_snapshot_from(
+    source: PathBuf,
+    isolated_home: &Path,
+) -> std::io::Result<Option<AuthSync>> {
+    let Some(_lock) = AuthFileLock::try_acquire_for(&source, AUTH_LOCK_WAIT)? else {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::WouldBlock,
+            "Codex credentials are being updated (usually by an interactive login); retry shortly",
+        ));
+    };
     let baseline = match std::fs::read(&source) {
         Ok(bytes) => bytes,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -1267,7 +1302,12 @@ impl AuthSync {
         if isolated == previous {
             return Ok(());
         }
-        let _lock = AuthFileLock::acquire(&self.source)?;
+        let Some(_lock) = AuthFileLock::try_acquire_for(&self.source, AUTH_LOCK_WAIT)? else {
+            tracing::debug!(
+                "Codex auth is busy; deferring this isolated credential refresh until a later sync"
+            );
+            return Ok(());
+        };
         let source = read_auth_or_empty(&self.source)?;
         if source != previous && source != isolated {
             tracing::warn!(
@@ -2057,7 +2097,7 @@ mod tests {
     }
 
     #[test]
-    fn auth_sync_serializes_publishers_on_the_shared_auth_lock() {
+    fn auth_sync_yields_when_the_shared_auth_lock_is_busy() {
         let temp = tempfile::tempdir().unwrap();
         let source = temp.path().join("auth.json");
         let isolated_a = temp.path().join("isolated-a.json");
@@ -2086,32 +2126,59 @@ mod tests {
         a_staged_rx.recv().unwrap();
 
         let (b_started_tx, b_started_rx) = std::sync::mpsc::channel();
-        let (b_staged_tx, b_staged_rx) = std::sync::mpsc::channel();
+        let (b_done_tx, b_done_rx) = std::sync::mpsc::channel();
         let b = {
             let sync = sync_b.clone();
             std::thread::spawn(move || {
                 b_started_tx.send(()).unwrap();
-                sync.sync_with_publish_hook(|| {
-                    b_staged_tx.send(()).unwrap();
-                })
+                let result = sync.sync();
+                b_done_tx.send(()).unwrap();
+                result
             })
         };
         b_started_rx.recv().unwrap();
-        assert_eq!(
-            b_staged_rx.recv_timeout(std::time::Duration::from_millis(200)),
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout)
-        );
+        b_done_rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("a pending login must not stall a competing refresh");
+        assert_eq!(std::fs::read(&source).unwrap(), b"old");
 
         release_a_tx.send(()).unwrap();
         a.join().unwrap().unwrap();
         b.join().unwrap().unwrap();
         assert_eq!(std::fs::read(&source).unwrap(), b"refresh-a");
 
-        // The second publisher observed A's committed source under the lock
-        // and permanently stood down instead of overwriting it later.
+        // B kept its old baseline when it yielded. Its retry observes A's
+        // committed source and stands down instead of overwriting it.
         std::fs::write(&isolated_b, b"later-refresh-b").unwrap();
         sync_b.sync().unwrap();
         assert_eq!(std::fs::read(&source).unwrap(), b"refresh-a");
+    }
+
+    #[test]
+    fn auth_snapshot_fails_fast_while_an_interactive_login_owns_the_lock() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("auth.json");
+        let isolated_home = temp.path().join("isolated-home");
+        std::fs::write(&source, b"old").unwrap();
+        std::fs::create_dir(&isolated_home).unwrap();
+        let login_lock = AuthFileLock::acquire(&source).unwrap();
+
+        let started = std::time::Instant::now();
+        let error = match stage_auth_snapshot_from(source.clone(), &isolated_home) {
+            Err(error) => error,
+            Ok(_) => panic!("snapshot unexpectedly acquired the interactive login lock"),
+        };
+        assert_eq!(error.kind(), std::io::ErrorKind::WouldBlock);
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(1),
+            "snapshot waited for an interactive login instead of yielding"
+        );
+
+        drop(login_lock);
+        let snapshot = stage_auth_snapshot_from(source, &isolated_home)
+            .unwrap()
+            .expect("snapshot should succeed after login releases the lock");
+        assert_eq!(std::fs::read(snapshot.isolated).unwrap(), b"old");
     }
 
     #[test]
