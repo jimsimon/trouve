@@ -7759,19 +7759,26 @@ for line in sys.stdin:
         let sync = AuthSync::new(source.clone(), isolated.clone(), b"old".to_vec());
 
         std::fs::write(&isolated, b"refreshed").unwrap();
-        sync.sync();
+        sync.sync().unwrap();
         assert_eq!(std::fs::read(&source).unwrap(), b"refreshed");
 
         std::fs::write(&source, b"new-login").unwrap();
         std::fs::write(&isolated, b"stale-refresh").unwrap();
-        sync.sync();
+        sync.sync().unwrap();
         assert_eq!(std::fs::read(&source).unwrap(), b"new-login");
 
         // Once an external login wins, later isolated changes remain unable
         // to overwrite it.
         std::fs::write(&isolated, b"later-stale-refresh").unwrap();
-        sync.sync();
+        sync.sync().unwrap();
         assert_eq!(std::fs::read(&source).unwrap(), b"new-login");
+
+        std::fs::remove_file(&isolated).unwrap();
+        let missing = AuthSync::new(source, isolated, b"old".to_vec());
+        assert_eq!(
+            missing.sync().unwrap_err().kind(),
+            std::io::ErrorKind::NotFound
+        );
     }
 
     #[test]
