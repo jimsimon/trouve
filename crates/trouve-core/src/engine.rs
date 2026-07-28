@@ -253,6 +253,29 @@ fn inherit_thinking_option(
     }
 }
 
+fn thinking_option_property(
+    model: &trouve_protocol::ModelInfo,
+) -> Option<(&'static str, &serde_json::Value, &[serde_json::Value])> {
+    THINKING_OPTION_KEYS.iter().find_map(|key| {
+        let property = model
+            .options_schema
+            .pointer(&format!("/properties/{key}"))?;
+        let values = property["enum"].as_array()?;
+        (values.len() > 1).then_some((*key, property, values.as_slice()))
+    })
+}
+
+pub(crate) fn advertised_thinking_levels(model: &trouve_protocol::ModelInfo) -> Vec<&str> {
+    thinking_option_property(model)
+        .map(|(_, _, values)| {
+            values
+                .iter()
+                .filter_map(serde_json::Value::as_str)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 /// Resolve the canonical inherited `thinking_level` key through a model's
 /// advertised options schema. Unknown/unsupported levels fall back to the
 /// model's schema default; models without an enum thinking knob drop the
@@ -264,15 +287,7 @@ fn normalize_thinking_option(
     let Some(canonical) = options.get("thinking_level").cloned() else {
         return;
     };
-    let property = model.and_then(|model| {
-        THINKING_OPTION_KEYS.iter().find_map(|key| {
-            let property = model
-                .options_schema
-                .pointer(&format!("/properties/{key}"))?;
-            let values = property["enum"].as_array()?;
-            (values.len() > 1).then_some((*key, property, values))
-        })
-    });
+    let property = model.and_then(thinking_option_property);
     let Some((key, property, values)) = property else {
         options.remove("thinking_level");
         return;
@@ -4233,6 +4248,35 @@ impl Engine {
                 ))
             })?;
         Ok((provider, model_name.to_string()))
+    }
+
+    pub(crate) async fn resolve_model_info(
+        &self,
+        model: &str,
+    ) -> Result<trouve_protocol::ModelInfo, EngineError> {
+        if let Some((_, backend, _)) = self.backend_for(model) {
+            return backend
+                .list_models()
+                .await
+                .into_iter()
+                .find(|candidate| candidate.id == model)
+                .ok_or_else(|| {
+                    EngineError::BadRequest(format!(
+                        "model {model} is not available from its configured provider"
+                    ))
+                });
+        }
+        let (provider, _) = self.resolve_provider(model)?;
+        let live = provider.list_models().await;
+        let known = provider.models();
+        live.into_iter()
+            .chain(known)
+            .find(|candidate| candidate.id == model)
+            .ok_or_else(|| {
+                EngineError::BadRequest(format!(
+                    "model {model} is not available from its configured provider"
+                ))
+            })
     }
 
     // --- approvals ------------------------------------------------------------

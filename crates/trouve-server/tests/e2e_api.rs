@@ -3814,10 +3814,52 @@ async fn offline_filters_models_and_reports_connectivity() {
 
 #[tokio::test]
 async fn code_review_dashboard_and_repository_policy_round_trip() {
+    struct ReviewRouterProvider;
+
+    #[async_trait::async_trait]
+    impl Provider for ReviewRouterProvider {
+        fn id(&self) -> &str {
+            "anthropic"
+        }
+
+        fn models(&self) -> Vec<trouve_protocol::ModelInfo> {
+            vec![trouve_protocol::ModelInfo {
+                id: "anthropic/claude".into(),
+                display_name: "Claude".into(),
+                context_window: 100_000,
+                supports_tools: true,
+                input_price_per_mtok: None,
+                output_price_per_mtok: None,
+                options_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "reasoning_effort": {
+                            "type": "string",
+                            "enum": ["low", "high"],
+                            "default": "low"
+                        }
+                    }
+                }),
+            }]
+        }
+
+        async fn stream_chat(
+            &self,
+            _model: &str,
+            _messages: &[Message],
+            _tools: &[ToolSpec],
+            _options: &serde_json::Map<String, serde_json::Value>,
+        ) -> Result<EventStream, ProviderError> {
+            unreachable!("repository round-trip validation never starts a model turn")
+        }
+    }
+
     let tmp = tempfile::tempdir().unwrap();
     let store = Store::open(&tmp.path().join("db/trouve.db")).unwrap();
     let engine = Arc::new(
-        Engine::new(store, tmp.path().join("data"), &Config::default()).with_config_dir(None),
+        Engine::new(store, tmp.path().join("data"), &Config::default())
+            .with_config_dir(None)
+            .with_provider("anthropic", Arc::new(ReviewRouterProvider)),
     );
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();

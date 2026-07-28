@@ -900,7 +900,7 @@ async fn update_code_review_repository(
     State(engine): State<Arc<Engine>>,
     Json(request): Json<UpdateCodeReviewRepositoryRequest>,
 ) -> Result<Json<CodeReviewRepository>, ApiError> {
-    Ok(Json(engine.update_code_review_repository(&request)?))
+    Ok(Json(engine.update_code_review_repository(&request).await?))
 }
 
 #[utoipa::path(post, path = "/v1/code-review/refresh",

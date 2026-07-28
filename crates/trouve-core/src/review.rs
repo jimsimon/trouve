@@ -1699,7 +1699,7 @@ impl Engine {
         Ok(())
     }
 
-    pub fn update_code_review_repository(
+    pub async fn update_code_review_repository(
         &self,
         request: &UpdateCodeReviewRepositoryRequest,
     ) -> Result<CodeReviewRepository, EngineError> {
@@ -1746,6 +1746,29 @@ impl Engine {
             .as_ref()
             .map(|level| level.trim().to_string())
             .filter(|level| !level.is_empty());
+        if let Some(level) = router_thinking_level.as_deref() {
+            let selected_model = router_model
+                .as_deref()
+                .or(model.as_deref())
+                .ok_or_else(|| {
+                    EngineError::BadRequest(
+                        "router thinking level requires a configured router or review model".into(),
+                    )
+                })?;
+            let model_info = self.resolve_model_info(selected_model).await?;
+            let supported = crate::engine::advertised_thinking_levels(&model_info);
+            if !supported.contains(&level) {
+                let detail = if supported.is_empty() {
+                    "it does not advertise configurable thinking levels".into()
+                } else {
+                    format!("supported levels: {}", supported.join(", "))
+                };
+                return Err(EngineError::BadRequest(format!(
+                    "router thinking level {level:?} is not supported by model \
+                     {selected_model:?}; {detail}"
+                )));
+            }
+        }
         let existing = self
             .store
             .list_code_review_repositories()?
@@ -5551,6 +5574,57 @@ fn merge_review_task_metrics(
 mod tests {
     use super::*;
 
+    struct RouterThinkingProvider;
+
+    #[async_trait::async_trait]
+    impl trouve_providers::Provider for RouterThinkingProvider {
+        fn id(&self) -> &str {
+            "provider"
+        }
+
+        fn models(&self) -> Vec<trouve_protocol::ModelInfo> {
+            vec![
+                trouve_protocol::ModelInfo {
+                    id: "provider/router".into(),
+                    display_name: "Router".into(),
+                    context_window: 100_000,
+                    supports_tools: true,
+                    input_price_per_mtok: None,
+                    output_price_per_mtok: None,
+                    options_schema: serde_json::json!({
+                        "type": "object",
+                        "properties": {
+                            "reasoning_effort": {
+                                "type": "string",
+                                "enum": ["low", "high"],
+                                "default": "low"
+                            }
+                        }
+                    }),
+                },
+                trouve_protocol::ModelInfo {
+                    id: "provider/plain".into(),
+                    display_name: "Plain".into(),
+                    context_window: 100_000,
+                    supports_tools: true,
+                    input_price_per_mtok: None,
+                    output_price_per_mtok: None,
+                    options_schema: serde_json::json!({}),
+                },
+            ]
+        }
+
+        async fn stream_chat(
+            &self,
+            _model: &str,
+            _messages: &[trouve_providers::Message],
+            _tools: &[trouve_providers::ToolSpec],
+            _options: &serde_json::Map<String, serde_json::Value>,
+        ) -> Result<trouve_providers::EventStream, trouve_providers::ProviderError> {
+            unreachable!("repository validation never starts a model turn")
+        }
+    }
+
     fn enqueue_test_review_job(
         store: &crate::store::Store,
         dedupe_key: &str,
@@ -6773,8 +6847,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn enabled_review_requires_an_explicit_model() {
+    #[tokio::test]
+    async fn enabled_review_requires_an_explicit_model() {
         let data = tempfile::tempdir().unwrap();
         let store = crate::store::Store::open_in_memory().unwrap();
         store
@@ -6801,6 +6875,7 @@ mod tests {
                 excluded_reviewer_ids: None,
                 reviewer_overrides: None,
             })
+            .await
             .unwrap_err();
         assert!(
             error
@@ -6809,8 +6884,76 @@ mod tests {
         );
     }
 
-    #[test]
-    fn repository_routing_policy_validation_rejects_invalid_selections() {
+    #[tokio::test]
+    async fn repository_router_thinking_level_must_match_selected_model() {
+        let data = tempfile::tempdir().unwrap();
+        let store = crate::store::Store::open_in_memory().unwrap();
+        store
+            .upsert_discovered_code_review_repository(7, "acme/widgets", false)
+            .unwrap();
+        let engine = Engine::new(
+            store,
+            data.path().to_path_buf(),
+            &crate::config::Config::default(),
+        )
+        .with_provider("provider", Arc::new(RouterThinkingProvider));
+        let request =
+            |router_model: Option<&str>, level: Option<&str>| UpdateCodeReviewRepositoryRequest {
+                installation_id: 7,
+                repository: "acme/widgets".into(),
+                mode: CodeReviewMode::Automatic,
+                model: Some("provider/router".into()),
+                router_model: router_model.map(str::to_owned),
+                router_thinking_level: level.map(str::to_owned),
+                prompt: String::new(),
+                reviewer_ids: Some(crate::reviewers::default_reviewer_ids()),
+                routing_mode: Some(CodeReviewRoutingMode::Auto),
+                semantic_routing: Some(true),
+                included_reviewer_ids: Some(Vec::new()),
+                excluded_reviewer_ids: Some(Vec::new()),
+                reviewer_overrides: Some(Vec::new()),
+            };
+
+        let saved = engine
+            .update_code_review_repository(&request(None, Some(" low ")))
+            .await
+            .unwrap();
+        assert_eq!(saved.router_thinking_level.as_deref(), Some("low"));
+
+        let error = engine
+            .update_code_review_repository(&request(None, Some("xhigh")))
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("supported levels: low, high"));
+        let unchanged = engine
+            .store
+            .list_code_review_repositories()
+            .unwrap()
+            .into_iter()
+            .find(|repository| repository.repository == "acme/widgets")
+            .unwrap();
+        assert_eq!(unchanged.router_thinking_level.as_deref(), Some("low"));
+
+        let error = engine
+            .update_code_review_repository(&request(Some("provider/plain"), Some("low")))
+            .await
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("does not advertise configurable thinking levels")
+        );
+
+        let saved = engine
+            .update_code_review_repository(&request(Some("provider/plain"), Some("  ")))
+            .await
+            .unwrap();
+        assert_eq!(saved.router_model.as_deref(), Some("provider/plain"));
+        assert!(saved.router_thinking_level.is_none());
+    }
+
+    #[tokio::test]
+    async fn repository_routing_policy_validation_rejects_invalid_selections() {
         let data = tempfile::tempdir().unwrap();
         let store = crate::store::Store::open_in_memory().unwrap();
         store
@@ -6836,30 +6979,37 @@ mod tests {
             excluded_reviewer_ids: Some(Vec::new()),
             reviewer_overrides: Some(Vec::new()),
         };
-        let rejected = |request: UpdateCodeReviewRepositoryRequest, expected: &str| {
-            let error = engine.update_code_review_repository(&request).unwrap_err();
+        async fn rejected(
+            engine: &Engine,
+            request: UpdateCodeReviewRepositoryRequest,
+            expected: &str,
+        ) {
+            let error = engine
+                .update_code_review_repository(&request)
+                .await
+                .unwrap_err();
             assert!(
                 error.to_string().contains(expected),
                 "expected {expected:?}, got {error}"
             );
-        };
+        }
 
         let mut invalid = request();
         invalid.reviewer_ids = Some(Vec::new());
-        rejected(invalid, "must select at least one reviewer");
+        rejected(&engine, invalid, "must select at least one reviewer").await;
 
         let mut invalid = request();
         invalid.included_reviewer_ids = Some(vec!["missing".into()]);
-        rejected(invalid, "unknown reviewer id");
+        rejected(&engine, invalid, "unknown reviewer id").await;
 
         let mut invalid = request();
         invalid.excluded_reviewer_ids = Some(vec!["missing".into()]);
-        rejected(invalid, "unknown reviewer id");
+        rejected(&engine, invalid, "unknown reviewer id").await;
 
         let mut invalid = request();
         invalid.included_reviewer_ids = Some(vec!["correctness".into()]);
         invalid.excluded_reviewer_ids = Some(vec!["correctness".into()]);
-        rejected(invalid, "cannot be both included and excluded");
+        rejected(&engine, invalid, "cannot be both included and excluded").await;
 
         let catalog_ids = engine
             .code_review_reviewer_catalog()
@@ -6871,7 +7021,7 @@ mod tests {
             let mut invalid = request();
             invalid.routing_mode = Some(routing_mode);
             invalid.excluded_reviewer_ids = Some(catalog_ids.clone());
-            rejected(invalid, "cannot exclude every reviewer");
+            rejected(&engine, invalid, "cannot exclude every reviewer").await;
         }
     }
 
