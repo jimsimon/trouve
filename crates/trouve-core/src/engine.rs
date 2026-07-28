@@ -10739,6 +10739,7 @@ impl Engine {
                     thread,
                     turn,
                     &mode,
+                    &ctx,
                     &backend_id,
                     backend,
                     model_name,
@@ -12671,6 +12672,7 @@ impl Engine {
         thread: &Thread,
         turn: u64,
         mode: &AgentPersona,
+        ctx: &ToolCtx,
         backend_id: &str,
         backend: Arc<dyn AgentBackend>,
         model_name: String,
@@ -13290,8 +13292,11 @@ impl Engine {
                         .map_err(anyhow::Error::msg)?;
                     if tools_enabled {
                         flush_backend_event_batch(&self.store, &scope, &mut persisted).await?;
-                        self.store
-                            .set_backend_session(&thread.id, backend_id, &session_id)?;
+                        self.store.set_backend_session(
+                            &thread.id,
+                            &backend_session_key,
+                            &session_id,
+                        )?;
                     }
                 }
                 BackendEvent::TextDelta(delta) => {
@@ -13405,15 +13410,15 @@ impl Engine {
                     // Snippet edits carry no position; the worktree file is
                     // still un-edited at announcement time, so resolve line
                     // hints now for the UI's diff gutter.
-                    annotate_edit_lines(Path::new(&session.worktree_path), &mut args);
+                    annotate_edit_lines(Path::new(&session.worktree_path), &mut display_args);
                     if seen_tool_cards.insert(call_id.clone())
                         && !self.tool_card_exists(&thread.id, turn, &call_id)
                     {
                         persisted.push(Event::ToolRequested {
                             turn,
                             call_id: call_id.clone(),
-                            tool,
-                            args,
+                            tool: display_tool,
+                            args: display_args,
                             requires_approval: false,
                         });
                     }
@@ -13715,10 +13720,14 @@ impl Engine {
                     };
                     backend_mutation_permits.remove(&call_id);
 
+                    let normalized_result = tool_calls
+                        .get(&call_id)
+                        .map(|(tool, _, _)| normalize_vendor_tool_result(tool, &result))
+                        .unwrap_or(result);
                     let mut completion_events = vec![Event::ToolCompleted {
                         call_id,
                         status,
-                        result,
+                        result: normalized_result,
                         execution_duration_ms,
                     }];
                     if let Some(todos) = todos {

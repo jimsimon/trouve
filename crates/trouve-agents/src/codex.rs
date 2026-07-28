@@ -592,10 +592,24 @@ impl AgentBackend for CodexBackend {
     }
 }
 
-/// Codex config overrides enabling raw reasoning when available and mounting
-/// the trouve MCP bridge plus the user's configured MCP servers as per-thread
-/// MCP servers (same shape as `mcp_servers` in codex's config.toml).
+/// Codex config overrides enabling raw reasoning when available.
 fn codex_config_override(turn: &crate::BackendTurn) -> Value {
+    let mut config = json!({ "show_raw_agent_reasoning": true });
+    if let Some(mcp_config) = mcp_config_override(turn, &HashSet::new())
+        && let (Some(config), Some(mcp)) = (config.as_object_mut(), mcp_config.as_object())
+    {
+        config.extend(mcp.clone());
+    }
+    config
+}
+
+/// Per-thread MCP mounts in Codex's config.toml shape. When the Trouve bridge
+/// is present, overlapping ambient product capabilities stand down while
+/// Codex's optimized shell, patch, image, and web tools remain enabled.
+fn mcp_config_override(
+    turn: &crate::BackendTurn,
+    supported_features: &HashSet<String>,
+) -> Option<Value> {
     let env_map = |env: &[(String, String)]| -> serde_json::Map<String, Value> {
         env.iter()
             .map(|(k, v)| (k.clone(), Value::String(v.clone())))
@@ -631,11 +645,21 @@ fn codex_config_override(turn: &crate::BackendTurn) -> Value {
             }),
         );
     }
-    let mut config = json!({ "show_raw_agent_reasoning": true });
-    if !servers.is_empty() {
-        config["mcp_servers"] = Value::Object(servers);
+    if servers.is_empty() {
+        return None;
     }
-    config
+    let mut config = json!({ "mcp_servers": servers });
+    if turn.mcp_bridge.is_some() {
+        let features: serde_json::Map<String, Value> = PRODUCT_SURFACE_FEATURES
+            .iter()
+            .filter(|name| supported_features.contains(**name))
+            .map(|name| ((*name).to_string(), Value::Bool(false)))
+            .collect();
+        if !features.is_empty() {
+            config["features"] = Value::Object(features);
+        }
+    }
+    Some(config)
 }
 
 fn thread_mcp_config(config: &Value) -> Value {
@@ -1703,6 +1727,9 @@ fn turn_stream(
                 .cleanup_active_turn_best_effort(&codex_thread_id, &codex_turn_id, "unroutable")
                 .await;
         }
+        // OAuth refreshes are rare; preserve any rotated credentials once per
+        // turn instead of reading both auth files after every JSON-RPC reply.
+        server.sync_auth().await;
         server.unsubscribe(&codex_thread_id, &route_tx).await;
         if let Err(error) = server.release_thread(&codex_thread_id).await {
             tracing::warn!(
@@ -4478,6 +4505,23 @@ async fn remove_route(routing: &Routing, thread_id: &str, expected: &RouteSender
         .lock()
         .await
         .remove_route_if_same(thread_id, expected, false);
+}
+
+impl Drop for AppServer {
+    fn drop(&mut self) {
+        if let Some(auth_sync) = &self.auth_sync
+            && let Err(error) = auth_sync.sync()
+        {
+            tracing::warn!("Codex credential sync failed during shutdown: {error}");
+        }
+    }
+}
+
+fn codex_auth_path() -> Option<std::path::PathBuf> {
+    std::env::var_os("CODEX_HOME")
+        .map(std::path::PathBuf::from)
+        .or_else(|| dirs::home_dir().map(|home| home.join(".codex")))
+        .map(|home| home.join("auth.json"))
 }
 
 #[cfg(test)]

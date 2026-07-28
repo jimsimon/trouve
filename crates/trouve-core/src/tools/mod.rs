@@ -1580,6 +1580,13 @@ async fn run_review_command_with_timeout(
     }
 }
 
+#[derive(Debug, Clone)]
+pub struct AttachmentStage {
+    pub attachment: trouve_protocol::Attachment,
+    pub source: PathBuf,
+    pub relative_path: PathBuf,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReviewDiffFile {
     pub path: String,

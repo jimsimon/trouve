@@ -20,6 +20,7 @@ pub mod process_env;
 mod route;
 
 use std::collections::VecDeque;
+use std::fmt;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
