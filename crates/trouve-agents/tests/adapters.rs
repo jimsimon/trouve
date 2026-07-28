@@ -1038,6 +1038,176 @@ cat > /dev/null
 }
 
 #[tokio::test]
+async fn codex_adapter_interrupts_turn_when_stream_is_dropped() {
+    let tmp = tempfile::tempdir().unwrap();
+    let stub = write_stub(
+        tmp.path(),
+        "codex-cancel",
+        r#"#!/bin/bash
+IFS= read -r line # initialize
+echo '{"jsonrpc":"2.0","id":1,"result":{}}'
+IFS= read -r line # initialized notification
+IFS= read -r line # thread/start
+echo '{"jsonrpc":"2.0","id":2,"result":{"thread":{"id":"thr-1"}}}'
+IFS= read -r line # turn/start
+echo '{"jsonrpc":"2.0","id":3,"result":{"turn":{"id":"turn-1"}}}'
+while IFS= read -r interrupt; do
+    if [[ "$interrupt" == *'"method":"turn/interrupt"'* ]]; then
+        printf '%s\n' "$interrupt" > "$0.interrupt.tmp"
+        mv "$0.interrupt.tmp" "$0.interrupt"
+        echo '{"jsonrpc":"2.0","id":4,"result":{}}'
+        break
+    fi
+done
+cat > /dev/null
+"#,
+    );
+    let backend = CodexBackend::new("codex", Some(stub.clone()));
+    let stream = start_turn(&backend, || {
+        turn(tmp.path().to_path_buf(), None, BackendPermission::Ask)
+    })
+    .await;
+
+    drop(stream);
+
+    let deadline = std::time::Duration::from_secs(2);
+    let interrupt_path = std::path::PathBuf::from(format!("{stub}.interrupt"));
+    tokio::time::timeout(deadline, async {
+        while !interrupt_path.exists() {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("dropping a Codex stream must interrupt its vendor turn");
+
+    let interrupt: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(interrupt_path).unwrap()).unwrap();
+    assert_eq!(interrupt["method"], "turn/interrupt");
+    assert_eq!(interrupt["params"]["threadId"], "thr-1");
+    assert_eq!(interrupt["params"]["turnId"], "turn-1");
+}
+
+#[tokio::test]
+async fn codex_adapter_ignores_late_events_from_cancelled_turn() {
+    let tmp = tempfile::tempdir().unwrap();
+    let stub = write_stub(
+        tmp.path(),
+        "codex-late-events",
+        r#"#!/bin/bash
+IFS= read -r line # initialize
+echo '{"jsonrpc":"2.0","id":1,"result":{}}'
+IFS= read -r line # initialized notification
+IFS= read -r line # thread/start
+echo '{"jsonrpc":"2.0","id":2,"result":{"thread":{"id":"thr-1"}}}'
+IFS= read -r line # first turn/start
+echo '{"jsonrpc":"2.0","id":3,"result":{"turn":{"id":"turn-1"}}}'
+IFS= read -r line # first turn/interrupt
+printf '%s\n' "$line" > "$0.interrupt.tmp"
+mv "$0.interrupt.tmp" "$0.interrupt"
+echo '{"jsonrpc":"2.0","id":4,"result":{}}'
+IFS= read -r line # thread/resume
+echo '{"jsonrpc":"2.0","id":5,"result":{"thread":{"id":"thr-1"}}}'
+IFS= read -r line # replacement turn/start
+echo '{"jsonrpc":"2.0","id":6,"result":{"turn":{"id":"turn-2"}}}'
+echo '{"jsonrpc":"2.0","method":"item/agentMessage/delta","params":{"threadId":"thr-1","turnId":"turn-1","delta":"stale"}}'
+echo '{"jsonrpc":"2.0","method":"turn/completed","params":{"threadId":"thr-1","turn":{"id":"turn-1","status":"completed"}}}'
+echo '{"jsonrpc":"2.0","method":"item/agentMessage/delta","params":{"threadId":"thr-1","turnId":"turn-2","delta":"replacement"}}'
+echo '{"jsonrpc":"2.0","method":"turn/completed","params":{"threadId":"thr-1","turn":{"id":"turn-2","status":"completed"}}}'
+cat > /dev/null
+"#,
+    );
+    let backend = CodexBackend::new("codex", Some(stub.clone()));
+    let first = start_turn(&backend, || {
+        turn(tmp.path().to_path_buf(), None, BackendPermission::Ask)
+    })
+    .await;
+    drop(first);
+
+    let interrupt_path = std::path::PathBuf::from(format!("{stub}.interrupt"));
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        while !interrupt_path.exists() {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("cancelled turn must be interrupted before its replacement starts");
+
+    let mut replacement = start_turn(&backend, || {
+        turn(
+            tmp.path().to_path_buf(),
+            Some("thr-1"),
+            BackendPermission::Ask,
+        )
+    })
+    .await;
+    let mut text = String::new();
+    let mut completed = 0;
+    while let Some(event) = replacement.next().await {
+        match event.unwrap() {
+            BackendEvent::TextDelta(delta) => text.push_str(&delta),
+            BackendEvent::Completed { .. } => completed += 1,
+            _ => {}
+        }
+    }
+
+    assert_eq!(text, "replacement");
+    assert_eq!(completed, 1);
+}
+
+#[tokio::test]
+async fn codex_adapter_aborts_replacement_when_predecessor_interrupt_fails() {
+    let tmp = tempfile::tempdir().unwrap();
+    let stub = write_stub(
+        tmp.path(),
+        "codex-interrupt-failure",
+        r#"#!/bin/bash
+IFS= read -r line # initialize
+echo '{"jsonrpc":"2.0","id":1,"result":{}}'
+IFS= read -r line # initialized notification
+IFS= read -r line # thread/start
+echo '{"jsonrpc":"2.0","id":2,"result":{"thread":{"id":"thr-1"}}}'
+IFS= read -r line # first turn/start
+echo '{"jsonrpc":"2.0","id":3,"result":{"turn":{"id":"turn-1"}}}'
+IFS= read -r line # replacement thread/resume
+echo '{"jsonrpc":"2.0","id":4,"result":{"thread":{"id":"thr-1"}}}'
+IFS= read -r line # predecessor turn/interrupt
+printf '%s\n' "$line" > "$0.interrupt"
+echo '{"jsonrpc":"2.0","id":5,"error":{"message":"cannot interrupt predecessor"}}'
+echo '{"jsonrpc":"2.0","method":"turn/completed","params":{"threadId":"thr-1","turn":{"id":"turn-1","status":"completed"}}}'
+cat > /dev/null
+"#,
+    );
+    let backend = CodexBackend::new("codex", Some(stub.clone()));
+    let mut first = start_turn(&backend, || {
+        turn(tmp.path().to_path_buf(), None, BackendPermission::Ask)
+    })
+    .await;
+
+    let replacement = backend
+        .run_turn(turn(
+            tmp.path().to_path_buf(),
+            Some("thr-1"),
+            BackendPermission::Ask,
+        ))
+        .await;
+    let error = match replacement {
+        Ok(_) => panic!("replacement must not start after an interrupt failure"),
+        Err(error) => error.to_string(),
+    };
+    assert!(error.contains("cannot interrupt predecessor"), "{error}");
+
+    let interrupt: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(format!("{stub}.interrupt")).unwrap())
+            .unwrap();
+    assert_eq!(interrupt["method"], "turn/interrupt");
+    assert_eq!(interrupt["params"]["turnId"], "turn-1");
+
+    while let Some(event) = first.next().await {
+        event.unwrap();
+    }
+}
+
+#[tokio::test]
 async fn claude_adapter_wires_mcp_tool_bridge() {
     let tmp = tempfile::tempdir().unwrap();
     let stub = write_stub(

@@ -261,6 +261,13 @@ impl AgentBackend for CodexBackend {
             }
         };
 
+        // A cancelled trouve stream may still have a live vendor turn if the
+        // app-server was blocked in a model or tool request when its consumer
+        // disappeared. Await its interruption before starting a replacement;
+        // otherwise Codex folds the new prompt into the old turn and its late
+        // completion is misattributed to the replacement.
+        let _lifecycle = server.lock_turn_lifecycle(&codex_thread_id).await;
+        server.interrupt_active_turn(&codex_thread_id).await?;
         let route = server.subscribe(&codex_thread_id).await;
 
         // Mode instructions (which include the search-tool guidance when
@@ -291,8 +298,23 @@ impl AgentBackend for CodexBackend {
             turn_params["model"] = json!(model_name);
         }
         apply_reasoning_options(&mut turn_params, effort);
-        let started_turn = server.request("turn/start", turn_params).await?;
-        let codex_turn_id = turn_id_of(&started_turn)?;
+        let started_turn = match server.request("turn/start", turn_params).await {
+            Ok(started) => started,
+            Err(error) => {
+                server.unsubscribe(&codex_thread_id, &route.tx).await;
+                return Err(error);
+            }
+        };
+        let codex_turn_id = match turn_id_of(&started_turn) {
+            Ok(turn_id) => turn_id,
+            Err(error) => {
+                server.unsubscribe(&codex_thread_id, &route.tx).await;
+                return Err(error);
+            }
+        };
+        server
+            .register_active_turn(&codex_thread_id, &codex_turn_id)
+            .await;
 
         let stream = turn_stream(
             server.clone(),
@@ -427,12 +449,16 @@ fn turn_stream(
     server: Arc<AppServer>,
     codex_thread_id: String,
     codex_turn_id: String,
-    mut route: RouteReceiver<ServerMsg>,
+    route: RouteSubscription,
     fresh_session: bool,
     model_name: String,
     observed_windows: Arc<std::sync::Mutex<HashMap<String, u64>>>,
 ) -> impl futures::Stream<Item = Result<BackendEvent, BackendError>> {
     async_stream(move |tx| async move {
+        let RouteSubscription {
+            tx: route_tx,
+            mut rx,
+        } = route;
         if fresh_session {
             let _ = tx
                 .send(Ok(BackendEvent::SessionStarted {
@@ -448,10 +474,15 @@ fn turn_stream(
         // twice.
         let mut streamed_reasoning = HashSet::new();
         let mut turn_finished = false;
+        let mut client_gone = false;
         let mut route_overloaded = false;
-        let mut overload_signal = route.overload_signal();
+        let mut overload_signal = rx.overload_signal();
         let process_route = async {
-            while let Some(msg) = route.recv().await {
+            while let Some(msg) = rx.recv().await {
+                if message_turn_id(&msg).is_some_and(|turn_id| turn_id != codex_turn_id) {
+                    tracing::warn!("codex: ignoring event for stale turn on {codex_thread_id}");
+                    continue;
+                }
                 match msg {
                     ServerMsg::Notification { method, params } => match method.as_str() {
                         "item/agentMessage/delta" => {
@@ -546,6 +577,12 @@ fn turn_stream(
                             }
                         }
                         "turn/completed" => {
+                            // Publish completion only after active-turn cleanup
+                            // is serialized with any replacement startup.
+                            let _lifecycle = server.lock_turn_lifecycle(&codex_thread_id).await;
+                            server
+                                .clear_active_turn(&codex_thread_id, &codex_turn_id)
+                                .await;
                             turn_finished = true;
                             let status = params["turn"]["status"].as_str().unwrap_or("completed");
                             if status == "failed" {
@@ -636,12 +673,24 @@ fn turn_stream(
         };
         tokio::select! {
             biased;
+            _ = tx.closed() => {
+                client_gone = true;
+            }
             _ = overload_signal.wait() => {
                 route_overloaded = true;
             }
             _ = process_route => {}
         }
-        if route_overloaded {
+        let _cleanup_lifecycle = if turn_finished {
+            None
+        } else {
+            Some(server.lock_turn_lifecycle(&codex_thread_id).await)
+        };
+        if client_gone {
+            server
+                .cleanup_active_turn_best_effort(&codex_thread_id, &codex_turn_id, "cancelled")
+                .await;
+        } else if route_overloaded {
             let _ = tx
                 .send(Err(BackendError::Protocol(format!(
                     "app-server event backlog exceeded the per-turn limit of \
@@ -652,20 +701,9 @@ fn turn_stream(
             // request that `process_route` may have been awaiting when the
             // overload signal won the select. Report the overload first so
             // an unresponsive app-server cannot suppress the stream error.
-            if let Err(error) = server
-                .request(
-                    "turn/interrupt",
-                    json!({
-                        "threadId": codex_thread_id.clone(),
-                        "turnId": codex_turn_id.clone(),
-                    }),
-                )
-                .await
-            {
-                tracing::warn!(
-                    "codex: failed to interrupt overloaded turn {codex_turn_id}: {error}"
-                );
-            }
+            server
+                .cleanup_active_turn_best_effort(&codex_thread_id, &codex_turn_id, "overloaded")
+                .await;
         } else if !turn_finished {
             let reason = if server.is_closed() {
                 "app-server closed before turn completed"
@@ -674,8 +712,19 @@ fn turn_stream(
             };
             let _ = tx.send(Err(BackendError::Protocol(reason.into()))).await;
         }
-        server.unsubscribe(&codex_thread_id).await;
+        server.unsubscribe(&codex_thread_id, &route_tx).await;
     })
+}
+
+/// Extract the vendor turn identity from every documented event shape.
+fn message_turn_id(message: &ServerMsg) -> Option<&str> {
+    let params = match message {
+        ServerMsg::Notification { params, .. } | ServerMsg::Request { params, .. } => params,
+    };
+    params["turnId"]
+        .as_str()
+        .or_else(|| params["turn"]["id"].as_str())
+        .or_else(|| params["item"]["turnId"].as_str())
 }
 
 fn json_rpc_id(id: &Value) -> String {
@@ -823,6 +872,52 @@ enum ServerMsg {
 
 type Pending = Arc<Mutex<HashMap<i64, oneshot::Sender<Result<Value, String>>>>>;
 type Routes = Arc<Mutex<HashMap<String, RouteSender<ServerMsg>>>>;
+type ActiveTurns = Arc<Mutex<HashMap<String, String>>>;
+type TurnLifecycles = Arc<std::sync::Mutex<HashMap<String, std::sync::Weak<Mutex<()>>>>>;
+
+struct TurnLifecycleGuard {
+    guard: Option<tokio::sync::OwnedMutexGuard<()>>,
+    thread_id: String,
+    lifecycle: Arc<Mutex<()>>,
+    registry: TurnLifecycles,
+}
+
+impl Drop for TurnLifecycleGuard {
+    fn drop(&mut self) {
+        // Release ownership before checking whether any waiter or holder still
+        // retains this lifecycle. Acquirers upgrade the weak entry while
+        // holding the same registry lock, so pruning cannot race a reuse.
+        self.guard.take();
+        let mut registry = self.registry.lock().unwrap();
+        let same_entry = registry
+            .get(&self.thread_id)
+            .is_some_and(|entry| entry.ptr_eq(&Arc::downgrade(&self.lifecycle)));
+        if same_entry && Arc::strong_count(&self.lifecycle) == 1 {
+            registry.remove(&self.thread_id);
+        }
+    }
+}
+
+async fn acquire_turn_lifecycle(registry: &TurnLifecycles, thread_id: &str) -> TurnLifecycleGuard {
+    let lifecycle = {
+        let mut registry = registry.lock().unwrap();
+        match registry.get(thread_id).and_then(std::sync::Weak::upgrade) {
+            Some(lifecycle) => lifecycle,
+            None => {
+                let lifecycle = Arc::new(Mutex::new(()));
+                registry.insert(thread_id.to_string(), Arc::downgrade(&lifecycle));
+                lifecycle
+            }
+        }
+    };
+    let guard = Arc::clone(&lifecycle).lock_owned().await;
+    TurnLifecycleGuard {
+        guard: Some(guard),
+        thread_id: thread_id.to_string(),
+        lifecycle,
+        registry: Arc::clone(registry),
+    }
+}
 
 #[derive(Default)]
 struct BufferedRoute {
@@ -963,6 +1058,13 @@ struct AppServer {
     /// app-server can emit notifications in the gap before `subscribe`.
     /// Delivered when the route is registered instead of being dropped.
     buffered: Buffered,
+    /// Vendor turn currently running for each Codex thread. A replacement
+    /// turn interrupts this first so Codex cannot merge prompts across trouve
+    /// turn boundaries after cancellation.
+    active_turns: ActiveTurns,
+    /// Per-thread guards serializing interruption through replacement
+    /// registration.
+    turn_lifecycles: TurnLifecycles,
     /// Held so the child (kill_on_drop) lives as long as the server handle.
     _child: Child,
     closed: Arc<std::sync::atomic::AtomicBool>,
@@ -990,6 +1092,8 @@ impl AppServer {
             pending: Arc::new(Mutex::new(HashMap::new())),
             routes: Arc::new(Mutex::new(HashMap::new())),
             buffered: Arc::new(Mutex::new(HashMap::new())),
+            active_turns: Arc::new(Mutex::new(HashMap::new())),
+            turn_lifecycles: Arc::new(std::sync::Mutex::new(HashMap::new())),
             _child: child,
             closed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         };
@@ -1048,6 +1152,72 @@ impl AppServer {
             .await;
     }
 
+    /// Lock the complete replacement lifecycle for one Codex thread.
+    async fn lock_turn_lifecycle(&self, thread_id: &str) -> TurnLifecycleGuard {
+        acquire_turn_lifecycle(&self.turn_lifecycles, thread_id).await
+    }
+
+    /// Record the vendor turn currently running on a Codex thread.
+    async fn register_active_turn(&self, thread_id: &str, turn_id: &str) {
+        self.active_turns
+            .lock()
+            .await
+            .insert(thread_id.to_string(), turn_id.to_string());
+    }
+
+    /// Clear an active turn only when the caller still owns that turn id.
+    async fn clear_active_turn(&self, thread_id: &str, expected_turn_id: &str) {
+        let mut active = self.active_turns.lock().await;
+        if active
+            .get(thread_id)
+            .is_some_and(|turn_id| turn_id == expected_turn_id)
+        {
+            active.remove(thread_id);
+        }
+    }
+
+    /// Interrupt a predecessor before replacement startup, propagating failure.
+    async fn interrupt_active_turn(&self, thread_id: &str) -> Result<(), BackendError> {
+        let turn_id = self.active_turns.lock().await.get(thread_id).cloned();
+        if let Some(turn_id) = turn_id {
+            self.interrupt_turn(thread_id, &turn_id).await?;
+            self.clear_active_turn(thread_id, &turn_id).await;
+        }
+        Ok(())
+    }
+
+    /// Ask app-server to stop one exact vendor turn.
+    async fn interrupt_turn(&self, thread_id: &str, turn_id: &str) -> Result<(), BackendError> {
+        self.request(
+            "turn/interrupt",
+            json!({
+                "threadId": thread_id,
+                "turnId": turn_id,
+            }),
+        )
+        .await
+        .map(|_| ())
+    }
+
+    /// Best-effort cleanup when this turn still owns the active marker.
+    async fn cleanup_active_turn_best_effort(&self, thread_id: &str, turn_id: &str, reason: &str) {
+        if !self
+            .active_turns
+            .lock()
+            .await
+            .get(thread_id)
+            .is_some_and(|active| active == turn_id)
+        {
+            return;
+        }
+        match self.interrupt_turn(thread_id, turn_id).await {
+            Ok(()) => self.clear_active_turn(thread_id, turn_id).await,
+            Err(error) => {
+                tracing::warn!("codex: failed to interrupt {reason} turn {turn_id}: {error}");
+            }
+        }
+    }
+
     async fn write(&self, msg: Value) -> Result<(), BackendError> {
         let mut stdin = self.stdin.lock().await;
         let mut line = serde_json::to_vec(&msg).expect("serializable");
@@ -1056,7 +1226,7 @@ impl AppServer {
         stdin.flush().await.map_err(BackendError::Io)
     }
 
-    async fn subscribe(&self, thread_id: &str) -> RouteReceiver<ServerMsg> {
+    async fn subscribe(&self, thread_id: &str) -> RouteSubscription {
         let (tx, rx) = route_channel();
         {
             // The reader takes these locks in the same order when it has no
@@ -1077,13 +1247,40 @@ impl AppServer {
                 }
             }
         }
-        rx
+        RouteSubscription { tx, rx }
     }
 
-    async fn unsubscribe(&self, thread_id: &str) {
-        self.routes.lock().await.remove(thread_id);
-        self.buffered.lock().await.remove(thread_id);
+    async fn unsubscribe(&self, thread_id: &str, expected: &RouteSender<ServerMsg>) {
+        remove_route(&self.routes, &self.buffered, thread_id, expected).await;
     }
+}
+
+/// One routed turn stream paired with the sender identity that owns it.
+struct RouteSubscription {
+    tx: RouteSender<ServerMsg>,
+    rx: RouteReceiver<ServerMsg>,
+}
+
+/// Remove a route only when cleanup still owns the active subscription.
+async fn remove_route(
+    routes: &Routes,
+    buffered: &Buffered,
+    thread_id: &str,
+    expected: &RouteSender<ServerMsg>,
+) {
+    let mut routes = routes.lock().await;
+    if !routes
+        .get(thread_id)
+        .is_some_and(|active| active.same_channel(expected))
+    {
+        return;
+    }
+    routes.remove(thread_id);
+    // Keep the lock order aligned with subscribe and the stdout reader.
+    // Buffered events belong to the route being removed only when it is
+    // still the active route; stale turn cleanup must not erase events for
+    // a replacement subscription.
+    buffered.lock().await.remove(thread_id);
 }
 
 #[cfg(test)]
@@ -1111,6 +1308,27 @@ mod tests {
     fn json_rpc_ids_make_stable_approval_ids() {
         assert_eq!(json_rpc_id(&json!(42)), "42");
         assert_eq!(json_rpc_id(&json!("request-7")), "request-7");
+    }
+
+    #[test]
+    fn extracts_turn_identity_from_codex_event_shapes() {
+        let direct = ServerMsg::Notification {
+            method: "item/agentMessage/delta".into(),
+            params: json!({ "threadId": "thread-1", "turnId": "turn-1" }),
+        };
+        assert_eq!(message_turn_id(&direct), Some("turn-1"));
+
+        let completed = ServerMsg::Notification {
+            method: "turn/completed".into(),
+            params: json!({ "threadId": "thread-1", "turn": { "id": "turn-2" } }),
+        };
+        assert_eq!(message_turn_id(&completed), Some("turn-2"));
+
+        let thread_scoped = ServerMsg::Notification {
+            method: "thread/tokenUsage/updated".into(),
+            params: json!({ "threadId": "thread-1" }),
+        };
+        assert_eq!(message_turn_id(&thread_scoped), None);
     }
 
     #[test]
@@ -1198,6 +1416,64 @@ mod tests {
                 .expect("turn route should be released")
                 .is_none()
         );
+    }
+
+    #[tokio::test]
+    async fn stale_turn_cleanup_preserves_replacement_route() {
+        let routes: Routes = Arc::new(Mutex::new(HashMap::new()));
+        let buffered: Buffered = Arc::new(Mutex::new(HashMap::new()));
+        let (stale_tx, _stale_rx) = route_channel();
+        let (replacement_tx, mut replacement_rx) = route_channel();
+        routes
+            .lock()
+            .await
+            .insert("thread-1".into(), replacement_tx.clone());
+
+        remove_route(&routes, &buffered, "thread-1", &stale_tx).await;
+
+        let active = routes
+            .lock()
+            .await
+            .get("thread-1")
+            .cloned()
+            .expect("stale cleanup must preserve the replacement route");
+        active
+            .try_send(ServerMsg::Notification {
+                method: "turn/started".into(),
+                params: json!({ "threadId": "thread-1" }),
+            })
+            .unwrap();
+        assert!(replacement_rx.recv().await.is_some());
+
+        remove_route(&routes, &buffered, "thread-1", &replacement_tx).await;
+        assert!(routes.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn lifecycle_entry_survives_waiters_and_prunes_after_final_guard() {
+        let registry: TurnLifecycles = Arc::new(std::sync::Mutex::new(HashMap::new()));
+        let first = acquire_turn_lifecycle(&registry, "thread-1").await;
+        let waiter_registry = Arc::clone(&registry);
+        let waiter =
+            tokio::spawn(async move { acquire_turn_lifecycle(&waiter_registry, "thread-1").await });
+
+        loop {
+            let strong = registry
+                .lock()
+                .unwrap()
+                .get("thread-1")
+                .map_or(0, std::sync::Weak::strong_count);
+            if strong >= 3 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+
+        drop(first);
+        let second = waiter.await.unwrap();
+        assert_eq!(registry.lock().unwrap().len(), 1);
+        drop(second);
+        assert!(registry.lock().unwrap().is_empty());
     }
 
     #[tokio::test]
