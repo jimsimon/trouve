@@ -4715,10 +4715,9 @@ impl Engine {
         tokio::spawn(async move {
             let thread_id = thread.id.clone();
             let prompt_id = prompt.id.clone();
-            // Catch a panic in the turn machinery so the claim (and cancel
-            // token) are always released and the UI unsticks — tokio would
-            // otherwise swallow the panic and leave the thread wedged as
-            // "active" with no TurnFailed event.
+            // Catch a panic in the turn machinery so a durable TurnFailed can
+            // be published before releasing the claim and cancellation token;
+            // tokio would otherwise swallow the panic with no terminal event.
             let drained =
                 std::panic::AssertUnwindSafe(engine.drain_queue(thread, turn, prompt, cancel))
                     .catch_unwind()
@@ -4735,15 +4734,21 @@ impl Engine {
                 }
                 Err(_) => {
                     tracing::error!("turn dispatcher for {thread_id} panicked");
-                    let _ = engine.store.release_queued_prompt(&prompt_id);
-                    let _ = engine.emit_queue(&thread_id);
-                    let _ = engine.store.append_event(
+                    if let Err(error) = engine.store.append_event(
                         Scope::Thread(thread_id.clone()),
                         Event::TurnFailed {
                             turn,
                             error: "internal error".into(),
                         },
-                    );
+                    ) {
+                        tracing::error!(
+                            "turn dispatcher for {thread_id} retained its claim after panic: \
+                             persisting failure: {error:#}"
+                        );
+                        return;
+                    }
+                    let _ = engine.store.release_queued_prompt(&prompt_id);
+                    let _ = engine.emit_queue(&thread_id);
                     engine.clear_cancel(&thread_id);
                     engine.release_thread(&thread_id);
                 }
@@ -4776,17 +4781,21 @@ impl Engine {
                 .record_outcome(&thread.model, outcome_error.as_deref());
             let cancelled = cancel.is_cancelled();
             if let Err(e) = result {
-                self.clear_cancel(&thread.id);
                 tracing::error!("turn {turn} of {} failed: {e}", thread.id);
+                self.store
+                    .append_event(
+                        Scope::Thread(thread.id.clone()),
+                        Event::TurnFailed {
+                            turn,
+                            error: e.to_string(),
+                        },
+                    )
+                    .with_context(|| {
+                        format!("persisting failure for turn {turn} of {}", thread.id)
+                    })?;
+                self.clear_cancel(&thread.id);
                 let _ = self.store.release_queued_prompt(&prompt.id);
                 let _ = self.emit_queue(&thread.id);
-                let _ = self.store.append_event(
-                    Scope::Thread(thread.id.clone()),
-                    Event::TurnFailed {
-                        turn,
-                        error: e.to_string(),
-                    },
-                );
                 self.release_thread(&thread.id);
                 return Ok(());
             }
