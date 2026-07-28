@@ -17,7 +17,7 @@
 //!   answered with `{ decision: "accept" | "decline" }`
 
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, Ordering};
@@ -210,6 +210,13 @@ impl AgentBackend for CodexBackend {
     }
 
     async fn start_login(&self) -> Result<BackendLogin, BackendError> {
+        // The isolated app-server and Trouve's own login flow both publish to
+        // the user's shared auth.json. Serialize the whole login so an
+        // app-server refresh cannot race the vendor CLI's final write.
+        let auth_lock = match codex_auth_path() {
+            Some(source) => Some(acquire_auth_lock(source).await?),
+            None => None,
+        };
         let BackendLogin {
             verification_url,
             user_code,
@@ -223,6 +230,9 @@ impl AgentBackend for CodexBackend {
             callback_sender,
             done: Box::pin(async move {
                 let result = done.await;
+                // Release before evicting the server: AppServer::drop syncs
+                // refreshed credentials through this same lock.
+                drop(auth_lock);
                 if result.is_ok() {
                     // AppServer snapshots auth into an isolated CODEX_HOME.
                     // Force the next request to create a fresh snapshot after
@@ -1144,10 +1154,95 @@ async fn read_stdout<R: AsyncRead + Unpin>(
 /// Keeps Codex's refreshed subscription credentials while the rest of its
 /// home remains isolated. A baseline comparison prevents an old app-server
 /// from overwriting a newer login performed by another process.
+///
+/// The adjacent lock file is stable across atomic auth.json replacements, so
+/// every Trouve app-server and Trouve-initiated login shares one writer lock.
+/// A direct vendor CLI does not participate in that lock; the second source
+/// read immediately before publication detects and preserves such a write
+/// whenever it overlaps staging.
 struct AuthSync {
     source: PathBuf,
     isolated: PathBuf,
     baseline: std::sync::Mutex<Option<Vec<u8>>>,
+}
+
+struct AuthFileLock {
+    _file: std::fs::File,
+}
+
+impl AuthFileLock {
+    fn acquire(source: &Path) -> std::io::Result<Self> {
+        let parent = source.parent().ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "Codex auth path has no parent directory",
+            )
+        })?;
+        std::fs::create_dir_all(parent)?;
+        let mut name = source
+            .file_name()
+            .ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "Codex auth path has no file name",
+                )
+            })?
+            .to_os_string();
+        name.push(".trouve.lock");
+        let path = source.with_file_name(name);
+        let mut options = std::fs::OpenOptions::new();
+        options.read(true).write(true).create(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            options.mode(0o600);
+        }
+        let file = options.open(path)?;
+        file.lock()?;
+        Ok(Self { _file: file })
+    }
+}
+
+async fn acquire_auth_lock(source: PathBuf) -> Result<AuthFileLock, BackendError> {
+    tokio::task::spawn_blocking(move || AuthFileLock::acquire(&source))
+        .await
+        .map_err(|error| BackendError::Io(std::io::Error::other(error.to_string())))?
+        .map_err(BackendError::Io)
+}
+
+fn read_auth_or_empty(path: &Path) -> std::io::Result<Vec<u8>> {
+    match std::fs::read(path) {
+        Ok(bytes) => Ok(bytes),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
+        Err(error) => Err(error),
+    }
+}
+
+fn stage_auth_snapshot(isolated_home: &Path) -> std::io::Result<Option<AuthSync>> {
+    let Some(source) = codex_auth_path() else {
+        return Ok(None);
+    };
+    let _lock = AuthFileLock::acquire(&source)?;
+    let baseline = match std::fs::read(&source) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    let isolated = isolated_home.join("auth.json");
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.mode(0o600);
+    }
+    {
+        use std::io::Write as _;
+        let mut file = options.open(&isolated)?;
+        file.write_all(&baseline)?;
+        file.sync_all()?;
+    }
+    Ok(Some(AuthSync::new(source, isolated, baseline)))
 }
 
 impl AuthSync {
@@ -1160,6 +1255,10 @@ impl AuthSync {
     }
 
     fn sync(&self) -> std::io::Result<()> {
+        self.sync_with_publish_hook(|| {})
+    }
+
+    fn sync_with_publish_hook(&self, before_publish: impl FnOnce()) -> std::io::Result<()> {
         let mut baseline = self.baseline.lock().unwrap();
         let Some(previous) = baseline.clone() else {
             return Ok(());
@@ -1168,11 +1267,8 @@ impl AuthSync {
         if isolated == previous {
             return Ok(());
         }
-        let source = match std::fs::read(&self.source) {
-            Ok(source) => source,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
-            Err(error) => return Err(error),
-        };
+        let _lock = AuthFileLock::acquire(&self.source)?;
+        let source = read_auth_or_empty(&self.source)?;
         if source != previous && source != isolated {
             tracing::warn!(
                 "Codex auth changed outside the isolated app-server; preserving the newer source"
@@ -1181,8 +1277,37 @@ impl AuthSync {
             return Ok(());
         }
         if source != isolated {
-            std::fs::copy(&self.isolated, &self.source)?;
+            let parent = self.source.parent().ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "Codex auth path has no parent directory",
+                )
+            })?;
+            let mut staged = tempfile::Builder::new()
+                .prefix(".trouve-auth-")
+                .tempfile_in(parent)?;
+            {
+                use std::io::Write as _;
+                staged.write_all(&isolated)?;
+                staged.as_file().sync_all()?;
+            }
+
+            before_publish();
+            let current = read_auth_or_empty(&self.source)?;
+            if current != source {
+                if current != isolated {
+                    tracing::warn!(
+                        "Codex auth changed while a refresh was staged; preserving the newer source"
+                    );
+                    *baseline = None;
+                    return Ok(());
+                }
+            } else {
+                staged.persist(&self.source).map_err(|error| error.error)?;
+            }
         }
+        // Publication (or another writer's identical publication) succeeded.
+        // Keep the old baseline on every error so the next sync retries.
         *baseline = Some(isolated);
         Ok(())
     }
@@ -1226,16 +1351,12 @@ impl AppServer {
             .prefix("trouve-codex-home-")
             .tempdir()
             .map_err(BackendError::Io)?;
-        let auth_sync = if let Some(source) = codex_auth_path()
-            && source.is_file()
-        {
-            let isolated = isolated_home.path().join("auth.json");
-            std::fs::copy(&source, &isolated).map_err(BackendError::Io)?;
-            let baseline = std::fs::read(&isolated).map_err(BackendError::Io)?;
-            Some(Arc::new(AuthSync::new(source, isolated, baseline)))
-        } else {
-            None
-        };
+        let isolated_path = isolated_home.path().to_path_buf();
+        let auth_sync = tokio::task::spawn_blocking(move || stage_auth_snapshot(&isolated_path))
+            .await
+            .map_err(|error| BackendError::Io(std::io::Error::other(error.to_string())))?
+            .map_err(BackendError::Io)?
+            .map(Arc::new);
         let mut child = tokio::process::Command::new(command)
             .arg("app-server")
             .arg("--strict-config")
@@ -1910,6 +2031,110 @@ mod tests {
             missing.sync().unwrap_err().kind(),
             std::io::ErrorKind::NotFound
         );
+    }
+
+    #[test]
+    fn auth_sync_preserves_login_interleaved_after_refresh_staging() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("auth.json");
+        let isolated = temp.path().join("isolated-auth.json");
+        std::fs::write(&source, b"old").unwrap();
+        std::fs::write(&isolated, b"refreshed").unwrap();
+        let sync = AuthSync::new(source.clone(), isolated.clone(), b"old".to_vec());
+
+        sync.sync_with_publish_hook(|| {
+            // Simulate a separately launched vendor CLI, which cannot know
+            // about Trouve's lock file, completing after the refresh was
+            // staged but before its atomic publication.
+            std::fs::write(&source, b"new-login").unwrap();
+        })
+        .unwrap();
+        assert_eq!(std::fs::read(&source).unwrap(), b"new-login");
+
+        std::fs::write(&isolated, b"later-stale-refresh").unwrap();
+        sync.sync().unwrap();
+        assert_eq!(std::fs::read(&source).unwrap(), b"new-login");
+    }
+
+    #[test]
+    fn auth_sync_serializes_publishers_on_the_shared_auth_lock() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("auth.json");
+        let isolated_a = temp.path().join("isolated-a.json");
+        let isolated_b = temp.path().join("isolated-b.json");
+        std::fs::write(&source, b"old").unwrap();
+        std::fs::write(&isolated_a, b"refresh-a").unwrap();
+        std::fs::write(&isolated_b, b"refresh-b").unwrap();
+        let sync_a = Arc::new(AuthSync::new(source.clone(), isolated_a, b"old".to_vec()));
+        let sync_b = Arc::new(AuthSync::new(
+            source.clone(),
+            isolated_b.clone(),
+            b"old".to_vec(),
+        ));
+
+        let (a_staged_tx, a_staged_rx) = std::sync::mpsc::channel();
+        let (release_a_tx, release_a_rx) = std::sync::mpsc::channel();
+        let a = {
+            let sync = sync_a.clone();
+            std::thread::spawn(move || {
+                sync.sync_with_publish_hook(|| {
+                    a_staged_tx.send(()).unwrap();
+                    release_a_rx.recv().unwrap();
+                })
+            })
+        };
+        a_staged_rx.recv().unwrap();
+
+        let (b_started_tx, b_started_rx) = std::sync::mpsc::channel();
+        let (b_staged_tx, b_staged_rx) = std::sync::mpsc::channel();
+        let b = {
+            let sync = sync_b.clone();
+            std::thread::spawn(move || {
+                b_started_tx.send(()).unwrap();
+                sync.sync_with_publish_hook(|| {
+                    b_staged_tx.send(()).unwrap();
+                })
+            })
+        };
+        b_started_rx.recv().unwrap();
+        assert_eq!(
+            b_staged_rx.recv_timeout(std::time::Duration::from_millis(200)),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+        );
+
+        release_a_tx.send(()).unwrap();
+        a.join().unwrap().unwrap();
+        b.join().unwrap().unwrap();
+        assert_eq!(std::fs::read(&source).unwrap(), b"refresh-a");
+
+        // The second publisher observed A's committed source under the lock
+        // and permanently stood down instead of overwriting it later.
+        std::fs::write(&isolated_b, b"later-refresh-b").unwrap();
+        sync_b.sync().unwrap();
+        assert_eq!(std::fs::read(&source).unwrap(), b"refresh-a");
+    }
+
+    #[test]
+    fn auth_sync_retries_when_atomic_publication_does_not_complete() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("auth.json");
+        let isolated = temp.path().join("isolated-auth.json");
+        std::fs::write(&source, b"old").unwrap();
+        std::fs::write(&isolated, b"refreshed").unwrap();
+        let sync = AuthSync::new(source.clone(), isolated, b"old".to_vec());
+
+        let error = sync
+            .sync_with_publish_hook(|| {
+                std::fs::remove_file(&source).unwrap();
+                std::fs::create_dir(&source).unwrap();
+            })
+            .unwrap_err();
+        assert_ne!(error.kind(), std::io::ErrorKind::NotFound);
+
+        std::fs::remove_dir(&source).unwrap();
+        std::fs::write(&source, b"old").unwrap();
+        sync.sync().unwrap();
+        assert_eq!(std::fs::read(&source).unwrap(), b"refreshed");
     }
 
     #[test]
