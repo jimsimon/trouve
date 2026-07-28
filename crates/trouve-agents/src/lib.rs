@@ -433,6 +433,21 @@ impl BackendEventBuffer {
 }
 
 impl BackendEventSender {
+    /// Wait until the consumer drops the exposed backend event stream.
+    pub(crate) async fn closed(&self) {
+        loop {
+            // Register before checking state so close_output cannot notify
+            // between the check and this waiter becoming visible.
+            let closed = self.buffer.space.notified();
+            tokio::pin!(closed);
+            closed.as_mut().enable();
+            if self.buffer.state.lock().unwrap().output_closed {
+                return;
+            }
+            closed.await;
+        }
+    }
+
     pub(crate) async fn send(&self, item: Result<BackendEvent, BackendError>) -> Result<(), ()> {
         let mut item = Some(item);
         let mut counted = false;
@@ -457,6 +472,16 @@ impl BackendEventSender {
 impl Drop for BackendEventSender {
     fn drop(&mut self) {
         self.buffer.close_input();
+    }
+}
+
+struct BackendEventStreamGuard {
+    buffer: Arc<BackendEventBuffer>,
+}
+
+impl Drop for BackendEventStreamGuard {
+    fn drop(&mut self) {
+        self.buffer.close_output();
     }
 }
 
@@ -633,10 +658,16 @@ where
     let sender = BackendEventSender {
         buffer: Arc::clone(&buffer),
     };
+    let stream_guard = BackendEventStreamGuard {
+        buffer: Arc::clone(&buffer),
+    };
     let (tx, mut rx) = tokio::sync::mpsc::channel(BACKEND_STREAM_CAPACITY);
     tokio::spawn(pump_backend_events(buffer, tx));
     tokio::spawn(f(sender));
-    futures::stream::poll_fn(move |cx| rx.poll_recv(cx))
+    futures::stream::poll_fn(move |cx| {
+        let _keep_guard_until_stream_drop = &stream_guard;
+        rx.poll_recv(cx)
+    })
 }
 
 /// Simple options-schema for backend models: vendors own the knobs.
@@ -729,6 +760,22 @@ mod tests {
             BackendEvent::ToolOutput { call_id, chunk } if call_id == "two" && chunk == "g"
         ));
         assert!(matches!(&events[4], BackendEvent::Completed { .. }));
+    }
+
+    #[tokio::test]
+    async fn sender_observes_when_exposed_stream_is_dropped() {
+        let (observed_tx, observed_rx) = tokio::sync::oneshot::channel();
+        let stream = async_stream(move |tx| async move {
+            tx.closed().await;
+            let _ = observed_tx.send(());
+        });
+
+        drop(stream);
+
+        tokio::time::timeout(Duration::from_secs(1), observed_rx)
+            .await
+            .expect("sender should observe the dropped stream")
+            .expect("observer task should report closure");
     }
 
     #[tokio::test]
