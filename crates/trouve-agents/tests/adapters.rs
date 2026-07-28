@@ -570,8 +570,14 @@ echo '{"jsonrpc":"2.0","id":3,"result":{"configOptions":[{"id":"mode","currentVa
 IFS= read -r line # first set model
 echo '{"jsonrpc":"2.0","id":4,"result":{"configOptions":[{"id":"model","currentValue":"test-model"}]}}'
 IFS= read -r line # first session/prompt
-for sequence in $(seq 1 2048); do
-    printf '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"sess-1","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"%s"}}}}\n' "$sequence"
+# Keep this above both ROUTE_EVENT_BUDGET and BACKEND_BUFFER_MAX_ITEMS.
+for sequence in $(seq 1 4096); do
+    if (( sequence % 2 )); then
+        update="agent_message_chunk"
+    else
+        update="agent_thought_chunk"
+    fi
+    printf '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"sess-1","update":{"sessionUpdate":"%s","content":{"type":"text","text":"%s"}}}}\n' "$update" "$sequence"
 done
 echo '{"jsonrpc":"2.0","id":5,"result":{"stopReason":"end_turn"}}'
 
@@ -589,9 +595,10 @@ echo '{"jsonrpc":"2.0","id":9,"result":{"stopReason":"end_turn"}}'
     let backend = CursorBackend::new("cursor", Some(stub), None);
     let deadline = std::time::Duration::from_secs(2);
 
-    // Leave the first stream unread and drive it past the route budget. Its
-    // translated-event queue fills after 64 events, but neither that nor the
-    // route overload may block the reader shared by this worktree.
+    // Leave the first stream unread and drive it past both bounded ingestion
+    // layers. Alternating delta kinds prevents the provider-neutral coalescer
+    // from collapsing this deliberate overload fixture; neither its
+    // backpressure nor the route overload may block the shared reader.
     let mut first = tokio::time::timeout(
         deadline,
         start_turn(&backend, || {

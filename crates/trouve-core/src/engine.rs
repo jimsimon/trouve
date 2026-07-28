@@ -29,6 +29,11 @@ use crate::{context, git, modes, new_id};
 /// Safety valve: maximum provider round-trips within a single turn.
 const MAX_ITERATIONS: usize = 32;
 
+/// Keep backend persistence efficient without making live SSE output feel
+/// buffered. Bursts flush by count; sparse output flushes by this deadline.
+const BACKEND_EVENT_BATCH_MAX: usize = 64;
+const BACKEND_EVENT_BATCH_WINDOW: std::time::Duration = std::time::Duration::from_millis(25);
+
 /// Compact the transcript once its estimated size crosses this share of the
 /// model's context window.
 const COMPACTION_THRESHOLD: f64 = 0.8;
@@ -36,6 +41,7 @@ const COMPACTION_THRESHOLD: f64 = 0.8;
 /// End-to-end budget for refreshing one GitHub host. This bounds how long a
 /// stalled GraphQL request can retain the shared dashboard-cache lock.
 const GITHUB_DASHBOARD_REFRESH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+const SESSION_TITLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(8);
 
 const TURN_CONCURRENCY_ENV: &str = "TROUVE_TURN_CONCURRENCY";
 const DEFAULT_TURN_CONCURRENCY: usize = 26;
@@ -52,6 +58,19 @@ fn positive_limit_from_env(name: &str, default: usize) -> usize {
         .and_then(|value| value.trim().parse::<usize>().ok())
         .filter(|value| *value > 0)
         .unwrap_or(default)
+}
+
+async fn flush_backend_event_batch(
+    store: &Store,
+    scope: &Scope,
+    events: &mut Vec<Event>,
+) -> Result<()> {
+    if !events.is_empty() {
+        store
+            .append_events_async(scope.clone(), std::mem::take(events))
+            .await?;
+    }
+    Ok(())
 }
 
 #[derive(Clone)]
@@ -352,6 +371,8 @@ pub struct Engine {
     /// Where provider configuration changes are persisted. `None` disables
     /// persistence (tests).
     config_file: Option<PathBuf>,
+    /// Serializes persistence and runtime application of title-model behavior.
+    title_model_behavior_transition: tokio::sync::Mutex<()>,
     default_model: RwLock<String>,
     /// Canonical thinking-level token inherited by modes without an
     /// override. It is translated through the selected model's schema when
@@ -368,6 +389,12 @@ pub struct Engine {
     cli_installs: Mutex<HashMap<String, CliInstallState>>,
     /// The llama-server sidecar behind the built-in "local" provider.
     local_manager: Arc<crate::local::LlamaManager>,
+    /// A separate, CPU-only sidecar for session titles. It never displaces
+    /// the local coding model from memory.
+    title_model: Arc<crate::title_model::TitleModelManager>,
+    /// A timed-out generation stays tracked while its cold start finishes.
+    /// The next request cancels and joins it before starting another.
+    title_model_generation: tokio::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
     /// The built-in "local" provider, kept around so enabling re-injects
     /// the same instance after a disable removed it from the registry.
     local_provider: Arc<dyn Provider>,
@@ -649,6 +676,11 @@ impl Engine {
         // Construction reaps llama-servers leaked by a crashed previous run
         // (they hold VRAM and would starve this run's model loads).
         let local_manager = Arc::new(crate::local::LlamaManager::new(&data_dir));
+        let title_model = Arc::new(crate::title_model::TitleModelManager::new(
+            data_dir.clone(),
+            config.title_model_load_behavior.unwrap_or_default(),
+            store.clone(),
+        ));
         let local_provider: Arc<dyn Provider> = Arc::new(crate::local::LocalProvider::new(
             data_dir.clone(),
             config_dir.clone(),
@@ -686,6 +718,7 @@ impl Engine {
             // let test/embedded engines built from synthetic configs
             // clobber the user's config.toml on any provider change.
             config_file: None,
+            title_model_behavior_transition: tokio::sync::Mutex::new(()),
             default_model: RwLock::new(
                 config
                     .default_model
@@ -701,6 +734,8 @@ impl Engine {
             logins: Mutex::new(HashMap::new()),
             cli_installs: Mutex::new(HashMap::new()),
             local_manager,
+            title_model,
+            title_model_generation: tokio::sync::Mutex::new(None),
             local_provider,
             local_downloads: Mutex::new(HashMap::new()),
             hardware: std::sync::OnceLock::new(),
@@ -1607,6 +1642,7 @@ impl Engine {
         }
         if cli == trouve_agents::install::CliId::LlamaServer {
             self.local_manager.stop().await;
+            self.title_model.stop().await;
         }
         trouve_agents::install::uninstall(&self.data_dir, cli)
             .map_err(|e| EngineError::Internal(e.into()))?;
@@ -2514,6 +2550,117 @@ impl Engine {
         }
         *self.default_permission_mode.write().unwrap() = mode;
         Ok(())
+    }
+
+    /// Current settings and runtime state for session naming.
+    pub fn git_worktree_settings(&self) -> trouve_protocol::GitWorktreeSettings {
+        self.title_model.settings()
+    }
+
+    /// Current settings paired with the server cursor they are at least as
+    /// fresh as. Read the cursor first so a concurrent status change can only
+    /// make the returned settings newer than the cursor, never older.
+    pub fn git_worktree_settings_snapshot(
+        &self,
+    ) -> Result<(u64, trouve_protocol::GitWorktreeSettings), EngineError> {
+        let cursor = self
+            .store
+            .latest_event_cursor(&trouve_protocol::Scope::Server)?;
+        Ok((cursor, self.git_worktree_settings()))
+    }
+
+    /// Persist and immediately apply the session-title model lifecycle.
+    pub async fn set_title_model_load_behavior(
+        &self,
+        behavior: trouve_protocol::TitleModelLoadBehavior,
+    ) -> Result<trouve_protocol::GitWorktreeSettings, EngineError> {
+        let _transition = self.title_model_behavior_transition.lock().await;
+        {
+            let mut config = self.config.lock().unwrap();
+            config.title_model_load_behavior = Some(behavior);
+            self.persist_config(&config);
+        }
+        self.title_model.set_behavior(behavior).await;
+        Ok(self.git_worktree_settings())
+    }
+
+    /// Warm the dedicated title model according to its configured lifecycle.
+    /// This is non-blocking and is safe to call once the Tokio runtime exists.
+    pub fn warm_title_model(&self) {
+        self.title_model.warm_on_start();
+    }
+
+    pub fn install_title_model(self: &Arc<Self>) -> Result<(), EngineError> {
+        let engine = Arc::downgrade(self);
+        self.title_model
+            .start_install(move || {
+                if let Some(engine) = engine.upgrade() {
+                    engine.reload_providers();
+                    engine
+                        .cli_latest
+                        .lock()
+                        .unwrap()
+                        .remove(trouve_agents::install::CliId::LlamaServer.as_str());
+                }
+            })
+            .map_err(|error| EngineError::Conflict(error.to_string()))?;
+        Ok(())
+    }
+
+    pub fn cancel_title_model_install(&self) -> Result<(), EngineError> {
+        match self.title_model.cancel_install() {
+            Ok(()) => Ok(()),
+            Err(error) if error.is::<crate::title_model::NoInstallInProgress>() => {
+                Err(EngineError::NotFound(error.to_string()))
+            }
+            Err(error) => Err(EngineError::Conflict(error.to_string())),
+        }
+    }
+
+    /// Derive a title without ever blocking session creation on optional
+    /// model assets or model-quality failures.
+    pub async fn generate_session_title(
+        &self,
+        prompt: &str,
+    ) -> trouve_protocol::GeneratedSessionTitle {
+        let title_model = self.title_model.clone();
+        let prompt_owned = prompt.to_string();
+        let generated = match tokio::time::timeout(SESSION_TITLE_TIMEOUT, async {
+            let mut generation = self.title_model_generation.lock().await;
+            if let Some(previous) = generation.as_mut() {
+                previous.abort();
+                let _ = previous.await;
+            }
+            generation.take();
+
+            let (result_tx, result_rx) = tokio::sync::oneshot::channel();
+            *generation = Some(tokio::spawn(async move {
+                let _ = result_tx.send(title_model.generate(&prompt_owned).await);
+            }));
+            drop(generation);
+
+            result_rx
+                .await
+                .map_err(|error| anyhow!("session title task failed: {error}"))?
+        })
+        .await
+        {
+            Ok(result) => result,
+            Err(_) => Err(anyhow!("session title generation timed out")),
+        };
+        match generated {
+            Ok(title) => trouve_protocol::GeneratedSessionTitle {
+                title,
+                source: "model".into(),
+            },
+            Err(error) => {
+                tracing::debug!("using heuristic session title: {error:#}");
+                trouve_protocol::GeneratedSessionTitle {
+                    title: crate::title::summarize_session_title(prompt),
+                    source: "heuristic".into(),
+                }
+            }
+        }
     }
 
     pub(crate) fn persist_config(&self, config: &Config) {
@@ -4894,6 +5041,7 @@ impl Engine {
                 .stream_chat(&model_name, &messages, &specs, &model_options)
                 .await
                 .map_err(|e| anyhow!("provider error: {e}"))?;
+            stream = trouve_providers::coalesce_event_stream(stream);
 
             let mut text = String::new();
             let mut tool_calls = Vec::new();
@@ -5034,7 +5182,8 @@ impl Engine {
                 .stream_chat(&model_name, &messages, &[], &model_options)
                 .await
             {
-                Ok(mut stream) => {
+                Ok(stream) => {
+                    let mut stream = trouve_providers::coalesce_event_stream(stream);
                     while let Some(event) = stream.next().await {
                         match event {
                             Ok(ProviderEvent::TextDelta(delta)) => {
@@ -5723,21 +5872,38 @@ impl Engine {
         } else {
             HashSet::new()
         };
+        let mut persisted = Vec::new();
+        let mut persist_deadline = None;
+        let mut seen_tool_cards = HashSet::new();
         loop {
+            let flush_at = persist_deadline.unwrap_or_else(Instant::now);
             let ev = tokio::select! {
                 biased;
                 // Cancellation drops the backend stream, whose Drop kills the
                 // vendor process (kill_on_drop). We stop consuming and finish
                 // the turn with whatever streamed so far.
                 _ = cancel.cancelled() => break,
+                _ = tokio::time::sleep_until(flush_at.into()), if persist_deadline.is_some() => {
+                    flush_backend_event_batch(&self.store, &scope, &mut persisted).await?;
+                    persist_deadline = None;
+                    continue;
+                }
                 ev = stream.next() => match ev {
                     Some(ev) => ev,
                     None => break,
                 },
             };
-            match ev.map_err(|e| anyhow!("backend stream error: {e}"))? {
+            let event = match ev {
+                Ok(event) => event,
+                Err(error) => {
+                    flush_backend_event_batch(&self.store, &scope, &mut persisted).await?;
+                    return Err(anyhow!("backend stream error: {error}"));
+                }
+            };
+            match event {
                 BackendEvent::SessionStarted { session_id } => {
                     if tools_enabled {
+                        flush_backend_event_batch(&self.store, &scope, &mut persisted).await?;
                         self.store
                             .set_backend_session(&thread.id, backend_id, &session_id)?;
                     }
@@ -5745,26 +5911,19 @@ impl Engine {
                 BackendEvent::TextDelta(delta) => {
                     text.push_str(&delta);
                     segment.push_str(&delta);
-                    self.store
-                        .append_event(scope.clone(), Event::AssistantDelta { turn, text: delta })?;
+                    persisted.push(Event::AssistantDelta { turn, text: delta });
                 }
                 BackendEvent::ThinkingDelta(delta) => {
                     // Thinking is a block boundary like a tool call:
                     // finalize the streamed text so far so post-thinking
                     // text starts a new bubble in the right order.
                     if !segment.is_empty() {
-                        self.store.append_event(
-                            scope.clone(),
-                            Event::AssistantMessage {
-                                turn,
-                                content: std::mem::take(&mut segment),
-                            },
-                        )?;
+                        persisted.push(Event::AssistantMessage {
+                            turn,
+                            content: std::mem::take(&mut segment),
+                        });
                     }
-                    self.store.append_event(
-                        scope.clone(),
-                        Event::AssistantThinking { turn, text: delta },
-                    )?;
+                    persisted.push(Event::AssistantThinking { turn, text: delta });
                 }
                 BackendEvent::ToolStarted {
                     call_id,
@@ -5772,36 +5931,32 @@ impl Engine {
                     mut args,
                 } => {
                     if !tools_enabled {
+                        flush_backend_event_batch(&self.store, &scope, &mut persisted).await?;
                         bail!("backend requested tool {tool} during a tool-free turn");
                     }
                     tool_calls.insert(call_id.clone(), (tool.clone(), args.clone()));
                     if !segment.is_empty() {
-                        self.store.append_event(
-                            scope.clone(),
-                            Event::AssistantMessage {
-                                turn,
-                                content: std::mem::take(&mut segment),
-                            },
-                        )?;
+                        persisted.push(Event::AssistantMessage {
+                            turn,
+                            content: std::mem::take(&mut segment),
+                        });
                     }
                     // Snippet edits carry no position; the worktree file is
                     // still un-edited at announcement time, so resolve line
                     // hints now for the UI's diff gutter.
                     annotate_edit_lines(Path::new(&session.worktree_path), &mut args);
-                    if !self.tool_card_exists(&thread.id, turn, &call_id) {
-                        self.store.append_event(
-                            scope.clone(),
-                            Event::ToolRequested {
-                                turn,
-                                call_id: call_id.clone(),
-                                tool,
-                                args,
-                                requires_approval: false,
-                            },
-                        )?;
+                    if seen_tool_cards.insert(call_id.clone())
+                        && !self.tool_card_exists(&thread.id, turn, &call_id)
+                    {
+                        persisted.push(Event::ToolRequested {
+                            turn,
+                            call_id: call_id.clone(),
+                            tool,
+                            args,
+                            requires_approval: false,
+                        });
                     }
-                    self.store
-                        .append_event(scope.clone(), Event::ToolStarted { call_id })?;
+                    persisted.push(Event::ToolStarted { call_id });
                 }
                 BackendEvent::ToolOutput { call_id, chunk } => {
                     if let Some((_, owner, repo)) = &github_repository
@@ -5813,18 +5968,17 @@ impl Engine {
                             .or_default()
                             .push_str(&chunk);
                     }
-                    self.store
-                        .append_event(scope.clone(), Event::ToolOutput { call_id, chunk })?;
+                    persisted.push(Event::ToolOutput { call_id, chunk });
                 }
                 BackendEvent::CommandsUpdated { commands } => {
-                    self.store
-                        .append_event(scope.clone(), Event::CommandsUpdated { commands })?;
+                    persisted.push(Event::CommandsUpdated { commands });
                 }
                 BackendEvent::ToolCompleted {
                     call_id,
                     ok,
                     result,
                 } => {
+                    flush_backend_event_batch(&self.store, &scope, &mut persisted).await?;
                     let status = if ok {
                         ToolStatus::Ok
                     } else {
@@ -5861,17 +6015,13 @@ impl Engine {
                     } else {
                         github_creation_output.remove(&call_id);
                     }
-                    self.store.append_event(
-                        scope.clone(),
-                        Event::ToolCompleted {
-                            call_id,
-                            status,
-                            result,
-                        },
-                    )?;
+                    persisted.push(Event::ToolCompleted {
+                        call_id,
+                        status,
+                        result,
+                    });
                     if let Some(todos) = todos {
-                        self.store
-                            .append_event(scope.clone(), Event::TodosUpdated { todos })?;
+                        persisted.push(Event::TodosUpdated { todos });
                     }
                 }
                 BackendEvent::ApprovalNeeded {
@@ -5881,17 +6031,16 @@ impl Engine {
                     responder,
                 } => {
                     if !tools_enabled {
+                        flush_backend_event_batch(&self.store, &scope, &mut persisted).await?;
                         bail!("backend requested approval for {tool} during a tool-free turn");
                     }
                     if !segment.is_empty() {
-                        self.store.append_event(
-                            scope.clone(),
-                            Event::AssistantMessage {
-                                turn,
-                                content: std::mem::take(&mut segment),
-                            },
-                        )?;
+                        persisted.push(Event::AssistantMessage {
+                            turn,
+                            content: std::mem::take(&mut segment),
+                        });
                     }
+                    flush_backend_event_batch(&self.store, &scope, &mut persisted).await?;
                     let approved = self
                         .gate_backend_approval(session, thread, turn, mode, &call_id, &tool, &args)
                         .await?;
@@ -5904,14 +6053,12 @@ impl Engine {
                     responder,
                 } => {
                     if !segment.is_empty() {
-                        self.store.append_event(
-                            scope.clone(),
-                            Event::AssistantMessage {
-                                turn,
-                                content: std::mem::take(&mut segment),
-                            },
-                        )?;
+                        persisted.push(Event::AssistantMessage {
+                            turn,
+                            content: std::mem::take(&mut segment),
+                        });
                     }
+                    flush_backend_event_batch(&self.store, &scope, &mut persisted).await?;
                     let answers = self
                         .ask_user_questions(&thread.id, turn, &request_id, title, questions)
                         .await?;
@@ -5929,10 +6076,19 @@ impl Engine {
                     }
                 }
             }
+            if persisted.is_empty() {
+                persist_deadline = None;
+            } else if persisted.len() >= BACKEND_EVENT_BATCH_MAX {
+                flush_backend_event_batch(&self.store, &scope, &mut persisted).await?;
+                persist_deadline = None;
+            } else if persist_deadline.is_none() {
+                persist_deadline = Some(Instant::now() + BACKEND_EVENT_BATCH_WINDOW);
+            }
         }
         // Drop the backend stream promptly so a cancelled turn kills the
         // vendor process now rather than at end of scope.
         drop(stream);
+        flush_backend_event_batch(&self.store, &scope, &mut persisted).await?;
 
         if cancel.is_cancelled() {
             if !segment.is_empty() {
@@ -6193,6 +6349,7 @@ impl Engine {
             .stream_chat(model_name, &messages, &[], &serde_json::Map::new())
             .await
             .map_err(|e| anyhow!("compaction provider error: {e}"))?;
+        stream = trouve_providers::coalesce_event_stream(stream);
         let mut summary = String::new();
         while let Some(ev) = stream.next().await {
             if let ProviderEvent::TextDelta(delta) =

@@ -25,18 +25,19 @@ use trouve_protocol::{
     CodeReviewDashboard, CodeReviewJob, CodeReviewJobDetail, CodeReviewJobList,
     CodeReviewRepository, CodeReviewStats, CodeReviewStatsRange, CodeReviewTask,
     CompleteLoginRequest, ConfigureGithubAppRequest, CreatePrRequest, CreateSessionRequest,
-    CreateThreadRequest, DirEntry, ErrorBody, FileContent, GithubAppStatus, GithubIntegration,
-    GithubPrList, KnownProvider, LocalSearchResult, LocalStatus, LoginStarted, LoginStatus,
-    McpLogs, McpServerInfo, MergePrRequest, ModeInfo, ModelInfo, OpenTerminalRequest,
+    CreateThreadRequest, DirEntry, EVENT_CURSOR_HEADER, ErrorBody, FileContent,
+    GenerateSessionTitleRequest, GeneratedSessionTitle, GitWorktreeSettings, GithubAppStatus,
+    GithubIntegration, GithubPrList, KnownProvider, LocalSearchResult, LocalStatus, LoginStarted,
+    LoginStatus, McpLogs, McpServerInfo, MergePrRequest, ModeInfo, ModelInfo, OpenTerminalRequest,
     PROTOCOL_VERSION, PrInfo, ProviderInfo, ProvidersResponse, QueuedPrompt,
     RegisterWorkspaceRequest, ReorderQueueRequest, RequestCodeReviewRequest,
     ResolveApprovalRequest, ResolveQuestionRequest, ReviewerProfile, Scope, SendMessageRequest,
     ServerInfo, Session, SessionDiff, SetDefaultModelRequest, SetDefaultPermissionModeRequest,
-    SetLocalEnabledRequest, SubscriptionHealth, TerminalInfo, TerminalInputRequest,
-    TerminalResizeRequest, Thread, TurnAccepted, UpdateCodeReviewRepositoryRequest,
-    UpdateQueuedPromptRequest, UpdateSessionRequest, UpdateThreadRequest, UpsertAutomationRequest,
-    UpsertMcpServerRequest, UpsertModeRequest, UpsertProviderRequest, UpsertReviewerProfileRequest,
-    UsageSummary, Workspace,
+    SetGitWorktreeSettingsRequest, SetLocalEnabledRequest, SubscriptionHealth, TerminalInfo,
+    TerminalInputRequest, TerminalResizeRequest, Thread, TurnAccepted,
+    UpdateCodeReviewRepositoryRequest, UpdateQueuedPromptRequest, UpdateSessionRequest,
+    UpdateThreadRequest, UpsertAutomationRequest, UpsertMcpServerRequest, UpsertModeRequest,
+    UpsertProviderRequest, UpsertReviewerProfileRequest, UsageSummary, Workspace,
 };
 use utoipa::OpenApi;
 
@@ -88,6 +89,7 @@ impl IntoResponse for ApiError {
         close_workspace,
         workspace_branches,
         refresh_github_prs,
+        generate_session_title,
         create_session,
         list_sessions,
         get_session,
@@ -137,6 +139,10 @@ impl IntoResponse for ApiError {
         restart_local_server,
         set_default_model,
         set_default_permission_mode,
+        get_git_worktree_settings,
+        set_git_worktree_settings,
+        install_title_model,
+        cancel_title_model_install,
         thread_usage,
         session_usage,
         session_mcp_servers,
@@ -223,6 +229,12 @@ impl IntoResponse for ApiError {
         UpsertProviderRequest,
         SetDefaultModelRequest,
         SetDefaultPermissionModeRequest,
+        trouve_protocol::TitleModelLoadBehavior,
+        trouve_protocol::TitleModelStatus,
+        GitWorktreeSettings,
+        SetGitWorktreeSettingsRequest,
+        GenerateSessionTitleRequest,
+        GeneratedSessionTitle,
         UsageSummary,
         SessionDiff,
         DirEntry,
@@ -437,6 +449,7 @@ pub fn build_router(engine: Arc<Engine>) -> Router {
         )
         .route("/v1/workspaces/{id}/branches", get(workspace_branches))
         .route("/v1/github/prs/refresh", post(refresh_github_prs))
+        .route("/v1/session-title", post(generate_session_title))
         .route("/v1/sessions", post(create_session).get(list_sessions))
         .route(
             "/v1/sessions/{id}",
@@ -582,6 +595,14 @@ pub fn build_router(engine: Arc<Engine>) -> Router {
             "/v1/config/default-permission-mode",
             axum::routing::put(set_default_permission_mode),
         )
+        .route(
+            "/v1/config/git-worktrees",
+            get(get_git_worktree_settings).put(set_git_worktree_settings),
+        )
+        .route(
+            "/v1/config/git-worktrees/title-model/install",
+            post(install_title_model).delete(cancel_title_model_install),
+        )
         .route("/v1/threads", post(create_thread).get(list_threads))
         .route("/v1/threads/{id}", get(get_thread).patch(update_thread))
         .route("/v1/threads/{id}/messages", post(send_message))
@@ -662,6 +683,7 @@ pub async fn serve_listener(
     // never serves a model list it immediately retracts (no-op without a
     // configured probe).
     engine.init_connectivity().await;
+    engine.warm_title_model();
     engine.start_connectivity_monitor();
     engine.start_automation_scheduler();
     engine.start_code_review_service();
@@ -950,6 +972,15 @@ async fn refresh_github_prs(
 ) -> Result<axum::http::StatusCode, ApiError> {
     engine.refresh_github_prs().await?;
     Ok(axum::http::StatusCode::NO_CONTENT)
+}
+
+#[utoipa::path(post, path = "/v1/session-title", request_body = GenerateSessionTitleRequest,
+    responses((status = 200, body = GeneratedSessionTitle)))]
+async fn generate_session_title(
+    State(engine): State<Arc<Engine>>,
+    Json(req): Json<GenerateSessionTitleRequest>,
+) -> Json<GeneratedSessionTitle> {
+    Json(engine.generate_session_title(&req.prompt).await)
 }
 
 #[utoipa::path(post, path = "/v1/sessions", request_body = CreateSessionRequest,
@@ -1488,6 +1519,47 @@ async fn set_default_permission_mode(
     Json(req): Json<SetDefaultPermissionModeRequest>,
 ) -> Result<StatusCode, ApiError> {
     engine.set_default_permission_mode(req.permission_mode)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+#[utoipa::path(get, path = "/v1/config/git-worktrees",
+    responses((status = 200, body = GitWorktreeSettings,
+        headers(("x-trouve-event-cursor" = u64, description = "Server event cursor for this snapshot")))))]
+async fn get_git_worktree_settings(
+    State(engine): State<Arc<Engine>>,
+) -> Result<impl IntoResponse, ApiError> {
+    let (cursor, settings) = engine.git_worktree_settings_snapshot()?;
+    Ok(([(EVENT_CURSOR_HEADER, cursor.to_string())], Json(settings)))
+}
+
+#[utoipa::path(put, path = "/v1/config/git-worktrees",
+    request_body = SetGitWorktreeSettingsRequest,
+    responses((status = 200, body = GitWorktreeSettings,
+        headers(("x-trouve-event-cursor" = u64, description = "Server event cursor for this snapshot")))))]
+async fn set_git_worktree_settings(
+    State(engine): State<Arc<Engine>>,
+    Json(req): Json<SetGitWorktreeSettingsRequest>,
+) -> Result<impl IntoResponse, ApiError> {
+    engine
+        .set_title_model_load_behavior(req.title_model_load_behavior)
+        .await?;
+    let (cursor, settings) = engine.git_worktree_settings_snapshot()?;
+    Ok(([(EVENT_CURSOR_HEADER, cursor.to_string())], Json(settings)))
+}
+
+#[utoipa::path(post, path = "/v1/config/git-worktrees/title-model/install",
+    responses((status = 202), (status = 409, body = ErrorBody)))]
+async fn install_title_model(State(engine): State<Arc<Engine>>) -> Result<StatusCode, ApiError> {
+    engine.install_title_model()?;
+    Ok(StatusCode::ACCEPTED)
+}
+
+#[utoipa::path(delete, path = "/v1/config/git-worktrees/title-model/install",
+    responses((status = 204), (status = 404, body = ErrorBody), (status = 409, body = ErrorBody)))]
+async fn cancel_title_model_install(
+    State(engine): State<Arc<Engine>>,
+) -> Result<StatusCode, ApiError> {
+    engine.cancel_title_model_install()?;
     Ok(StatusCode::NO_CONTENT)
 }
 

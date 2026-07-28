@@ -7,8 +7,8 @@ use slint::{Model, ModelRc, SharedString, VecModel};
 use crate::render::ChatRowData;
 use crate::{
     AppWindow, ChatRow, ChatTableCell, CliItem, DiffRow, FileItem, KnownProviderItem,
-    ModelHealthItem, NavRow, ProviderConfigFieldItem, ProviderItem, QOption, QPair, TextSegment,
-    ThreadTabItem, TodoUiItem,
+    ModelHealthItem, NavRow, ProviderConfigFieldItem, ProviderItem, QOption, QPair, SectionId,
+    TextSegment, ThreadTabItem, TodoUiItem,
 };
 
 type Ui = slint::Weak<AppWindow>;
@@ -1017,8 +1017,48 @@ pub fn set_github_integration(ui: &Ui, hosts: Vec<GithubHostView>) {
     });
 }
 
-pub fn set_settings_section(ui: &Ui, section: i32) {
+pub fn set_settings_section(ui: &Ui, section: SectionId) {
     let _ = ui.upgrade_in_event_loop(move |ui| ui.set_settings_section(section));
+}
+
+pub(crate) fn title_model_load_behavior_of(index: i32) -> trouve_protocol::TitleModelLoadBehavior {
+    match index {
+        1 => trouve_protocol::TitleModelLoadBehavior::Always,
+        2 => trouve_protocol::TitleModelLoadBehavior::OnDemand,
+        3 => trouve_protocol::TitleModelLoadBehavior::Off,
+        _ => trouve_protocol::TitleModelLoadBehavior::Auto,
+    }
+}
+
+pub(crate) fn title_model_load_behavior_index(
+    behavior: trouve_protocol::TitleModelLoadBehavior,
+) -> i32 {
+    match behavior {
+        trouve_protocol::TitleModelLoadBehavior::Auto => 0,
+        trouve_protocol::TitleModelLoadBehavior::Always => 1,
+        trouve_protocol::TitleModelLoadBehavior::OnDemand => 2,
+        trouve_protocol::TitleModelLoadBehavior::Off => 3,
+    }
+}
+
+pub fn set_git_worktree_settings(ui: &Ui, settings: trouve_protocol::GitWorktreeSettings) {
+    let behavior = title_model_load_behavior_index(settings.title_model_load_behavior);
+    let status = settings.title_model;
+    let installed = status.runtime_installed && status.model_downloaded;
+    let installing = status.state == "installing";
+    let progress = if installing && status.install_total > 0 {
+        ((status.install_bytes.saturating_mul(100) / status.install_total).min(100)) as i32
+    } else {
+        -1
+    };
+    let _ = ui.upgrade_in_event_loop(move |ui| {
+        ui.set_settings_title_model_load_index(behavior);
+        ui.set_settings_title_model_state(status.state.into());
+        ui.set_settings_title_model_detail(status.detail.into());
+        ui.set_settings_title_model_installed(installed);
+        ui.set_settings_title_model_installing(installing);
+        ui.set_settings_title_model_install_progress(progress);
+    });
 }
 
 pub fn set_diff(ui: &Ui, rows: Vec<trouve_slint_diff_view::RowData>, raw: String) {
@@ -1738,6 +1778,17 @@ mod tests {
 
         assert_eq!(queue_preview(prompt), "If we support multiple users:");
         assert_eq!(queue_preview(" \r\n\t\n"), "");
+    }
+
+    #[test]
+    fn title_model_load_behavior_indices_round_trip() {
+        use trouve_protocol::TitleModelLoadBehavior::{Always, Auto, Off, OnDemand};
+
+        for (index, behavior) in [(0, Auto), (1, Always), (2, OnDemand), (3, Off)] {
+            assert_eq!(title_model_load_behavior_of(index), behavior);
+            assert_eq!(title_model_load_behavior_index(behavior), index);
+        }
+        assert_eq!(title_model_load_behavior_of(99), Auto);
     }
 
     fn workspace_rows(ids: &[&str]) -> Vec<NavRowData> {

@@ -107,7 +107,16 @@ pub use requests::*;
 // the snapshot's event cursor so clients can skip redundant history (additive).
 // 1.12: failed code-review personas can be retried independently while
 // retaining successful reviewer task outputs (additive).
-pub const PROTOCOL_VERSION: &str = "1.12";
+// 1.13: Git & Worktrees settings persist the title-model load behavior;
+// title-model status/install endpoints and POST /v1/session-title provide
+// synchronous model-assisted naming with a deterministic fallback, while
+// settings.git_worktrees_updated carries lifecycle snapshots (additive).
+// 1.14: cancelling a missing title-model installation returns Not Found,
+// matching the managed CLI installation lifecycle (additive).
+// 1.15: Git & Worktrees settings responses include the corresponding server
+// event cursor so clients can order snapshots against SSE replay (additive).
+pub const PROTOCOL_VERSION: &str = "1.15";
+pub const EVENT_CURSOR_HEADER: &str = "x-trouve-event-cursor";
 
 pub type WorkspaceId = String;
 pub type SessionId = String;
