@@ -54,6 +54,8 @@ export interface Repository {
   private: boolean;
   mode: ReviewMode;
   model?: string;
+  router_model?: string;
+  router_thinking_level?: string;
   prompt: string;
   reviewer_ids: string[];
   routing_mode: RoutingMode;
@@ -86,6 +88,8 @@ export interface ReviewJob {
   retry_of?: string;
   retried_by?: string;
   model?: string;
+  router_model?: string;
+  router_thinking_level?: string;
   reviewer_ids: string[];
   routing_mode: RoutingMode;
   semantic_routing: boolean;

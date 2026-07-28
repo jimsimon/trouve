@@ -120,7 +120,7 @@ After creating it:
    GitHub webhook secret when webhooks are enabled.
 5. Click **Poll now**. The installed repositories will appear with review
    mode **Off**.
-6. Choose a default model and persona-routing strategy, then set each
+6. Choose an explicit review model and persona-routing strategy, then set each
    repository to **Manual** or **Automatic**.
 
 `Manual` runs only when the bot is selected (or re-requested) through
@@ -159,15 +159,22 @@ a repository that still exactly matches either historical built-in default set
 is migrated to Auto once. Customized reviewer sets remain Core, and a later
 explicit switch back to Core is preserved.
 
-Built-in reviewers use the repository's selected model (or the server
-default). Every semantic router and reviewer pass uses the job's snapshotted
-configuration, so later policy edits cannot change an in-flight review.
+An enabled repository must select an explicit review model. The coordinator
+and every reviewer without a profile or repository override use that model;
+the unattended review system never falls back to trouve's built-in thread
+model because that provider/model may not be configured on the deployment.
+
+Semantic triage has separate optional **router model** and **router thinking
+level** controls. When the router model is unset it inherits the required
+repository review model. When its thinking level is unset it inherits the
+review mode's thinking default. Both values are snapshotted on the job, so a
+policy edit cannot change an in-flight router pass.
 
 Repository policies can refine each reviewer without changing its reusable
 profile. In Core, the checkbox enables or disables that reviewer for the
 repository. A model override can select a different model for that reviewer;
-otherwise it inherits the profile model, then the repository or server
-default. Prompt behavior can inherit the profile prompt, append
+otherwise it inherits the profile model, then the required repository review
+model. Prompt behavior can inherit the profile prompt, append
 repository-specific instructions to it, or replace it for that repository.
 Overrides remain saved when a reviewer is temporarily disabled or routed out.
 
@@ -188,11 +195,12 @@ by changed path and divided into bounded per-file batches. Core and Thorough
 send every selected reviewer every batch. Auto records a decision for every
 persona/batch candidate and dispatches only the selected combinations in the
 built-in read-only review mode, including files beyond the model-facing
-aggregate diff limit. Reviewer profiles, models, routing mode, include/exclude
-controls, and every typed routing reason are snapshotted durably with the job
-after repository overrides are applied. The dashboard exposes both the router
-task output and the complete selected/skipped decision matrix, which is also
-published on the job's persisted event stream.
+aggregate diff limit. Reviewer profiles, review/router models, router thinking
+level, routing mode, include/exclude controls, and every typed routing reason
+are snapshotted durably with the job after repository overrides are applied.
+The dashboard exposes both the router task output and the complete
+selected/skipped decision matrix, which is also published on the job's
+persisted event stream.
 
 If semantic triage is disabled or its model response fails validation, Auto
 continues with its baseline and deterministic choices. Semantic output is
@@ -207,8 +215,9 @@ duplicates, corrects line metadata, and produces the published summary. The
 result is checked against diff lines again before it is sent to GitHub.
 
 When either commit or the effective review configuration changes—including
-routing mode, semantic triage, persona inclusion/exclusion, reviewer selection,
-model overrides, or prompt overrides—queued reviews for the old
+routing mode, semantic triage, router model/thinking, persona
+inclusion/exclusion, reviewer selection, model overrides, or prompt
+overrides—queued reviews for the old
 revision/configuration are marked stale and an in-flight model turn is
 cancelled before the replacement is queued. Before publishing, trouve reads the
 PR again and marks the job stale if either commit moved. Inline findings that

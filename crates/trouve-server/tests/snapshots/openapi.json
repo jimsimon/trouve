@@ -7,7 +7,7 @@
       "name": "MIT",
       "identifier": "MIT"
     },
-    "version": "1.16"
+    "version": "1.17"
   },
   "paths": {
     "/v1/approvals": {
@@ -4655,6 +4655,20 @@
             },
             "description": "Reviewer profiles are snapshotted internally; their stable ids are\nexposed here for history and diagnostics. Auto/Thorough jobs snapshot\nthe candidate catalog; routing decisions record which personas ran."
           },
+          "router_model": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Model snapshotted for semantic persona triage. Absent inherits\n`model`; legacy jobs may omit both and are rejected before dispatch."
+          },
+          "router_thinking_level": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Thinking level snapshotted for semantic persona triage."
+          },
           "routing_mode": {
             "$ref": "#/components/schemas/CodeReviewRoutingMode"
           },
@@ -5035,7 +5049,7 @@
               "string",
               "null"
             ],
-            "description": "Provider-qualified model; absent means the review mode/global default."
+            "description": "Provider-qualified model used by the coordinator and inherited by\nreviewers without an override. Required while reviews are enabled."
           },
           "private": {
             "type": "boolean"
@@ -5060,6 +5074,20 @@
               "$ref": "#/components/schemas/ReviewerOverride"
             },
             "description": "Per-reviewer repository overrides. Entries may be retained while a\nreviewer is disabled so re-enabling it restores its configuration."
+          },
+          "router_model": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Provider-qualified model used by semantic persona triage. Absent\ninherits `model`."
+          },
+          "router_thinking_level": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Preferred thinking level for semantic persona triage. Absent inherits\nthe review mode's thinking default."
           },
           "routing_mode": {
             "$ref": "#/components/schemas/CodeReviewRoutingMode",
@@ -8683,6 +8711,18 @@
               "$ref": "#/components/schemas/ReviewerOverride"
             },
             "description": "Omitted by older clients to preserve existing reviewer overrides."
+          },
+          "router_model": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "router_thinking_level": {
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "routing_mode": {
             "oneOf": [

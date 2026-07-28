@@ -1439,6 +1439,8 @@ impl Engine {
                 trigger: "manual".into(),
                 retry_of: None,
                 model: repository.model,
+                router_model: repository.router_model,
+                router_thinking_level: repository.router_thinking_level,
                 prompt: repository.prompt,
                 reviewers,
                 routing_mode: repository.routing_mode,
@@ -1530,6 +1532,8 @@ impl Engine {
         let routing_config = serde_json::to_string(&(
             repository.routing_mode,
             repository.semantic_routing,
+            &repository.router_model,
+            &repository.router_thinking_level,
             &repository.included_reviewer_ids,
             &repository.excluded_reviewer_ids,
         ))
@@ -1697,13 +1701,47 @@ impl Engine {
     ) -> Result<CodeReviewRepository, EngineError> {
         validate_repository(&request.repository)
             .map_err(|error| EngineError::BadRequest(error.to_string()))?;
-        if request
+        let model = request
             .model
-            .as_deref()
-            .is_some_and(|model| model.trim().is_empty())
-        {
+            .as_ref()
+            .map(|model| model.trim().to_string())
+            .filter(|model| !model.is_empty());
+        if request.model.is_some() && model.is_none() {
             return Err(EngineError::BadRequest("model cannot be empty".into()));
         }
+        if model.as_deref().is_some_and(|model| !model.contains('/')) {
+            return Err(EngineError::BadRequest(
+                "review model must be provider-qualified".into(),
+            ));
+        }
+        if request.mode != CodeReviewMode::Off && model.is_none() {
+            return Err(EngineError::BadRequest(
+                "enabled code review requires an explicit repository model".into(),
+            ));
+        }
+        let router_model = request
+            .router_model
+            .as_ref()
+            .map(|model| model.trim().to_string())
+            .filter(|model| !model.is_empty());
+        if request.router_model.is_some() && router_model.is_none() {
+            return Err(EngineError::BadRequest(
+                "router model cannot be empty".into(),
+            ));
+        }
+        if router_model
+            .as_deref()
+            .is_some_and(|model| !model.contains('/'))
+        {
+            return Err(EngineError::BadRequest(
+                "router model must be provider-qualified".into(),
+            ));
+        }
+        let router_thinking_level = request
+            .router_thinking_level
+            .as_ref()
+            .map(|level| level.trim().to_string())
+            .filter(|level| !level.is_empty());
         let existing = self
             .store
             .list_code_review_repositories()?
@@ -1794,7 +1832,9 @@ impl Engine {
             installation_id: request.installation_id,
             repository: request.repository.clone(),
             mode: request.mode,
-            model: request.model.clone(),
+            model,
+            router_model,
+            router_thinking_level,
             prompt: request.prompt.clone(),
             reviewer_ids: Some(reviewer_ids),
             routing_mode: Some(routing_mode),
@@ -2164,6 +2204,8 @@ impl Engine {
                         trigger: requested.trigger.into(),
                         retry_of: None,
                         model: repository.model.clone(),
+                        router_model: repository.router_model.clone(),
+                        router_thinking_level: repository.router_thinking_level.clone(),
                         prompt: repository.prompt.clone(),
                         reviewers: reviewers.clone(),
                         routing_mode: repository.routing_mode,
@@ -2596,6 +2638,7 @@ impl Engine {
     ) -> Result<String> {
         let preparation_started = Instant::now();
         let mut job = record.job.clone();
+        let coordinator_model = review_model(&job)?;
         ensure_review_current(superseded)?;
         validate_repository(&job.repository)?;
         validate_sha(&job.base_ref)?;
@@ -2652,7 +2695,7 @@ impl Engine {
         let coordinator = self.create_thread(CreateThreadRequest {
             session_id: session.id.clone(),
             mode: Some("review".into()),
-            model: job.model.clone(),
+            model: Some(coordinator_model),
             model_options: serde_json::Map::new(),
             permission_mode: Some(PermissionMode::Yolo),
         })?;
@@ -2885,7 +2928,7 @@ impl Engine {
                             reviewer_name: reviewer.name.clone(),
                             batch_index: batch_index as u64,
                             batch_count: batch_count as u64,
-                            model: reviewer.model.clone().or_else(|| job.model.clone()),
+                            model: Some(reviewer_model(&job, &reviewer)?),
                             prompt: prompt.clone(),
                         })?;
                         engine.emit_code_review_task(&job.id, task.clone())?;
@@ -2904,7 +2947,7 @@ impl Engine {
                         let thread = engine.create_thread(CreateThreadRequest {
                             session_id,
                             mode: Some("review".into()),
-                            model: reviewer.model.clone().or_else(|| job.model.clone()),
+                            model: Some(reviewer_model(&job, &reviewer)?),
                             model_options: reviewer_model_options(&reviewer),
                             permission_mode: Some(PermissionMode::Yolo),
                         })?;
@@ -3340,6 +3383,7 @@ impl Engine {
             }
             let prompt =
                 semantic_routing_prompt(job, batch, batch_index, batches.len(), &candidates);
+            let routing_model = router_model(job)?;
             let task = self.store.create_code_review_task(&NewCodeReviewTask {
                 job_id: job.id.clone(),
                 role: trouve_protocol::CodeReviewTaskRole::Router,
@@ -3347,15 +3391,15 @@ impl Engine {
                 reviewer_name: "Automatic persona router".into(),
                 batch_index: batch_index as u64,
                 batch_count: batches.len() as u64,
-                model: job.model.clone(),
+                model: Some(routing_model.clone()),
                 prompt: prompt.clone(),
             })?;
             self.emit_code_review_task(&job.id, task.clone())?;
             let thread = self.create_thread(CreateThreadRequest {
                 session_id: session_id.to_owned(),
                 mode: Some("review".into()),
-                model: job.model.clone(),
-                model_options: serde_json::Map::new(),
+                model: Some(routing_model),
+                model_options: thinking_model_options(job.router_thinking_level.as_deref()),
                 permission_mode: Some(PermissionMode::Yolo),
             })?;
             let task = self
@@ -4485,19 +4529,53 @@ fn apply_reviewer_overrides(
         .collect()
 }
 
-fn reviewer_model_options(
-    reviewer: &ReviewerProfile,
-) -> serde_json::Map<String, serde_json::Value> {
-    reviewer
-        .default_thinking_level
+fn review_model(job: &trouve_protocol::CodeReviewJob) -> Result<String> {
+    job.model
         .as_ref()
+        .map(|model| model.trim())
+        .filter(|model| !model.is_empty())
+        .map(str::to_owned)
+        .ok_or_else(|| {
+            anyhow!(
+                "review job {} has no configured model; select a repository review model and retry",
+                job.id
+            )
+        })
+}
+
+fn reviewer_model(
+    job: &trouve_protocol::CodeReviewJob,
+    reviewer: &ReviewerProfile,
+) -> Result<String> {
+    reviewer
+        .model
+        .clone()
+        .map(Ok)
+        .unwrap_or_else(|| review_model(job))
+}
+
+fn router_model(job: &trouve_protocol::CodeReviewJob) -> Result<String> {
+    job.router_model
+        .clone()
+        .map(Ok)
+        .unwrap_or_else(|| review_model(job))
+}
+
+fn thinking_model_options(level: Option<&str>) -> serde_json::Map<String, serde_json::Value> {
+    level
         .map(|level| {
             serde_json::Map::from_iter([(
                 "thinking_level".into(),
-                serde_json::Value::String(level.clone()),
+                serde_json::Value::String(level.to_owned()),
             )])
         })
         .unwrap_or_default()
+}
+
+fn reviewer_model_options(
+    reviewer: &ReviewerProfile,
+) -> serde_json::Map<String, serde_json::Value> {
+    thinking_model_options(reviewer.default_thinking_level.as_deref())
 }
 
 fn ensure_review_current(superseded: &CancellationToken) -> Result<()> {
@@ -5433,6 +5511,8 @@ mod tests {
                 trigger: "automatic".into(),
                 retry_of: None,
                 model: Some("provider/default".into()),
+                router_model: None,
+                router_thinking_level: None,
                 prompt: "Review it".into(),
                 reviewers: crate::reviewers::built_in_reviewers()
                     .into_iter()
@@ -6596,6 +6676,82 @@ mod tests {
     }
 
     #[test]
+    fn enabled_review_requires_an_explicit_model() {
+        let data = tempfile::tempdir().unwrap();
+        let store = crate::store::Store::open_in_memory().unwrap();
+        store
+            .upsert_discovered_code_review_repository(7, "acme/widgets", false)
+            .unwrap();
+        let engine = Engine::new(
+            store,
+            data.path().to_path_buf(),
+            &crate::config::Config::default(),
+        );
+        let error = engine
+            .update_code_review_repository(&UpdateCodeReviewRepositoryRequest {
+                installation_id: 7,
+                repository: "acme/widgets".into(),
+                mode: CodeReviewMode::Automatic,
+                model: None,
+                router_model: Some("provider/router".into()),
+                router_thinking_level: Some("low".into()),
+                prompt: String::new(),
+                reviewer_ids: None,
+                routing_mode: None,
+                semantic_routing: None,
+                included_reviewer_ids: None,
+                excluded_reviewer_ids: None,
+                reviewer_overrides: None,
+            })
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("requires an explicit repository model")
+        );
+    }
+
+    #[test]
+    fn review_threads_never_use_the_engine_builtin_model_fallback() {
+        let store = crate::store::Store::open_in_memory().unwrap();
+        let mut job = enqueue_test_review_job(&store, "acme/widgets#42:model-resolution");
+        let mut reviewer = crate::reviewers::built_in_reviewers().remove(0);
+        job.model = None;
+        assert!(
+            review_model(&job)
+                .unwrap_err()
+                .to_string()
+                .contains("no configured model")
+        );
+        assert!(
+            reviewer_model(&job, &reviewer)
+                .unwrap_err()
+                .to_string()
+                .contains("no configured model")
+        );
+        assert!(
+            router_model(&job)
+                .unwrap_err()
+                .to_string()
+                .contains("no configured model")
+        );
+
+        job.model = Some("provider/review".into());
+        assert_eq!(review_model(&job).unwrap(), "provider/review");
+        assert_eq!(reviewer_model(&job, &reviewer).unwrap(), "provider/review");
+        assert_eq!(router_model(&job).unwrap(), "provider/review");
+        reviewer.model = Some("provider/persona".into());
+        assert_eq!(reviewer_model(&job, &reviewer).unwrap(), "provider/persona");
+        job.router_model = Some("provider/router".into());
+        assert_eq!(router_model(&job).unwrap(), "provider/router");
+        assert!(thinking_model_options(None).is_empty());
+        assert_eq!(
+            thinking_model_options(Some("high")).get("thinking_level"),
+            Some(&serde_json::json!("high"))
+        );
+    }
+
+    #[test]
     fn webhook_signatures_are_verified_and_deliveries_are_idempotent() {
         let data = tempfile::tempdir().unwrap();
         let store = crate::store::Store::open_in_memory().unwrap();
@@ -6642,7 +6798,9 @@ mod tests {
                 installation_id: 7,
                 repository: "acme/widgets".into(),
                 mode: CodeReviewMode::Manual,
-                model: None,
+                model: Some("provider/review".into()),
+                router_model: None,
+                router_thinking_level: None,
                 prompt: String::new(),
                 reviewer_ids: None,
                 routing_mode: None,

@@ -1084,6 +1084,14 @@ function JobDetailPane({
           <dd>{job.routing_mode === "auto" && job.semantic_routing ? "Enabled" : "Off"}</dd>
         </div>
         <div>
+          <dt>Router model</dt>
+          <dd>{job.router_model || job.model || "Missing configuration"}</dd>
+        </div>
+        <div>
+          <dt>Router thinking</dt>
+          <dd>{job.router_thinking_level || "Review mode default"}</dd>
+        </div>
+        <div>
           <dt>Pending</dt>
           <dd>{duration(job.pending_elapsed_ms)}</dd>
         </div>
@@ -1590,11 +1598,22 @@ function RepositoryEditor({
     }));
   };
   const excludedReviewerIds = draft.excluded_reviewer_ids ?? [];
+  const effectiveRouterModel = models.find(
+    (model) => model.id === (draft.router_model || draft.model),
+  );
+  const routerThinking = thinkingOptions(effectiveRouterModel);
+  const compatibleRouterThinking = (model: Model | undefined): string | undefined => {
+    const configured = draft.router_thinking_level;
+    return configured && thinkingOptions(model).values.includes(configured)
+      ? configured
+      : undefined;
+  };
   const reviewerPolicyInvalid =
     draft.routing_mode === "core"
       ? draft.reviewer_ids.length === 0
       : reviewers.length === 0 ||
         reviewers.every((reviewer) => excludedReviewerIds.includes(reviewer.id));
+  const reviewModelInvalid = draft.mode !== "off" && !draft.model;
   return (
     <details class="repository-editor">
       <summary>
@@ -1661,17 +1680,75 @@ function RepositoryEditor({
             </small>
           </label>
           <label>
-            Default model
+            Review model
             <select
               value={draft.model ?? ""}
-              onChange={(event) =>
-                setDraft({ ...draft, model: event.currentTarget.value || undefined })
-              }
+              onChange={(event) => {
+                const model = event.currentTarget.value || undefined;
+                const selectedRouterModel = models.find(
+                  (candidate) => candidate.id === (draft.router_model || model),
+                );
+                setDraft({
+                  ...draft,
+                  model,
+                  router_thinking_level: compatibleRouterThinking(selectedRouterModel),
+                });
+              }}
             >
-              <option value="">System review default</option>
+              <option value="">Select a model</option>
               {models.map((model) => (
                 <option value={model.id} key={model.id}>
                   {model.display_name} · {model.id}
+                </option>
+              ))}
+            </select>
+            <small>Required while review is enabled; no built-in model is assumed.</small>
+          </label>
+          <label>
+            Semantic router model
+            <select
+              value={draft.router_model ?? ""}
+              disabled={draft.routing_mode !== "auto" || !draft.semantic_routing}
+              onChange={(event) => {
+                const routerModel = event.currentTarget.value || undefined;
+                const selectedRouterModel = models.find(
+                  (candidate) => candidate.id === (routerModel || draft.model),
+                );
+                setDraft({
+                  ...draft,
+                  router_model: routerModel,
+                  router_thinking_level: compatibleRouterThinking(selectedRouterModel),
+                });
+              }}
+            >
+              <option value="">Inherit review model</option>
+              {models.map((model) => (
+                <option value={model.id} key={model.id}>
+                  {model.display_name} · {model.id}
+                </option>
+              ))}
+            </select>
+          </label>
+          <label>
+            Semantic router thinking
+            <select
+              value={draft.router_thinking_level ?? ""}
+              disabled={
+                draft.routing_mode !== "auto" ||
+                !draft.semantic_routing ||
+                !routerThinking.values.length
+              }
+              onChange={(event) =>
+                setDraft({
+                  ...draft,
+                  router_thinking_level: event.currentTarget.value || undefined,
+                })
+              }
+            >
+              <option value="">Inherit review default</option>
+              {routerThinking.values.map((level) => (
+                <option value={level} key={level}>
+                  {thinkingLevelLabel(level)}
                 </option>
               ))}
             </select>
@@ -1698,7 +1775,7 @@ function RepositoryEditor({
                   />
                   <span>
                     <strong>{reviewer.name}</strong>
-                    <small>{reviewer.model || "inherits model"}</small>
+                    <small>{reviewer.model || "inherits review model"}</small>
                   </span>
                 </label>
               ))}
@@ -1733,7 +1810,7 @@ function RepositoryEditor({
                   <label class="routing-persona" key={reviewer.id}>
                     <span>
                       <strong>{reviewer.name}</strong>
-                      <small>{reviewer.model || "inherits model"}</small>
+                      <small>{reviewer.model || "inherits review model"}</small>
                     </span>
                     <select
                       value={included ? "included" : excluded ? "excluded" : "automatic"}
@@ -1757,9 +1834,15 @@ function RepositoryEditor({
           </fieldset>
         )}
         <div class="action-row">
-          <button type="submit" disabled={busy || reviewerPolicyInvalid}>
+          <button
+            type="submit"
+            disabled={busy || reviewerPolicyInvalid || reviewModelInvalid}
+          >
             {busy ? "Saving…" : "Save repository"}
           </button>
+          {reviewModelInvalid && (
+            <span class="error-text">Select a review model before enabling reviews.</span>
+          )}
           {message && <span role="status">{message}</span>}
         </div>
       </form>

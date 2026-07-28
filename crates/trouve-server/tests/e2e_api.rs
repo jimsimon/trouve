@@ -3891,6 +3891,8 @@ async fn code_review_dashboard_and_repository_policy_round_trip() {
             "repository": "acme/widgets",
             "mode": "automatic",
             "model": "openai/gpt-5",
+            "router_model": "anthropic/claude",
+            "router_thinking_level": "low",
             "prompt": "focus on concurrency",
             "reviewer_ids": ["correctness", custom_id],
             "routing_mode": "auto",
@@ -3927,6 +3929,11 @@ async fn code_review_dashboard_and_repository_policy_round_trip() {
     assert_eq!(dashboard["repositories"][0]["repository"], "acme/widgets");
     assert_eq!(dashboard["repositories"][0]["mode"], "automatic");
     assert_eq!(dashboard["repositories"][0]["model"], "openai/gpt-5");
+    assert_eq!(
+        dashboard["repositories"][0]["router_model"],
+        "anthropic/claude"
+    );
+    assert_eq!(dashboard["repositories"][0]["router_thinking_level"], "low");
     assert_eq!(
         dashboard["repositories"][0]["reviewer_ids"],
         serde_json::json!(["correctness", custom_id])
@@ -4022,6 +4029,8 @@ async fn code_review_job_overview_loads_task_content_separately() {
             trigger: "automatic".into(),
             retry_of: None,
             model: Some("provider/model".into()),
+            router_model: Some("provider/router".into()),
+            router_thinking_level: Some("low".into()),
             prompt: "Review it".into(),
             reviewers: Vec::new(),
             routing_mode: trouve_protocol::CodeReviewRoutingMode::Core,
@@ -4104,6 +4113,9 @@ async fn code_review_job_overview_loads_task_content_separately() {
     assert_eq!(overview["tasks"][0]["status"], "running");
     assert_eq!(overview["event_cursor"], snapshot_event.cursor);
     assert_eq!(overview["job"]["routing_mode"], "core");
+    assert_eq!(overview["job"]["model"], "provider/model");
+    assert_eq!(overview["job"]["router_model"], "provider/router");
+    assert_eq!(overview["job"]["router_thinking_level"], "low");
     assert_eq!(
         overview["routing_decisions"][0]["reviewer_id"],
         "correctness"

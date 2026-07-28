@@ -834,9 +834,18 @@ pub struct CodeReviewRepository {
     pub private: bool,
     #[serde(default)]
     pub mode: CodeReviewMode,
-    /// Provider-qualified model; absent means the review mode/global default.
+    /// Provider-qualified model used by the coordinator and inherited by
+    /// reviewers without an override. Required while reviews are enabled.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
+    /// Provider-qualified model used by semantic persona triage. Absent
+    /// inherits `model`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub router_model: Option<String>,
+    /// Preferred thinking level for semantic persona triage. Absent inherits
+    /// the review mode's thinking default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub router_thinking_level: Option<String>,
     /// Extra repository-specific review instructions.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub prompt: String,
@@ -871,6 +880,10 @@ pub struct UpdateCodeReviewRepositoryRequest {
     pub mode: CodeReviewMode,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub router_model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub router_thinking_level: Option<String>,
     #[serde(default)]
     pub prompt: String,
     /// Omitted by older clients to preserve the current/default selection.
@@ -1136,6 +1149,13 @@ pub struct CodeReviewJob {
     pub retried_by: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
+    /// Model snapshotted for semantic persona triage. Absent inherits
+    /// `model`; legacy jobs may omit both and are rejected before dispatch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub router_model: Option<String>,
+    /// Thinking level snapshotted for semantic persona triage.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub router_thinking_level: Option<String>,
     /// Reviewer profiles are snapshotted internally; their stable ids are
     /// exposed here for history and diagnostics. Auto/Thorough jobs snapshot
     /// the candidate catalog; routing decisions record which personas ran.
