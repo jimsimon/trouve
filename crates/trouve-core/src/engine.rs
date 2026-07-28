@@ -4714,44 +4714,11 @@ impl Engine {
         let engine = self.clone();
         tokio::spawn(async move {
             let thread_id = thread.id.clone();
-            let prompt_id = prompt.id.clone();
-            // Catch a panic in the turn machinery so a durable TurnFailed can
-            // be published before releasing the claim and cancellation token;
-            // tokio would otherwise swallow the panic with no terminal event.
-            let drained =
-                std::panic::AssertUnwindSafe(engine.drain_queue(thread, turn, prompt, cancel))
-                    .catch_unwind()
-                    .await;
-            match drained {
-                Ok(Ok(())) => {}
-                Ok(Err(error)) => {
-                    // A terminal event failed to persist. Keep the active
-                    // claim and cancellation state intact so no later turn
-                    // can overtake an unrecorded terminal state.
-                    tracing::error!(
-                        "turn dispatcher for {thread_id} retained its claim: {error:#}"
-                    );
-                }
-                Err(_) => {
-                    tracing::error!("turn dispatcher for {thread_id} panicked");
-                    if let Err(error) = engine.store.append_event(
-                        Scope::Thread(thread_id.clone()),
-                        Event::TurnFailed {
-                            turn,
-                            error: "internal error".into(),
-                        },
-                    ) {
-                        tracing::error!(
-                            "turn dispatcher for {thread_id} retained its claim after panic: \
-                             persisting failure: {error:#}"
-                        );
-                        return;
-                    }
-                    let _ = engine.store.release_queued_prompt(&prompt_id);
-                    let _ = engine.emit_queue(&thread_id);
-                    engine.clear_cancel(&thread_id);
-                    engine.release_thread(&thread_id);
-                }
+            if let Err(error) = engine.drain_queue(thread, turn, prompt, cancel).await {
+                // A terminal event failed to persist. Keep the active claim
+                // and cancellation state intact so no later turn can overtake
+                // an unrecorded terminal state.
+                tracing::error!("turn dispatcher for {thread_id} retained its claim: {error:#}");
             }
         });
         Ok(Some(turn))
@@ -4775,7 +4742,35 @@ impl Engine {
             let cancel = first_cancel
                 .take()
                 .unwrap_or_else(|| self.register_cancel(&thread.id));
-            let result = self.run_turn(&thread, turn, &prompt, cancel.clone()).await;
+            let result =
+                std::panic::AssertUnwindSafe(self.run_turn(&thread, turn, &prompt, cancel.clone()))
+                    .catch_unwind()
+                    .await;
+            let result = match result {
+                Ok(result) => result,
+                Err(_) => {
+                    tracing::error!("turn {turn} of {} panicked", thread.id);
+                    self.store
+                        .append_event(
+                            Scope::Thread(thread.id.clone()),
+                            Event::TurnFailed {
+                                turn,
+                                error: "internal error".into(),
+                            },
+                        )
+                        .with_context(|| {
+                            format!(
+                                "persisting failure after panic in turn {turn} of {}",
+                                thread.id
+                            )
+                        })?;
+                    let _ = self.store.release_queued_prompt(&prompt.id);
+                    let _ = self.emit_queue(&thread.id);
+                    self.clear_cancel(&thread.id);
+                    self.release_thread(&thread.id);
+                    return Ok(());
+                }
+            };
             let outcome_error = result.as_ref().err().map(ToString::to_string);
             self.turn_scheduler
                 .record_outcome(&thread.model, outcome_error.as_deref());
