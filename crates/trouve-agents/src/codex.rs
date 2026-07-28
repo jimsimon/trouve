@@ -474,7 +474,6 @@ fn turn_stream(
         // twice.
         let mut streamed_reasoning = HashSet::new();
         let mut turn_finished = false;
-        let mut turn_stopped = false;
         let mut client_gone = false;
         let mut route_overloaded = false;
         let mut overload_signal = rx.overload_signal();
@@ -578,8 +577,13 @@ fn turn_stream(
                             }
                         }
                         "turn/completed" => {
+                            // Publish completion only after active-turn cleanup
+                            // is serialized with any replacement startup.
+                            let _lifecycle = server.lock_turn_lifecycle(&codex_thread_id).await;
+                            server
+                                .clear_active_turn(&codex_thread_id, &codex_turn_id)
+                                .await;
                             turn_finished = true;
-                            turn_stopped = true;
                             let status = params["turn"]["status"].as_str().unwrap_or("completed");
                             if status == "failed" {
                                 let msg = params["turn"]["error"]["message"]
@@ -677,9 +681,14 @@ fn turn_stream(
             }
             _ = process_route => {}
         }
+        let _cleanup_lifecycle = if turn_finished {
+            None
+        } else {
+            Some(server.lock_turn_lifecycle(&codex_thread_id).await)
+        };
         if client_gone {
-            turn_stopped = server
-                .interrupt_turn_best_effort(&codex_thread_id, &codex_turn_id, "cancelled")
+            server
+                .cleanup_active_turn_best_effort(&codex_thread_id, &codex_turn_id, "cancelled")
                 .await;
         } else if route_overloaded {
             let _ = tx
@@ -692,8 +701,8 @@ fn turn_stream(
             // request that `process_route` may have been awaiting when the
             // overload signal won the select. Report the overload first so
             // an unresponsive app-server cannot suppress the stream error.
-            turn_stopped = server
-                .interrupt_turn_best_effort(&codex_thread_id, &codex_turn_id, "overloaded")
+            server
+                .cleanup_active_turn_best_effort(&codex_thread_id, &codex_turn_id, "overloaded")
                 .await;
         } else if !turn_finished {
             let reason = if server.is_closed() {
@@ -702,11 +711,6 @@ fn turn_stream(
                 "app-server event route closed before turn completed"
             };
             let _ = tx.send(Err(BackendError::Protocol(reason.into()))).await;
-        }
-        if turn_stopped {
-            server
-                .clear_active_turn(&codex_thread_id, &codex_turn_id)
-                .await;
         }
         server.unsubscribe(&codex_thread_id, &route_tx).await;
     })
@@ -869,7 +873,51 @@ enum ServerMsg {
 type Pending = Arc<Mutex<HashMap<i64, oneshot::Sender<Result<Value, String>>>>>;
 type Routes = Arc<Mutex<HashMap<String, RouteSender<ServerMsg>>>>;
 type ActiveTurns = Arc<Mutex<HashMap<String, String>>>;
-type TurnLifecycles = Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>;
+type TurnLifecycles = Arc<std::sync::Mutex<HashMap<String, std::sync::Weak<Mutex<()>>>>>;
+
+struct TurnLifecycleGuard {
+    guard: Option<tokio::sync::OwnedMutexGuard<()>>,
+    thread_id: String,
+    lifecycle: Arc<Mutex<()>>,
+    registry: TurnLifecycles,
+}
+
+impl Drop for TurnLifecycleGuard {
+    fn drop(&mut self) {
+        // Release ownership before checking whether any waiter or holder still
+        // retains this lifecycle. Acquirers upgrade the weak entry while
+        // holding the same registry lock, so pruning cannot race a reuse.
+        self.guard.take();
+        let mut registry = self.registry.lock().unwrap();
+        let same_entry = registry
+            .get(&self.thread_id)
+            .is_some_and(|entry| entry.ptr_eq(&Arc::downgrade(&self.lifecycle)));
+        if same_entry && Arc::strong_count(&self.lifecycle) == 1 {
+            registry.remove(&self.thread_id);
+        }
+    }
+}
+
+async fn acquire_turn_lifecycle(registry: &TurnLifecycles, thread_id: &str) -> TurnLifecycleGuard {
+    let lifecycle = {
+        let mut registry = registry.lock().unwrap();
+        match registry.get(thread_id).and_then(std::sync::Weak::upgrade) {
+            Some(lifecycle) => lifecycle,
+            None => {
+                let lifecycle = Arc::new(Mutex::new(()));
+                registry.insert(thread_id.to_string(), Arc::downgrade(&lifecycle));
+                lifecycle
+            }
+        }
+    };
+    let guard = Arc::clone(&lifecycle).lock_owned().await;
+    TurnLifecycleGuard {
+        guard: Some(guard),
+        thread_id: thread_id.to_string(),
+        lifecycle,
+        registry: Arc::clone(registry),
+    }
+}
 
 #[derive(Default)]
 struct BufferedRoute {
@@ -1045,7 +1093,7 @@ impl AppServer {
             routes: Arc::new(Mutex::new(HashMap::new())),
             buffered: Arc::new(Mutex::new(HashMap::new())),
             active_turns: Arc::new(Mutex::new(HashMap::new())),
-            turn_lifecycles: Arc::new(Mutex::new(HashMap::new())),
+            turn_lifecycles: Arc::new(std::sync::Mutex::new(HashMap::new())),
             _child: child,
             closed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         };
@@ -1105,15 +1153,8 @@ impl AppServer {
     }
 
     /// Lock the complete replacement lifecycle for one Codex thread.
-    async fn lock_turn_lifecycle(&self, thread_id: &str) -> tokio::sync::OwnedMutexGuard<()> {
-        let lifecycle = self
-            .turn_lifecycles
-            .lock()
-            .await
-            .entry(thread_id.to_string())
-            .or_default()
-            .clone();
-        lifecycle.lock_owned().await
+    async fn lock_turn_lifecycle(&self, thread_id: &str) -> TurnLifecycleGuard {
+        acquire_turn_lifecycle(&self.turn_lifecycles, thread_id).await
     }
 
     /// Record the vendor turn currently running on a Codex thread.
@@ -1158,18 +1199,21 @@ impl AppServer {
         .map(|_| ())
     }
 
-    /// Best-effort interruption for cleanup paths that cannot report failure.
-    async fn interrupt_turn_best_effort(
-        &self,
-        thread_id: &str,
-        turn_id: &str,
-        reason: &str,
-    ) -> bool {
+    /// Best-effort cleanup when this turn still owns the active marker.
+    async fn cleanup_active_turn_best_effort(&self, thread_id: &str, turn_id: &str, reason: &str) {
+        if !self
+            .active_turns
+            .lock()
+            .await
+            .get(thread_id)
+            .is_some_and(|active| active == turn_id)
+        {
+            return;
+        }
         match self.interrupt_turn(thread_id, turn_id).await {
-            Ok(()) => true,
+            Ok(()) => self.clear_active_turn(thread_id, turn_id).await,
             Err(error) => {
                 tracing::warn!("codex: failed to interrupt {reason} turn {turn_id}: {error}");
-                false
             }
         }
     }
@@ -1403,6 +1447,33 @@ mod tests {
 
         remove_route(&routes, &buffered, "thread-1", &replacement_tx).await;
         assert!(routes.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn lifecycle_entry_survives_waiters_and_prunes_after_final_guard() {
+        let registry: TurnLifecycles = Arc::new(std::sync::Mutex::new(HashMap::new()));
+        let first = acquire_turn_lifecycle(&registry, "thread-1").await;
+        let waiter_registry = Arc::clone(&registry);
+        let waiter =
+            tokio::spawn(async move { acquire_turn_lifecycle(&waiter_registry, "thread-1").await });
+
+        loop {
+            let strong = registry
+                .lock()
+                .unwrap()
+                .get("thread-1")
+                .map_or(0, std::sync::Weak::strong_count);
+            if strong >= 3 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+
+        drop(first);
+        let second = waiter.await.unwrap();
+        assert_eq!(registry.lock().unwrap().len(), 1);
+        drop(second);
+        assert!(registry.lock().unwrap().is_empty());
     }
 
     #[tokio::test]
