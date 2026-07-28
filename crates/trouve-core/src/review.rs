@@ -5574,7 +5574,9 @@ fn merge_review_task_metrics(
 mod tests {
     use super::*;
 
-    struct RouterThinkingProvider;
+    struct RouterThinkingProvider {
+        stall: bool,
+    }
 
     #[async_trait::async_trait]
     impl trouve_providers::Provider for RouterThinkingProvider {
@@ -5612,6 +5614,13 @@ mod tests {
                     options_schema: serde_json::json!({}),
                 },
             ]
+        }
+
+        async fn list_models(&self) -> Vec<trouve_protocol::ModelInfo> {
+            if self.stall {
+                return std::future::pending().await;
+            }
+            self.models()
         }
 
         async fn stream_chat(
@@ -6896,7 +6905,10 @@ mod tests {
             data.path().to_path_buf(),
             &crate::config::Config::default(),
         )
-        .with_provider("provider", Arc::new(RouterThinkingProvider));
+        .with_provider(
+            "provider",
+            Arc::new(RouterThinkingProvider { stall: false }),
+        );
         let request =
             |router_model: Option<&str>, level: Option<&str>| UpdateCodeReviewRepositoryRequest {
                 installation_id: 7,
@@ -6950,6 +6962,21 @@ mod tests {
             .unwrap();
         assert_eq!(saved.router_model.as_deref(), Some("provider/plain"));
         assert!(saved.router_thinking_level.is_none());
+
+        let engine =
+            engine.with_provider("provider", Arc::new(RouterThinkingProvider { stall: true }));
+        let error = tokio::time::timeout(
+            Duration::from_secs(1),
+            engine.update_code_review_repository(&request(None, Some("low"))),
+        )
+        .await
+        .expect("model metadata validation did not respect its deadline")
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("timed out loading model metadata")
+        );
     }
 
     #[tokio::test]

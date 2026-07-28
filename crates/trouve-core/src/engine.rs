@@ -37,6 +37,10 @@ const COMPACTION_THRESHOLD: f64 = 0.8;
 /// stalled GraphQL request can retain the shared dashboard-cache lock.
 const GITHUB_DASHBOARD_REFRESH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 const SESSION_TITLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(8);
+#[cfg(not(test))]
+const MODEL_CATALOG_VALIDATION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+#[cfg(test)]
+const MODEL_CATALOG_VALIDATION_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(100);
 
 const TURN_CONCURRENCY_ENV: &str = "TROUVE_TURN_CONCURRENCY";
 const DEFAULT_TURN_CONCURRENCY: usize = 26;
@@ -4255,9 +4259,15 @@ impl Engine {
         model: &str,
     ) -> Result<trouve_protocol::ModelInfo, EngineError> {
         if let Some((_, backend, _)) = self.backend_for(model) {
-            return backend
-                .list_models()
-                .await
+            let models =
+                tokio::time::timeout(MODEL_CATALOG_VALIDATION_TIMEOUT, backend.list_models())
+                    .await
+                    .map_err(|_| {
+                        EngineError::BadRequest(format!(
+                            "timed out loading model metadata for {model}"
+                        ))
+                    })?;
+            return models
                 .into_iter()
                 .find(|candidate| candidate.id == model)
                 .ok_or_else(|| {
@@ -4267,7 +4277,11 @@ impl Engine {
                 });
         }
         let (provider, _) = self.resolve_provider(model)?;
-        let live = provider.list_models().await;
+        let live = tokio::time::timeout(MODEL_CATALOG_VALIDATION_TIMEOUT, provider.list_models())
+            .await
+            .map_err(|_| {
+                EngineError::BadRequest(format!("timed out loading model metadata for {model}"))
+            })?;
         let known = provider.models();
         live.into_iter()
             .chain(known)
