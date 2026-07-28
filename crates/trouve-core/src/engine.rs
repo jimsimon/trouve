@@ -4075,10 +4075,12 @@ impl Engine {
     pub async fn delete_session(&self, id: &str) -> Result<(), EngineError> {
         let session = self.get_session(id)?;
         {
-            // Lock ordering is always active_threads -> deleting_sessions;
-            // dispatch_queue uses the same order. Once the marker is set, an
-            // idle session cannot acquire a new dispatcher while deletion is
-            // in progress.
+            // Lock ordering is always activity publication -> active_threads
+            // -> deleting_sessions; dispatch_queue uses the same order. This
+            // also waits for a pending idle event before admitting deletion.
+            // Once the marker is set, an idle session cannot acquire a new
+            // dispatcher while deletion is in progress.
+            let _activity_publication = self.session_activity_publication.lock().unwrap();
             let active = self.active_threads.lock().unwrap();
             if active.values().any(|session_id| session_id == id) {
                 return Err(EngineError::Conflict(format!(
