@@ -1665,7 +1665,14 @@ mod tests {
         };
 
         let png = clipboard_image_png_from(&mut clipboard).unwrap();
-        assert!(png.starts_with(b"\x89PNG\r\n\x1a\n"));
+        let decoder = png::Decoder::new(std::io::Cursor::new(png));
+        let mut reader = decoder.read_info().unwrap();
+        let mut pixels = vec![0; reader.output_buffer_size().unwrap()];
+        let info = reader.next_frame(&mut pixels).unwrap();
+        assert_eq!((info.width, info.height), (1, 1));
+        assert_eq!(info.color_type, png::ColorType::Rgba);
+        assert_eq!(info.bit_depth, png::BitDepth::Eight);
+        assert_eq!(&pixels[..info.buffer_size()], &[0, 0, 0, 255]);
         assert_eq!(clipboard.image_reads, 1);
     }
 
