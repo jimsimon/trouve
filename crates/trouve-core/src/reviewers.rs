@@ -111,6 +111,12 @@ mod tests {
         for default in DEFAULT_REVIEWER_IDS {
             assert!(ids.contains(default));
         }
+        for baseline in AUTO_BASELINE_REVIEWER_IDS {
+            assert!(
+                ids.contains(baseline),
+                "unknown baseline reviewer {baseline}"
+            );
+        }
         assert!(DEFAULT_REVIEWER_IDS.contains(&"concurrency"));
     }
 }

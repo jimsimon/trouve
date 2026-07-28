@@ -265,8 +265,6 @@ CREATE TABLE IF NOT EXISTS code_review_routing_decisions (
   reasons TEXT NOT NULL DEFAULT '[]',
   PRIMARY KEY (job_id, batch_index, reviewer_id)
 );
-CREATE INDEX IF NOT EXISTS code_review_routing_decisions_job
-  ON code_review_routing_decisions (job_id, batch_index, reviewer_id);
 CREATE TABLE IF NOT EXISTS code_review_findings (
   id TEXT PRIMARY KEY,
   job_id TEXT NOT NULL REFERENCES code_review_jobs(id),
@@ -344,9 +342,9 @@ CREATE TABLE IF NOT EXISTS code_review_polled_comments (
 );
 "#;
 
-/// Additive migrations for databases created before a column existed.
-/// `CREATE TABLE IF NOT EXISTS` won't touch existing tables, so each entry
-/// is applied and "duplicate column" errors are ignored.
+/// Repeat-safe migrations for databases created before a schema change.
+/// `CREATE TABLE IF NOT EXISTS` won't touch existing tables, so column
+/// additions are retried and "duplicate column" errors are ignored.
 const MIGRATIONS: &[&str] = &[
     "ALTER TABLE workspaces ADD COLUMN closed INTEGER NOT NULL DEFAULT 0",
     "ALTER TABLE sessions ADD COLUMN archived INTEGER NOT NULL DEFAULT 0",
@@ -395,6 +393,7 @@ const MIGRATIONS: &[&str] = &[
     "ALTER TABLE code_review_jobs ADD COLUMN excluded_reviewer_ids TEXT NOT NULL DEFAULT '[]'",
     "ALTER TABLE code_review_jobs ADD COLUMN router_model TEXT",
     "ALTER TABLE code_review_jobs ADD COLUMN router_thinking_level TEXT",
+    "DROP INDEX IF EXISTS code_review_routing_decisions_job",
     "ALTER TABLE code_review_pr_state ADD COLUMN last_reviewed_head_sha TEXT NOT NULL DEFAULT ''",
     "ALTER TABLE code_review_pr_state ADD COLUMN last_reviewed_base_sha TEXT NOT NULL DEFAULT ''",
     "ALTER TABLE code_review_pr_state ADD COLUMN last_reviewed_at TEXT",
@@ -4986,6 +4985,28 @@ mod tests {
             .map(|column| column.strip_prefix("'' AS ").unwrap_or(column));
 
         assert!(full_columns.eq(summary_columns));
+    }
+
+    #[test]
+    fn migration_removes_redundant_routing_decisions_index() {
+        let store = Store::open_in_memory().unwrap();
+        let conn = store.conn.lock().unwrap();
+        conn.execute_batch(
+            "CREATE INDEX code_review_routing_decisions_job
+             ON code_review_routing_decisions (job_id, batch_index, reviewer_id)",
+        )
+        .unwrap();
+        apply_migrations(&conn).unwrap();
+        let redundant_indexes = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master
+                 WHERE type = 'index' AND name = 'code_review_routing_decisions_job'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap();
+
+        assert_eq!(redundant_indexes, 0);
     }
 
     #[test]

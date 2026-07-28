@@ -1529,13 +1529,17 @@ impl Engine {
     ) -> Result<String, EngineError> {
         let reviewer_config = serde_json::to_string(reviewers)
             .map_err(|error| EngineError::Internal(error.into()))?;
+        let mut included_reviewer_ids = repository.included_reviewer_ids.clone();
+        let mut excluded_reviewer_ids = repository.excluded_reviewer_ids.clone();
+        included_reviewer_ids.sort();
+        excluded_reviewer_ids.sort();
         let routing_config = serde_json::to_string(&(
             repository.routing_mode,
             repository.semantic_routing,
             &repository.router_model,
             &repository.router_thinking_level,
-            &repository.included_reviewer_ids,
-            &repository.excluded_reviewer_ids,
+            included_reviewer_ids,
+            excluded_reviewer_ids,
         ))
         .map_err(|error| EngineError::Internal(error.into()))?;
         Ok(hex::encode(Sha256::digest(
@@ -3374,85 +3378,133 @@ impl Engine {
         superseded: &CancellationToken,
         active_threads: &Arc<Mutex<HashSet<String>>>,
     ) -> Result<HashMap<(usize, String), String>> {
+        let routing_model = router_model(job)?;
+        let batch_count = batches.len();
+        let task_concurrency = positive_concurrency_from_env(
+            REVIEW_TASK_CONCURRENCY_ENV,
+            DEFAULT_REVIEW_TASK_CONCURRENCY,
+        );
+        let work = batches
+            .iter()
+            .enumerate()
+            .filter_map(|(batch_index, batch)| {
+                let candidates = semantic_routing_candidates(job, reviewers, batch)
+                    .into_iter()
+                    .cloned()
+                    .collect::<Vec<_>>();
+                if candidates.is_empty() {
+                    return None;
+                }
+                let prompt =
+                    semantic_routing_prompt(job, batch, batch_index, batch_count, &candidates);
+                Some((batch_index, candidates, prompt))
+            })
+            .collect::<Vec<_>>();
+        let engine = Arc::clone(self);
+        let job = job.clone();
+        let session_id = session_id.to_owned();
+        let superseded = superseded.clone();
+        let active_threads = Arc::clone(active_threads);
+        let results = stream::iter(work.into_iter().map(
+            move |(batch_index, candidates, prompt)| {
+                let engine = Arc::clone(&engine);
+                let job = job.clone();
+                let session_id = session_id.clone();
+                let routing_model = routing_model.clone();
+                let superseded = superseded.clone();
+                let active_threads = Arc::clone(&active_threads);
+                async move {
+                    ensure_review_current(&superseded)?;
+                    let task = engine.store.create_code_review_task(&NewCodeReviewTask {
+                        job_id: job.id.clone(),
+                        role: trouve_protocol::CodeReviewTaskRole::Router,
+                        reviewer_id: None,
+                        reviewer_name: "Automatic persona router".into(),
+                        batch_index: batch_index as u64,
+                        batch_count: batch_count as u64,
+                        model: Some(routing_model.clone()),
+                        prompt: prompt.clone(),
+                    })?;
+                    engine.emit_code_review_task(&job.id, task.clone())?;
+                    let thread = engine.create_thread(CreateThreadRequest {
+                        session_id,
+                        mode: Some("review".into()),
+                        model: Some(routing_model),
+                        model_options: thinking_model_options(job.router_thinking_level.as_deref()),
+                        permission_mode: Some(PermissionMode::Yolo),
+                    })?;
+                    let task = engine
+                        .store
+                        .start_code_review_task(
+                            &task.id,
+                            &thread.session_id,
+                            &thread.id,
+                            &thread.model,
+                        )?
+                        .ok_or_else(|| {
+                            anyhow!("semantic routing task was cancelled before dispatch")
+                        })?;
+                    engine.emit_code_review_task(&job.id, task.clone())?;
+                    match engine
+                        .run_semantic_routing_turn(
+                            &job,
+                            &task.id,
+                            &thread.id,
+                            prompt,
+                            &superseded,
+                            &active_threads,
+                        )
+                        .await
+                    {
+                        Ok((turn, parsed)) => {
+                            let selected = validated_semantic_routing(parsed, &candidates);
+                            if let Some(task) = engine.store.finish_code_review_task(
+                                &task.id,
+                                "succeeded",
+                                &turn.output,
+                                0,
+                                "",
+                            )? {
+                                engine.emit_code_review_task(&job.id, task)?;
+                            }
+                            Ok::<_, anyhow::Error>((batch_index, selected))
+                        }
+                        Err(error) => {
+                            if superseded.is_cancelled() {
+                                return Err(error);
+                            }
+                            if let Some(task) = engine.store.finish_code_review_task(
+                                &task.id,
+                                "failed",
+                                "",
+                                0,
+                                &format!(
+                                    "semantic routing failed; deterministic routing was retained: \
+                                     {error:#}"
+                                ),
+                            )? {
+                                engine.emit_code_review_task(&job.id, task)?;
+                            }
+                            engine.record_review_error(format!(
+                                "semantic routing for review {} batch {} failed: {error:#}",
+                                job.id,
+                                batch_index + 1
+                            ));
+                            Ok((batch_index, HashMap::new()))
+                        }
+                    }
+                }
+            },
+        ))
+        .buffer_unordered(task_concurrency)
+        .collect::<Vec<_>>()
+        .await;
+
         let mut routed = HashMap::new();
-        for (batch_index, batch) in batches.iter().enumerate() {
-            ensure_review_current(superseded)?;
-            let candidates = semantic_routing_candidates(job, reviewers, batch);
-            if candidates.is_empty() {
-                continue;
-            }
-            let prompt =
-                semantic_routing_prompt(job, batch, batch_index, batches.len(), &candidates);
-            let routing_model = router_model(job)?;
-            let task = self.store.create_code_review_task(&NewCodeReviewTask {
-                job_id: job.id.clone(),
-                role: trouve_protocol::CodeReviewTaskRole::Router,
-                reviewer_id: None,
-                reviewer_name: "Automatic persona router".into(),
-                batch_index: batch_index as u64,
-                batch_count: batches.len() as u64,
-                model: Some(routing_model.clone()),
-                prompt: prompt.clone(),
-            })?;
-            self.emit_code_review_task(&job.id, task.clone())?;
-            let thread = self.create_thread(CreateThreadRequest {
-                session_id: session_id.to_owned(),
-                mode: Some("review".into()),
-                model: Some(routing_model),
-                model_options: thinking_model_options(job.router_thinking_level.as_deref()),
-                permission_mode: Some(PermissionMode::Yolo),
-            })?;
-            let task = self
-                .store
-                .start_code_review_task(&task.id, &thread.session_id, &thread.id, &thread.model)?
-                .ok_or_else(|| anyhow!("semantic routing task was cancelled before dispatch"))?;
-            self.emit_code_review_task(&job.id, task.clone())?;
-            match self
-                .run_semantic_routing_turn(
-                    job,
-                    &task.id,
-                    &thread.id,
-                    prompt,
-                    superseded,
-                    active_threads,
-                )
-                .await
-            {
-                Ok((turn, parsed)) => {
-                    for (reviewer_id, reason) in validated_semantic_routing(parsed, &candidates) {
-                        routed.insert((batch_index, reviewer_id), reason);
-                    }
-                    if let Some(task) = self.store.finish_code_review_task(
-                        &task.id,
-                        "succeeded",
-                        &turn.output,
-                        0,
-                        "",
-                    )? {
-                        self.emit_code_review_task(&job.id, task)?;
-                    }
-                }
-                Err(error) => {
-                    if superseded.is_cancelled() {
-                        return Err(error);
-                    }
-                    if let Some(task) = self.store.finish_code_review_task(
-                        &task.id,
-                        "failed",
-                        "",
-                        0,
-                        &format!(
-                            "semantic routing failed; deterministic routing was retained: {error:#}"
-                        ),
-                    )? {
-                        self.emit_code_review_task(&job.id, task)?;
-                    }
-                    self.record_review_error(format!(
-                        "semantic routing for review {} batch {} failed: {error:#}",
-                        job.id,
-                        batch_index + 1
-                    ));
-                }
+        for result in results {
+            let (batch_index, selected) = result?;
+            for (reviewer_id, reason) in selected {
+                routed.insert((batch_index, reviewer_id), reason);
             }
         }
         Ok(routed)
@@ -4757,8 +4809,15 @@ fn deterministic_reviewer_reasons(reviewer_id: &str, batch: &ReviewBatch) -> Vec
         "reliability" => contains_any(
             &diff,
             &[
-                "retry", "timeout", "cancel", "cleanup", "shutdown", "drop(", "error", "result<",
-                "unwrap()", "expect(", "idempot", "partial",
+                "retry",
+                "timeout",
+                "cancel",
+                "cleanup",
+                "shutdown",
+                "idempot",
+                "partial write",
+                "rollback",
+                "recovery",
             ],
         ),
         "performance" => {
@@ -4775,16 +4834,14 @@ fn deterministic_reviewer_reasons(reviewer_id: &str, batch: &ReviewBatch) -> Vec
             ) || contains_any(
                 &diff,
                 &[
-                    "for ",
-                    "while ",
-                    ".collect",
-                    ".clone()",
-                    "allocate",
                     "cache",
                     "pagination",
                     "per_page",
-                    "batch",
                     "n + 1",
+                    "n+1",
+                    "benchmark",
+                    "hot path",
+                    "round trip",
                 ],
             )
         }
@@ -4982,7 +5039,7 @@ fn semantic_routing_prompt(
     batch: &ReviewBatch,
     batch_index: usize,
     batch_count: usize,
-    candidates: &[&ReviewerProfile],
+    candidates: &[ReviewerProfile],
 ) -> String {
     let catalog = candidates
         .iter()
@@ -5025,6 +5082,9 @@ fn parse_semantic_routing_output(output: &str) -> Result<SemanticRoutingOutput> 
     let end = trimmed
         .rfind('}')
         .ok_or_else(|| anyhow!("semantic router did not contain JSON"))?;
+    if end < start {
+        bail!("semantic router did not contain JSON");
+    }
     serde_json::from_str(&trimmed[start..=end]).context("decoding semantic router JSON")
 }
 
@@ -5038,7 +5098,7 @@ fn semantic_routing_repair_prompt(error: &anyhow::Error, malformed_output: &str)
 
 fn validated_semantic_routing(
     routed: SemanticRoutingOutput,
-    candidates: &[&ReviewerProfile],
+    candidates: &[ReviewerProfile],
 ) -> HashMap<String, String> {
     let allowed = candidates
         .iter()
@@ -6676,6 +6736,44 @@ mod tests {
     }
 
     #[test]
+    fn review_config_hash_treats_routing_include_and_exclude_lists_as_sets() {
+        let reviewers = crate::reviewers::built_in_reviewers()
+            .into_iter()
+            .take(2)
+            .collect::<Vec<_>>();
+        let mut repository = CodeReviewRepository {
+            installation_id: 7,
+            repository: "acme/widgets".into(),
+            private: false,
+            mode: CodeReviewMode::Automatic,
+            model: Some("provider/review".into()),
+            router_model: Some("provider/router".into()),
+            router_thinking_level: Some("low".into()),
+            prompt: "Review it".into(),
+            reviewer_ids: crate::reviewers::default_reviewer_ids(),
+            routing_mode: CodeReviewRoutingMode::Auto,
+            semantic_routing: true,
+            included_reviewer_ids: vec!["reliability".into(), "performance".into()],
+            excluded_reviewer_ids: vec!["operations".into(), "accessibility".into()],
+            reviewer_overrides: Vec::new(),
+        };
+        let initial = Engine::code_review_config_hash(&repository, &reviewers).unwrap();
+
+        repository.included_reviewer_ids.reverse();
+        repository.excluded_reviewer_ids.reverse();
+        assert_eq!(
+            Engine::code_review_config_hash(&repository, &reviewers).unwrap(),
+            initial
+        );
+
+        repository.included_reviewer_ids.push("dependencies".into());
+        assert_ne!(
+            Engine::code_review_config_hash(&repository, &reviewers).unwrap(),
+            initial
+        );
+    }
+
+    #[test]
     fn enabled_review_requires_an_explicit_model() {
         let data = tempfile::tempdir().unwrap();
         let store = crate::store::Store::open_in_memory().unwrap();
@@ -6709,6 +6807,72 @@ mod tests {
                 .to_string()
                 .contains("requires an explicit repository model")
         );
+    }
+
+    #[test]
+    fn repository_routing_policy_validation_rejects_invalid_selections() {
+        let data = tempfile::tempdir().unwrap();
+        let store = crate::store::Store::open_in_memory().unwrap();
+        store
+            .upsert_discovered_code_review_repository(7, "acme/widgets", false)
+            .unwrap();
+        let engine = Engine::new(
+            store,
+            data.path().to_path_buf(),
+            &crate::config::Config::default(),
+        );
+        let request = || UpdateCodeReviewRepositoryRequest {
+            installation_id: 7,
+            repository: "acme/widgets".into(),
+            mode: CodeReviewMode::Automatic,
+            model: Some("provider/review".into()),
+            router_model: None,
+            router_thinking_level: None,
+            prompt: String::new(),
+            reviewer_ids: Some(crate::reviewers::default_reviewer_ids()),
+            routing_mode: Some(CodeReviewRoutingMode::Core),
+            semantic_routing: Some(true),
+            included_reviewer_ids: Some(Vec::new()),
+            excluded_reviewer_ids: Some(Vec::new()),
+            reviewer_overrides: Some(Vec::new()),
+        };
+        let rejected = |request: UpdateCodeReviewRepositoryRequest, expected: &str| {
+            let error = engine.update_code_review_repository(&request).unwrap_err();
+            assert!(
+                error.to_string().contains(expected),
+                "expected {expected:?}, got {error}"
+            );
+        };
+
+        let mut invalid = request();
+        invalid.reviewer_ids = Some(Vec::new());
+        rejected(invalid, "must select at least one reviewer");
+
+        let mut invalid = request();
+        invalid.included_reviewer_ids = Some(vec!["missing".into()]);
+        rejected(invalid, "unknown reviewer id");
+
+        let mut invalid = request();
+        invalid.excluded_reviewer_ids = Some(vec!["missing".into()]);
+        rejected(invalid, "unknown reviewer id");
+
+        let mut invalid = request();
+        invalid.included_reviewer_ids = Some(vec!["correctness".into()]);
+        invalid.excluded_reviewer_ids = Some(vec!["correctness".into()]);
+        rejected(invalid, "cannot be both included and excluded");
+
+        let catalog_ids = engine
+            .code_review_reviewer_catalog()
+            .unwrap()
+            .into_iter()
+            .map(|reviewer| reviewer.id)
+            .collect::<Vec<_>>();
+        for routing_mode in [CodeReviewRoutingMode::Auto, CodeReviewRoutingMode::Thorough] {
+            let mut invalid = request();
+            invalid.routing_mode = Some(routing_mode);
+            invalid.excluded_reviewer_ids = Some(catalog_ids.clone());
+            rejected(invalid, "cannot exclude every reviewer");
+        }
     }
 
     #[test]
@@ -6884,6 +7048,26 @@ mod tests {
                 .into(),
         };
         assert!(reviewer_applies_to_batch("concurrency", &lock_scope));
+        let ordinary_rust = ReviewBatch {
+            paths: plain.paths.clone(),
+            diff: "+fn values() -> Result<Vec<u64>, Error> {\n\
+                   +    for value in source() { output.push(value.clone()); }\n\
+                   +    Ok(output.into_iter().collect())\n\
+                   +}\n"
+                .into(),
+        };
+        assert!(!reviewer_applies_to_batch("reliability", &ordinary_rust));
+        assert!(!reviewer_applies_to_batch("performance", &ordinary_rust));
+        let failure_controls = ReviewBatch {
+            paths: plain.paths.clone(),
+            diff: "+retry_with_timeout(cancel_token).await?;\n".into(),
+        };
+        assert!(reviewer_applies_to_batch("reliability", &failure_controls));
+        let pagination_cache = ReviewBatch {
+            paths: plain.paths.clone(),
+            diff: "+cache.fetch_page(per_page, cursor).await?;\n".into(),
+        };
+        assert!(reviewer_applies_to_batch("performance", &pagination_cache));
         let frontend = ReviewBatch {
             paths: vec!["web/app.tsx".into()],
             diff: "+<button aria-label=\"Save\" />\n".into(),
@@ -6994,7 +7178,7 @@ mod tests {
             .iter()
             .find(|reviewer| reviewer.id == "reliability")
             .unwrap();
-        let candidates = vec![performance, reliability];
+        let candidates = vec![performance.clone(), reliability.clone()];
         let routed = SemanticRoutingOutput {
             selections: vec![
                 SemanticRoutingSelection {
@@ -7022,6 +7206,20 @@ mod tests {
             selected.get("performance").map(String::as_str),
             Some("cache behavior changed")
         );
+    }
+
+    #[test]
+    fn semantic_routing_parser_extracts_embedded_json_and_rejects_reversed_boundaries() {
+        let parsed = parse_semantic_routing_output(
+            "Routing result:\n{\"selections\":[{\"reviewer_id\":\"performance\",\
+             \"reason\":\"cache behavior changed\"}]}\nDone.",
+        )
+        .unwrap();
+        assert_eq!(parsed.selections.len(), 1);
+        assert_eq!(parsed.selections[0].reviewer_id, "performance");
+        assert_eq!(parsed.selections[0].reason, "cache behavior changed");
+
+        assert!(parse_semantic_routing_output("} malformed {").is_err());
     }
 
     #[test]

@@ -189,6 +189,8 @@ function routingReasonLabel(
       return "Always include";
     case "thorough":
       return "Thorough mode";
+    default:
+      return source;
   }
 }
 
@@ -680,6 +682,7 @@ function JobDetailPane({
   const [taskLoading, setTaskLoading] = useState("");
   const [taskErrors, setTaskErrors] = useState<Record<string, string>>({});
   const [eventCursor, setEventCursor] = useState<number | null>(null);
+  const [routingOpen, setRoutingOpen] = useState(false);
   const now = useClock(detail?.job.status === "running");
   const aliveRef = useRef<string | null>(jobId);
   const taskRequestsRef = useRef(new Set<string>());
@@ -738,6 +741,7 @@ function JobDetailPane({
     setTaskLoading("");
     setTaskErrors({});
     setEventCursor(null);
+    setRoutingOpen(false);
     taskRequestsRef.current.clear();
     void load();
     return () => {
@@ -1160,7 +1164,10 @@ function JobDetailPane({
       </div>
       {job.check_sync_error && <p class="warning">Check sync: {job.check_sync_error}</p>}
       {routingDecisions.length > 0 && (
-        <details class="routing-decisions">
+        <details
+          class="routing-decisions"
+          onToggle={(event) => setRoutingOpen(event.currentTarget.open)}
+        >
           <summary>
             <strong>Persona routing</strong>
             <span>
@@ -1168,41 +1175,43 @@ function JobDetailPane({
               {routingDecisions.length} persona-batch candidates selected
             </span>
           </summary>
-          <div class="routing-batches">
-            {[...new Set(routingDecisions.map((decision) => decision.batch_index))].map(
-              (batchIndex) => (
-                <section key={batchIndex}>
-                  <h3>Batch {batchIndex + 1}</h3>
-                  <div>
-                    {routingDecisions
-                      .filter((decision) => decision.batch_index === batchIndex)
-                      .map((decision) => (
-                        <article
-                          class={`routing-decision ${decision.selected ? "selected" : "skipped"}`}
-                          key={decision.reviewer_id}
-                        >
-                          <header>
-                            <strong>{decision.reviewer_name}</strong>
-                            <span>{decision.selected ? "Selected" : "Skipped"}</span>
-                          </header>
-                          {(decision.reasons ?? []).length > 0 ? (
-                            <ul>
-                              {(decision.reasons ?? []).map((reason, index) => (
-                                <li key={`${reason.source}:${index}`}>
-                                  <b>{routingReasonLabel(reason.source)}:</b> {reason.detail}
-                                </li>
-                              ))}
-                            </ul>
-                          ) : (
-                            <p>No applicable routing signal.</p>
-                          )}
-                        </article>
-                      ))}
-                  </div>
-                </section>
-              ),
-            )}
-          </div>
+          {routingOpen && (
+            <div class="routing-batches">
+              {[...new Set(routingDecisions.map((decision) => decision.batch_index))].map(
+                (batchIndex) => (
+                  <section key={batchIndex}>
+                    <h3>Batch {batchIndex + 1}</h3>
+                    <div>
+                      {routingDecisions
+                        .filter((decision) => decision.batch_index === batchIndex)
+                        .map((decision) => (
+                          <article
+                            class={`routing-decision ${decision.selected ? "selected" : "skipped"}`}
+                            key={decision.reviewer_id}
+                          >
+                            <header>
+                              <strong>{decision.reviewer_name}</strong>
+                              <span>{decision.selected ? "Selected" : "Skipped"}</span>
+                            </header>
+                            {(decision.reasons ?? []).length > 0 ? (
+                              <ul>
+                                {(decision.reasons ?? []).map((reason, index) => (
+                                  <li key={`${reason.source}:${index}`}>
+                                    <b>{routingReasonLabel(reason.source)}:</b> {reason.detail}
+                                  </li>
+                                ))}
+                              </ul>
+                            ) : (
+                              <p>No applicable routing signal.</p>
+                            )}
+                          </article>
+                        ))}
+                    </div>
+                  </section>
+                ),
+              )}
+            </div>
+          )}
         </details>
       )}
       <section class="detail-section">
@@ -1609,10 +1618,11 @@ function RepositoryEditor({
       : undefined;
   };
   const reviewerPolicyInvalid =
-    draft.routing_mode === "core"
+    draft.mode !== "off" &&
+    (draft.routing_mode === "core"
       ? draft.reviewer_ids.length === 0
       : reviewers.length === 0 ||
-        reviewers.every((reviewer) => excludedReviewerIds.includes(reviewer.id));
+        reviewers.every((reviewer) => excludedReviewerIds.includes(reviewer.id)));
   const reviewModelInvalid = draft.mode !== "off" && !draft.model;
   return (
     <details class="repository-editor">
