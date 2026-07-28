@@ -769,7 +769,37 @@ component CopyButton inherits Rectangle {
 // TextEdit widgets provide. Keep the raw input behavior while adding the same
 // platform context menu (native on Windows/macOS, Slint-rendered fallback on
 // platforms without a native popup-menu backend).
-component ContextTextInput inherits TextInput {
+component ContextTextInput {
+    in-out property <string> text <=> input.text;
+    in property <string> font-family <=> input.font-family;
+    in property <length> font-size <=> input.font-size;
+    in property <brush> color <=> input.color;
+    in property <color> selection-background-color <=> input.selection-background-color;
+    in property <TextWrap> wrap <=> input.wrap;
+    in property <bool> enabled <=> input.enabled;
+    in property <bool> single-line <=> input.single-line;
+    in property <bool> read-only <=> input.read-only;
+    out property <bool> has-focus: input.has-focus;
+    out property <int> cursor-position-byte-offset: input.cursor-position-byte-offset;
+    callback accepted;
+    callback edited;
+    callback cursor-position-changed(Point);
+    callback key-pressed(KeyEvent) -> EventResult;
+    callback key-released(KeyEvent) -> EventResult;
+
+    public function set-selection-offsets(start: int, end: int) {
+        input.set-selection-offsets(start, end);
+    }
+    public function select-all() { input.select-all(); }
+    public function clear-selection() { input.clear-selection(); }
+    public function cut() { input.cut(); }
+    public function copy() { input.copy(); }
+    public function paste() { input.paste(); }
+
+    preferred-width: input.preferred-width;
+    preferred-height: input.preferred-height;
+    forward-focus: input;
+
     ContextMenuArea {
         enabled: root.enabled;
         Menu {
@@ -793,6 +823,14 @@ component ContextTextInput inherits TextInput {
                 enabled: root.text != "";
                 activated => { root.select-all(); }
             }
+        }
+
+        input := TextInput {
+            accepted => { root.accepted(); }
+            edited => { root.edited(); }
+            cursor-position-changed(pos) => { root.cursor-position-changed(pos); }
+            key-pressed(event) => { root.key-pressed(event) }
+            key-released(event) => { root.key-released(event) }
         }
     }
 }
