@@ -114,7 +114,7 @@ pub struct McpServerLaunch {
 /// reach trouve (the engine's internal per-thread MCP endpoint). It provides
 /// the provider-independent supplemental capability set and, for Claude,
 /// the permission-prompt target.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct McpBridgeConfig {
     /// Thread-scoped endpoint URL, with non-secret capability selectors in
     /// its query parameters.
@@ -123,6 +123,20 @@ pub struct McpBridgeConfig {
     /// here rather than in the URL, where vendor logs and diagnostics may
     /// record them.
     pub headers: Vec<(String, String)>,
+}
+
+impl fmt::Debug for McpBridgeConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let headers: Vec<(&str, &str)> = self
+            .headers
+            .iter()
+            .map(|(name, _)| (name.as_str(), "<redacted>"))
+            .collect();
+        f.debug_struct("McpBridgeConfig")
+            .field("url", &self.url)
+            .field("headers", &headers)
+            .finish()
+    }
 }
 
 /// One event from a backend turn, in trouve-shaped vocabulary.

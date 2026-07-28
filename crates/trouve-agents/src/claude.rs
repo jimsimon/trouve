@@ -23,12 +23,14 @@
 //! rate-limit windows. No user message is sent, so no model turn runs.
 
 use std::collections::HashMap;
+use std::fmt::Write as _;
 use std::process::Stdio;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use futures::StreamExt;
 use serde_json::{Value, json};
+use sha2::Digest;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, Command};
 use tokio::sync::{Mutex, mpsc};
@@ -243,7 +245,24 @@ impl ClaudeProc {
 
 /// Spawn-time configuration that must match for a process to be reused.
 fn config_fingerprint(turn: &BackendTurn) -> String {
-    let bridge = turn.mcp_bridge.as_ref().map(|b| (&b.url, &b.headers));
+    let bridge = turn.mcp_bridge.as_ref().map(|bridge| {
+        let mut digest = sha2::Sha256::new();
+        for (name, value) in &bridge.headers {
+            digest.update((name.len() as u64).to_le_bytes());
+            digest.update(name.as_bytes());
+            digest.update((value.len() as u64).to_le_bytes());
+            digest.update(value.as_bytes());
+        }
+        let header_fingerprint =
+            digest
+                .finalize()
+                .iter()
+                .fold(String::with_capacity(64), |mut output, byte| {
+                    write!(output, "{byte:02x}").expect("writing to String cannot fail");
+                    output
+                });
+        (&bridge.url, header_fingerprint)
+    });
     let servers: Vec<String> = turn
         .mcp_servers
         .iter()
@@ -1128,6 +1147,27 @@ mod tests {
             mcp_bridge: None,
             mcp_servers: Vec::new(),
         }
+    }
+
+    #[test]
+    fn bridge_credentials_are_redacted_but_still_affect_process_reuse() {
+        let mut turn = turn("claude-fable-5", "thinking_level", "high");
+        turn.mcp_bridge = Some(crate::McpBridgeConfig {
+            url: "http://127.0.0.1/internal/threads/th_1/mcp".into(),
+            headers: vec![("Authorization".into(), "Bearer bridge-secret-a".into())],
+        });
+
+        let debug = format!("{turn:?}");
+        assert!(debug.contains("Authorization"));
+        assert!(debug.contains("<redacted>"));
+        assert!(!debug.contains("bridge-secret-a"));
+
+        let first = config_fingerprint(&turn);
+        assert!(!first.contains("bridge-secret-a"));
+        turn.mcp_bridge.as_mut().unwrap().headers[0].1 = "Bearer bridge-secret-b".into();
+        let second = config_fingerprint(&turn);
+        assert!(!second.contains("bridge-secret-b"));
+        assert_ne!(first, second);
     }
 
     #[test]
