@@ -7815,7 +7815,7 @@ for line in sys.stdin:
     }
 
     #[test]
-    fn auth_sync_serializes_publishers_on_the_shared_auth_lock() {
+    fn auth_sync_yields_when_the_shared_auth_lock_is_busy() {
         let temp = tempfile::tempdir().unwrap();
         let source = temp.path().join("auth.json");
         let isolated_a = temp.path().join("isolated-a.json");
@@ -7844,32 +7844,59 @@ for line in sys.stdin:
         a_staged_rx.recv().unwrap();
 
         let (b_started_tx, b_started_rx) = std::sync::mpsc::channel();
-        let (b_staged_tx, b_staged_rx) = std::sync::mpsc::channel();
+        let (b_done_tx, b_done_rx) = std::sync::mpsc::channel();
         let b = {
             let sync = sync_b.clone();
             std::thread::spawn(move || {
                 b_started_tx.send(()).unwrap();
-                sync.sync_with_publish_hook(|| {
-                    b_staged_tx.send(()).unwrap();
-                })
+                let result = sync.sync();
+                b_done_tx.send(()).unwrap();
+                result
             })
         };
         b_started_rx.recv().unwrap();
-        assert_eq!(
-            b_staged_rx.recv_timeout(std::time::Duration::from_millis(200)),
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout)
-        );
+        b_done_rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("a pending login must not stall a competing refresh");
+        assert_eq!(std::fs::read(&source).unwrap(), b"old");
 
         release_a_tx.send(()).unwrap();
         a.join().unwrap().unwrap();
         b.join().unwrap().unwrap();
         assert_eq!(std::fs::read(&source).unwrap(), b"refresh-a");
 
-        // The second publisher observed A's committed source under the lock
-        // and permanently stood down instead of overwriting it later.
+        // B kept its old baseline when it yielded. Its retry observes A's
+        // committed source and stands down instead of overwriting it.
         std::fs::write(&isolated_b, b"later-refresh-b").unwrap();
         sync_b.sync().unwrap();
         assert_eq!(std::fs::read(&source).unwrap(), b"refresh-a");
+    }
+
+    #[test]
+    fn auth_snapshot_fails_fast_while_an_interactive_login_owns_the_lock() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("auth.json");
+        let isolated_home = temp.path().join("isolated-home");
+        std::fs::write(&source, b"old").unwrap();
+        std::fs::create_dir(&isolated_home).unwrap();
+        let login_lock = AuthFileLock::acquire(&source).unwrap();
+
+        let started = std::time::Instant::now();
+        let error = match stage_auth_snapshot_from(source.clone(), &isolated_home) {
+            Err(error) => error,
+            Ok(_) => panic!("snapshot unexpectedly acquired the interactive login lock"),
+        };
+        assert_eq!(error.kind(), std::io::ErrorKind::WouldBlock);
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(1),
+            "snapshot waited for an interactive login instead of yielding"
+        );
+
+        drop(login_lock);
+        let snapshot = stage_auth_snapshot_from(source, &isolated_home)
+            .unwrap()
+            .expect("snapshot should succeed after login releases the lock");
+        assert_eq!(std::fs::read(snapshot.isolated).unwrap(), b"old");
     }
 
     #[test]
