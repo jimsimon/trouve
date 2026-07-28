@@ -366,7 +366,11 @@ impl ToolExecutor for LocalToolExecutor {
         }
 
         // Retries and duplicate requests for an immutable revision can reuse
-        // objects already fetched into the shared review repository.
+        // objects already fetched into the shared review repository. Anchor
+        // both objects before returning so later git maintenance cannot prune
+        // commits that arrived only through a now-expired FETCH_HEAD.
+        let base_ref = "refs/remotes/origin/trouve-base";
+        let pull_ref = format!("refs/remotes/origin/trouve-pr-{}", request.pull_number);
         let base_present = run(vec![
             "cat-file".into(),
             "-e".into(),
@@ -382,6 +386,18 @@ impl ToolExecutor for LocalToolExecutor {
         .await
         .is_ok();
         if base_present && head_present {
+            run(vec![
+                "update-ref".into(),
+                base_ref.into(),
+                request.base_sha.clone(),
+            ])
+            .await?;
+            run(vec![
+                "update-ref".into(),
+                pull_ref,
+                request.head_sha.clone(),
+            ])
+            .await?;
             return Ok(repository_path);
         }
 
@@ -391,7 +407,7 @@ impl ToolExecutor for LocalToolExecutor {
             "--force".into(),
             "--no-tags".into(),
             "origin".into(),
-            format!("+{}:refs/remotes/origin/trouve-base", request.base_sha),
+            format!("+{}:{base_ref}", request.base_sha),
             format!("+refs/pull/{}/head:{pull_ref}", request.pull_number),
         ])
         .await?;
@@ -494,5 +510,72 @@ mod tests {
         };
         let res = exec.execute(&ctx, "nope", &serde_json::json!({})).await;
         assert_eq!(res.status, ToolStatus::Error);
+    }
+
+    #[tokio::test]
+    async fn review_repository_reuse_anchors_existing_commits() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("reviews");
+        let repository = root.join("owner/repo");
+        std::fs::create_dir_all(&repository).unwrap();
+        let git = |args: &[&str]| {
+            let output = std::process::Command::new("git")
+                .args(args)
+                .current_dir(&repository)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "git {}: {}",
+                args.join(" "),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            String::from_utf8_lossy(&output.stdout).trim().to_string()
+        };
+        git(&["init"]);
+        git(&[
+            "-c",
+            "user.name=Trouve Test",
+            "-c",
+            "user.email=trouve@example.invalid",
+            "commit",
+            "--allow-empty",
+            "-m",
+            "base",
+        ]);
+        let base_sha = git(&["rev-parse", "HEAD"]);
+        git(&[
+            "-c",
+            "user.name=Trouve Test",
+            "-c",
+            "user.email=trouve@example.invalid",
+            "commit",
+            "--allow-empty",
+            "-m",
+            "head",
+        ]);
+        let head_sha = git(&["rev-parse", "HEAD"]);
+
+        let synced = LocalToolExecutor::default()
+            .sync_review_repository(&ReviewRepositorySync {
+                root,
+                repository: "owner/repo".into(),
+                pull_number: 42,
+                base_sha: base_sha.clone(),
+                head_sha: head_sha.clone(),
+                token: "unused-on-reuse".into(),
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(synced, repository);
+        assert_eq!(
+            git(&["rev-parse", "refs/remotes/origin/trouve-base"]),
+            base_sha
+        );
+        assert_eq!(
+            git(&["rev-parse", "refs/remotes/origin/trouve-pr-42"]),
+            head_sha
+        );
     }
 }

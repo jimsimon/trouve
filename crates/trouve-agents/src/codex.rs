@@ -17,6 +17,7 @@
 //!   answered with `{ decision: "accept" | "decline" }`
 
 use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, Ordering};
@@ -25,7 +26,7 @@ use futures::StreamExt;
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin};
-use tokio::sync::{Mutex, oneshot};
+use tokio::sync::{Mutex, OnceCell, oneshot};
 use trouve_protocol::{ModelInfo, Usage};
 use trouve_providers::codex::completed_raw_reasoning_text;
 
@@ -49,6 +50,27 @@ pub struct CodexBackend {
 
 /// How long a fetched vendor model list stays fresh.
 const MODELS_TTL: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// Product-level capabilities Trouve suppresses when the running Codex
+/// app-server advertises them. The dynamic feature catalog is the schema
+/// authority: older CLIs never receive config keys they do not understand.
+const PRODUCT_SURFACE_FEATURES: &[&str] = &[
+    "apps",
+    "browser_use",
+    "browser_use_external",
+    "computer_use",
+    "current_time_reminder",
+    "goals",
+    "hooks",
+    "image_generation",
+    "memories",
+    "multi_agent",
+    "plugins",
+    "remote_plugin",
+    "skill_mcp_dependency_install",
+    "tool_suggest",
+    "workspace_dependencies",
+];
 
 /// Codex's two sandbox spellings: `thread/start` uses the kebab-case mode,
 /// while `turn/start` uses the camel-case policy discriminator.
@@ -387,6 +409,24 @@ fn codex_config_override(turn: &crate::BackendTurn) -> Value {
         config["mcp_servers"] = Value::Object(servers);
     }
     config
+}
+
+fn parse_supported_features(result: &Value) -> HashSet<String> {
+    result
+        .get("data")
+        .or_else(|| result.get("features"))
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|feature| {
+            feature
+                .get("name")
+                .or_else(|| feature.get("key"))
+                .or_else(|| feature.get("feature"))
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        })
+        .collect()
 }
 
 /// Split a `<model>@<effort>` id into its parts. Threads created before the
@@ -1101,6 +1141,53 @@ async fn read_stdout<R: AsyncRead + Unpin>(
     close_transport(&pending, &routes, &buffered, &closed).await;
 }
 
+/// Keeps Codex's refreshed subscription credentials while the rest of its
+/// home remains isolated. A baseline comparison prevents an old app-server
+/// from overwriting a newer login performed by another process.
+struct AuthSync {
+    source: PathBuf,
+    isolated: PathBuf,
+    baseline: std::sync::Mutex<Option<Vec<u8>>>,
+}
+
+impl AuthSync {
+    fn new(source: PathBuf, isolated: PathBuf, baseline: Vec<u8>) -> Self {
+        Self {
+            source,
+            isolated,
+            baseline: std::sync::Mutex::new(Some(baseline)),
+        }
+    }
+
+    fn sync(&self) {
+        let mut baseline = self.baseline.lock().unwrap();
+        let Some(previous) = baseline.clone() else {
+            return;
+        };
+        let Ok(isolated) = std::fs::read(&self.isolated) else {
+            return;
+        };
+        if isolated == previous {
+            return;
+        }
+        let source = std::fs::read(&self.source).unwrap_or_default();
+        if source != previous && source != isolated {
+            tracing::warn!(
+                "Codex auth changed outside the isolated app-server; preserving the newer source"
+            );
+            *baseline = None;
+            return;
+        }
+        if source != isolated
+            && let Err(error) = std::fs::copy(&self.isolated, &self.source)
+        {
+            tracing::warn!("failed to preserve refreshed Codex credentials: {error}");
+            return;
+        }
+        *baseline = Some(isolated);
+    }
+}
+
 struct AppServer {
     stdin: Mutex<ChildStdin>,
     next_id: AtomicI64,
@@ -1124,6 +1211,12 @@ struct AppServer {
     /// alive prevents ambient config, skills, plugins, hooks, and MCP servers
     /// from becoming a second capability source.
     _isolated_home: tempfile::TempDir,
+    /// The app-server schema, discovered through its version-specific
+    /// experimental feature catalog on the first optimized turn.
+    supported_features: OnceCell<HashSet<String>>,
+    /// Syncs token rotations from the isolated home back to Codex's real
+    /// credential file without exposing any other ambient configuration.
+    auth_sync: Option<Arc<AuthSync>>,
     closed: Arc<std::sync::atomic::AtomicBool>,
 }
 
@@ -1133,12 +1226,16 @@ impl AppServer {
             .prefix("trouve-codex-home-")
             .tempdir()
             .map_err(BackendError::Io)?;
-        if let Some(source) = codex_auth_path()
+        let auth_sync = if let Some(source) = codex_auth_path()
             && source.is_file()
         {
-            std::fs::copy(&source, isolated_home.path().join("auth.json"))
-                .map_err(BackendError::Io)?;
-        }
+            let isolated = isolated_home.path().join("auth.json");
+            std::fs::copy(&source, &isolated).map_err(BackendError::Io)?;
+            let baseline = std::fs::read(&isolated).map_err(BackendError::Io)?;
+            Some(Arc::new(AuthSync::new(source, isolated, baseline)))
+        } else {
+            None
+        };
         let mut child = tokio::process::Command::new(command)
             .arg("app-server")
             .arg("--strict-config")
@@ -1165,6 +1262,8 @@ impl AppServer {
             turn_lifecycles: Arc::new(std::sync::Mutex::new(HashMap::new())),
             _child: child,
             _isolated_home: isolated_home,
+            supported_features: OnceCell::new(),
+            auth_sync,
             closed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         };
         server.start_reader(stdout);
@@ -1181,6 +1280,29 @@ impl AppServer {
         let pending = self.pending.clone();
         let buffered = self.buffered.clone();
         tokio::spawn(read_stdout(stdout, pending, routes, buffered, closed));
+    }
+
+    async fn supported_features(&self) -> HashSet<String> {
+        match self
+            .supported_features
+            .get_or_try_init(|| async {
+                self.request("experimentalFeature/list", json!({ "limit": 100 }))
+                    .await
+                    .map(|result| parse_supported_features(&result))
+            })
+            .await
+        {
+            Ok(features) => features.clone(),
+            Err(error) => {
+                // Old app-server schemas may not expose this method. In that
+                // case omit all speculative feature overrides; the isolated
+                // CODEX_HOME still excludes ambient skills/plugins/config.
+                tracing::debug!(
+                    "Codex feature catalog unavailable; omitting feature overrides: {error}"
+                );
+                HashSet::new()
+            }
+        }
     }
 
     async fn handshake(&self) -> Result<(), BackendError> {
@@ -1202,13 +1324,19 @@ impl AppServer {
         self.pending.lock().await.insert(id, tx);
         self.write(json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params }))
             .await?;
-        match rx.await {
+        let result = match rx.await {
             Ok(Ok(v)) => Ok(v),
             Ok(Err(e)) => Err(BackendError::Protocol(format!("{method}: {e}"))),
             Err(_) => Err(BackendError::Protocol(format!(
                 "{method}: app-server closed before responding"
             ))),
+        };
+        if let Some(auth_sync) = self.auth_sync.clone()
+            && let Err(error) = tokio::task::spawn_blocking(move || auth_sync.sync()).await
+        {
+            tracing::warn!("Codex credential sync task failed: {error}");
         }
+        result
     }
 
     async fn notify(&self, method: &str, params: Value) {
@@ -1688,8 +1816,19 @@ mod tests {
         turn.mcp_bridge = Some(crate::McpBridgeConfig {
             url: "http://127.0.0.1:1/internal/threads/th_1/mcp?approval=0".into(),
         });
+        let supported_features = [
+            "apps",
+            "hooks",
+            "multi_agent",
+            "plugins",
+            "shell_tool",
+            "unknown_future_feature",
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect();
 
-        let config = mcp_config_override(&turn).unwrap();
+        let config = mcp_config_override(&turn, &supported_features).unwrap();
         assert!(config["web_search"].is_null());
         assert_eq!(
             config["mcp_servers"]
@@ -1699,36 +1838,67 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["trouve"]
         );
-        for feature in [
-            "apps",
-            "browser_use",
-            "browser_use_external",
-            "computer_use",
-            "current_time_reminder",
-            "goals",
-            "hooks",
-            "image_generation",
-            "memories",
-            "multi_agent",
-            "plugins",
-            "remote_plugin",
-            "skill_mcp_dependency_install",
-            "tool_suggest",
-            "workspace_dependencies",
-        ] {
+        for feature in ["apps", "hooks", "multi_agent", "plugins"] {
             assert_eq!(
                 config["features"][feature], false,
                 "feature {feature} escaped product-surface isolation"
             );
         }
+        // Unsupported schema keys are omitted under --strict-config, while
+        // model-optimized native tools remain enabled by omission.
+        assert!(config["features"]["browser_use"].is_null());
         assert!(config["features"]["shell_tool"].is_null());
-        assert!(config["features"]["shell_snapshot"].is_null());
-        assert_eq!(config["agents"]["enabled"], false);
-        assert_eq!(config["experimental_request_user_input_enabled"], false);
+        assert!(config["features"]["unknown_future_feature"].is_null());
+        assert!(config["agents"].is_null());
+        assert!(config["experimental_request_user_input_enabled"].is_null());
         assert_eq!(
             config["mcp_servers"]["trouve"]["default_tools_approval_mode"],
             "approve"
         );
+    }
+
+    #[test]
+    fn parses_version_specific_feature_catalog_shapes() {
+        assert_eq!(
+            parse_supported_features(&json!({
+                "data": [{"name": "plugins"}, {"key": "multi_agent"}]
+            })),
+            ["plugins", "multi_agent"]
+                .into_iter()
+                .map(str::to_string)
+                .collect()
+        );
+        assert_eq!(
+            parse_supported_features(&json!({
+                "features": [{"feature": "apps"}, {"name": 42}, "bad"]
+            })),
+            ["apps"].into_iter().map(str::to_string).collect()
+        );
+    }
+
+    #[test]
+    fn auth_sync_preserves_refreshes_and_never_overwrites_newer_login() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("source-auth.json");
+        let isolated = temp.path().join("isolated-auth.json");
+        std::fs::write(&source, b"old").unwrap();
+        std::fs::write(&isolated, b"old").unwrap();
+        let sync = AuthSync::new(source.clone(), isolated.clone(), b"old".to_vec());
+
+        std::fs::write(&isolated, b"refreshed").unwrap();
+        sync.sync();
+        assert_eq!(std::fs::read(&source).unwrap(), b"refreshed");
+
+        std::fs::write(&source, b"new-login").unwrap();
+        std::fs::write(&isolated, b"stale-refresh").unwrap();
+        sync.sync();
+        assert_eq!(std::fs::read(&source).unwrap(), b"new-login");
+
+        // Once an external login wins, later isolated changes remain unable
+        // to overwrite it.
+        std::fs::write(&isolated, b"later-stale-refresh").unwrap();
+        sync.sync();
+        assert_eq!(std::fs::read(&source).unwrap(), b"new-login");
     }
 
     #[test]

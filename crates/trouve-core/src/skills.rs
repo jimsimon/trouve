@@ -506,6 +506,11 @@ mod tests {
         );
 
         let catalog = command_catalog(Some(&cfg), None, true);
+        assert!(
+            catalog
+                .iter()
+                .all(|command| command.name != "../escape" && command.name != "bad")
+        );
         let command = catalog
             .iter()
             .find(|command| command.name == "plugin:review")
