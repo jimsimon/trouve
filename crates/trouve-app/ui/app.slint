@@ -1141,7 +1141,6 @@ component NewChatForm inherits VerticalLayout {
     callback start(int, int, bool, int, int, int, int, string);
     callback cancel();
     callback workspace-changed(int);
-    callback register-workspace(string);
     callback model-filter(string);
     in property <[AttachmentChip]> attachments;
     callback attach-file();
@@ -1186,22 +1185,6 @@ component NewChatForm inherits VerticalLayout {
             current-index <=> root.workspace-index;
             enabled: !root.blocked;
             selected => { root.workspace-changed(self.current-index); }
-        }
-        HorizontalLayout {
-            spacing: 6px;
-            ws-path := LineEdit {
-                horizontal-stretch: 1;
-                placeholder-text: "…or register a git repo by absolute path";
-                enabled: !root.blocked;
-            }
-            Button {
-                text: "Add";
-                enabled: ws-path.text != "" && !root.blocked;
-                clicked => {
-                    root.register-workspace(ws-path.text);
-                    ws-path.text = "";
-                }
-            }
         }
     }
 
@@ -1958,7 +1941,6 @@ export component AppWindow inherits Window {
     callback nc-model-changed(int);
     changed nc-model-index => { root.nc-model-changed(root.nc-model-index); }
     callback nc-workspace-changed(int);
-    callback register-workspace-path(string);
     callback start-new-chat(/* ws */ int, /* branch */ int, /* fetch */ bool, /* mode */ int,
                             /* model */ int, /* thinking */ int,
                             /* permission */ int, /* prompt */ string);
@@ -4669,7 +4651,6 @@ export component AppWindow inherits Window {
                 }
                 cancel => { root.cancel-new-chat(); }
                 workspace-changed(i) => { root.nc-workspace-changed(i); }
-                register-workspace(path) => { root.register-workspace-path(path); }
                 model-filter(q) => { root.model-filter-changed(q); }
             }
 
