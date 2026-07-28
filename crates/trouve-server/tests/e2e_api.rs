@@ -4040,6 +4040,14 @@ async fn secured_router_enforces_loopback_host_and_internal_token() {
         .send()
         .await
         .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::UNAUTHORIZED);
+    let resp = client
+        .post(&internal)
+        .bearer_auth("bridge-secret")
+        .json(&initialize)
+        .send()
+        .await
+        .unwrap();
     assert_eq!(resp.status(), reqwest::StatusCode::OK);
 }
 

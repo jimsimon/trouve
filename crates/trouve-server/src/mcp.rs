@@ -45,6 +45,10 @@ pub(crate) struct McpQuery {
     /// with native approval flows like Codex turn it off).
     #[serde(default = "default_approval")]
     approval: u8,
+    /// Revision embedded in the vendor's configured URL. The engine prepared
+    /// this catalog before launching the turn, so tools/list can reuse it.
+    #[serde(default)]
+    catalog_revision: Option<String>,
 }
 
 fn default_approval() -> u8 {
@@ -87,7 +91,13 @@ pub(crate) async fn mcp_endpoint(
                 result's file_path and line to discover similar code.",
         })),
         "ping" => Ok(json!({})),
-        "tools/list" => tools_list(&engine, &thread_id, q.approval != 0).await,
+        "tools/list" => {
+            let revision = q
+                .catalog_revision
+                .as_deref()
+                .and_then(|value| u64::from_str_radix(value, 16).ok());
+            tools_list(&engine, &thread_id, q.approval != 0, revision).await
+        }
         "tools/call"
             if msg["params"]["name"] == "approval_prompt"
                 && tool_available_for_bridge("approval_prompt", q.approval != 0) =>
@@ -115,6 +125,7 @@ async fn tools_list(
     engine: &Engine,
     thread_id: &str,
     serve_approval: bool,
+    catalog_revision: Option<u64>,
 ) -> Result<Value, String> {
     // The approval gate is served for Claude (its permission-prompt tool is
     // invoked by name and must exist on the configured MCP server).
@@ -136,7 +147,7 @@ async fn tools_list(
         }));
     }
     let specs = engine
-        .bridged_tool_specs(thread_id)
+        .bridged_tool_specs_for_revision(thread_id, catalog_revision)
         .await
         .map_err(|e| format!("supplemental tool catalog unavailable for {thread_id}: {e}"))?;
     tools.extend(

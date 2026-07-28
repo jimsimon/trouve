@@ -22,8 +22,9 @@ mod web;
 
 pub use search::{VENDOR_SEARCH_GUIDANCE, gc_index_store_in_background, warm_index_in_background};
 
+use std::collections::HashMap;
 use std::path::{Component, Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 
 use anyhow::{Context, Result, bail};
 use serde_json::Value;
@@ -199,6 +200,10 @@ pub struct LocalToolExecutor {
     tools: Vec<Arc<dyn Tool>>,
     mcp: crate::mcp::McpManager,
     jobs: Arc<shell::JobRegistry>,
+    /// Shared bare repositories are reused across review jobs. Serialize the
+    /// complete fetch/ref transaction per repository while allowing unrelated
+    /// repositories to sync concurrently.
+    review_repository_locks: Mutex<HashMap<PathBuf, Weak<tokio::sync::Mutex<()>>>>,
 }
 
 impl Default for LocalToolExecutor {
@@ -241,11 +246,23 @@ impl LocalToolExecutor {
             ],
             mcp: crate::mcp::McpManager::with_logs(logs),
             jobs,
+            review_repository_locks: Mutex::new(HashMap::new()),
         }
     }
 
     fn find(&self, name: &str) -> Option<&Arc<dyn Tool>> {
         self.tools.iter().find(|t| t.name() == name)
+    }
+
+    fn review_repository_lock(&self, path: &Path) -> Arc<tokio::sync::Mutex<()>> {
+        let mut locks = self.review_repository_locks.lock().unwrap();
+        locks.retain(|_, lock| lock.strong_count() > 0);
+        if let Some(lock) = locks.get(path).and_then(Weak::upgrade) {
+            return lock;
+        }
+        let lock = Arc::new(tokio::sync::Mutex::new(()));
+        locks.insert(path.to_path_buf(), Arc::downgrade(&lock));
+        lock
     }
 }
 
@@ -318,6 +335,8 @@ impl ToolExecutor for LocalToolExecutor {
         use base64::Engine as _;
 
         let repository_path = request.root.join(&request.repository);
+        let repository_lock = self.review_repository_lock(&repository_path);
+        let _repository_guard = repository_lock.lock().await;
         let parent = repository_path
             .parent()
             .ok_or_else(|| "invalid review repository path".to_string())?;
@@ -509,6 +528,17 @@ mod tests {
         };
         let res = exec.execute(&ctx, "nope", &serde_json::json!({})).await;
         assert_eq!(res.status, ToolStatus::Error);
+    }
+
+    #[test]
+    fn review_repository_locks_are_shared_only_within_one_repository() {
+        let executor = LocalToolExecutor::default();
+        let first = executor.review_repository_lock(Path::new("/reviews/owner/one"));
+        let same = executor.review_repository_lock(Path::new("/reviews/owner/one"));
+        let other = executor.review_repository_lock(Path::new("/reviews/owner/two"));
+
+        assert!(Arc::ptr_eq(&first, &same));
+        assert!(!Arc::ptr_eq(&first, &other));
     }
 
     #[tokio::test]

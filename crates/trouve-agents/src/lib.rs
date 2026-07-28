@@ -116,9 +116,13 @@ pub struct McpServerLaunch {
 /// the permission-prompt target.
 #[derive(Debug, Clone)]
 pub struct McpBridgeConfig {
-    /// Full endpoint URL, thread-scoped, with the approval surface selected
-    /// via query parameters.
+    /// Thread-scoped endpoint URL, with non-secret capability selectors in
+    /// its query parameters.
     pub url: String,
+    /// Static headers sent with every bridge request. Credentials belong
+    /// here rather than in the URL, where vendor logs and diagnostics may
+    /// record them.
+    pub headers: Vec<(String, String)>,
 }
 
 /// One event from a backend turn, in trouve-shaped vocabulary.

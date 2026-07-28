@@ -528,6 +528,25 @@ fn truncate_command_output(mut output: String) -> String {
     output
 }
 
+fn fenced_block(language: &str, body: &str) -> String {
+    // CommonMark closes a fenced block with a run at least as long as the
+    // opening fence. Repository content is arbitrary, so keep ours longer
+    // than every backtick run it encloses.
+    let longest = body
+        .split(|character| character != '`')
+        .map(str::len)
+        .max()
+        .unwrap_or(0);
+    let fence = "`".repeat(longest.max(3) + 1);
+    format!("{fence}{language}\n{body}\n{fence}")
+}
+
+#[derive(Clone)]
+struct BridgedToolCatalog {
+    revision: u64,
+    specs: Vec<ToolSpec>,
+}
+
 pub struct Engine {
     pub(crate) store: Store,
     pub(crate) data_dir: PathBuf,
@@ -550,6 +569,13 @@ pub struct Engine {
     questions: Arc<QuestionHub>,
     bridge_echoes: BridgeEchoTracker,
     turn_scheduler: TurnScheduler,
+    /// Last command catalog emitted per thread. Catalogs are recomputed
+    /// before turns so edited skills converge, but identical durable events
+    /// are suppressed for the lifetime of this engine.
+    command_catalogs: Mutex<HashMap<String, Vec<CommandInfo>>>,
+    /// Catalog prepared while constructing a vendor bridge URL. The matching
+    /// tools/list request reuses it instead of repeating MCP discovery.
+    bridged_tool_catalogs: Mutex<HashMap<String, BridgedToolCatalog>>,
     /// Per-session worktree access. Read-only turns share a read guard;
     /// mutating turns, checkpoint restoration, and settings changes take the
     /// write guard. This lets review/plan work fan out without weakening the
@@ -629,7 +655,7 @@ pub struct Engine {
     /// This server's reachable base URL (e.g. "http://127.0.0.1:7433"), set
     /// once the listener binds; the MCP tool bridge dials back through it.
     base_url: RwLock<Option<String>>,
-    /// Ephemeral credential appended only to internal MCP bridge URLs.
+    /// Ephemeral credential sent only in internal MCP bridge headers.
     bridge_token: RwLock<Option<String>>,
     /// Warm the search index on session creation and GC the shared index
     /// store on archive/delete. Off by default so tests never touch the
@@ -954,6 +980,8 @@ impl Engine {
             questions: Arc::new(QuestionHub::default()),
             bridge_echoes: BridgeEchoTracker::default(),
             turn_scheduler: TurnScheduler::new(),
+            command_catalogs: Mutex::new(HashMap::new()),
+            bridged_tool_catalogs: Mutex::new(HashMap::new()),
             session_locks: Mutex::new(HashMap::new()),
             active_threads: Mutex::new(std::collections::HashMap::new()),
             session_activity_publication: Mutex::new(()),
@@ -1095,9 +1123,9 @@ impl Engine {
         *self.base_url.write().unwrap() = Some(url.trim_end_matches('/').to_string());
     }
 
-    /// Set the server-generated credential vendor children must present to
-    /// the internal MCP bridge. `None` keeps in-process open test routers
-    /// backwards-compatible.
+    /// Set the server-generated bearer credential vendor children must
+    /// present to the internal MCP bridge. `None` keeps in-process open test
+    /// routers backwards-compatible.
     pub fn set_bridge_token(&self, token: Option<String>) {
         *self.bridge_token.write().unwrap() = token;
     }
@@ -4601,12 +4629,18 @@ impl Engine {
     }
 
     fn emit_command_catalog(&self, thread_id: &str, workspace_root: &Path) -> Result<()> {
+        let commands = self.command_catalog(workspace_root);
+        let mut emitted = self.command_catalogs.lock().unwrap();
+        if emitted.get(thread_id) == Some(&commands) {
+            return Ok(());
+        }
         self.store.append_event(
             Scope::Thread(thread_id.to_string()),
             Event::CommandCatalogUpdated {
-                commands: self.command_catalog(workspace_root),
+                commands: commands.clone(),
             },
         )?;
+        emitted.insert(thread_id.to_string(), commands);
         Ok(())
     }
 
@@ -4958,7 +4992,10 @@ impl Engine {
                 let output = if diff.trim().is_empty() {
                     "No changes against the session base revision.".into()
                 } else {
-                    format!("## Session diff\n\n````diff\n{}\n````", diff.trim_end())
+                    format!(
+                        "## Session diff\n\n{}",
+                        fenced_block("diff", diff.trim_end())
+                    )
                 };
                 (output, CommandAction::None)
             }
@@ -5004,8 +5041,8 @@ impl Engine {
                 );
                 (
                     format!(
-                        "## Effective instructions\n\n````text\n{}\n````",
-                        instructions.trim_end()
+                        "## Effective instructions\n\n{}",
+                        fenced_block("text", instructions.trim_end())
                     ),
                     CommandAction::None,
                 )
@@ -6373,18 +6410,22 @@ impl Engine {
         // Codex and Cursor own their approval protocol. Claude uses the
         // bridge as its headless permission-prompt target.
         let approval = (kind == "claude-cli") as u8;
-        let revision = tool_catalog_revision(&self.bridged_tool_specs(thread_id).await?);
-        let mut url = format!(
+        let (revision, _) = self.refresh_bridged_tool_catalog(thread_id).await?;
+        let url = format!(
             "{}/internal/threads/{}/mcp?approval={}&catalog_revision={revision:016x}",
             base_url.trim_end_matches('/'),
             thread_id,
             approval,
         );
-        if let Some(token) = self.bridge_token.read().unwrap().as_deref() {
-            url.push_str("&bridge_token=");
-            url.push_str(token);
-        }
-        Ok(Some(trouve_agents::McpBridgeConfig { url }))
+        let headers = self
+            .bridge_token
+            .read()
+            .unwrap()
+            .as_ref()
+            .map(|token| ("Authorization".into(), format!("Bearer {token}")))
+            .into_iter()
+            .collect();
+        Ok(Some(trouve_agents::McpBridgeConfig { url, headers }))
     }
 
     // --- bridged tools (MCP tool bridge, Phase 6) -----------------------------
@@ -6392,6 +6433,52 @@ impl Engine {
     /// Tool specs for a thread, as exposed to a bridged vendor agent
     /// (filtered by the thread's mode, same as native turns).
     pub async fn bridged_tool_specs(&self, thread_id: &str) -> Result<Vec<ToolSpec>, EngineError> {
+        self.build_bridged_tool_specs(thread_id).await
+    }
+
+    /// Reuse the catalog prepared for the bridge URL when its revision
+    /// matches. A missing/stale entry is rebuilt so direct callers and
+    /// restarted servers remain self-healing.
+    pub async fn bridged_tool_specs_for_revision(
+        &self,
+        thread_id: &str,
+        revision: Option<u64>,
+    ) -> Result<Vec<ToolSpec>, EngineError> {
+        if let Some(revision) = revision
+            && let Some(catalog) = self
+                .bridged_tool_catalogs
+                .lock()
+                .unwrap()
+                .get(thread_id)
+                .filter(|catalog| catalog.revision == revision)
+                .cloned()
+        {
+            return Ok(catalog.specs);
+        }
+        let (_, specs) = self.refresh_bridged_tool_catalog(thread_id).await?;
+        Ok(specs)
+    }
+
+    async fn refresh_bridged_tool_catalog(
+        &self,
+        thread_id: &str,
+    ) -> Result<(u64, Vec<ToolSpec>), EngineError> {
+        let specs = self.build_bridged_tool_specs(thread_id).await?;
+        let revision = tool_catalog_revision(&specs);
+        self.bridged_tool_catalogs.lock().unwrap().insert(
+            thread_id.to_string(),
+            BridgedToolCatalog {
+                revision,
+                specs: specs.clone(),
+            },
+        );
+        Ok((revision, specs))
+    }
+
+    async fn build_bridged_tool_specs(
+        &self,
+        thread_id: &str,
+    ) -> Result<Vec<ToolSpec>, EngineError> {
         let (_, _, mode, ctx) = self.bridged_context(thread_id)?;
         let mut specs: Vec<ToolSpec> = self
             .executor
@@ -6478,14 +6565,16 @@ impl Engine {
         let synthetic = matched.is_none();
         let call_id = matched.unwrap_or_else(|| new_id("appr"));
         if synthetic {
+            let (display_tool, mut display_args) = normalize_vendor_tool_call(tool, args);
+            annotate_edit_lines(Path::new(&session.worktree_path), &mut display_args);
             self.store
                 .append_event(
                     scope.clone(),
                     Event::ToolRequested {
                         turn,
                         call_id: call_id.clone(),
-                        tool: tool.to_string(),
-                        args: args.clone(),
+                        tool: display_tool,
+                        args: display_args,
                         requires_approval: true,
                     },
                 )
@@ -6526,6 +6615,11 @@ impl Engine {
         tool: &str,
         args: &serde_json::Value,
     ) -> Option<String> {
+        // Tool cards persist Trouve's canonical display vocabulary. Approval
+        // callbacks carry the provider's raw vocabulary, so normalize before
+        // matching or two in-flight calls of the same operation can attach
+        // the prompt to the wrong card.
+        let (tool, args) = normalize_vendor_tool_call(tool, args);
         let events = self
             .store
             .events_after(&Scope::Thread(thread_id.to_string()), 0)
@@ -6540,7 +6634,7 @@ impl Engine {
                     tool: name,
                     args: a,
                     ..
-                } if *t == turn && name == tool => {
+                } if *t == turn && name == &tool => {
                     open.push((call_id.clone(), a.clone()));
                 }
                 Event::ToolCompleted { call_id, .. } => {
@@ -6569,9 +6663,10 @@ impl Engine {
             }
             v
         };
+        let args = strip(&args);
         open.iter()
             .rev()
-            .find(|(_, a)| strip(a) == *args)
+            .find(|(_, a)| strip(a) == args)
             .or(open.last())
             .map(|(id, _)| id.clone())
     }
@@ -9690,6 +9785,128 @@ fn expand_provider_template(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fenced_blocks_outgrow_backticks_in_repository_content() {
+        let block = fenced_block("diff", "before\n``````\nafter");
+        assert!(block.starts_with("```````diff\n"));
+        assert!(block.ends_with("\n```````"));
+    }
+
+    #[test]
+    fn unchanged_command_catalog_is_not_reemitted() {
+        let data = tempfile::tempdir().unwrap();
+        let store = Store::open_in_memory().unwrap();
+        let engine = Engine::new(store.clone(), data.path().into(), &Config::default())
+            .with_config_dir(None);
+
+        engine
+            .emit_command_catalog("th_catalog", data.path())
+            .unwrap();
+        engine
+            .emit_command_catalog("th_catalog", data.path())
+            .unwrap();
+
+        let events = store
+            .events_after(&Scope::Thread("th_catalog".into()), 0)
+            .unwrap();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event.event, Event::CommandCatalogUpdated { .. }))
+                .count(),
+            1
+        );
+    }
+
+    struct CountingCatalogExecutor {
+        spec_calls: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    #[async_trait::async_trait]
+    impl ToolExecutor for CountingCatalogExecutor {
+        async fn specs(&self, _ctx: &ToolCtx) -> Vec<ToolSpec> {
+            self.spec_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            vec![ToolSpec {
+                name: "search".into(),
+                description: "Search".into(),
+                parameters: serde_json::json!({"type": "object"}),
+            }]
+        }
+
+        fn tool_mutates(&self, _name: &str) -> Option<bool> {
+            Some(false)
+        }
+
+        async fn execute(
+            &self,
+            _ctx: &ToolCtx,
+            _name: &str,
+            _args: &serde_json::Value,
+        ) -> crate::tools::ToolResult {
+            crate::tools::ToolResult::error("unused")
+        }
+    }
+
+    #[tokio::test]
+    async fn bridge_tool_list_reuses_the_catalog_named_by_its_url() {
+        let data = tempfile::tempdir().unwrap();
+        let store = Store::open_in_memory().unwrap();
+        let workspace = Workspace {
+            id: "ws_catalog".into(),
+            name: "catalog".into(),
+            path: data.path().to_string_lossy().into_owned(),
+        };
+        store.insert_workspace(&workspace).unwrap();
+        let session = Session {
+            id: "se_catalog".into(),
+            workspace_id: workspace.id.clone(),
+            title: "catalog".into(),
+            branch: "catalog".into(),
+            worktree_path: workspace.path.clone(),
+            base_ref: "main".into(),
+            archived: false,
+            active: false,
+            created_at: chrono::Utc::now(),
+        };
+        store.insert_session(&session).unwrap();
+        let thread = Thread {
+            id: "th_catalog".into(),
+            session_id: session.id,
+            mode: "code".into(),
+            model: "claude/test".into(),
+            model_options: serde_json::Map::new(),
+            permission_mode: PermissionMode::Ask,
+            created_at: chrono::Utc::now(),
+            spawned: false,
+            todos: Vec::new(),
+        };
+        store
+            .insert_thread(&thread, &serde_json::Map::new())
+            .unwrap();
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let engine = Engine::new(store, data.path().into(), &Config::default())
+            .with_config_dir(None)
+            .with_executor(Arc::new(CountingCatalogExecutor {
+                spec_calls: calls.clone(),
+            }));
+
+        let (revision, prepared) = engine
+            .refresh_bridged_tool_catalog(&thread.id)
+            .await
+            .unwrap();
+        let listed = engine
+            .bridged_tool_specs_for_revision(&thread.id, Some(revision))
+            .await
+            .unwrap();
+
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(
+            tool_catalog_revision(&prepared),
+            tool_catalog_revision(&listed)
+        );
+    }
 
     struct BlockingProviderSecretStore {
         values: Mutex<HashMap<String, String>>,
