@@ -29,6 +29,11 @@ use crate::{context, git, modes, new_id};
 /// Safety valve: maximum provider round-trips within a single turn.
 const MAX_ITERATIONS: usize = 32;
 
+/// Keep backend persistence efficient without making live SSE output feel
+/// buffered. Bursts flush by count; sparse output flushes by this deadline.
+const BACKEND_EVENT_BATCH_MAX: usize = 64;
+const BACKEND_EVENT_BATCH_WINDOW: std::time::Duration = std::time::Duration::from_millis(25);
+
 /// Compact the transcript once its estimated size crosses this share of the
 /// model's context window.
 const COMPACTION_THRESHOLD: f64 = 0.8;
@@ -53,6 +58,19 @@ fn positive_limit_from_env(name: &str, default: usize) -> usize {
         .and_then(|value| value.trim().parse::<usize>().ok())
         .filter(|value| *value > 0)
         .unwrap_or(default)
+}
+
+async fn flush_backend_event_batch(
+    store: &Store,
+    scope: &Scope,
+    events: &mut Vec<Event>,
+) -> Result<()> {
+    if !events.is_empty() {
+        store
+            .append_events_async(scope.clone(), std::mem::take(events))
+            .await?;
+    }
+    Ok(())
 }
 
 #[derive(Clone)]
@@ -5023,6 +5041,7 @@ impl Engine {
                 .stream_chat(&model_name, &messages, &specs, &model_options)
                 .await
                 .map_err(|e| anyhow!("provider error: {e}"))?;
+            stream = trouve_providers::coalesce_event_stream(stream);
 
             let mut text = String::new();
             let mut tool_calls = Vec::new();
@@ -5163,7 +5182,8 @@ impl Engine {
                 .stream_chat(&model_name, &messages, &[], &model_options)
                 .await
             {
-                Ok(mut stream) => {
+                Ok(stream) => {
+                    let mut stream = trouve_providers::coalesce_event_stream(stream);
                     while let Some(event) = stream.next().await {
                         match event {
                             Ok(ProviderEvent::TextDelta(delta)) => {
@@ -5852,21 +5872,38 @@ impl Engine {
         } else {
             HashSet::new()
         };
+        let mut persisted = Vec::new();
+        let mut persist_deadline = None;
+        let mut seen_tool_cards = HashSet::new();
         loop {
+            let flush_at = persist_deadline.unwrap_or_else(Instant::now);
             let ev = tokio::select! {
                 biased;
                 // Cancellation drops the backend stream, whose Drop kills the
                 // vendor process (kill_on_drop). We stop consuming and finish
                 // the turn with whatever streamed so far.
                 _ = cancel.cancelled() => break,
+                _ = tokio::time::sleep_until(flush_at.into()), if persist_deadline.is_some() => {
+                    flush_backend_event_batch(&self.store, &scope, &mut persisted).await?;
+                    persist_deadline = None;
+                    continue;
+                }
                 ev = stream.next() => match ev {
                     Some(ev) => ev,
                     None => break,
                 },
             };
-            match ev.map_err(|e| anyhow!("backend stream error: {e}"))? {
+            let event = match ev {
+                Ok(event) => event,
+                Err(error) => {
+                    flush_backend_event_batch(&self.store, &scope, &mut persisted).await?;
+                    return Err(anyhow!("backend stream error: {error}"));
+                }
+            };
+            match event {
                 BackendEvent::SessionStarted { session_id } => {
                     if tools_enabled {
+                        flush_backend_event_batch(&self.store, &scope, &mut persisted).await?;
                         self.store
                             .set_backend_session(&thread.id, backend_id, &session_id)?;
                     }
@@ -5874,26 +5911,19 @@ impl Engine {
                 BackendEvent::TextDelta(delta) => {
                     text.push_str(&delta);
                     segment.push_str(&delta);
-                    self.store
-                        .append_event(scope.clone(), Event::AssistantDelta { turn, text: delta })?;
+                    persisted.push(Event::AssistantDelta { turn, text: delta });
                 }
                 BackendEvent::ThinkingDelta(delta) => {
                     // Thinking is a block boundary like a tool call:
                     // finalize the streamed text so far so post-thinking
                     // text starts a new bubble in the right order.
                     if !segment.is_empty() {
-                        self.store.append_event(
-                            scope.clone(),
-                            Event::AssistantMessage {
-                                turn,
-                                content: std::mem::take(&mut segment),
-                            },
-                        )?;
+                        persisted.push(Event::AssistantMessage {
+                            turn,
+                            content: std::mem::take(&mut segment),
+                        });
                     }
-                    self.store.append_event(
-                        scope.clone(),
-                        Event::AssistantThinking { turn, text: delta },
-                    )?;
+                    persisted.push(Event::AssistantThinking { turn, text: delta });
                 }
                 BackendEvent::ToolStarted {
                     call_id,
@@ -5901,36 +5931,32 @@ impl Engine {
                     mut args,
                 } => {
                     if !tools_enabled {
+                        flush_backend_event_batch(&self.store, &scope, &mut persisted).await?;
                         bail!("backend requested tool {tool} during a tool-free turn");
                     }
                     tool_calls.insert(call_id.clone(), (tool.clone(), args.clone()));
                     if !segment.is_empty() {
-                        self.store.append_event(
-                            scope.clone(),
-                            Event::AssistantMessage {
-                                turn,
-                                content: std::mem::take(&mut segment),
-                            },
-                        )?;
+                        persisted.push(Event::AssistantMessage {
+                            turn,
+                            content: std::mem::take(&mut segment),
+                        });
                     }
                     // Snippet edits carry no position; the worktree file is
                     // still un-edited at announcement time, so resolve line
                     // hints now for the UI's diff gutter.
                     annotate_edit_lines(Path::new(&session.worktree_path), &mut args);
-                    if !self.tool_card_exists(&thread.id, turn, &call_id) {
-                        self.store.append_event(
-                            scope.clone(),
-                            Event::ToolRequested {
-                                turn,
-                                call_id: call_id.clone(),
-                                tool,
-                                args,
-                                requires_approval: false,
-                            },
-                        )?;
+                    if seen_tool_cards.insert(call_id.clone())
+                        && !self.tool_card_exists(&thread.id, turn, &call_id)
+                    {
+                        persisted.push(Event::ToolRequested {
+                            turn,
+                            call_id: call_id.clone(),
+                            tool,
+                            args,
+                            requires_approval: false,
+                        });
                     }
-                    self.store
-                        .append_event(scope.clone(), Event::ToolStarted { call_id })?;
+                    persisted.push(Event::ToolStarted { call_id });
                 }
                 BackendEvent::ToolOutput { call_id, chunk } => {
                     if let Some((_, owner, repo)) = &github_repository
@@ -5942,18 +5968,17 @@ impl Engine {
                             .or_default()
                             .push_str(&chunk);
                     }
-                    self.store
-                        .append_event(scope.clone(), Event::ToolOutput { call_id, chunk })?;
+                    persisted.push(Event::ToolOutput { call_id, chunk });
                 }
                 BackendEvent::CommandsUpdated { commands } => {
-                    self.store
-                        .append_event(scope.clone(), Event::CommandsUpdated { commands })?;
+                    persisted.push(Event::CommandsUpdated { commands });
                 }
                 BackendEvent::ToolCompleted {
                     call_id,
                     ok,
                     result,
                 } => {
+                    flush_backend_event_batch(&self.store, &scope, &mut persisted).await?;
                     let status = if ok {
                         ToolStatus::Ok
                     } else {
@@ -5990,17 +6015,13 @@ impl Engine {
                     } else {
                         github_creation_output.remove(&call_id);
                     }
-                    self.store.append_event(
-                        scope.clone(),
-                        Event::ToolCompleted {
-                            call_id,
-                            status,
-                            result,
-                        },
-                    )?;
+                    persisted.push(Event::ToolCompleted {
+                        call_id,
+                        status,
+                        result,
+                    });
                     if let Some(todos) = todos {
-                        self.store
-                            .append_event(scope.clone(), Event::TodosUpdated { todos })?;
+                        persisted.push(Event::TodosUpdated { todos });
                     }
                 }
                 BackendEvent::ApprovalNeeded {
@@ -6010,17 +6031,16 @@ impl Engine {
                     responder,
                 } => {
                     if !tools_enabled {
+                        flush_backend_event_batch(&self.store, &scope, &mut persisted).await?;
                         bail!("backend requested approval for {tool} during a tool-free turn");
                     }
                     if !segment.is_empty() {
-                        self.store.append_event(
-                            scope.clone(),
-                            Event::AssistantMessage {
-                                turn,
-                                content: std::mem::take(&mut segment),
-                            },
-                        )?;
+                        persisted.push(Event::AssistantMessage {
+                            turn,
+                            content: std::mem::take(&mut segment),
+                        });
                     }
+                    flush_backend_event_batch(&self.store, &scope, &mut persisted).await?;
                     let approved = self
                         .gate_backend_approval(session, thread, turn, mode, &call_id, &tool, &args)
                         .await?;
@@ -6033,14 +6053,12 @@ impl Engine {
                     responder,
                 } => {
                     if !segment.is_empty() {
-                        self.store.append_event(
-                            scope.clone(),
-                            Event::AssistantMessage {
-                                turn,
-                                content: std::mem::take(&mut segment),
-                            },
-                        )?;
+                        persisted.push(Event::AssistantMessage {
+                            turn,
+                            content: std::mem::take(&mut segment),
+                        });
                     }
+                    flush_backend_event_batch(&self.store, &scope, &mut persisted).await?;
                     let answers = self
                         .ask_user_questions(&thread.id, turn, &request_id, title, questions)
                         .await?;
@@ -6058,10 +6076,19 @@ impl Engine {
                     }
                 }
             }
+            if persisted.is_empty() {
+                persist_deadline = None;
+            } else if persisted.len() >= BACKEND_EVENT_BATCH_MAX {
+                flush_backend_event_batch(&self.store, &scope, &mut persisted).await?;
+                persist_deadline = None;
+            } else if persist_deadline.is_none() {
+                persist_deadline = Some(Instant::now() + BACKEND_EVENT_BATCH_WINDOW);
+            }
         }
         // Drop the backend stream promptly so a cancelled turn kills the
         // vendor process now rather than at end of scope.
         drop(stream);
+        flush_backend_event_batch(&self.store, &scope, &mut persisted).await?;
 
         if cancel.is_cancelled() {
             if !segment.is_empty() {
@@ -6322,6 +6349,7 @@ impl Engine {
             .stream_chat(model_name, &messages, &[], &serde_json::Map::new())
             .await
             .map_err(|e| anyhow!("compaction provider error: {e}"))?;
+        stream = trouve_providers::coalesce_event_stream(stream);
         let mut summary = String::new();
         while let Some(ev) = stream.next().await {
             if let ProviderEvent::TextDelta(delta) =

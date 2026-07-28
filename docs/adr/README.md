@@ -27,3 +27,4 @@ sequentially.
 | [0015](0015-read-shared-turns-and-prioritized-capacity.md) | Read-shared turns and prioritized model capacity | Accepted |
 | [0016](0016-catalog-backed-provider-transports.md) | Catalog-backed provider transports | Accepted |
 | [0017](0017-server-owned-session-title-model.md) | Server-owned session title model with heuristic fallback | Accepted |
+| [0018](0018-bounded-coalesced-event-ingestion.md) | Bounded, coalesced event ingestion | Accepted |
