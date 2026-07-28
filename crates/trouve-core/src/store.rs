@@ -2439,6 +2439,7 @@ impl Store {
                 .into_iter()
                 .map(|reviewer| reviewer.id)
                 .collect::<HashSet<_>>();
+            let fallback_reviewer_id = crate::reviewers::default_reviewer_ids().into_iter().next();
             for (
                 repository,
                 encoded_ids,
@@ -2463,17 +2464,18 @@ impl Store {
                 included.retain(|reviewer_id| reviewer_id != id);
                 excluded.retain(|reviewer_id| reviewer_id != id);
                 overrides.retain(|reviewer_override| reviewer_override.reviewer_id != id);
-                let mut changed = ids.len() != before_ids
+                let changed = ids.len() != before_ids
                     || included.len() != before_included
                     || excluded.len() != before_excluded
                     || overrides.len() != before_overrides;
-                if routing_mode != "core"
+                if changed
+                    && routing_mode != "core"
                     && built_in_ids
                         .iter()
                         .all(|reviewer_id| excluded.contains(reviewer_id))
+                    && let Some(fallback_reviewer_id) = &fallback_reviewer_id
                 {
-                    excluded.retain(|reviewer_id| reviewer_id != "correctness");
-                    changed = true;
+                    excluded.retain(|reviewer_id| reviewer_id != fallback_reviewer_id);
                 }
                 if changed {
                     if ids.is_empty() {
@@ -6195,6 +6197,7 @@ mod tests {
             .into_iter()
             .map(|built_in| built_in.id)
             .collect::<Vec<_>>();
+        let unrelated_exclusions = excluded_built_ins.clone();
         store
             .update_code_review_repository(&trouve_protocol::UpdateCodeReviewRepositoryRequest {
                 installation_id: 7,
@@ -6217,20 +6220,42 @@ mod tests {
                 }]),
             })
             .unwrap();
+        store
+            .update_code_review_repository(&trouve_protocol::UpdateCodeReviewRepositoryRequest {
+                installation_id: 7,
+                repository: "acme/unrelated".into(),
+                mode: trouve_protocol::CodeReviewMode::Off,
+                model: None,
+                router_model: None,
+                router_thinking_level: None,
+                prompt: String::new(),
+                reviewer_ids: Some(crate::reviewers::default_reviewer_ids()),
+                routing_mode: Some(trouve_protocol::CodeReviewRoutingMode::Auto),
+                semantic_routing: Some(true),
+                included_reviewer_ids: Some(Vec::new()),
+                excluded_reviewer_ids: Some(unrelated_exclusions.clone()),
+                reviewer_overrides: Some(Vec::new()),
+            })
+            .unwrap();
         let repositories = store.list_code_review_repositories().unwrap();
+        let repository = repositories
+            .iter()
+            .find(|repository| repository.repository == "acme/widgets")
+            .unwrap();
         assert_eq!(
-            repositories[0].reviewer_ids.as_slice(),
+            repository.reviewer_ids.as_slice(),
             std::slice::from_ref(&reviewer.id)
         );
-        assert_eq!(repositories[0].reviewer_overrides.len(), 1);
-        assert_eq!(
-            repositories[0].included_reviewer_ids,
-            vec![reviewer.id.clone()]
-        );
+        assert_eq!(repository.reviewer_overrides.len(), 1);
+        assert_eq!(repository.included_reviewer_ids, vec![reviewer.id.clone()]);
 
         assert!(store.delete_custom_reviewer_profile(&reviewer.id).unwrap());
         assert!(store.list_custom_reviewer_profiles().unwrap().is_empty());
-        let repository = store.list_code_review_repositories().unwrap().remove(0);
+        let repositories = store.list_code_review_repositories().unwrap();
+        let repository = repositories
+            .iter()
+            .find(|repository| repository.repository == "acme/widgets")
+            .unwrap();
         assert_eq!(
             repository.reviewer_ids,
             crate::reviewers::default_reviewer_ids()
@@ -6242,6 +6267,11 @@ mod tests {
                 .contains(&"correctness".into())
         );
         assert!(repository.reviewer_overrides.is_empty());
+        let unrelated = repositories
+            .iter()
+            .find(|repository| repository.repository == "acme/unrelated")
+            .unwrap();
+        assert_eq!(unrelated.excluded_reviewer_ids, unrelated_exclusions);
     }
 
     #[test]
