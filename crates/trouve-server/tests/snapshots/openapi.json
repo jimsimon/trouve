@@ -7,7 +7,7 @@
       "name": "MIT",
       "identifier": "MIT"
     },
-    "version": "1.15"
+    "version": "1.16"
   },
   "paths": {
     "/v1/approvals": {
@@ -4547,6 +4547,12 @@
           "error": {
             "type": "string"
           },
+          "excluded_reviewer_ids": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
           "fixed_issue_count": {
             "type": "integer",
             "format": "int64",
@@ -4560,6 +4566,12 @@
           },
           "id": {
             "type": "string"
+          },
+          "included_reviewer_ids": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
           },
           "installation_id": {
             "type": "integer",
@@ -4641,7 +4653,10 @@
             "items": {
               "type": "string"
             },
-            "description": "Reviewer profiles are snapshotted internally; their stable ids are\nexposed here for history and diagnostics."
+            "description": "Reviewer profiles are snapshotted internally; their stable ids are\nexposed here for history and diagnostics. Auto/Thorough jobs snapshot\nthe candidate catalog; routing decisions record which personas ran."
+          },
+          "routing_mode": {
+            "$ref": "#/components/schemas/CodeReviewRoutingMode"
           },
           "running_elapsed_ms": {
             "type": "integer",
@@ -4650,6 +4665,9 @@
           },
           "scope": {
             "$ref": "#/components/schemas/CodeReviewJobScope"
+          },
+          "semantic_routing": {
+            "type": "boolean"
           },
           "session_id": {
             "type": [
@@ -4715,6 +4733,12 @@
           },
           "prompt_for_agents": {
             "type": "string"
+          },
+          "routing_decisions": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/CodeReviewRoutingDecision"
+            }
           },
           "summary": {
             "type": "string"
@@ -4984,6 +5008,20 @@
           "repository"
         ],
         "properties": {
+          "excluded_reviewer_ids": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Personas Auto and Thorough modes never run."
+          },
+          "included_reviewer_ids": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Personas that Auto mode always runs. Custom personas can be opted into\nautomatic routing through this list."
+          },
           "installation_id": {
             "type": "integer",
             "format": "int64",
@@ -5022,6 +5060,14 @@
               "$ref": "#/components/schemas/ReviewerOverride"
             },
             "description": "Per-reviewer repository overrides. Entries may be retained while a\nreviewer is disabled so re-enabling it restores its configuration."
+          },
+          "routing_mode": {
+            "$ref": "#/components/schemas/CodeReviewRoutingMode",
+            "description": "Persona-routing policy. Core uses `reviewer_ids`; Auto and Thorough\nconsider the complete reviewer catalog plus the controls below."
+          },
+          "semantic_routing": {
+            "type": "boolean",
+            "description": "Whether Auto mode may run one tool-free semantic router pass per diff\nbatch. Semantic choices can only add personas."
           }
         }
       },
@@ -5062,6 +5108,73 @@
             "$ref": "#/components/schemas/CodeReviewStatusCounts"
           }
         }
+      },
+      "CodeReviewRoutingDecision": {
+        "type": "object",
+        "description": "Durable explanation of why one reviewer did or did not run for one batch.",
+        "required": [
+          "batch_index",
+          "reviewer_id",
+          "reviewer_name",
+          "selected"
+        ],
+        "properties": {
+          "batch_index": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "reasons": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/CodeReviewRoutingReason"
+            }
+          },
+          "reviewer_id": {
+            "type": "string"
+          },
+          "reviewer_name": {
+            "type": "string"
+          },
+          "selected": {
+            "type": "boolean"
+          }
+        }
+      },
+      "CodeReviewRoutingMode": {
+        "type": "string",
+        "description": "How a repository chooses reviewer personas for each diff batch.",
+        "enum": [
+          "core",
+          "auto",
+          "thorough"
+        ]
+      },
+      "CodeReviewRoutingReason": {
+        "type": "object",
+        "required": [
+          "source",
+          "detail"
+        ],
+        "properties": {
+          "detail": {
+            "type": "string"
+          },
+          "source": {
+            "$ref": "#/components/schemas/CodeReviewRoutingSource"
+          }
+        }
+      },
+      "CodeReviewRoutingSource": {
+        "type": "string",
+        "enum": [
+          "core",
+          "baseline",
+          "deterministic",
+          "semantic",
+          "included",
+          "thorough"
+        ]
       },
       "CodeReviewStats": {
         "type": "object",
@@ -5222,7 +5335,7 @@
       },
       "CodeReviewTask": {
         "type": "object",
-        "description": "One durable reviewer/coordinator execution. Tasks survive cleanup of their\nimplementation sessions and threads.",
+        "description": "One durable router, reviewer, or coordinator execution. Tasks survive\ncleanup of their implementation sessions and threads.",
         "required": [
           "id",
           "job_id",
@@ -5368,6 +5481,7 @@
       "CodeReviewTaskRole": {
         "type": "string",
         "enum": [
+          "router",
           "reviewer",
           "coordinator"
         ]
@@ -6228,7 +6342,7 @@
           },
           {
             "type": "object",
-            "description": "A reviewer or coordinator task changed durable state.",
+            "description": "A router, reviewer, or coordinator task changed durable state.",
             "required": [
               "job_id",
               "task",
@@ -6245,6 +6359,32 @@
                 "type": "string",
                 "enum": [
                   "code_review.task_updated"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "description": "The complete, durable persona-routing matrix was selected for a job.",
+            "required": [
+              "job_id",
+              "routing_decisions",
+              "type"
+            ],
+            "properties": {
+              "job_id": {
+                "type": "string"
+              },
+              "routing_decisions": {
+                "type": "array",
+                "items": {
+                  "$ref": "#/components/schemas/CodeReviewRoutingDecision"
+                }
+              },
+              "type": {
+                "type": "string",
+                "enum": [
+                  "code_review.routing_updated"
                 ]
               }
             }
@@ -8484,6 +8624,26 @@
           "mode"
         ],
         "properties": {
+          "excluded_reviewer_ids": {
+            "type": [
+              "array",
+              "null"
+            ],
+            "items": {
+              "type": "string"
+            },
+            "description": "Omitted by older clients to preserve existing forced exclusions."
+          },
+          "included_reviewer_ids": {
+            "type": [
+              "array",
+              "null"
+            ],
+            "items": {
+              "type": "string"
+            },
+            "description": "Omitted by older clients to preserve existing forced inclusions."
+          },
           "installation_id": {
             "type": "integer",
             "format": "int64",
@@ -8523,6 +8683,24 @@
               "$ref": "#/components/schemas/ReviewerOverride"
             },
             "description": "Omitted by older clients to preserve existing reviewer overrides."
+          },
+          "routing_mode": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/CodeReviewRoutingMode",
+                "description": "Omitted by older clients to preserve the current/default routing mode."
+              }
+            ]
+          },
+          "semantic_routing": {
+            "type": [
+              "boolean",
+              "null"
+            ],
+            "description": "Omitted by older clients to preserve the current/default semantic\nrouting choice."
           }
         }
       },

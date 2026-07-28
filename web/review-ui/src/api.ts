@@ -96,6 +96,10 @@ export const saveRepository = (repository: Repository): Promise<Repository> =>
       model: repository.model || null,
       prompt: repository.prompt,
       reviewer_ids: repository.reviewer_ids,
+      routing_mode: repository.routing_mode,
+      semantic_routing: repository.semantic_routing,
+      included_reviewer_ids: repository.included_reviewer_ids ?? [],
+      excluded_reviewer_ids: repository.excluded_reviewer_ids ?? [],
       reviewer_overrides: repository.reviewer_overrides ?? [],
     }),
   });

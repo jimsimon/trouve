@@ -19,9 +19,10 @@ use sha2::{Digest, Sha256};
 use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
 use trouve_protocol::{
-    CodeReviewDashboard, CodeReviewMode, CodeReviewRepository, ConfigureGithubAppRequest,
-    CreateSessionRequest, CreateThreadRequest, Event, GithubAppStatus, PermissionMode,
-    ReviewerOverride, ReviewerProfile, ReviewerPromptMode, Scope,
+    CodeReviewDashboard, CodeReviewMode, CodeReviewRepository, CodeReviewRoutingDecision,
+    CodeReviewRoutingMode, CodeReviewRoutingReason, CodeReviewRoutingSource,
+    ConfigureGithubAppRequest, CreateSessionRequest, CreateThreadRequest, Event, GithubAppStatus,
+    PermissionMode, ReviewerOverride, ReviewerProfile, ReviewerPromptMode, Scope,
     UpdateCodeReviewRepositoryRequest, UpsertReviewerProfileRequest,
 };
 
@@ -640,6 +641,19 @@ struct ReviewBatch {
     diff: String,
 }
 
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+struct SemanticRoutingOutput {
+    #[serde(default)]
+    selections: Vec<SemanticRoutingSelection>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+struct SemanticRoutingSelection {
+    reviewer_id: String,
+    #[serde(default)]
+    reason: String,
+}
+
 #[derive(Debug, Clone, Serialize)]
 struct CandidateFinding {
     candidate_id: String,
@@ -1029,6 +1043,21 @@ impl Engine {
         Ok(())
     }
 
+    fn emit_code_review_routing(
+        &self,
+        job_id: &str,
+        routing_decisions: Vec<CodeReviewRoutingDecision>,
+    ) -> Result<(), EngineError> {
+        self.store.append_event(
+            Scope::CodeReviewJob(job_id.to_owned()),
+            Event::CodeReviewRoutingUpdated {
+                job_id: job_id.to_owned(),
+                routing_decisions,
+            },
+        )?;
+        Ok(())
+    }
+
     fn emit_code_review_progress(&self, job_id: &str) -> Result<(), EngineError> {
         let progress = self
             .store
@@ -1375,19 +1404,8 @@ impl Engine {
                 "only open pull requests can be reviewed".into(),
             ));
         }
-        let reviewers = apply_reviewer_overrides(
-            self.resolve_code_review_reviewers(&repository.reviewer_ids)?,
-            &repository.reviewer_overrides,
-        );
-        let reviewer_config = serde_json::to_string(&reviewers)
-            .map_err(|error| EngineError::Internal(error.into()))?;
-        let config_hash = hex::encode(Sha256::digest(
-            format!(
-                "{:?}\0{}\0{reviewer_config}",
-                repository.model, repository.prompt
-            )
-            .as_bytes(),
-        ));
+        let reviewers = self.reviewers_for_repository_policy(&repository)?;
+        let config_hash = Self::code_review_config_hash(&repository, &reviewers)?;
         let pull_state = self
             .store
             .code_review_pull_state(&repository.repository, pull.number)?;
@@ -1423,6 +1441,10 @@ impl Engine {
                 model: repository.model,
                 prompt: repository.prompt,
                 reviewers,
+                routing_mode: repository.routing_mode,
+                semantic_routing: repository.semantic_routing,
+                included_reviewer_ids: repository.included_reviewer_ids,
+                excluded_reviewer_ids: repository.excluded_reviewer_ids,
                 config_hash,
             })?
             .ok_or_else(|| EngineError::Internal(anyhow!("manual review dedupe collision")))?;
@@ -1471,6 +1493,54 @@ impl Engine {
             resolved.push(reviewer);
         }
         Ok(resolved)
+    }
+
+    fn reviewers_for_repository_policy(
+        &self,
+        repository: &CodeReviewRepository,
+    ) -> Result<Vec<ReviewerProfile>, EngineError> {
+        let reviewers = match repository.routing_mode {
+            CodeReviewRoutingMode::Core => {
+                self.resolve_code_review_reviewers(&repository.reviewer_ids)?
+            }
+            CodeReviewRoutingMode::Auto | CodeReviewRoutingMode::Thorough => {
+                let excluded = repository
+                    .excluded_reviewer_ids
+                    .iter()
+                    .map(String::as_str)
+                    .collect::<HashSet<_>>();
+                self.code_review_reviewer_catalog()?
+                    .into_iter()
+                    .filter(|reviewer| !excluded.contains(reviewer.id.as_str()))
+                    .collect()
+            }
+        };
+        Ok(apply_reviewer_overrides(
+            reviewers,
+            &repository.reviewer_overrides,
+        ))
+    }
+
+    fn code_review_config_hash(
+        repository: &CodeReviewRepository,
+        reviewers: &[ReviewerProfile],
+    ) -> Result<String, EngineError> {
+        let reviewer_config = serde_json::to_string(reviewers)
+            .map_err(|error| EngineError::Internal(error.into()))?;
+        let routing_config = serde_json::to_string(&(
+            repository.routing_mode,
+            repository.semantic_routing,
+            &repository.included_reviewer_ids,
+            &repository.excluded_reviewer_ids,
+        ))
+        .map_err(|error| EngineError::Internal(error.into()))?;
+        Ok(hex::encode(Sha256::digest(
+            format!(
+                "{:?}\0{}\0{routing_config}\0{reviewer_config}",
+                repository.model, repository.prompt
+            )
+            .as_bytes(),
+        )))
     }
 
     fn normalize_reviewer_overrides(
@@ -1648,12 +1718,67 @@ impl Engine {
                     .map(|repository| repository.reviewer_ids.clone())
             })
             .unwrap_or_else(crate::reviewers::default_reviewer_ids);
-        if request.mode != CodeReviewMode::Off && reviewer_ids.is_empty() {
+        let routing_mode = request
+            .routing_mode
+            .or_else(|| existing.as_ref().map(|repository| repository.routing_mode))
+            .unwrap_or_default();
+        let semantic_routing = request
+            .semantic_routing
+            .or_else(|| {
+                existing
+                    .as_ref()
+                    .map(|repository| repository.semantic_routing)
+            })
+            .unwrap_or(true);
+        let included_reviewer_ids = request
+            .included_reviewer_ids
+            .clone()
+            .or_else(|| {
+                existing
+                    .as_ref()
+                    .map(|repository| repository.included_reviewer_ids.clone())
+            })
+            .unwrap_or_default();
+        let excluded_reviewer_ids = request
+            .excluded_reviewer_ids
+            .clone()
+            .or_else(|| {
+                existing
+                    .as_ref()
+                    .map(|repository| repository.excluded_reviewer_ids.clone())
+            })
+            .unwrap_or_default();
+        if request.mode != CodeReviewMode::Off
+            && routing_mode == CodeReviewRoutingMode::Core
+            && reviewer_ids.is_empty()
+        {
             return Err(EngineError::BadRequest(
-                "an enabled repository must select at least one reviewer".into(),
+                "an enabled Core repository must select at least one reviewer".into(),
             ));
         }
         self.resolve_code_review_reviewers(&reviewer_ids)?;
+        self.resolve_code_review_reviewers(&included_reviewer_ids)?;
+        self.resolve_code_review_reviewers(&excluded_reviewer_ids)?;
+        let excluded = excluded_reviewer_ids.iter().collect::<HashSet<_>>();
+        if let Some(overlap) = included_reviewer_ids
+            .iter()
+            .find(|reviewer_id| excluded.contains(reviewer_id))
+        {
+            return Err(EngineError::BadRequest(format!(
+                "reviewer {overlap:?} cannot be both included and excluded"
+            )));
+        }
+        if request.mode != CodeReviewMode::Off
+            && routing_mode != CodeReviewRoutingMode::Core
+            && self
+                .code_review_reviewer_catalog()?
+                .iter()
+                .all(|reviewer| excluded.contains(&reviewer.id))
+        {
+            return Err(EngineError::BadRequest(
+                "an enabled Auto or Thorough repository cannot exclude every reviewer".into(),
+            ));
+        }
         let reviewer_overrides = request
             .reviewer_overrides
             .as_ref()
@@ -1672,6 +1797,10 @@ impl Engine {
             model: request.model.clone(),
             prompt: request.prompt.clone(),
             reviewer_ids: Some(reviewer_ids),
+            routing_mode: Some(routing_mode),
+            semantic_routing: Some(semantic_routing),
+            included_reviewer_ids: Some(included_reviewer_ids),
+            excluded_reviewer_ids: Some(excluded_reviewer_ids),
             reviewer_overrides: Some(reviewer_overrides),
         };
         self.store.update_code_review_repository(&normalized)?;
@@ -1893,18 +2022,8 @@ impl Engine {
 
     async fn poll_code_review_repository(&self, repository: &CodeReviewRepository) -> Result<bool> {
         validate_repository(&repository.repository)?;
-        let reviewers = apply_reviewer_overrides(
-            self.resolve_code_review_reviewers(&repository.reviewer_ids)?,
-            &repository.reviewer_overrides,
-        );
-        let reviewer_config = serde_json::to_string(&reviewers)?;
-        let config_hash = hex::encode(Sha256::digest(
-            format!(
-                "{:?}\0{}\0{reviewer_config}",
-                repository.model, repository.prompt
-            )
-            .as_bytes(),
-        ));
+        let reviewers = self.reviewers_for_repository_policy(repository)?;
+        let config_hash = Self::code_review_config_hash(repository, &reviewers)?;
         let api = self.installation_api(repository.installation_id).await?;
         let bot_login = self.github_app_status()?.bot_login;
         let mut pulls = Vec::new();
@@ -2047,6 +2166,10 @@ impl Engine {
                         model: repository.model.clone(),
                         prompt: repository.prompt.clone(),
                         reviewers: reviewers.clone(),
+                        routing_mode: repository.routing_mode,
+                        semantic_routing: repository.semantic_routing,
+                        included_reviewer_ids: repository.included_reviewer_ids.clone(),
+                        excluded_reviewer_ids: repository.excluded_reviewer_ids.clone(),
                         config_hash: config_hash.clone(),
                     })?;
                     if let Some(comment_key) = requested.comment_key {
@@ -2579,6 +2702,37 @@ impl Engine {
         } else {
             record.reviewers.clone()
         };
+        let mut routing_decisions = self.store.code_review_routing_decisions(&job.id)?;
+        if routing_decisions.is_empty() && !reviewers.is_empty() && !batches.is_empty() {
+            let semantic =
+                if job.routing_mode == CodeReviewRoutingMode::Auto && job.semantic_routing {
+                    self.semantic_routing_for_batches(
+                        &job,
+                        &session.id,
+                        &reviewers,
+                        &batches,
+                        superseded,
+                        active_threads,
+                    )
+                    .await?
+                } else {
+                    HashMap::new()
+                };
+            let proposed = build_routing_decisions(&job, &reviewers, &batches, &semantic);
+            routing_decisions = self
+                .store
+                .save_code_review_routing_decisions(&job.id, &proposed)?;
+            self.emit_code_review_routing(&job.id, routing_decisions.clone())?;
+        }
+        let routing_by_reviewer_batch = routing_decisions
+            .iter()
+            .map(|decision| {
+                (
+                    (decision.reviewer_id.clone(), decision.batch_index),
+                    decision,
+                )
+            })
+            .collect::<HashMap<_, _>>();
         let reviewer_count = reviewers.len();
         let existing_tasks = self.store.latest_code_review_reviewer_tasks(&job.id)?;
         let mut latest_tasks = HashMap::new();
@@ -2603,7 +2757,25 @@ impl Engine {
         // batches for the first persona.
         for (batch_index, batch) in batches.iter().cloned().enumerate() {
             for reviewer in &reviewers {
-                let applies = reviewer_applies_to_batch(&reviewer.id, &batch);
+                let fallback_decision;
+                let decision = if let Some(decision) =
+                    routing_by_reviewer_batch.get(&(reviewer.id.clone(), batch_index as u64))
+                {
+                    *decision
+                } else {
+                    fallback_decision = CodeReviewRoutingDecision {
+                        batch_index: batch_index as u64,
+                        reviewer_id: reviewer.id.clone(),
+                        reviewer_name: reviewer.name.clone(),
+                        selected: true,
+                        reasons: vec![CodeReviewRoutingReason {
+                            source: CodeReviewRoutingSource::Core,
+                            detail: "legacy review job without a routing snapshot".into(),
+                        }],
+                    };
+                    &fallback_decision
+                };
+                let applies = decision.selected;
                 let prompt = if applies {
                     let mut execution_record = record.clone();
                     execution_record.job = job.clone();
@@ -2613,14 +2785,28 @@ impl Engine {
                         &batch,
                         batch_index,
                         batches.len(),
+                        &decision.reasons,
                     )
                 } else {
                     String::new()
                 };
+                let skip_reason = if applies {
+                    String::new()
+                } else {
+                    "Automatic routing found no applicable signal for this persona and batch."
+                        .into()
+                };
                 let existing = latest_tasks.remove(&(reviewer.id.clone(), batch_index as u64));
                 match existing {
                     Some(task) if task.status == "queued" => {
-                        planned.push((reviewer.clone(), batch_index, prompt, applies, Some(task)));
+                        planned.push((
+                            reviewer.clone(),
+                            batch_index,
+                            prompt,
+                            applies,
+                            skip_reason,
+                            Some(task),
+                        ));
                     }
                     Some(task) if task.status == "succeeded" => {
                         let reused = parse_review_output(&task.output)
@@ -2657,7 +2843,14 @@ impl Engine {
                         task.status
                     ))),
                     None => {
-                        planned.push((reviewer.clone(), batch_index, prompt, applies, None));
+                        planned.push((
+                            reviewer.clone(),
+                            batch_index,
+                            prompt,
+                            applies,
+                            skip_reason,
+                            None,
+                        ));
                     }
                 }
             }
@@ -2673,7 +2866,7 @@ impl Engine {
             DEFAULT_REVIEW_TASK_CONCURRENCY,
         );
         let executed_results = stream::iter(planned.into_iter().map(
-            |(reviewer, batch_index, prompt, applies, existing_task)| {
+            |(reviewer, batch_index, prompt, applies, skip_reason, existing_task)| {
                 let engine = self.clone();
                 let job = job.clone();
                 let session_id = session.id.clone();
@@ -2701,10 +2894,7 @@ impl Engine {
                     if !applies {
                         let skipped = engine
                             .store
-                            .skip_code_review_task(
-                                &task.id,
-                                "No changed files or hunks matched this focused persona.",
-                            )?
+                            .skip_code_review_task(&task.id, &skip_reason)?
                             .ok_or_else(|| anyhow!("review task was cancelled before routing"))?;
                         engine.emit_code_review_task(&job.id, skipped)?;
                         engine.refresh_code_review_progress(&job.id).await?;
@@ -3076,6 +3266,152 @@ impl Engine {
             )
         })?;
         Ok((turn, parsed))
+    }
+
+    async fn run_semantic_routing_turn(
+        self: &Arc<Self>,
+        job: &trouve_protocol::CodeReviewJob,
+        task_id: &str,
+        thread_id: &str,
+        prompt: String,
+        superseded: &CancellationToken,
+        active_threads: &Arc<Mutex<HashSet<String>>>,
+    ) -> Result<(ReviewTurnResult, SemanticRoutingOutput)> {
+        let mut turn = self
+            .run_tracked_code_review_turn(
+                job,
+                task_id,
+                thread_id,
+                ReviewTurnRequest::json_repair(prompt),
+                superseded,
+                active_threads,
+            )
+            .await?;
+        self.store
+            .set_code_review_task_metrics(task_id, &turn.metrics)?;
+        let initial_error = match parse_semantic_routing_output(&turn.output) {
+            Ok(parsed) => return Ok((turn, parsed)),
+            Err(error) => error,
+        };
+        let repaired = self
+            .run_tracked_code_review_turn(
+                job,
+                task_id,
+                thread_id,
+                ReviewTurnRequest::json_repair(semantic_routing_repair_prompt(
+                    &initial_error,
+                    &turn.output,
+                )),
+                superseded,
+                active_threads,
+            )
+            .await
+            .with_context(|| {
+                format!("repairing malformed semantic routing output after: {initial_error:#}")
+            })?;
+        merge_review_task_metrics(&mut turn.metrics, &repaired.metrics);
+        turn.output = repaired.output;
+        self.store
+            .set_code_review_task_metrics(task_id, &turn.metrics)?;
+        let parsed = parse_semantic_routing_output(&turn.output).with_context(|| {
+            format!(
+                "semantic routing remained invalid after one JSON repair attempt; \
+                 initial response error: {initial_error:#}"
+            )
+        })?;
+        Ok((turn, parsed))
+    }
+
+    async fn semantic_routing_for_batches(
+        self: &Arc<Self>,
+        job: &trouve_protocol::CodeReviewJob,
+        session_id: &str,
+        reviewers: &[ReviewerProfile],
+        batches: &[ReviewBatch],
+        superseded: &CancellationToken,
+        active_threads: &Arc<Mutex<HashSet<String>>>,
+    ) -> Result<HashMap<(usize, String), String>> {
+        let mut routed = HashMap::new();
+        for (batch_index, batch) in batches.iter().enumerate() {
+            ensure_review_current(superseded)?;
+            let candidates = semantic_routing_candidates(job, reviewers, batch);
+            if candidates.is_empty() {
+                continue;
+            }
+            let prompt =
+                semantic_routing_prompt(job, batch, batch_index, batches.len(), &candidates);
+            let task = self.store.create_code_review_task(&NewCodeReviewTask {
+                job_id: job.id.clone(),
+                role: trouve_protocol::CodeReviewTaskRole::Router,
+                reviewer_id: None,
+                reviewer_name: "Automatic persona router".into(),
+                batch_index: batch_index as u64,
+                batch_count: batches.len() as u64,
+                model: job.model.clone(),
+                prompt: prompt.clone(),
+            })?;
+            self.emit_code_review_task(&job.id, task.clone())?;
+            let thread = self.create_thread(CreateThreadRequest {
+                session_id: session_id.to_owned(),
+                mode: Some("review".into()),
+                model: job.model.clone(),
+                model_options: serde_json::Map::new(),
+                permission_mode: Some(PermissionMode::Yolo),
+            })?;
+            let task = self
+                .store
+                .start_code_review_task(&task.id, &thread.session_id, &thread.id, &thread.model)?
+                .ok_or_else(|| anyhow!("semantic routing task was cancelled before dispatch"))?;
+            self.emit_code_review_task(&job.id, task.clone())?;
+            match self
+                .run_semantic_routing_turn(
+                    job,
+                    &task.id,
+                    &thread.id,
+                    prompt,
+                    superseded,
+                    active_threads,
+                )
+                .await
+            {
+                Ok((turn, parsed)) => {
+                    for (reviewer_id, reason) in validated_semantic_routing(parsed, &candidates) {
+                        routed.insert((batch_index, reviewer_id), reason);
+                    }
+                    if let Some(task) = self.store.finish_code_review_task(
+                        &task.id,
+                        "succeeded",
+                        &turn.output,
+                        0,
+                        "",
+                    )? {
+                        self.emit_code_review_task(&job.id, task)?;
+                    }
+                }
+                Err(error) => {
+                    if superseded.is_cancelled() {
+                        return Err(error);
+                    }
+                    if let Some(task) = self.store.finish_code_review_task(
+                        &task.id,
+                        "failed",
+                        "",
+                        0,
+                        &format!(
+                            "semantic routing failed; deterministic routing was retained: {error:#}"
+                        ),
+                    )? {
+                        self.emit_code_review_task(&job.id, task)?;
+                    }
+                    self.record_review_error(format!(
+                        "semantic routing for review {} batch {} failed: {error:#}",
+                        job.id,
+                        batch_index + 1
+                    ));
+                }
+            }
+        }
+        Ok(routed)
     }
 
     async fn run_code_review_turn(
@@ -3860,14 +4196,26 @@ fn render_check_details(
         .iter()
         .filter(|task| task.status == "failed" && !task.error.trim().is_empty())
         .filter(|task| {
-            task.role != trouve_protocol::CodeReviewTaskRole::Reviewer
-                || latest_reviewer_tasks
+            if task.role == trouve_protocol::CodeReviewTaskRole::Reviewer {
+                latest_reviewer_tasks
                     .iter()
                     .any(|latest| latest.id == task.id)
+            } else {
+                let position = detail
+                    .tasks
+                    .iter()
+                    .position(|candidate| candidate.id == task.id)
+                    .unwrap_or(0);
+                !detail.tasks[position.saturating_add(1)..]
+                    .iter()
+                    .any(|candidate| {
+                        candidate.role == task.role && candidate.batch_index == task.batch_index
+                    })
+            }
         })
         .collect::<Vec<_>>();
     if !failed_tasks.is_empty() {
-        body.push_str("### Failed reviewer tasks\n\n");
+        body.push_str("### Failed review tasks\n\n");
         for task in failed_tasks {
             body.push_str(&format!(
                 "- **{} · batch {}/{}:** {}\n",
@@ -4228,15 +4576,15 @@ fn estimated_tokens(text: &str) -> usize {
     text.chars().count().div_ceil(4)
 }
 
-fn reviewer_applies_to_batch(reviewer_id: &str, batch: &ReviewBatch) -> bool {
+fn deterministic_reviewer_reasons(reviewer_id: &str, batch: &ReviewBatch) -> Vec<String> {
     if batch.paths.is_empty() {
-        return true;
+        return Vec::new();
     }
     let paths = batch.paths.join("\n").to_ascii_lowercase();
     let diff = batch.diff.to_ascii_lowercase();
     let contains_any =
         |haystack: &str, needles: &[&str]| needles.iter().any(|needle| haystack.contains(needle));
-    match reviewer_id {
+    let matched = match reviewer_id {
         "dependencies" => {
             contains_any(
                 &paths,
@@ -4328,6 +4676,40 @@ fn reviewer_applies_to_batch(reviewer_id: &str, batch: &ReviewBatch) -> bool {
                 "notify",
             ],
         ),
+        "reliability" => contains_any(
+            &diff,
+            &[
+                "retry", "timeout", "cancel", "cleanup", "shutdown", "drop(", "error", "result<",
+                "unwrap()", "expect(", "idempot", "partial",
+            ],
+        ),
+        "performance" => {
+            contains_any(
+                &paths,
+                &[
+                    "cache",
+                    "index",
+                    "search",
+                    "query",
+                    "pagination",
+                    "benchmark",
+                ],
+            ) || contains_any(
+                &diff,
+                &[
+                    "for ",
+                    "while ",
+                    ".collect",
+                    ".clone()",
+                    "allocate",
+                    "cache",
+                    "pagination",
+                    "per_page",
+                    "batch",
+                    "n + 1",
+                ],
+            )
+        }
         "api-compatibility" => {
             contains_any(
                 &paths,
@@ -4380,10 +4762,224 @@ fn reviewer_applies_to_batch(reviewer_id: &str, batch: &ReviewBatch) -> bool {
                 ],
             )
         }
-        // Broad correctness, security, reliability, performance, testing,
-        // and maintainability passes remain universal.
-        _ => true,
+        "maintainability" => {
+            contains_any(
+                &paths,
+                &["architecture", "/core/", "controller", "engine", "service"],
+            ) || contains_any(
+                &diff,
+                &[
+                    "trait ",
+                    "impl ",
+                    "state machine",
+                    "duplicate",
+                    "workaround",
+                    "temporary",
+                    "todo",
+                ],
+            )
+        }
+        _ => false,
+    };
+    if !matched {
+        return Vec::new();
     }
+    vec![
+        match reviewer_id {
+            "dependencies" => "dependency or build metadata changed",
+            "accessibility" => "frontend or accessibility-sensitive code changed",
+            "data-integrity" => "durable state, schema, or transaction code changed",
+            "concurrency" => "synchronization or asynchronous control flow changed",
+            "reliability" => "failure, cancellation, cleanup, or recovery behavior changed",
+            "performance" => {
+                "a cache, loop, query, pagination, or allocation-sensitive path changed"
+            }
+            "api-compatibility" => "a public API, protocol, schema, or route changed",
+            "operations" => "operational configuration, telemetry, or resilience code changed",
+            "maintainability" => "an architectural boundary or complex implementation changed",
+            _ => "the diff matched this reviewer's deterministic routing signals",
+        }
+        .to_string(),
+    ]
+}
+
+#[cfg(test)]
+fn reviewer_applies_to_batch(reviewer_id: &str, batch: &ReviewBatch) -> bool {
+    crate::reviewers::AUTO_BASELINE_REVIEWER_IDS.contains(&reviewer_id)
+        || !deterministic_reviewer_reasons(reviewer_id, batch).is_empty()
+}
+
+fn non_semantic_routing_reasons(
+    job: &trouve_protocol::CodeReviewJob,
+    reviewer: &ReviewerProfile,
+    batch: &ReviewBatch,
+) -> Vec<CodeReviewRoutingReason> {
+    match job.routing_mode {
+        CodeReviewRoutingMode::Core => vec![CodeReviewRoutingReason {
+            source: CodeReviewRoutingSource::Core,
+            detail: "selected by the repository's Core reviewer set".into(),
+        }],
+        CodeReviewRoutingMode::Thorough => vec![CodeReviewRoutingReason {
+            source: CodeReviewRoutingSource::Thorough,
+            detail: "selected because Thorough mode runs the complete reviewer catalog".into(),
+        }],
+        CodeReviewRoutingMode::Auto => {
+            let mut reasons = Vec::new();
+            if crate::reviewers::AUTO_BASELINE_REVIEWER_IDS.contains(&reviewer.id.as_str()) {
+                reasons.push(CodeReviewRoutingReason {
+                    source: CodeReviewRoutingSource::Baseline,
+                    detail: "part of Auto mode's always-on correctness baseline".into(),
+                });
+            }
+            if job.included_reviewer_ids.contains(&reviewer.id) {
+                reasons.push(CodeReviewRoutingReason {
+                    source: CodeReviewRoutingSource::Included,
+                    detail: "always included by this repository's review policy".into(),
+                });
+            }
+            reasons.extend(
+                deterministic_reviewer_reasons(&reviewer.id, batch)
+                    .into_iter()
+                    .map(|detail| CodeReviewRoutingReason {
+                        source: CodeReviewRoutingSource::Deterministic,
+                        detail,
+                    }),
+            );
+            reasons
+        }
+    }
+}
+
+fn build_routing_decisions(
+    job: &trouve_protocol::CodeReviewJob,
+    reviewers: &[ReviewerProfile],
+    batches: &[ReviewBatch],
+    semantic: &HashMap<(usize, String), String>,
+) -> Vec<CodeReviewRoutingDecision> {
+    let mut decisions = Vec::with_capacity(reviewers.len().saturating_mul(batches.len()));
+    for (batch_index, batch) in batches.iter().enumerate() {
+        let start = decisions.len();
+        for reviewer in reviewers {
+            let mut reasons = non_semantic_routing_reasons(job, reviewer, batch);
+            if let Some(detail) = semantic.get(&(batch_index, reviewer.id.clone())) {
+                reasons.push(CodeReviewRoutingReason {
+                    source: CodeReviewRoutingSource::Semantic,
+                    detail: detail.clone(),
+                });
+            }
+            decisions.push(CodeReviewRoutingDecision {
+                batch_index: batch_index as u64,
+                reviewer_id: reviewer.id.clone(),
+                reviewer_name: reviewer.name.clone(),
+                selected: !reasons.is_empty(),
+                reasons,
+            });
+        }
+        if !decisions[start..].iter().any(|decision| decision.selected)
+            && let Some(fallback) = decisions.get_mut(start)
+        {
+            fallback.selected = true;
+            fallback.reasons.push(CodeReviewRoutingReason {
+                source: CodeReviewRoutingSource::Baseline,
+                detail: "fallback selected because no other routing signal matched".into(),
+            });
+        }
+    }
+    decisions
+}
+
+fn semantic_routing_candidates<'a>(
+    job: &trouve_protocol::CodeReviewJob,
+    reviewers: &'a [ReviewerProfile],
+    batch: &ReviewBatch,
+) -> Vec<&'a ReviewerProfile> {
+    reviewers
+        .iter()
+        .filter(|reviewer| non_semantic_routing_reasons(job, reviewer, batch).is_empty())
+        .collect()
+}
+
+fn semantic_routing_prompt(
+    job: &trouve_protocol::CodeReviewJob,
+    batch: &ReviewBatch,
+    batch_index: usize,
+    batch_count: usize,
+    candidates: &[&ReviewerProfile],
+) -> String {
+    let catalog = candidates
+        .iter()
+        .map(|reviewer| {
+            format!(
+                "- `{}` — {}: {}",
+                reviewer.id,
+                reviewer.name,
+                reviewer.prompt.trim()
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    format!(
+        "Route complete diff batch {batch_number}/{batch_count} for pull request #{number}. \
+         Baseline and deterministic reviewers have already been selected. Choose only additional \
+         personas whose focused expertise is materially relevant to a plausible defect in this \
+         batch. Selection may only add coverage; returning none is expected when the existing \
+         routing is sufficient.\n\nCandidate personas:\n{catalog}\n\nChanged paths: {paths}\n\n\
+         Unified diff:\n{diff}\n\nReturn JSON only with this exact shape:\n\
+         {{\"selections\":[{{\"reviewer_id\":\"persona-id\",\"reason\":\"specific relevance to this diff\"}}]}}\n\
+         Use only candidate ids listed above, give a concrete one-sentence reason, and return an \
+         empty selections array when none are materially relevant.",
+        batch_number = batch_index + 1,
+        batch_count = batch_count,
+        number = job.pull_number,
+        paths = batch.paths.join(", "),
+        diff = batch.diff,
+    )
+}
+
+fn parse_semantic_routing_output(output: &str) -> Result<SemanticRoutingOutput> {
+    let trimmed = output.trim();
+    if let Ok(routing) = serde_json::from_str(trimmed) {
+        return Ok(routing);
+    }
+    let start = trimmed
+        .find('{')
+        .ok_or_else(|| anyhow!("semantic router did not contain JSON"))?;
+    let end = trimmed
+        .rfind('}')
+        .ok_or_else(|| anyhow!("semantic router did not contain JSON"))?;
+    serde_json::from_str(&trimmed[start..=end]).context("decoding semantic router JSON")
+}
+
+fn semantic_routing_repair_prompt(error: &anyhow::Error, malformed_output: &str) -> String {
+    format!(
+        "Your persona-routing response was invalid: {error:#}\n\nMalformed response:\n\
+         {malformed_output}\n\nReturn JSON only using exactly:\n\
+         {{\"selections\":[{{\"reviewer_id\":\"persona-id\",\"reason\":\"specific relevance\"}}]}}"
+    )
+}
+
+fn validated_semantic_routing(
+    routed: SemanticRoutingOutput,
+    candidates: &[&ReviewerProfile],
+) -> HashMap<String, String> {
+    let allowed = candidates
+        .iter()
+        .map(|reviewer| reviewer.id.as_str())
+        .collect::<HashSet<_>>();
+    let mut selected = HashMap::new();
+    for selection in routed.selections {
+        let reason = selection.reason.trim();
+        if allowed.contains(selection.reviewer_id.as_str()) && !reason.is_empty() {
+            selected.entry(selection.reviewer_id).or_insert_with(|| {
+                let mut bounded = reason.chars().take(400).collect::<String>();
+                if reason.chars().count() > 400 {
+                    bounded.push('…');
+                }
+                bounded
+            });
+        }
+    }
+    selected
 }
 
 fn split_diff_chunks(diff: &str, limit: usize) -> Vec<&str> {
@@ -4422,6 +5018,7 @@ fn reviewer_prompt(
     batch: &ReviewBatch,
     batch_index: usize,
     batch_count: usize,
+    routing_reasons: &[CodeReviewRoutingReason],
 ) -> String {
     let job = &record.job;
     let extra = if record.prompt.trim().is_empty() {
@@ -4429,12 +5026,18 @@ fn reviewer_prompt(
     } else {
         format!("\nRepository-specific instructions:\n{}\n", record.prompt)
     };
+    let routing = routing_reasons
+        .iter()
+        .map(|reason| format!("- {:?}: {}", reason.source, reason.detail))
+        .collect::<Vec<_>>()
+        .join("\n");
     format!(
         "Review pull request #{number} ({title}) at immutable head {head}, compared with \
          base commit {base}. This is complete diff batch {batch_number} of {batch_count}.\n\
          {extra}\nChanged paths in this batch: {paths}\n\nUnified diff:\n{diff}\n\n\
          You are the `{reviewer_name}` reviewer. Your focused mandate is:\n\
-         {reviewer_instructions}\n\nReview every supplied file or fragment. Inspect relevant \
+         {reviewer_instructions}\n\nRouting rationale:\n{routing}\n\n\
+         Review every supplied file or fragment. Inspect relevant \
          unchanged code with read/search tools only when the supplied diff leaves a concrete \
          ambiguity. Report only actionable problems introduced by the change. Do not ask \
          questions and do not modify files.\n\n{execution_guidance}\n\n\
@@ -4445,6 +5048,7 @@ fn reviewer_prompt(
          actionable issues.",
         reviewer_name = reviewer.name,
         reviewer_instructions = reviewer.prompt,
+        routing = routing,
         execution_guidance = REVIEWER_EXECUTION_GUIDANCE,
         number = job.pull_number,
         title = job.pull_title,
@@ -4834,6 +5438,10 @@ mod tests {
                     .into_iter()
                     .take(1)
                     .collect(),
+                routing_mode: CodeReviewRoutingMode::Core,
+                semantic_routing: false,
+                included_reviewer_ids: Vec::new(),
+                excluded_reviewer_ids: Vec::new(),
                 config_hash: "config".into(),
             })
             .unwrap()
@@ -4970,6 +5578,52 @@ mod tests {
                 "provider/reviewer",
             )
             .unwrap();
+        let failed_router = store
+            .create_code_review_task(&NewCodeReviewTask {
+                job_id: queued.id.clone(),
+                role: trouve_protocol::CodeReviewTaskRole::Router,
+                reviewer_id: None,
+                reviewer_name: "Automatic persona router".into(),
+                batch_index: 0,
+                batch_count: 1,
+                model: Some("provider/router".into()),
+                prompt: "Route personas".into(),
+            })
+            .unwrap();
+        store
+            .start_code_review_task(
+                &failed_router.id,
+                "session-router",
+                "thread-router-1",
+                "provider/router",
+            )
+            .unwrap();
+        store
+            .finish_code_review_task(&failed_router.id, "failed", "", 0, "stale router failure")
+            .unwrap();
+        let recovered_router = store
+            .create_code_review_task(&NewCodeReviewTask {
+                job_id: queued.id.clone(),
+                role: trouve_protocol::CodeReviewTaskRole::Router,
+                reviewer_id: None,
+                reviewer_name: "Automatic persona router".into(),
+                batch_index: 0,
+                batch_count: 1,
+                model: Some("provider/router".into()),
+                prompt: "Route personas again".into(),
+            })
+            .unwrap();
+        store
+            .start_code_review_task(
+                &recovered_router.id,
+                "session-router",
+                "thread-router-2",
+                "provider/router",
+            )
+            .unwrap();
+        store
+            .finish_code_review_task(&recovered_router.id, "succeeded", "{}", 0, "")
+            .unwrap();
 
         let detail = store.code_review_job_detail(&queued.id).unwrap().unwrap();
         let latest_tasks = store.latest_code_review_reviewer_tasks(&queued.id).unwrap();
@@ -4978,6 +5632,7 @@ mod tests {
         assert!(running.contains("### Reviewer status"));
         assert!(running.contains("Reliability & Error Handling"));
         assert!(running.contains("| running | 0/1 |"));
+        assert!(!running.contains("stale router failure"));
 
         store
             .finish_code_review_task(
@@ -5000,7 +5655,7 @@ mod tests {
         let failed = render_check_details(&detail, &latest_tasks);
         assert!(failed.contains("### Error"));
         assert!(failed.contains("reviewer output was invalid"));
-        assert!(failed.contains("### Failed reviewer tasks"));
+        assert!(failed.contains("### Failed review tasks"));
         assert!(failed.contains("review did not contain JSON<br>repair also failed"));
         assert!(!failed.trim().is_empty());
 
@@ -5011,7 +5666,7 @@ mod tests {
         let detail = store.code_review_job_detail(&queued.id).unwrap().unwrap();
         let latest_tasks = store.latest_code_review_reviewer_tasks(&queued.id).unwrap();
         let retried = render_check_details(&detail, &latest_tasks);
-        assert!(!retried.contains("### Failed reviewer tasks"));
+        assert!(!retried.contains("### Failed review tasks"));
         assert!(!retried.contains("review did not contain JSON"));
     }
 
@@ -5990,6 +6645,10 @@ mod tests {
                 model: None,
                 prompt: String::new(),
                 reviewer_ids: None,
+                routing_mode: None,
+                semantic_routing: None,
+                included_reviewer_ids: None,
+                excluded_reviewer_ids: None,
                 reviewer_overrides: None,
             })
             .unwrap();
@@ -6060,11 +6719,215 @@ mod tests {
             diff: "+tokio::spawn(async move { work().await });\n".into(),
         };
         assert!(reviewer_applies_to_batch("concurrency", &asynchronous));
+        let lock_scope = ReviewBatch {
+            paths: plain.paths.clone(),
+            diff: "+let mut caches = self.github_dashboard_caches.lock().unwrap();\n\
+                   +self.store.append_event(scope, event)?;\n"
+                .into(),
+        };
+        assert!(reviewer_applies_to_batch("concurrency", &lock_scope));
         let frontend = ReviewBatch {
             paths: vec!["web/app.tsx".into()],
             diff: "+<button aria-label=\"Save\" />\n".into(),
         };
         assert!(reviewer_applies_to_batch("accessibility", &frontend));
+    }
+
+    #[test]
+    fn automatic_routing_combines_baseline_diff_semantic_and_repository_signals() {
+        let store = crate::store::Store::open_in_memory().unwrap();
+        let mut job = enqueue_test_review_job(&store, "acme/widgets#42:auto-routing");
+        job.routing_mode = CodeReviewRoutingMode::Auto;
+        job.semantic_routing = true;
+        job.included_reviewer_ids = vec!["reliability".into()];
+        let reviewers = crate::reviewers::built_in_reviewers()
+            .into_iter()
+            .filter(|reviewer| {
+                ["correctness", "concurrency", "performance", "reliability"]
+                    .contains(&reviewer.id.as_str())
+            })
+            .collect::<Vec<_>>();
+        let batches = vec![ReviewBatch {
+            paths: vec!["crates/trouve-core/src/engine.rs".into()],
+            diff: "+let caches = self.github_dashboard_caches.lock().unwrap();\n\
+                   +self.store.append_event(scope, event)?;\n"
+                .into(),
+        }];
+        let semantic = HashMap::from([(
+            (0, "performance".to_string()),
+            "cache invalidation changed on a high-traffic path".to_string(),
+        )]);
+
+        let decisions = build_routing_decisions(&job, &reviewers, &batches, &semantic);
+        let decision = |reviewer_id: &str| {
+            decisions
+                .iter()
+                .find(|candidate| candidate.reviewer_id == reviewer_id)
+                .unwrap()
+        };
+        assert!(decision("correctness").selected);
+        assert!(
+            decision("correctness")
+                .reasons
+                .iter()
+                .any(|reason| reason.source == CodeReviewRoutingSource::Baseline)
+        );
+        assert!(decision("concurrency").selected);
+        assert!(
+            decision("concurrency")
+                .reasons
+                .iter()
+                .any(|reason| reason.source == CodeReviewRoutingSource::Deterministic)
+        );
+        assert!(decision("performance").selected);
+        assert!(
+            decision("performance")
+                .reasons
+                .iter()
+                .any(|reason| reason.source == CodeReviewRoutingSource::Semantic)
+        );
+        assert!(decision("reliability").selected);
+        assert!(
+            decision("reliability")
+                .reasons
+                .iter()
+                .any(|reason| reason.source == CodeReviewRoutingSource::Included)
+        );
+    }
+
+    #[test]
+    fn core_and_thorough_routing_select_the_snapshotted_catalog() {
+        let reviewers = crate::reviewers::built_in_reviewers()
+            .into_iter()
+            .take(3)
+            .collect::<Vec<_>>();
+        let batches = vec![ReviewBatch {
+            paths: vec!["README.md".into()],
+            diff: "+Documentation only.\n".into(),
+        }];
+        for mode in [CodeReviewRoutingMode::Core, CodeReviewRoutingMode::Thorough] {
+            let store = crate::store::Store::open_in_memory().unwrap();
+            let mut job = enqueue_test_review_job(&store, "acme/widgets#42:fixed-routing");
+            job.routing_mode = mode;
+            let decisions = build_routing_decisions(&job, &reviewers, &batches, &HashMap::new());
+            assert_eq!(decisions.len(), reviewers.len());
+            assert!(decisions.iter().all(|decision| decision.selected));
+            let source = match mode {
+                CodeReviewRoutingMode::Core => CodeReviewRoutingSource::Core,
+                CodeReviewRoutingMode::Thorough => CodeReviewRoutingSource::Thorough,
+                CodeReviewRoutingMode::Auto => unreachable!(),
+            };
+            assert!(
+                decisions
+                    .iter()
+                    .all(|decision| decision.reasons[0].source == source)
+            );
+        }
+    }
+
+    #[test]
+    fn semantic_routing_accepts_only_known_additive_candidates() {
+        let reviewers = crate::reviewers::built_in_reviewers();
+        let performance = reviewers
+            .iter()
+            .find(|reviewer| reviewer.id == "performance")
+            .unwrap();
+        let reliability = reviewers
+            .iter()
+            .find(|reviewer| reviewer.id == "reliability")
+            .unwrap();
+        let candidates = vec![performance, reliability];
+        let routed = SemanticRoutingOutput {
+            selections: vec![
+                SemanticRoutingSelection {
+                    reviewer_id: "performance".into(),
+                    reason: "  cache behavior changed  ".into(),
+                },
+                SemanticRoutingSelection {
+                    reviewer_id: "performance".into(),
+                    reason: "duplicate must not replace the first reason".into(),
+                },
+                SemanticRoutingSelection {
+                    reviewer_id: "reliability".into(),
+                    reason: "   ".into(),
+                },
+                SemanticRoutingSelection {
+                    reviewer_id: "unknown".into(),
+                    reason: "not in the candidate set".into(),
+                },
+            ],
+        };
+
+        let selected = validated_semantic_routing(routed, &candidates);
+        assert_eq!(selected.len(), 1);
+        assert_eq!(
+            selected.get("performance").map(String::as_str),
+            Some("cache behavior changed")
+        );
+    }
+
+    #[test]
+    fn automatic_routing_keeps_a_fallback_when_no_signal_matches() {
+        let store = crate::store::Store::open_in_memory().unwrap();
+        let mut job = enqueue_test_review_job(&store, "acme/widgets#42:routing-fallback");
+        job.routing_mode = CodeReviewRoutingMode::Auto;
+        let reviewers = vec![ReviewerProfile {
+            id: "custom:domain".into(),
+            name: "Domain invariants".into(),
+            prompt: "Review domain rules.".into(),
+            model: None,
+            default_thinking_level: None,
+            built_in: false,
+        }];
+        let batches = vec![ReviewBatch {
+            paths: vec!["README.md".into()],
+            diff: "+Documentation only.\n".into(),
+        }];
+
+        let decisions = build_routing_decisions(&job, &reviewers, &batches, &HashMap::new());
+        assert_eq!(decisions.len(), 1);
+        assert!(decisions[0].selected);
+        assert!(
+            decisions[0]
+                .reasons
+                .iter()
+                .any(|reason| reason.detail.contains("fallback"))
+        );
+    }
+
+    #[test]
+    fn routing_snapshot_is_published_on_the_job_event_log() {
+        let store = crate::store::Store::open_in_memory().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        let engine = Engine::new(
+            store.clone(),
+            data.path().to_path_buf(),
+            &crate::config::Config::default(),
+        );
+        let decisions = vec![CodeReviewRoutingDecision {
+            batch_index: 0,
+            reviewer_id: "concurrency".into(),
+            reviewer_name: "Concurrency & Parallelism".into(),
+            selected: true,
+            reasons: vec![CodeReviewRoutingReason {
+                source: CodeReviewRoutingSource::Deterministic,
+                detail: "synchronization changed".into(),
+            }],
+        }];
+
+        engine
+            .emit_code_review_routing("rv_routing", decisions.clone())
+            .unwrap();
+        let events = store
+            .events_after(&Scope::CodeReviewJob("rv_routing".into()), 0)
+            .unwrap();
+        assert!(matches!(
+            &events[0].event,
+            Event::CodeReviewRoutingUpdated {
+                job_id,
+                routing_decisions,
+            } if job_id == "rv_routing" && routing_decisions == &decisions
+        ));
     }
 
     #[test]

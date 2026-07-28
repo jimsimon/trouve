@@ -3893,6 +3893,10 @@ async fn code_review_dashboard_and_repository_policy_round_trip() {
             "model": "openai/gpt-5",
             "prompt": "focus on concurrency",
             "reviewer_ids": ["correctness", custom_id],
+            "routing_mode": "auto",
+            "semantic_routing": true,
+            "included_reviewer_ids": [custom_id, "reliability"],
+            "excluded_reviewer_ids": ["operations"],
             "reviewer_overrides": [
                 {
                     "reviewer_id": "correctness",
@@ -3926,6 +3930,16 @@ async fn code_review_dashboard_and_repository_policy_round_trip() {
     assert_eq!(
         dashboard["repositories"][0]["reviewer_ids"],
         serde_json::json!(["correctness", custom_id])
+    );
+    assert_eq!(dashboard["repositories"][0]["routing_mode"], "auto");
+    assert_eq!(dashboard["repositories"][0]["semantic_routing"], true);
+    assert_eq!(
+        dashboard["repositories"][0]["included_reviewer_ids"],
+        serde_json::json!([custom_id, "reliability"])
+    );
+    assert_eq!(
+        dashboard["repositories"][0]["excluded_reviewer_ids"],
+        serde_json::json!(["operations"])
     );
     assert_eq!(
         dashboard["repositories"][0]["reviewer_overrides"][0]["model"],
@@ -3972,6 +3986,10 @@ async fn code_review_dashboard_and_repository_policy_round_trip() {
         serde_json::json!(["correctness"])
     );
     assert_eq!(
+        dashboard["repositories"][0]["included_reviewer_ids"],
+        serde_json::json!(["reliability"])
+    );
+    assert_eq!(
         dashboard["repositories"][0]["reviewer_overrides"]
             .as_array()
             .unwrap()
@@ -4006,11 +4024,31 @@ async fn code_review_job_overview_loads_task_content_separately() {
             model: Some("provider/model".into()),
             prompt: "Review it".into(),
             reviewers: Vec::new(),
+            routing_mode: trouve_protocol::CodeReviewRoutingMode::Core,
+            semantic_routing: false,
+            included_reviewer_ids: Vec::new(),
+            excluded_reviewer_ids: Vec::new(),
             config_hash: "config".into(),
         })
         .unwrap()
         .unwrap();
     engine.store().claim_code_review_job().unwrap().unwrap();
+    engine
+        .store()
+        .save_code_review_routing_decisions(
+            &queued.id,
+            &[trouve_protocol::CodeReviewRoutingDecision {
+                batch_index: 0,
+                reviewer_id: "correctness".into(),
+                reviewer_name: "Correctness".into(),
+                selected: true,
+                reasons: vec![trouve_protocol::CodeReviewRoutingReason {
+                    source: trouve_protocol::CodeReviewRoutingSource::Core,
+                    detail: "selected by the repository's Core reviewer set".into(),
+                }],
+            }],
+        )
+        .unwrap();
     let task = engine
         .store()
         .create_code_review_task(&NewCodeReviewTask {
@@ -4065,6 +4103,15 @@ async fn code_review_job_overview_loads_task_content_separately() {
     assert_eq!(overview["tasks"][0]["id"], task.id);
     assert_eq!(overview["tasks"][0]["status"], "running");
     assert_eq!(overview["event_cursor"], snapshot_event.cursor);
+    assert_eq!(overview["job"]["routing_mode"], "core");
+    assert_eq!(
+        overview["routing_decisions"][0]["reviewer_id"],
+        "correctness"
+    );
+    assert_eq!(
+        overview["routing_decisions"][0]["reasons"][0]["source"],
+        "core"
+    );
     assert!(overview["tasks"][0]["prompt"].is_null());
     assert!(overview["tasks"][0]["output"].is_null());
 

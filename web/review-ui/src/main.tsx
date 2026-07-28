@@ -62,6 +62,7 @@ import type {
   ProvidersResponse,
   Repository,
   ReviewJob,
+  RoutingDecision,
   ReviewTask,
   ReviewStats,
   ReviewerProfile,
@@ -151,9 +152,44 @@ function taskAttemptLabel(tasks: ReviewTask[], task: ReviewTask): string {
     (candidate) =>
       candidate.role === task.role && candidate.batch_index === task.batch_index,
   );
-  const base = task.role === "coordinator" ? "Attempt" : `Batch ${task.batch_index + 1}`;
+  const base =
+    task.role === "coordinator"
+      ? "Attempt"
+      : task.role === "router"
+        ? `Routing ${task.batch_index + 1}`
+        : `Batch ${task.batch_index + 1}`;
   if (attempts.length === 1) return base;
   return `${base} · attempt ${attempts.indexOf(task) + 1}`;
+}
+
+function routingModeLabel(mode: Repository["routing_mode"]): string {
+  switch (mode) {
+    case "auto":
+      return "Auto";
+    case "thorough":
+      return "Thorough";
+    default:
+      return "Core";
+  }
+}
+
+function routingReasonLabel(
+  source: NonNullable<RoutingDecision["reasons"]>[number]["source"],
+): string {
+  switch (source) {
+    case "core":
+      return "Core selection";
+    case "baseline":
+      return "Auto baseline";
+    case "deterministic":
+      return "Diff signal";
+    case "semantic":
+      return "Semantic triage";
+    case "included":
+      return "Always include";
+    case "thorough":
+      return "Thorough mode";
+  }
 }
 
 function useClock(active: boolean): number {
@@ -746,6 +782,13 @@ function JobDetailPane({
             [task.id]: { ...task, [field]: `${task[field]}${event.text}` },
           };
         });
+      } else if (
+        event.type === "code_review.routing_updated" &&
+        event.routing_decisions
+      ) {
+        setDetail((current) =>
+          current ? { ...current, routing_decisions: event.routing_decisions } : current,
+        );
       } else if (event.type === "code_review.task_updated" && event.task) {
         setDetail((current) => {
           if (!current) return current;
@@ -870,6 +913,7 @@ function JobDetailPane({
     ),
   );
   const candidateRejections = detail.candidate_rejections ?? [];
+  const routingDecisions = detail.routing_decisions ?? [];
   const unrecordedCandidateDecisions = Math.max(
     0,
     job.candidate_issue_count - acceptedCandidateIds.size - candidateRejections.length,
@@ -881,16 +925,51 @@ function JobDetailPane({
     subtitle: string;
     tasks: ReviewTask[];
     persona?: PersonaResult;
-  }> = detail.personas.map((persona) => ({
-    id: `persona:${persona.reviewer_id}`,
-    name: persona.reviewer_name,
-    status: persona.status,
-    subtitle: `${persona.completed_batches}/${persona.total_batches} batches · ${duration(
-      liveElapsed(persona.elapsed_ms, persona.status, persona.started_at, now),
-    )}`,
-    tasks: detail.tasks.filter((task) => task.reviewer_id === persona.reviewer_id),
-    persona,
-  }));
+  }> = [];
+  const routerTasks = detail.tasks.filter((task) => task.role === "router");
+  if (routerTasks.length) {
+    const latestRouterByBatch = new Map<number, ReviewTask>();
+    routerTasks.forEach((task) => {
+      // Tasks arrive in durable attempt order, so the final entry for a
+      // batch is the current attempt even when timestamps collide.
+      latestRouterByBatch.set(task.batch_index, task);
+    });
+    const currentRouterTasks = [...latestRouterByBatch.values()];
+    const runningRouter = currentRouterTasks.find((task) => task.status === "running");
+    const queuedRouter = currentRouterTasks.find((task) => task.status === "queued");
+    const failedRouter = currentRouterTasks.find((task) => task.status === "failed");
+    const routerStatus =
+      runningRouter?.status ??
+      queuedRouter?.status ??
+      failedRouter?.status ??
+      (currentRouterTasks.every((task) => task.status === "succeeded")
+        ? "succeeded"
+        : "cancelled");
+    const routerElapsed = currentRouterTasks.reduce(
+      (sum, task) =>
+        sum + liveElapsed(task.elapsed_ms, task.status, task.started_at, now),
+      0,
+    );
+    activityGroups.push({
+      id: "router",
+      name: "Persona router",
+      status: routerStatus,
+      subtitle: `${currentRouterTasks.filter((task) => !["queued", "running"].includes(task.status)).length}/${currentRouterTasks.length} batches · ${duration(routerElapsed)}`,
+      tasks: routerTasks,
+    });
+  }
+  activityGroups.push(
+    ...detail.personas.map((persona) => ({
+      id: `persona:${persona.reviewer_id}`,
+      name: persona.reviewer_name,
+      status: persona.status,
+      subtitle: `${persona.completed_batches}/${persona.total_batches} batches · ${duration(
+        liveElapsed(persona.elapsed_ms, persona.status, persona.started_at, now),
+      )}`,
+      tasks: detail.tasks.filter((task) => task.reviewer_id === persona.reviewer_id),
+      persona,
+    })),
+  );
   const personaReviewerIds = new Set(detail.personas.map((persona) => persona.reviewer_id));
   const unmatchedReviewerTasks = new Map<string, ReviewTask[]>();
   detail.tasks
@@ -964,6 +1043,14 @@ function JobDetailPane({
   const selectedGroup = activityGroups.find((group) =>
     group.tasks.some((task) => task.id === selectedTask?.id),
   );
+  const selectedRoutingDecision =
+    selectedTask?.role === "reviewer"
+      ? routingDecisions.find(
+          (decision) =>
+            decision.reviewer_id === selectedTask.reviewer_id &&
+            decision.batch_index === selectedTask.batch_index,
+        )
+      : undefined;
   const selectPreferredTask = (tasks: ReviewTask[]): void => {
     const preferred = pickPreferredTask(tasks);
     if (preferred) setSelectedTaskId(preferred.id);
@@ -987,6 +1074,14 @@ function JobDetailPane({
         <div>
           <dt>Scope</dt>
           <dd>{job.scope}</dd>
+        </div>
+        <div>
+          <dt>Persona routing</dt>
+          <dd>{routingModeLabel(job.routing_mode)}</dd>
+        </div>
+        <div>
+          <dt>Semantic triage</dt>
+          <dd>{job.routing_mode === "auto" && job.semantic_routing ? "Enabled" : "Off"}</dd>
         </div>
         <div>
           <dt>Pending</dt>
@@ -1056,6 +1151,52 @@ function JobDetailPane({
         <ExternalLink href={job.check_run_url}>Open Check Run ↗</ExternalLink>
       </div>
       {job.check_sync_error && <p class="warning">Check sync: {job.check_sync_error}</p>}
+      {routingDecisions.length > 0 && (
+        <details class="routing-decisions">
+          <summary>
+            <strong>Persona routing</strong>
+            <span>
+              {routingDecisions.filter((decision) => decision.selected).length} of{" "}
+              {routingDecisions.length} persona-batch candidates selected
+            </span>
+          </summary>
+          <div class="routing-batches">
+            {[...new Set(routingDecisions.map((decision) => decision.batch_index))].map(
+              (batchIndex) => (
+                <section key={batchIndex}>
+                  <h3>Batch {batchIndex + 1}</h3>
+                  <div>
+                    {routingDecisions
+                      .filter((decision) => decision.batch_index === batchIndex)
+                      .map((decision) => (
+                        <article
+                          class={`routing-decision ${decision.selected ? "selected" : "skipped"}`}
+                          key={decision.reviewer_id}
+                        >
+                          <header>
+                            <strong>{decision.reviewer_name}</strong>
+                            <span>{decision.selected ? "Selected" : "Skipped"}</span>
+                          </header>
+                          {(decision.reasons ?? []).length > 0 ? (
+                            <ul>
+                              {(decision.reasons ?? []).map((reason, index) => (
+                                <li key={`${reason.source}:${index}`}>
+                                  <b>{routingReasonLabel(reason.source)}:</b> {reason.detail}
+                                </li>
+                              ))}
+                            </ul>
+                          ) : (
+                            <p>No applicable routing signal.</p>
+                          )}
+                        </article>
+                      ))}
+                  </div>
+                </section>
+              ),
+            )}
+          </div>
+        </details>
+      )}
       <section class="detail-section">
         <div class="panel-title inline">
           <div>
@@ -1210,6 +1351,28 @@ function JobDetailPane({
                     {duration(selectedGroup.persona.provider_wait_ms)} capacity wait ·{" "}
                     {duration(selectedGroup.persona.model_elapsed_ms)} model/tools
                   </p>
+                )}
+                {selectedRoutingDecision && (
+                  <div
+                    class={`selected-routing ${selectedRoutingDecision.selected ? "selected" : "skipped"}`}
+                  >
+                    <strong>
+                      {selectedRoutingDecision.selected
+                        ? "Why this persona ran"
+                        : "Why this persona was skipped"}
+                    </strong>
+                    {(selectedRoutingDecision.reasons ?? []).length > 0 ? (
+                      <ul>
+                        {(selectedRoutingDecision.reasons ?? []).map((reason, index) => (
+                          <li key={`${reason.source}:${index}`}>
+                            <b>{routingReasonLabel(reason.source)}:</b> {reason.detail}
+                          </li>
+                        ))}
+                      </ul>
+                    ) : (
+                      <p>No baseline, deterministic, semantic, or repository include matched.</p>
+                    )}
+                  </div>
                 )}
                 <dl class="task-facts">
                   <div>
@@ -1410,6 +1573,28 @@ function RepositoryEditor({
         : [...current.reviewer_ids, id],
     }));
   };
+  const setRoutingOverride = (
+    id: string,
+    value: "automatic" | "included" | "excluded",
+  ): void => {
+    setDraft((current) => ({
+      ...current,
+      included_reviewer_ids:
+        value === "included"
+          ? [...(current.included_reviewer_ids ?? []).filter((reviewer) => reviewer !== id), id]
+          : (current.included_reviewer_ids ?? []).filter((reviewer) => reviewer !== id),
+      excluded_reviewer_ids:
+        value === "excluded"
+          ? [...(current.excluded_reviewer_ids ?? []).filter((reviewer) => reviewer !== id), id]
+          : (current.excluded_reviewer_ids ?? []).filter((reviewer) => reviewer !== id),
+    }));
+  };
+  const excludedReviewerIds = draft.excluded_reviewer_ids ?? [];
+  const reviewerPolicyInvalid =
+    draft.routing_mode === "core"
+      ? draft.reviewer_ids.length === 0
+      : reviewers.length === 0 ||
+        reviewers.every((reviewer) => excludedReviewerIds.includes(reviewer.id));
   return (
     <details class="repository-editor">
       <summary>
@@ -1417,6 +1602,8 @@ function RepositoryEditor({
           <strong>{repository.repository}</strong>
           <small>
             {repository.private ? "private" : "public"} · installation {repository.installation_id}
+            {" · "}
+            {routingModeLabel(repository.routing_mode)} routing
           </small>
         </span>
         <StatusPill status={repository.mode === "off" ? "disabled" : repository.mode} />
@@ -1451,6 +1638,29 @@ function RepositoryEditor({
             </select>
           </label>
           <label>
+            Persona routing
+            <select
+              value={draft.routing_mode}
+              onChange={(event) =>
+                setDraft({
+                  ...draft,
+                  routing_mode: event.currentTarget.value as Repository["routing_mode"],
+                })
+              }
+            >
+              <option value="core">Core · fixed reviewer set</option>
+              <option value="auto">Auto · route from each diff</option>
+              <option value="thorough">Thorough · run every persona</option>
+            </select>
+            <small>
+              {draft.routing_mode === "core"
+                ? "Runs exactly the checked personas on every diff batch."
+                : draft.routing_mode === "thorough"
+                  ? "Runs the full catalog on every batch except personas marked Never run."
+                  : "Always runs the safety baseline, then adds personas using diff signals and optional semantic triage."}
+            </small>
+          </label>
+          <label>
             Default model
             <select
               value={draft.model ?? ""}
@@ -1475,26 +1685,79 @@ function RepositoryEditor({
             onInput={(event) => setDraft({ ...draft, prompt: event.currentTarget.value })}
           />
         </label>
-        <fieldset>
-          <legend>Reviewer personas</legend>
-          <div class="check-grid">
-            {reviewers.map((reviewer) => (
-              <label class="checkbox" key={reviewer.id}>
+        {draft.routing_mode === "core" ? (
+          <fieldset>
+            <legend>Reviewer personas · exact set</legend>
+            <div class="check-grid">
+              {reviewers.map((reviewer) => (
+                <label class="checkbox" key={reviewer.id}>
+                  <input
+                    type="checkbox"
+                    checked={draft.reviewer_ids.includes(reviewer.id)}
+                    onChange={() => toggleReviewer(reviewer.id)}
+                  />
+                  <span>
+                    <strong>{reviewer.name}</strong>
+                    <small>{reviewer.model || "inherits model"}</small>
+                  </span>
+                </label>
+              ))}
+            </div>
+          </fieldset>
+        ) : (
+          <fieldset>
+            <legend>Persona routing overrides</legend>
+            {draft.routing_mode === "auto" && (
+              <label class="checkbox semantic-routing">
                 <input
                   type="checkbox"
-                  checked={draft.reviewer_ids.includes(reviewer.id)}
-                  onChange={() => toggleReviewer(reviewer.id)}
+                  checked={draft.semantic_routing}
+                  onChange={(event) =>
+                    setDraft({ ...draft, semantic_routing: event.currentTarget.checked })
+                  }
                 />
                 <span>
-                  <strong>{reviewer.name}</strong>
-                  <small>{reviewer.model || "inherits model"}</small>
+                  <strong>Semantic triage</strong>
+                  <small>
+                    Run one lightweight, tool-free pass per batch. It may add reviewers but can
+                    never remove baseline or deterministically selected reviewers.
+                  </small>
                 </span>
               </label>
-            ))}
-          </div>
-        </fieldset>
+            )}
+            <div class="routing-personas">
+              {reviewers.map((reviewer) => {
+                const included = (draft.included_reviewer_ids ?? []).includes(reviewer.id);
+                const excluded = excludedReviewerIds.includes(reviewer.id);
+                return (
+                  <label class="routing-persona" key={reviewer.id}>
+                    <span>
+                      <strong>{reviewer.name}</strong>
+                      <small>{reviewer.model || "inherits model"}</small>
+                    </span>
+                    <select
+                      value={included ? "included" : excluded ? "excluded" : "automatic"}
+                      onChange={(event) =>
+                        setRoutingOverride(
+                          reviewer.id,
+                          event.currentTarget.value as "automatic" | "included" | "excluded",
+                        )
+                      }
+                    >
+                      <option value="automatic">
+                        {draft.routing_mode === "thorough" ? "Run" : "Automatic"}
+                      </option>
+                      <option value="included">Always run</option>
+                      <option value="excluded">Never run</option>
+                    </select>
+                  </label>
+                );
+              })}
+            </div>
+          </fieldset>
+        )}
         <div class="action-row">
-          <button type="submit" disabled={busy || draft.reviewer_ids.length === 0}>
+          <button type="submit" disabled={busy || reviewerPolicyInvalid}>
             {busy ? "Saving…" : "Save repository"}
           </button>
           {message && <span role="status">{message}</span>}

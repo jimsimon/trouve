@@ -258,11 +258,17 @@ pub enum Event {
     WorktreeRemoved { path: String, branch: String },
 
     // --- code-review-job scope ------------------------------------------
-    /// A reviewer or coordinator task changed durable state.
+    /// A router, reviewer, or coordinator task changed durable state.
     #[serde(rename = "code_review.task_updated")]
     CodeReviewTaskUpdated {
         job_id: String,
         task: Box<crate::CodeReviewTask>,
+    },
+    /// The complete, durable persona-routing matrix was selected for a job.
+    #[serde(rename = "code_review.routing_updated")]
+    CodeReviewRoutingUpdated {
+        job_id: String,
+        routing_decisions: Vec<crate::CodeReviewRoutingDecision>,
     },
     /// Live output projected from the disposable agent thread into durable
     /// review history.
@@ -408,6 +414,26 @@ mod tests {
         })
         .unwrap();
         assert_eq!(progress["type"], "code_review.progress_updated");
+
+        let routing = serde_json::to_value(Event::CodeReviewRoutingUpdated {
+            job_id: "rv_1".into(),
+            routing_decisions: vec![crate::CodeReviewRoutingDecision {
+                batch_index: 0,
+                reviewer_id: "concurrency".into(),
+                reviewer_name: "Concurrency".into(),
+                selected: true,
+                reasons: vec![crate::CodeReviewRoutingReason {
+                    source: crate::CodeReviewRoutingSource::Deterministic,
+                    detail: "synchronization changed".into(),
+                }],
+            }],
+        })
+        .unwrap();
+        assert_eq!(routing["type"], "code_review.routing_updated");
+        assert_eq!(
+            routing["routing_decisions"][0]["reviewer_id"],
+            "concurrency"
+        );
     }
 
     #[test]

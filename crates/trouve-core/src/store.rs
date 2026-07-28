@@ -6,7 +6,7 @@
 //! what was sent to/received from the model, which the event taxonomy does
 //! not try to encode.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
@@ -132,6 +132,10 @@ CREATE TABLE IF NOT EXISTS automations (
   last_error TEXT NOT NULL DEFAULT '',
   created_at TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS store_migrations (
+  id TEXT PRIMARY KEY,
+  applied_at TEXT NOT NULL
+);
 -- The identity-based SQL names below are retained for compatibility with
 -- preview databases; the Rust and wire APIs expose reviewer profiles.
 CREATE TABLE IF NOT EXISTS code_review_repositories (
@@ -141,7 +145,11 @@ CREATE TABLE IF NOT EXISTS code_review_repositories (
   mode TEXT NOT NULL DEFAULT 'off',
   model TEXT,
   prompt TEXT NOT NULL DEFAULT '',
-  identity_ids TEXT NOT NULL DEFAULT '["correctness","security","api-compatibility","testing"]',
+  identity_ids TEXT NOT NULL DEFAULT '["correctness","security","concurrency","api-compatibility","testing"]',
+  routing_mode TEXT NOT NULL DEFAULT 'auto',
+  semantic_routing INTEGER NOT NULL DEFAULT 1,
+  included_reviewer_ids TEXT NOT NULL DEFAULT '[]',
+  excluded_reviewer_ids TEXT NOT NULL DEFAULT '[]',
   reviewer_overrides TEXT NOT NULL DEFAULT '[]',
   updated_at TEXT NOT NULL
 );
@@ -202,7 +210,11 @@ CREATE TABLE IF NOT EXISTS code_review_jobs (
   preparation_elapsed_ms INTEGER NOT NULL DEFAULT 0,
   reviewer_elapsed_ms INTEGER NOT NULL DEFAULT 0,
   coordinator_elapsed_ms INTEGER NOT NULL DEFAULT 0,
-  publication_elapsed_ms INTEGER NOT NULL DEFAULT 0
+  publication_elapsed_ms INTEGER NOT NULL DEFAULT 0,
+  routing_mode TEXT NOT NULL DEFAULT 'auto',
+  semantic_routing INTEGER NOT NULL DEFAULT 1,
+  included_reviewer_ids TEXT NOT NULL DEFAULT '[]',
+  excluded_reviewer_ids TEXT NOT NULL DEFAULT '[]'
 );
 CREATE INDEX IF NOT EXISTS code_review_jobs_status ON code_review_jobs (status, created_at);
 CREATE INDEX IF NOT EXISTS code_review_jobs_repository_history
@@ -240,6 +252,17 @@ CREATE INDEX IF NOT EXISTS code_review_tasks_job
   ON code_review_tasks (job_id, role, reviewer_id, batch_index, created_at);
 CREATE INDEX IF NOT EXISTS code_review_tasks_stats
   ON code_review_tasks (reviewer_id, model, status, completed_at);
+CREATE TABLE IF NOT EXISTS code_review_routing_decisions (
+  job_id TEXT NOT NULL REFERENCES code_review_jobs(id),
+  batch_index INTEGER NOT NULL,
+  reviewer_id TEXT NOT NULL,
+  reviewer_name TEXT NOT NULL,
+  selected INTEGER NOT NULL,
+  reasons TEXT NOT NULL DEFAULT '[]',
+  PRIMARY KEY (job_id, batch_index, reviewer_id)
+);
+CREATE INDEX IF NOT EXISTS code_review_routing_decisions_job
+  ON code_review_routing_decisions (job_id, batch_index, reviewer_id);
 CREATE TABLE IF NOT EXISTS code_review_findings (
   id TEXT PRIMARY KEY,
   job_id TEXT NOT NULL REFERENCES code_review_jobs(id),
@@ -328,7 +351,11 @@ const MIGRATIONS: &[&str] = &[
     "ALTER TABLE queued_prompts ADD COLUMN tools_enabled INTEGER NOT NULL DEFAULT 1",
     "ALTER TABLE automations ADD COLUMN permission_mode TEXT NOT NULL DEFAULT 'ask'",
     "ALTER TABLE threads ADD COLUMN todos TEXT NOT NULL DEFAULT '[]'",
-    "ALTER TABLE code_review_repositories ADD COLUMN identity_ids TEXT NOT NULL DEFAULT '[\"correctness\",\"security\",\"api-compatibility\",\"testing\"]'",
+    "ALTER TABLE code_review_repositories ADD COLUMN identity_ids TEXT NOT NULL DEFAULT '[\"correctness\",\"security\",\"concurrency\",\"api-compatibility\",\"testing\"]'",
+    "ALTER TABLE code_review_repositories ADD COLUMN routing_mode TEXT NOT NULL DEFAULT 'core'",
+    "ALTER TABLE code_review_repositories ADD COLUMN semantic_routing INTEGER NOT NULL DEFAULT 0",
+    "ALTER TABLE code_review_repositories ADD COLUMN included_reviewer_ids TEXT NOT NULL DEFAULT '[]'",
+    "ALTER TABLE code_review_repositories ADD COLUMN excluded_reviewer_ids TEXT NOT NULL DEFAULT '[]'",
     "ALTER TABLE code_review_repositories ADD COLUMN reviewer_overrides TEXT NOT NULL DEFAULT '[]'",
     "ALTER TABLE code_review_jobs ADD COLUMN identities TEXT NOT NULL DEFAULT '[]'",
     "ALTER TABLE code_review_jobs ADD COLUMN config_hash TEXT NOT NULL DEFAULT ''",
@@ -356,6 +383,10 @@ const MIGRATIONS: &[&str] = &[
     "ALTER TABLE code_review_jobs ADD COLUMN reviewer_elapsed_ms INTEGER NOT NULL DEFAULT 0",
     "ALTER TABLE code_review_jobs ADD COLUMN coordinator_elapsed_ms INTEGER NOT NULL DEFAULT 0",
     "ALTER TABLE code_review_jobs ADD COLUMN publication_elapsed_ms INTEGER NOT NULL DEFAULT 0",
+    "ALTER TABLE code_review_jobs ADD COLUMN routing_mode TEXT NOT NULL DEFAULT 'core'",
+    "ALTER TABLE code_review_jobs ADD COLUMN semantic_routing INTEGER NOT NULL DEFAULT 0",
+    "ALTER TABLE code_review_jobs ADD COLUMN included_reviewer_ids TEXT NOT NULL DEFAULT '[]'",
+    "ALTER TABLE code_review_jobs ADD COLUMN excluded_reviewer_ids TEXT NOT NULL DEFAULT '[]'",
     "ALTER TABLE code_review_pr_state ADD COLUMN last_reviewed_head_sha TEXT NOT NULL DEFAULT ''",
     "ALTER TABLE code_review_pr_state ADD COLUMN last_reviewed_base_sha TEXT NOT NULL DEFAULT ''",
     "ALTER TABLE code_review_pr_state ADD COLUMN last_reviewed_at TEXT",
@@ -384,6 +415,47 @@ fn apply_migrations(conn: &Connection) -> Result<()> {
         }
     }
     migrate_backend_sessions(conn)?;
+    migrate_automatic_code_review_routing(conn)?;
+    Ok(())
+}
+
+/// Upgrade untouched default policies to automatic routing while preserving
+/// customized persona selections as Core policies. Record the migration so a
+/// later user choice to return to Core remains respected.
+fn migrate_automatic_code_review_routing(conn: &Connection) -> Result<()> {
+    const MIGRATION_ID: &str = "automatic-code-review-routing-v1";
+    const LEGACY_DEFAULTS: &str = r#"["correctness","security","api-compatibility","testing"]"#;
+    const CURRENT_DEFAULTS: &str =
+        r#"["correctness","security","concurrency","api-compatibility","testing"]"#;
+
+    let applied = conn
+        .query_row(
+            "SELECT 1 FROM store_migrations WHERE id = ?1",
+            [MIGRATION_ID],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some();
+    if applied {
+        return Ok(());
+    }
+
+    conn.execute(
+        "UPDATE code_review_repositories
+         SET identity_ids = ?2, routing_mode = 'auto', semantic_routing = 1
+         WHERE identity_ids = ?1",
+        params![LEGACY_DEFAULTS, CURRENT_DEFAULTS],
+    )?;
+    conn.execute(
+        "UPDATE code_review_repositories
+         SET routing_mode = 'auto', semantic_routing = 1
+         WHERE identity_ids = ?1 AND routing_mode = 'core'",
+        [CURRENT_DEFAULTS],
+    )?;
+    conn.execute(
+        "INSERT INTO store_migrations (id, applied_at) VALUES (?1, ?2)",
+        params![MIGRATION_ID, chrono::Utc::now().to_rfc3339()],
+    )?;
     Ok(())
 }
 
@@ -487,6 +559,22 @@ fn code_review_mode_str(value: trouve_protocol::CodeReviewMode) -> &'static str 
     }
 }
 
+fn code_review_routing_mode_from(value: &str) -> trouve_protocol::CodeReviewRoutingMode {
+    match value {
+        "auto" => trouve_protocol::CodeReviewRoutingMode::Auto,
+        "thorough" => trouve_protocol::CodeReviewRoutingMode::Thorough,
+        _ => trouve_protocol::CodeReviewRoutingMode::Core,
+    }
+}
+
+fn code_review_routing_mode_str(value: trouve_protocol::CodeReviewRoutingMode) -> &'static str {
+    match value {
+        trouve_protocol::CodeReviewRoutingMode::Core => "core",
+        trouve_protocol::CodeReviewRoutingMode::Auto => "auto",
+        trouve_protocol::CodeReviewRoutingMode::Thorough => "thorough",
+    }
+}
+
 fn parse_datetime(value: String) -> chrono::DateTime<chrono::Utc> {
     value.parse().unwrap_or_else(|_| chrono::Utc::now())
 }
@@ -551,8 +639,14 @@ fn row_to_code_review_repository(
         prompt: r.get(5)?,
         reviewer_ids: serde_json::from_str::<Vec<String>>(&r.get::<_, String>(6)?)
             .unwrap_or_else(|_| crate::reviewers::default_reviewer_ids()),
+        routing_mode: code_review_routing_mode_from(&r.get::<_, String>(7)?),
+        semantic_routing: r.get(8)?,
+        included_reviewer_ids: serde_json::from_str::<Vec<String>>(&r.get::<_, String>(9)?)
+            .unwrap_or_default(),
+        excluded_reviewer_ids: serde_json::from_str::<Vec<String>>(&r.get::<_, String>(10)?)
+            .unwrap_or_default(),
         reviewer_overrides: serde_json::from_str::<Vec<trouve_protocol::ReviewerOverride>>(
-            &r.get::<_, String>(7)?,
+            &r.get::<_, String>(11)?,
         )
         .unwrap_or_default(),
     })
@@ -576,6 +670,10 @@ pub struct NewCodeReviewJob {
     pub model: Option<String>,
     pub prompt: String,
     pub reviewers: Vec<trouve_protocol::ReviewerProfile>,
+    pub routing_mode: trouve_protocol::CodeReviewRoutingMode,
+    pub semantic_routing: bool,
+    pub included_reviewer_ids: Vec<String>,
+    pub excluded_reviewer_ids: Vec<String>,
     pub config_hash: String,
 }
 
@@ -644,6 +742,12 @@ fn row_to_code_review_job(r: &rusqlite::Row<'_>) -> rusqlite::Result<CodeReviewJ
                 .iter()
                 .map(|reviewer| reviewer.id.clone())
                 .collect(),
+            routing_mode: code_review_routing_mode_from(&r.get::<_, String>(43)?),
+            semantic_routing: r.get(44)?,
+            included_reviewer_ids: serde_json::from_str::<Vec<String>>(&r.get::<_, String>(45)?)
+                .unwrap_or_default(),
+            excluded_reviewer_ids: serde_json::from_str::<Vec<String>>(&r.get::<_, String>(46)?)
+                .unwrap_or_default(),
             session_id: r.get(15)?,
             thread_id: r.get(16)?,
             review_url: r.get(17)?,
@@ -685,7 +789,8 @@ const CODE_REVIEW_JOB_COLUMNS: &str = "id, installation_id, repository, pull_num
      retried_by, lifecycle_comment_url, check_run_id, check_run_url, check_sync_error, cancel_requested, \
      completed_reviewers, total_reviewers, candidate_issue_count, issue_count, fixed_issue_count, summary, \
      prompt_for_agents, publication_claimed, preparation_elapsed_ms, reviewer_elapsed_ms, \
-     coordinator_elapsed_ms, publication_elapsed_ms";
+     coordinator_elapsed_ms, publication_elapsed_ms, routing_mode, semantic_routing, \
+     included_reviewer_ids, excluded_reviewer_ids";
 
 #[derive(Debug, Clone)]
 pub struct NewCodeReviewTask {
@@ -718,6 +823,7 @@ pub enum CodeReviewJobPhase {
 
 fn code_review_task_role_str(role: trouve_protocol::CodeReviewTaskRole) -> &'static str {
     match role {
+        trouve_protocol::CodeReviewTaskRole::Router => "router",
         trouve_protocol::CodeReviewTaskRole::Reviewer => "reviewer",
         trouve_protocol::CodeReviewTaskRole::Coordinator => "coordinator",
     }
@@ -725,6 +831,7 @@ fn code_review_task_role_str(role: trouve_protocol::CodeReviewTaskRole) -> &'sta
 
 fn code_review_task_role_from(value: &str) -> trouve_protocol::CodeReviewTaskRole {
     match value {
+        "router" => trouve_protocol::CodeReviewTaskRole::Router,
         "coordinator" => trouve_protocol::CodeReviewTaskRole::Coordinator,
         _ => trouve_protocol::CodeReviewTaskRole::Reviewer,
     }
@@ -807,6 +914,18 @@ fn row_to_code_review_task_attempt(
     Ok(CodeReviewTaskAttempt {
         task: row_to_code_review_task(r)?,
         insertion_order: r.get(CODE_REVIEW_TASK_INSERTION_ORDER_COLUMN)?,
+    })
+}
+
+fn row_to_code_review_routing_decision(
+    r: &rusqlite::Row<'_>,
+) -> rusqlite::Result<trouve_protocol::CodeReviewRoutingDecision> {
+    Ok(trouve_protocol::CodeReviewRoutingDecision {
+        batch_index: r.get::<_, i64>(0)? as u64,
+        reviewer_id: r.get(1)?,
+        reviewer_name: r.get(2)?,
+        selected: r.get(3)?,
+        reasons: serde_json::from_str(&r.get::<_, String>(4)?).unwrap_or_default(),
     })
 }
 
@@ -2284,33 +2403,79 @@ impl Store {
             params![id],
         )?;
         if deleted > 0 {
-            let repositories: Vec<(String, String, String)> = {
+            let repositories: Vec<(String, String, String, String, String, String)> = {
                 let mut stmt = tx.prepare(
-                    "SELECT repository, identity_ids, reviewer_overrides
+                    "SELECT repository, identity_ids, included_reviewer_ids,
+                            excluded_reviewer_ids, reviewer_overrides, routing_mode
                      FROM code_review_repositories",
                 )?;
-                stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
-                    .collect::<rusqlite::Result<_>>()?
+                stmt.query_map([], |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                    ))
+                })?
+                .collect::<rusqlite::Result<_>>()?
             };
-            for (repository, encoded_ids, encoded_overrides) in repositories {
+            let built_in_ids = crate::reviewers::built_in_reviewers()
+                .into_iter()
+                .map(|reviewer| reviewer.id)
+                .collect::<HashSet<_>>();
+            for (
+                repository,
+                encoded_ids,
+                encoded_included,
+                encoded_excluded,
+                encoded_overrides,
+                routing_mode,
+            ) in repositories
+            {
                 let mut ids: Vec<String> = serde_json::from_str(&encoded_ids).unwrap_or_default();
+                let mut included: Vec<String> =
+                    serde_json::from_str(&encoded_included).unwrap_or_default();
+                let mut excluded: Vec<String> =
+                    serde_json::from_str(&encoded_excluded).unwrap_or_default();
                 let mut overrides: Vec<trouve_protocol::ReviewerOverride> =
                     serde_json::from_str(&encoded_overrides).unwrap_or_default();
                 let before_ids = ids.len();
+                let before_included = included.len();
+                let before_excluded = excluded.len();
                 let before_overrides = overrides.len();
                 ids.retain(|reviewer_id| reviewer_id != id);
+                included.retain(|reviewer_id| reviewer_id != id);
+                excluded.retain(|reviewer_id| reviewer_id != id);
                 overrides.retain(|reviewer_override| reviewer_override.reviewer_id != id);
-                if ids.len() != before_ids || overrides.len() != before_overrides {
+                let mut changed = ids.len() != before_ids
+                    || included.len() != before_included
+                    || excluded.len() != before_excluded
+                    || overrides.len() != before_overrides;
+                if routing_mode != "core"
+                    && built_in_ids
+                        .iter()
+                        .all(|reviewer_id| excluded.contains(reviewer_id))
+                {
+                    excluded.retain(|reviewer_id| reviewer_id != "correctness");
+                    changed = true;
+                }
+                if changed {
                     if ids.is_empty() {
                         ids = crate::reviewers::default_reviewer_ids();
                     }
                     tx.execute(
                         "UPDATE code_review_repositories
-                         SET identity_ids = ?2, reviewer_overrides = ?3, updated_at = ?4
+                         SET identity_ids = ?2, included_reviewer_ids = ?3,
+                             excluded_reviewer_ids = ?4, reviewer_overrides = ?5,
+                             updated_at = ?6
                          WHERE repository = ?1",
                         params![
                             repository,
                             serde_json::to_string(&ids)?,
+                            serde_json::to_string(&included)?,
+                            serde_json::to_string(&excluded)?,
                             serde_json::to_string(&overrides)?,
                             chrono::Utc::now().to_rfc3339(),
                         ],
@@ -2352,7 +2517,8 @@ impl Store {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
             "SELECT repository, installation_id, private, mode, model, prompt,
-                    identity_ids, reviewer_overrides
+                    identity_ids, routing_mode, semantic_routing,
+                    included_reviewer_ids, excluded_reviewer_ids, reviewer_overrides
              FROM code_review_repositories ORDER BY repository",
         )?;
         let rows = stmt.query_map([], row_to_code_review_repository)?;
@@ -2374,20 +2540,43 @@ impl Store {
             .as_ref()
             .map(serde_json::to_string)
             .transpose()?;
+        let routing_mode = request.routing_mode.map(code_review_routing_mode_str);
+        let included_reviewer_ids = request
+            .included_reviewer_ids
+            .as_ref()
+            .map(serde_json::to_string)
+            .transpose()?;
+        let excluded_reviewer_ids = request
+            .excluded_reviewer_ids
+            .as_ref()
+            .map(serde_json::to_string)
+            .transpose()?;
+        let default_reviewer_ids =
+            serde_json::to_string(&crate::reviewers::default_reviewer_ids())?;
         self.conn.lock().unwrap().execute(
             "INSERT INTO code_review_repositories
                     (repository, installation_id, private, mode, model, prompt,
-                     identity_ids, reviewer_overrides, updated_at)
+                     identity_ids, routing_mode, semantic_routing,
+                     included_reviewer_ids, excluded_reviewer_ids,
+                     reviewer_overrides, updated_at)
              VALUES (?1, ?2, 0, ?3, ?4, ?5,
-                     COALESCE(?6, '[\"correctness\",\"security\",\"api-compatibility\",\"testing\"]'),
-                     COALESCE(?7, '[]'), ?8)
+                     COALESCE(?6, ?13), COALESCE(?7, 'auto'),
+                     COALESCE(?8, 1), COALESCE(?9, '[]'),
+                     COALESCE(?10, '[]'), COALESCE(?11, '[]'), ?12)
              ON CONFLICT(repository) DO UPDATE SET
                installation_id = excluded.installation_id,
                mode = excluded.mode,
                model = excluded.model,
                prompt = excluded.prompt,
                identity_ids = COALESCE(?6, code_review_repositories.identity_ids),
-               reviewer_overrides = COALESCE(?7, code_review_repositories.reviewer_overrides),
+               routing_mode = COALESCE(?7, code_review_repositories.routing_mode),
+               semantic_routing = COALESCE(?8, code_review_repositories.semantic_routing),
+               included_reviewer_ids =
+                   COALESCE(?9, code_review_repositories.included_reviewer_ids),
+               excluded_reviewer_ids =
+                   COALESCE(?10, code_review_repositories.excluded_reviewer_ids),
+               reviewer_overrides =
+                   COALESCE(?11, code_review_repositories.reviewer_overrides),
                updated_at = excluded.updated_at",
             params![
                 request.repository,
@@ -2396,8 +2585,13 @@ impl Store {
                 request.model,
                 request.prompt,
                 reviewer_ids,
+                routing_mode,
+                request.semantic_routing,
+                included_reviewer_ids,
+                excluded_reviewer_ids,
                 reviewer_overrides,
                 chrono::Utc::now().to_rfc3339(),
+                default_reviewer_ids,
             ],
         )?;
         Ok(())
@@ -2411,14 +2605,18 @@ impl Store {
         let now = chrono::Utc::now().to_rfc3339();
         let conn = self.conn.lock().unwrap();
         let reviewers = serde_json::to_string(&new_job.reviewers)?;
+        let included_reviewer_ids = serde_json::to_string(&new_job.included_reviewer_ids)?;
+        let excluded_reviewer_ids = serde_json::to_string(&new_job.excluded_reviewer_ids)?;
         let inserted = conn.execute(
             "INSERT OR IGNORE INTO code_review_jobs
                     (id, dedupe_key, installation_id, repository, pull_number, pull_title,
                      pull_url, head_sha, base_ref, head_ref, trigger, status, model, prompt,
                      identities, config_hash, created_at, review_base_sha, review_scope,
-                     retry_of, total_reviewers)
+                     retry_of, total_reviewers, routing_mode, semantic_routing,
+                     included_reviewer_ids, excluded_reviewer_ids)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, 'queued',
-                     ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20)",
+                     ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20,
+                     ?21, ?22, ?23, ?24)",
             params![
                 id,
                 new_job.dedupe_key,
@@ -2440,6 +2638,10 @@ impl Store {
                 code_review_scope_str(new_job.scope),
                 new_job.retry_of,
                 new_job.reviewers.len() as i64,
+                code_review_routing_mode_str(new_job.routing_mode),
+                new_job.semantic_routing,
+                included_reviewer_ids,
+                excluded_reviewer_ids,
             ],
         )?;
         if inserted == 0 {
@@ -2721,6 +2923,75 @@ impl Store {
             params![id, elapsed_ms as i64],
         )?;
         Ok(())
+    }
+
+    pub fn code_review_routing_decisions(
+        &self,
+        job_id: &str,
+    ) -> Result<Vec<trouve_protocol::CodeReviewRoutingDecision>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT batch_index, reviewer_id, reviewer_name, selected, reasons
+             FROM code_review_routing_decisions
+             WHERE job_id = ?1
+             ORDER BY batch_index, reviewer_id",
+        )?;
+        let rows = stmt.query_map([job_id], row_to_code_review_routing_decision)?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
+    }
+
+    /// Persist the complete routing snapshot once. Interrupted executions and
+    /// persona retries reuse it instead of making different routing choices.
+    pub fn save_code_review_routing_decisions(
+        &self,
+        job_id: &str,
+        decisions: &[trouve_protocol::CodeReviewRoutingDecision],
+    ) -> Result<Vec<trouve_protocol::CodeReviewRoutingDecision>> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        let existing: i64 = tx.query_row(
+            "SELECT COUNT(*) FROM code_review_routing_decisions WHERE job_id = ?1",
+            [job_id],
+            |row| row.get(0),
+        )?;
+        if existing == 0 && !decisions.is_empty() {
+            let running: bool = tx.query_row(
+                "SELECT status = 'running' FROM code_review_jobs WHERE id = ?1",
+                [job_id],
+                |row| row.get(0),
+            )?;
+            if !running {
+                anyhow::bail!("review job {job_id} is no longer running");
+            }
+            let mut insert = tx.prepare(
+                "INSERT INTO code_review_routing_decisions
+                        (job_id, batch_index, reviewer_id, reviewer_name, selected, reasons)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            )?;
+            for decision in decisions {
+                insert.execute(params![
+                    job_id,
+                    decision.batch_index as i64,
+                    decision.reviewer_id,
+                    decision.reviewer_name,
+                    decision.selected,
+                    serde_json::to_string(&decision.reasons)?,
+                ])?;
+            }
+        }
+        let routed = {
+            let mut stmt = tx.prepare(
+                "SELECT batch_index, reviewer_id, reviewer_name, selected, reasons
+                 FROM code_review_routing_decisions
+                 WHERE job_id = ?1
+                 ORDER BY batch_index, reviewer_id",
+            )?;
+            stmt.query_map([job_id], row_to_code_review_routing_decision)?
+                .collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        tx.commit()?;
+        Ok(routed)
     }
 
     pub fn create_code_review_task(
@@ -3406,6 +3677,7 @@ impl Store {
         let tasks = attempts.into_iter().map(|attempt| attempt.task).collect();
         let findings = self.code_review_findings(id)?;
         let candidate_rejections = self.code_review_candidate_rejections(id)?;
+        let routing_decisions = self.code_review_routing_decisions(id)?;
         Ok(Some(trouve_protocol::CodeReviewJobDetail {
             job: record.job,
             event_cursor,
@@ -3413,6 +3685,7 @@ impl Store {
             personas,
             findings,
             candidate_rejections,
+            routing_decisions,
             summary: record.summary,
             prompt_for_agents: record.prompt_for_agents,
         }))
@@ -3947,11 +4220,15 @@ impl Store {
                     (id, dedupe_key, installation_id, repository, pull_number,
                      pull_title, pull_url, head_sha, base_ref, head_ref, trigger,
                      status, model, prompt, identities, config_hash, created_at,
-                     review_base_sha, review_scope, retry_of, total_reviewers)
+                     review_base_sha, review_scope, retry_of, total_reviewers,
+                     routing_mode, semantic_routing, included_reviewer_ids,
+                     excluded_reviewer_ids)
              SELECT ?2, ?3, installation_id, repository, pull_number,
                     pull_title, pull_url, head_sha, base_ref, head_ref, 'retry',
                     'queued', model, prompt, identities, config_hash, ?4,
-                    review_base_sha, review_scope, id, total_reviewers
+                    review_base_sha, review_scope, id, total_reviewers,
+                    routing_mode, semantic_routing, included_reviewer_ids,
+                    excluded_reviewer_ids
              FROM code_review_jobs WHERE id = ?1",
             params![id, new_id, format!("retry:{id}:{new_id}"), now],
         )?;
@@ -5537,6 +5814,10 @@ mod tests {
         assert_eq!(discovered.len(), 1);
         assert_eq!(discovered[0].mode, trouve_protocol::CodeReviewMode::Off);
         assert!(discovered[0].private);
+        assert_eq!(
+            discovered[0].reviewer_ids,
+            crate::reviewers::default_reviewer_ids()
+        );
 
         store
             .update_code_review_repository(&trouve_protocol::UpdateCodeReviewRepositoryRequest {
@@ -5546,6 +5827,10 @@ mod tests {
                 model: Some("openai/gpt-5".into()),
                 prompt: "focus on concurrency".into(),
                 reviewer_ids: Some(crate::reviewers::default_reviewer_ids()),
+                routing_mode: Some(trouve_protocol::CodeReviewRoutingMode::Auto),
+                semantic_routing: Some(true),
+                included_reviewer_ids: Some(vec!["reliability".into()]),
+                excluded_reviewer_ids: Some(vec!["operations".into()]),
                 reviewer_overrides: Some(vec![trouve_protocol::ReviewerOverride {
                     reviewer_id: "security".into(),
                     model: Some("anthropic/security".into()),
@@ -5603,6 +5888,10 @@ mod tests {
             model: configured.model,
             prompt: configured.prompt,
             reviewers,
+            routing_mode: configured.routing_mode,
+            semantic_routing: configured.semantic_routing,
+            included_reviewer_ids: configured.included_reviewer_ids,
+            excluded_reviewer_ids: configured.excluded_reviewer_ids,
             config_hash: "config".into(),
         };
         let queued = store.enqueue_code_review_job(&new_job).unwrap().unwrap();
@@ -5737,6 +6026,61 @@ mod tests {
     }
 
     #[test]
+    fn legacy_default_reviewers_gain_automatic_routing_only_once() {
+        const LEGACY_DEFAULTS: &str = r#"["correctness","security","api-compatibility","testing"]"#;
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(SCHEMA).unwrap();
+        conn.execute(
+            "INSERT INTO code_review_repositories
+                    (repository, installation_id, identity_ids, routing_mode,
+                     semantic_routing, updated_at)
+             VALUES ('acme/widgets', 7, ?1, 'core', 0, '2026-01-01T00:00:00Z')",
+            [LEGACY_DEFAULTS],
+        )
+        .unwrap();
+
+        migrate_automatic_code_review_routing(&conn).unwrap();
+        let migrated: (String, String, bool) = conn
+            .query_row(
+                "SELECT identity_ids, routing_mode, semantic_routing
+                 FROM code_review_repositories
+                 WHERE repository = 'acme/widgets'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            serde_json::from_str::<Vec<String>>(&migrated.0).unwrap(),
+            crate::reviewers::default_reviewer_ids()
+        );
+        assert_eq!(migrated.1, "auto");
+        assert!(migrated.2);
+
+        // Once migrated, an explicit return to Core is a user choice and must
+        // survive subsequent startups.
+        conn.execute(
+            "UPDATE code_review_repositories
+             SET identity_ids = ?1, routing_mode = 'core', semantic_routing = 0
+             WHERE repository = 'acme/widgets'",
+            [LEGACY_DEFAULTS],
+        )
+        .unwrap();
+        migrate_automatic_code_review_routing(&conn).unwrap();
+        let retained: (String, String, bool) = conn
+            .query_row(
+                "SELECT identity_ids, routing_mode, semantic_routing
+                 FROM code_review_repositories
+                 WHERE repository = 'acme/widgets'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(retained.0, LEGACY_DEFAULTS);
+        assert_eq!(retained.1, "core");
+        assert!(!retained.2);
+    }
+
+    #[test]
     fn terminal_code_review_jobs_are_cleanup_eligible() {
         let store = Store::open_in_memory().unwrap();
         let finish_job = |status: &str, suffix: &str| {
@@ -5758,6 +6102,10 @@ mod tests {
                     model: None,
                     prompt: String::new(),
                     reviewers: Vec::new(),
+                    routing_mode: trouve_protocol::CodeReviewRoutingMode::Core,
+                    semantic_routing: false,
+                    included_reviewer_ids: Vec::new(),
+                    excluded_reviewer_ids: Vec::new(),
                     config_hash: "config".into(),
                 })
                 .unwrap()
@@ -5811,6 +6159,10 @@ mod tests {
         store.upsert_reviewer_profile(&reviewer).unwrap();
         let reviewers = store.list_custom_reviewer_profiles().unwrap();
         assert_eq!(reviewers.as_slice(), std::slice::from_ref(&reviewer));
+        let excluded_built_ins = crate::reviewers::built_in_reviewers()
+            .into_iter()
+            .map(|built_in| built_in.id)
+            .collect::<Vec<_>>();
         store
             .update_code_review_repository(&trouve_protocol::UpdateCodeReviewRepositoryRequest {
                 installation_id: 7,
@@ -5819,6 +6171,10 @@ mod tests {
                 model: None,
                 prompt: String::new(),
                 reviewer_ids: Some(vec![reviewer.id.clone()]),
+                routing_mode: Some(trouve_protocol::CodeReviewRoutingMode::Auto),
+                semantic_routing: Some(true),
+                included_reviewer_ids: Some(vec![reviewer.id.clone()]),
+                excluded_reviewer_ids: Some(excluded_built_ins),
                 reviewer_overrides: Some(vec![trouve_protocol::ReviewerOverride {
                     reviewer_id: reviewer.id.clone(),
                     model: Some("anthropic/domain".into()),
@@ -5833,18 +6189,25 @@ mod tests {
             std::slice::from_ref(&reviewer.id)
         );
         assert_eq!(repositories[0].reviewer_overrides.len(), 1);
+        assert_eq!(
+            repositories[0].included_reviewer_ids,
+            vec![reviewer.id.clone()]
+        );
 
         assert!(store.delete_custom_reviewer_profile(&reviewer.id).unwrap());
         assert!(store.list_custom_reviewer_profiles().unwrap().is_empty());
+        let repository = store.list_code_review_repositories().unwrap().remove(0);
         assert_eq!(
-            store.list_code_review_repositories().unwrap()[0].reviewer_ids,
+            repository.reviewer_ids,
             crate::reviewers::default_reviewer_ids()
         );
+        assert!(repository.included_reviewer_ids.is_empty());
         assert!(
-            store.list_code_review_repositories().unwrap()[0]
-                .reviewer_overrides
-                .is_empty()
+            !repository
+                .excluded_reviewer_ids
+                .contains(&"correctness".into())
         );
+        assert!(repository.reviewer_overrides.is_empty());
     }
 
     #[test]
@@ -5872,12 +6235,44 @@ mod tests {
                 model: Some("provider/default".into()),
                 prompt: "Review it".into(),
                 reviewers,
+                routing_mode: trouve_protocol::CodeReviewRoutingMode::Core,
+                semantic_routing: false,
+                included_reviewer_ids: Vec::new(),
+                excluded_reviewer_ids: Vec::new(),
                 config_hash: "config".into(),
             })
             .unwrap()
             .unwrap();
         let running = store.claim_code_review_job().unwrap().unwrap();
         assert_eq!(running.job.id, queued.id);
+        let routing_decisions = vec![trouve_protocol::CodeReviewRoutingDecision {
+            batch_index: 0,
+            reviewer_id: "correctness".into(),
+            reviewer_name: "Correctness".into(),
+            selected: true,
+            reasons: vec![trouve_protocol::CodeReviewRoutingReason {
+                source: trouve_protocol::CodeReviewRoutingSource::Core,
+                detail: "selected by the repository's Core reviewer set".into(),
+            }],
+        }];
+        assert_eq!(
+            store
+                .save_code_review_routing_decisions(&queued.id, &routing_decisions)
+                .unwrap(),
+            routing_decisions
+        );
+        let replacement = vec![trouve_protocol::CodeReviewRoutingDecision {
+            selected: false,
+            reasons: Vec::new(),
+            ..routing_decisions[0].clone()
+        }];
+        assert_eq!(
+            store
+                .save_code_review_routing_decisions(&queued.id, &replacement)
+                .unwrap(),
+            routing_decisions,
+            "routing is a once-only snapshot and retries must reuse it"
+        );
 
         let task = store
             .create_code_review_task(&NewCodeReviewTask {
@@ -5987,6 +6382,7 @@ mod tests {
         assert_eq!(detail.personas[0].status, "succeeded");
         assert_eq!(detail.findings[0].sources[0].task_id, task.id);
         assert_eq!(detail.prompt_for_agents, "Fix every confirmed issue.");
+        assert_eq!(detail.routing_decisions, routing_decisions);
 
         let overview = store.code_review_job_overview(&queued.id).unwrap().unwrap();
         assert_eq!(overview.tasks.len(), detail.tasks.len());
@@ -6004,6 +6400,7 @@ mod tests {
         );
         assert_eq!(overview.findings.len(), detail.findings.len());
         assert_eq!(overview.findings[0].id, detail.findings[0].id);
+        assert_eq!(overview.routing_decisions, routing_decisions);
 
         let retained_task = store
             .code_review_task(&queued.id, &task.id)
@@ -6143,6 +6540,10 @@ mod tests {
                 model: Some("provider/default".into()),
                 prompt: "Review it".into(),
                 reviewers: vec![reviewer.clone()],
+                routing_mode: trouve_protocol::CodeReviewRoutingMode::Core,
+                semantic_routing: false,
+                included_reviewer_ids: Vec::new(),
+                excluded_reviewer_ids: Vec::new(),
                 config_hash: "config".into(),
             })
             .unwrap()
@@ -6307,6 +6708,10 @@ mod tests {
                 model: Some("provider/default".into()),
                 prompt: "Review it".into(),
                 reviewers: vec![reviewer.clone()],
+                routing_mode: trouve_protocol::CodeReviewRoutingMode::Core,
+                semantic_routing: false,
+                included_reviewer_ids: Vec::new(),
+                excluded_reviewer_ids: Vec::new(),
                 config_hash: "config".into(),
             })
             .unwrap()
@@ -6392,6 +6797,10 @@ mod tests {
                 model: None,
                 prompt: String::new(),
                 reviewers: Vec::new(),
+                routing_mode: trouve_protocol::CodeReviewRoutingMode::Core,
+                semantic_routing: false,
+                included_reviewer_ids: Vec::new(),
+                excluded_reviewer_ids: Vec::new(),
                 config_hash: "config".into(),
             })
             .unwrap()
@@ -6446,6 +6855,10 @@ mod tests {
                     model: None,
                     prompt: String::new(),
                     reviewers: Vec::new(),
+                    routing_mode: trouve_protocol::CodeReviewRoutingMode::Core,
+                    semantic_routing: false,
+                    included_reviewer_ids: Vec::new(),
+                    excluded_reviewer_ids: Vec::new(),
                     config_hash: config_hash.into(),
                 })
                 .unwrap()

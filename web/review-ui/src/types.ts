@@ -1,5 +1,13 @@
 export type ReviewMode = "off" | "manual" | "automatic";
 export type ReviewScope = "incremental" | "full";
+export type RoutingMode = "core" | "auto" | "thorough";
+export type RoutingSource =
+  | "core"
+  | "baseline"
+  | "deterministic"
+  | "semantic"
+  | "included"
+  | "thorough";
 export type ReviewStatus =
   | "queued"
   | "running"
@@ -48,6 +56,10 @@ export interface Repository {
   model?: string;
   prompt: string;
   reviewer_ids: string[];
+  routing_mode: RoutingMode;
+  semantic_routing: boolean;
+  included_reviewer_ids?: string[];
+  excluded_reviewer_ids?: string[];
   reviewer_overrides?: ReviewerOverride[];
 }
 
@@ -75,6 +87,10 @@ export interface ReviewJob {
   retried_by?: string;
   model?: string;
   reviewer_ids: string[];
+  routing_mode: RoutingMode;
+  semantic_routing: boolean;
+  included_reviewer_ids?: string[];
+  excluded_reviewer_ids?: string[];
   session_id?: string;
   thread_id?: string;
   review_url: string;
@@ -102,7 +118,7 @@ export interface ReviewJob {
 export interface ReviewTask {
   id: string;
   job_id: string;
-  role: "reviewer" | "coordinator";
+  role: "router" | "reviewer" | "coordinator";
   reviewer_id?: string;
   reviewer_name: string;
   batch_index: number;
@@ -187,6 +203,19 @@ export interface CandidateRejection {
   reason: string;
 }
 
+export interface RoutingReason {
+  source: RoutingSource;
+  detail: string;
+}
+
+export interface RoutingDecision {
+  batch_index: number;
+  reviewer_id: string;
+  reviewer_name: string;
+  selected: boolean;
+  reasons?: RoutingReason[];
+}
+
 export interface JobDetail {
   job: ReviewJob;
   event_cursor: number;
@@ -194,6 +223,7 @@ export interface JobDetail {
   personas: PersonaResult[];
   findings: Finding[];
   candidate_rejections?: CandidateRejection[];
+  routing_decisions?: RoutingDecision[];
   summary: string;
   prompt_for_agents: string;
 }
@@ -336,4 +366,5 @@ export interface EventEnvelope {
   text?: string;
   task?: ReviewTask;
   progress?: Progress;
+  routing_decisions?: RoutingDecision[];
 }
