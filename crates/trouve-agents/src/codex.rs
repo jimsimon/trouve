@@ -299,6 +299,13 @@ impl AgentBackend for CodexBackend {
     }
 
     async fn start_login(&self) -> Result<BackendLogin, BackendError> {
+        // The isolated app-server and Trouve's own login flow both publish to
+        // the user's shared auth.json. Serialize the whole login so an
+        // app-server refresh cannot race the vendor CLI's final write.
+        let auth_lock = match codex_auth_path() {
+            Some(source) => Some(acquire_auth_lock(source).await?),
+            None => None,
+        };
         let BackendLogin {
             verification_url,
             user_code,
@@ -312,6 +319,9 @@ impl AgentBackend for CodexBackend {
             callback_sender,
             done: Box::pin(async move {
                 let result = done.await;
+                // Release before evicting the server: AppServer::drop syncs
+                // refreshed credentials through this same lock.
+                drop(auth_lock);
                 if result.is_ok() {
                     // AppServer snapshots auth into an isolated CODEX_HOME.
                     // Force the next request to create a fresh snapshot after
@@ -7779,6 +7789,110 @@ for line in sys.stdin:
             missing.sync().unwrap_err().kind(),
             std::io::ErrorKind::NotFound
         );
+    }
+
+    #[test]
+    fn auth_sync_preserves_login_interleaved_after_refresh_staging() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("auth.json");
+        let isolated = temp.path().join("isolated-auth.json");
+        std::fs::write(&source, b"old").unwrap();
+        std::fs::write(&isolated, b"refreshed").unwrap();
+        let sync = AuthSync::new(source.clone(), isolated.clone(), b"old".to_vec());
+
+        sync.sync_with_publish_hook(|| {
+            // Simulate a separately launched vendor CLI, which cannot know
+            // about Trouve's lock file, completing after the refresh was
+            // staged but before its atomic publication.
+            std::fs::write(&source, b"new-login").unwrap();
+        })
+        .unwrap();
+        assert_eq!(std::fs::read(&source).unwrap(), b"new-login");
+
+        std::fs::write(&isolated, b"later-stale-refresh").unwrap();
+        sync.sync().unwrap();
+        assert_eq!(std::fs::read(&source).unwrap(), b"new-login");
+    }
+
+    #[test]
+    fn auth_sync_serializes_publishers_on_the_shared_auth_lock() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("auth.json");
+        let isolated_a = temp.path().join("isolated-a.json");
+        let isolated_b = temp.path().join("isolated-b.json");
+        std::fs::write(&source, b"old").unwrap();
+        std::fs::write(&isolated_a, b"refresh-a").unwrap();
+        std::fs::write(&isolated_b, b"refresh-b").unwrap();
+        let sync_a = Arc::new(AuthSync::new(source.clone(), isolated_a, b"old".to_vec()));
+        let sync_b = Arc::new(AuthSync::new(
+            source.clone(),
+            isolated_b.clone(),
+            b"old".to_vec(),
+        ));
+
+        let (a_staged_tx, a_staged_rx) = std::sync::mpsc::channel();
+        let (release_a_tx, release_a_rx) = std::sync::mpsc::channel();
+        let a = {
+            let sync = sync_a.clone();
+            std::thread::spawn(move || {
+                sync.sync_with_publish_hook(|| {
+                    a_staged_tx.send(()).unwrap();
+                    release_a_rx.recv().unwrap();
+                })
+            })
+        };
+        a_staged_rx.recv().unwrap();
+
+        let (b_started_tx, b_started_rx) = std::sync::mpsc::channel();
+        let (b_staged_tx, b_staged_rx) = std::sync::mpsc::channel();
+        let b = {
+            let sync = sync_b.clone();
+            std::thread::spawn(move || {
+                b_started_tx.send(()).unwrap();
+                sync.sync_with_publish_hook(|| {
+                    b_staged_tx.send(()).unwrap();
+                })
+            })
+        };
+        b_started_rx.recv().unwrap();
+        assert_eq!(
+            b_staged_rx.recv_timeout(std::time::Duration::from_millis(200)),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+        );
+
+        release_a_tx.send(()).unwrap();
+        a.join().unwrap().unwrap();
+        b.join().unwrap().unwrap();
+        assert_eq!(std::fs::read(&source).unwrap(), b"refresh-a");
+
+        // The second publisher observed A's committed source under the lock
+        // and permanently stood down instead of overwriting it later.
+        std::fs::write(&isolated_b, b"later-refresh-b").unwrap();
+        sync_b.sync().unwrap();
+        assert_eq!(std::fs::read(&source).unwrap(), b"refresh-a");
+    }
+
+    #[test]
+    fn auth_sync_retries_when_atomic_publication_does_not_complete() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("auth.json");
+        let isolated = temp.path().join("isolated-auth.json");
+        std::fs::write(&source, b"old").unwrap();
+        std::fs::write(&isolated, b"refreshed").unwrap();
+        let sync = AuthSync::new(source.clone(), isolated, b"old".to_vec());
+
+        let error = sync
+            .sync_with_publish_hook(|| {
+                std::fs::remove_file(&source).unwrap();
+                std::fs::create_dir(&source).unwrap();
+            })
+            .unwrap_err();
+        assert_ne!(error.kind(), std::io::ErrorKind::NotFound);
+
+        std::fs::remove_dir(&source).unwrap();
+        std::fs::write(&source, b"old").unwrap();
+        sync.sync().unwrap();
+        assert_eq!(std::fs::read(&source).unwrap(), b"refreshed");
     }
 
     #[test]
