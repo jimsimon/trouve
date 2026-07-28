@@ -2252,10 +2252,10 @@ impl Controller {
             if let Some(local_row) = local_row {
                 self.restoring_thread = Some(thread_id);
                 ui::restore_chat_position(&self.ui, local_row, bookmark.offset);
-            } else if window.is_none_or(|window| window.total == 0) {
-                // The first follower render is intentionally empty while
-                // persisted events are replayed. Keep the absolute bookmark
-                // pending; render_chat applies it once rows exist.
+            } else if window.is_none_or(|window| !window.initialized) {
+                // Persisted events may still be replaying, including after a
+                // partially populated render. Keep the absolute bookmark
+                // pending; render_chat applies it once that row exists.
                 self.restoring_thread = Some(thread_id);
             } else {
                 // Row structure can change across app versions or card
