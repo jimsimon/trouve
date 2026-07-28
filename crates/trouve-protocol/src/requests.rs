@@ -93,6 +93,70 @@ pub struct ServerInfo {
     pub online: bool,
 }
 
+// --- Git & Worktrees settings -------------------------------------------
+
+/// When the dedicated session-title model should occupy memory.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum TitleModelLoadBehavior {
+    /// Keep the model ready when the server detects comfortable memory
+    /// headroom; otherwise load it for each naming request.
+    #[default]
+    Auto,
+    /// Load at server startup and keep the model resident.
+    Always,
+    /// Load for naming requests and release it after an idle period.
+    OnDemand,
+    /// Never load the model; use the built-in naming heuristics.
+    Off,
+}
+
+/// Runtime status for the managed session-title model.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct TitleModelStatus {
+    /// `not_installed`, `installing`, `stopped`, `loading`, `ready`, or
+    /// `error`.
+    pub state: String,
+    /// Human-readable context for the settings screen.
+    #[serde(default)]
+    pub detail: String,
+    pub runtime_installed: bool,
+    pub model_downloaded: bool,
+    /// Empty, `runtime`, or `model`.
+    #[serde(default)]
+    pub install_stage: String,
+    #[serde(default)]
+    pub install_bytes: u64,
+    #[serde(default)]
+    pub install_total: u64,
+}
+
+/// Global settings shown under Settings → Git & Worktrees.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct GitWorktreeSettings {
+    pub title_model_load_behavior: TitleModelLoadBehavior,
+    pub title_model: TitleModelStatus,
+}
+
+/// Update Settings → Git & Worktrees.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct SetGitWorktreeSettingsRequest {
+    pub title_model_load_behavior: TitleModelLoadBehavior,
+}
+
+/// Ask the server to derive the title used to create a session and branch.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct GenerateSessionTitleRequest {
+    pub prompt: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct GeneratedSessionTitle {
+    pub title: String,
+    /// `model` or `heuristic`.
+    pub source: String,
+}
+
 // --- workspaces ----------------------------------------------------------
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]

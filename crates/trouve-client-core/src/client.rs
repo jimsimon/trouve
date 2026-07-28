@@ -148,6 +148,18 @@ impl ProtocolClient {
             .await
     }
 
+    /// Generate the title that will be used for both the session and its
+    /// branch before either is created.
+    pub async fn generate_session_title(&self, prompt: &str) -> Result<GeneratedSessionTitle> {
+        self.post_json(
+            "/session-title",
+            &GenerateSessionTitleRequest {
+                prompt: prompt.into(),
+            },
+        )
+        .await
+    }
+
     pub async fn create_session(&self, req: &CreateSessionRequest) -> Result<Session> {
         self.post_json("/sessions", req).await
     }
@@ -514,6 +526,44 @@ impl ProtocolClient {
             &SetDefaultPermissionModeRequest { permission_mode },
         )
         .await
+    }
+
+    pub async fn git_worktree_settings(&self) -> Result<(u64, GitWorktreeSettings)> {
+        let path = "/config/git-worktrees";
+        let response = self
+            .http
+            .get(format!("{}{path}", self.base))
+            .send()
+            .await
+            .with_context(|| format!("GET {path}"))?;
+        decode_cursor_response(response, path).await
+    }
+
+    pub async fn set_git_worktree_settings(
+        &self,
+        title_model_load_behavior: TitleModelLoadBehavior,
+    ) -> Result<(u64, GitWorktreeSettings)> {
+        let path = "/config/git-worktrees";
+        let response = self
+            .http
+            .put(format!("{}{path}", self.base))
+            .json(&SetGitWorktreeSettingsRequest {
+                title_model_load_behavior,
+            })
+            .send()
+            .await
+            .with_context(|| format!("PUT {path}"))?;
+        decode_cursor_response(response, path).await
+    }
+
+    pub async fn install_title_model(&self) -> Result<()> {
+        self.post_empty("/config/git-worktrees/title-model/install")
+            .await
+    }
+
+    pub async fn cancel_title_model_install(&self) -> Result<()> {
+        self.delete("/config/git-worktrees/title-model/install")
+            .await
     }
 
     pub async fn session_diff(&self, session_id: &str) -> Result<SessionDiff> {
@@ -1040,6 +1090,30 @@ async fn decode<T: serde::de::DeserializeOwned>(resp: reqwest::Response, path: &
         return Err(response_error(path, status, &bytes));
     }
     serde_json::from_slice(&bytes).with_context(|| format!("decoding {path} response"))
+}
+
+async fn decode_cursor_response<T: serde::de::DeserializeOwned>(
+    resp: reqwest::Response,
+    path: &str,
+) -> Result<(u64, T)> {
+    let status = resp.status();
+    if !status.is_success() {
+        let bytes = resp.bytes().await?;
+        return Err(response_error(path, status, &bytes));
+    }
+    let cursor = resp
+        .headers()
+        .get(EVENT_CURSOR_HEADER)
+        .context("missing event cursor response header")?
+        .to_str()
+        .context("invalid event cursor response header")?
+        .parse()
+        .context("invalid event cursor response header")?;
+    let value = resp
+        .json()
+        .await
+        .with_context(|| format!("decoding {path} response"))?;
+    Ok((cursor, value))
 }
 
 async fn decode_empty(resp: reqwest::Response, path: &str) -> Result<()> {

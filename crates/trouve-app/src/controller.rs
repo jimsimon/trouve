@@ -41,6 +41,8 @@ const SERVER_EVENT_FRESH_WINDOW: std::time::Duration = std::time::Duration::from
 /// A quiet period marks the end of a server-history burst when no fresh event
 /// arrives to provide a natural boundary.
 const SERVER_REPLAY_IDLE_FLUSH: std::time::Duration = std::time::Duration::from_millis(250);
+/// Session creation must not wait indefinitely for the optional title sidecar.
+const SESSION_TITLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
 
 /// During global history replay, only the newest state snapshot for each
 /// GitHub host matters. Lifecycle events are edge-triggered and stale ones are
@@ -48,20 +50,33 @@ const SERVER_REPLAY_IDLE_FLUSH: std::time::Duration = std::time::Duration::from_
 #[derive(Default)]
 struct ServerReplayBuffer {
     github_prs: HashMap<String, EventEnvelope>,
+    git_worktree_settings: Option<EventEnvelope>,
 }
 
 impl ServerReplayBuffer {
     fn push(&mut self, envelope: EventEnvelope) -> bool {
-        let trouve_protocol::Event::GithubPullRequestsUpdated { pull_requests } = &envelope.event
-        else {
-            return false;
-        };
-        self.github_prs.insert(pull_requests.host.clone(), envelope);
-        true
+        match &envelope.event {
+            trouve_protocol::Event::GithubPullRequestsUpdated { pull_requests } => {
+                self.github_prs.insert(pull_requests.host.clone(), envelope);
+                true
+            }
+            trouve_protocol::Event::GitWorktreeSettingsUpdated { .. } => {
+                if self
+                    .git_worktree_settings
+                    .as_ref()
+                    .is_none_or(|current| envelope.cursor > current.cursor)
+                {
+                    self.git_worktree_settings = Some(envelope);
+                }
+                true
+            }
+            _ => false,
+        }
     }
 
     fn take(&mut self) -> Vec<EventEnvelope> {
         let mut snapshots: Vec<_> = std::mem::take(&mut self.github_prs).into_values().collect();
+        snapshots.extend(self.git_worktree_settings.take());
         snapshots.sort_by_key(|envelope| envelope.cursor);
         snapshots
     }
@@ -316,6 +331,9 @@ pub enum UiCommand {
 
     // Settings window.
     RefreshSettings,
+    SetTitleModelLoadBehavior(i32),
+    InstallTitleModel,
+    CancelTitleModelInstall,
     SaveProvider {
         id: String,
         kind: String,
@@ -747,6 +765,8 @@ struct Controller {
     /// Newest applied snapshot cursor per host. A debounce flush and a fresh
     /// event may race; cursors prevent an older replay snapshot winning.
     pr_dash_cursors: HashMap<String, u64>,
+    /// Newest applied Git & Worktrees settings snapshot cursor.
+    git_worktree_settings_cursor: Option<u64>,
     /// Multi-instance account refresh failures.
     pr_dash_errors: HashMap<String, String>,
     /// Shared GitHub refreshes in flight (the `github` key is the guard).
@@ -970,6 +990,7 @@ pub async fn run(
         pr_error: String::new(),
         pr_dash: HashMap::new(),
         pr_dash_cursors: HashMap::new(),
+        git_worktree_settings_cursor: None,
         pr_dash_errors: HashMap::new(),
         pr_dash_loading: HashSet::new(),
         pr_dash_last_refreshed: None,
@@ -3544,11 +3565,33 @@ impl Controller {
                     .get(selection.workspace_idx)
                     .context("no workspace selected")?
                     .clone();
+                let generated_title = match tokio::time::timeout(
+                    SESSION_TITLE_TIMEOUT,
+                    self.client.generate_session_title(&prompt),
+                )
+                .await
+                {
+                    Ok(result) => result,
+                    Err(error) => Err(anyhow::anyhow!(
+                        "session title generation timed out: {error}"
+                    )),
+                };
+                let title = match generated_title {
+                    Ok(generated) => generated.title,
+                    Err(error) => {
+                        tracing::warn!(
+                            "session title generation failed; creating session with prompt \
+                             fallback: \
+                             {error:#}"
+                        );
+                        session_title_fallback(&prompt)
+                    }
+                };
                 let session = self
                     .client
                     .create_session(&CreateSessionRequest {
                         workspace_id: workspace.id,
-                        title: Some(trouve_client_core::title::summarize_session_title(&prompt)),
+                        title: Some(title),
                         base_ref: self.branches.get(selection.branch_idx).cloned(),
                         checkout_ref: None,
                         fetch_latest: selection.fetch_latest,
@@ -3584,6 +3627,7 @@ impl Controller {
     // --- settings --------------------------------------------------------------
 
     async fn refresh_settings(&mut self) {
+        self.refresh_title_model().await;
         if let Ok(gh) = self.client.github_integration().await {
             self.apply_github_integration(gh);
             self.push_github_integration();
@@ -3679,6 +3723,20 @@ impl Controller {
         ui::set_known_providers(&self.ui, known, providers.providers);
         self.refresh_clis().await;
         self.refresh_local();
+    }
+
+    async fn refresh_title_model(&mut self) {
+        match self.client.git_worktree_settings().await {
+            Ok((cursor, settings)) => {
+                self.apply_git_worktree_settings_snapshot(cursor, settings);
+            }
+            Err(error) => {
+                ui::set_settings_status(
+                    &self.ui,
+                    format!("failed to load Git & Worktrees settings: {error:#}"),
+                );
+            }
+        }
     }
 
     /// Estimated bytes/sec for an in-flight download, from consecutive
@@ -4107,13 +4165,47 @@ impl Controller {
         true
     }
 
+    fn apply_git_worktree_settings(
+        &mut self,
+        cursor: u64,
+        settings: trouve_protocol::GitWorktreeSettings,
+    ) {
+        if self
+            .git_worktree_settings_cursor
+            .is_some_and(|seen| seen >= cursor)
+        {
+            return;
+        }
+        ui::set_git_worktree_settings(&self.ui, settings);
+        self.git_worktree_settings_cursor = Some(cursor);
+    }
+
+    fn apply_git_worktree_settings_snapshot(
+        &mut self,
+        cursor: u64,
+        settings: trouve_protocol::GitWorktreeSettings,
+    ) {
+        if self
+            .git_worktree_settings_cursor
+            .is_some_and(|seen| seen > cursor)
+        {
+            return;
+        }
+        ui::set_git_worktree_settings(&self.ui, settings);
+        self.git_worktree_settings_cursor = Some(cursor);
+    }
+
     fn handle_server_replay(&mut self, envelopes: Vec<trouve_protocol::EventEnvelope>) {
         let mut changed = false;
         for envelope in envelopes {
-            if let trouve_protocol::Event::GithubPullRequestsUpdated { pull_requests } =
-                envelope.event
-            {
-                changed |= self.apply_github_pr_snapshot(envelope.cursor, pull_requests);
+            match envelope.event {
+                trouve_protocol::Event::GithubPullRequestsUpdated { pull_requests } => {
+                    changed |= self.apply_github_pr_snapshot(envelope.cursor, pull_requests);
+                }
+                trouve_protocol::Event::GitWorktreeSettingsUpdated { settings } => {
+                    self.apply_git_worktree_settings(envelope.cursor, settings);
+                }
+                _ => {}
             }
         }
         if changed {
@@ -4137,6 +4229,10 @@ impl Controller {
                     self.sync_shared_prs(false);
                     self.push_pr_dashboard();
                 }
+                return;
+            }
+            Event::GitWorktreeSettingsUpdated { settings } => {
+                self.apply_git_worktree_settings(cursor, settings);
                 return;
             }
             event => event,
@@ -5238,7 +5334,7 @@ impl Controller {
                 }
             }
             UiCommand::OpenIntegrationsSettings => {
-                ui::set_settings_section(&self.ui, 4);
+                ui::set_settings_section(&self.ui, crate::SectionId::Integrations);
                 self.refresh_settings().await;
                 self.refresh_mcp();
                 self.refresh_subscriptions(SubscriptionRefresh::IfStale);
@@ -5424,6 +5520,31 @@ impl Controller {
                 self.reload_catalogs().await;
                 self.refresh_settings().await;
                 self.refresh_subscriptions(SubscriptionRefresh::Force);
+            }
+            UiCommand::SetTitleModelLoadBehavior(index) => {
+                let behavior = ui::title_model_load_behavior_of(index);
+                match self.client.set_git_worktree_settings(behavior).await {
+                    Ok((cursor, settings)) => {
+                        self.apply_git_worktree_settings_snapshot(cursor, settings);
+                    }
+                    Err(error) => {
+                        ui::set_settings_status(&self.ui, format!("{error:#}"));
+                        self.refresh_title_model().await;
+                    }
+                }
+            }
+            UiCommand::InstallTitleModel => match self.client.install_title_model().await {
+                Ok(()) => {
+                    self.refresh_title_model().await;
+                }
+                Err(error) => ui::set_settings_status(&self.ui, format!("{error:#}")),
+            },
+            UiCommand::CancelTitleModelInstall => {
+                match self.client.cancel_title_model_install().await {
+                    Ok(()) => {}
+                    Err(error) => ui::set_settings_status(&self.ui, format!("{error:#}")),
+                }
+                self.refresh_title_model().await;
             }
             UiCommand::SaveProvider {
                 id,
@@ -7266,6 +7387,17 @@ fn should_open_chat_at_tail(force_tail: bool, turn_running: bool, has_queue: boo
     force_tail || turn_running || has_queue
 }
 
+fn session_title_fallback(prompt: &str) -> String {
+    prompt
+        .trim()
+        .lines()
+        .next()
+        .unwrap_or("")
+        .chars()
+        .take(48)
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -7273,7 +7405,8 @@ mod tests {
         attention_badge, check_pill, classify_pr, download_progress,
         format_pr_dashboard_refresh_status, human_age, human_rate, merge_pill, model_health_view,
         pr_badge, project_session_prs, provider_login_requires_code, reconcile_pr_group_order,
-        reconcile_workspace_order, reorder_id, should_open_chat_at_tail, thinking_property,
+        reconcile_workspace_order, reorder_id, session_title_fallback, should_open_chat_at_tail,
+        thinking_property,
     };
     use chrono::{Duration, TimeZone, Utc};
     use trouve_protocol::{
@@ -7306,14 +7439,38 @@ mod tests {
         }
     }
 
+    fn git_worktree_settings_snapshot(cursor: u64) -> EventEnvelope {
+        EventEnvelope {
+            cursor,
+            scope: Scope::Server,
+            ts: Utc::now(),
+            event: Event::GitWorktreeSettingsUpdated {
+                settings: trouve_protocol::GitWorktreeSettings {
+                    title_model_load_behavior: trouve_protocol::TitleModelLoadBehavior::Off,
+                    title_model: trouve_protocol::TitleModelStatus {
+                        state: "stopped".into(),
+                        detail: String::new(),
+                        runtime_installed: false,
+                        model_downloaded: false,
+                        install_stage: String::new(),
+                        install_bytes: 0,
+                        install_total: 0,
+                    },
+                },
+            },
+        }
+    }
+
     #[test]
-    fn server_replay_keeps_only_the_newest_pr_snapshot_per_host() {
+    fn server_replay_keeps_only_the_newest_state_snapshots() {
         let mut replay = ServerReplayBuffer::default();
         assert!(replay.push(github_snapshot(1, "github.com")));
         assert!(replay.push(github_snapshot(2, "github.example.com")));
         assert!(replay.push(github_snapshot(3, "github.com")));
+        assert!(replay.push(git_worktree_settings_snapshot(4)));
+        assert!(replay.push(git_worktree_settings_snapshot(5)));
         assert!(!replay.push(EventEnvelope {
-            cursor: 4,
+            cursor: 6,
             scope: Scope::Server,
             ts: Utc::now(),
             event: Event::SessionActivity {
@@ -7329,7 +7486,7 @@ mod tests {
                 .iter()
                 .map(|envelope| envelope.cursor)
                 .collect::<Vec<_>>(),
-            [2, 3]
+            [2, 3, 5]
         );
         assert!(replay.take().is_empty());
     }
@@ -7347,6 +7504,13 @@ mod tests {
         let changed2 = reconcile_workspace_order(&mut order2, &list);
         assert_eq!(order2, ["c", "a", "b", "d"]);
         assert!(!changed2); // No changes when order already matches
+    }
+
+    #[test]
+    fn session_title_fallback_uses_a_bounded_first_line() {
+        let first_line = "é".repeat(52);
+        let prompt = format!("  {first_line}\nignore this line");
+        assert_eq!(session_title_fallback(&prompt), "é".repeat(48));
     }
 
     #[test]
