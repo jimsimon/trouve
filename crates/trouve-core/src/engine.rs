@@ -25,7 +25,7 @@ use trouve_providers::{Message, Provider, ProviderEvent, ToolSpec};
 use crate::config::{Config, ProviderConfig};
 use crate::permissions::{ApprovalHub, Gate, QuestionHub, allow_key, gate};
 use crate::store::{CheckpointRow, Store};
-use crate::tools::{LocalToolExecutor, ToolCtx, ToolExecutor};
+use crate::tools::{AttachmentStage, LocalToolExecutor, ToolCtx, ToolExecutor};
 use crate::{context, git, modes, new_id};
 
 /// Safety valve: maximum provider round-trips within a single turn.
@@ -4516,6 +4516,12 @@ impl Engine {
             // filesystem work. A database error must leave the session and
             // its worktree consistently intact.
             let attachment_paths = self.store.session_attachment_paths(id)?;
+            let thread_ids: Vec<String> = self
+                .store
+                .list_threads(id)?
+                .into_iter()
+                .map(|thread| thread.id)
+                .collect();
             self.terminals.remove_session(id);
             if let Err(error) = self.store.delete_session(id) {
                 // Restore terminal access when the database transaction left
@@ -4525,6 +4531,7 @@ impl Engine {
                 }
                 return Err(error.into());
             }
+            self.evict_thread_catalogs(&thread_ids);
             self.executor
                 .evict_worktree(Path::new(&session.worktree_path))
                 .await;
@@ -5384,6 +5391,20 @@ impl Engine {
         tools_enabled: bool,
     ) -> Result<TurnAccepted, EngineError> {
         let thread = self.get_thread(thread_id)?; // 404 for unknown threads
+        self.validate_prompt_content(&thread, &content)?;
+        let attachments = self.save_attachments(thread_id, uploads)?;
+        self.store
+            .enqueue_prompt_with_tools(thread_id, &content, &attachments, tools_enabled)?;
+        self.emit_queue(thread_id)?;
+        let turn = self.dispatch_queue(thread_id)?;
+        Ok(TurnAccepted {
+            thread_id: thread_id.to_string(),
+            turn: turn.unwrap_or(0),
+            queued: turn.is_none(),
+        })
+    }
+
+    fn validate_prompt_content(&self, thread: &Thread, content: &str) -> Result<(), EngineError> {
         if let Some(after_slash) = content.trim().strip_prefix('/') {
             let name_end = after_slash
                 .find(char::is_whitespace)
@@ -5407,21 +5428,12 @@ impl Engine {
             crate::skills::expand_invocation(
                 self.config_dir.as_deref(),
                 Some(Path::new(&workspace.path)),
-                &content,
+                content,
                 self.builtin_skills_enabled(),
             )
             .map_err(|error| EngineError::BadRequest(error.to_string()))?;
         }
-        let attachments = self.save_attachments(thread_id, uploads)?;
-        self.store
-            .enqueue_prompt_with_tools(thread_id, &content, &attachments, tools_enabled)?;
-        self.emit_queue(thread_id)?;
-        let turn = self.dispatch_queue(thread_id)?;
-        Ok(TurnAccepted {
-            thread_id: thread_id.to_string(),
-            turn: turn.unwrap_or(0),
-            queued: turn.is_none(),
-        })
+        Ok(())
     }
 
     /// Decode and persist prompt uploads under `data_dir/attachments`,
@@ -5540,6 +5552,8 @@ impl Engine {
             .store
             .queued_prompt_thread(prompt_id)?
             .ok_or_else(|| EngineError::NotFound(format!("queued prompt {prompt_id}")))?;
+        let thread = self.get_thread(&thread_id)?;
+        self.validate_prompt_content(&thread, content)?;
         if !self.store.update_queued_prompt(prompt_id, content)? {
             return Err(EngineError::NotFound(format!("queued prompt {prompt_id}")));
         }
@@ -5994,6 +6008,7 @@ impl Engine {
                     thread,
                     turn,
                     &mode,
+                    &ctx,
                     &backend_id,
                     backend,
                     model_name,
@@ -6054,7 +6069,7 @@ impl Engine {
         // absolute paths (the sandbox), so a data-dir path the model can't
         // open is useless — a worktree-relative copy is reachable.
         let resolved = self.resolve_attachments(&attachments);
-        let materialized = materialize_attachments(&worktree, &resolved);
+        let materialized = materialize_attachments(self.executor.as_ref(), &ctx, &resolved).await;
         let content = annotate_attachments(model_content, &materialized);
         self.store
             .append_message(&thread.id, &serde_json::to_value(Message::User(content))?)?;
@@ -6836,6 +6851,7 @@ impl Engine {
         thread: &Thread,
         turn: u64,
         mode: &AgentMode,
+        ctx: &ToolCtx,
         backend_id: &str,
         backend: Arc<dyn AgentBackend>,
         model_name: String,
@@ -6919,7 +6935,7 @@ impl Engine {
             .partition(|(a, _)| a.mime.starts_with("image/"));
         // Stage non-image uploads inside the worktree so native CLI tools
         // never receive an unreadable data-dir path.
-        let materialized_files = materialize_attachments(Path::new(&session.worktree_path), &files);
+        let materialized_files = materialize_attachments(self.executor.as_ref(), ctx, &files).await;
         let content = annotate_attachments(content, &materialized_files);
         let turn_attachments: Vec<trouve_agents::TurnAttachment> = images
             .into_iter()
@@ -7059,8 +7075,11 @@ impl Engine {
                 BackendEvent::SessionStarted { session_id } => {
                     if tools_enabled {
                         flush_backend_event_batch(&self.store, &scope, &mut persisted).await?;
-                        self.store
-                            .set_backend_session(&thread.id, backend_id, &session_id)?;
+                        self.store.set_backend_session(
+                            &thread.id,
+                            &backend_session_key,
+                            &session_id,
+                        )?;
                     }
                 }
                 BackendEvent::TextDelta(delta) => {
@@ -7113,15 +7132,15 @@ impl Engine {
                     // Snippet edits carry no position; the worktree file is
                     // still un-edited at announcement time, so resolve line
                     // hints now for the UI's diff gutter.
-                    annotate_edit_lines(Path::new(&session.worktree_path), &mut args);
+                    annotate_edit_lines(Path::new(&session.worktree_path), &mut display_args);
                     if seen_tool_cards.insert(call_id.clone())
                         && !self.tool_card_exists(&thread.id, turn, &call_id)
                     {
                         persisted.push(Event::ToolRequested {
                             turn,
                             call_id: call_id.clone(),
-                            tool,
-                            args,
+                            tool: display_tool,
+                            args: display_args,
                             requires_approval: false,
                         });
                     }
@@ -7187,10 +7206,14 @@ impl Engine {
                     } else {
                         github_creation_output.remove(&call_id);
                     }
+                    let normalized_result = tool_calls
+                        .get(&call_id)
+                        .map(|(tool, _)| normalize_vendor_tool_result(tool, &result))
+                        .unwrap_or(result);
                     persisted.push(Event::ToolCompleted {
                         call_id,
                         status,
-                        result,
+                        result: normalized_result,
                     });
                     if let Some(todos) = todos {
                         persisted.push(Event::TodosUpdated { todos });
@@ -8374,76 +8397,58 @@ fn ceil_char_boundary(s: &str, mut at: usize) -> usize {
     at
 }
 
-/// Copy prompt attachments into the session worktree (under a gitignored
-/// `.trouve/attachments/` dir) so Trouve's file tools — which only open
-/// worktree-relative paths — can read them. Returns each attachment paired
-/// with its worktree-relative path. Failures drop that attachment with a
-/// warning rather than failing the turn.
-fn materialize_attachments(
-    worktree: &Path,
+/// Stage prompt attachments through [`ToolExecutor`] under the worktree's
+/// gitignored `.trouve/attachments/` directory. Returns each attachment
+/// paired with its worktree-relative path. Failures drop affected files with
+/// a warning rather than failing the turn.
+async fn materialize_attachments(
+    executor: &dyn ToolExecutor,
+    ctx: &ToolCtx,
     files: &[(trouve_protocol::Attachment, PathBuf)],
 ) -> Vec<(trouve_protocol::Attachment, PathBuf)> {
     if files.is_empty() {
         return Vec::new();
     }
     let rel_dir = Path::new(".trouve").join("attachments");
-    let abs_dir = worktree.join(&rel_dir);
-    if let Err(e) = std::fs::create_dir_all(&abs_dir) {
-        tracing::warn!("cannot stage attachments in {}: {e}", abs_dir.display());
-        return Vec::new();
-    }
-    let canonical_worktree = match worktree.canonicalize() {
-        Ok(path) => path,
-        Err(e) => {
-            tracing::warn!("cannot resolve worktree {}: {e}", worktree.display());
-            return Vec::new();
-        }
-    };
-    let canonical_abs_dir = match abs_dir.canonicalize() {
-        Ok(path) if path.starts_with(&canonical_worktree) => path,
-        Ok(path) => {
+    let requests: Vec<AttachmentStage> = files
+        .iter()
+        .map(|(attachment, source)| {
+            // Prefix with the id so distinct attachments with the same
+            // filename don't collide. Upload metadata is protocol input, so
+            // flatten separators/control characters rather than trusting a
+            // basename.
+            let safe_name: String = attachment
+                .name
+                .chars()
+                .take(160)
+                .map(|character| {
+                    if character.is_ascii_alphanumeric() || matches!(character, '.' | '-' | '_') {
+                        character
+                    } else {
+                        '_'
+                    }
+                })
+                .collect();
+            AttachmentStage {
+                attachment: attachment.clone(),
+                source: source.clone(),
+                relative_path: rel_dir.join(format!("{}-{safe_name}", attachment.id)),
+            }
+        })
+        .collect();
+    match executor.stage_attachments(ctx, &requests).await {
+        Ok(staged) => staged
+            .into_iter()
+            .map(|file| (file.attachment, file.relative_path))
+            .collect(),
+        Err(error) => {
             tracing::warn!(
-                "refusing attachment directory {} outside worktree {}",
-                path.display(),
-                canonical_worktree.display()
+                "cannot stage attachments in {}: {error}",
+                ctx.worktree.display()
             );
-            return Vec::new();
-        }
-        Err(e) => {
-            tracing::warn!(
-                "cannot resolve attachment directory {}: {e}",
-                abs_dir.display()
-            );
-            return Vec::new();
-        }
-    };
-    // Keep the staged files out of the user's diffs/commits.
-    let _ = std::fs::write(worktree.join(".trouve").join(".gitignore"), "*\n");
-    let mut out = Vec::new();
-    for (meta, src) in files {
-        // Prefix with the id so distinct attachments with the same filename
-        // don't collide. Upload metadata is protocol input, so flatten every
-        // path separator/control character rather than trusting a basename.
-        let safe_name: String = meta
-            .name
-            .chars()
-            .take(160)
-            .map(|c| {
-                if c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_') {
-                    c
-                } else {
-                    '_'
-                }
-            })
-            .collect();
-        let file_name = format!("{}-{}", meta.id, safe_name);
-        let rel = rel_dir.join(&file_name);
-        match std::fs::copy(src, canonical_abs_dir.join(&file_name)) {
-            Ok(_) => out.push((meta.clone(), rel)),
-            Err(e) => tracing::warn!("cannot stage attachment {}: {e}", meta.name),
+            Vec::new()
         }
     }
-    out
 }
 
 fn annotate_attachments(

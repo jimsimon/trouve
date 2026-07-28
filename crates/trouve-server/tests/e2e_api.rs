@@ -2344,7 +2344,28 @@ async fn queued_prompts_crud_and_in_order_dispatch() {
     let id_two = queue[0]["id"].as_str().unwrap().to_string();
     let id_three = queue[1]["id"].as_str().unwrap().to_string();
 
-    // Edit a queued prompt.
+    // Edits go through the same command/skill validation as initial sends;
+    // a rejected edit leaves the durable prompt untouched.
+    for content in ["/status", "/skill missing"] {
+        let resp = client
+            .patch(format!("{base}/queue/{id_two}"))
+            .json(&serde_json::json!({"content": content}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 400, "{content}");
+    }
+    let queue: Vec<serde_json::Value> = client
+        .get(format!("{base}/threads/{thread_id}/queue"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(queue[0]["content"], "two");
+
+    // A valid queued-prompt edit succeeds.
     let resp = client
         .patch(format!("{base}/queue/{id_two}"))
         .json(&serde_json::json!({"content": "two v2"}))

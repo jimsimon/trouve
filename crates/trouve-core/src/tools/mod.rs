@@ -167,6 +167,17 @@ pub trait ToolExecutor: Send + Sync {
     ) -> Result<Vec<ReviewDiffFile>, String> {
         Err("review repository diff is unavailable in this executor".into())
     }
+    /// Stage user-provided non-image attachments inside the session
+    /// worktree so provider-native file tools can read them. This controlled
+    /// filesystem mutation stays behind the same executor boundary as every
+    /// other Trouve-owned worktree write.
+    async fn stage_attachments(
+        &self,
+        _ctx: &ToolCtx,
+        _files: &[AttachmentStage],
+    ) -> Result<Vec<AttachmentStage>, String> {
+        Err("attachment staging is unavailable in this executor".into())
+    }
     /// Release any per-worktree resources (e.g. spawned MCP server
     /// processes) when a session/worktree is going away. Default no-op.
     async fn evict_worktree(&self, _worktree: &Path) {}
@@ -186,6 +197,13 @@ pub struct ReviewRepositorySync {
 pub struct ReviewRepositoryDiff {
     pub worktree: PathBuf,
     pub base_sha: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct AttachmentStage {
+    pub attachment: trouve_protocol::Attachment,
+    pub source: PathBuf,
+    pub relative_path: PathBuf,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -326,6 +344,66 @@ impl ToolExecutor for LocalToolExecutor {
             Some(tool) => tool.run(ctx, args).await,
             None => ToolResult::error(format!("unknown tool: {name}")),
         }
+    }
+
+    async fn stage_attachments(
+        &self,
+        ctx: &ToolCtx,
+        files: &[AttachmentStage],
+    ) -> Result<Vec<AttachmentStage>, String> {
+        if files.is_empty() {
+            return Ok(Vec::new());
+        }
+        let relative_dir = Path::new(".trouve").join("attachments");
+        let attachment_dir = ctx
+            .resolve(&relative_dir.to_string_lossy())
+            .map_err(|error| error.to_string())?;
+        tokio::fs::create_dir_all(&attachment_dir)
+            .await
+            .map_err(|error| {
+                format!(
+                    "cannot create attachment directory {}: {error}",
+                    attachment_dir.display()
+                )
+            })?;
+        let ignore_path = ctx
+            .resolve(".trouve/.gitignore")
+            .map_err(|error| error.to_string())?;
+        if let Err(error) = tokio::fs::write(&ignore_path, "*\n").await {
+            tracing::warn!(
+                "cannot gitignore staged attachments at {}: {error}",
+                ignore_path.display()
+            );
+        }
+
+        let mut staged = Vec::new();
+        for file in files {
+            if !file.relative_path.starts_with(&relative_dir) {
+                tracing::warn!(
+                    "refusing attachment destination outside {}: {}",
+                    relative_dir.display(),
+                    file.relative_path.display()
+                );
+                continue;
+            }
+            let destination = match ctx.resolve(&file.relative_path.to_string_lossy()) {
+                Ok(destination) => destination,
+                Err(error) => {
+                    tracing::warn!(
+                        "cannot resolve attachment destination {}: {error}",
+                        file.relative_path.display()
+                    );
+                    continue;
+                }
+            };
+            match tokio::fs::copy(&file.source, destination).await {
+                Ok(_) => staged.push(file.clone()),
+                Err(error) => {
+                    tracing::warn!("cannot stage attachment {}: {error}", file.attachment.name)
+                }
+            }
+        }
+        Ok(staged)
     }
 
     async fn sync_review_repository(

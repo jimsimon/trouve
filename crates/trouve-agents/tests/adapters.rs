@@ -81,7 +81,7 @@ EOF
         turn(
             tmp.path().to_path_buf(),
             Some("old-sess"),
-            BackendPermission::ReadOnly,
+            BackendPermission::Ask,
         )
     })
     .await;
@@ -134,20 +134,47 @@ EOF
             && usage.cost_usd.is_none()
     )));
 
-    // Flags: resume + read-only permission mapping + mode instructions.
-    // Read-only avoids `--permission-mode plan` (its interactive plan
-    // workflow prompt misfires headless); mutating built-ins are disallowed
-    // and everything else is denied through the approval gate.
+    // Flags: resume + mode instructions.
     let args = std::fs::read_to_string(format!("{stub}.args")).unwrap();
     assert!(args.contains("--resume"), "{args}");
     assert!(args.contains("old-sess"), "{args}");
     assert!(!args.contains("--permission-mode"), "{args}");
-    assert!(args.contains("--disallowedTools"), "{args}");
-    assert!(args.contains("Write,Edit,NotebookEdit"), "{args}");
     assert!(args.contains("--append-system-prompt"), "{args}");
     assert!(args.contains("--model"), "{args}");
     assert!(args.contains("--include-partial-messages"), "{args}");
     assert!(args.contains("--thinking-display"), "{args}");
+}
+
+#[tokio::test]
+async fn claude_read_only_turn_requires_the_permission_bridge() {
+    let tmp = tempfile::tempdir().unwrap();
+    let backend = ClaudeBackend::new(
+        "claude-code",
+        Some(
+            tmp.path()
+                .join("missing-claude")
+                .to_string_lossy()
+                .into_owned(),
+        ),
+    );
+
+    let result = backend
+        .run_turn(turn(
+            tmp.path().to_path_buf(),
+            None,
+            BackendPermission::ReadOnly,
+        ))
+        .await;
+    let error = match result {
+        Ok(_) => panic!("read-only turn unexpectedly started without a bridge"),
+        Err(error) => error,
+    };
+    assert!(
+        error
+            .to_string()
+            .contains("require Trouve's permission bridge"),
+        "{error}"
+    );
 }
 
 #[tokio::test]
@@ -193,7 +220,7 @@ EOF
     );
     let backend = ClaudeBackend::new("claude-code", Some(stub));
     let mut stream = start_turn(&backend, || {
-        turn(tmp.path().to_path_buf(), None, BackendPermission::ReadOnly)
+        turn(tmp.path().to_path_buf(), None, BackendPermission::Ask)
     })
     .await;
 
@@ -1249,7 +1276,7 @@ EOF
     );
     let backend = ClaudeBackend::new("claude-code", Some(stub.clone()));
     let mut stream = start_turn(&backend, || {
-        let mut t = turn(tmp.path().to_path_buf(), None, BackendPermission::Ask);
+        let mut t = turn(tmp.path().to_path_buf(), None, BackendPermission::ReadOnly);
         t.mcp_bridge = Some(trouve_agents::McpBridgeConfig {
             url: "http://127.0.0.1:1/internal/threads/th_1/mcp?approval=1".into(),
             headers: vec![("Authorization".into(), "Bearer bridge-secret".into())],
@@ -1264,7 +1291,8 @@ EOF
     let args = std::fs::read_to_string(format!("{stub}.args")).unwrap();
     assert!(args.contains("--mcp-config"), "{args}");
     assert!(args.contains("--strict-mcp-config"), "{args}");
-    assert!(!args.contains("--disallowedTools"), "{args}");
+    assert!(args.contains("--disallowedTools"), "{args}");
+    assert!(args.contains("Write,Edit,NotebookEdit"), "{args}");
     assert!(args.contains("--allowedTools"), "{args}");
     assert!(args.contains("mcp__trouve"), "{args}");
     assert!(args.contains("--setting-sources"), "{args}");

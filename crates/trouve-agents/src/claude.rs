@@ -38,7 +38,8 @@ use trouve_protocol::{ModelInfo, Usage};
 
 use crate::{
     AgentBackend, BackendError, BackendEvent, BackendEventStream, BackendLogin, BackendPermission,
-    BackendStatus, BackendTurn, async_stream, binary_on_path, format_reset, spawn_claude_login,
+    BackendStatus, BackendTurn, McpBridgeConfig, async_stream, binary_on_path, format_reset,
+    spawn_claude_login,
 };
 
 /// Most live processes kept at once; the least recently used is evicted.
@@ -244,10 +245,11 @@ impl ClaudeProc {
 }
 
 /// Spawn-time configuration that must match for a process to be reused.
-fn config_fingerprint(turn: &BackendTurn) -> String {
-    let bridge = turn.mcp_bridge.as_ref().map(|bridge| {
+fn config_fingerprint(turn: &BackendTurn) -> Result<String, BackendError> {
+    let bridge = if let Some(bridge) = &turn.mcp_bridge {
+        let headers = canonical_bridge_headers(bridge)?;
         let mut digest = sha2::Sha256::new();
-        for (name, value) in &bridge.headers {
+        for (name, value) in headers {
             digest.update((name.len() as u64).to_le_bytes());
             digest.update(name.as_bytes());
             digest.update((value.len() as u64).to_le_bytes());
@@ -261,14 +263,16 @@ fn config_fingerprint(turn: &BackendTurn) -> String {
                     write!(output, "{byte:02x}").expect("writing to String cannot fail");
                     output
                 });
-        (&bridge.url, header_fingerprint)
-    });
+        Some((&bridge.url, header_fingerprint))
+    } else {
+        None
+    };
     let servers: Vec<String> = turn
         .mcp_servers
         .iter()
         .map(|s| format!("{}|{}|{:?}|{:?}", s.name, s.command, s.args, s.env))
         .collect();
-    format!(
+    Ok(format!(
         "{:?}|{}|{:?}|{:?}|{:?}|{}|{:?}|{:?}",
         turn.worktree,
         turn.model,
@@ -278,7 +282,28 @@ fn config_fingerprint(turn: &BackendTurn) -> String {
         turn.tool_free,
         bridge,
         servers,
-    )
+    ))
+}
+
+fn canonical_bridge_headers(bridge: &McpBridgeConfig) -> Result<Vec<(&str, &str)>, BackendError> {
+    let mut headers: Vec<(&str, &str)> = bridge
+        .headers
+        .iter()
+        .map(|(name, value)| (name.as_str(), value.as_str()))
+        .collect();
+    headers.sort_unstable_by(|(left, _), (right, _)| {
+        left.to_ascii_lowercase().cmp(&right.to_ascii_lowercase())
+    });
+    if let Some((name, _)) = headers
+        .windows(2)
+        .find(|pair| pair[0].0.eq_ignore_ascii_case(pair[1].0))
+        .map(|pair| pair[1])
+    {
+        return Err(BackendError::Protocol(format!(
+            "duplicate Trouve bridge header: {name}"
+        )));
+    }
+    Ok(headers)
 }
 
 /// Apply the model's reasoning control using Claude Code's current interface.
@@ -399,6 +424,14 @@ impl AgentBackend for ClaudeBackend {
     }
 
     async fn run_turn(&self, turn: BackendTurn) -> Result<BackendEventStream, BackendError> {
+        if matches!(turn.permission, BackendPermission::ReadOnly)
+            && !turn.tool_free
+            && turn.mcp_bridge.is_none()
+        {
+            return Err(BackendError::Protocol(
+                "read-only Claude turns require Trouve's permission bridge".into(),
+            ));
+        }
         if turn.mcp_bridge.is_some() && !turn.mcp_servers.is_empty() {
             return Err(BackendError::Protocol(
                 "optimized Claude turns mount user MCP only through Trouve's capability bridge"
@@ -667,7 +700,7 @@ impl ClaudeBackend {
     /// is none, it died, or the turn's spawn-time config / session id no
     /// longer matches.
     async fn proc_for(&self, turn: &BackendTurn) -> Result<Arc<ClaudeProc>, BackendError> {
-        let fp = config_fingerprint(turn);
+        let fp = config_fingerprint(turn)?;
         let mut procs = self.pool.procs.lock().await;
         if let Some(p) = procs.get(&turn.thread_id) {
             let alive = p.child.lock().await.try_wait().ok().flatten().is_none();
@@ -746,11 +779,16 @@ impl ClaudeBackend {
                 );
             }
             if let Some(bridge) = &turn.mcp_bridge {
-                let headers: serde_json::Map<String, serde_json::Value> = bridge
-                    .headers
-                    .iter()
-                    .map(|(name, value)| (name.clone(), serde_json::Value::String(value.clone())))
-                    .collect();
+                let headers: serde_json::Map<String, serde_json::Value> =
+                    canonical_bridge_headers(bridge)?
+                        .into_iter()
+                        .map(|(name, value)| {
+                            (
+                                name.to_string(),
+                                serde_json::Value::String(value.to_string()),
+                            )
+                        })
+                        .collect();
                 mcp_servers.insert(
                     "trouve".into(),
                     serde_json::json!({
@@ -1162,12 +1200,43 @@ mod tests {
         assert!(debug.contains("<redacted>"));
         assert!(!debug.contains("bridge-secret-a"));
 
-        let first = config_fingerprint(&turn);
+        let first = config_fingerprint(&turn).unwrap();
         assert!(!first.contains("bridge-secret-a"));
         turn.mcp_bridge.as_mut().unwrap().headers[0].1 = "Bearer bridge-secret-b".into();
-        let second = config_fingerprint(&turn);
+        let second = config_fingerprint(&turn).unwrap();
         assert!(!second.contains("bridge-secret-b"));
         assert_ne!(first, second);
+    }
+
+    #[test]
+    fn equivalent_bridge_header_order_keeps_the_process_fingerprint() {
+        let mut turn = turn("claude-fable-5", "thinking_level", "high");
+        turn.mcp_bridge = Some(crate::McpBridgeConfig {
+            url: "http://127.0.0.1/internal/threads/th_1/mcp".into(),
+            headers: vec![
+                ("X-Trouve-Context".into(), "thread".into()),
+                ("Authorization".into(), "Bearer bridge-secret".into()),
+            ],
+        });
+
+        let first = config_fingerprint(&turn).unwrap();
+        turn.mcp_bridge.as_mut().unwrap().headers.reverse();
+        assert_eq!(first, config_fingerprint(&turn).unwrap());
+    }
+
+    #[test]
+    fn duplicate_bridge_header_names_are_rejected() {
+        let mut turn = turn("claude-fable-5", "thinking_level", "high");
+        turn.mcp_bridge = Some(crate::McpBridgeConfig {
+            url: "http://127.0.0.1/internal/threads/th_1/mcp".into(),
+            headers: vec![
+                ("Authorization".into(), "Bearer first".into()),
+                ("authorization".into(), "Bearer second".into()),
+            ],
+        });
+
+        let error = config_fingerprint(&turn).unwrap_err();
+        assert!(error.to_string().contains("duplicate Trouve bridge header"));
     }
 
     #[test]

@@ -276,11 +276,21 @@ impl AgentBackend for CodexBackend {
             json!({ "type": sandbox_policy_type })
         };
 
-        // Per-thread config overrides: request raw reasoning from models that
-        // expose it and mount trouve/user MCP servers. Both thread/start and
-        // thread/resume accept `config`, and resumed threads re-spawn their
-        // MCP servers from it.
-        let config_override = codex_config_override(&turn);
+        // Per-thread config overrides request raw reasoning, mount Trouve's
+        // supplemental bridge, and suppress overlapping product features
+        // advertised by this exact app-server version.
+        let supported_features = if turn.mcp_bridge.is_some() {
+            server.supported_features().await
+        } else {
+            HashSet::new()
+        };
+        let mut config_override = codex_config_override(&turn);
+        if let Some(mcp_config) = mcp_config_override(&turn, &supported_features)
+            && let (Some(config), Some(mcp)) =
+                (config_override.as_object_mut(), mcp_config.as_object())
+        {
+            config.extend(mcp.clone());
+        }
         let with_config = |mut params: Value| {
             params["config"] = config_override.clone();
             params
@@ -385,10 +395,24 @@ impl AgentBackend for CodexBackend {
     }
 }
 
-/// Codex config overrides enabling raw reasoning when available and mounting
-/// the trouve MCP bridge plus the user's configured MCP servers as per-thread
-/// MCP servers (same shape as `mcp_servers` in codex's config.toml).
+/// Codex config overrides enabling raw reasoning when available.
 fn codex_config_override(turn: &crate::BackendTurn) -> Value {
+    let mut config = json!({ "show_raw_agent_reasoning": true });
+    if let Some(mcp_config) = mcp_config_override(turn, &HashSet::new())
+        && let (Some(config), Some(mcp)) = (config.as_object_mut(), mcp_config.as_object())
+    {
+        config.extend(mcp.clone());
+    }
+    config
+}
+
+/// Per-thread MCP mounts in Codex's config.toml shape. When the Trouve bridge
+/// is present, overlapping ambient product capabilities stand down while
+/// Codex's optimized shell, patch, image, and web tools remain enabled.
+fn mcp_config_override(
+    turn: &crate::BackendTurn,
+    supported_features: &HashSet<String>,
+) -> Option<Value> {
     let env_map = |env: &[(String, String)]| -> serde_json::Map<String, Value> {
         env.iter()
             .map(|(k, v)| (k.clone(), Value::String(v.clone())))
@@ -424,11 +448,21 @@ fn codex_config_override(turn: &crate::BackendTurn) -> Value {
             }),
         );
     }
-    let mut config = json!({ "show_raw_agent_reasoning": true });
-    if !servers.is_empty() {
-        config["mcp_servers"] = Value::Object(servers);
+    if servers.is_empty() {
+        return None;
     }
-    config
+    let mut config = json!({ "mcp_servers": servers });
+    if turn.mcp_bridge.is_some() {
+        let features: serde_json::Map<String, Value> = PRODUCT_SURFACE_FEATURES
+            .iter()
+            .filter(|name| supported_features.contains(**name))
+            .map(|name| ((*name).to_string(), Value::Bool(false)))
+            .collect();
+        if !features.is_empty() {
+            config["features"] = Value::Object(features);
+        }
+    }
+    Some(config)
 }
 
 fn parse_supported_features(result: &Value) -> HashSet<String> {
@@ -825,6 +859,9 @@ fn turn_stream(
             };
             let _ = tx.send(Err(BackendError::Protocol(reason.into()))).await;
         }
+        // OAuth refreshes are rare; preserve any rotated credentials once per
+        // turn instead of reading both auth files after every JSON-RPC reply.
+        server.sync_auth().await;
         server.unsubscribe(&codex_thread_id, &route_tx).await;
     })
 }
@@ -1651,6 +1688,23 @@ async fn remove_route(
     // still the active route; stale turn cleanup must not erase events for
     // a replacement subscription.
     buffered.lock().await.remove(thread_id);
+}
+
+impl Drop for AppServer {
+    fn drop(&mut self) {
+        if let Some(auth_sync) = &self.auth_sync
+            && let Err(error) = auth_sync.sync()
+        {
+            tracing::warn!("Codex credential sync failed during shutdown: {error}");
+        }
+    }
+}
+
+fn codex_auth_path() -> Option<std::path::PathBuf> {
+    std::env::var_os("CODEX_HOME")
+        .map(std::path::PathBuf::from)
+        .or_else(|| dirs::home_dir().map(|home| home.join(".codex")))
+        .map(|home| home.join("auth.json"))
 }
 
 #[cfg(test)]
