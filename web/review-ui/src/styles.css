@@ -157,6 +157,20 @@ dd { margin: 5px 0 0; }
 .candidate-rejection p { margin: 8px 0; line-height: 1.5; }
 .candidate-rejection > div b { color: var(--text); }
 .decision-note { padding: 11px 12px; border-radius: 7px; background: var(--surface-2); color: var(--muted); font-size: 12px; }
+.routing-decisions { margin-top: 13px; border: 1px solid var(--line-soft); border-radius: 8px; background: #0e131d; }
+.routing-decisions > summary { display: flex; justify-content: space-between; gap: 12px; padding: 12px 14px; cursor: pointer; }
+.routing-decisions > summary span { color: var(--muted); font-size: 11px; font-weight: normal; }
+.routing-batches { display: grid; gap: 12px; padding: 0 10px 10px; }
+.routing-batches h3 { margin: 0 0 6px; color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: .07em; }
+.routing-batches section > div { display: grid; grid-template-columns: repeat(auto-fill, minmax(245px, 1fr)); gap: 7px; }
+.routing-decision { min-width: 0; padding: 10px; border: 1px solid var(--line-soft); border-left: 3px solid var(--line); border-radius: 7px; background: var(--surface-2); }
+.routing-decision.selected { border-left-color: var(--green); }
+.routing-decision header { display: flex; justify-content: space-between; gap: 8px; font-size: 11px; }
+.routing-decision header span { color: var(--muted); }
+.routing-decision ul, .selected-routing ul { margin: 8px 0 0; padding-left: 17px; color: var(--muted); font-size: 11px; line-height: 1.5; }
+.routing-decision p, .selected-routing p { margin: 8px 0 0; color: var(--muted); font-size: 11px; }
+.selected-routing { margin: 11px 0 0; padding: 10px 11px; border-left: 3px solid var(--line); border-radius: 7px; background: var(--surface-2); font-size: 11px; }
+.selected-routing.selected { border-left-color: var(--green); }
 
 .activity-layout { display: grid; grid-template-columns: minmax(190px, .72fr) minmax(0, 1.5fr); gap: 10px; align-items: start; }
 .activity-groups { display: flex; min-width: 0; flex-direction: column; gap: 6px; }
@@ -211,6 +225,13 @@ legend { color: var(--muted); font-size: 11px; }
 .repository-editor > summary span:first-child { display: flex; flex-direction: column; }
 .repository-editor > summary small { margin-top: 3px; color: var(--muted); }
 .repository-editor form { display: flex; flex-direction: column; gap: 13px; padding: 4px 14px 15px; }
+.semantic-routing { margin: 3px 0 12px; padding: 10px; border-radius: 7px; background: var(--surface-2); }
+.routing-personas { display: grid; grid-template-columns: repeat(auto-fill, minmax(280px, 1fr)); gap: 7px; }
+.routing-persona { display: grid; grid-template-columns: minmax(0, 1fr) 125px; gap: 10px; align-items: center; padding: 9px; border-radius: 7px; background: var(--surface-2); }
+.routing-persona > span { display: flex; min-width: 0; flex-direction: column; }
+.routing-persona strong, .routing-persona small { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.routing-persona small { margin-top: 2px; color: var(--muted); }
+.routing-persona select { padding: 7px 8px; }
 .reviewer-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(330px, 1fr)); gap: 14px; }
 .reviewer-editor { display: flex; flex-direction: column; gap: 12px; padding: 17px; }
 .reviewer-editor h2 { margin: 3px 0 0; font-size: 18px; }
@@ -302,4 +323,5 @@ th { color: var(--muted); font-size: 10px; text-transform: uppercase; letter-spa
   .activity-groups { max-height: 280px; overflow: auto; }
   .task-facts { grid-template-columns: 1fr 1fr; }
   .candidate-decisions > summary { flex-direction: column; }
+  .routing-decisions > summary { flex-direction: column; }
 }

@@ -264,6 +264,10 @@ impl IntoResponse for ApiError {
         ReviewerProfile,
         trouve_protocol::ReviewerOverride,
         trouve_protocol::ReviewerPromptMode,
+        trouve_protocol::CodeReviewRoutingMode,
+        trouve_protocol::CodeReviewRoutingSource,
+        trouve_protocol::CodeReviewRoutingReason,
+        trouve_protocol::CodeReviewRoutingDecision,
         CodeReviewRepository,
         trouve_protocol::CodeReviewJob,
         trouve_protocol::CodeReviewJobScope,
@@ -896,7 +900,7 @@ async fn update_code_review_repository(
     State(engine): State<Arc<Engine>>,
     Json(request): Json<UpdateCodeReviewRepositoryRequest>,
 ) -> Result<Json<CodeReviewRepository>, ApiError> {
-    Ok(Json(engine.update_code_review_repository(&request)?))
+    Ok(Json(engine.update_code_review_repository(&request).await?))
 }
 
 #[utoipa::path(post, path = "/v1/code-review/refresh",

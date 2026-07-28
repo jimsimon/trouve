@@ -1,7 +1,14 @@
 use trouve_protocol::ReviewerProfile;
 
-pub const DEFAULT_REVIEWER_IDS: &[&str] =
-    &["correctness", "security", "api-compatibility", "testing"];
+pub const DEFAULT_REVIEWER_IDS: &[&str] = &[
+    "correctness",
+    "security",
+    "concurrency",
+    "api-compatibility",
+    "testing",
+];
+
+pub const AUTO_BASELINE_REVIEWER_IDS: &[&str] = &["correctness", "security", "testing"];
 
 fn built_in(id: &str, name: &str, prompt: &str) -> ReviewerProfile {
     ReviewerProfile {
@@ -41,7 +48,7 @@ pub fn built_in_reviewers() -> Vec<ReviewerProfile> {
         built_in(
             "concurrency",
             "Concurrency & Async",
-            "Analyze races, deadlocks, lock ordering, cancellation races, task and process lifetime, atomicity, lost wakeups, duplicate work, and unsafe assumptions about serialization across threads, workers, or replicas.",
+            "Analyze races, deadlocks, lock ordering and scope, cancellation races, task and process lifetime, atomicity, lost wakeups, duplicate work, and unsafe assumptions about serialization across threads, workers, or replicas. Trace synchronization guards through their full lifetime, especially across awaits, I/O, durable writes, callbacks, and state publication or removal.",
         ),
         built_in(
             "api-compatibility",
@@ -104,5 +111,12 @@ mod tests {
         for default in DEFAULT_REVIEWER_IDS {
             assert!(ids.contains(default));
         }
+        for baseline in AUTO_BASELINE_REVIEWER_IDS {
+            assert!(
+                ids.contains(baseline),
+                "unknown baseline reviewer {baseline}"
+            );
+        }
+        assert!(DEFAULT_REVIEWER_IDS.contains(&"concurrency"));
     }
 }

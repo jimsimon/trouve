@@ -120,8 +120,8 @@ After creating it:
    GitHub webhook secret when webhooks are enabled.
 5. Click **Poll now**. The installed repositories will appear with review
    mode **Off**.
-6. Choose a default model, select its reviewers, and set each repository to
-   **Manual** or **Automatic**.
+6. Choose an explicit review model and persona-routing strategy, then set each
+   repository to **Manual** or **Automatic**.
 
 `Manual` runs only when the bot is selected (or re-requested) through
 GitHub's reviewer UI. `Automatic` reviews every new non-draft base/head
@@ -133,24 +133,50 @@ triggers.
 Each reviewer is one focused model pass over the pull request. trouve ships
 built-in reviewers for correctness, security, reliability, performance,
 concurrency, API compatibility, data integrity, testing, maintainability,
-dependencies, accessibility, and operations. New and existing repository
-policies start with the core correctness, security, API compatibility, and
-testing reviewers selected.
+dependencies, accessibility, and operations.
 
-Select only the reviewers relevant to a repository: each selected reviewer
-examines every diff batch, so adding reviewers increases model usage and review
-latency. Built-in reviewers use the repository's selected model (or the server
-default). Custom reviewer profiles are reusable across repositories and contain
-a name, focused prompt, and optional model override. Create and manage them in
-the dashboard's **Reviewers** section, then enable them on each repository.
+Each repository has one of three persona-routing strategies:
+
+- **Core** runs exactly the manually checked personas on every diff batch. Use
+  it when a repository needs a small, fixed reviewer set.
+- **Auto** always runs the correctness, security, and testing baseline, then
+  adds focused personas whose deterministic path/content signals match each
+  diff batch. Optional semantic triage makes one lightweight, tool-free model
+  pass per batch and may add more personas; it can never remove a baseline or
+  deterministic selection. This is the default.
+- **Thorough** runs the complete reviewer catalog on every batch. It provides
+  maximum coverage at the highest model usage and latency.
+
+Auto and Thorough support repository overrides. **Always run** forces a
+persona into every Auto batch, while **Never run** excludes it from both Auto
+and Thorough. The controls are mutually exclusive. Custom reviewer profiles are
+reusable across repositories and contain a name, focused prompt, and optional
+model override. Auto can select a custom persona through semantic triage, or it
+can be forced with **Always run**; Thorough includes it automatically.
+
+New repositories start in Auto with semantic triage enabled. During upgrade,
+a repository that still exactly matches either historical built-in default set
+is migrated to Auto once. Customized reviewer sets remain Core, and a later
+explicit switch back to Core is preserved.
+
+An enabled repository must select an explicit review model. The coordinator
+and every reviewer without a profile or repository override use that model;
+the unattended review system never falls back to trouve's built-in thread
+model because that provider/model may not be configured on the deployment.
+
+Semantic triage has separate optional **router model** and **router thinking
+level** controls. When the router model is unset it inherits the required
+repository review model. When its thinking level is unset it inherits the
+review mode's thinking default. Both values are snapshotted on the job, so a
+policy edit cannot change an in-flight router pass.
 
 Repository policies can refine each reviewer without changing its reusable
-profile. The checkbox enables or disables that reviewer for the repository. A
-model override can select a different model for that reviewer; otherwise it
-inherits the profile model, then the repository or server default. Prompt
-behavior can inherit the profile prompt, append repository-specific
-instructions to it, or replace it for that repository. Overrides remain saved
-when a reviewer is temporarily disabled.
+profile. In Core, the checkbox enables or disables that reviewer for the
+repository. A model override can select a different model for that reviewer;
+otherwise it inherits the profile model, then the required repository review
+model. Prompt behavior can inherit the profile prompt, append
+repository-specific instructions to it, or replace it for that repository.
+Overrides remain saved when a reviewer is temporarily disabled or routed out.
 
 ## Runtime behavior
 
@@ -165,10 +191,22 @@ generation.
 
 Each job fetches the exact base and head commits into a managed repository and
 creates an isolated trouve session at that head. The complete diff is enumerated
-by changed path and divided into bounded per-file batches; every selected
-reviewer receives every batch in the built-in read-only review mode, including
-files beyond the model-facing aggregate diff limit. Reviewer profiles and models
-are snapshotted with the durable job after repository overrides are applied.
+by changed path and divided into bounded per-file batches. Core and Thorough
+send every selected reviewer every batch. Auto records a decision for every
+persona/batch candidate and dispatches only the selected combinations in the
+built-in read-only review mode, including files beyond the model-facing
+aggregate diff limit. Reviewer profiles, review/router models, router thinking
+level, routing mode, include/exclude controls, and every typed routing reason
+are snapshotted durably with the job after repository overrides are applied.
+The dashboard exposes both the router task output and the complete
+selected/skipped decision matrix, which is also published on the job's
+persisted event stream.
+
+If semantic triage is disabled or its model response fails validation, Auto
+continues with its baseline and deterministic choices. Semantic output is
+restricted to the offered persona IDs, requires a concrete reason, and is
+additive only. A once-persisted routing snapshot is reused by interrupted-job
+recovery and persona retries.
 
 Candidate findings are first checked against actual commentable diff lines. A
 separate final editor pass then verifies them against the repository, removes
@@ -177,8 +215,10 @@ duplicates, corrects line metadata, and produces the published summary. The
 result is checked against diff lines again before it is sent to GitHub.
 
 When either commit or the effective review configuration changes—including
-reviewer selection, model overrides, or prompt overrides—queued reviews for the
-old revision/configuration are marked stale and an in-flight model turn is
+routing mode, semantic triage, router model/thinking, persona
+inclusion/exclusion, reviewer selection, model overrides, or prompt
+overrides—queued reviews for the old
+revision/configuration are marked stale and an in-flight model turn is
 cancelled before the replacement is queued. Before publishing, trouve reads the
 PR again and marks the job stale if either commit moved. Inline findings that
 GitHub still rejects are preserved in a summary-only fallback review.

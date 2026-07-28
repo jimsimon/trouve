@@ -3814,10 +3814,52 @@ async fn offline_filters_models_and_reports_connectivity() {
 
 #[tokio::test]
 async fn code_review_dashboard_and_repository_policy_round_trip() {
+    struct ReviewRouterProvider;
+
+    #[async_trait::async_trait]
+    impl Provider for ReviewRouterProvider {
+        fn id(&self) -> &str {
+            "anthropic"
+        }
+
+        fn models(&self) -> Vec<trouve_protocol::ModelInfo> {
+            vec![trouve_protocol::ModelInfo {
+                id: "anthropic/claude".into(),
+                display_name: "Claude".into(),
+                context_window: 100_000,
+                supports_tools: true,
+                input_price_per_mtok: None,
+                output_price_per_mtok: None,
+                options_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "reasoning_effort": {
+                            "type": "string",
+                            "enum": ["low", "high"],
+                            "default": "low"
+                        }
+                    }
+                }),
+            }]
+        }
+
+        async fn stream_chat(
+            &self,
+            _model: &str,
+            _messages: &[Message],
+            _tools: &[ToolSpec],
+            _options: &serde_json::Map<String, serde_json::Value>,
+        ) -> Result<EventStream, ProviderError> {
+            unreachable!("repository round-trip validation never starts a model turn")
+        }
+    }
+
     let tmp = tempfile::tempdir().unwrap();
     let store = Store::open(&tmp.path().join("db/trouve.db")).unwrap();
     let engine = Arc::new(
-        Engine::new(store, tmp.path().join("data"), &Config::default()).with_config_dir(None),
+        Engine::new(store, tmp.path().join("data"), &Config::default())
+            .with_config_dir(None)
+            .with_provider("anthropic", Arc::new(ReviewRouterProvider)),
     );
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -3891,8 +3933,14 @@ async fn code_review_dashboard_and_repository_policy_round_trip() {
             "repository": "acme/widgets",
             "mode": "automatic",
             "model": "openai/gpt-5",
+            "router_model": "anthropic/claude",
+            "router_thinking_level": "low",
             "prompt": "focus on concurrency",
             "reviewer_ids": ["correctness", custom_id],
+            "routing_mode": "auto",
+            "semantic_routing": true,
+            "included_reviewer_ids": [custom_id, "reliability"],
+            "excluded_reviewer_ids": ["operations"],
             "reviewer_overrides": [
                 {
                     "reviewer_id": "correctness",
@@ -3924,8 +3972,23 @@ async fn code_review_dashboard_and_repository_policy_round_trip() {
     assert_eq!(dashboard["repositories"][0]["mode"], "automatic");
     assert_eq!(dashboard["repositories"][0]["model"], "openai/gpt-5");
     assert_eq!(
+        dashboard["repositories"][0]["router_model"],
+        "anthropic/claude"
+    );
+    assert_eq!(dashboard["repositories"][0]["router_thinking_level"], "low");
+    assert_eq!(
         dashboard["repositories"][0]["reviewer_ids"],
         serde_json::json!(["correctness", custom_id])
+    );
+    assert_eq!(dashboard["repositories"][0]["routing_mode"], "auto");
+    assert_eq!(dashboard["repositories"][0]["semantic_routing"], true);
+    assert_eq!(
+        dashboard["repositories"][0]["included_reviewer_ids"],
+        serde_json::json!([custom_id, "reliability"])
+    );
+    assert_eq!(
+        dashboard["repositories"][0]["excluded_reviewer_ids"],
+        serde_json::json!(["operations"])
     );
     assert_eq!(
         dashboard["repositories"][0]["reviewer_overrides"][0]["model"],
@@ -3972,6 +4035,10 @@ async fn code_review_dashboard_and_repository_policy_round_trip() {
         serde_json::json!(["correctness"])
     );
     assert_eq!(
+        dashboard["repositories"][0]["included_reviewer_ids"],
+        serde_json::json!(["reliability"])
+    );
+    assert_eq!(
         dashboard["repositories"][0]["reviewer_overrides"]
             .as_array()
             .unwrap()
@@ -4004,13 +4071,35 @@ async fn code_review_job_overview_loads_task_content_separately() {
             trigger: "automatic".into(),
             retry_of: None,
             model: Some("provider/model".into()),
+            router_model: Some("provider/router".into()),
+            router_thinking_level: Some("low".into()),
             prompt: "Review it".into(),
             reviewers: Vec::new(),
+            routing_mode: trouve_protocol::CodeReviewRoutingMode::Core,
+            semantic_routing: false,
+            included_reviewer_ids: Vec::new(),
+            excluded_reviewer_ids: Vec::new(),
             config_hash: "config".into(),
         })
         .unwrap()
         .unwrap();
     engine.store().claim_code_review_job().unwrap().unwrap();
+    engine
+        .store()
+        .save_code_review_routing_decisions(
+            &queued.id,
+            &[trouve_protocol::CodeReviewRoutingDecision {
+                batch_index: 0,
+                reviewer_id: "correctness".into(),
+                reviewer_name: "Correctness".into(),
+                selected: true,
+                reasons: vec![trouve_protocol::CodeReviewRoutingReason {
+                    source: trouve_protocol::CodeReviewRoutingSource::Core,
+                    detail: "selected by the repository's Core reviewer set".into(),
+                }],
+            }],
+        )
+        .unwrap();
     let task = engine
         .store()
         .create_code_review_task(&NewCodeReviewTask {
@@ -4065,6 +4154,18 @@ async fn code_review_job_overview_loads_task_content_separately() {
     assert_eq!(overview["tasks"][0]["id"], task.id);
     assert_eq!(overview["tasks"][0]["status"], "running");
     assert_eq!(overview["event_cursor"], snapshot_event.cursor);
+    assert_eq!(overview["job"]["routing_mode"], "core");
+    assert_eq!(overview["job"]["model"], "provider/model");
+    assert_eq!(overview["job"]["router_model"], "provider/router");
+    assert_eq!(overview["job"]["router_thinking_level"], "low");
+    assert_eq!(
+        overview["routing_decisions"][0]["reviewer_id"],
+        "correctness"
+    );
+    assert_eq!(
+        overview["routing_decisions"][0]["reasons"][0]["source"],
+        "core"
+    );
     assert!(overview["tasks"][0]["prompt"].is_null());
     assert!(overview["tasks"][0]["output"].is_null());
 

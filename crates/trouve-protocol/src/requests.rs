@@ -796,6 +796,20 @@ pub enum ReviewerPromptMode {
     Replace,
 }
 
+/// How a repository chooses reviewer personas for each diff batch.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum CodeReviewRoutingMode {
+    /// Run exactly the repository's manually selected `reviewer_ids`.
+    Core,
+    /// Keep the baseline reviewers and add relevant personas from deterministic
+    /// and optional semantic routing.
+    #[default]
+    Auto,
+    /// Run every available persona except explicit repository exclusions.
+    Thorough,
+}
+
 /// Repository-specific changes layered over a reusable reviewer profile.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
 pub struct ReviewerOverride {
@@ -820,15 +834,39 @@ pub struct CodeReviewRepository {
     pub private: bool,
     #[serde(default)]
     pub mode: CodeReviewMode,
-    /// Provider-qualified model; absent means the review mode/global default.
+    /// Provider-qualified model used by the coordinator and inherited by
+    /// reviewers without an override. Required while reviews are enabled.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
+    /// Provider-qualified model used by semantic persona triage. Absent
+    /// inherits `model`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub router_model: Option<String>,
+    /// Preferred thinking level for semantic persona triage. Absent inherits
+    /// the review mode's thinking default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub router_thinking_level: Option<String>,
     /// Extra repository-specific review instructions.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub prompt: String,
     /// Ordered reviewer profiles run for each revision.
     #[serde(default)]
     pub reviewer_ids: Vec<String>,
+    /// Persona-routing policy. Core uses `reviewer_ids`; Auto and Thorough
+    /// consider the complete reviewer catalog plus the controls below.
+    #[serde(default)]
+    pub routing_mode: CodeReviewRoutingMode,
+    /// Whether Auto mode may run one tool-free semantic router pass per diff
+    /// batch. Semantic choices can only add personas.
+    #[serde(default)]
+    pub semantic_routing: bool,
+    /// Personas that Auto mode always runs. Custom personas can be opted into
+    /// automatic routing through this list.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub included_reviewer_ids: Vec<String>,
+    /// Personas Auto and Thorough modes never run.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub excluded_reviewer_ids: Vec<String>,
     /// Per-reviewer repository overrides. Entries may be retained while a
     /// reviewer is disabled so re-enabling it restores its configuration.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -842,11 +880,28 @@ pub struct UpdateCodeReviewRepositoryRequest {
     pub mode: CodeReviewMode,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub router_model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub router_thinking_level: Option<String>,
     #[serde(default)]
     pub prompt: String,
     /// Omitted by older clients to preserve the current/default selection.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reviewer_ids: Option<Vec<String>>,
+    /// Omitted by older clients to preserve the current/default routing mode.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub routing_mode: Option<CodeReviewRoutingMode>,
+    /// Omitted by older clients to preserve the current/default semantic
+    /// routing choice.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub semantic_routing: Option<bool>,
+    /// Omitted by older clients to preserve existing forced inclusions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub included_reviewer_ids: Option<Vec<String>>,
+    /// Omitted by older clients to preserve existing forced exclusions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub excluded_reviewer_ids: Option<Vec<String>>,
     /// Omitted by older clients to preserve existing reviewer overrides.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reviewer_overrides: Option<Vec<ReviewerOverride>>,
@@ -873,8 +928,37 @@ pub struct CodeReviewProgress {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum CodeReviewTaskRole {
+    Router,
     Reviewer,
     Coordinator,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum CodeReviewRoutingSource {
+    Core,
+    Baseline,
+    Deterministic,
+    Semantic,
+    Included,
+    Thorough,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct CodeReviewRoutingReason {
+    pub source: CodeReviewRoutingSource,
+    pub detail: String,
+}
+
+/// Durable explanation of why one reviewer did or did not run for one batch.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct CodeReviewRoutingDecision {
+    pub batch_index: u64,
+    pub reviewer_id: String,
+    pub reviewer_name: String,
+    pub selected: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub reasons: Vec<CodeReviewRoutingReason>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
@@ -885,8 +969,8 @@ pub enum CodeReviewOutputStream {
     Tool,
 }
 
-/// One durable reviewer/coordinator execution. Tasks survive cleanup of their
-/// implementation sessions and threads.
+/// One durable router, reviewer, or coordinator execution. Tasks survive
+/// cleanup of their implementation sessions and threads.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct CodeReviewTask {
     pub id: String,
@@ -1065,10 +1149,26 @@ pub struct CodeReviewJob {
     pub retried_by: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
+    /// Model snapshotted for semantic persona triage. Absent inherits
+    /// `model`; legacy jobs may omit both and are rejected before dispatch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub router_model: Option<String>,
+    /// Thinking level snapshotted for semantic persona triage.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub router_thinking_level: Option<String>,
     /// Reviewer profiles are snapshotted internally; their stable ids are
-    /// exposed here for history and diagnostics.
+    /// exposed here for history and diagnostics. Auto/Thorough jobs snapshot
+    /// the candidate catalog; routing decisions record which personas ran.
     #[serde(default)]
     pub reviewer_ids: Vec<String>,
+    #[serde(default)]
+    pub routing_mode: CodeReviewRoutingMode,
+    #[serde(default)]
+    pub semantic_routing: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub included_reviewer_ids: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub excluded_reviewer_ids: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1130,6 +1230,8 @@ pub struct CodeReviewJobDetail {
     pub findings: Vec<CodeReviewFinding>,
     #[serde(default)]
     pub candidate_rejections: Vec<CodeReviewCandidateRejection>,
+    #[serde(default)]
+    pub routing_decisions: Vec<CodeReviewRoutingDecision>,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub summary: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
