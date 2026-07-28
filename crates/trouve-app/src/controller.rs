@@ -98,12 +98,9 @@ impl ChatWindow {
             return;
         }
 
-        let covered_tail = self.end >= self.total;
-        if covered_tail {
+        if self.following_tail {
             self.end = total;
-            if self.following_tail {
-                self.start = self.end.saturating_sub(CHAT_WINDOW_ROWS);
-            }
+            self.start = self.end.saturating_sub(CHAT_WINDOW_ROWS);
         } else {
             self.end = self.end.min(total);
         }
@@ -4350,6 +4347,14 @@ impl Controller {
         {
             return;
         }
+        self.update_git_worktree_settings(cursor, settings);
+    }
+
+    fn update_git_worktree_settings(
+        &mut self,
+        cursor: u64,
+        settings: trouve_protocol::GitWorktreeSettings,
+    ) {
         ui::set_git_worktree_settings(&self.ui, settings);
         self.git_worktree_settings_cursor = Some(cursor);
     }
@@ -4365,8 +4370,7 @@ impl Controller {
         {
             return;
         }
-        ui::set_git_worktree_settings(&self.ui, settings);
-        self.git_worktree_settings_cursor = Some(cursor);
+        self.update_git_worktree_settings(cursor, settings);
     }
 
     fn handle_server_replay(&mut self, envelopes: Vec<trouve_protocol::EventEnvelope>) {
@@ -8172,7 +8176,7 @@ mod tests {
 
         window.following_tail = false;
         window.update(560, None);
-        assert_eq!(window.range(), 380..560);
+        assert_eq!(window.range(), 380..540);
     }
 
     #[test]
