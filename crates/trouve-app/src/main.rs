@@ -113,7 +113,73 @@ fn workspace_arg() -> Option<std::path::PathBuf> {
         .map(std::path::PathBuf::from)
 }
 
+/// Enable Slint 1.17's Skia dirty-region renderer before the UI platform is
+/// constructed. Without it, changing a tiny activity transform submits the
+/// entire scene again. Keep the upstream variable externally overridable for
+/// its `log`/`visualize` diagnostics, with a Trouve escape hatch for drivers
+/// that do not preserve swapchain contents correctly.
+fn enable_skia_partial_rendering() {
+    const SLINT_PARTIAL_RENDERING: &str = "SLINT_SKIA_PARTIAL_RENDERING";
+    const TROUVE_DISABLE_PARTIAL_RENDERING: &str = "TROUVE_DISABLE_SKIA_PARTIAL_RENDERING";
+
+    if std::env::var_os(SLINT_PARTIAL_RENDERING).is_none()
+        && std::env::var_os(TROUVE_DISABLE_PARTIAL_RENDERING).is_none()
+    {
+        // SAFETY: This is the first operation in `main`, before Trouve or its
+        // dependencies create any threads that could concurrently access the
+        // process environment.
+        unsafe {
+            std::env::set_var(SLINT_PARTIAL_RENDERING, "1");
+        }
+    }
+}
+
+/// Track focus for notifications and occlusion for animation scheduling.
+/// Visible windows stay display-paced even without keyboard focus; an
+/// occluded/minimized window should not wake the renderer at all.
+fn install_window_activity_tracking(
+    window: &AppWindow,
+    focused: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    tx: tokio::sync::mpsc::UnboundedSender<UiCommand>,
+) {
+    use slint::winit_030::{EventResult, WinitWindowAccessor, winit};
+
+    let weak = window.as_weak();
+    let mut has_focus = false;
+    let mut occluded = false;
+    let mut reported_focus = false;
+    window.window().on_winit_window_event(move |_, event| {
+        let state_changed = match event {
+            winit::event::WindowEvent::Focused(next) => {
+                has_focus = *next;
+                true
+            }
+            winit::event::WindowEvent::Occluded(next) => {
+                occluded = *next;
+                true
+            }
+            _ => false,
+        };
+
+        if state_changed {
+            let focused_and_visible = has_focus && !occluded;
+            focused.store(focused_and_visible, std::sync::atomic::Ordering::Relaxed);
+            if let Some(window) = weak.upgrade() {
+                window.set_window_occluded(occluded);
+            }
+            if reported_focus != focused_and_visible {
+                reported_focus = focused_and_visible;
+                let _ = tx.send(UiCommand::WindowFocusChanged(focused_and_visible));
+            }
+        }
+
+        EventResult::Propagate
+    });
+}
+
 fn main() -> anyhow::Result<()> {
+    enable_skia_partial_rendering();
+
     // Must precede both the external-server client path and the embedded
     // server: the final desktop binary links two Rustls provider features,
     // so automatic provider selection would panic on the first HTTPS call.
@@ -155,11 +221,11 @@ fn main() -> anyhow::Result<()> {
     let quit_when_idle = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
 
     // Window focus for the controller's notification gate (events on the
-    // focused, on-screen thread never pop a desktop notification). Sampled
-    // off winit by the 1s geometry poll below; starts false so a launch
-    // that never gains focus (or a locked screen) doesn't suppress
-    // notifications.
+    // focused, on-screen thread never pop a desktop notification). Starts
+    // false so a launch that never gains focus (or a locked screen) doesn't
+    // suppress notifications.
     let window_focused = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    install_window_activity_tracking(&window, window_focused.clone(), tx.clone());
 
     // --- appearance: restore, populate the pickers, wire the callbacks ------
     // All handled here on the UI thread (palette swaps are direct property
@@ -1368,7 +1434,6 @@ fn main() -> anyhow::Result<()> {
     }
 
     // Controller (and spawned server) live on a background tokio runtime.
-    let geometry_tx = tx.clone();
     let weak = window.as_weak();
     let focused = window_focused.clone();
     let deferred_quit = quit_when_idle.clone();
@@ -1414,23 +1479,12 @@ fn main() -> anyhow::Result<()> {
     {
         let weak = window.as_weak();
         let last = std::cell::RefCell::new(restored);
-        let last_focus = std::cell::Cell::new(false);
-        let focused = window_focused.clone();
         geometry_timer.start(
             slint::TimerMode::Repeated,
             std::time::Duration::from_secs(1),
             move || {
                 let Some(window) = weak.upgrade() else { return };
                 let w = window.window();
-                {
-                    use slint::winit_030::WinitWindowAccessor;
-                    if let Some(f) = w.with_winit_window(|w| w.has_focus()) {
-                        focused.store(f, std::sync::atomic::Ordering::Relaxed);
-                        if last_focus.replace(f) != f {
-                            let _ = geometry_tx.send(UiCommand::WindowFocusChanged(f));
-                        }
-                    }
-                }
                 let mut next = last.borrow().unwrap_or_default();
                 next.maximized = w.is_maximized();
                 if !next.maximized {

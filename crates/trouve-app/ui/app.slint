@@ -1303,37 +1303,80 @@ component NewChatForm inherits VerticalLayout {
     }
 }
 
+// A fixed, shared image mask makes rotation cheap: the renderer can retain
+// the spinner pixels and update only this component's transform each frame,
+// instead of rebuilding the std-widget Spinner's arc geometry.
+component ActivitySpinner inherits Rectangle {
+    in property <duration> animation-time: 0ms;
+    in property <bool> animate: true;
+    in property <brush> spinner-color: Theme.c.accent;
+    background: transparent;
+    accessible-role: progress-indicator;
+    property <angle> rotation: root.animate
+        ? 360deg * (mod(root.animation-time, 900ms) / 900ms)
+        : 0deg;
+
+    rotor := Rectangle {
+        width: parent.width;
+        height: parent.height;
+        background: transparent;
+        transform-rotation: root.rotation;
+
+        Image {
+            width: parent.width;
+            height: parent.height;
+            source: @image-url("assets/activity-spinner.svg");
+            colorize: root.spinner-color;
+            image-fit: contain;
+            cache-rendering-hint: true;
+            accessible-role: none;
+        }
+    }
+}
+
 // Activity indicator: three accent dots doing a soft sine wave — each one
 // rises and brightens in sequence, with a faint halo behind the crest.
-// Quieter than a spinner ring but visibly "alive"; with animate off
-// (reduce motion) the dots rest as static faint marks.
+// Geometry stays fixed so each frame changes only translation, scale, and
+// opacity. With animate off (reduce motion), the dots rest as static marks.
 component PulseDots inherits Rectangle {
     in property <bool> animate: true;
-    in property <int> phase: 0;
+    in property <duration> animation-time: 0ms;
     width: 38px;
     height: 16px;
-    property <float> t: root.animate ? root.phase / 12.0 : 0.0;
+    background: transparent;
+    property <float> t: root.animate
+        ? mod(root.animation-time, 1.4s) / 1.4s
+        : 0.0;
     for i in [0, 1, 2]: Rectangle {
         // Half-wave per dot, staggered: sin clipped at 0 so each dot rests
         // between pulses instead of dipping below the baseline.
         property <float> wave: Math.max(0.0, Math.sin(360deg * (t - i * 0.15)));
-        property <length> size: 6px + 2px * wave;
-        width: self.size;
-        height: self.size;
-        border-radius: self.size / 2;
-        x: 3px + i * 12px + (6px - self.size) / 2;
-        y: parent.height - self.size - wave * 6px;
-        background: Theme.c.accent;
+        width: 12px;
+        height: 12px;
+        x: 1px + i * 12px;
+        y: 4px - wave * 5px;
+        background: transparent;
+        transform-origin: { x: self.width / 2, y: self.height };
+        transform-scale: root.animate ? 0.75 + 0.25 * wave : 0.75;
         opacity: root.animate ? 0.25 + 0.75 * wave : 0.4;
-        // Halo: a soft ring that swells with the dot's crest.
+
+        // Fixed halo and dot geometry move and scale with the wrapper.
         Rectangle {
-            x: (parent.width - self.width) / 2;
-            y: (parent.height - self.height) / 2;
-            width: parent.width + 8px * wave;
-            height: self.width;
-            border-radius: self.width / 2;
+            x: -1px;
+            y: 1px;
+            width: 14px;
+            height: 14px;
+            border-radius: 7px;
             background: Theme.c.accent;
             opacity: 0.18 * wave;
+        }
+        Rectangle {
+            x: 2px;
+            y: 4px;
+            width: 8px;
+            height: 8px;
+            border-radius: 4px;
+            background: Theme.c.accent;
         }
     }
 }
@@ -2106,19 +2149,36 @@ export component AppWindow inherits Window {
     // Quit confirmation while agents run: closing the window with active
     // turns opens the modal instead of quitting.
     in property <int> agents-running: 0;
-    // One low-frequency clock drives every busy affordance. Slint's
-    // animation-tick() repaints the whole scene at display rate even though
-    // these tiny indicators need only a handful of visual steps per second.
-    property <int> activity-phase: 0;
+    // Set directly from winit occlusion events. Visible foreground activity
+    // follows Slint's presentation-driven clock even on a second monitor;
+    // an occluded/minimized window stops its clock entirely, like a browser
+    // background tab. Background-only sidebar activity remains at 10 fps.
+    in property <bool> window-occluded: false;
+    property <bool> activity-surface-visible: !root.minimized
+        && !root.window-occluded
+        && root.center-screen < 3;
+    property <bool> foreground-activity: root.center-screen == 0
+        && (root.composer-turn-running || root.context-compacting);
+    property <bool> activity-present: root.agents-running > 0
+        || root.composer-turn-running
+        || root.context-compacting;
+    property <bool> native-rate-activity: root.activity-surface-visible
+        && root.foreground-activity;
+    property <duration> background-animation-time: 0ms;
+    property <duration> activity-animation-time:
+        !Theme.reduce-motion && root.native-rate-activity
+            ? animation-tick()
+            : root.background-animation-time;
+    property <float> sidebar-activity-phase:
+        mod(root.activity-animation-time, 1.6s) / 1.6s;
     Timer {
-        interval: 125ms;
+        interval: 100ms;
         running: !Theme.reduce-motion
-            && (root.agents-running > 0
-                || root.composer-turn-running
-                || root.context-compacting);
+            && root.activity-surface-visible
+            && root.activity-present
+            && !root.native-rate-activity;
         triggered => {
-            root.activity-phase = root.activity-phase >= 11
-                ? 0 : root.activity-phase + 1;
+            root.background-animation-time += 100ms;
         }
     }
     in-out property <bool> quit-dialog: false;
@@ -2643,7 +2703,7 @@ export component AppWindow inherits Window {
                                     opacity: Theme.reduce-motion
                                         ? 1.0
                                         : 0.55 + 0.45 * Math.sin(
-                                            360deg * (root.activity-phase / 12.0));
+                                            360deg * root.sidebar-activity-phase);
                                 }
                                 if row.attention-kind == 0 && !row.error && !row.unread && !row.busy && row.pr-kind != 0: IconButton {
                                     width: 26px;
@@ -3242,17 +3302,15 @@ export component AppWindow inherits Window {
                                         font-size: Theme.fs(10px);
                                         vertical-alignment: center;
                                     }
-                                    // Running tools show a determinate spinner
-                                    // stepped by the shared activity phase;
-                                    // settled ones use a status glyph. Reduce
-                                    // motion uses a static glyph instead.
+                                    // Running tools rotate one cached image
+                                    // layer; settled ones use a status glyph.
+                                    // Reduce motion uses a static glyph.
                                     if row.tool-status == 1 && !Theme.reduce-motion: VerticalLayout {
                                         alignment: center;
-                                        Spinner {
+                                        ActivitySpinner {
                                             width: 12px;
                                             height: 12px;
-                                            progress: (root.activity-phase + 1) / 12.0;
-                                            indeterminate: false;
+                                            animation-time: root.activity-animation-time;
                                         }
                                     }
                                     if row.tool-status == 1 && Theme.reduce-motion: Text {
@@ -3511,7 +3569,7 @@ export component AppWindow inherits Window {
                                 PulseDots {
                                     // Reduce motion: dots rest as static marks.
                                     animate: !Theme.reduce-motion;
-                                    phase: root.activity-phase;
+                                    animation-time: root.activity-animation-time;
                                 }
                                 Text {
                                     text: row.text;
@@ -4410,28 +4468,38 @@ export component AppWindow inherits Window {
                             clicked => { root.attach-file(); }
                         }
                     }
-                    // Context usage dial; compacting uses determinate,
-                    // phase-driven progress. A red exclamation replaces it
-                    // when the provider did not report a window and automatic
-                    // compaction is disabled.
+                    // Context usage dial; compacting rotates the same cached
+                    // image layer used by tool activity. A red exclamation
+                    // replaces it when the provider did not report a window
+                    // and automatic compaction is disabled.
                     VerticalLayout {
                         spacing: 2px;
                         Text { text: " "; font-size: Theme.fs(10px); }
                     dial := Rectangle {
                         width: 30px;
                         height: 30px;
-                        // Reduce motion: freeze the compacting animation at a
-                        // full ring (the tooltip still says "compacting…").
-                        if !root.context-unavailable: Spinner {
+                        if !root.context-unavailable && root.context-compacting && !Theme.reduce-motion: ActivitySpinner {
                             width: 26px;
                             height: 26px;
                             x: 2px;
                             y: 2px;
-                            progress: root.context-compacting && Theme.reduce-motion
-                                ? 1.0
-                                : root.context-compacting
-                                    ? (root.activity-phase + 1) / 12.0
-                                    : root.context-fill;
+                            animation-time: root.activity-animation-time;
+                        }
+                        // Reduce motion freezes compacting at a full ring.
+                        if !root.context-unavailable && root.context-compacting && Theme.reduce-motion: Spinner {
+                            width: 26px;
+                            height: 26px;
+                            x: 2px;
+                            y: 2px;
+                            progress: 1.0;
+                            indeterminate: false;
+                        }
+                        if !root.context-unavailable && !root.context-compacting: Spinner {
+                            width: 26px;
+                            height: 26px;
+                            x: 2px;
+                            y: 2px;
+                            progress: root.context-fill;
                             indeterminate: false;
                         }
                         if root.context-unavailable: Rectangle {

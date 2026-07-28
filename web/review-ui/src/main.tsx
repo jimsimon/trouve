@@ -156,12 +156,25 @@ function taskAttemptLabel(tasks: ReviewTask[], task: ReviewTask): string {
   return `${base} · attempt ${attempts.indexOf(task) + 1}`;
 }
 
-function useClock(active = true): number {
+function useClock(active: boolean): number {
   const [now, setNow] = useState(Date.now());
   useEffect(() => {
     if (!active) return;
-    const timer = window.setInterval(() => setNow(Date.now()), 1_000);
-    return () => window.clearInterval(timer);
+    let timer: number | undefined;
+    const syncVisibility = (): void => {
+      if (timer !== undefined) window.clearInterval(timer);
+      timer = undefined;
+      if (document.visibilityState === "visible") {
+        setNow(Date.now());
+        timer = window.setInterval(() => setNow(Date.now()), 1_000);
+      }
+    };
+    document.addEventListener("visibilitychange", syncVisibility);
+    syncVisibility();
+    return () => {
+      document.removeEventListener("visibilitychange", syncVisibility);
+      if (timer !== undefined) window.clearInterval(timer);
+    };
   }, [active]);
   return now;
 }
@@ -189,7 +202,11 @@ function ProgressBar({ job }: { job: ReviewJob }) {
       aria-valuenow={job.progress.percent}
       aria-label={`${job.progress.completed_reviewers} of ${job.progress.total_reviewers} reviewers complete`}
     >
-      <span style={{ width: `${job.progress.percent}%` }} />
+      <span
+        style={{
+          transform: `scaleX(${Math.max(0, Math.min(100, job.progress.percent)) / 100})`,
+        }}
+      />
       <small>
         {job.progress.completed_reviewers}/{job.progress.total_reviewers} reviewers ·{" "}
         {job.progress.percent}%
@@ -389,7 +406,6 @@ function Overview({
   dashboard: Dashboard;
   onRefresh: () => void;
 }) {
-  const now = useClock();
   const counts = dashboard.jobs.reduce<Record<string, number>>((result, job) => {
     result[job.status] = (result[job.status] ?? 0) + 1;
     return result;
@@ -397,6 +413,7 @@ function Overview({
   const active = dashboard.jobs.filter(
     (job) => job.status === "running" || job.status === "queued",
   );
+  const now = useClock(active.some((job) => job.status === "running"));
   const recent = dashboard.jobs.filter((job) => !active.includes(job)).slice(0, 8);
   return (
     <section>
@@ -538,7 +555,7 @@ function JobsPage({
   const [repository, setRepository] = useState("");
   const [jobs, setJobs] = useState(dashboard.jobs);
   const [error, setError] = useState("");
-  const now = useClock();
+  const now = useClock(jobs.some((job) => job.status === "running"));
 
   const load = async (): Promise<void> => {
     try {
@@ -1851,6 +1868,9 @@ function StatsChart({
         })),
       },
       options: {
+        // Stats refresh by replacing the chart. Chart.js's default entrance
+        // animation repaints the entire canvas for decorative motion only.
+        animation: false,
         responsive: true,
         maintainAspectRatio: false,
         interaction: { mode: "index", intersect: false },
