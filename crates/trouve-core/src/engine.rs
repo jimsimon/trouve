@@ -4715,19 +4715,30 @@ impl Engine {
                 std::panic::AssertUnwindSafe(engine.drain_queue(thread, turn, prompt, cancel))
                     .catch_unwind()
                     .await;
-            if drained.is_err() {
-                tracing::error!("turn dispatcher for {thread_id} panicked");
-                let _ = engine.store.release_queued_prompt(&prompt_id);
-                let _ = engine.emit_queue(&thread_id);
-                let _ = engine.store.append_event(
-                    Scope::Thread(thread_id.clone()),
-                    Event::TurnFailed {
-                        turn,
-                        error: "internal error".into(),
-                    },
-                );
-                engine.clear_cancel(&thread_id);
-                engine.release_thread(&thread_id);
+            match drained {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => {
+                    // A terminal event failed to persist. Keep the active
+                    // claim and cancellation state intact so no later turn
+                    // can overtake an unrecorded terminal state.
+                    tracing::error!(
+                        "turn dispatcher for {thread_id} retained its claim: {error:#}"
+                    );
+                }
+                Err(_) => {
+                    tracing::error!("turn dispatcher for {thread_id} panicked");
+                    let _ = engine.store.release_queued_prompt(&prompt_id);
+                    let _ = engine.emit_queue(&thread_id);
+                    let _ = engine.store.append_event(
+                        Scope::Thread(thread_id.clone()),
+                        Event::TurnFailed {
+                            turn,
+                            error: "internal error".into(),
+                        },
+                    );
+                    engine.clear_cancel(&thread_id);
+                    engine.release_thread(&thread_id);
+                }
             }
         });
         Ok(Some(turn))
@@ -4742,7 +4753,7 @@ impl Engine {
         turn: u64,
         prompt: trouve_protocol::QueuedPrompt,
         first_cancel: tokio_util::sync::CancellationToken,
-    ) {
+    ) -> Result<()> {
         let mut thread = thread;
         let mut turn = turn;
         let mut prompt = prompt;
@@ -4769,7 +4780,7 @@ impl Engine {
                     },
                 );
                 self.release_thread(&thread.id);
-                return;
+                return Ok(());
             }
             if cancelled {
                 // A user-cancelled turn normally pauses the queue (like a
@@ -4777,35 +4788,36 @@ impl Engine {
                 // cancel request is itself an explicit resume, though.
                 // Publish the terminal event before making that decision so
                 // a subsequent turn cannot overtake it in the event log.
-                let _ = self.store.append_event(
-                    Scope::Thread(thread.id.clone()),
-                    Event::TurnCancelled { turn },
-                );
+                self.store
+                    .append_event(
+                        Scope::Thread(thread.id.clone()),
+                        Event::TurnCancelled { turn },
+                    )
+                    .with_context(|| {
+                        format!("persisting cancellation for turn {turn} of {}", thread.id)
+                    })?;
                 // Decide atomically with releasing the active claim so a
                 // racing send cannot be stranded between the two.
                 let resume = self.finish_cancelled_turn(&thread.id);
                 if !resume {
-                    return;
+                    return Ok(());
                 }
             } else {
                 self.clear_cancel(&thread.id);
             }
             // Pop the next prompt; releasing the claim and inspecting the
             // queue must be atomic against concurrent send_message calls.
-            let (next, session_idle) = {
+            let next = {
                 let mut active = self.active_threads.lock().unwrap();
                 match self.store.claim_queued_prompt(&thread.id) {
-                    Ok(Some(p)) => (Some(p), false),
+                    Ok(Some(p)) => Some(p),
                     _ => {
-                        active.remove(&thread.id);
-                        (None, !active.values().any(|s| *s == thread.session_id))
+                        self.release_thread_claim(&mut active, &thread.id);
+                        None
                     }
                 }
             };
-            if session_idle {
-                self.emit_session_activity(&thread.session_id, false);
-            }
-            let Some(next) = next else { return };
+            let Some(next) = next else { return Ok(()) };
             let _ = self.emit_queue(&thread.id);
             // Thread settings may have changed between turns.
             if let Ok(t) = self.get_thread(&thread.id) {
@@ -4818,7 +4830,7 @@ impl Engine {
                     let _ = self.store.release_queued_prompt(&next.id);
                     let _ = self.emit_queue(&thread.id);
                     self.release_thread(&thread.id);
-                    return;
+                    return Ok(());
                 }
             };
             prompt = next;
@@ -4828,15 +4840,26 @@ impl Engine {
     /// Drop a thread's dispatcher claim; when it was the session's last
     /// active thread, announce the session going idle.
     fn release_thread(&self, thread_id: &str) {
-        let idle_session = {
-            let mut active = self.active_threads.lock().unwrap();
-            active
-                .remove(thread_id)
-                .filter(|session| !active.values().any(|s| s == session))
-        };
-        if let Some(session_id) = idle_session {
-            self.emit_session_activity(&session_id, false);
+        let mut active = self.active_threads.lock().unwrap();
+        self.release_thread_claim(&mut active, thread_id);
+    }
+
+    /// Publish the idle transition before removing the claim. Callers hold
+    /// `active_threads`, so a new dispatcher cannot publish the matching
+    /// active transition first.
+    fn release_thread_claim(
+        &self,
+        active: &mut std::collections::HashMap<String, String>,
+        thread_id: &str,
+    ) {
+        if let Some(session_id) = active.get(thread_id)
+            && !active
+                .iter()
+                .any(|(id, candidate)| id != thread_id && candidate == session_id)
+        {
+            self.emit_session_activity(session_id, false);
         }
+        active.remove(thread_id);
     }
 
     /// Register a fresh cancellation token for a turn about to run.
@@ -4858,23 +4881,13 @@ impl Engine {
     /// waiting on the same active-thread claim. Returns true when one of
     /// those sends requested that the queue continue draining.
     fn finish_cancelled_turn(&self, thread_id: &str) -> bool {
-        let (resume, idle_session) = {
-            // Lock ordering matches `dispatch_queue`: active thread, cancel
-            // token, then resume marker.
-            let mut active = self.active_threads.lock().unwrap();
-            self.turn_cancels.lock().unwrap().remove(thread_id);
-            let resume = self.resume_after_cancel.lock().unwrap().remove(thread_id);
-            let idle_session = if resume {
-                None
-            } else {
-                active
-                    .remove(thread_id)
-                    .filter(|session| !active.values().any(|s| s == session))
-            };
-            (resume, idle_session)
-        };
-        if let Some(session_id) = idle_session {
-            self.emit_session_activity(&session_id, false);
+        // Lock ordering matches `dispatch_queue`: active thread, cancel
+        // token, then resume marker.
+        let mut active = self.active_threads.lock().unwrap();
+        self.turn_cancels.lock().unwrap().remove(thread_id);
+        let resume = self.resume_after_cancel.lock().unwrap().remove(thread_id);
+        if !resume {
+            self.release_thread_claim(&mut active, thread_id);
         }
         resume
     }
