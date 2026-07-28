@@ -519,12 +519,11 @@ async fn enforce_security(
     }
     let internal = request.uri().path().starts_with("/internal/");
     if internal && let Some(expected) = security.internal_token.as_deref() {
-        let provided = request.uri().query().and_then(|query| {
-            query
-                .split('&')
-                .filter_map(|part| part.split_once('='))
-                .find_map(|(key, value)| (key == "bridge_token").then_some(value))
-        });
+        let provided = request
+            .headers()
+            .get(axum::http::header::AUTHORIZATION)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.strip_prefix("Bearer "));
         if !provided.is_some_and(|token| token_matches(expected, token)) {
             return (StatusCode::UNAUTHORIZED, "missing or invalid bridge token").into_response();
         }

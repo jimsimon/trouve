@@ -30,7 +30,7 @@ pub use search::{
 use std::collections::HashMap;
 use std::path::{Component, Path, PathBuf};
 use std::process::Stdio;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
@@ -4063,6 +4063,17 @@ mod tests {
         };
         let res = exec.execute(&ctx, "nope", &serde_json::json!({})).await;
         assert_eq!(res.status, ToolStatus::Error);
+    }
+
+    #[test]
+    fn review_repository_locks_are_shared_only_within_one_repository() {
+        let executor = LocalToolExecutor::default();
+        let first = executor.review_repository_lock(Path::new("/reviews/owner/one"));
+        let same = executor.review_repository_lock(Path::new("/reviews/owner/one"));
+        let other = executor.review_repository_lock(Path::new("/reviews/owner/two"));
+
+        assert!(Arc::ptr_eq(&first, &same));
+        assert!(!Arc::ptr_eq(&first, &other));
     }
 
     #[tokio::test]

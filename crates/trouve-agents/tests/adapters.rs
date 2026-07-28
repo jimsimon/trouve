@@ -2173,6 +2173,7 @@ EOF
         let mut t = turn(tmp.path().to_path_buf(), None, BackendPermission::Ask);
         t.mcp_bridge = Some(trouve_agents::McpBridgeConfig {
             url: "http://127.0.0.1:1/internal/threads/th_1/mcp?approval=1".into(),
+            headers: vec![("Authorization".into(), "Bearer bridge-secret".into())],
         });
         t
     })
@@ -2215,6 +2216,10 @@ EOF
         config["mcpServers"]["trouve"]["url"],
         "http://127.0.0.1:1/internal/threads/th_1/mcp?approval=1"
     );
+    assert_eq!(
+        config["mcpServers"]["trouve"]["headers"]["Authorization"],
+        "Bearer bridge-secret"
+    );
     assert!(config["mcpServers"]["trouve"]["command"].is_null());
     assert_eq!(
         config["mcpServers"].as_object().unwrap().len(),
@@ -2256,6 +2261,7 @@ exit 1
     let mut t = turn(tmp.path().to_path_buf(), None, BackendPermission::Ask);
     t.mcp_bridge = Some(trouve_agents::McpBridgeConfig {
         url: "http://127.0.0.1:1/internal/threads/th_1/mcp?approval=1".into(),
+        headers: Vec::new(),
     });
     match backend.run_turn(t).await {
         Err(trouve_agents::BackendError::Protocol(message)) => {
@@ -2287,6 +2293,7 @@ EOF
         t.thread_id = "th_2".into();
         t.mcp_bridge = Some(trouve_agents::McpBridgeConfig {
             url: "http://127.0.0.1:1/internal/threads/th_2/mcp?approval=1".into(),
+            headers: Vec::new(),
         });
         t
     })

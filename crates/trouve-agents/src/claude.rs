@@ -327,7 +327,7 @@ impl ClaudeProc {
 
 /// Spawn-time configuration that must match for a process to be reused.
 fn config_fingerprint(turn: &BackendTurn) -> String {
-    let bridge = turn.mcp_bridge.as_ref().map(|b| b.url.clone());
+    let bridge = turn.mcp_bridge.as_ref().map(|b| (&b.url, &b.headers));
     let servers: Vec<String> = turn
         .mcp_servers
         .iter()
@@ -942,11 +942,17 @@ impl ClaudeBackend {
                 );
             }
             if let Some(bridge) = &turn.mcp_bridge {
+                let headers: serde_json::Map<String, serde_json::Value> = bridge
+                    .headers
+                    .iter()
+                    .map(|(name, value)| (name.clone(), serde_json::Value::String(value.clone())))
+                    .collect();
                 mcp_servers.insert(
                     "trouve".into(),
                     serde_json::json!({
                         "type": "http",
                         "url": bridge.url,
+                        "headers": headers,
                     }),
                 );
             }

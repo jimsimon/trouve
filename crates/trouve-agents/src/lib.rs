@@ -139,8 +139,8 @@ pub struct McpServerLaunch {
 /// mutation-capable tool so the engine can enforce worktree serialization.
 #[derive(Debug, Clone)]
 pub struct McpBridgeConfig {
-    /// Full endpoint URL, thread-scoped, with the approval surface selected
-    /// via query parameters.
+    /// Thread-scoped endpoint URL, with non-secret capability selectors in
+    /// its query parameters.
     pub url: String,
     /// When true the bridge serves trouve's ToolExecutor tools and vendor
     /// mutations are disabled or sandbox-confined; when false it only serves

@@ -2008,6 +2008,25 @@ struct GlobalDefaults {
     permission_mode: trouve_protocol::PermissionMode,
 }
 
+fn fenced_block(language: &str, body: &str) -> String {
+    // CommonMark closes a fenced block with a run at least as long as the
+    // opening fence. Repository content is arbitrary, so keep ours longer
+    // than every backtick run it encloses.
+    let longest = body
+        .split(|character| character != '`')
+        .map(str::len)
+        .max()
+        .unwrap_or(0);
+    let fence = "`".repeat(longest.max(3) + 1);
+    format!("{fence}{language}\n{body}\n{fence}")
+}
+
+#[derive(Clone)]
+struct BridgedToolCatalog {
+    revision: u64,
+    specs: Vec<ToolSpec>,
+}
+
 pub struct Engine {
     pub(crate) store: Store,
     pub(crate) data_dir: PathBuf,
@@ -2031,6 +2050,13 @@ pub struct Engine {
     questions: Arc<QuestionHub>,
     bridge_echoes: BridgeEchoTracker,
     turn_scheduler: TurnScheduler,
+    /// Last command catalog emitted per thread. Catalogs are recomputed
+    /// before turns so edited skills converge, but identical durable events
+    /// are suppressed for the lifetime of this engine.
+    command_catalogs: Mutex<HashMap<String, Vec<CommandInfo>>>,
+    /// Catalog prepared while constructing a vendor bridge URL. The matching
+    /// tools/list request reuses it instead of repeating MCP discovery.
+    bridged_tool_catalogs: Mutex<HashMap<String, BridgedToolCatalog>>,
     /// Per-session worktree access. Read-only turns share a read guard;
     /// mutating turns and checkpoint restoration take the
     /// write guard. This lets review/plan work fan out without weakening the
@@ -2139,7 +2165,7 @@ pub struct Engine {
     /// This server's reachable base URL (e.g. "http://127.0.0.1:7433"), set
     /// once the listener binds; the MCP tool bridge dials back through it.
     base_url: RwLock<Option<String>>,
-    /// Ephemeral credential appended only to internal MCP bridge URLs.
+    /// Ephemeral credential sent only in internal MCP bridge headers.
     bridge_token: RwLock<Option<String>>,
     /// Per-thread capabilities layered over the process-wide bridge
     /// credential. Query flags and URL paths are never authorities by
@@ -2495,6 +2521,8 @@ impl Engine {
             questions: Arc::new(QuestionHub::default()),
             bridge_echoes: BridgeEchoTracker::default(),
             turn_scheduler: TurnScheduler::new(),
+            command_catalogs: Mutex::new(HashMap::new()),
+            bridged_tool_catalogs: Mutex::new(HashMap::new()),
             session_locks: Mutex::new(HashMap::new()),
             session_create_locks: Mutex::new(HashMap::new()),
             tool_execution_locks: Mutex::new(HashMap::new()),
@@ -2833,9 +2861,9 @@ impl Engine {
         *self.base_url.write().unwrap() = Some(url.trim_end_matches('/').to_string());
     }
 
-    /// Set the server-generated credential vendor children must present to
-    /// the internal MCP bridge. `None` keeps in-process open test routers
-    /// backwards-compatible.
+    /// Set the server-generated bearer credential vendor children must
+    /// present to the internal MCP bridge. `None` keeps in-process open test
+    /// routers backwards-compatible.
     pub fn set_bridge_token(&self, token: Option<String>) {
         *self.bridge_token.write().unwrap() = token;
     }
@@ -8360,12 +8388,18 @@ impl Engine {
     }
 
     fn emit_command_catalog(&self, thread_id: &str, workspace_root: &Path) -> Result<()> {
+        let commands = self.command_catalog(workspace_root);
+        let mut emitted = self.command_catalogs.lock().unwrap();
+        if emitted.get(thread_id) == Some(&commands) {
+            return Ok(());
+        }
         self.store.append_event(
             Scope::Thread(thread_id.to_string()),
             Event::CommandCatalogUpdated {
-                commands: self.command_catalog(workspace_root),
+                commands: commands.clone(),
             },
         )?;
+        emitted.insert(thread_id.to_string(), commands);
         Ok(())
     }
 
@@ -8717,7 +8751,10 @@ impl Engine {
                 let output = if diff.trim().is_empty() {
                     "No changes against the session base revision.".into()
                 } else {
-                    format!("## Session diff\n\n````diff\n{}\n````", diff.trim_end())
+                    format!(
+                        "## Session diff\n\n{}",
+                        fenced_block("diff", diff.trim_end())
+                    )
                 };
                 (output, CommandAction::None)
             }
@@ -8763,8 +8800,8 @@ impl Engine {
                 );
                 (
                     format!(
-                        "## Effective instructions\n\n````text\n{}\n````",
-                        instructions.trim_end()
+                        "## Effective instructions\n\n{}",
+                        fenced_block("text", instructions.trim_end())
                     ),
                     CommandAction::None,
                 )
@@ -11602,6 +11639,11 @@ impl Engine {
         tool: &str,
         args: &serde_json::Value,
     ) -> Option<String> {
+        // Tool cards persist Trouve's canonical display vocabulary. Approval
+        // callbacks carry the provider's raw vocabulary, so normalize before
+        // matching or two in-flight calls of the same operation can attach
+        // the prompt to the wrong card.
+        let (tool, args) = normalize_vendor_tool_call(tool, args);
         let events = self
             .store
             .events_after(&Scope::Thread(thread_id.to_string()), 0)
@@ -11616,7 +11658,7 @@ impl Engine {
                     tool: name,
                     args: a,
                     ..
-                } if *t == turn && name == tool => {
+                } if *t == turn && name == &tool => {
                     open.push((call_id.clone(), a.clone()));
                 }
                 Event::ToolCompleted { call_id, .. } => {
@@ -11645,9 +11687,10 @@ impl Engine {
             }
             v
         };
+        let args = strip(&args);
         open.iter()
             .rev()
-            .find(|(_, a)| strip(a) == *args)
+            .find(|(_, a)| strip(a) == args)
             .or(open.last())
             .map(|(id, _)| id.clone())
     }

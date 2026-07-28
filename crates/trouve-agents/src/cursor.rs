@@ -2133,7 +2133,10 @@ fn acp_mcp_servers(
             "type": "http",
             "name": "trouve",
             "url": bridge.url,
-            "headers": [],
+            "headers": bridge.headers
+                .iter()
+                .map(|(name, value)| json!({ "name": name, "value": value }))
+                .collect::<Vec<_>>(),
         }));
     }
     Ok(Value::Array(values))
@@ -2282,6 +2285,7 @@ mod tests {
 
         let bridge = crate::McpBridgeConfig {
             url: "http://127.0.0.1:7433/internal/threads/th_1/mcp?approval=0".into(),
+            headers: vec![("Authorization".into(), "Bearer bridge-secret".into())],
         };
         assert_eq!(
             acp_mcp_servers(&[], Some(&bridge), true).unwrap(),
@@ -2289,7 +2293,10 @@ mod tests {
                 "type": "http",
                 "name": "trouve",
                 "url": bridge.url,
-                "headers": [],
+                "headers": [{
+                    "name": "Authorization",
+                    "value": "Bearer bridge-secret",
+                }],
             }])
         );
         assert!(acp_mcp_servers(&[], Some(&bridge), false).is_err());

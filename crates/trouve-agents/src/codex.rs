@@ -613,12 +613,18 @@ fn codex_config_override(turn: &crate::BackendTurn) -> Value {
         );
     }
     if let Some(bridge) = &turn.mcp_bridge {
+        let http_headers: serde_json::Map<String, Value> = bridge
+            .headers
+            .iter()
+            .map(|(name, value)| (name.clone(), Value::String(value.clone())))
+            .collect();
         // Streamable-HTTP server (`url` instead of `command` selects the
         // transport in codex's mcp_servers config shape).
         servers.insert(
             "trouve".into(),
             json!({
                 "url": bridge.url,
+                "http_headers": http_headers,
                 // ToolExecutor already classifies and gates every call. Do
                 // not wrap it in Codex's separate MCP approval heuristic.
                 "default_tools_approval_mode": "approve",
@@ -7565,6 +7571,7 @@ cat > /dev/null
         });
         turn.mcp_bridge = Some(crate::McpBridgeConfig {
             url: "http://127.0.0.1:1/internal/threads/th_1/mcp?approval=0".into(),
+            headers: vec![("Authorization".into(), "Bearer bridge-secret".into())],
         });
         let config = codex_config_override(&turn);
         let servers = &config["mcp_servers"];
@@ -7575,6 +7582,10 @@ cat > /dev/null
             "http://127.0.0.1:1/internal/threads/th_1/mcp?approval=0"
         );
         assert_eq!(servers["trouve"]["default_tools_approval_mode"], "approve");
+        assert_eq!(
+            servers["trouve"]["http_headers"]["Authorization"],
+            "Bearer bridge-secret"
+        );
         assert!(servers["trouve"]["command"].is_null());
 
         // User servers alone (no bridge) still produce an override.
@@ -7698,6 +7709,7 @@ for line in sys.stdin:
         let mut turn = bare_turn();
         turn.mcp_bridge = Some(crate::McpBridgeConfig {
             url: "http://127.0.0.1:1/internal/threads/th_1/mcp?approval=0".into(),
+            headers: Vec::new(),
         });
         let supported_features = [
             "apps",

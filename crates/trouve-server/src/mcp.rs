@@ -168,6 +168,7 @@ async fn tools_list(
     engine: &Engine,
     thread_id: &str,
     serve_approval: bool,
+    catalog_revision: Option<u64>,
 ) -> Result<Value, String> {
     // The approval gate is served for Claude (its permission-prompt tool is
     // invoked by name and must exist on the configured MCP server).
