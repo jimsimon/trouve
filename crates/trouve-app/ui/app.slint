@@ -765,6 +765,38 @@ component CopyButton inherits Rectangle {
     }
 }
 
+// Raw TextInput does not include the editing menu that Slint's LineEdit and
+// TextEdit widgets provide. Keep the raw input behavior while adding the same
+// platform context menu (native on Windows/macOS, Slint-rendered fallback on
+// platforms without a native popup-menu backend).
+component ContextTextInput inherits TextInput {
+    ContextMenuArea {
+        enabled: root.enabled;
+        Menu {
+            MenuItem {
+                title: @tr("Cut");
+                enabled: !root.read-only && root.enabled;
+                activated => { root.cut(); }
+            }
+            MenuItem {
+                title: @tr("Copy");
+                enabled: root.text != "";
+                activated => { root.copy(); }
+            }
+            MenuItem {
+                title: @tr("Paste");
+                enabled: !root.read-only && root.enabled;
+                activated => { root.paste(); }
+            }
+            MenuItem {
+                title: @tr("Select All");
+                enabled: root.text != "";
+                activated => { root.select-all(); }
+            }
+        }
+    }
+}
+
 // Shared table grid for chat markdown and rendered file previews. Callers
 // supply the text tint; grid structure and surface colors stay identical.
 component TableGrid inherits Rectangle {
@@ -890,7 +922,7 @@ component PromptBox inherits Rectangle {
         height: parent.height - 2 * root.pad;
         clip: true;
 
-        input := TextInput {
+        input := ContextTextInput {
             x: 0;
             y: min(0px, max(root.scroll-y, clipper.height - self.preferred-height));
             width: parent.width;
@@ -3387,7 +3419,7 @@ export component AppWindow inherits Window {
                                     }
                                 }
                             }
-                            if row.kind == 2 && row.expanded && row.tool-diff.length == 0: TextInput {
+                            if row.kind == 2 && row.expanded && row.tool-diff.length == 0: ContextTextInput {
                                 text: row.detail;
                                 read-only: true;
                                 single-line: false;
@@ -3434,7 +3466,7 @@ export component AppWindow inherits Window {
 
                             // Raw response text: the turn's markdown source
                             // as one fully selectable block.
-                            if row.kind == 6: TextInput {
+                            if row.kind == 6: ContextTextInput {
                                 text: row.text;
                                 read-only: true;
                                 single-line: false;
@@ -3637,7 +3669,7 @@ export component AppWindow inherits Window {
                                         border-color: Theme.c.card-border;
                                         background: Theme.c.inset-bg;
                                         height: other-input.preferred-height + 12px;
-                                        other-input := TextInput {
+                                        other-input := ContextTextInput {
                                             x: 10px;
                                             y: 6px;
                                             width: parent.width - 20px;
