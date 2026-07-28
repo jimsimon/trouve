@@ -4689,22 +4689,26 @@ impl Engine {
             active.insert(thread_id.to_string(), thread.session_id.clone());
             (p, !was_active)
         };
-        if session_woke {
-            self.emit_session_activity(&thread.session_id, true);
+        if session_woke && let Err(error) = self.emit_session_activity(&thread.session_id, true) {
+            let prompt_release = self.store.release_queued_prompt(&prompt.id);
+            self.active_threads.lock().unwrap().remove(thread_id);
+            drop(activity_publication);
+            prompt_release?;
+            return Err(error);
         }
         drop(activity_publication);
         // If setup fails after claiming, release the claim — otherwise the
         // thread stays "active" forever and can never dispatch again.
         if let Err(e) = self.emit_queue(thread_id) {
             let _ = self.store.release_queued_prompt(&prompt.id);
-            self.release_thread(thread_id);
+            self.release_thread(thread_id)?;
             return Err(e);
         }
         let turn = match self.store.next_turn(thread_id) {
             Ok(t) => t,
             Err(e) => {
                 let _ = self.store.release_queued_prompt(&prompt.id);
-                self.release_thread(thread_id);
+                self.release_thread(thread_id)?;
                 return Err(e.into());
             }
         };
@@ -4715,9 +4719,9 @@ impl Engine {
         tokio::spawn(async move {
             let thread_id = thread.id.clone();
             if let Err(error) = engine.drain_queue(thread, turn, prompt, cancel).await {
-                // A terminal event failed to persist. Keep the active claim
-                // and cancellation state intact so no later turn can overtake
-                // an unrecorded terminal state.
+                // A terminal or activity event failed to persist. The
+                // transition keeps or restores the active claim so no later
+                // turn can overtake the unrecorded state.
                 tracing::error!("turn dispatcher for {thread_id} retained its claim: {error:#}");
             }
         });
@@ -4767,7 +4771,7 @@ impl Engine {
                     let _ = self.store.release_queued_prompt(&prompt.id);
                     let _ = self.emit_queue(&thread.id);
                     self.clear_cancel(&thread.id);
-                    self.release_thread(&thread.id);
+                    self.release_thread(&thread.id)?;
                     return Ok(());
                 }
             };
@@ -4791,7 +4795,7 @@ impl Engine {
                 self.clear_cancel(&thread.id);
                 let _ = self.store.release_queued_prompt(&prompt.id);
                 let _ = self.emit_queue(&thread.id);
-                self.release_thread(&thread.id);
+                self.release_thread(&thread.id)?;
                 return Ok(());
             }
             if cancelled {
@@ -4810,7 +4814,7 @@ impl Engine {
                     })?;
                 // Decide atomically with releasing the active claim so a
                 // racing send cannot be stranded between the two.
-                let resume = self.finish_cancelled_turn(&thread.id);
+                let resume = self.finish_cancelled_turn(&thread.id)?;
                 if !resume {
                     return Ok(());
                 }
@@ -4828,9 +4832,7 @@ impl Engine {
                         _ => (None, Self::remove_thread_claim(&mut active, &thread.id)),
                     }
                 };
-                if let Some(session_id) = idle_session {
-                    self.emit_session_activity(&session_id, false);
-                }
+                self.publish_idle_or_restore(&thread.id, idle_session)?;
                 next
             };
             let Some(next) = next else { return Ok(()) };
@@ -4845,7 +4847,7 @@ impl Engine {
                     tracing::error!("queue for {} stopped: {e}", thread.id);
                     let _ = self.store.release_queued_prompt(&next.id);
                     let _ = self.emit_queue(&thread.id);
-                    self.release_thread(&thread.id);
+                    self.release_thread(&thread.id)?;
                     return Ok(());
                 }
             };
@@ -4855,15 +4857,13 @@ impl Engine {
 
     /// Drop a thread's dispatcher claim; when it was the session's last
     /// active thread, announce the session going idle.
-    fn release_thread(&self, thread_id: &str) {
+    fn release_thread(&self, thread_id: &str) -> Result<(), EngineError> {
         let _activity_publication = self.session_activity_publication.lock().unwrap();
         let idle_session = {
             let mut active = self.active_threads.lock().unwrap();
             Self::remove_thread_claim(&mut active, thread_id)
         };
-        if let Some(session_id) = idle_session {
-            self.emit_session_activity(&session_id, false);
-        }
+        self.publish_idle_or_restore(thread_id, idle_session)
     }
 
     /// Remove a claim and return its session only when it was the session's
@@ -4875,6 +4875,26 @@ impl Engine {
         active
             .remove(thread_id)
             .filter(|session| !active.values().any(|candidate| candidate == session))
+    }
+
+    /// Publish an idle transition, restoring its claim when persistence fails.
+    /// The caller must hold `session_activity_publication`.
+    fn publish_idle_or_restore(
+        &self,
+        thread_id: &str,
+        idle_session: Option<String>,
+    ) -> Result<(), EngineError> {
+        let Some(session_id) = idle_session else {
+            return Ok(());
+        };
+        if let Err(error) = self.emit_session_activity(&session_id, false) {
+            self.active_threads
+                .lock()
+                .unwrap()
+                .insert(thread_id.to_string(), session_id);
+            return Err(error);
+        }
+        Ok(())
     }
 
     /// Register a fresh cancellation token for a turn about to run.
@@ -4895,21 +4915,23 @@ impl Engine {
     /// Finish a cancelled turn while coordinating with sends that may be
     /// waiting on the same active-thread claim. Returns true when one of
     /// those sends requested that the queue continue draining.
-    fn finish_cancelled_turn(&self, thread_id: &str) -> bool {
+    fn finish_cancelled_turn(&self, thread_id: &str) -> Result<bool, EngineError> {
         // Lock ordering matches `dispatch_queue`: activity publication,
         // active thread, cancel token, then resume marker.
         let _activity_publication = self.session_activity_publication.lock().unwrap();
         let (resume, idle_session) = {
             let mut active = self.active_threads.lock().unwrap();
-            self.turn_cancels.lock().unwrap().remove(thread_id);
-            let resume = self.resume_after_cancel.lock().unwrap().remove(thread_id);
-            let idle_session = (!resume).then(|| Self::remove_thread_claim(&mut active, thread_id));
-            (resume, idle_session.flatten())
+            let resume = self.resume_after_cancel.lock().unwrap().contains(thread_id);
+            let idle_session = if resume {
+                None
+            } else {
+                Self::remove_thread_claim(&mut active, thread_id)
+            };
+            (resume, idle_session)
         };
-        if let Some(session_id) = idle_session {
-            self.emit_session_activity(&session_id, false);
-        }
-        resume
+        self.publish_idle_or_restore(thread_id, idle_session)?;
+        self.clear_cancel(thread_id);
+        Ok(resume)
     }
 
     /// Interrupt the turn currently running on a thread. Trips its
@@ -4930,22 +4952,21 @@ impl Engine {
 
     /// Server-scope `session.activity` event — session lists light up (or
     /// dim) their indicator without refetching.
-    fn emit_session_activity(&self, session_id: &str, active: bool) {
+    fn emit_session_activity(&self, session_id: &str, active: bool) -> Result<(), EngineError> {
         let workspace_id = self
             .store
-            .session(session_id)
-            .ok()
-            .flatten()
+            .session(session_id)?
             .map(|s| s.workspace_id)
             .unwrap_or_default();
-        let _ = self.store.append_event(
+        self.store.append_event(
             Scope::Server,
             Event::SessionActivity {
                 session_id: session_id.to_string(),
                 workspace_id,
                 active,
             },
-        );
+        )?;
+        Ok(())
     }
 
     async fn run_turn(
