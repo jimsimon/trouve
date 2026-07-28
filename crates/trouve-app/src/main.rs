@@ -1510,11 +1510,35 @@ fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// The clipboard's image as PNG bytes, or `None` when it holds no image
-/// (or the clipboard isn't reachable). Used by the composer's Ctrl+V hook
-/// to turn pasted screenshots into attachments.
+trait ClipboardReader {
+    fn has_text(&mut self) -> bool;
+    fn image(&mut self) -> Option<arboard::ImageData<'static>>;
+}
+
+impl ClipboardReader for arboard::Clipboard {
+    fn has_text(&mut self) -> bool {
+        self.get_text().is_ok()
+    }
+
+    fn image(&mut self) -> Option<arboard::ImageData<'static>> {
+        self.get_image().ok()
+    }
+}
+
+/// The clipboard's image as PNG bytes, or `None` when text is available, it
+/// holds no image, or the clipboard isn't reachable. Text takes precedence
+/// because rich clipboard sources can advertise both representations and an
+/// image attachment must never swallow an ordinary text paste.
 fn clipboard_image_png() -> Option<Vec<u8>> {
-    let image = arboard::Clipboard::new().ok()?.get_image().ok()?;
+    let mut clipboard = arboard::Clipboard::new().ok()?;
+    clipboard_image_png_from(&mut clipboard)
+}
+
+fn clipboard_image_png_from(clipboard: &mut impl ClipboardReader) -> Option<Vec<u8>> {
+    if clipboard.has_text() {
+        return None;
+    }
+    let image = clipboard.image()?;
     let mut out = Vec::new();
     {
         let mut encoder = png::Encoder::new(&mut out, image.width as u32, image.height as u32);
@@ -1555,10 +1579,30 @@ fn pr_group_drag_id(data: &slint::DataTransfer) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+    use std::borrow::Cow;
+
     use super::{
-        ProviderConfigFieldItem, at_token, chat_file_link, pr_group_drag_id, pr_group_drag_payload,
-        provider_fields_valid, workspace_drag_id, workspace_drag_payload,
+        ClipboardReader, ProviderConfigFieldItem, at_token, chat_file_link,
+        clipboard_image_png_from, pr_group_drag_id, pr_group_drag_payload, provider_fields_valid,
+        workspace_drag_id, workspace_drag_payload,
     };
+
+    struct TestClipboard {
+        text: bool,
+        image: Option<arboard::ImageData<'static>>,
+        image_reads: usize,
+    }
+
+    impl ClipboardReader for TestClipboard {
+        fn has_text(&mut self) -> bool {
+            self.text
+        }
+
+        fn image(&mut self) -> Option<arboard::ImageData<'static>> {
+            self.image_reads += 1;
+            self.image.take()
+        }
+    }
 
     fn provider_field(
         required: bool,
@@ -1590,6 +1634,39 @@ mod tests {
         assert!(provider_fields_valid(
             vec![provider_field(true, "", true)].into_iter()
         ));
+    }
+
+    #[test]
+    fn clipboard_text_takes_precedence_over_an_image_representation() {
+        let mut clipboard = TestClipboard {
+            text: true,
+            image: Some(arboard::ImageData {
+                width: 1,
+                height: 1,
+                bytes: Cow::Owned(vec![0, 0, 0, 255]),
+            }),
+            image_reads: 0,
+        };
+
+        assert_eq!(clipboard_image_png_from(&mut clipboard), None);
+        assert_eq!(clipboard.image_reads, 0);
+    }
+
+    #[test]
+    fn image_only_clipboard_content_is_encoded_as_png() {
+        let mut clipboard = TestClipboard {
+            text: false,
+            image: Some(arboard::ImageData {
+                width: 1,
+                height: 1,
+                bytes: Cow::Owned(vec![0, 0, 0, 255]),
+            }),
+            image_reads: 0,
+        };
+
+        let png = clipboard_image_png_from(&mut clipboard).unwrap();
+        assert!(png.starts_with(b"\x89PNG\r\n\x1a\n"));
+        assert_eq!(clipboard.image_reads, 1);
     }
 
     #[test]
