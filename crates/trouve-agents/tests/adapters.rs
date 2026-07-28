@@ -1148,6 +1148,59 @@ cat > /dev/null
 }
 
 #[tokio::test]
+async fn codex_adapter_aborts_replacement_when_predecessor_interrupt_fails() {
+    let tmp = tempfile::tempdir().unwrap();
+    let stub = write_stub(
+        tmp.path(),
+        "codex-interrupt-failure",
+        r#"#!/bin/bash
+IFS= read -r line # initialize
+echo '{"jsonrpc":"2.0","id":1,"result":{}}'
+IFS= read -r line # initialized notification
+IFS= read -r line # thread/start
+echo '{"jsonrpc":"2.0","id":2,"result":{"thread":{"id":"thr-1"}}}'
+IFS= read -r line # first turn/start
+echo '{"jsonrpc":"2.0","id":3,"result":{"turn":{"id":"turn-1"}}}'
+IFS= read -r line # replacement thread/resume
+echo '{"jsonrpc":"2.0","id":4,"result":{"thread":{"id":"thr-1"}}}'
+IFS= read -r line # predecessor turn/interrupt
+printf '%s\n' "$line" > "$0.interrupt"
+echo '{"jsonrpc":"2.0","id":5,"error":{"message":"cannot interrupt predecessor"}}'
+echo '{"jsonrpc":"2.0","method":"turn/completed","params":{"threadId":"thr-1","turn":{"id":"turn-1","status":"completed"}}}'
+cat > /dev/null
+"#,
+    );
+    let backend = CodexBackend::new("codex", Some(stub.clone()));
+    let mut first = start_turn(&backend, || {
+        turn(tmp.path().to_path_buf(), None, BackendPermission::Ask)
+    })
+    .await;
+
+    let replacement = backend
+        .run_turn(turn(
+            tmp.path().to_path_buf(),
+            Some("thr-1"),
+            BackendPermission::Ask,
+        ))
+        .await;
+    let error = match replacement {
+        Ok(_) => panic!("replacement must not start after an interrupt failure"),
+        Err(error) => error.to_string(),
+    };
+    assert!(error.contains("cannot interrupt predecessor"), "{error}");
+
+    let interrupt: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(format!("{stub}.interrupt")).unwrap())
+            .unwrap();
+    assert_eq!(interrupt["method"], "turn/interrupt");
+    assert_eq!(interrupt["params"]["turnId"], "turn-1");
+
+    while let Some(event) = first.next().await {
+        event.unwrap();
+    }
+}
+
+#[tokio::test]
 async fn claude_adapter_wires_mcp_tool_bridge() {
     let tmp = tempfile::tempdir().unwrap();
     let stub = write_stub(

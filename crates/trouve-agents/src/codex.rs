@@ -266,7 +266,8 @@ impl AgentBackend for CodexBackend {
         // disappeared. Await its interruption before starting a replacement;
         // otherwise Codex folds the new prompt into the old turn and its late
         // completion is misattributed to the replacement.
-        server.interrupt_active_turn(&codex_thread_id).await;
+        let _lifecycle = server.lock_turn_lifecycle(&codex_thread_id).await;
+        server.interrupt_active_turn(&codex_thread_id).await?;
         let route = server.subscribe(&codex_thread_id).await;
 
         // Mode instructions (which include the search-tool guidance when
@@ -473,6 +474,7 @@ fn turn_stream(
         // twice.
         let mut streamed_reasoning = HashSet::new();
         let mut turn_finished = false;
+        let mut turn_stopped = false;
         let mut client_gone = false;
         let mut route_overloaded = false;
         let mut overload_signal = rx.overload_signal();
@@ -577,6 +579,7 @@ fn turn_stream(
                         }
                         "turn/completed" => {
                             turn_finished = true;
+                            turn_stopped = true;
                             let status = params["turn"]["status"].as_str().unwrap_or("completed");
                             if status == "failed" {
                                 let msg = params["turn"]["error"]["message"]
@@ -675,8 +678,8 @@ fn turn_stream(
             _ = process_route => {}
         }
         if client_gone {
-            server
-                .interrupt_turn(&codex_thread_id, &codex_turn_id, "cancelled")
+            turn_stopped = server
+                .interrupt_turn_best_effort(&codex_thread_id, &codex_turn_id, "cancelled")
                 .await;
         } else if route_overloaded {
             let _ = tx
@@ -689,8 +692,8 @@ fn turn_stream(
             // request that `process_route` may have been awaiting when the
             // overload signal won the select. Report the overload first so
             // an unresponsive app-server cannot suppress the stream error.
-            server
-                .interrupt_turn(&codex_thread_id, &codex_turn_id, "overloaded")
+            turn_stopped = server
+                .interrupt_turn_best_effort(&codex_thread_id, &codex_turn_id, "overloaded")
                 .await;
         } else if !turn_finished {
             let reason = if server.is_closed() {
@@ -700,13 +703,16 @@ fn turn_stream(
             };
             let _ = tx.send(Err(BackendError::Protocol(reason.into()))).await;
         }
-        server
-            .clear_active_turn(&codex_thread_id, &codex_turn_id)
-            .await;
+        if turn_stopped {
+            server
+                .clear_active_turn(&codex_thread_id, &codex_turn_id)
+                .await;
+        }
         server.unsubscribe(&codex_thread_id, &route_tx).await;
     })
 }
 
+/// Extract the vendor turn identity from every documented event shape.
 fn message_turn_id(message: &ServerMsg) -> Option<&str> {
     let params = match message {
         ServerMsg::Notification { params, .. } | ServerMsg::Request { params, .. } => params,
@@ -863,6 +869,7 @@ enum ServerMsg {
 type Pending = Arc<Mutex<HashMap<i64, oneshot::Sender<Result<Value, String>>>>>;
 type Routes = Arc<Mutex<HashMap<String, RouteSender<ServerMsg>>>>;
 type ActiveTurns = Arc<Mutex<HashMap<String, String>>>;
+type TurnLifecycles = Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>;
 
 #[derive(Default)]
 struct BufferedRoute {
@@ -1007,6 +1014,9 @@ struct AppServer {
     /// turn interrupts this first so Codex cannot merge prompts across trouve
     /// turn boundaries after cancellation.
     active_turns: ActiveTurns,
+    /// Per-thread guards serializing interruption through replacement
+    /// registration.
+    turn_lifecycles: TurnLifecycles,
     /// Held so the child (kill_on_drop) lives as long as the server handle.
     _child: Child,
     closed: Arc<std::sync::atomic::AtomicBool>,
@@ -1035,6 +1045,7 @@ impl AppServer {
             routes: Arc::new(Mutex::new(HashMap::new())),
             buffered: Arc::new(Mutex::new(HashMap::new())),
             active_turns: Arc::new(Mutex::new(HashMap::new())),
+            turn_lifecycles: Arc::new(Mutex::new(HashMap::new())),
             _child: child,
             closed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         };
@@ -1093,6 +1104,19 @@ impl AppServer {
             .await;
     }
 
+    /// Lock the complete replacement lifecycle for one Codex thread.
+    async fn lock_turn_lifecycle(&self, thread_id: &str) -> tokio::sync::OwnedMutexGuard<()> {
+        let lifecycle = self
+            .turn_lifecycles
+            .lock()
+            .await
+            .entry(thread_id.to_string())
+            .or_default()
+            .clone();
+        lifecycle.lock_owned().await
+    }
+
+    /// Record the vendor turn currently running on a Codex thread.
     async fn register_active_turn(&self, thread_id: &str, turn_id: &str) {
         self.active_turns
             .lock()
@@ -1100,6 +1124,7 @@ impl AppServer {
             .insert(thread_id.to_string(), turn_id.to_string());
     }
 
+    /// Clear an active turn only when the caller still owns that turn id.
     async fn clear_active_turn(&self, thread_id: &str, expected_turn_id: &str) {
         let mut active = self.active_turns.lock().await;
         if active
@@ -1110,26 +1135,42 @@ impl AppServer {
         }
     }
 
-    async fn interrupt_active_turn(&self, thread_id: &str) {
+    /// Interrupt a predecessor before replacement startup, propagating failure.
+    async fn interrupt_active_turn(&self, thread_id: &str) -> Result<(), BackendError> {
         let turn_id = self.active_turns.lock().await.get(thread_id).cloned();
         if let Some(turn_id) = turn_id {
-            self.interrupt_turn(thread_id, &turn_id, "superseded").await;
+            self.interrupt_turn(thread_id, &turn_id).await?;
             self.clear_active_turn(thread_id, &turn_id).await;
         }
+        Ok(())
     }
 
-    async fn interrupt_turn(&self, thread_id: &str, turn_id: &str, reason: &str) {
-        if let Err(error) = self
-            .request(
-                "turn/interrupt",
-                json!({
-                    "threadId": thread_id,
-                    "turnId": turn_id,
-                }),
-            )
-            .await
-        {
-            tracing::warn!("codex: failed to interrupt {reason} turn {turn_id}: {error}");
+    /// Ask app-server to stop one exact vendor turn.
+    async fn interrupt_turn(&self, thread_id: &str, turn_id: &str) -> Result<(), BackendError> {
+        self.request(
+            "turn/interrupt",
+            json!({
+                "threadId": thread_id,
+                "turnId": turn_id,
+            }),
+        )
+        .await
+        .map(|_| ())
+    }
+
+    /// Best-effort interruption for cleanup paths that cannot report failure.
+    async fn interrupt_turn_best_effort(
+        &self,
+        thread_id: &str,
+        turn_id: &str,
+        reason: &str,
+    ) -> bool {
+        match self.interrupt_turn(thread_id, turn_id).await {
+            Ok(()) => true,
+            Err(error) => {
+                tracing::warn!("codex: failed to interrupt {reason} turn {turn_id}: {error}");
+                false
+            }
         }
     }
 
@@ -1170,11 +1211,13 @@ impl AppServer {
     }
 }
 
+/// One routed turn stream paired with the sender identity that owns it.
 struct RouteSubscription {
     tx: RouteSender<ServerMsg>,
     rx: RouteReceiver<ServerMsg>,
 }
 
+/// Remove a route only when cleanup still owns the active subscription.
 async fn remove_route(
     routes: &Routes,
     buffered: &Buffered,
