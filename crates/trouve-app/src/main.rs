@@ -598,12 +598,6 @@ fn main() -> anyhow::Result<()> {
     }
     {
         let tx = tx.clone();
-        window.on_register_workspace_path(move |path| {
-            let _ = tx.send(UiCommand::RegisterWorkspacePath(path.to_string()));
-        });
-    }
-    {
-        let tx = tx.clone();
         window.on_start_new_chat(
             move |ws, branch, fetch_latest, mode, model, thinking, permission, prompt| {
                 let _ = tx.send(UiCommand::StartNewChat {
