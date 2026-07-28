@@ -1159,32 +1159,32 @@ impl AuthSync {
         }
     }
 
-    fn sync(&self) {
+    fn sync(&self) -> std::io::Result<()> {
         let mut baseline = self.baseline.lock().unwrap();
         let Some(previous) = baseline.clone() else {
-            return;
+            return Ok(());
         };
-        let Ok(isolated) = std::fs::read(&self.isolated) else {
-            return;
-        };
+        let isolated = std::fs::read(&self.isolated)?;
         if isolated == previous {
-            return;
+            return Ok(());
         }
-        let source = std::fs::read(&self.source).unwrap_or_default();
+        let source = match std::fs::read(&self.source) {
+            Ok(source) => source,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+            Err(error) => return Err(error),
+        };
         if source != previous && source != isolated {
             tracing::warn!(
                 "Codex auth changed outside the isolated app-server; preserving the newer source"
             );
             *baseline = None;
-            return;
+            return Ok(());
         }
-        if source != isolated
-            && let Err(error) = std::fs::copy(&self.isolated, &self.source)
-        {
-            tracing::warn!("failed to preserve refreshed Codex credentials: {error}");
-            return;
+        if source != isolated {
+            std::fs::copy(&self.isolated, &self.source)?;
         }
         *baseline = Some(isolated);
+        Ok(())
     }
 }
 
@@ -1334,10 +1334,12 @@ impl AppServer {
     }
 
     async fn sync_auth(&self) {
-        if let Some(auth_sync) = self.auth_sync.clone()
-            && let Err(error) = tokio::task::spawn_blocking(move || auth_sync.sync()).await
-        {
-            tracing::warn!("Codex credential sync task failed: {error}");
+        if let Some(auth_sync) = self.auth_sync.clone() {
+            match tokio::task::spawn_blocking(move || auth_sync.sync()).await {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => tracing::warn!("Codex credential sync failed: {error}"),
+                Err(error) => tracing::warn!("Codex credential sync task failed: {error}"),
+            }
         }
     }
 
@@ -1888,19 +1890,26 @@ mod tests {
         let sync = AuthSync::new(source.clone(), isolated.clone(), b"old".to_vec());
 
         std::fs::write(&isolated, b"refreshed").unwrap();
-        sync.sync();
+        sync.sync().unwrap();
         assert_eq!(std::fs::read(&source).unwrap(), b"refreshed");
 
         std::fs::write(&source, b"new-login").unwrap();
         std::fs::write(&isolated, b"stale-refresh").unwrap();
-        sync.sync();
+        sync.sync().unwrap();
         assert_eq!(std::fs::read(&source).unwrap(), b"new-login");
 
         // Once an external login wins, later isolated changes remain unable
         // to overwrite it.
         std::fs::write(&isolated, b"later-stale-refresh").unwrap();
-        sync.sync();
+        sync.sync().unwrap();
         assert_eq!(std::fs::read(&source).unwrap(), b"new-login");
+
+        std::fs::remove_file(&isolated).unwrap();
+        let missing = AuthSync::new(source, isolated, b"old".to_vec());
+        assert_eq!(
+            missing.sync().unwrap_err().kind(),
+            std::io::ErrorKind::NotFound
+        );
     }
 
     #[test]
