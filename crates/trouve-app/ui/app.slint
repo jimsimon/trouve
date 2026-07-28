@@ -786,6 +786,7 @@ component ContextTextInput {
     callback cursor-position-changed(Point);
     callback key-pressed(KeyEvent) -> EventResult;
     callback key-released(KeyEvent) -> EventResult;
+    callback paste-requested() -> bool;
 
     public function set-selection-offsets(start: int, end: int) {
         input.set-selection-offsets(start, end);
@@ -794,7 +795,11 @@ component ContextTextInput {
     public function clear-selection() { input.clear-selection(); }
     public function cut() { input.cut(); }
     public function copy() { input.copy(); }
-    public function paste() { input.paste(); }
+    public function paste() {
+        if (!root.paste-requested()) {
+            input.paste();
+        }
+    }
 
     preferred-width: input.preferred-width;
     preferred-height: input.preferred-height;
@@ -971,6 +976,7 @@ component PromptBox inherits Rectangle {
             color: root.enabled ? Theme.c.text-hi : Theme.c.text-disabled;
             font-size: Theme.fs(13px);
             selection-background-color: Theme.c.selection;
+            paste-requested => { root.paste-image-attempted() }
 
             key-pressed(event) => {
                 if ((event.text == "v" || event.text == "V")
