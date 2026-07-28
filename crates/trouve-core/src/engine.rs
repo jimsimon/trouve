@@ -8270,6 +8270,19 @@ impl Engine {
         .await
     }
 
+    fn evict_thread_catalogs(&self, thread_ids: &[String]) {
+        {
+            let mut catalogs = self.command_catalogs.lock().unwrap();
+            for thread_id in thread_ids {
+                catalogs.remove(thread_id);
+            }
+        }
+        let mut catalogs = self.bridged_tool_catalogs.lock().unwrap();
+        for thread_id in thread_ids {
+            catalogs.remove(thread_id);
+        }
+    }
+
     // --- threads ------------------------------------------------------------
 
     pub fn create_thread(&self, req: CreateThreadRequest) -> Result<Thread, EngineError> {
@@ -8389,8 +8402,7 @@ impl Engine {
 
     fn emit_command_catalog(&self, thread_id: &str, workspace_root: &Path) -> Result<()> {
         let commands = self.command_catalog(workspace_root);
-        let mut emitted = self.command_catalogs.lock().unwrap();
-        if emitted.get(thread_id) == Some(&commands) {
+        if self.command_catalogs.lock().unwrap().get(thread_id) == Some(&commands) {
             return Ok(());
         }
         self.store.append_event(
@@ -8399,7 +8411,10 @@ impl Engine {
                 commands: commands.clone(),
             },
         )?;
-        emitted.insert(thread_id.to_string(), commands);
+        self.command_catalogs
+            .lock()
+            .unwrap()
+            .insert(thread_id.to_string(), commands);
         Ok(())
     }
 

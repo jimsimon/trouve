@@ -150,6 +150,20 @@ pub struct McpBridgeConfig {
     pub disallowed_tools: Vec<String>,
 }
 
+impl fmt::Debug for McpBridgeConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let headers: Vec<(&str, &str)> = self
+            .headers
+            .iter()
+            .map(|(name, _)| (name.as_str(), "<redacted>"))
+            .collect();
+        f.debug_struct("McpBridgeConfig")
+            .field("url", &self.url)
+            .field("headers", &headers)
+            .finish()
+    }
+}
+
 /// One event from a backend turn, in trouve-shaped vocabulary.
 pub enum BackendEvent {
     /// The vendor allocated (or rotated) its session id; persist it so the
