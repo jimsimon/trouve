@@ -61,6 +61,12 @@ mime_guess = "2.0.5"
 png = "0.18.1"
 base64 = "0.22"
 
+[target.'cfg(target_os = "linux")'.dependencies]
+# Linux niceness is per-thread. The controller lowers its priority before
+# constructing Tokio so its workers and CPU-heavy child processes yield to
+# the Slint event loop under contention.
+libc = "0.2.186"
+
 [build-dependencies]
 slint-build = "1.17"
 
