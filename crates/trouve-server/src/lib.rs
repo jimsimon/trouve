@@ -1551,7 +1551,10 @@ async fn set_git_worktree_settings(
     Json(req): Json<SetGitWorktreeSettingsRequest>,
 ) -> Result<impl IntoResponse, ApiError> {
     engine
-        .set_title_model_load_behavior(req.title_model_load_behavior)
+        .set_git_worktree_settings(
+            req.title_model_load_behavior,
+            req.title_model_resource_policy,
+        )
         .await?;
     let (cursor, settings) = engine.git_worktree_settings_snapshot()?;
     Ok(([(EVENT_CURSOR_HEADER, cursor.to_string())], Json(settings)))

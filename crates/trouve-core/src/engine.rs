@@ -41,7 +41,10 @@ const COMPACTION_THRESHOLD: f64 = 0.8;
 /// End-to-end budget for refreshing one GitHub host. This bounds how long a
 /// stalled GraphQL request can retain the shared dashboard-cache lock.
 const GITHUB_DASHBOARD_REFRESH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
-const SESSION_TITLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(8);
+// Leave room beyond title_model's decoding timeout for a cold sidecar start
+// and request handoff. Matching these budgets caused valid model requests to
+// be canceled at the outer boundary and silently replaced by heuristics.
+const SESSION_TITLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
 #[cfg(not(test))]
 const MODEL_CATALOG_VALIDATION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 #[cfg(test)]
@@ -451,8 +454,8 @@ pub struct Engine {
     cli_installs: Mutex<HashMap<String, CliInstallState>>,
     /// The llama-server sidecar behind the built-in "local" provider.
     local_manager: Arc<crate::local::LlamaManager>,
-    /// A separate, CPU-only sidecar for session titles. It never displaces
-    /// the local coding model from memory.
+    /// A separate sidecar for session titles with independently configured
+    /// resource placement.
     title_model: Arc<crate::title_model::TitleModelManager>,
     /// A timed-out generation stays tracked while its cold start finishes.
     /// The next request cancels and joins it before starting another.
@@ -744,8 +747,11 @@ impl Engine {
         let title_model = Arc::new(crate::title_model::TitleModelManager::new(
             data_dir.clone(),
             config.title_model_load_behavior.unwrap_or_default(),
+            config.title_model_resource_policy.unwrap_or_default(),
+            &local_manager,
             store.clone(),
         ));
+        local_manager.set_adaptive_title(Arc::downgrade(&title_model));
         let local_provider: Arc<dyn Provider> = Arc::new(crate::local::LocalProvider::new(
             data_dir.clone(),
             config_dir.clone(),
@@ -2117,14 +2123,9 @@ impl Engine {
         let managed = cli::installed(&self.data_dir, cli::CliId::LlamaServer);
         let (runtime_installed, runtime_version, runtime_managed) = match &managed {
             Some(info) => (true, Some(info.version.clone()), true),
-            None => match cli::find_on_path("llama-server") {
-                Some(_) => (true, Some("system".into()), false),
-                None => (false, None, false),
-            },
+            None => (false, None, false),
         };
         let runtime_latest_version = self.cli_latest_version(cli::CliId::LlamaServer).await;
-        // Only a managed install is ours to update; system builds belong
-        // to the user's package manager.
         let runtime_update_available = match (&managed, &runtime_latest_version) {
             (Some(info), Some(latest)) => !cli_version_matches(&info.version, latest),
             _ => false,
@@ -2217,6 +2218,7 @@ impl Engine {
             self.injected_providers.lock().unwrap().remove("local");
             self.providers.write().unwrap().remove("local");
             self.local_manager.stop().await;
+            self.title_model.local_model_stopped().await;
         }
         Ok(())
     }
@@ -2428,6 +2430,7 @@ impl Engine {
             .ok_or_else(|| EngineError::NotFound(format!("local model {id}")))?;
         if self.local_manager.running_model().as_deref() == Some(id) {
             self.local_manager.stop().await;
+            self.title_model.local_model_stopped().await;
         }
         self.local_downloads.lock().unwrap().remove(id);
         let gguf = crate::local::gguf_path(&self.data_dir, &entry);
@@ -2451,6 +2454,7 @@ impl Engine {
     /// local turn restarts it).
     pub async fn stop_local_server(&self) {
         self.local_manager.stop().await;
+        self.title_model.local_model_stopped().await;
     }
 
     /// Restart the llama-server sidecar with the model it is serving. The
@@ -2636,18 +2640,22 @@ impl Engine {
         Ok((cursor, self.git_worktree_settings()))
     }
 
-    /// Persist and immediately apply the session-title model lifecycle.
-    pub async fn set_title_model_load_behavior(
+    /// Persist and immediately apply session-title lifecycle and placement.
+    pub async fn set_git_worktree_settings(
         &self,
         behavior: trouve_protocol::TitleModelLoadBehavior,
+        resources: trouve_protocol::TitleModelResourcePolicy,
     ) -> Result<trouve_protocol::GitWorktreeSettings, EngineError> {
         let _transition = self.title_model_behavior_transition.lock().await;
         {
             let mut config = self.config.lock().unwrap();
             config.title_model_load_behavior = Some(behavior);
+            config.title_model_resource_policy = Some(resources);
             self.persist_config(&config);
         }
-        self.title_model.set_behavior(behavior).await;
+        self.title_model
+            .set_configuration(behavior, resources)
+            .await;
         Ok(self.git_worktree_settings())
     }
 

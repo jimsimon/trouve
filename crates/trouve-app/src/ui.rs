@@ -1041,8 +1041,31 @@ pub(crate) fn title_model_load_behavior_index(
     }
 }
 
+pub(crate) fn title_model_resource_policy_of(
+    index: i32,
+) -> trouve_protocol::TitleModelResourcePolicy {
+    match index {
+        1 => trouve_protocol::TitleModelResourcePolicy::GpuCpuRam,
+        2 => trouve_protocol::TitleModelResourcePolicy::GpuOnly,
+        3 => trouve_protocol::TitleModelResourcePolicy::CpuRamOnly,
+        _ => trouve_protocol::TitleModelResourcePolicy::Adaptive,
+    }
+}
+
+pub(crate) fn title_model_resource_policy_index(
+    policy: trouve_protocol::TitleModelResourcePolicy,
+) -> i32 {
+    match policy {
+        trouve_protocol::TitleModelResourcePolicy::Adaptive => 0,
+        trouve_protocol::TitleModelResourcePolicy::GpuCpuRam => 1,
+        trouve_protocol::TitleModelResourcePolicy::GpuOnly => 2,
+        trouve_protocol::TitleModelResourcePolicy::CpuRamOnly => 3,
+    }
+}
+
 pub fn set_git_worktree_settings(ui: &Ui, settings: trouve_protocol::GitWorktreeSettings) {
     let behavior = title_model_load_behavior_index(settings.title_model_load_behavior);
+    let resources = title_model_resource_policy_index(settings.title_model_resource_policy);
     let status = settings.title_model;
     let installed = status.runtime_installed && status.model_downloaded;
     let installing = status.state == "installing";
@@ -1053,6 +1076,7 @@ pub fn set_git_worktree_settings(ui: &Ui, settings: trouve_protocol::GitWorktree
     };
     let _ = ui.upgrade_in_event_loop(move |ui| {
         ui.set_settings_title_model_load_index(behavior);
+        ui.set_settings_title_model_resource_index(resources);
         ui.set_settings_title_model_state(status.state.into());
         ui.set_settings_title_model_detail(status.detail.into());
         ui.set_settings_title_model_installed(installed);
@@ -1862,6 +1886,17 @@ mod tests {
             assert_eq!(title_model_load_behavior_index(behavior), index);
         }
         assert_eq!(title_model_load_behavior_of(99), Auto);
+    }
+
+    #[test]
+    fn title_model_resource_policy_indices_round_trip() {
+        use trouve_protocol::TitleModelResourcePolicy::{Adaptive, CpuRamOnly, GpuCpuRam, GpuOnly};
+
+        for (index, policy) in [(0, Adaptive), (1, GpuCpuRam), (2, GpuOnly), (3, CpuRamOnly)] {
+            assert_eq!(title_model_resource_policy_of(index), policy);
+            assert_eq!(title_model_resource_policy_index(policy), index);
+        }
+        assert_eq!(title_model_resource_policy_of(99), Adaptive);
     }
 
     fn workspace_rows(ids: &[&str]) -> Vec<NavRowData> {

@@ -112,6 +112,23 @@ pub enum TitleModelLoadBehavior {
     Off,
 }
 
+/// Compute resources the dedicated session-title model may use.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum TitleModelResourcePolicy {
+    /// Choose GPU acceleration when it will not contend with a running local
+    /// coding model; otherwise use CPU and system RAM.
+    Adaptive,
+    /// Allow llama.cpp to place the model across GPU, CPU, and system RAM.
+    GpuCpuRam,
+    /// Require all model layers to fit on a detected GPU.
+    GpuOnly,
+    /// Keep all model computation off the GPU. This preserves the behavior
+    /// used before resource selection was exposed.
+    #[default]
+    CpuRamOnly,
+}
+
 /// Runtime status for the managed session-title model.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct TitleModelStatus {
@@ -136,6 +153,8 @@ pub struct TitleModelStatus {
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct GitWorktreeSettings {
     pub title_model_load_behavior: TitleModelLoadBehavior,
+    #[serde(default)]
+    pub title_model_resource_policy: TitleModelResourcePolicy,
     pub title_model: TitleModelStatus,
 }
 
@@ -143,6 +162,8 @@ pub struct GitWorktreeSettings {
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct SetGitWorktreeSettingsRequest {
     pub title_model_load_behavior: TitleModelLoadBehavior,
+    #[serde(default)]
+    pub title_model_resource_policy: TitleModelResourcePolicy,
 }
 
 /// Ask the server to derive the title used to create a session and branch.
@@ -1911,5 +1932,18 @@ mod tests {
 
         assert!(request.fetch_latest);
         assert!(request.checkout_ref.is_none());
+    }
+
+    #[test]
+    fn title_resources_default_to_the_historical_cpu_mode() {
+        let request: SetGitWorktreeSettingsRequest = serde_json::from_value(serde_json::json!({
+            "title_model_load_behavior": "auto"
+        }))
+        .unwrap();
+
+        assert_eq!(
+            request.title_model_resource_policy,
+            TitleModelResourcePolicy::CpuRamOnly
+        );
     }
 }

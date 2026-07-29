@@ -42,7 +42,7 @@ const SERVER_EVENT_FRESH_WINDOW: std::time::Duration = std::time::Duration::from
 /// arrives to provide a natural boundary.
 const SERVER_REPLAY_IDLE_FLUSH: std::time::Duration = std::time::Duration::from_millis(250);
 /// Session creation must not wait indefinitely for the optional title sidecar.
-const SESSION_TITLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+const SESSION_TITLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(18);
 /// Render only this many transcript rows when a thread is first opened.
 /// Slint virtualizes delegates, but giving its ListView the complete model
 /// still makes it estimate and settle every historical row before reaching
@@ -443,7 +443,10 @@ pub enum UiCommand {
 
     // Settings window.
     RefreshSettings,
-    SetTitleModelLoadBehavior(i32),
+    SetTitleModelSettings {
+        load_index: i32,
+        resource_index: i32,
+    },
     InstallTitleModel,
     CancelTitleModelInstall,
     SaveProvider {
@@ -6195,9 +6198,17 @@ impl Controller {
                 self.refresh_settings().await;
                 self.refresh_subscriptions(SubscriptionRefresh::Force);
             }
-            UiCommand::SetTitleModelLoadBehavior(index) => {
-                let behavior = ui::title_model_load_behavior_of(index);
-                match self.client.set_git_worktree_settings(behavior).await {
+            UiCommand::SetTitleModelSettings {
+                load_index,
+                resource_index,
+            } => {
+                let behavior = ui::title_model_load_behavior_of(load_index);
+                let resources = ui::title_model_resource_policy_of(resource_index);
+                match self
+                    .client
+                    .set_git_worktree_settings(behavior, resources)
+                    .await
+                {
                     Ok((cursor, settings)) => {
                         self.apply_git_worktree_settings_snapshot(cursor, settings);
                     }
@@ -8125,6 +8136,8 @@ mod tests {
             event: Event::GitWorktreeSettingsUpdated {
                 settings: trouve_protocol::GitWorktreeSettings {
                     title_model_load_behavior: trouve_protocol::TitleModelLoadBehavior::Off,
+                    title_model_resource_policy:
+                        trouve_protocol::TitleModelResourcePolicy::CpuRamOnly,
                     title_model: trouve_protocol::TitleModelStatus {
                         state: "stopped".into(),
                         detail: String::new(),

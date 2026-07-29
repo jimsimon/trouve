@@ -7035,6 +7035,9 @@
           },
           "title_model_load_behavior": {
             "$ref": "#/components/schemas/TitleModelLoadBehavior"
+          },
+          "title_model_resource_policy": {
+            "$ref": "#/components/schemas/TitleModelResourcePolicy"
           }
         }
       },
@@ -8447,6 +8450,9 @@
         "properties": {
           "title_model_load_behavior": {
             "$ref": "#/components/schemas/TitleModelLoadBehavior"
+          },
+          "title_model_resource_policy": {
+            "$ref": "#/components/schemas/TitleModelResourcePolicy"
           }
         }
       },
@@ -8649,6 +8655,16 @@
           "always",
           "on_demand",
           "off"
+        ]
+      },
+      "TitleModelResourcePolicy": {
+        "type": "string",
+        "description": "Compute resources the dedicated session-title model may use.",
+        "enum": [
+          "adaptive",
+          "gpu_cpu_ram",
+          "gpu_only",
+          "cpu_ram_only"
         ]
       },
       "TitleModelStatus": {
