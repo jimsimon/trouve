@@ -395,6 +395,150 @@ fn to_chat_row(r: &ChatRowData) -> ChatRow {
 thread_local! {
     static LAST_CHAT: std::cell::RefCell<Vec<ChatRowData>> =
         const { std::cell::RefCell::new(Vec::new()) };
+    static CHAT_FIND_BY_THREAD:
+        std::cell::RefCell<std::collections::HashMap<String, ChatFindState>> =
+        std::cell::RefCell::new(std::collections::HashMap::new());
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct ChatFindState {
+    open: bool,
+    query: String,
+    case_sensitive: bool,
+    active_row: Option<i32>,
+}
+
+fn active_chat_find_row(ui: &AppWindow) -> Option<i32> {
+    (ui.get_chat_find_active() >= 0)
+        .then(|| {
+            ui.get_chat_find_matches()
+                .row_data(ui.get_chat_find_active() as usize)
+        })
+        .flatten()
+}
+
+fn current_chat_find_state(ui: &AppWindow) -> ChatFindState {
+    ChatFindState {
+        open: ui.get_chat_find_open(),
+        query: ui.get_chat_find_query().to_string(),
+        case_sensitive: ui.get_chat_find_case_sensitive(),
+        active_row: active_chat_find_row(ui),
+    }
+}
+
+fn store_chat_find_state(thread_key: &str, state: ChatFindState) {
+    if thread_key.is_empty() {
+        return;
+    }
+    CHAT_FIND_BY_THREAD.with(|states| {
+        states.borrow_mut().insert(thread_key.to_string(), state);
+    });
+}
+
+fn chat_find_state_for(thread_key: &str) -> ChatFindState {
+    if thread_key.is_empty() {
+        return ChatFindState::default();
+    }
+    CHAT_FIND_BY_THREAD.with(|states| states.borrow().get(thread_key).cloned().unwrap_or_default())
+}
+
+fn save_chat_find_state(ui: &AppWindow, thread_key: &str) {
+    store_chat_find_state(thread_key, current_chat_find_state(ui));
+}
+
+fn chat_find_indices(rows: &[ChatRowData], query: &str, case_sensitive: bool) -> Vec<i32> {
+    let needle = query.trim();
+    if needle.is_empty() {
+        return Vec::new();
+    }
+    let folded_needle = (!case_sensitive).then(|| needle.to_lowercase());
+    let matches_text = |text: &str| {
+        folded_needle.as_ref().map_or_else(
+            || text.contains(needle),
+            |folded| text.to_lowercase().contains(folded),
+        )
+    };
+
+    rows.iter()
+        .enumerate()
+        .filter_map(|(index, row)| {
+            let fixed_fields = [
+                row.text.as_str(),
+                row.md_lang.as_str(),
+                row.tool_name.as_str(),
+                row.tool_file.as_str(),
+                row.detail.as_str(),
+                row.meta.as_str(),
+                row.subtitle.as_str(),
+                row.q_prompt.as_str(),
+                row.q_other_text.as_str(),
+            ];
+            let matches = fixed_fields.iter().any(|field| matches_text(field))
+                || row
+                    .table_rows
+                    .iter()
+                    .flatten()
+                    .any(|(text, _)| matches_text(text))
+                || row.diff.iter().any(|line| matches_text(&line.text))
+                || row.q_options.iter().any(|(label, _)| matches_text(label))
+                || row
+                    .q_summary
+                    .iter()
+                    .any(|(prompt, answer)| matches_text(prompt) || matches_text(answer));
+            matches.then_some(index as i32)
+        })
+        .collect()
+}
+
+fn refresh_chat_find_now(ui: &AppWindow, reset_active: bool) {
+    let query = ui.get_chat_find_query();
+    let old_active_row = if reset_active {
+        None
+    } else {
+        active_chat_find_row(ui)
+    };
+    refresh_chat_find_matches_now(ui, &query, old_active_row, reset_active);
+}
+
+fn refresh_chat_find_matches_now(
+    ui: &AppWindow,
+    query: &str,
+    preferred_active_row: Option<i32>,
+    reveal: bool,
+) {
+    let matches = LAST_CHAT.with(|cache| {
+        chat_find_indices(
+            cache.borrow().as_slice(),
+            query,
+            ui.get_chat_find_case_sensitive(),
+        )
+    });
+    let active = preferred_active_row
+        .and_then(|row| matches.iter().position(|candidate| *candidate == row))
+        .map_or(if matches.is_empty() { -1 } else { 0 }, |index| {
+            index as i32
+        });
+    ui.set_chat_find_matches(ModelRc::new(VecModel::from(matches)));
+    ui.set_chat_find_active(active);
+    if reveal {
+        ui.invoke_reveal_chat_find_result();
+    }
+}
+
+fn restore_chat_find_state(ui: &AppWindow, thread_key: &str) {
+    let state = chat_find_state_for(thread_key);
+    ui.set_chat_find_open(state.open);
+    ui.set_chat_find_query(state.query.as_str().into());
+    ui.set_chat_find_case_sensitive(state.case_sensitive);
+    refresh_chat_find_matches_now(ui, &state.query, state.active_row, false);
+}
+
+/// Recompute in-transcript find matches after the user edits the query.
+/// This runs on the UI thread and searches the same cached rows driving the
+/// virtualized transcript.
+pub fn refresh_chat_find(ui: &AppWindow) {
+    refresh_chat_find_now(ui, true);
+    save_chat_find_state(ui, ui.get_chat_thread_key().as_str());
 }
 
 /// Drop the chat diff cache so the next `set_chat` rebuilds every row.
@@ -413,13 +557,15 @@ pub fn set_chat(ui: &Ui, rows: Vec<ChatRowData>, thread_key: String, scroll_to_e
     use slint::Model as _;
 
     let _ = ui.upgrade_in_event_loop(move |ui| {
-        let thread_changed = ui.get_chat_thread_key().as_str() != thread_key;
+        let previous_thread_key = ui.get_chat_thread_key().to_string();
+        let thread_changed = previous_thread_key != thread_key;
         // Sampled before the model changes: row add/removes make the
         // ListView re-derive viewport-y from estimated row heights, so a
         // toggle at the tail would land the view at a visibly wrong spot
         // unless we re-pin it below.
         let was_at_bottom = !thread_changed && ui.get_chat_at_bottom();
         if thread_changed {
+            save_chat_find_state(&ui, &previous_thread_key);
             // Flush any user-scroll sample under the old key and cancel its
             // tail/anchor convergence before the new transcript is installed.
             ui.invoke_reset_chat_positioning();
@@ -457,6 +603,12 @@ pub fn set_chat(ui: &Ui, rows: Vec<ChatRowData>, thread_key: String, scroll_to_e
             }
             *cache = rows;
         });
+        if thread_changed {
+            restore_chat_find_state(&ui, &thread_key);
+        } else if ui.get_chat_find_open() {
+            refresh_chat_find_now(&ui, false);
+            save_chat_find_state(&ui, &thread_key);
+        }
         if scroll_to_end || (was_at_bottom && !ui.get_chat_restoring()) {
             // At the tail, the bottom edge is the user's anchor: keep it
             // glued there through the re-layout (collapsing a card at the
@@ -1851,6 +2003,64 @@ mod tests {
 
         assert_eq!(queue_preview(prompt), "If we support multiple users:");
         assert_eq!(queue_preview(" \r\n\t\n"), "");
+    }
+
+    #[test]
+    fn chat_find_supports_both_case_modes_and_searches_structured_rows() {
+        let rows = vec![
+            ChatRowData {
+                text: "Hello from the Agent".into(),
+                ..Default::default()
+            },
+            ChatRowData {
+                tool_file: "src/SearchPanel.rs".into(),
+                detail: "Read completed".into(),
+                ..Default::default()
+            },
+            ChatRowData {
+                q_summary: vec![("Which branch?".into(), "Feature/FIND".into())],
+                ..Default::default()
+            },
+        ];
+
+        assert_eq!(chat_find_indices(&rows, "agent", false), vec![0]);
+        assert_eq!(chat_find_indices(&rows, "searchpanel", false), vec![1]);
+        assert_eq!(chat_find_indices(&rows, "feature/find", false), vec![2]);
+        assert_eq!(chat_find_indices(&rows, "  READ  ", false), vec![1]);
+        assert!(chat_find_indices(&rows, "", false).is_empty());
+        assert!(chat_find_indices(&rows, "missing", false).is_empty());
+
+        assert_eq!(chat_find_indices(&rows, "Agent", true), vec![0]);
+        assert!(chat_find_indices(&rows, "agent", true).is_empty());
+        assert_eq!(chat_find_indices(&rows, "Feature/FIND", true), vec![2]);
+        assert!(chat_find_indices(&rows, "feature/find", true).is_empty());
+    }
+
+    #[test]
+    fn chat_find_state_is_scoped_to_each_thread() {
+        let first = ChatFindState {
+            open: true,
+            query: "Alpha".into(),
+            case_sensitive: true,
+            active_row: Some(12),
+        };
+        let second = ChatFindState {
+            open: false,
+            query: "beta".into(),
+            case_sensitive: false,
+            active_row: Some(3),
+        };
+
+        store_chat_find_state("thread-a", first.clone());
+        store_chat_find_state("thread-b", second.clone());
+
+        assert_eq!(chat_find_state_for("thread-a"), first);
+        assert_eq!(chat_find_state_for("thread-b"), second);
+        assert_eq!(
+            chat_find_state_for("unseen-thread"),
+            ChatFindState::default()
+        );
+        assert_eq!(chat_find_state_for(""), ChatFindState::default());
     }
 
     #[test]
