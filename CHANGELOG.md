@@ -4,6 +4,47 @@ All notable changes to this project are documented in this file. The format
 is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this
 project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [3.5.0] - 2026-07-28
+
+### Added
+
+- **Catalog-backed model providers**: provider setup and model discovery now
+  combine live account availability with a refreshable catalog and offline
+  snapshot, including native Azure OpenAI, Amazon Bedrock, Vertex Gemini, and
+  Anthropic-on-Vertex transports plus provider-specific fields and secrets.
+- **Model-assisted session naming**: an optional managed local model can
+  generate concise session and branch names before worktree creation, with
+  configurable preload policies and deterministic fallback when the model is
+  disabled, unavailable, or resource-constrained.
+- **Automatic review persona routing**: code review can run a fixed Core set,
+  the complete Thorough catalog, or an Auto baseline augmented by path signals
+  and optional semantic triage. Routing choices, reasons, router output, model,
+  and thinking level are durable and inspectable for each job.
+- **Desktop workflow conveniences**: active sessions can prevent system sleep,
+  text inputs have standard context menus, and the New Session screen no
+  longer asks for an absolute workspace registration path.
+
+### Changed
+
+- **Responsive long-running interfaces**: chat history and review transcripts
+  load incrementally, review details no longer wait on live model discovery,
+  and desktop and web activity animations reduce work while hidden or idle.
+- **Targeted review retries**: failed or cancelled reviewer persona batches can
+  be retried without rerunning successful personas.
+- **Lossless burst handling**: provider deltas are coalesced and event-log
+  writes are batched without changing persisted ordering, while bounded
+  per-turn routes keep one overloaded Codex or Cursor turn from stalling
+  unrelated sessions.
+
+### Fixed
+
+- **Cancellation and queue recovery**: replacement Codex turns wait for
+  predecessor interruption, stale routes cannot consume new events, and a
+  prompt submitted during cancellation explicitly resumes dispatch instead of
+  remaining stranded.
+- **Clipboard pasting**: copied text takes precedence when a rich clipboard
+  source also advertises image data.
+
 ## [3.4.2] - 2026-07-26
 
 ### Added
@@ -537,6 +578,7 @@ semble ([BENCHMARKS.md](BENCHMARKS.md)):
 - Incremental reindex (1 file touched): 0.86 s vs ~3 min (212x)
 - Warm query: 0.55 s vs 7.2 s (13x)
 
+[3.5.0]: https://github.com/jimsimon/trouve/compare/v3.4.2...v3.5.0
 [3.4.2]: https://github.com/jimsimon/trouve/compare/v3.4.1...v3.4.2
 [3.4.1]: https://github.com/jimsimon/trouve/compare/v3.4.0...v3.4.1
 [3.4.0]: https://github.com/jimsimon/trouve/compare/v3.3.3...v3.4.0
