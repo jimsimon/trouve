@@ -1633,7 +1633,8 @@ function RepositoryEditor({
   const [draft, setDraft] = useState(repository);
   const [busy, setBusy] = useState(false);
   const [message, flash] = useFlash();
-  useEffect(() => setDraft(repository), [repository]);
+  const persistedRepository = JSON.stringify(repository);
+  useEffect(() => setDraft(repository), [persistedRepository]);
   const persistRepository = async (
     next: Repository,
     successMessage = "Saved",
@@ -2161,7 +2162,8 @@ function ReviewerEditor({
   const [draft, setDraft] = useState(reviewer ?? empty);
   const [busy, setBusy] = useState(false);
   const [message, flash] = useFlash();
-  useEffect(() => setDraft(reviewer ?? empty), [reviewer]);
+  const persistedReviewer = JSON.stringify(reviewer ?? null);
+  useEffect(() => setDraft(reviewer ?? empty), [persistedReviewer]);
   const reviewerModel = models.find(
     (model) => model.id === (draft.model || defaultModel),
   );

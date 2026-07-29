@@ -124,7 +124,7 @@ pub use requests::*;
 // 1.18: code-review repositories and jobs expose coordinator thinking,
 // repository reviewer overrides can select a thinking setting, and canonical
 // settings accept fixed token budgets advertised by older models (additive).
-pub const PROTOCOL_VERSION: &str = "1.18";
+pub const PROTOCOL_VERSION: &str = "1.19";
 pub const EVENT_CURSOR_HEADER: &str = "x-trouve-event-cursor";
 
 pub type WorkspaceId = String;
