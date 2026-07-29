@@ -1634,6 +1634,21 @@ function RepositoryEditor({
   const [busy, setBusy] = useState(false);
   const [message, flash] = useFlash();
   useEffect(() => setDraft(repository), [repository]);
+  const persistRepository = async (
+    next: Repository,
+    successMessage = "Saved",
+  ): Promise<void> => {
+    setBusy(true);
+    try {
+      await saveRepository(next);
+      flash(successMessage);
+      onSaved();
+    } catch (cause) {
+      flash(cause instanceof Error ? cause.message : String(cause));
+    } finally {
+      setBusy(false);
+    }
+  };
   const toggleReviewer = (id: string): void => {
     setDraft((current) => ({
       ...current,
@@ -1718,16 +1733,7 @@ function RepositoryEditor({
       <form
         onSubmit={async (event) => {
           event.preventDefault();
-          setBusy(true);
-          try {
-            await saveRepository(draft);
-            flash("Saved");
-            onSaved();
-          } catch (cause) {
-            flash(cause instanceof Error ? cause.message : String(cause));
-          } finally {
-            setBusy(false);
-          }
+          await persistRepository(draft);
         }}
       >
         <div class="form-grid">
@@ -1817,8 +1823,9 @@ function RepositoryEditor({
               ))}
             </select>
             <small>
-              Required while review is enabled. Reviewers inherit it unless their persona or
-              repository override selects another model.
+              {models.length
+                ? "Required while review is enabled. Reviewers inherit it unless their persona or repository override selects another model."
+                : "No models are currently available. Configure or sign in to a model provider first."}
             </small>
           </label>
           <label>
@@ -1841,7 +1848,6 @@ function RepositoryEditor({
             Semantic router model
             <select
               value={draft.router_model ?? ""}
-              disabled={draft.routing_mode !== "auto" || !draft.semantic_routing}
               onChange={(event) => {
                 const routerModel = event.currentTarget.value || undefined;
                 const selectedRouterModel = models.find(
@@ -1864,6 +1870,7 @@ function RepositoryEditor({
                 </option>
               ))}
             </select>
+            <small>Used only when Auto routing and Semantic triage are enabled.</small>
           </label>
           <label>
             {routerThinking.budget
@@ -1873,7 +1880,6 @@ function RepositoryEditor({
               options={routerThinking}
               value={draft.router_thinking_level ?? ""}
               inheritLabel="Inherit review default"
-              disabled={draft.routing_mode !== "auto" || !draft.semantic_routing}
               onChange={(value) =>
                 setDraft({
                   ...draft,
@@ -2043,6 +2049,21 @@ function RepositoryEditor({
           </button>
           {reviewModelInvalid && (
             <span class="error-text">Select a review model before enabling reviews.</span>
+          )}
+          {repository.mode !== "off" && (
+            <button
+              class="danger ghost"
+              type="button"
+              disabled={busy}
+              onClick={() =>
+                void persistRepository(
+                  { ...draft, mode: "off" },
+                  "Reviews disabled",
+                )
+              }
+            >
+              Disable reviews
+            </button>
           )}
           {message && <span role="status">{message}</span>}
         </div>

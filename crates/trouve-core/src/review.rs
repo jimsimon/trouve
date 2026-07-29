@@ -1759,6 +1759,21 @@ impl Engine {
     ) -> Result<CodeReviewRepository, EngineError> {
         validate_repository(&request.repository)
             .map_err(|error| EngineError::BadRequest(error.to_string()))?;
+        // Disabling must always be an escape hatch for legacy or otherwise
+        // invalid enabled policies. Persist the dormant configuration as-is;
+        // it will be normalized and validated before a later re-enable.
+        if request.mode == CodeReviewMode::Off {
+            self.store.update_code_review_repository(request)?;
+            let repository = self
+                .store
+                .list_code_review_repositories()?
+                .into_iter()
+                .find(|repository| repository.repository == request.repository)
+                .ok_or_else(|| EngineError::Internal(anyhow!("updated repository disappeared")))?;
+            self.code_review.poll_wake.notify_one();
+            self.emit_code_review_updated(None)?;
+            return Ok(repository);
+        }
         let model = request
             .model
             .as_ref()
@@ -6986,6 +7001,50 @@ mod tests {
             error
                 .to_string()
                 .contains("requires an explicit repository model")
+        );
+    }
+
+    #[tokio::test]
+    async fn invalid_legacy_review_policy_can_always_be_disabled() {
+        let data = tempfile::tempdir().unwrap();
+        let store = crate::store::Store::open_in_memory().unwrap();
+        store
+            .upsert_discovered_code_review_repository(7, "acme/widgets", false)
+            .unwrap();
+        let legacy = UpdateCodeReviewRepositoryRequest {
+            installation_id: 7,
+            repository: "acme/widgets".into(),
+            mode: CodeReviewMode::Manual,
+            model: None,
+            coordinator_thinking_level: Some("unsupported".into()),
+            router_model: Some("legacy-unqualified-model".into()),
+            router_thinking_level: Some("unsupported".into()),
+            prompt: String::new(),
+            reviewer_ids: None,
+            routing_mode: None,
+            semantic_routing: None,
+            included_reviewer_ids: None,
+            excluded_reviewer_ids: None,
+            reviewer_overrides: None,
+        };
+        store.update_code_review_repository(&legacy).unwrap();
+        let engine = Engine::new(
+            store,
+            data.path().to_path_buf(),
+            &crate::config::Config::default(),
+        );
+        let disabled = engine
+            .update_code_review_repository(&UpdateCodeReviewRepositoryRequest {
+                mode: CodeReviewMode::Off,
+                ..legacy
+            })
+            .await
+            .unwrap();
+        assert_eq!(disabled.mode, CodeReviewMode::Off);
+        assert!(disabled.model.is_none());
+        assert_eq!(
+            disabled.router_model.as_deref(),
+            Some("legacy-unqualified-model")
         );
     }
 
