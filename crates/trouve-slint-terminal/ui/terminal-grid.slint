@@ -8,8 +8,37 @@ export struct TermSpan {
     text: string,
     fg: color,
     bg: color,
+    bold: bool,
+    dim: bool,
+    italic: bool,
+    underline: bool,
     // True when bg differs from the grid background (skips overdraw).
     has-bg: bool,
+}
+
+component TermTouchKey inherits Rectangle {
+    in property <string> label;
+    in property <bool> checked: false;
+    callback pressed();
+    min-width: 34px;
+    height: 30px;
+    border-radius: 4px;
+    border-width: root.checked ? 1px : 0px;
+    border-color: #79b8ff;
+    background: root.checked ? #174b73 : key-touch.has-hover ? #303030 : #242424;
+    accessible-role: button;
+    accessible-label: root.label;
+    accessible-action-default => { root.pressed(); }
+    Text {
+        text: root.label;
+        color: #e1e1e1;
+        font-size: 12px;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+    }
+    key-touch := TouchArea {
+        clicked => { root.pressed(); }
+    }
 }
 
 export component TerminalGrid inherits Rectangle {
@@ -17,25 +46,79 @@ export component TerminalGrid inherits Rectangle {
     in property <[[TermSpan]]> grid-lines;
     in property <int> cursor-row: -1;
     in property <int> cursor-col: -1;
+    // 0 block, 1 underline, 2 bar (DECSCUSR).
+    in property <int> cursor-shape: 0;
+    in property <bool> cursor-blinking: true;
+    private property <bool> cursor-on: true;
     // Lines scrolled into history (0 = live); shows the "history" badge.
     in property <int> scrollback-lines: 0;
     in property <string> grid-font-family: "monospace";
     in property <length> grid-font-size: 13px;
     in property <color> grid-foreground: #d4d4d4;
     in property <bool> grid-enabled: true;
+    in property <color> selection-color: #2675bf88;
+    in property <int> search-start-row: -1;
+    in property <int> search-start-col: 0;
+    in property <int> search-end-row: -1;
+    in property <int> search-end-col: 0;
+    // Plain visible contents exposed to assistive technology. This is not a
+    // live region, so streaming output does not interrupt the screen reader.
+    in property <string> accessible-text;
+    in property <int> bell-seq: 0;
+    private property <bool> bell-visible: false;
+    // 0 none, 1 press, 2 press/release, 3 button motion, 4 any motion.
+    in property <int> mouse-mode: 0;
+    in property <bool> show-touch-toolbar: false;
+    private property <length> toolbar-height: root.show-touch-toolbar ? 36px : 0px;
+    private property <bool> touch-ctrl: false;
+    private property <bool> touch-alt: false;
+    private property <int> report-button: 0;
+
+    // The host extracts selected text from its terminal model, then bumps
+    // clipboard-seq. This keeps cell/wrap semantics in the VT engine while
+    // leaving platform clipboard access in the widget.
+    in property <string> clipboard-text;
+    in property <int> clipboard-seq: 0;
+
+    // Selection is a normalized cell range: inclusive start, exclusive end.
+    out property <int> selection-start-row: -1;
+    out property <int> selection-start-col: 0;
+    out property <int> selection-end-row: -1;
+    out property <int> selection-end-col: 0;
+    out property <bool> has-selection: root.selection-start-row >= 0
+        && (root.selection-start-row != root.selection-end-row
+            || root.selection-start-col != root.selection-end-col);
+    private property <int> selection-anchor-row: -1;
+    private property <int> selection-anchor-col: 0;
+    private property <bool> copied: false;
+    in property <int> host-selection-start-row: -1;
+    in property <int> host-selection-start-col: 0;
+    in property <int> host-selection-end-row: -1;
+    in property <int> host-selection-end-col: 0;
+    in property <int> host-selection-seq: 0;
+    private property <bool> awaiting-third-click: false;
 
     // Cell metrics probed from the actual font, exported so hosts can size
     // the PTY: number of whole cells that fit the current widget size.
     out property <length> cell-width: probe.preferred-width / 100;
     out property <length> cell-height: probe.preferred-height * 1.15;
     out property <int> grid-cols: max(2, floor(root.width / root.cell-width));
-    out property <int> grid-rows-count: max(2, floor(root.height / root.cell-height));
+    out property <int> grid-rows-count: max(2,
+        floor((root.height - root.toolbar-height) / root.cell-height));
 
     // A key press with modifiers (special keys arrive as Slint's
     // private-use-area code points). The host encodes and writes to the PTY.
     callback key-pressed(text: string, ctrl: bool, alt: bool, shift: bool);
     // Clipboard text pasted via Ctrl+Shift+V.
     callback paste-text(text: string);
+    // Requests host-side extraction of the selected cell range.
+    callback copy-requested(start-row: int, start-col: int, end-row: int, end-col: int);
+    // kind: 0 press, 1 release, 2 move, 3 wheel-up, 4 wheel-down;
+    // button: 0 none, 1 left, 2 middle, 3 right.
+    callback mouse-event(kind: int, button: int, row: int, col: int,
+                         ctrl: bool, alt: bool, shift: bool);
+    callback unit-selection-requested(row: int, col: int, /* line */ bool);
+    callback link-requested(row: int, col: int);
     // Mouse wheel: positive = towards history, in lines.
     callback wheel(lines: int);
     // The widget was resized to a new cell grid (debounce host-side).
@@ -45,13 +128,92 @@ export component TerminalGrid inherits Rectangle {
         keys.focus();
     }
 
+    function clear-selection() {
+        root.selection-start-row = -1;
+        root.selection-end-row = -1;
+        root.selection-anchor-row = -1;
+    }
+
+    function point-to-row(y: length) -> int {
+        return max(0, min(root.grid-rows-count - 1, floor(y / root.cell-height)));
+    }
+
+    function point-to-col(x: length) -> int {
+        return max(0, min(root.grid-cols, round(x / root.cell-width)));
+    }
+
+    function update-selection(row: int, col: int) {
+        if (row > root.selection-anchor-row
+            || (row == root.selection-anchor-row && col >= root.selection-anchor-col)) {
+            root.selection-start-row = root.selection-anchor-row;
+            root.selection-start-col = root.selection-anchor-col;
+            root.selection-end-row = row;
+            root.selection-end-col = col;
+        } else {
+            root.selection-start-row = row;
+            root.selection-start-col = col;
+            root.selection-end-row = root.selection-anchor-row;
+            root.selection-end-col = root.selection-anchor-col;
+        }
+    }
+
+    function request-copy() {
+        if (root.has-selection) {
+            root.copy-requested(
+                root.selection-start-row,
+                root.selection-start-col,
+                root.selection-end-row,
+                root.selection-end-col);
+        }
+    }
+
+    function send-touch-key(text: string) {
+        root.key-pressed(text, root.touch-ctrl, root.touch-alt, false);
+        root.touch-ctrl = false;
+        root.touch-alt = false;
+    }
+
+    pure function is-special-key(text: string) -> bool {
+        return text == Key.Return || text == Key.Backspace || text == Key.Tab
+            || text == Key.Escape || text == Key.Delete || text == Key.UpArrow
+            || text == Key.DownArrow || text == Key.LeftArrow || text == Key.RightArrow
+            || text == Key.Home || text == Key.End || text == Key.PageUp
+            || text == Key.PageDown || text == Key.Insert || text == Key.F1
+            || text == Key.F2 || text == Key.F3 || text == Key.F4 || text == Key.F5
+            || text == Key.F6 || text == Key.F7 || text == Key.F8 || text == Key.F9
+            || text == Key.F10 || text == Key.F11 || text == Key.F12;
+    }
+
+    function copy-host-text() {
+        if (root.clipboard-text != "") {
+            copy-sink.text = root.clipboard-text;
+            copy-sink.select-all();
+            copy-sink.copy();
+            copy-sink.text = "";
+            root.copied = true;
+        }
+    }
+
     // The init emit reports the size a freshly created grid settled on
     // (changed handlers only fire on later changes).
     init => { root.grid-resized(root.grid-cols, root.grid-rows-count); }
     changed grid-cols => { root.grid-resized(root.grid-cols, root.grid-rows-count); }
     changed grid-rows-count => { root.grid-resized(root.grid-cols, root.grid-rows-count); }
+    changed grid-lines => { root.clear-selection(); root.cursor-on = true; }
+    changed clipboard-seq => { root.copy-host-text(); }
+    changed bell-seq => { root.bell-visible = true; }
+    changed host-selection-seq => {
+        root.selection-start-row = root.host-selection-start-row;
+        root.selection-start-col = root.host-selection-start-col;
+        root.selection-end-row = root.host-selection-end-row;
+        root.selection-end-col = root.host-selection-end-col;
+    }
 
     background: #101010;
+    accessible-role: text;
+    accessible-label: "Terminal";
+    accessible-description: "Interactive shell. Use the terminal toolbar for touch controls.";
+    accessible-value: root.accessible-text;
     forward-focus: keys;
 
     // Invisible metrics probe: 100 zeros wide so integer rounding of the
@@ -65,45 +227,173 @@ export component TerminalGrid inherits Rectangle {
         font-size: root.grid-font-size;
     }
 
-    keys := FocusScope {
+    keys := TextInput {
+        width: 1px;
+        height: 1px;
+        opacity: 0;
+        single-line: true;
         enabled: root.grid-enabled;
 
         key-pressed(event) => {
+            // Ctrl+C remains PTY input; terminal copy convention is
+            // Ctrl+Shift+C, with Command+C on Apple platforms.
+            if (root.has-selection
+                && ((event.modifiers.control && event.modifiers.shift)
+                    || event.modifiers.meta)
+                && (event.text == "c" || event.text == "C")) {
+                root.request-copy();
+                return accept;
+            }
             // Ctrl+Shift+V pastes; everything else goes to the PTY.
-            if (event.modifiers.control && event.modifiers.shift && (event.text == "v" || event.text == "V")) {
+            if (((event.modifiers.control && event.modifiers.shift)
+                    || event.modifiers.meta)
+                && (event.text == "v" || event.text == "V")) {
                 clip.text = "";
                 clip.paste();
                 return accept;
             }
-            root.key-pressed(
-                event.text,
-                event.modifiers.control,
-                event.modifiers.alt,
-                event.modifiers.shift);
-            return accept;
+            // Let unmodified printable text flow through TextInput so the
+            // platform IME can compose it. Navigation/control keys bypass
+            // the editor and retain terminal semantics.
+            let alt-gr-text = event.modifiers.control && event.modifiers.alt
+                && !event.modifiers.meta && !root.is-special-key(event.text);
+            if (root.is-special-key(event.text)
+                || ((event.modifiers.control || event.modifiers.alt || event.modifiers.meta)
+                    && !alt-gr-text)) {
+                root.key-pressed(
+                    event.text,
+                    event.modifiers.control,
+                    event.modifiers.alt,
+                    event.modifiers.shift);
+                return accept;
+            }
+            return reject;
         }
-
-        // Hidden clipboard shuttle: paste() lands here, then the edited
-        // callback hands the text to the host and clears.
-        clip := TextInput {
-            width: 0;
-            height: 0;
-            opacity: 0;
-            edited => {
-                if (self.text != "") {
-                    root.paste-text(self.text);
-                    self.text = "";
-                }
+        edited => {
+            if (self.text != "") {
+                root.key-pressed(self.text, false, false, false);
+                self.text = "";
             }
         }
     }
 
+    // Hidden clipboard shuttle: paste() lands here, then the edited
+    // callback hands the text to the host and clears.
+    clip := TextInput {
+        width: 0;
+        height: 0;
+        opacity: 0;
+        edited => {
+            if (self.text != "") {
+                root.paste-text(self.text);
+                self.text = "";
+            }
+        }
+    }
+
+    copy-sink := TextInput {
+        visible: false;
+        width: 0;
+        height: 0;
+        single-line: false;
+    }
+
+    Timer {
+        interval: 1.2s;
+        running: root.copied;
+        triggered => { root.copied = false; }
+    }
+    Timer {
+        interval: 500ms;
+        running: root.awaiting-third-click;
+        triggered => { root.awaiting-third-click = false; }
+    }
+
+    Timer {
+        interval: 120ms;
+        running: root.bell-visible;
+        triggered => { root.bell-visible = false; }
+    }
+    Timer {
+        interval: 550ms;
+        running: root.cursor-blinking && keys.has-focus
+            && root.cursor-row >= 0 && root.cursor-col >= 0;
+        triggered => { root.cursor-on = !root.cursor-on; }
+    }
+
     ta := TouchArea {
+        height: root.height - root.toolbar-height;
         mouse-cursor: text;
-        clicked => { keys.focus(); }
+        pointer-event(event) => {
+            let button-code = event.button == PointerEventButton.left ? 1
+                : event.button == PointerEventButton.middle ? 2
+                : event.button == PointerEventButton.right ? 3 : 0;
+            let selecting = root.mouse-mode == 0
+                || event.modifiers.shift || event.touch-finger-id != 0;
+            if (event.kind == PointerEventKind.down) {
+                keys.focus();
+                root.copied = false;
+                if (selecting && event.button == PointerEventButton.left
+                    && (event.modifiers.control || event.modifiers.meta)) {
+                    root.selection-anchor-row = -1;
+                    root.link-requested(
+                        root.point-to-row(self.pressed-y), root.point-to-col(self.pressed-x));
+                } else if (selecting && event.button == PointerEventButton.left) {
+                    root.selection-anchor-row = root.point-to-row(self.pressed-y);
+                    root.selection-anchor-col = root.point-to-col(self.pressed-x);
+                    root.update-selection(
+                        root.selection-anchor-row,
+                        root.selection-anchor-col);
+                } else if (!selecting) {
+                    root.report-button = button-code;
+                    root.mouse-event(0, button-code,
+                        root.point-to-row(self.mouse-y), root.point-to-col(self.mouse-x),
+                        event.modifiers.control, event.modifiers.alt, event.modifiers.shift);
+                }
+            } else if (!selecting && event.kind == PointerEventKind.up) {
+                let released-button = button-code != 0 ? button-code : root.report-button;
+                root.mouse-event(1, released-button,
+                    root.point-to-row(self.mouse-y), root.point-to-col(self.mouse-x),
+                    event.modifiers.control, event.modifiers.alt, event.modifiers.shift);
+                root.report-button = 0;
+            } else if (!selecting && event.kind == PointerEventKind.move
+                && root.mouse-mode >= 3) {
+                root.mouse-event(2, root.report-button,
+                    root.point-to-row(self.mouse-y), root.point-to-col(self.mouse-x),
+                    event.modifiers.control, event.modifiers.alt, event.modifiers.shift);
+            }
+        }
+        moved => {
+            if (self.pressed && root.selection-anchor-row >= 0) {
+                root.update-selection(
+                    root.point-to-row(self.mouse-y),
+                    root.point-to-col(self.mouse-x));
+            }
+        }
+        clicked => {
+            if (root.awaiting-third-click && root.mouse-mode == 0) {
+                root.awaiting-third-click = false;
+                root.unit-selection-requested(
+                    root.point-to-row(self.mouse-y), root.point-to-col(self.mouse-x), true);
+            }
+        }
+        double-clicked => {
+            if (root.mouse-mode == 0) {
+                root.awaiting-third-click = true;
+                root.unit-selection-requested(
+                    root.point-to-row(self.mouse-y), root.point-to-col(self.mouse-x), false);
+            }
+        }
         scroll-event(event) => {
             if (event.delta-y != 0) {
-                root.wheel(event.delta-y > 0 ? 3 : -3);
+                root.clear-selection();
+                if (root.mouse-mode != 0 && !event.modifiers.shift) {
+                    root.mouse-event(event.delta-y > 0 ? 3 : 4, 0,
+                        root.point-to-row(self.mouse-y), root.point-to-col(self.mouse-x),
+                        event.modifiers.control, event.modifiers.alt, event.modifiers.shift);
+                } else {
+                    root.wheel(event.delta-y > 0 ? 3 : -3);
+                }
                 return accept;
             }
             return reject;
@@ -113,23 +403,60 @@ export component TerminalGrid inherits Rectangle {
     // The cell grid. Rows are absolutely positioned so partial rows at the
     // bottom simply clip.
     grid := Rectangle {
+        height: root.height - root.toolbar-height;
         clip: true;
         for line[r] in root.grid-lines: Rectangle {
             x: 0;
             y: r * root.cell-height;
             height: root.cell-height;
             width: root.width;
+            if root.search-start-row >= 0
+                && r >= root.search-start-row
+                && r <= root.search-end-row: Rectangle {
+                property <length> from: r == root.search-start-row
+                    ? root.search-start-col * root.cell-width : 0px;
+                property <length> to: r == root.search-end-row
+                    ? root.search-end-col * root.cell-width : root.width;
+                x: self.from;
+                width: max(0px, min(root.width, self.to) - self.from);
+                height: parent.height;
+                background: #d9a40088;
+            }
+            if root.has-selection
+                && r >= root.selection-start-row
+                && r <= root.selection-end-row: Rectangle {
+                property <length> from: r == root.selection-start-row
+                    ? root.selection-start-col * root.cell-width : 0px;
+                property <length> to: r == root.selection-end-row
+                    ? root.selection-end-col * root.cell-width : root.width;
+                x: self.from;
+                width: max(0px, min(root.width, self.to) - self.from);
+                height: parent.height;
+                background: root.selection-color;
+            }
             HorizontalLayout {
                 alignment: start;
-                for span in line: Rectangle {
+                for span in line: span-box := Rectangle {
+                    width: span-text.preferred-width;
+                    height: root.cell-height;
                     background: span.has-bg ? span.bg : transparent;
-                    Text {
+                    span-text := Text {
                         text: span.text;
                         color: span.fg;
+                        opacity: span.dim ? 0.6 : 1;
                         font-family: root.grid-font-family;
                         font-size: root.grid-font-size;
+                        font-weight: span.bold ? 700 : 400;
+                        font-italic: span.italic;
                         vertical-alignment: center;
                         height: root.cell-height;
+                    }
+                    if span.underline: Rectangle {
+                        y: parent.height - 2px;
+                        width: parent.width;
+                        height: 1px;
+                        background: span.fg;
+                        opacity: span.dim ? 0.6 : 1;
                     }
                 }
             }
@@ -138,13 +465,55 @@ export component TerminalGrid inherits Rectangle {
         // Block cursor: filled when focused, outline otherwise.
         if root.cursor-row >= 0 && root.cursor-col >= 0: Rectangle {
             x: root.cursor-col * root.cell-width;
-            y: root.cursor-row * root.cell-height;
-            width: root.cell-width;
-            height: root.cell-height;
-            background: keys.has-focus ? root.grid-foreground.with-alpha(0.55) : transparent;
-            border-width: keys.has-focus ? 0 : 1px;
+            y: root.cursor-row * root.cell-height
+                + (root.cursor-shape == 1 ? root.cell-height - 2px : 0px);
+            width: root.cursor-shape == 2 ? 2px : root.cell-width;
+            height: root.cursor-shape == 1 ? 2px : root.cell-height;
+            visible: !root.cursor-blinking || root.cursor-on || !keys.has-focus;
+            background: keys.has-focus || root.cursor-shape != 0
+                ? root.grid-foreground.with-alpha(0.55) : transparent;
+            border-width: keys.has-focus || root.cursor-shape != 0 ? 0 : 1px;
             border-color: root.grid-foreground.with-alpha(0.7);
         }
+    }
+
+    if root.show-touch-toolbar: Rectangle {
+        y: root.height - root.toolbar-height;
+        height: root.toolbar-height;
+        background: #181818;
+        border-width: 1px;
+        border-color: #353535;
+        HorizontalLayout {
+            padding: 3px;
+            spacing: 3px;
+            TermTouchKey { label: "Esc"; pressed => { root.send-touch-key(Key.Escape); } }
+            TermTouchKey { label: "Tab"; pressed => { root.send-touch-key(Key.Tab); } }
+            TermTouchKey {
+                label: "Ctrl";
+                checked: root.touch-ctrl;
+                pressed => { root.touch-ctrl = !root.touch-ctrl; }
+            }
+            TermTouchKey {
+                label: "Alt";
+                checked: root.touch-alt;
+                pressed => { root.touch-alt = !root.touch-alt; }
+            }
+            TermTouchKey { label: "←"; pressed => { root.send-touch-key(Key.LeftArrow); } }
+            TermTouchKey { label: "↓"; pressed => { root.send-touch-key(Key.DownArrow); } }
+            TermTouchKey { label: "↑"; pressed => { root.send-touch-key(Key.UpArrow); } }
+            TermTouchKey { label: "→"; pressed => { root.send-touch-key(Key.RightArrow); } }
+            TermTouchKey {
+                label: "Paste";
+                min-width: 50px;
+                pressed => { clip.text = ""; clip.paste(); }
+            }
+        }
+    }
+
+    if root.bell-visible: Rectangle {
+        border-width: 2px;
+        border-color: root.grid-foreground.with-alpha(0.8);
+        background: root.grid-foreground.with-alpha(0.08);
     }
 
     // Scrolled-into-history badge.
@@ -159,6 +528,31 @@ export component TerminalGrid inherits Rectangle {
             text: "history · " + root.scrollback-lines;
             color: #d4d4d4;
             font-size: root.grid-font-size * 0.85;
+        }
+    }
+
+    // A visible copy affordance makes selection useful on touch-only
+    // devices as well as desktops with Ctrl+Shift+C / Command+C.
+    if root.has-selection: Rectangle {
+        x: 8px;
+        y: 6px;
+        width: copy-label.preferred-width + 20px;
+        height: copy-label.preferred-height + 10px;
+        background: copy-ta.has-hover ? #202020ee : #000000cc;
+        border-radius: 4px;
+        accessible-role: button;
+        accessible-label: root.copied ? "Copied terminal selection" : "Copy terminal selection";
+        accessible-action-default => { root.request-copy(); }
+        copy-label := Text {
+            text: root.copied ? "Copied" : "Copy";
+            color: root.copied ? #7fd18a : #d4d4d4;
+            font-size: root.grid-font-size * 0.85;
+            horizontal-alignment: center;
+            vertical-alignment: center;
+        }
+        copy-ta := TouchArea {
+            mouse-cursor: pointer;
+            clicked => { root.request-copy(); }
         }
     }
 }

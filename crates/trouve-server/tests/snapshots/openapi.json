@@ -7,7 +7,7 @@
       "name": "MIT",
       "identifier": "MIT"
     },
-    "version": "1.17"
+    "version": "1.18"
   },
   "paths": {
     "/v1/approvals": {
@@ -2983,6 +2983,93 @@
       "post": {
         "tags": [],
         "operationId": "open_terminal",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/OpenTerminalRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TerminalInfo"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/sessions/{id}/terminals": {
+      "get": {
+        "tags": [],
+        "operationId": "list_terminals",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/TerminalInfo"
+                  }
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      },
+      "post": {
+        "tags": [],
+        "operationId": "create_terminal",
         "parameters": [
           {
             "name": "id",
@@ -7586,7 +7673,7 @@
       },
       "OpenTerminalRequest": {
         "type": "object",
-        "description": "Open (or re-attach to) the session's terminal.",
+        "description": "Initial dimensions for a newly created terminal. The singular compatibility\nendpoint ignores these values when it re-attaches to a live terminal.",
         "required": [
           "cols",
           "rows"
@@ -7595,7 +7682,6 @@
           "cols": {
             "type": "integer",
             "format": "int32",
-            "description": "Initial grid size; ignored when re-attaching to a live terminal.",
             "minimum": 0
           },
           "rows": {

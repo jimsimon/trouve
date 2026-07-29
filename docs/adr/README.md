@@ -28,3 +28,4 @@ sequentially.
 | [0016](0016-catalog-backed-provider-transports.md) | Catalog-backed provider transports | Accepted |
 | [0017](0017-server-owned-session-title-model.md) | Server-owned session title model with heuristic fallback | Accepted |
 | [0018](0018-bounded-coalesced-event-ingestion.md) | Bounded, coalesced event ingestion | Accepted |
+| [0019](0019-multiple-ephemeral-terminals-per-session.md) | Multiple ephemeral terminals per session | Accepted |
