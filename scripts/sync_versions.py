@@ -397,6 +397,47 @@ def sync_internal_pins(holder: dict, expected: str) -> list[str]:
     return changes
 
 
+def sync_first_party_registry_lock_records(
+    payload: dict, expected: str
+) -> list[str]:
+    """Keep installed first-party lock records consistent before publication."""
+    packages = payload.get("packages", {})
+    if not isinstance(packages, dict):
+        return []
+
+    changes: list[str] = []
+    prefix = f"node_modules/{INTERNAL_SCOPE}"
+    for location, record in packages.items():
+        if (
+            not str(location).startswith(prefix)
+            or not isinstance(record, dict)
+            or record.get("link") is True
+        ):
+            continue
+        found = record.get("version")
+        if found != expected:
+            changes.append(
+                f"packages[{location!r}]: version {found!r} "
+                f"(expected {expected!r})"
+            )
+            if isinstance(found, str):
+                resolved = record.get("resolved")
+                old_suffix = f"-{found}.tgz"
+                if isinstance(resolved, str) and resolved.endswith(old_suffix):
+                    record["resolved"] = (
+                        f"{resolved[:-len(old_suffix)]}-{expected}.tgz"
+                    )
+                else:
+                    record.pop("resolved", None)
+            record["version"] = expected
+            # The new tarball does not exist yet, so its integrity cannot be
+            # known during release preparation.
+            record.pop("integrity", None)
+        for pin_change in sync_internal_pins(record, expected):
+            changes.append(f"packages[{location!r}]: {pin_change}")
+    return changes
+
+
 def set_version(holder: dict, expected: str) -> None:
     if "version" in holder:
         holder["version"] = expected
@@ -430,6 +471,12 @@ def sync_json_artifacts(root: Path, expected: str, *, check: bool) -> list[str]:
                 changed = True
             for pin_change in sync_internal_pins(holder, expected):
                 changes.append(f"{path.relative_to(root)} {label}: {pin_change}")
+                changed = True
+        if path.name == "package-lock.json":
+            for lock_change in sync_first_party_registry_lock_records(
+                payload, expected
+            ):
+                changes.append(f"{path.relative_to(root)} {lock_change}")
                 changed = True
         if changed and not check:
             path.write_text(

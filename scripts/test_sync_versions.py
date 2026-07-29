@@ -275,7 +275,14 @@ version = "2.1.0"
                         "node_modules/@trouve-ai/search-core": {
                             "name": "@trouve-ai/search-core",
                             "version": "9.9.9",
-                            "resolved": "https://registry.example/search-core.tgz",
+                            "resolved": (
+                                "https://registry.example/"
+                                "search-core-9.9.9.tgz"
+                            ),
+                            "integrity": "sha512-stale",
+                            "dependencies": {
+                                "@trouve-ai/runtime": "2.1.0"
+                            },
                         },
                     },
                 },
@@ -321,7 +328,21 @@ version = "2.1.0"
             )
             self.assertEqual(
                 lock["packages"]["node_modules/@trouve-ai/search-core"]["version"],
-                "9.9.9",
+                "3.0.0",
+            )
+            self.assertEqual(
+                lock["packages"]["node_modules/@trouve-ai/search-core"]["resolved"],
+                "https://registry.example/search-core-3.0.0.tgz",
+            )
+            self.assertNotIn(
+                "integrity",
+                lock["packages"]["node_modules/@trouve-ai/search-core"],
+            )
+            self.assertEqual(
+                lock["packages"]["node_modules/@trouve-ai/search-core"][
+                    "dependencies"
+                ]["@trouve-ai/runtime"],
+                "3.0.0",
             )
             self.assertEqual(
                 json.loads(claude_path.read_text(encoding="utf-8"))["version"],
