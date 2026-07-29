@@ -804,6 +804,11 @@ impl PromptDrafts {
     fn get(&self, thread_id: &str) -> String {
         self.0.get(thread_id).cloned().unwrap_or_default()
     }
+
+    fn retain_live(&mut self, live_thread_ids: &HashSet<String>) {
+        self.0
+            .retain(|thread_id, _| live_thread_ids.contains(thread_id));
+    }
 }
 
 fn thread_attention(vm: &ThreadViewModel) -> AttentionCounts {
@@ -1817,6 +1822,8 @@ impl Controller {
         for thread_id in stale_threads {
             self.stop_following_thread(&thread_id);
         }
+        let live_thread_ids = self.thread_sessions.keys().cloned().collect();
+        self.prompt_drafts.retain_live(&live_thread_ids);
         self.attention_by_session
             .retain(|session_id, _| session_ids.contains(session_id));
         // If the open session vanished (deleted in another window or by an
@@ -4949,6 +4956,13 @@ impl Controller {
                     let id = self.sessions[i].id.clone();
                     let was_current = self.current_session == Some(i);
                     self.client.delete_session(&id).await?;
+                    let live_thread_ids = self
+                        .thread_sessions
+                        .iter()
+                        .filter(|(_, session_id)| *session_id != &id)
+                        .map(|(thread_id, _)| thread_id.clone())
+                        .collect();
+                    self.prompt_drafts.retain_live(&live_thread_ids);
                     // Drop the session's resume bookmarks along with it.
                     if let Some(thread_id) = self.resume.session_threads.remove(&id) {
                         self.resume.thread_scroll.remove(&thread_id);
@@ -8128,6 +8142,8 @@ fn session_title_fallback(prompt: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashSet;
+
     use super::{
         ChatWindow, PromptDrafts, ServerReplayBuffer, SubscriptionRefresh,
         SubscriptionRefreshState, approval_pill, attention_badge, check_pill, classify_pr,
@@ -8232,6 +8248,18 @@ mod tests {
         drafts.update("thread-a".into(), String::new());
         assert_eq!(drafts.get("thread-a"), "");
         assert_eq!(drafts.get("thread-b"), "draft for b");
+    }
+
+    #[test]
+    fn prompt_drafts_drop_nonempty_text_for_threads_that_are_no_longer_live() {
+        let mut drafts = PromptDrafts::default();
+        drafts.update("live-thread".into(), "keep me".into());
+        drafts.update("deleted-thread".into(), "remove me".into());
+
+        drafts.retain_live(&HashSet::from(["live-thread".into()]));
+
+        assert_eq!(drafts.get("live-thread"), "keep me");
+        assert_eq!(drafts.get("deleted-thread"), "");
     }
 
     #[test]
