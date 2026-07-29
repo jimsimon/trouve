@@ -50,6 +50,28 @@ const SESSION_TITLE_TIMEOUT: std::time::Duration = std::time::Duration::from_sec
 const CHAT_WINDOW_ROWS: usize = 160;
 /// Refill history before the reader lands exactly on the first loaded row.
 const CHAT_HISTORY_REFILL_ROWS: usize = 20;
+/// Fold persisted thread history only after its SSE replay has gone quiet.
+///
+/// The server sends replay in bounded pages. Flushing on a fixed timer from
+/// the first envelope makes a long transcript repaint page by page, so its
+/// bounded window still appears to stream from the beginning. Treat this as
+/// an idle debounce instead: every arriving replay envelope restarts the
+/// quiet period and the controller receives one completed backlog batch.
+const THREAD_REPLAY_IDLE_FLUSH: std::time::Duration = std::time::Duration::from_millis(250);
+
+async fn wait_for_thread_replay_idle(generation: &std::sync::atomic::AtomicU64) {
+    use std::sync::atomic::Ordering;
+
+    let mut observed = generation.load(Ordering::Acquire);
+    loop {
+        tokio::time::sleep(THREAD_REPLAY_IDLE_FLUSH).await;
+        let current = generation.load(Ordering::Acquire);
+        if current == observed {
+            return;
+        }
+        observed = current;
+    }
+}
 
 /// The absolute rendered-row interval currently installed in the chat list.
 ///
@@ -2633,6 +2655,7 @@ impl Controller {
             use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
             let cursor = std::sync::Arc::new(AtomicU64::new(0));
             let replay = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            let replay_generation = std::sync::Arc::new(AtomicU64::new(0));
             let replay_flush_scheduled = std::sync::Arc::new(AtomicBool::new(false));
             // Startup history predates this app run and is already viewed;
             // persisted envelopes after the stream has gone live are a
@@ -2642,6 +2665,7 @@ impl Controller {
                 let id = thread_id.clone();
                 let seen = cursor.clone();
                 let replay = replay.clone();
+                let replay_generation = replay_generation.clone();
                 let flush_scheduled = replay_flush_scheduled.clone();
                 let live_seen = live_seen.clone();
                 let event_tx = tx.clone();
@@ -2654,20 +2678,25 @@ impl Controller {
                             .is_ok_and(|age| age > std::time::Duration::from_secs(2));
                         if persisted_replay {
                             replay.lock().unwrap().push(envelope);
+                            replay_generation.fetch_add(1, Ordering::Release);
                             if !flush_scheduled.swap(true, Ordering::AcqRel) {
                                 let replay = replay.clone();
+                                let replay_generation = replay_generation.clone();
                                 let flush_scheduled = flush_scheduled.clone();
+                                let live_seen = live_seen.clone();
                                 let event_tx = event_tx.clone();
                                 let id = id.clone();
-                                let mark_unread = live_seen.load(Ordering::Relaxed);
                                 tokio::spawn(async move {
-                                    // Let the local replay producer fill the
-                                    // batch before handing it to the
-                                    // controller's unbounded command queue.
-                                    tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+                                    // Do not repaint a long transcript once
+                                    // per server replay page. Wait until no
+                                    // persisted envelope has arrived for a
+                                    // complete quiet period, then install
+                                    // the bounded transcript tail once.
+                                    wait_for_thread_replay_idle(&replay_generation).await;
                                     flush_scheduled.store(false, Ordering::Release);
                                     let batch = std::mem::take(&mut *replay.lock().unwrap());
                                     if !batch.is_empty() {
+                                        let mark_unread = live_seen.load(Ordering::Relaxed);
                                         let _ = event_tx.send(UiCommand::Events(
                                             id,
                                             batch,
@@ -8080,11 +8109,11 @@ fn session_title_fallback(prompt: &str) -> String {
 mod tests {
     use super::{
         ChatWindow, ServerReplayBuffer, SubscriptionRefresh, SubscriptionRefreshState,
-        approval_pill, attention_badge, check_pill, classify_pr, download_progress,
-        format_pr_dashboard_refresh_status, human_age, human_rate, is_web_url, merge_pill,
-        model_health_view, pr_badge, project_session_prs, provider_login_requires_code,
+        THREAD_REPLAY_IDLE_FLUSH, approval_pill, attention_badge, check_pill, classify_pr,
+        download_progress, format_pr_dashboard_refresh_status, human_age, human_rate, is_web_url,
+        merge_pill, model_health_view, pr_badge, project_session_prs, provider_login_requires_code,
         reconcile_pr_group_order, reconcile_workspace_order, reorder_id, session_title_fallback,
-        should_open_chat_at_tail, thinking_property,
+        should_open_chat_at_tail, thinking_property, wait_for_thread_replay_idle,
     };
     use chrono::{Duration, TimeZone, Utc};
     use trouve_protocol::{
@@ -8646,6 +8675,30 @@ mod tests {
         assert!(window.initialized);
         assert_eq!(window.range(), 390..500);
         assert_eq!(window.local_row(410), Some(20));
+    }
+
+    #[tokio::test]
+    async fn thread_replay_flush_waits_for_a_complete_quiet_period() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        let generation = std::sync::Arc::new(AtomicU64::new(1));
+        let waiting_on = generation.clone();
+        let mut wait = tokio::spawn(async move { wait_for_thread_replay_idle(&waiting_on).await });
+        tokio::task::yield_now().await;
+
+        tokio::time::sleep(THREAD_REPLAY_IDLE_FLUSH / 2).await;
+        generation.fetch_add(1, Ordering::Release);
+
+        assert!(
+            tokio::time::timeout(THREAD_REPLAY_IDLE_FLUSH * 3 / 4, &mut wait)
+                .await
+                .is_err(),
+            "a new replay envelope must restart the idle wait"
+        );
+        tokio::time::timeout(THREAD_REPLAY_IDLE_FLUSH * 2, wait)
+            .await
+            .expect("replay wait should finish after a quiet period")
+            .expect("replay wait task should not panic");
     }
 
     #[test]
