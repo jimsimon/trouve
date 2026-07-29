@@ -134,9 +134,29 @@ fn enable_skia_partial_rendering() {
     }
 }
 
+/// Slint 1.17 matches its standard editing shortcuts against lowercase key
+/// text. Winit reports these letters uppercase while Caps Lock is active, so
+/// normalize just the affected primary-modifier shortcuts before Slint sees
+/// them. Shift remains significant (for example, Ctrl+Shift+C in a terminal).
+fn normalized_editing_shortcut(text: &str, primary: bool, shift: bool) -> Option<&'static str> {
+    if !primary || shift {
+        return None;
+    }
+    match text {
+        "A" => Some("a"),
+        "C" => Some("c"),
+        "V" => Some("v"),
+        "X" => Some("x"),
+        "Y" => Some("y"),
+        "Z" => Some("z"),
+        _ => None,
+    }
+}
+
 /// Track focus for notifications and occlusion for animation scheduling.
 /// Visible windows stay display-paced even without keyboard focus; an
-/// occluded/minimized window should not wake the renderer at all.
+/// occluded/minimized window should not wake the renderer at all. The same
+/// Winit filter also normalizes editing shortcuts affected by Caps Lock.
 fn install_window_activity_tracking(
     window: &AppWindow,
     focused: std::sync::Arc<std::sync::atomic::AtomicBool>,
@@ -148,7 +168,8 @@ fn install_window_activity_tracking(
     let mut has_focus = false;
     let mut occluded = false;
     let mut reported_focus = false;
-    window.window().on_winit_window_event(move |_, event| {
+    let mut modifiers = winit::keyboard::ModifiersState::default();
+    window.window().on_winit_window_event(move |window, event| {
         let state_changed = match event {
             winit::event::WindowEvent::Focused(next) => {
                 has_focus = *next;
@@ -171,6 +192,33 @@ fn install_window_activity_tracking(
                 reported_focus = focused_and_visible;
                 let _ = tx.send(UiCommand::WindowFocusChanged(focused_and_visible));
             }
+        }
+
+        if let winit::event::WindowEvent::ModifiersChanged(next) = event {
+            modifiers = next.state();
+        }
+
+        if let winit::event::WindowEvent::KeyboardInput { event, .. } = event
+            && let winit::keyboard::Key::Character(text) = &event.logical_key
+            && let Some(text) = normalized_editing_shortcut(
+                text,
+                modifiers.control_key() || modifiers.super_key(),
+                modifiers.shift_key(),
+            )
+        {
+            let event = match (event.state, event.repeat) {
+                (winit::event::ElementState::Pressed, false) => {
+                    slint::platform::WindowEvent::KeyPressed { text: text.into() }
+                }
+                (winit::event::ElementState::Pressed, true) => {
+                    slint::platform::WindowEvent::KeyPressRepeated { text: text.into() }
+                }
+                (winit::event::ElementState::Released, _) => {
+                    slint::platform::WindowEvent::KeyReleased { text: text.into() }
+                }
+            };
+            window.dispatch_event(event);
+            return EventResult::PreventDefault;
         }
 
         EventResult::Propagate
@@ -1662,8 +1710,8 @@ mod tests {
 
     use super::{
         ClipboardReader, ProviderConfigFieldItem, at_token, chat_file_link,
-        clipboard_image_png_from, pr_group_drag_id, pr_group_drag_payload, provider_fields_valid,
-        workspace_drag_id, workspace_drag_payload,
+        clipboard_image_png_from, normalized_editing_shortcut, pr_group_drag_id,
+        pr_group_drag_payload, provider_fields_valid, workspace_drag_id, workspace_drag_payload,
     };
 
     struct TestClipboard {
@@ -1713,6 +1761,19 @@ mod tests {
         assert!(provider_fields_valid(
             vec![provider_field(true, "", true)].into_iter()
         ));
+    }
+
+    #[test]
+    fn caps_lock_editing_shortcuts_are_normalized_without_erasing_shift() {
+        assert_eq!(normalized_editing_shortcut("A", true, false), Some("a"));
+        assert_eq!(normalized_editing_shortcut("C", true, false), Some("c"));
+        assert_eq!(normalized_editing_shortcut("V", true, false), Some("v"));
+        assert_eq!(normalized_editing_shortcut("X", true, false), Some("x"));
+        assert_eq!(normalized_editing_shortcut("Y", true, false), Some("y"));
+        assert_eq!(normalized_editing_shortcut("Z", true, false), Some("z"));
+        assert_eq!(normalized_editing_shortcut("C", true, true), None);
+        assert_eq!(normalized_editing_shortcut("C", false, false), None);
+        assert_eq!(normalized_editing_shortcut("F", true, false), None);
     }
 
     #[test]
