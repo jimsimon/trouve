@@ -970,6 +970,45 @@ fn main() -> anyhow::Result<()> {
             let _ = tx.send(UiCommand::ToggleArchivedFilter { row: row as usize });
         });
     }
+    {
+        let tx = tx.clone();
+        window.on_workspace_list_option_picked(move |category, option| {
+            let _ = tx.send(UiCommand::WorkspaceListOption {
+                category: category as u8,
+                option: option as u8,
+            });
+        });
+    }
+    {
+        let tx = tx.clone();
+        window.on_workspace_list_show_toggled(move |option| {
+            let _ = tx.send(UiCommand::WorkspaceListShow {
+                option: option as u8,
+            });
+        });
+    }
+    {
+        let tx = tx.clone();
+        window.on_workspace_list_filter_toggled(move |row, category, option| {
+            let _ = tx.send(UiCommand::WorkspaceListFilter {
+                row: row as usize,
+                category: category as u8,
+                option: option as u8,
+            });
+        });
+    }
+    {
+        let tx = tx.clone();
+        window.on_collapse_workspace(move |row| {
+            let _ = tx.send(UiCommand::CollapseWorkspace { row: row as usize });
+        });
+    }
+    {
+        let tx = tx.clone();
+        window.on_mark_workspace_read(move |row| {
+            let _ = tx.send(UiCommand::MarkWorkspaceRead { row: row as usize });
+        });
+    }
 
     // Closing with agents mid-turn asks first (quit / quit when idle /
     // cancel) instead of tearing the run down silently.

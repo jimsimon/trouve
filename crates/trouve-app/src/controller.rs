@@ -8,7 +8,7 @@
 //! speaks HTTP/SSE to it over loopback — no `trouve-core` import, no
 //! engine access.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use anyhow::{Context, Result};
 use tokio::sync::mpsc;
@@ -270,8 +270,29 @@ pub enum UiCommand {
         row: usize,
     },
     /// Flip the "show archived sessions" filter of one workspace (by the
-    /// nav row of its header, where the funnel menu lives).
+    /// nav row of its header, where the overflow menu lives).
     ToggleArchivedFilter {
+        row: usize,
+    },
+    /// Set one of the exclusive workspace-list choices (grouping/ordering).
+    WorkspaceListOption {
+        category: u8,
+        option: u8,
+    },
+    /// Toggle one entry in the workspace header's Show submenu.
+    WorkspaceListShow {
+        option: u8,
+    },
+    /// Toggle one entry in a named workspace's Status or PR filter.
+    WorkspaceListFilter {
+        row: usize,
+        category: u8,
+        option: u8,
+    },
+    CollapseWorkspace {
+        row: usize,
+    },
+    MarkWorkspaceRead {
         row: usize,
     },
     /// Remove a workspace from the sidebar without deleting its sessions.
@@ -754,6 +775,8 @@ enum NavEntry {
     Session(usize),
     /// Toggles the archived group of this workspace id.
     ArchivedToggle(String),
+    /// Toggles one generated Updated/Status section.
+    SessionGroupToggle(String),
 }
 
 /// Which flavor of the new-chat screen is open.
@@ -837,10 +860,17 @@ struct Controller {
     nav: Vec<NavEntry>,
     current_session: Option<usize>,
     archived_expanded: HashSet<String>,
+    /// Collapsed generated sections for Updated/Status grouping.
+    collapsed_session_groups: HashSet<String>,
     collapsed_workspaces: HashSet<String>,
     /// Session-list filter: workspaces showing their archived sessions
-    /// (each workspace header's funnel menu toggles its own entry).
+    /// (each workspace header's overflow menu toggles its own entry).
     show_archived: HashSet<String>,
+    workspace_list_prefs: crate::winstate::WorkspaceListPrefs,
+    workspace_filters: HashMap<String, crate::winstate::WorkspaceFilterPrefs>,
+    /// Most recent persisted/live thread event per session. Creation time is
+    /// the fallback until a session emits activity in this client.
+    session_updated_at: HashMap<String, chrono::DateTime<chrono::Utc>>,
     /// Quit once every agent turn finishes (armed from the quit dialog).
     /// Shared with the UI callback so cancellation takes effect before its
     /// command can race a final session-activity event in this queue.
@@ -1136,8 +1166,12 @@ pub async fn run(
         nav: Vec::new(),
         current_session: None,
         archived_expanded: HashSet::new(),
+        collapsed_session_groups: HashSet::new(),
         collapsed_workspaces: HashSet::new(),
         show_archived: HashSet::new(),
+        workspace_list_prefs: crate::winstate::load_workspace_list_prefs(),
+        workspace_filters: crate::winstate::load_workspace_filters(),
+        session_updated_at: HashMap::new(),
         quit_when_idle,
         threads: Vec::new(),
         current_thread: None,
@@ -1747,23 +1781,18 @@ impl Controller {
             self.save_workspace_order();
         }
         self.sessions = self.client.list_sessions().await?;
-        // Archived/deleted sessions and sessions in closed workspaces have no
-        // live backend PTYs. Discard their cached grids as well so reopening
-        // them attaches to fresh tabs instead of reviving an exited view.
-        let open_workspaces: HashSet<String> = self
-            .workspaces
-            .iter()
-            .map(|workspace| workspace.id.clone())
-            .collect();
-        let terminal_sessions: HashSet<String> = self
+        let live_session_ids: HashSet<&str> = self
             .sessions
             .iter()
-            .filter(|session| !session.archived && open_workspaces.contains(&session.workspace_id))
-            .map(|session| session.id.clone())
+            .map(|session| session.id.as_str())
             .collect();
-        let terminal_state_count = self.terms.len();
-        self.terms.retain(|id, _| terminal_sessions.contains(id));
-        let terminal_state_changed = self.terms.len() != terminal_state_count;
+        self.session_updated_at
+            .retain(|id, _| live_session_ids.contains(id.as_str()));
+        for session in &self.sessions {
+            self.session_updated_at
+                .entry(session.id.clone())
+                .or_insert(session.created_at);
+        }
         self.busy_sessions = self
             .sessions
             .iter()
@@ -1878,7 +1907,139 @@ impl Controller {
             pr_tooltip,
             attention_kind,
             attention_tooltip,
+            show_branches: self.workspace_list_prefs.show_branches,
+            show_status: self.workspace_list_prefs.show_status,
             ..Default::default()
+        }
+    }
+
+    /// Cursor-style status buckets, in the same order as the menu.
+    fn session_status(&self, index: usize) -> u8 {
+        let session = &self.sessions[index];
+        let attention = self
+            .attention_by_session
+            .get(&session.id)
+            .copied()
+            .unwrap_or_default();
+        if attention != AttentionCounts::default() || self.error_sessions.contains(&session.id) {
+            0 // Needs Attention
+        } else if self.unread_sessions.contains(&session.id) {
+            1 // Unread
+        } else if self.busy_sessions.contains(&session.id) {
+            2 // Working
+        } else if session.archived
+            || self.nav_prs.get(&session.id).is_some_and(|prs| {
+                prs.iter()
+                    .any(|pr| pr.state == "merged" || pr.state == "closed")
+            })
+        {
+            4 // Done
+        } else {
+            3 // Draft
+        }
+    }
+
+    /// PR filter bucket: draft, open, merged, closed, or no PR.
+    fn session_pr_kind(&self, index: usize) -> u8 {
+        let Some(prs) = self.nav_prs.get(&self.sessions[index].id) else {
+            return 4;
+        };
+        if prs.iter().any(|pr| pr.state == "open" && pr.draft) {
+            0
+        } else if prs.iter().any(|pr| pr.state == "open") {
+            1
+        } else if prs.iter().any(|pr| pr.state == "merged") {
+            2
+        } else if prs.iter().any(|pr| pr.state == "closed") {
+            3
+        } else {
+            4
+        }
+    }
+
+    fn session_visible_in_workspace_list(&self, index: usize) -> bool {
+        let prefs = self
+            .workspace_filters
+            .get(&self.sessions[index].workspace_id)
+            .copied()
+            .unwrap_or_default();
+        prefs.status_filter & (1 << self.session_status(index)) != 0
+            && prefs.pr_filter & (1 << self.session_pr_kind(index)) != 0
+    }
+
+    fn session_updated_at(&self, index: usize) -> chrono::DateTime<chrono::Utc> {
+        let session = &self.sessions[index];
+        self.session_updated_at
+            .get(&session.id)
+            .copied()
+            .unwrap_or(session.created_at)
+    }
+
+    fn note_thread_updated(&mut self, thread_id: &str, at: chrono::DateTime<chrono::Utc>) -> bool {
+        let Some(session_id) = self.thread_sessions.get(thread_id).cloned() else {
+            return false;
+        };
+        let updated = self.session_updated_at.entry(session_id).or_insert(at);
+        if at > *updated {
+            *updated = at;
+            true
+        } else {
+            false
+        }
+    }
+
+    fn updated_organization_active(&self) -> bool {
+        self.workspace_list_prefs.grouping == 2 || self.workspace_list_prefs.ordering == 0
+    }
+
+    fn compare_workspace_sessions(&self, left: usize, right: usize) -> std::cmp::Ordering {
+        let left_session = &self.sessions[left];
+        let right_session = &self.sessions[right];
+        let newest_updated = || {
+            self.session_updated_at(right)
+                .cmp(&self.session_updated_at(left))
+                .then_with(|| right_session.created_at.cmp(&left_session.created_at))
+        };
+        match self.workspace_list_prefs.ordering {
+            1 => self
+                .session_status(left)
+                .cmp(&self.session_status(right))
+                .then_with(newest_updated),
+            2 => right_session
+                .created_at
+                .cmp(&left_session.created_at)
+                .then_with(|| right_session.id.cmp(&left_session.id)),
+            _ => newest_updated(),
+        }
+    }
+
+    /// Group rank and label. Repository/Workspace use the existing outer
+    /// workspace headers and therefore need no extra nested section.
+    fn workspace_session_group(&self, index: usize) -> Option<(u8, &'static str)> {
+        match self.workspace_list_prefs.grouping {
+            2 => {
+                let age = chrono::Utc::now()
+                    .date_naive()
+                    .signed_duration_since(self.session_updated_at(index).date_naive())
+                    .num_days();
+                Some(if age <= 0 {
+                    (0, "Today")
+                } else if age == 1 {
+                    (1, "Yesterday")
+                } else if age <= 7 {
+                    (2, "Previous 7 Days")
+                } else {
+                    (3, "Older")
+                })
+            }
+            3 => Some(match self.session_status(index) {
+                0 => (0, "Needs Attention"),
+                1 => (1, "Unread"),
+                2 => (2, "Working"),
+                3 => (3, "Draft"),
+                _ => (4, "Done"),
+            }),
+            _ => None,
         }
     }
 
@@ -1968,6 +2129,11 @@ impl Controller {
                 continue;
             };
             let ws = &self.workspaces[wi];
+            let filters = self
+                .workspace_filters
+                .get(&ws.id)
+                .copied()
+                .unwrap_or_default();
             let expanded = !self.collapsed_workspaces.contains(&ws.id);
             let show_archived = self.show_archived.contains(&ws.id);
             rows.push(NavRowData {
@@ -1978,6 +2144,10 @@ impl Controller {
                 workspace_count,
                 expanded,
                 show_archived,
+                show_branches: self.workspace_list_prefs.show_branches,
+                show_status: self.workspace_list_prefs.show_status,
+                status_filter: i32::from(filters.status_filter),
+                pr_filter: i32::from(filters.pr_filter),
                 ..Default::default()
             });
             nav.push(NavEntry::Workspace(wi));
@@ -1985,39 +2155,81 @@ impl Controller {
                 continue;
             }
 
-            let mut archived_count = 0;
-            for (i, session) in self.sessions.iter().enumerate() {
-                if session.workspace_id != ws.id {
-                    continue;
+            let mut active: Vec<usize> = self
+                .sessions
+                .iter()
+                .enumerate()
+                .filter(|(index, session)| {
+                    session.workspace_id == ws.id
+                        && !session.archived
+                        && self.session_visible_in_workspace_list(*index)
+                })
+                .map(|(index, _)| index)
+                .collect();
+            active.sort_by(|left, right| self.compare_workspace_sessions(*left, *right));
+
+            let mut groups: BTreeMap<u8, (&'static str, Vec<usize>)> = BTreeMap::new();
+            for index in active {
+                if let Some((rank, label)) = self.workspace_session_group(index) {
+                    groups
+                        .entry(rank)
+                        .or_insert_with(|| (label, Vec::new()))
+                        .1
+                        .push(index);
+                } else {
+                    rows.push(self.session_nav_row(index, false));
+                    nav.push(NavEntry::Session(index));
                 }
-                if session.archived {
-                    archived_count += 1;
-                    continue;
-                }
-                rows.push(self.session_nav_row(i, false));
-                nav.push(NavEntry::Session(i));
             }
-            if archived_count > 0 && show_archived {
+            for (rank, (label, indices)) in groups {
+                let key = format!("{}:{}:{rank}", ws.id, self.workspace_list_prefs.grouping);
+                let group_expanded = !self.collapsed_session_groups.contains(&key);
+                rows.push(NavRowData {
+                    kind: 2,
+                    title: format!("{label} ({})", indices.len()),
+                    expanded: group_expanded,
+                    ..Default::default()
+                });
+                nav.push(NavEntry::SessionGroupToggle(key));
+                if group_expanded {
+                    for index in indices {
+                        rows.push(self.session_nav_row(index, false));
+                        nav.push(NavEntry::Session(index));
+                    }
+                }
+            }
+
+            let mut archived: Vec<usize> = self
+                .sessions
+                .iter()
+                .enumerate()
+                .filter(|(index, session)| {
+                    session.workspace_id == ws.id
+                        && session.archived
+                        && self.session_visible_in_workspace_list(*index)
+                })
+                .map(|(index, _)| index)
+                .collect();
+            archived.sort_by(|left, right| self.compare_workspace_sessions(*left, *right));
+            if !archived.is_empty() && show_archived {
                 let expanded = self.archived_expanded.contains(&ws.id);
                 rows.push(NavRowData {
                     kind: 2,
-                    title: format!("Archived ({archived_count})"),
+                    title: format!("Archived ({})", archived.len()),
                     expanded,
                     ..Default::default()
                 });
                 nav.push(NavEntry::ArchivedToggle(ws.id.clone()));
                 if expanded {
-                    for (i, session) in self.sessions.iter().enumerate() {
-                        if session.workspace_id != ws.id || !session.archived {
-                            continue;
-                        }
-                        rows.push(self.session_nav_row(i, true));
-                        nav.push(NavEntry::Session(i));
+                    for index in archived {
+                        rows.push(self.session_nav_row(index, true));
+                        nav.push(NavEntry::Session(index));
                     }
                 }
             }
         }
         self.nav = nav;
+        ui::set_workspace_list_prefs(&self.ui, self.workspace_list_prefs);
         ui::set_nav(&self.ui, rows);
     }
 
@@ -4832,6 +5044,12 @@ impl Controller {
                     }
                     self.push_nav();
                 }
+                Some(NavEntry::SessionGroupToggle(key)) => {
+                    if !self.collapsed_session_groups.remove(&key) {
+                        self.collapsed_session_groups.insert(key);
+                    }
+                    self.push_nav();
+                }
                 _ => {}
             },
             UiCommand::WorkspaceDropped {
@@ -4882,6 +5100,82 @@ impl Controller {
                         self.show_archived.insert(id);
                     }
                     self.push_nav();
+                }
+            }
+            UiCommand::WorkspaceListOption { category, option } => {
+                match category {
+                    0 if option <= 3 => self.workspace_list_prefs.grouping = option,
+                    1 if option <= 2 => self.workspace_list_prefs.ordering = option,
+                    _ => return Ok(()),
+                }
+                self.collapsed_session_groups.clear();
+                crate::winstate::save_workspace_list_prefs(&self.workspace_list_prefs);
+                self.push_nav();
+            }
+            UiCommand::WorkspaceListShow { option } => {
+                match option {
+                    0 => {
+                        self.workspace_list_prefs.show_branches =
+                            !self.workspace_list_prefs.show_branches;
+                    }
+                    1 => {
+                        self.workspace_list_prefs.show_status =
+                            !self.workspace_list_prefs.show_status;
+                    }
+                    _ => return Ok(()),
+                }
+                crate::winstate::save_workspace_list_prefs(&self.workspace_list_prefs);
+                self.push_nav();
+            }
+            UiCommand::WorkspaceListFilter {
+                row,
+                category,
+                option,
+            } => {
+                if let Some(NavEntry::Workspace(wi)) = self.nav.get(row)
+                    && let Some(workspace) = self.workspaces.get(*wi)
+                {
+                    let workspace_id = workspace.id.clone();
+                    let filters = self.workspace_filters.entry(workspace_id).or_default();
+                    match (category, option) {
+                        (1, 0..=4) => filters.status_filter ^= 1 << option,
+                        (2, 0..=4) => filters.pr_filter ^= 1 << option,
+                        _ => return Ok(()),
+                    }
+                    crate::winstate::save_workspace_filters(&self.workspace_filters);
+                    self.push_nav();
+                }
+            }
+            UiCommand::CollapseWorkspace { row } => {
+                if let Some(NavEntry::Workspace(wi)) = self.nav.get(row)
+                    && let Some(workspace) = self.workspaces.get(*wi)
+                    && self.collapsed_workspaces.insert(workspace.id.clone())
+                {
+                    self.push_nav();
+                }
+            }
+            UiCommand::MarkWorkspaceRead { row } => {
+                if let Some(NavEntry::Workspace(wi)) = self.nav.get(row)
+                    && let Some(workspace) = self.workspaces.get(*wi)
+                {
+                    let workspace_id = &workspace.id;
+                    let session_ids: HashSet<&str> = self
+                        .sessions
+                        .iter()
+                        .filter(|session| session.workspace_id == *workspace_id)
+                        .map(|session| session.id.as_str())
+                        .collect();
+                    let unread_before = self.unread_sessions.len();
+                    let errors_before = self.error_sessions.len();
+                    self.unread_sessions
+                        .retain(|id| !session_ids.contains(id.as_str()));
+                    self.error_sessions
+                        .retain(|id| !session_ids.contains(id.as_str()));
+                    if self.unread_sessions.len() != unread_before
+                        || self.error_sessions.len() != errors_before
+                    {
+                        self.push_nav();
+                    }
                 }
             }
             UiCommand::CloseWorkspace { row } => {
@@ -7007,6 +7301,11 @@ impl Controller {
                 let mut finished = false;
                 let mut failed = false;
                 let mut todos_changed = false;
+                let updated_changed = envelopes
+                    .iter()
+                    .map(|envelope| envelope.ts)
+                    .max()
+                    .is_some_and(|at| self.note_thread_updated(&thread_id, at));
                 for envelope in &envelopes {
                     todos_changed |= self.capture_todos(&thread_id, envelope);
                     changed |= self
@@ -7053,7 +7352,10 @@ impl Controller {
                 let unread_changed = mark_unread
                     && finished
                     && self.mark_thread_unread_if_hidden(&thread_id, failed);
-                if attention_changed || unread_changed {
+                if attention_changed
+                    || unread_changed
+                    || (updated_changed && self.updated_organization_active())
+                {
                     self.push_nav();
                 }
                 if todos_changed {
@@ -7067,6 +7369,12 @@ impl Controller {
                 }
                 let completed =
                     matches!(envelope.event, trouve_protocol::Event::TurnCompleted { .. });
+                let is_delta = matches!(
+                    envelope.event,
+                    trouve_protocol::Event::AssistantDelta { .. }
+                        | trouve_protocol::Event::AssistantThinking { .. }
+                );
+                let updated_changed = self.note_thread_updated(&thread_id, envelope.ts);
                 let before = self
                     .vms
                     .get(&thread_id)
@@ -7107,11 +7415,6 @@ impl Controller {
                         // (including the finalized assistant.message and
                         // turn.completed) renders immediately, so the last
                         // token is never left unshown.
-                        let is_delta = matches!(
-                            envelope.event,
-                            trouve_protocol::Event::AssistantDelta { .. }
-                                | trouve_protocol::Event::AssistantThinking { .. }
-                        );
                         let now = std::time::Instant::now();
                         let throttled = is_delta
                             && self
@@ -7142,6 +7445,7 @@ impl Controller {
                 if finished {
                     nav_changed |= self.mark_thread_unread_if_hidden(&thread_id, failed);
                 }
+                nav_changed |= updated_changed && !is_delta && self.updated_organization_active();
                 if nav_changed {
                     self.push_nav();
                 }

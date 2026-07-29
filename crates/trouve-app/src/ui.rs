@@ -45,6 +45,10 @@ pub struct NavRowData {
     pub attention_tooltip: String,
     /// Workspace headers: this workspace shows its archived sessions.
     pub show_archived: bool,
+    pub show_branches: bool,
+    pub show_status: bool,
+    pub status_filter: i32,
+    pub pr_filter: i32,
 }
 
 /// Bring the window to the front (notification clicks). Wayland
@@ -167,6 +171,15 @@ pub fn set_nav(ui: &Ui, rows: Vec<NavRowData>) {
     });
 }
 
+pub fn set_workspace_list_prefs(ui: &Ui, prefs: crate::winstate::WorkspaceListPrefs) {
+    let _ = ui.upgrade_in_event_loop(move |ui| {
+        ui.set_workspace_list_grouping(i32::from(prefs.grouping));
+        ui.set_workspace_list_ordering(i32::from(prefs.ordering));
+        ui.set_workspace_list_show_branches(prefs.show_branches);
+        ui.set_workspace_list_show_status(prefs.show_status);
+    });
+}
+
 fn set_nav_now(ui: &AppWindow, rows: Vec<NavRowData>) {
     use slint::Model as _;
 
@@ -191,6 +204,10 @@ fn set_nav_now(ui: &AppWindow, rows: Vec<NavRowData>) {
             attention_kind: r.attention_kind,
             attention_tooltip: r.attention_tooltip.into(),
             show_archived: r.show_archived,
+            show_branches: r.show_branches,
+            show_status: r.show_status,
+            status_filter: r.status_filter,
+            pr_filter: r.pr_filter,
         })
         .collect();
 
