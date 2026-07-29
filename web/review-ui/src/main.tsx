@@ -1717,6 +1717,12 @@ function RepositoryEditor({
       : reviewers.length === 0 ||
         reviewers.every((reviewer) => excludedReviewerIds.includes(reviewer.id)));
   const reviewModelInvalid = draft.mode !== "off" && !draft.model;
+  const semanticRouterEnabled =
+    draft.routing_mode === "auto" && draft.semantic_routing;
+  const semanticRouterRequirement =
+    draft.routing_mode !== "auto"
+      ? "Choose Auto persona routing to configure it."
+      : "Enable Semantic triage to configure it.";
   return (
     <details class="repository-editor">
       <summary>
@@ -1749,6 +1755,10 @@ function RepositoryEditor({
               <option value="manual">Manual requests</option>
               <option value="automatic">Automatic</option>
             </select>
+            <small>
+              Off prevents reviews. Manual runs only when requested; Automatic reviews eligible
+              pull request updates.
+            </small>
           </label>
           <label>
             Persona routing
@@ -1824,7 +1834,7 @@ function RepositoryEditor({
             </select>
             <small>
               {models.length
-                ? "Required while review is enabled. Reviewers inherit it unless their persona or repository override selects another model."
+                ? "Runs the final coordinator that validates and combines findings. It is also the fallback for personas without their own model."
                 : "No models are currently available. Configure or sign in to a model provider first."}
             </small>
           </label>
@@ -1843,11 +1853,16 @@ function RepositoryEditor({
                 })
               }
             />
+            <small>
+              Controls reasoning for the final coordinator. Inherit review mode uses the default
+              configured in Review mode settings.
+            </small>
           </label>
-          <label>
+          <label class={semanticRouterEnabled ? undefined : "field-disabled"}>
             Semantic router model
             <select
               value={draft.router_model ?? ""}
+              disabled={!semanticRouterEnabled}
               onChange={(event) => {
                 const routerModel = event.currentTarget.value || undefined;
                 const selectedRouterModel = models.find(
@@ -1870,9 +1885,12 @@ function RepositoryEditor({
                 </option>
               ))}
             </select>
-            <small>Used only when Auto routing and Semantic triage are enabled.</small>
+            <small>
+              Runs the lightweight, tool-free triage pass that may add relevant personas.
+              {!semanticRouterEnabled && ` ${semanticRouterRequirement}`}
+            </small>
           </label>
-          <label>
+          <label class={semanticRouterEnabled ? undefined : "field-disabled"}>
             {routerThinking.budget
               ? "Semantic router thinking budget (tokens)"
               : "Semantic router thinking"}
@@ -1880,6 +1898,7 @@ function RepositoryEditor({
               options={routerThinking}
               value={draft.router_thinking_level ?? ""}
               inheritLabel="Inherit review default"
+              disabled={!semanticRouterEnabled}
               onChange={(value) =>
                 setDraft({
                   ...draft,
@@ -1887,6 +1906,11 @@ function RepositoryEditor({
                 })
               }
             />
+            <small>
+              Controls reasoning for semantic triage. Inherit review default follows the Review
+              mode setting.
+              {!semanticRouterEnabled && ` ${semanticRouterRequirement}`}
+            </small>
           </label>
         </div>
         <label>
@@ -1896,6 +1920,10 @@ function RepositoryEditor({
             value={draft.prompt}
             onInput={(event) => setDraft({ ...draft, prompt: event.currentTarget.value })}
           />
+          <small>
+            Adds repository-specific guidance to the instructions used for this repository's
+            reviews.
+          </small>
         </label>
         {draft.routing_mode === "core" ? (
           <fieldset>
@@ -1971,8 +1999,9 @@ function RepositoryEditor({
         <fieldset>
           <legend>Persona models and thinking</legend>
           <p class="field-help">
-            Repository overrides take precedence over persona defaults. Leave either value
-            inherited to keep the reusable persona or review-mode setting.
+            Tune a persona for this repository without changing its reusable defaults. Model
+            overrides take precedence over the persona and coordinator fallback; thinking
+            overrides take precedence over the persona and Review mode default.
           </p>
           <div class="persona-execution-grid">
             {reviewers.map((reviewer) => {
@@ -2017,6 +2046,9 @@ function RepositoryEditor({
                         </option>
                       ))}
                     </select>
+                    <small>
+                      Overrides the model for this persona in this repository only.
+                    </small>
                   </label>
                   <label>
                     {reviewerThinking.budget ? "Thinking budget (tokens)" : "Thinking"}
@@ -2034,6 +2066,9 @@ function RepositoryEditor({
                         })
                       }
                     />
+                    <small>
+                      Overrides this persona's reasoning setting for this repository only.
+                    </small>
                   </label>
                 </div>
               );
@@ -2196,6 +2231,10 @@ function ReviewerEditor({
             </option>
           ))}
         </select>
+        <small>
+          Sets this persona's reusable model. Repository-specific persona overrides take
+          precedence; otherwise Inherit uses the repository coordinator/fallback model.
+        </small>
       </label>
       <label>
         {reviewerThinking.budget ? "Thinking budget (tokens)" : "Thinking level"}
@@ -2210,6 +2249,10 @@ function ReviewerEditor({
             })
           }
         />
+        <small>
+          Sets this persona's reusable reasoning default. Repository-specific overrides take
+          precedence; otherwise Inherit follows the Review mode default.
+        </small>
       </label>
       <div class="action-row">
         <button type="submit" disabled={busy}>
@@ -2940,6 +2983,10 @@ function ProviderSettings({
               <option value={model.id} key={model.id}>{model.display_name} · {model.id}</option>
             ))}
           </select>
+          <small>
+            Base model for interactive threads and settings that inherit the global default.
+            Enabled repositories still require an explicit coordinator model.
+          </small>
         </label>
         <label>
           {defaultThinkingOptions.budget
@@ -2950,6 +2997,10 @@ function ProviderSettings({
             value={defaultThinking}
             onChange={setDefaultThinking}
           />
+          <small>
+            Base reasoning setting used when a mode, persona, or repository does not specify its
+            own thinking level.
+          </small>
         </label>
         <button type="submit" disabled={!defaultModel}>Save system defaults</button>
       </form>

@@ -208,8 +208,18 @@ input, select, textarea {
   background: #0d121b; outline: none;
 }
 input:focus, select:focus, textarea:focus { border-color: var(--blue); box-shadow: 0 0 0 2px #62a8ff22; }
+input:disabled, select:disabled, textarea:disabled {
+  border-color: #202936;
+  background: #080c12;
+  color: #6f7887;
+  box-shadow: none;
+  cursor: not-allowed;
+  opacity: .65;
+}
 textarea { resize: vertical; line-height: 1.45; }
 label > small { color: var(--muted); line-height: 1.45; }
+.field-disabled { color: #747e8d; }
+.field-disabled > small { color: #687281; }
 .checkbox { flex-direction: row; align-items: center; min-width: 0 !important; }
 .checkbox input { width: auto; }
 .checkbox span { display: flex; flex-direction: column; }
