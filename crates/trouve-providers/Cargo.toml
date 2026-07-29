@@ -13,7 +13,7 @@ async-trait.workspace = true
 aws-config = { version = "1.8.18", features = ["behavior-version-latest"] }
 aws-sdk-bedrockruntime = "1.135.0"
 aws-smithy-types = "1"
-base64 = "0.22"
+base64 = "0.23"
 bytes.workspace = true
 chrono.workspace = true
 dirs.workspace = true
