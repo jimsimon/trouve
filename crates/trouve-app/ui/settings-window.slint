@@ -1542,11 +1542,7 @@ export component SettingsScreen inherits Rectangle {
                                         spacing: 8px;
                                         VerticalLayout {
                                             spacing: 2px;
-                                            Text {
-                                                text: "Default permissions";
-                                                color: Theme.c.text-soft;
-                                                font-size: Theme.fs(10px);
-                                            }
+                                            FormFieldLabel { text: "Default permissions"; }
                                             ComboBox {
                                                 width: 150px;
                                                 model: root.mode-permission-names;
@@ -1559,11 +1555,7 @@ export component SettingsScreen inherits Rectangle {
                                         VerticalLayout {
                                             spacing: 2px;
                                             horizontal-stretch: 1;
-                                            Text {
-                                                text: "Default model";
-                                                color: Theme.c.text-soft;
-                                                font-size: Theme.fs(10px);
-                                            }
+                                            FormFieldLabel { text: "Default model"; }
                                             form-model-box := ComboBox {
                                                 model: root.mode-model-names;
                                                 current-index: root.mode-form-model + 1;
@@ -1578,11 +1570,7 @@ export component SettingsScreen inherits Rectangle {
                                             && root.mode-form-thinking-model-index < root.model-thinking-items.length
                                             && root.model-thinking-items[root.mode-form-thinking-model-index].values.length > 0: VerticalLayout {
                                             spacing: 2px;
-                                            Text {
-                                                text: "Default thinking level";
-                                                color: Theme.c.text-soft;
-                                                font-size: Theme.fs(10px);
-                                            }
+                                            FormFieldLabel { text: "Default thinking level"; }
                                             ComboBox {
                                                 width: 190px;
                                                 model: root.model-thinking-items[root.mode-form-thinking-model-index].mode-names;
@@ -1637,7 +1625,6 @@ export component SettingsScreen inherits Rectangle {
                         // ---------------- local models (Providers → Local) ----------------
                         if root.section == SectionId.providers && root.provider-tab == 2: VerticalLayout {
                             spacing: 12px;
-                            alignment: start;
 
                             HorizontalLayout {
                                 spacing: 12px;
