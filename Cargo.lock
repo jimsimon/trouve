@@ -9265,6 +9265,7 @@ dependencies = [
  "notify-rust",
  "open",
  "png",
+ "pulldown-cmark",
  "rfd",
  "serde",
  "serde_json",

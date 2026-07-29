@@ -6,7 +6,7 @@ use slint::{Model, ModelRc, SharedString, VecModel};
 
 use crate::render::ChatRowData;
 use crate::{
-    AppWindow, ChatRow, ChatTableCell, CliItem, DiffRow, FileItem, KnownProviderItem,
+    AppWindow, ChatLink, ChatRow, ChatTableCell, CliItem, DiffRow, FileItem, KnownProviderItem,
     ModelHealthItem, NavRow, ProviderConfigFieldItem, ProviderItem, QOption, QPair, SectionId,
     TextSegment, ThreadTabItem, TodoUiItem,
 };
@@ -285,10 +285,21 @@ fn to_chat_row(r: &ChatRowData) -> ChatRow {
                     ModelRc::new(VecModel::from(
                         table_row
                             .iter()
-                            .map(|(markdown, alignment)| ChatTableCell {
+                            .map(|(markdown, plain_text, links, alignment)| ChatTableCell {
                                 text: slint::StyledText::from_markdown(markdown).unwrap_or_else(
                                     |_| slint::StyledText::from_plain_text(markdown),
                                 ),
+                                plain_text: SharedString::from(plain_text.as_str()),
+                                links: ModelRc::new(VecModel::from(
+                                    links
+                                        .iter()
+                                        .map(|(start, end, url)| ChatLink {
+                                            start: *start,
+                                            end: *end,
+                                            url: SharedString::from(url.as_str()),
+                                        })
+                                        .collect::<Vec<_>>(),
+                                )),
                                 alignment: *alignment,
                             })
                             .collect::<Vec<_>>(),
@@ -305,6 +316,17 @@ fn to_chat_row(r: &ChatRowData) -> ChatRow {
         md_indent: r.md_indent,
         md_lang: SharedString::from(r.md_lang.as_str()),
         text: SharedString::from(r.text.as_str()),
+        plain_text: SharedString::from(r.plain_text.as_str()),
+        links: ModelRc::new(VecModel::from(
+            r.links
+                .iter()
+                .map(|(start, end, url)| ChatLink {
+                    start: *start,
+                    end: *end,
+                    url: SharedString::from(url.as_str()),
+                })
+                .collect::<Vec<_>>(),
+        )),
         code_lines,
         table_rows,
         // Malformed markup falls back to the raw text rather than
