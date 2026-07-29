@@ -15,6 +15,7 @@ import {
   getJob,
   getJobs,
   getKnownProviders,
+  getModeInfos,
   getModels,
   getProviders,
   getStats,
@@ -25,9 +26,11 @@ import {
   openServerEvents,
   refreshReviews,
   requestReview,
+  resetMode,
   retryJob,
   retryPersona,
   saveDefaultModel,
+  saveMode,
   saveProvider,
   saveRepository,
   saveReviewer,
@@ -46,6 +49,7 @@ import {
   defaultThinkingSelection,
   thinkingLevelLabel,
   thinkingOptions,
+  thinkingSelectionIsValid,
 } from "./model-settings";
 import { jobStatusClass, safeExternalUrl } from "./security";
 import type {
@@ -57,6 +61,7 @@ import type {
   KnownProvider,
   LoginStarted,
   Model,
+  ModeInfo,
   PersonaResult,
   Provider,
   ProvidersResponse,
@@ -65,6 +70,7 @@ import type {
   RoutingDecision,
   ReviewTask,
   ReviewStats,
+  ReviewerOverride,
   ReviewerProfile,
   StatsRange,
 } from "./types";
@@ -286,6 +292,7 @@ function App() {
   const [dashboard, setDashboard] = useState<Dashboard | null>(null);
   const [providers, setProviders] = useState<ProvidersResponse | null>(null);
   const [models, setModels] = useState<Model[]>([]);
+  const [modeInfos, setModeInfos] = useState<ModeInfo[]>([]);
   const [dashboardError, setDashboardError] = useState("");
   const [configurationError, setConfigurationError] = useState("");
   const [loading, setLoading] = useState(true);
@@ -306,6 +313,7 @@ function App() {
     const results = await Promise.allSettled([
       getProviders().then(setProviders),
       getModels().then(setModels),
+      getModeInfos().then(setModeInfos),
     ]);
     const errors = results
       .filter((result): result is PromiseRejectedResult => result.status === "rejected")
@@ -374,6 +382,7 @@ function App() {
           app={dashboard.app}
           providers={providers}
           models={models}
+          reviewModeInfo={modeInfos.find(({ mode }) => mode.id === "review")}
           onChanged={() => {
             void loadDashboard(true);
             void loadConfiguration();
@@ -1567,6 +1576,49 @@ function RepositoriesPage({
   );
 }
 
+function ThinkingSetting({
+  options,
+  value,
+  onChange,
+  inheritLabel,
+  disabled = false,
+}: {
+  options: ReturnType<typeof thinkingOptions>;
+  value: string;
+  onChange: (value: string) => void;
+  inheritLabel?: string;
+  disabled?: boolean;
+}) {
+  if (options.budget) {
+    return (
+      <input
+        type="number"
+        min={options.budget.minimum}
+        max={options.budget.maximum}
+        step={1}
+        value={value}
+        placeholder={inheritLabel}
+        disabled={disabled}
+        onInput={(event) => onChange(event.currentTarget.value)}
+      />
+    );
+  }
+  return (
+    <select
+      value={value}
+      onChange={(event) => onChange(event.currentTarget.value)}
+      disabled={disabled || !options.values.length}
+    >
+      {inheritLabel !== undefined && <option value="">{inheritLabel}</option>}
+      {options.values.map((level) => (
+        <option value={level} key={level}>
+          {thinkingLevelLabel(level)}
+        </option>
+      ))}
+    </select>
+  );
+}
+
 function RepositoryEditor({
   repository,
   reviewers,
@@ -1606,16 +1658,42 @@ function RepositoryEditor({
           : (current.excluded_reviewer_ids ?? []).filter((reviewer) => reviewer !== id),
     }));
   };
+  const updateReviewerOverride = (
+    id: string,
+    patch: Partial<ReviewerOverride>,
+  ): void => {
+    setDraft((current) => {
+      const overrides = current.reviewer_overrides ?? [];
+      const existing = overrides.find((item) => item.reviewer_id === id) ?? {
+        reviewer_id: id,
+        prompt_mode: "inherit" as const,
+        prompt: "",
+      };
+      const updated = { ...existing, ...patch };
+      const retained = overrides.filter((item) => item.reviewer_id !== id);
+      if (
+        updated.model ||
+        updated.thinking_level ||
+        updated.prompt_mode !== "inherit" ||
+        updated.prompt
+      ) {
+        retained.push(updated);
+      }
+      return { ...current, reviewer_overrides: retained };
+    });
+  };
   const excludedReviewerIds = draft.excluded_reviewer_ids ?? [];
+  const effectiveCoordinatorModel = models.find((model) => model.id === draft.model);
+  const coordinatorThinking = thinkingOptions(effectiveCoordinatorModel);
   const effectiveRouterModel = models.find(
     (model) => model.id === (draft.router_model || draft.model),
   );
   const routerThinking = thinkingOptions(effectiveRouterModel);
-  const compatibleRouterThinking = (model: Model | undefined): string | undefined => {
-    const configured = draft.router_thinking_level;
-    return configured && thinkingOptions(model).values.includes(configured)
-      ? configured
-      : undefined;
+  const compatibleThinking = (
+    configured: string | undefined,
+    model: Model | undefined,
+  ): string | undefined => {
+    return thinkingSelectionIsValid(model, configured) ? configured : undefined;
   };
   const reviewerPolicyInvalid =
     draft.mode !== "off" &&
@@ -1690,18 +1768,44 @@ function RepositoryEditor({
             </small>
           </label>
           <label>
-            Review model
+            Coordinator and fallback model
             <select
               value={draft.model ?? ""}
               onChange={(event) => {
                 const model = event.currentTarget.value || undefined;
+                const selectedCoordinatorModel = models.find(
+                  (candidate) => candidate.id === model,
+                );
                 const selectedRouterModel = models.find(
                   (candidate) => candidate.id === (draft.router_model || model),
                 );
                 setDraft({
                   ...draft,
                   model,
-                  router_thinking_level: compatibleRouterThinking(selectedRouterModel),
+                  coordinator_thinking_level: compatibleThinking(
+                    draft.coordinator_thinking_level,
+                    selectedCoordinatorModel,
+                  ),
+                  router_thinking_level: compatibleThinking(
+                    draft.router_thinking_level,
+                    selectedRouterModel,
+                  ),
+                  reviewer_overrides: (draft.reviewer_overrides ?? []).map((override) => {
+                    const profile = reviewers.find(
+                      (reviewer) => reviewer.id === override.reviewer_id,
+                    );
+                    const selectedReviewerModel = models.find(
+                      (candidate) =>
+                        candidate.id === (override.model || profile?.model || model),
+                    );
+                    return {
+                      ...override,
+                      thinking_level: compatibleThinking(
+                        override.thinking_level,
+                        selectedReviewerModel,
+                      ),
+                    };
+                  }),
                 });
               }}
             >
@@ -1712,7 +1816,26 @@ function RepositoryEditor({
                 </option>
               ))}
             </select>
-            <small>Required while review is enabled; no built-in model is assumed.</small>
+            <small>
+              Required while review is enabled. Reviewers inherit it unless their persona or
+              repository override selects another model.
+            </small>
+          </label>
+          <label>
+            {coordinatorThinking.budget
+              ? "Coordinator thinking budget (tokens)"
+              : "Coordinator thinking"}
+            <ThinkingSetting
+              options={coordinatorThinking}
+              value={draft.coordinator_thinking_level ?? ""}
+              inheritLabel="Inherit review mode"
+              onChange={(value) =>
+                setDraft({
+                  ...draft,
+                  coordinator_thinking_level: value || undefined,
+                })
+              }
+            />
           </label>
           <label>
             Semantic router model
@@ -1727,11 +1850,14 @@ function RepositoryEditor({
                 setDraft({
                   ...draft,
                   router_model: routerModel,
-                  router_thinking_level: compatibleRouterThinking(selectedRouterModel),
+                  router_thinking_level: compatibleThinking(
+                    draft.router_thinking_level,
+                    selectedRouterModel,
+                  ),
                 });
               }}
             >
-              <option value="">Inherit review model</option>
+              <option value="">Inherit coordinator/fallback model</option>
               {models.map((model) => (
                 <option value={model.id} key={model.id}>
                   {model.display_name} · {model.id}
@@ -1740,28 +1866,21 @@ function RepositoryEditor({
             </select>
           </label>
           <label>
-            Semantic router thinking
-            <select
+            {routerThinking.budget
+              ? "Semantic router thinking budget (tokens)"
+              : "Semantic router thinking"}
+            <ThinkingSetting
+              options={routerThinking}
               value={draft.router_thinking_level ?? ""}
-              disabled={
-                draft.routing_mode !== "auto" ||
-                !draft.semantic_routing ||
-                !routerThinking.values.length
-              }
-              onChange={(event) =>
+              inheritLabel="Inherit review default"
+              disabled={draft.routing_mode !== "auto" || !draft.semantic_routing}
+              onChange={(value) =>
                 setDraft({
                   ...draft,
-                  router_thinking_level: event.currentTarget.value || undefined,
+                  router_thinking_level: value || undefined,
                 })
               }
-            >
-              <option value="">Inherit review default</option>
-              {routerThinking.values.map((level) => (
-                <option value={level} key={level}>
-                  {thinkingLevelLabel(level)}
-                </option>
-              ))}
-            </select>
+            />
           </label>
         </div>
         <label>
@@ -1843,6 +1962,78 @@ function RepositoryEditor({
             </div>
           </fieldset>
         )}
+        <fieldset>
+          <legend>Persona models and thinking</legend>
+          <p class="field-help">
+            Repository overrides take precedence over persona defaults. Leave either value
+            inherited to keep the reusable persona or review-mode setting.
+          </p>
+          <div class="persona-execution-grid">
+            {reviewers.map((reviewer) => {
+              const override = (draft.reviewer_overrides ?? []).find(
+                (item) => item.reviewer_id === reviewer.id,
+              );
+              const effectiveModelId = override?.model || reviewer.model || draft.model;
+              const reviewerThinking = thinkingOptions(
+                models.find((model) => model.id === effectiveModelId),
+              );
+              return (
+                <div class="persona-execution" key={reviewer.id}>
+                  <header>
+                    <strong>{reviewer.name}</strong>
+                    <small>{effectiveModelId || "No model selected"}</small>
+                  </header>
+                  <label>
+                    Model
+                    <select
+                      value={override?.model ?? ""}
+                      onChange={(event) => {
+                        const model = event.currentTarget.value || undefined;
+                        const selectedModel = models.find(
+                          (candidate) =>
+                            candidate.id === (model || reviewer.model || draft.model),
+                        );
+                        updateReviewerOverride(reviewer.id, {
+                          model,
+                          thinking_level: compatibleThinking(
+                            override?.thinking_level,
+                            selectedModel,
+                          ),
+                        });
+                      }}
+                    >
+                      <option value="">
+                        Inherit · {reviewer.model || draft.model || "no model"}
+                      </option>
+                      {models.map((model) => (
+                        <option value={model.id} key={model.id}>
+                          {model.display_name} · {model.id}
+                        </option>
+                      ))}
+                    </select>
+                  </label>
+                  <label>
+                    {reviewerThinking.budget ? "Thinking budget (tokens)" : "Thinking"}
+                    <ThinkingSetting
+                      options={reviewerThinking}
+                      value={override?.thinking_level ?? ""}
+                      inheritLabel={
+                        reviewer.default_thinking_level
+                          ? `Inherit · ${thinkingLevelLabel(reviewer.default_thinking_level)}`
+                          : "Inherit persona/review mode"
+                      }
+                      onChange={(value) =>
+                        updateReviewerOverride(reviewer.id, {
+                          thinking_level: value || undefined,
+                        })
+                      }
+                    />
+                  </label>
+                </div>
+              );
+            })}
+          </div>
+        </fieldset>
         <div class="action-row">
           <button
             type="submit"
@@ -1986,24 +2177,18 @@ function ReviewerEditor({
         </select>
       </label>
       <label>
-        Thinking level
-        <select
+        {reviewerThinking.budget ? "Thinking budget (tokens)" : "Thinking level"}
+        <ThinkingSetting
+          options={reviewerThinking}
           value={draft.default_thinking_level ?? ""}
-          disabled={!reviewerThinking.values.length}
-          onChange={(event) =>
+          inheritLabel="Inherit default"
+          onChange={(value) =>
             setDraft({
               ...draft,
-              default_thinking_level: event.currentTarget.value || undefined,
+              default_thinking_level: value || undefined,
             })
           }
-        >
-          <option value="">Inherit default</option>
-          {reviewerThinking.values.map((level) => (
-            <option value={level} key={level}>
-              {thinkingLevelLabel(level)}
-            </option>
-          ))}
-        </select>
+        />
       </label>
       <div class="action-row">
         <button type="submit" disabled={busy}>
@@ -2274,11 +2459,13 @@ function SettingsPage({
   app,
   providers,
   models,
+  reviewModeInfo,
   onChanged,
 }: {
   app: GithubAppStatus;
   providers: ProvidersResponse | null;
   models: Model[];
+  reviewModeInfo?: ModeInfo;
   onChanged: () => void;
 }) {
   return (
@@ -2286,12 +2473,160 @@ function SettingsPage({
       <PageHeader
         eyebrow="Administration"
         title="Settings"
-        description="GitHub App credentials, webhook and Checks health, and model-provider authentication."
+        description="Review execution defaults, GitHub App health, and model-provider authentication."
+      />
+      <ReviewModeSettings
+        modeInfo={reviewModeInfo}
+        models={models}
+        globalModel={providers?.default_model}
+        globalThinking={providers?.default_thinking_level}
+        onChanged={onChanged}
       />
       <div class="settings-grid">
         <GithubAppSettings app={app} onChanged={onChanged} />
         <ProviderSettings providers={providers} models={models} onChanged={onChanged} />
       </div>
+    </section>
+  );
+}
+
+function ReviewModeSettings({
+  modeInfo,
+  models,
+  globalModel,
+  globalThinking,
+  onChanged,
+}: {
+  modeInfo?: ModeInfo;
+  models: Model[];
+  globalModel?: string;
+  globalThinking?: string;
+  onChanged: () => void;
+}) {
+  const mode = modeInfo?.mode;
+  const [model, setModel] = useState(mode?.default_model ?? "");
+  const [thinking, setThinking] = useState(mode?.default_thinking_level ?? "");
+  const [busy, setBusy] = useState(false);
+  const [message, flash] = useFlash();
+  useEffect(() => setModel(mode?.default_model ?? ""), [mode?.default_model]);
+  useEffect(
+    () => setThinking(mode?.default_thinking_level ?? ""),
+    [mode?.default_thinking_level],
+  );
+  const effectiveModel = model || globalModel || "";
+  const selectedModel = models.find((candidate) => candidate.id === effectiveModel);
+  const options = thinkingOptions(selectedModel);
+  const inheritedThinking = globalThinking
+    ? thinkingLevelLabel(globalThinking)
+    : "model default";
+
+  return (
+    <section class="panel settings-card review-mode-settings">
+      <PanelTitle
+        title="Review mode"
+        subtitle="Defaults for review-mode threads. Repository models still take precedence for automated reviews."
+      />
+      {mode ? (
+        <form
+          onSubmit={async (event) => {
+            event.preventDefault();
+            setBusy(true);
+            try {
+              await saveMode({
+                ...mode,
+                default_model: model || undefined,
+                default_thinking_level: thinking || undefined,
+              });
+              flash("Review mode defaults saved");
+              onChanged();
+            } catch (cause) {
+              flash(cause instanceof Error ? cause.message : String(cause));
+            } finally {
+              setBusy(false);
+            }
+          }}
+        >
+          <div class="form-grid">
+            <label>
+              Default model
+              <select
+                value={model}
+                onChange={(event) => {
+                  const next = event.currentTarget.value;
+                  setModel(next);
+                  const nextOptions = thinkingOptions(
+                    models.find((candidate) => candidate.id === (next || globalModel)),
+                  );
+                  const nextModel = models.find(
+                    (candidate) => candidate.id === (next || globalModel),
+                  );
+                  if (thinking && !thinkingSelectionIsValid(nextModel, thinking)) {
+                    setThinking(
+                      nextOptions.defaultValue ??
+                        (nextOptions.budget ? String(nextOptions.budget.minimum) : ""),
+                    );
+                  }
+                }}
+              >
+                <option value="">
+                  Inherit global{globalModel ? ` · ${globalModel}` : ""}
+                </option>
+                {models.map((candidate) => (
+                  <option value={candidate.id} key={candidate.id}>
+                    {candidate.display_name} · {candidate.id}
+                  </option>
+                ))}
+              </select>
+              <small>
+                Manual review threads inherit this model. Automated jobs continue to use
+                their repository model.
+              </small>
+            </label>
+            <label>
+              {options.budget ? "Default thinking budget (tokens)" : "Default thinking level"}
+              <ThinkingSetting
+                options={options}
+                value={thinking}
+                onChange={setThinking}
+                inheritLabel={`Inherit global · ${inheritedThinking}`}
+              />
+              <small>
+                Automated coordinators inherit this level; persona-specific settings
+                still take precedence.
+              </small>
+            </label>
+          </div>
+          <div class="action-row">
+            <button type="submit" disabled={busy}>
+              {busy ? "Saving…" : "Save review mode"}
+            </button>
+            {modeInfo?.origin === "customized" && (
+              <button
+                class="ghost"
+                type="button"
+                disabled={busy}
+                onClick={async () => {
+                  setBusy(true);
+                  try {
+                    await resetMode("review");
+                    flash("Review mode reset to built-in defaults");
+                    onChanged();
+                  } catch (cause) {
+                    flash(cause instanceof Error ? cause.message : String(cause));
+                  } finally {
+                    setBusy(false);
+                  }
+                }}
+              >
+                Reset built-in defaults
+              </button>
+            )}
+            {message && <span role="status">{message}</span>}
+          </div>
+        </form>
+      ) : (
+        <p class="muted">Review mode configuration is unavailable.</p>
+      )}
     </section>
   );
 }
@@ -2553,7 +2888,9 @@ function ProviderSettings({
           try {
             await saveDefaultModel(
               defaultModel,
-              defaultThinkingOptions.values.length ? defaultThinking : undefined,
+              defaultThinkingOptions.values.length || defaultThinkingOptions.budget
+                ? defaultThinking
+                : undefined,
             );
             flash("System model defaults saved");
             onChanged();
@@ -2584,16 +2921,14 @@ function ProviderSettings({
           </select>
         </label>
         <label>
-          Global thinking level
-          <select
+          {defaultThinkingOptions.budget
+            ? "Global thinking budget (tokens)"
+            : "Global thinking level"}
+          <ThinkingSetting
+            options={defaultThinkingOptions}
             value={defaultThinking}
-            onChange={(event) => setDefaultThinking(event.currentTarget.value)}
-            disabled={!defaultThinkingOptions.values.length}
-          >
-            {defaultThinkingOptions.values.map((level) => (
-              <option value={level} key={level}>{thinkingLevelLabel(level)}</option>
-            ))}
-          </select>
+            onChange={setDefaultThinking}
+          />
         </label>
         <button type="submit" disabled={!defaultModel}>Save system defaults</button>
       </form>

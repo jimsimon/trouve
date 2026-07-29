@@ -68,10 +68,11 @@ pub fn builtin_modes() -> Vec<AgentMode> {
             read_only: true,
             default_permission_mode: None,
             default_model: None,
-            // Unattended review fans out across many focused agents. Keep
-            // the inherited default fast; an explicit persona setting still
-            // wins when deeper reasoning is worth the latency.
-            default_thinking_level: Some("low".into()),
+            // Unattended review fans out across focused agents, but the final
+            // coordinator also inherits this setting. Medium keeps that
+            // adjudication reliable while explicit persona settings can
+            // still move narrower work up or down.
+            default_thinking_level: Some("medium".into()),
         },
         AgentMode {
             id: "architect".into(),
@@ -291,14 +292,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn review_mode_defaults_to_low_thinking_without_changing_plan_mode() {
+    fn review_mode_defaults_to_medium_thinking_without_changing_plan_mode() {
         let modes = builtin_modes();
         assert_eq!(
             find_mode(&modes, "review")
                 .unwrap()
                 .default_thinking_level
                 .as_deref(),
-            Some("low")
+            Some("medium")
         );
         assert!(
             find_mode(&modes, "plan")

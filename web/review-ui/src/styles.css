@@ -232,6 +232,11 @@ legend { color: var(--muted); font-size: 11px; }
 .routing-persona strong, .routing-persona small { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .routing-persona small { margin-top: 2px; color: var(--muted); }
 .routing-persona select { padding: 7px 8px; }
+.field-help { margin: 0 0 10px; color: var(--muted); font-size: 12px; }
+.persona-execution-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(330px, 1fr)); gap: 8px; }
+.persona-execution { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 9px; padding: 10px; border-radius: 7px; background: var(--surface-2); }
+.persona-execution header { grid-column: 1 / -1; display: flex; min-width: 0; flex-direction: column; }
+.persona-execution header small { margin-top: 2px; overflow: hidden; color: var(--muted); text-overflow: ellipsis; white-space: nowrap; }
 .reviewer-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(330px, 1fr)); gap: 14px; }
 .reviewer-editor { display: flex; flex-direction: column; gap: 12px; padding: 17px; }
 .reviewer-editor h2 { margin: 3px 0 0; font-size: 18px; }
@@ -258,6 +263,7 @@ th { color: var(--muted); font-size: 10px; text-transform: uppercase; letter-spa
 .settings-grid { display: grid; grid-template-columns: minmax(350px, .85fr) minmax(440px, 1.15fr); gap: 16px; align-items: start; }
 .settings-card { display: flex; flex-direction: column; gap: 15px; padding: 18px; }
 .settings-card form { display: flex; flex-direction: column; gap: 12px; }
+.review-mode-settings { margin-bottom: 16px; }
 .health-list { display: grid; grid-template-columns: 1fr 1fr; gap: 7px; }
 .health-list > div { display: flex; gap: 8px; align-items: flex-start; padding: 9px; border-radius: 7px; background: var(--surface-2); }
 .health-list i { flex: 0 0 8px; width: 8px; height: 8px; margin-top: 4px; border-radius: 50%; background: var(--red); }
@@ -315,6 +321,9 @@ th { color: var(--muted); font-size: 10px; text-transform: uppercase; letter-spa
   .page-header { flex-direction: column; }
   .metric-grid { grid-template-columns: 1fr 1fr; }
   .facts, .form-grid, .stats-summary-grid { grid-template-columns: 1fr 1fr; }
+  .review-mode-settings .form-grid { grid-template-columns: 1fr; }
+  .persona-execution { grid-template-columns: 1fr; }
+  .persona-execution header { grid-column: 1; }
   .job-row { grid-template-columns: 72px minmax(0, 1fr); }
   .job-meta { display: none; }
   .health-list { grid-template-columns: 1fr; }

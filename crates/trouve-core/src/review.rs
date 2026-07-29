@@ -1439,6 +1439,7 @@ impl Engine {
                 trigger: "manual".into(),
                 retry_of: None,
                 model: repository.model,
+                coordinator_thinking_level: repository.coordinator_thinking_level,
                 router_model: repository.router_model,
                 router_thinking_level: repository.router_thinking_level,
                 prompt: repository.prompt,
@@ -1544,8 +1545,8 @@ impl Engine {
         .map_err(|error| EngineError::Internal(error.into()))?;
         Ok(hex::encode(Sha256::digest(
             format!(
-                "{:?}\0{}\0{routing_config}\0{reviewer_config}",
-                repository.model, repository.prompt
+                "{:?}\0{:?}\0{}\0{routing_config}\0{reviewer_config}",
+                repository.model, repository.coordinator_thinking_level, repository.prompt
             )
             .as_bytes(),
         )))
@@ -1587,6 +1588,12 @@ impl Engine {
                     reviewer_override.reviewer_id
                 )));
             }
+            let thinking_level = reviewer_override
+                .thinking_level
+                .as_deref()
+                .map(str::trim)
+                .filter(|level| !level.is_empty())
+                .map(str::to_string);
             let prompt = reviewer_override.prompt.trim();
             if prompt.len() > 16_000 {
                 return Err(EngineError::BadRequest(format!(
@@ -1600,12 +1607,16 @@ impl Engine {
                     reviewer_override.reviewer_id
                 )));
             }
-            if model.is_none() && reviewer_override.prompt_mode == ReviewerPromptMode::Inherit {
+            if model.is_none()
+                && thinking_level.is_none()
+                && reviewer_override.prompt_mode == ReviewerPromptMode::Inherit
+            {
                 continue;
             }
             normalized.push(ReviewerOverride {
                 reviewer_id: reviewer_override.reviewer_id.clone(),
                 model,
+                thinking_level,
                 prompt_mode: reviewer_override.prompt_mode,
                 prompt: if reviewer_override.prompt_mode == ReviewerPromptMode::Inherit {
                     String::new()
@@ -1699,6 +1710,49 @@ impl Engine {
         Ok(())
     }
 
+    async fn validate_code_review_thinking_level(
+        &self,
+        role: &str,
+        level: Option<&str>,
+        model: Option<&str>,
+    ) -> Result<(), EngineError> {
+        let Some(level) = level else {
+            return Ok(());
+        };
+        let selected_model = model.ok_or_else(|| {
+            EngineError::BadRequest(format!("{role} thinking level requires a configured model"))
+        })?;
+        let model_info = self.resolve_model_info(selected_model).await?;
+        let supported = crate::engine::advertised_thinking_levels(&model_info);
+        if supported.contains(&level) {
+            return Ok(());
+        }
+        if let Some((minimum, maximum)) = crate::engine::advertised_thinking_budget(&model_info) {
+            let budget = level.parse::<u64>().ok();
+            if budget.is_some_and(|budget| {
+                budget >= minimum && maximum.is_none_or(|maximum| budget <= maximum)
+            }) {
+                return Ok(());
+            }
+            let range = maximum
+                .map(|maximum| format!("{minimum} through {maximum}"))
+                .unwrap_or_else(|| format!("at least {minimum}"));
+            return Err(EngineError::BadRequest(format!(
+                "{role} thinking budget {level:?} is not supported by model \
+                 {selected_model:?}; enter a whole token count {range}"
+            )));
+        }
+        let detail = if supported.is_empty() {
+            "it does not advertise configurable thinking levels".into()
+        } else {
+            format!("supported levels: {}", supported.join(", "))
+        };
+        Err(EngineError::BadRequest(format!(
+            "{role} thinking level {level:?} is not supported by model \
+             {selected_model:?}; {detail}"
+        )))
+    }
+
     pub async fn update_code_review_repository(
         &self,
         request: &UpdateCodeReviewRepositoryRequest,
@@ -1723,6 +1777,17 @@ impl Engine {
                 "enabled code review requires an explicit repository model".into(),
             ));
         }
+        let coordinator_thinking_level = request
+            .coordinator_thinking_level
+            .as_ref()
+            .map(|level| level.trim().to_string())
+            .filter(|level| !level.is_empty());
+        self.validate_code_review_thinking_level(
+            "coordinator",
+            coordinator_thinking_level.as_deref(),
+            model.as_deref(),
+        )
+        .await?;
         let router_model = request
             .router_model
             .as_ref()
@@ -1746,29 +1811,12 @@ impl Engine {
             .as_ref()
             .map(|level| level.trim().to_string())
             .filter(|level| !level.is_empty());
-        if let Some(level) = router_thinking_level.as_deref() {
-            let selected_model = router_model
-                .as_deref()
-                .or(model.as_deref())
-                .ok_or_else(|| {
-                    EngineError::BadRequest(
-                        "router thinking level requires a configured router or review model".into(),
-                    )
-                })?;
-            let model_info = self.resolve_model_info(selected_model).await?;
-            let supported = crate::engine::advertised_thinking_levels(&model_info);
-            if !supported.contains(&level) {
-                let detail = if supported.is_empty() {
-                    "it does not advertise configurable thinking levels".into()
-                } else {
-                    format!("supported levels: {}", supported.join(", "))
-                };
-                return Err(EngineError::BadRequest(format!(
-                    "router thinking level {level:?} is not supported by model \
-                     {selected_model:?}; {detail}"
-                )));
-            }
-        }
+        self.validate_code_review_thinking_level(
+            "router",
+            router_thinking_level.as_deref(),
+            router_model.as_deref().or(model.as_deref()),
+        )
+        .await?;
         let existing = self
             .store
             .list_code_review_repositories()?
@@ -1855,11 +1903,29 @@ impl Engine {
             })
             .unwrap_or_default();
         let reviewer_overrides = self.normalize_reviewer_overrides(&reviewer_overrides)?;
+        let reviewer_catalog = self.code_review_reviewer_catalog()?;
+        for reviewer_override in &reviewer_overrides {
+            let reviewer = reviewer_catalog
+                .iter()
+                .find(|reviewer| reviewer.id == reviewer_override.reviewer_id)
+                .expect("normalized reviewer override has a catalog entry");
+            self.validate_code_review_thinking_level(
+                &format!("reviewer {:?}", reviewer_override.reviewer_id),
+                reviewer_override.thinking_level.as_deref(),
+                reviewer_override
+                    .model
+                    .as_deref()
+                    .or(reviewer.model.as_deref())
+                    .or(model.as_deref()),
+            )
+            .await?;
+        }
         let normalized = UpdateCodeReviewRepositoryRequest {
             installation_id: request.installation_id,
             repository: request.repository.clone(),
             mode: request.mode,
             model,
+            coordinator_thinking_level,
             router_model,
             router_thinking_level,
             prompt: request.prompt.clone(),
@@ -2231,6 +2297,7 @@ impl Engine {
                         trigger: requested.trigger.into(),
                         retry_of: None,
                         model: repository.model.clone(),
+                        coordinator_thinking_level: repository.coordinator_thinking_level.clone(),
                         router_model: repository.router_model.clone(),
                         router_thinking_level: repository.router_thinking_level.clone(),
                         prompt: repository.prompt.clone(),
@@ -2723,7 +2790,7 @@ impl Engine {
             session_id: session.id.clone(),
             mode: Some("review".into()),
             model: Some(coordinator_model),
-            model_options: serde_json::Map::new(),
+            model_options: thinking_model_options(job.coordinator_thinking_level.as_deref()),
             permission_mode: Some(PermissionMode::Yolo),
         })?;
         if !self
@@ -4586,6 +4653,9 @@ fn apply_reviewer_overrides(
             if let Some(model) = &reviewer_override.model {
                 reviewer.model = Some(model.clone());
             }
+            if let Some(thinking_level) = &reviewer_override.thinking_level {
+                reviewer.default_thinking_level = Some(thinking_level.clone());
+            }
             match reviewer_override.prompt_mode {
                 ReviewerPromptMode::Inherit => {}
                 ReviewerPromptMode::Append => {
@@ -5613,6 +5683,24 @@ mod tests {
                     output_price_per_mtok: None,
                     options_schema: serde_json::json!({}),
                 },
+                trouve_protocol::ModelInfo {
+                    id: "provider/fixed".into(),
+                    display_name: "Fixed thinking".into(),
+                    context_window: 100_000,
+                    supports_tools: true,
+                    input_price_per_mtok: None,
+                    output_price_per_mtok: None,
+                    options_schema: serde_json::json!({
+                        "type": "object",
+                        "properties": {
+                            "thinking_budget_tokens": {
+                                "type": "integer",
+                                "minimum": 1024,
+                                "maximum": 32768
+                            }
+                        }
+                    }),
+                },
             ]
         }
 
@@ -5654,6 +5742,7 @@ mod tests {
                 trigger: "automatic".into(),
                 retry_of: None,
                 model: Some("provider/default".into()),
+                coordinator_thinking_level: None,
                 router_model: None,
                 router_thinking_level: None,
                 prompt: "Review it".into(),
@@ -6382,12 +6471,16 @@ mod tests {
             &[ReviewerOverride {
                 reviewer_id: "security".into(),
                 model: Some("anthropic/reviewer".into()),
+                thinking_level: Some("medium".into()),
                 prompt_mode: ReviewerPromptMode::Append,
                 prompt: "Focus on tenant isolation.".into(),
             }],
         );
         assert_eq!(appended[0].model.as_deref(), Some("anthropic/reviewer"));
-        assert_eq!(appended[0].default_thinking_level.as_deref(), Some("high"));
+        assert_eq!(
+            appended[0].default_thinking_level.as_deref(),
+            Some("medium")
+        );
         assert!(appended[0].prompt.starts_with(&reviewer.prompt));
         assert!(appended[0].prompt.ends_with("Focus on tenant isolation."));
 
@@ -6396,6 +6489,7 @@ mod tests {
             &[ReviewerOverride {
                 reviewer_id: "security".into(),
                 model: None,
+                thinking_level: None,
                 prompt_mode: ReviewerPromptMode::Replace,
                 prompt: "Review only authorization changes.".into(),
             }],
@@ -6830,6 +6924,7 @@ mod tests {
             private: false,
             mode: CodeReviewMode::Automatic,
             model: Some("provider/review".into()),
+            coordinator_thinking_level: Some("medium".into()),
             router_model: Some("provider/router".into()),
             router_thinking_level: Some("low".into()),
             prompt: "Review it".into(),
@@ -6874,6 +6969,7 @@ mod tests {
                 repository: "acme/widgets".into(),
                 mode: CodeReviewMode::Automatic,
                 model: None,
+                coordinator_thinking_level: None,
                 router_model: Some("provider/router".into()),
                 router_thinking_level: Some("low".into()),
                 prompt: String::new(),
@@ -6915,6 +7011,7 @@ mod tests {
                 repository: "acme/widgets".into(),
                 mode: CodeReviewMode::Automatic,
                 model: Some("provider/router".into()),
+                coordinator_thinking_level: None,
                 router_model: router_model.map(str::to_owned),
                 router_thinking_level: level.map(str::to_owned),
                 prompt: String::new(),
@@ -6963,6 +7060,53 @@ mod tests {
         assert_eq!(saved.router_model.as_deref(), Some("provider/plain"));
         assert!(saved.router_thinking_level.is_none());
 
+        let mut coordinator_request = request(None, None);
+        coordinator_request.coordinator_thinking_level = Some(" high ".into());
+        let saved = engine
+            .update_code_review_repository(&coordinator_request)
+            .await
+            .unwrap();
+        assert_eq!(saved.coordinator_thinking_level.as_deref(), Some("high"));
+
+        let mut fixed_request = request(None, None);
+        fixed_request.model = Some("provider/fixed".into());
+        fixed_request.coordinator_thinking_level = Some("16384".into());
+        let saved = engine
+            .update_code_review_repository(&fixed_request)
+            .await
+            .unwrap();
+        assert_eq!(saved.coordinator_thinking_level.as_deref(), Some("16384"));
+        fixed_request.coordinator_thinking_level = Some("512".into());
+        let error = engine
+            .update_code_review_repository(&fixed_request)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("1024 through 32768"));
+
+        let mut reviewer_request = request(None, None);
+        reviewer_request.reviewer_overrides = Some(vec![ReviewerOverride {
+            reviewer_id: "security".into(),
+            model: Some("provider/router".into()),
+            thinking_level: Some(" low ".into()),
+            prompt_mode: ReviewerPromptMode::Inherit,
+            prompt: String::new(),
+        }]);
+        let saved = engine
+            .update_code_review_repository(&reviewer_request)
+            .await
+            .unwrap();
+        assert_eq!(
+            saved.reviewer_overrides[0].thinking_level.as_deref(),
+            Some("low")
+        );
+        reviewer_request.reviewer_overrides.as_mut().unwrap()[0].thinking_level =
+            Some("xhigh".into());
+        let error = engine
+            .update_code_review_repository(&reviewer_request)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("supported levels: low, high"));
+
         let engine =
             engine.with_provider("provider", Arc::new(RouterThinkingProvider { stall: true }));
         let error = tokio::time::timeout(
@@ -6996,6 +7140,7 @@ mod tests {
             repository: "acme/widgets".into(),
             mode: CodeReviewMode::Automatic,
             model: Some("provider/review".into()),
+            coordinator_thinking_level: None,
             router_model: None,
             router_thinking_level: None,
             prompt: String::new(),
@@ -7140,6 +7285,7 @@ mod tests {
                 repository: "acme/widgets".into(),
                 mode: CodeReviewMode::Manual,
                 model: Some("provider/review".into()),
+                coordinator_thinking_level: None,
                 router_model: None,
                 router_thinking_level: None,
                 prompt: String::new(),

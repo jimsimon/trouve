@@ -4095,7 +4095,8 @@ async fn code_review_dashboard_and_repository_policy_round_trip() {
             "installation_id": 7,
             "repository": "acme/widgets",
             "mode": "automatic",
-            "model": "openai/gpt-5",
+            "model": "anthropic/claude",
+            "coordinator_thinking_level": "high",
             "router_model": "anthropic/claude",
             "router_thinking_level": "low",
             "prompt": "focus on concurrency",
@@ -4108,6 +4109,7 @@ async fn code_review_dashboard_and_repository_policy_round_trip() {
                 {
                     "reviewer_id": "correctness",
                     "model": "anthropic/claude",
+                    "thinking_level": "low",
                     "prompt_mode": "append",
                     "prompt": "Focus on widget lifecycle boundaries."
                 },
@@ -4133,7 +4135,11 @@ async fn code_review_dashboard_and_repository_policy_round_trip() {
         .unwrap();
     assert_eq!(dashboard["repositories"][0]["repository"], "acme/widgets");
     assert_eq!(dashboard["repositories"][0]["mode"], "automatic");
-    assert_eq!(dashboard["repositories"][0]["model"], "openai/gpt-5");
+    assert_eq!(dashboard["repositories"][0]["model"], "anthropic/claude");
+    assert_eq!(
+        dashboard["repositories"][0]["coordinator_thinking_level"],
+        "high"
+    );
     assert_eq!(
         dashboard["repositories"][0]["router_model"],
         "anthropic/claude"
@@ -4156,6 +4162,10 @@ async fn code_review_dashboard_and_repository_policy_round_trip() {
     assert_eq!(
         dashboard["repositories"][0]["reviewer_overrides"][0]["model"],
         "anthropic/claude"
+    );
+    assert_eq!(
+        dashboard["repositories"][0]["reviewer_overrides"][0]["thinking_level"],
+        "low"
     );
     assert_eq!(
         dashboard["repositories"][0]["reviewer_overrides"][1]["prompt_mode"],
@@ -4234,6 +4244,7 @@ async fn code_review_job_overview_loads_task_content_separately() {
             trigger: "automatic".into(),
             retry_of: None,
             model: Some("provider/model".into()),
+            coordinator_thinking_level: Some("medium".into()),
             router_model: Some("provider/router".into()),
             router_thinking_level: Some("low".into()),
             prompt: "Review it".into(),
