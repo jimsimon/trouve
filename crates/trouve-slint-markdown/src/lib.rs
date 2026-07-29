@@ -119,6 +119,10 @@ fn is_closing_fence(s: &str, ticks: usize) -> bool {
     s.len() >= ticks && s.bytes().all(|byte| byte == b'`')
 }
 
+fn has_closing_fence<'a>(mut lines: impl Iterator<Item = &'a str>, ticks: usize) -> bool {
+    lines.any(|candidate| is_closing_fence(candidate.trim(), ticks))
+}
+
 fn is_markdown_language(info: &str) -> bool {
     matches!(
         info.split_whitespace().next(),
@@ -273,10 +277,7 @@ pub fn parse_blocks(text: &str) -> Vec<Block> {
                 // Recover a same-length inner fence only when a later fence
                 // remains to close the outer markdown example. Without that
                 // lookahead, valid CommonMark keeps its standard meaning.
-                let closes_nested = *nested_opener
-                    && input
-                        .clone()
-                        .any(|candidate| is_closing_fence(candidate.trim(), *ticks));
+                let closes_nested = *nested_opener && has_closing_fence(input.clone(), *ticks);
                 if closes_nested {
                     lines.push(line);
                     *nested_opener = false;
@@ -397,7 +398,7 @@ fn to_widget_block(b: &Block) -> MarkdownBlock {
 /// Byte length of the largest prefix ending at a complete blank line outside
 /// a fenced code block. Parsing state is reset there, so blocks before it can
 /// be retained unchanged while streamed text continues to arrive.
-fn stable_prefix_len(text: &str) -> usize {
+fn stable_prefix_len(text: &str, complete: bool) -> usize {
     let mut offset = 0;
     let mut stable = 0;
     // (outer ticks, markdown example, possible same-length nested opener).
@@ -406,15 +407,16 @@ fn stable_prefix_len(text: &str) -> usize {
     // make a later streamed outer closer impossible to recover.
     let mut code = None;
 
-    for raw_line in text.split_inclusive('\n') {
+    let mut input = text.split_inclusive('\n').peekable();
+    while let Some(raw_line) = input.next() {
         offset += raw_line.len();
         let line = raw_line.strip_suffix('\n').unwrap_or(raw_line);
         if let Some((ticks, markdown_example, nested_opener)) = code.as_mut() {
             let trimmed = line.trim();
             if is_closing_fence(trimmed, *ticks) {
-                if *nested_opener {
+                if *nested_opener && has_closing_fence(input.clone(), *ticks) {
                     *nested_opener = false;
-                } else {
+                } else if !*nested_opener || complete {
                     code = None;
                 }
             } else if *markdown_example
@@ -435,7 +437,7 @@ fn stable_prefix_len(text: &str) -> usize {
         }
     }
 
-    stable
+    if complete { text.len() } else { stable }
 }
 
 /// Live block model for a streaming message.
@@ -477,8 +479,20 @@ impl StreamingMarkdown {
     /// were touched — appends normally touch only the trailing block.
     pub fn push(&mut self, delta: &str) -> usize {
         self.text.push_str(delta);
+        self.sync(false)
+    }
+
+    /// Finalize a completed stream and make its entire block model stable.
+    ///
+    /// Call this after the final [`Self::push`]. No more text may be appended
+    /// afterward.
+    pub fn finish(&mut self) -> usize {
+        self.sync(true)
+    }
+
+    fn sync(&mut self, complete: bool) -> usize {
         let tail = &self.text[self.stable_text_len..];
-        let newly_stable_len = stable_prefix_len(tail);
+        let newly_stable_len = stable_prefix_len(tail, complete);
         let mut new_tail = parse_blocks(&tail[..newly_stable_len]);
         let newly_stable_blocks = new_tail.len();
         new_tail.extend(parse_blocks(&tail[newly_stable_len..]));
@@ -777,5 +791,26 @@ after";
 
         assert_eq!(streaming.blocks, parse_blocks(full));
         assert!(streaming.stable_text_len > "before\n\n".len());
+    }
+
+    #[test]
+    fn streaming_single_closer_keeps_commonmark_meaning_and_stabilizes() {
+        let stable = "before\n\n```markdown\n```text\n```\nafter\n\n";
+        let full = format!("{stable}last");
+        let mut streaming = StreamingMarkdown::new();
+        let mut streamed_text = String::new();
+
+        for chunk in full.as_bytes().chunks(5) {
+            let chunk = std::str::from_utf8(chunk).unwrap_or("");
+            streamed_text.push_str(chunk);
+            streaming.push(chunk);
+            assert_eq!(streaming.blocks, parse_blocks(&streamed_text));
+        }
+
+        assert_eq!(streaming.blocks, parse_blocks(&full));
+        assert_eq!(streaming.stable_text_len, "before\n\n".len());
+        streaming.finish();
+        assert_eq!(streaming.blocks, parse_blocks(&full));
+        assert_eq!(streaming.stable_text_len, full.len());
     }
 }
