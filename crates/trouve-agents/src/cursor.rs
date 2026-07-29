@@ -54,6 +54,7 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin};
 use tokio::sync::{Mutex, oneshot};
 use trouve_protocol::{ModelInfo, Usage};
+use trouve_providers::models_dev::{ModelsDevCatalog, OptionsDialect};
 
 use crate::{
     AgentBackend, BackendError, BackendEvent, BackendEventSender, BackendEventStream, BackendLogin,
@@ -68,7 +69,10 @@ pub struct CursorBackend {
     command: String,
     api_key: Option<String>,
     pool: Arc<ServerPool>,
-    /// `cursor/list_available_models` result, cached for [`MODELS_TTL`].
+    catalog: Arc<ModelsDevCatalog>,
+    /// Raw `cursor/list_available_models` adapter records, cached for
+    /// [`MODELS_TTL`]. Catalog-covered records are canonicalized on every
+    /// read so a models.dev refresh takes effect immediately.
     models_cache: Mutex<Option<(std::time::Instant, Vec<ModelInfo>)>>,
     /// The CLI's credential file, read (never written) for the usage query.
     auth_file: std::path::PathBuf,
@@ -108,6 +112,7 @@ impl CursorBackend {
             command: command.unwrap_or_else(|| "cursor-agent".into()),
             api_key,
             pool: Arc::new(ServerPool::default()),
+            catalog: Arc::new(ModelsDevCatalog::embedded()),
             models_cache: Mutex::new(None),
             auth_file: cli_auth_file(),
             dashboard_base: DASHBOARD_BASE.into(),
@@ -124,6 +129,18 @@ impl CursorBackend {
         self.auth_file = auth_file;
         self.dashboard_base = base.into();
         self
+    }
+
+    pub fn with_catalog(mut self, catalog: Arc<ModelsDevCatalog>) -> Self {
+        self.catalog = catalog;
+        self
+    }
+
+    fn canonicalize_models(&self, models: Vec<ModelInfo>) -> Vec<ModelInfo> {
+        models
+            .into_iter()
+            .filter_map(|live| canonicalize_cursor_model(&self.catalog, &self.id, live))
+            .collect()
     }
 
     /// The pooled child for this worktree, spawned (cwd-pinned) on first
@@ -201,20 +218,21 @@ impl AgentBackend for CursorBackend {
     }
 
     fn models(&self) -> Vec<ModelInfo> {
-        // Minimal offline fallback; `list_models` asks the vendor for the
-        // real catalog (per-account, with per-model config options).
+        // Cursor's automatic selection is a transport-owned model with no
+        // public catalog identity. Live discovery supplies the rest.
         vec![model(&self.id, "default", "Cursor Auto", 0)]
     }
 
     async fn list_models(&self) -> Vec<ModelInfo> {
-        {
+        let stale = {
             let cache = self.models_cache.lock().await;
             if let Some((at, models)) = cache.as_ref()
                 && at.elapsed() < MODELS_TTL
             {
-                return models.clone();
+                return self.canonicalize_models(models.clone());
             }
-        }
+            cache.as_ref().map(|(_, models)| models.clone())
+        };
         let fetched = async {
             let server = self.any_server().await?;
             server
@@ -224,16 +242,22 @@ impl AgentBackend for CursorBackend {
         .await;
         match fetched {
             Ok(result) => {
-                let models = parse_acp_models(&self.id, &result);
-                if models.is_empty() {
-                    return self.models();
+                if !result["models"].is_array() {
+                    return stale
+                        .map(|models| self.canonicalize_models(models))
+                        .unwrap_or_else(|| self.models());
                 }
+                let models = parse_acp_models(&self.id, &result);
                 *self.models_cache.lock().await = Some((std::time::Instant::now(), models.clone()));
-                models
+                self.canonicalize_models(models)
             }
             Err(e) => {
-                tracing::debug!("cursor/list_available_models failed: {e}; using static list");
-                self.models()
+                tracing::debug!(
+                    "cursor/list_available_models failed: {e}; using stale/static list"
+                );
+                stale
+                    .map(|models| self.canonicalize_models(models))
+                    .unwrap_or_else(|| self.models())
             }
         }
     }
@@ -1030,9 +1054,76 @@ fn parse_usage(usage: &Value) -> Usage {
 
 // --- model catalog -----------------------------------------------------------
 
+/// Replace metadata for public vendor models that models.dev can identify
+/// while preserving Cursor-only execution controls. Recognizable public ids
+/// absent from the catalog are omitted rather than accepting ACP metadata as a
+/// second source of truth. `default`, Composer models, and other Cursor-owned
+/// ids deliberately keep the ACP adapter record intact.
+fn canonicalize_cursor_model(
+    catalog: &ModelsDevCatalog,
+    backend_id: &str,
+    live: ModelInfo,
+) -> Option<ModelInfo> {
+    let raw_id = live
+        .id
+        .strip_prefix(backend_id)
+        .and_then(|id| id.strip_prefix('/'))
+        .unwrap_or(&live.id);
+    let canonical = [
+        ("anthropic", OptionsDialect::ClaudeCli),
+        ("openai", OptionsDialect::CodexCli),
+        ("google", OptionsDialect::Gemini),
+    ]
+    .into_iter()
+    .find_map(|(provider, dialect)| catalog.model(provider, backend_id, raw_id, dialect));
+    let Some(mut canonical) = canonical else {
+        return (!looks_like_public_cursor_model(raw_id)).then_some(live);
+    };
+
+    // The account-visible spelling is what Cursor accepts at execution time.
+    canonical.id = live.id;
+    canonical.input_price_per_mtok = None;
+    canonical.output_price_per_mtok = None;
+
+    // Context selection and fast mode are Cursor transport controls, not
+    // public model capabilities. Generic reasoning settings remain
+    // catalog-owned even when ACP advertises a conflicting list/default.
+    if let (Some(canonical_properties), Some(live_properties)) = (
+        canonical
+            .options_schema
+            .pointer_mut("/properties")
+            .and_then(Value::as_object_mut),
+        live.options_schema
+            .pointer("/properties")
+            .and_then(Value::as_object),
+    ) {
+        for key in ["context", "fast"] {
+            if let Some(property) = live_properties.get(key) {
+                canonical_properties.insert(key.into(), property.clone());
+            }
+        }
+    }
+    Some(canonical)
+}
+
+fn looks_like_public_cursor_model(id: &str) -> bool {
+    id.starts_with("claude-")
+        || id.starts_with("gemini-")
+        || id.starts_with("gpt-")
+        || id.starts_with("chatgpt-")
+        || id.starts_with("codex-")
+        || id.starts_with("computer-use-")
+        || ["o1", "o3", "o4"].iter().any(|family| {
+            id == *family
+                || id
+                    .strip_prefix(*family)
+                    .is_some_and(|suffix| suffix.starts_with('-'))
+        })
+}
+
 /// Map a `cursor/list_available_models` result to ModelInfos: one entry per
-/// model with its config options (thinking/context/effort/reasoning/fast)
-/// as an options schema.
+/// model with its config options as an adapter schema. A later canonicalization
+/// pass replaces public vendor metadata/settings from models.dev.
 fn parse_acp_models(backend_id: &str, result: &Value) -> Vec<ModelInfo> {
     let Some(models) = result["models"].as_array() else {
         return Vec::new();
@@ -1768,6 +1859,57 @@ mod tests {
 
         let composer = &models[2];
         assert_eq!(composer.context_window, 0); // no context option
+        assert_eq!(
+            composer.options_schema.pointer("/properties/fast/default"),
+            Some(&json!(true))
+        );
+    }
+
+    #[test]
+    fn models_dev_canonicalizes_public_cursor_models_only() {
+        let catalog = ModelsDevCatalog::embedded();
+        let result = json!({ "models": [
+            { "value": "claude-fable-5", "name": "Vendor Override", "configOptions": [
+                { "id": "context", "description": "Context size",
+                  "currentValue": "300k",
+                  "options": [ { "value": "300k" }, { "value": "1m" } ] },
+                { "id": "effort", "description": "Vendor effort",
+                  "currentValue": "high",
+                  "options": [ { "value": "low" }, { "value": "high" } ] }
+            ]},
+            { "value": "composer-2.5", "name": "Composer 2.5", "configOptions": [
+                { "id": "fast", "description": "Faster",
+                  "currentValue": "true",
+                  "options": [ { "value": "false" }, { "value": "true" } ] }
+            ]},
+            { "value": "gpt-future", "name": "Uncatalogued public model",
+              "configOptions": [] }
+        ]});
+        let live = parse_acp_models("cursor", &result);
+        let models: Vec<_> = live
+            .into_iter()
+            .filter_map(|model| canonicalize_cursor_model(&catalog, "cursor", model))
+            .collect();
+
+        assert_eq!(models.len(), 2, "unknown public ids are not guessed");
+        let fable = &models[0];
+        assert_eq!(fable.display_name, "Claude Fable 5");
+        assert_eq!(fable.context_window, 1_000_000);
+        assert_eq!(
+            fable.options_schema.pointer("/properties/effort/enum"),
+            Some(&json!(["low", "medium", "high", "xhigh", "max"]))
+        );
+        assert_eq!(
+            fable.options_schema.pointer("/properties/effort/default"),
+            Some(&json!("medium"))
+        );
+        assert_eq!(
+            fable.options_schema.pointer("/properties/context/enum"),
+            Some(&json!(["300k", "1m"]))
+        );
+
+        let composer = &models[1];
+        assert_eq!(composer.display_name, "Composer 2.5");
         assert_eq!(
             composer.options_schema.pointer("/properties/fast/default"),
             Some(&json!(true))

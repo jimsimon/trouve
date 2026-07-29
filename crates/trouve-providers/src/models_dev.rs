@@ -1,11 +1,13 @@
 //! Model metadata from the public, tokenless models.dev catalog.
 //!
-//! Provider APIs remain authoritative for availability and for any fields
-//! they report. This catalog fills gaps such as context limits, pricing, and
-//! model-specific reasoning controls. A generated snapshot keeps the complete
-//! provider roster plus OpenAI/Anthropic model details available offline; a
-//! validated disk cache is refreshed from models.dev when the server has
-//! connectivity monitoring.
+//! Provider APIs and vendor CLIs contribute account-specific availability,
+//! while this catalog remains authoritative for provider identity, model
+//! metadata, and model-specific option schemas. Explicit adapters own metadata
+//! only for integrations the catalog cannot describe (custom gateways, local
+//! runtimes, and Cursor-only models). A generated snapshot keeps the complete
+//! provider roster plus model details available offline; a validated disk
+//! cache is refreshed from models.dev when the server has connectivity
+//! monitoring.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -31,6 +33,7 @@ type Catalog = BTreeMap<String, CatalogProvider>;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OptionsDialect {
     OpenAi,
+    CodexCli,
     Anthropic,
     ClaudeCli,
     Gemini,
@@ -362,6 +365,34 @@ impl ModelsDevCatalog {
             .collect()
     }
 
+    /// Catalog-owned metadata for the account-visible ids reported by a live
+    /// provider or vendor CLI. The live source contributes only availability:
+    /// unknown, deprecated, and non-tool models are omitted rather than
+    /// synthesizing metadata from a partial vendor record.
+    pub fn provider_models_for_ids<I, S>(
+        &self,
+        catalog_provider: &str,
+        output_provider: &str,
+        available_ids: I,
+        dialect: OptionsDialect,
+    ) -> Vec<ModelInfo>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        let mut models = BTreeMap::new();
+        for id in available_ids {
+            let Some(model) = self.model(catalog_provider, output_provider, id.as_ref(), dialect)
+            else {
+                continue;
+            };
+            if model.supports_tools {
+                models.entry(model.id.clone()).or_insert(model);
+            }
+        }
+        models.into_values().collect()
+    }
+
     /// Provider setup presets derived from the same catalog as model
     /// metadata. `api.json` supplies the roster, names, key environment
     /// variables, and explicit compatible endpoints. A small transport
@@ -505,18 +536,28 @@ impl CatalogModel {
             match option.kind.as_str() {
                 "effort" if option.values.len() > 1 => {
                     let key = match dialect {
-                        OptionsDialect::OpenAi => "reasoning_effort",
+                        OptionsDialect::OpenAi | OptionsDialect::CodexCli => "reasoning_effort",
                         OptionsDialect::Anthropic | OptionsDialect::ClaudeCli => "effort",
                         OptionsDialect::Gemini => "thinking_level",
                     };
-                    properties.insert(
-                        key.into(),
-                        json!({
-                            "type": "string",
-                            "enum": option.values,
-                            "description": "How much thinking the model does before answering"
-                        }),
-                    );
+                    let mut schema = json!({
+                        "type": "string",
+                        "enum": option.values,
+                        "description": "How much thinking the model does before answering"
+                    });
+                    // models.dev supplies the supported ordering but not a
+                    // separate default. Normalize that once for every client:
+                    // prefer the conventional midpoint, then the catalog's
+                    // first supported value.
+                    if let Some(default) = option
+                        .values
+                        .iter()
+                        .find(|value| *value == "medium")
+                        .or_else(|| option.values.first())
+                    {
+                        schema["default"] = json!(default);
+                    }
+                    properties.insert(key.into(), schema);
                 }
                 "budget_tokens"
                     if matches!(
@@ -557,6 +598,7 @@ impl CatalogModel {
                         json!({
                             "type": "string",
                             "enum": ["off", "on"],
+                            "default": "off",
                             "description": "Extended thinking"
                         }),
                     );
@@ -564,7 +606,12 @@ impl CatalogModel {
                 _ => {}
             }
         }
-        if self.temperature == Some(true) && dialect != OptionsDialect::ClaudeCli {
+        if self.temperature == Some(true)
+            && !matches!(
+                dialect,
+                OptionsDialect::CodexCli | OptionsDialect::ClaudeCli
+            )
+        {
             let maximum =
                 if dialect == OptionsDialect::Anthropic || dialect == OptionsDialect::Gemini {
                     1.0
@@ -1004,6 +1051,11 @@ mod tests {
                 .unwrap(),
             &json!(["none", "low", "medium", "high", "xhigh", "max"])
         );
+        assert_eq!(
+            gpt.options_schema
+                .pointer("/properties/reasoning_effort/default"),
+            Some(&json!("medium"))
+        );
 
         let fable = catalog
             .model(
@@ -1019,6 +1071,37 @@ mod tests {
                 .pointer("/properties/effort/enum")
                 .unwrap(),
             &json!(["low", "medium", "high", "xhigh", "max"])
+        );
+    }
+
+    #[test]
+    fn live_ids_are_only_an_availability_overlay() {
+        let catalog = ModelsDevCatalog::embedded();
+        let models = catalog.provider_models_for_ids(
+            "openai",
+            "codex",
+            [
+                "gpt-5.6",
+                "text-embedding-4-large",
+                "vendor-only",
+                "gpt-5.6",
+            ],
+            OptionsDialect::CodexCli,
+        );
+        assert_eq!(models.len(), 1);
+        assert_eq!(models[0].id, "codex/gpt-5.6");
+        assert_eq!(models[0].context_window, 1_050_000);
+        assert!(
+            models[0]
+                .options_schema
+                .pointer("/properties/reasoning_effort")
+                .is_some()
+        );
+        assert!(
+            models[0]
+                .options_schema
+                .pointer("/properties/temperature")
+                .is_none()
         );
     }
 

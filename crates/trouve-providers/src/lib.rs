@@ -191,14 +191,16 @@ pub trait Provider: Send + Sync {
     /// Stable identifier used as the prefix of model ids ("openai/gpt-4.1").
     fn id(&self) -> &str;
 
-    /// Live model listing, for providers whose catalog can be queried.
-    /// Defaults to the static snapshot.
+    /// Models available to the configured account or endpoint. For
+    /// catalog-covered providers, live discovery contributes identifiers only
+    /// and models.dev supplies canonical metadata and option schemas.
     async fn list_models(&self) -> Vec<trouve_protocol::ModelInfo> {
         self.models()
     }
 
-    /// Known models with capability/options schemas and pricing. Empty when
-    /// the provider can't enumerate its models (custom gateways).
+    /// Canonical catalog models, or explicit adapter metadata when no
+    /// models.dev identity exists. Empty when neither source can enumerate
+    /// the endpoint.
     fn models(&self) -> Vec<trouve_protocol::ModelInfo> {
         Vec::new()
     }

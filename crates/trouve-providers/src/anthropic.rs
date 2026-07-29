@@ -96,6 +96,26 @@ impl AnthropicProvider {
         })
     }
 
+    /// Rebuild catalog-covered cache entries from their available ids so
+    /// models.dev refreshes are not delayed by the live availability TTL.
+    fn canonicalize_models(
+        &self,
+        models: Vec<trouve_protocol::ModelInfo>,
+    ) -> Vec<trouve_protocol::ModelInfo> {
+        let Some(catalog_provider) = self.catalog_provider_id() else {
+            return models;
+        };
+        let prefix = format!("{}/", self.id);
+        self.catalog.provider_models_for_ids(
+            &catalog_provider,
+            &self.id,
+            models
+                .iter()
+                .map(|model| model.id.strip_prefix(&prefix).unwrap_or(model.id.as_str())),
+            OptionsDialect::Anthropic,
+        )
+    }
+
     /// Add auth headers (API key or OAuth bearer) to a request.
     fn authed(&self, mut req: reqwest::RequestBuilder, key: &str) -> reqwest::RequestBuilder {
         req = req.header("anthropic-version", ANTHROPIC_VERSION);
@@ -117,8 +137,10 @@ impl AnthropicProvider {
         req
     }
 
-    /// Fetch the account's model list from `/v1/models`, keeping the static
-    /// catalog's pricing where ids match (the API doesn't report pricing).
+    /// Fetch the account's model ids from `/v1/models`. For catalog-covered
+    /// providers every metadata field and option schema is rebuilt from
+    /// models.dev; custom Anthropic-compatible endpoints retain an explicit
+    /// live-record adapter.
     async fn fetch_models(&self) -> Result<Vec<trouve_protocol::ModelInfo>, ProviderError> {
         if self.vertex_bearer {
             return Err(ProviderError::Api(
@@ -142,15 +164,22 @@ impl AnthropicProvider {
             .json()
             .await
             .map_err(|e| ProviderError::Request(e.to_string()))?;
-        let limits = parse_output_limits(&body);
-        if !limits.is_empty() {
-            self.output_limits.lock().await.extend(
-                limits
-                    .into_iter()
-                    .map(|(model, limit)| (model, Some(limit))),
-            );
+        if !body["data"].is_array() {
+            return Err(ProviderError::Api(
+                "models response is missing its data array".into(),
+            ));
         }
         let catalog_provider = self.catalog_provider_id();
+        if catalog_provider.is_none() {
+            let limits = parse_output_limits(&body);
+            if !limits.is_empty() {
+                self.output_limits.lock().await.extend(
+                    limits
+                        .into_iter()
+                        .map(|(model, limit)| (model, Some(limit))),
+                );
+            }
+        }
         Ok(parse_model_list(
             &self.id,
             &body,
@@ -159,10 +188,16 @@ impl AnthropicProvider {
         ))
     }
 
-    /// Resolve the model's required Messages `max_tokens` cap. The normal
-    /// model-list refresh populates this cache; direct/headless use lazily
-    /// retrieves just the selected model.
+    /// Resolve the model's required Messages `max_tokens` cap. Catalog data is
+    /// canonical when the endpoint has a models.dev identity; live lookup is
+    /// retained only for custom Anthropic-compatible endpoints.
     async fn output_limit(&self, model: &str, key: &str) -> Option<u64> {
+        if let Some(limit) = self
+            .catalog_provider_id()
+            .and_then(|provider| self.catalog.output_limit(&provider, model))
+        {
+            return Some(limit);
+        }
         if let Some(limit) = self.output_limits.lock().await.get(model).copied() {
             return limit;
         }
@@ -185,10 +220,7 @@ impl AnthropicProvider {
             body["max_tokens"].as_u64().filter(|n| *n > 0)
         }
         .await;
-        let limit = fetched.or_else(|| {
-            self.catalog_provider_id()
-                .and_then(|provider| self.catalog.output_limit(&provider, model))
-        });
+        let limit = fetched;
         self.output_limits
             .lock()
             .await
@@ -308,9 +340,9 @@ impl AnthropicProvider {
     }
 }
 
-/// Map the Models API's per-model capability records into the schemas clients
-/// render. Older API versions omitted `capabilities`; only that case uses the
-/// curated model fallback rather than inventing levels for a partial record.
+/// Treat a live Models API response as availability for catalog-covered
+/// providers. Custom Anthropic-compatible endpoints have no catalog identity,
+/// so their response remains an explicit metadata adapter.
 fn parse_model_list(
     provider_id: &str,
     body: &Value,
@@ -320,35 +352,29 @@ fn parse_model_list(
     let Some(data) = body["data"].as_array() else {
         return Vec::new();
     };
+    if let Some(catalog_provider) = catalog_provider_id {
+        return models_dev.provider_models_for_ids(
+            catalog_provider,
+            provider_id,
+            data.iter().filter_map(|entry| entry["id"].as_str()),
+            OptionsDialect::Anthropic,
+        );
+    }
     data.iter()
         .filter_map(|entry| {
             let name = entry["id"].as_str()?;
-            let known = catalog_provider_id.and_then(|catalog_provider| {
-                models_dev.model(
-                    catalog_provider,
-                    provider_id,
-                    name,
-                    OptionsDialect::Anthropic,
-                )
-            });
-            let window = entry["max_input_tokens"]
+            let context_window = entry["max_input_tokens"]
                 .as_u64()
                 .filter(|w| *w > 0)
-                .or_else(|| known.as_ref().map(|model| model.context_window))
                 .unwrap_or(0);
             Some(trouve_protocol::ModelInfo {
                 id: format!("{provider_id}/{name}"),
                 display_name: entry["display_name"].as_str().unwrap_or(name).to_string(),
-                context_window: window,
+                context_window,
                 supports_tools: true,
-                input_price_per_mtok: known.as_ref().and_then(|model| model.input_price_per_mtok),
-                output_price_per_mtok: known.as_ref().and_then(|model| model.output_price_per_mtok),
-                options_schema: model_options_schema(
-                    name,
-                    entry.get("capabilities"),
-                    catalog_provider_id,
-                    models_dev,
-                ),
+                input_price_per_mtok: None,
+                output_price_per_mtok: None,
+                options_schema: uncatalogued_model_options_schema(entry.get("capabilities")),
             })
         })
         .collect()
@@ -368,22 +394,9 @@ fn parse_output_limits(body: &Value) -> HashMap<String, u64> {
         .collect()
 }
 
-fn model_options_schema(
-    model: &str,
-    capabilities: Option<&Value>,
-    catalog_provider_id: Option<&str>,
-    models_dev: &ModelsDevCatalog,
-) -> Value {
-    let catalog_schema = || {
-        catalog_provider_id
-            .and_then(|provider| {
-                models_dev.model(provider, provider, model, OptionsDialect::Anthropic)
-            })
-            .map(|model| model.options_schema)
-            .unwrap_or_else(catalog::anthropic_plain_schema)
-    };
+fn uncatalogued_model_options_schema(capabilities: Option<&Value>) -> Value {
     let Some(capabilities) = capabilities else {
-        return catalog_schema();
+        return catalog::anthropic_plain_schema();
     };
 
     let effort = &capabilities["effort"];
@@ -406,7 +419,7 @@ fn model_options_schema(
         .pointer("/thinking/supported")
         .and_then(Value::as_bool)
     {
-        Some(true) => catalog_schema(),
+        Some(true) => catalog::anthropic_plain_schema(),
         Some(false) | None => catalog::anthropic_plain_schema(),
     }
 }
@@ -462,17 +475,19 @@ impl Provider for AnthropicProvider {
         if let Some((at, models)) = cache.as_ref()
             && at.elapsed() < MODELS_TTL
         {
-            return models.clone();
+            return self.canonicalize_models(models.clone());
         }
+        let stale = cache.as_ref().map(|(_, models)| models.clone());
         match self.fetch_models().await {
-            Ok(models) if !models.is_empty() => {
+            Ok(models) => {
                 *cache = Some((std::time::Instant::now(), models.clone()));
-                models
+                self.canonicalize_models(models)
             }
-            Ok(_) => self.models(),
             Err(e) => {
-                tracing::debug!("anthropic model list failed: {e}; using models.dev cache");
-                self.models()
+                tracing::debug!("anthropic model list failed: {e}; using stale/models.dev list");
+                stale
+                    .map(|models| self.canonicalize_models(models))
+                    .unwrap_or_else(|| self.models())
             }
         }
     }
@@ -766,7 +781,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn model_list_uses_reported_effort_levels() {
+    fn catalog_provider_uses_live_ids_and_models_dev_settings() {
         let catalog = ModelsDevCatalog::embedded();
         let body = json!({
             "data": [{
@@ -794,7 +809,11 @@ mod tests {
         let schema = &models[0].options_schema;
         assert_eq!(
             schema.pointer("/properties/effort/enum").unwrap(),
-            &json!(["low", "medium", "high", "max"])
+            &json!(["low", "medium", "high", "xhigh", "max"])
+        );
+        assert_eq!(
+            schema.pointer("/properties/effort/default"),
+            Some(&json!("medium"))
         );
         assert!(schema.pointer("/properties/thinking_level").is_none());
         assert_eq!(parse_output_limits(&body)["claude-fable-5"], 128_000);
@@ -812,14 +831,38 @@ mod tests {
                 }
             }]
         });
-        let models = parse_model_list("anthropic", &body, Some("anthropic"), &catalog);
+        let models = parse_model_list("custom", &body, None, &catalog);
         let properties = models[0].options_schema["properties"].as_object().unwrap();
         assert_eq!(properties.len(), 1);
         assert!(properties.contains_key("temperature"));
     }
 
     #[test]
-    fn old_model_records_use_models_dev_fallback() {
+    fn custom_endpoint_retains_reported_effort_adapter() {
+        let catalog = ModelsDevCatalog::embedded();
+        let body = json!({"data": [{
+            "id": "private-model",
+            "display_name": "Private Model",
+            "max_input_tokens": 32_000,
+            "capabilities": {
+                "effort": {
+                    "supported": true,
+                    "low": {"supported": true},
+                    "high": {"supported": true}
+                }
+            }
+        }]});
+        let models = parse_model_list("custom", &body, None, &catalog);
+        assert_eq!(models[0].display_name, "Private Model");
+        assert_eq!(models[0].context_window, 32_000);
+        assert_eq!(
+            models[0].options_schema.pointer("/properties/effort/enum"),
+            Some(&json!(["low", "high"]))
+        );
+    }
+
+    #[test]
+    fn model_ids_without_live_capabilities_still_use_models_dev() {
         let catalog = ModelsDevCatalog::embedded();
         let body = json!({"data": [{"id": "claude-fable-5"}]});
         let models = parse_model_list("anthropic", &body, Some("anthropic"), &catalog);

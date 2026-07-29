@@ -7297,7 +7297,7 @@ fn short_model(model: &str) -> String {
 /// The thinking-style enum in a model's options schema, if any: property
 /// name, value tokens, and the schema default. Providers name the knob
 /// differently (anthropic: thinking_level, codex: reasoning_effort,
-/// cursor's ACP catalog: effort or reasoning).
+/// Cursor-only ACP adapters: effort or reasoning).
 fn thinking_property(schema: &serde_json::Value) -> Option<(String, Vec<String>, Option<String>)> {
     for key in ["thinking_level", "reasoning_effort", "effort", "reasoning"] {
         let Some(prop) = schema.pointer(&format!("/properties/{key}")) else {

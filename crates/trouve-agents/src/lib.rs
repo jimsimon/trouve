@@ -245,13 +245,15 @@ pub trait AgentBackend: Send + Sync {
     /// Stable identifier used as the prefix of model ids ("codex/gpt-5.4").
     fn id(&self) -> &str;
 
-    /// Static model snapshot: instant and offline-safe, used when the
-    /// vendor can't be asked (not installed, not logged in, query failed).
+    /// Canonical model metadata snapshot: instant and offline-safe, used when
+    /// the vendor cannot report current availability.
     fn models(&self) -> Vec<ModelInfo>;
 
-    /// Models as reported by the vendor right now (authoritative: vendors
-    /// evolve their catalogs faster than we ship). Implementations should
-    /// cache; the default falls back to the static snapshot.
+    /// Models available to the current account. Catalog-covered backends use
+    /// vendor output only as an id allowlist and rebuild metadata/settings
+    /// from models.dev. Explicit adapters own uncatalogued integrations such
+    /// as Cursor-only models. Implementations should cache availability; the
+    /// default falls back to the canonical snapshot.
     async fn list_models(&self) -> Vec<ModelInfo> {
         self.models()
     }
