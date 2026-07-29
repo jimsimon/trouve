@@ -8854,7 +8854,7 @@ mod tests {
         );
         // Codex wraps MCP calls in an `mcpToolCall` item carrying the real
         // tool and arguments.
-        let codex = vec![Event::ToolRequested {
+        let codex = [Event::ToolRequested {
             turn: 1,
             call_id: "item_7".into(),
             tool: "mcpToolCall".into(),
