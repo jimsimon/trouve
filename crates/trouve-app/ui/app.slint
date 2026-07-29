@@ -903,9 +903,9 @@ component PromptBox inherits Rectangle {
     in property <bool> completion-active: false;
     in property <string> completion-text;
     callback completion-dismissed();
-    // Ctrl/Cmd+V: give the app a chance to capture a clipboard image as an
-    // attachment; returns true when it did (the text paste is skipped).
-    callback paste-image-attempted() -> bool;
+    // Ctrl/Cmd+V: give the app a chance to capture clipboard content as an
+    // attachment; returns true when it did (the widget paste is skipped).
+    callback paste-attachment-attempted() -> bool;
     public function apply-completion(t: string) {
         input.text = t + " ";
         input.set-selection-offsets(
@@ -982,13 +982,13 @@ component PromptBox inherits Rectangle {
             color: root.enabled ? Theme.c.text-hi : Theme.c.text-disabled;
             font-size: Theme.fs(13px);
             selection-background-color: Theme.c.selection;
-            paste-requested => { root.paste-image-attempted() }
+            paste-requested => { root.paste-attachment-attempted() }
 
             key-pressed(event) => {
                 if ((event.text == "v" || event.text == "V")
                     && (event.modifiers.control || event.modifiers.meta)
                     && !event.modifiers.shift
-                    && root.paste-image-attempted()) {
+                    && root.paste-attachment-attempted()) {
                     return accept;
                 }
                 if (root.at-active) {
@@ -1150,7 +1150,7 @@ component NewChatForm inherits VerticalLayout {
     in property <[AttachmentChip]> attachments;
     callback attach-file();
     callback attachment-removed(int);
-    callback paste-image-attempted() -> bool;
+    callback paste-attachment-attempted() -> bool;
     property <bool> yolo-selected: root.permission-index >= 0
         && root.permission-index < root.permission-options.length
         && root.permission-options[root.permission-index] == "Yolo";
@@ -1300,7 +1300,7 @@ component NewChatForm inherits VerticalLayout {
         spacing: 6px;
         Text { text: "First message"; color: Theme.c.text-mid; font-size: Theme.fs(12px); font-weight: 700; }
         prompt-edit := PromptBox {
-            paste-image-attempted => { root.paste-image-attempted() }
+            paste-attachment-attempted => { root.paste-attachment-attempted() }
             placeholder: root.blocked && root.blocked-severe
                 ? "Server unavailable — prompts are disabled"
                 : root.blocked
@@ -1780,10 +1780,9 @@ export component AppWindow inherits Window {
     in property <[AttachmentChip]> composer-attachments: [];
     callback attach-file();
     callback attachment-removed(int);
-    // Ctrl/Cmd+V in the composer: returns true when the clipboard held an
-    // image that was captured as an attachment (so the paste shouldn't
-    // also insert text).
-    callback paste-image-attempted() -> bool;
+    // Ctrl/Cmd+V in the composer: returns true when clipboard content was
+    // captured as an attachment (so the widget shouldn't also insert it).
+    callback paste-attachment-attempted() -> bool;
 
     // "/" skill completion: the harness's slash commands (parallel name /
     // description lists), the fuzzy-ranked match indices (best first,
@@ -3039,7 +3038,7 @@ export component AppWindow inherits Window {
                     attachments: root.composer-attachments;
                     attach-file => { root.attach-file(); }
                     attachment-removed(i) => { root.attachment-removed(i); }
-                    paste-image-attempted => { root.paste-image-attempted() }
+                    paste-attachment-attempted => { root.paste-attachment-attempted() }
                     start(ws, br, fetch, mode, model, thinking, permission, prompt) => {
                         root.start-new-chat(ws, br, fetch, mode, model, thinking, permission, prompt);
                     }
@@ -4387,7 +4386,7 @@ export component AppWindow inherits Window {
                             root.composer-cursor = offset;
                             root.at-filter-changed(self.text, offset);
                         }
-                        paste-image-attempted => { root.paste-image-attempted() }
+                        paste-attachment-attempted => { root.paste-attachment-attempted() }
                         submitted(text) => {
                             root.send-message(text);
                             self.text = "";
@@ -4679,7 +4678,7 @@ export component AppWindow inherits Window {
                 attachments: root.composer-attachments;
                 attach-file => { root.attach-file(); }
                 attachment-removed(i) => { root.attachment-removed(i); }
-                paste-image-attempted => { root.paste-image-attempted() }
+                paste-attachment-attempted => { root.paste-attachment-attempted() }
                 start(ws, br, fetch, mode, model, thinking, permission, prompt) => {
                     root.start-new-chat(ws, br, fetch, mode, model, thinking, permission, prompt);
                 }

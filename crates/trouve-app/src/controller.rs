@@ -357,7 +357,7 @@ pub enum UiCommand {
     /// Composer 📎 button: pick files to ride with the next prompt.
     AttachFileDialog,
     /// A file's bytes staged as a prompt attachment (from the picker or a
-    /// clipboard image paste).
+    /// clipboard paste).
     AddAttachment {
         name: String,
         mime: String,
