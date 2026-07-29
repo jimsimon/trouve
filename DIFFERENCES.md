@@ -168,7 +168,9 @@ single instance.
 
 ## What did *not* change
 
-- The embedding model (`potion-code-16M-v2`) and its semantics.
+- The embedding model identifier (`potion-code-16M-v2`) and per-text output.
+  trouve embeds every text as a batch of one rather than using upstream batch
+  padding, as described above.
 - Chunking: same tree-sitter merge algorithm, same 750-byte target, same
   line-based fallback, identical boundaries where both use a grammar. trouve
   compiles a curated native-grammar subset; other recognized languages use

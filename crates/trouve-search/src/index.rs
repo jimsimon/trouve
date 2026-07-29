@@ -1,10 +1,11 @@
 //! The Trouve index: incremental, content-addressed, multithreaded.
 //!
-//! Assembly works from a manifest of `(path, content key)` pairs: cached files
-//! load their chunks/embeddings/tokens from a store shared across branches and
-//! worktrees, missing files are parsed/chunked/tokenized in parallel with
-//! rayon and embedded in batches, and the BM25 corpus statistics are
-//! recomputed on every assembly (cheap relative to embedding).
+//! Assembly works from a manifest of `(path, content key)` pairs: identical
+//! manifests load from mmap snapshots, compatible changes patch the previous
+//! snapshot, and remaining cached files load from a store shared across
+//! branches and worktrees. Missing files are parsed/chunked/tokenized in
+//! parallel with rayon and embedded in batches, and the BM25 corpus statistics
+//! are recomputed on every assembly (cheap relative to embedding).
 
 use std::collections::HashMap;
 use std::path::Path;

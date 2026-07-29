@@ -185,15 +185,18 @@ impl EmbeddingModel {
     fn from_files(files: &ModelFiles, model_id: String) -> Result<EmbeddingModel> {
         let tokenizer_bytes =
             std::fs::read(&files.tokenizer).context("failed to read tokenizer.json")?;
-        let tokenizer = Tokenizer::from_bytes(&tokenizer_bytes)
-            .map_err(|e| anyhow!("failed to load tokenizer: {e}"))?;
+        let tokenizer = Tokenizer::from_bytes(&tokenizer_bytes).map_err(|error| {
+            invalid_model_artifact(format!("failed to load tokenizer: {error}"))
+        })?;
         let spec: serde_json::Value =
-            serde_json::from_slice(&tokenizer_bytes).context("failed to parse tokenizer.json")?;
+            serde_json::from_slice(&tokenizer_bytes).map_err(|error| {
+                invalid_model_artifact(format!("failed to parse tokenizer.json: {error}"))
+            })?;
 
-        let cfg: serde_json::Value = serde_json::from_slice(
-            &std::fs::read(&files.config).context("failed to read config.json")?,
-        )
-        .context("failed to parse config.json")?;
+        let config_bytes = std::fs::read(&files.config).context("failed to read config.json")?;
+        let cfg: serde_json::Value = serde_json::from_slice(&config_bytes).map_err(|error| {
+            invalid_model_artifact(format!("failed to parse config.json: {error}"))
+        })?;
         let normalize = cfg
             .get("normalize")
             .and_then(serde_json::Value::as_bool)
@@ -203,27 +206,36 @@ impl EmbeddingModel {
         // Safety: the mmap'd model file is assumed not to be truncated
         // concurrently; same contract as the snapshot mmaps.
         let map = Arc::new(unsafe { Mmap::map(&file) }.context("failed to mmap model")?);
-        let safet =
-            safetensors::SafeTensors::deserialize(&map).context("failed to parse safetensors")?;
+        let safet = safetensors::SafeTensors::deserialize(&map).map_err(|error| {
+            invalid_model_artifact(format!("failed to parse safetensors: {error}"))
+        })?;
 
         let tensor = safet
             .tensor("embeddings")
             .or_else(|_| safet.tensor("0"))
             .or_else(|_| safet.tensor("embedding.weight"))
-            .context("embeddings tensor not found")?;
+            .map_err(|error| {
+                invalid_model_artifact(format!("embeddings tensor not found: {error}"))
+            })?;
         let [rows, dim]: [usize; 2] = tensor
             .shape()
             .try_into()
             .ok()
-            .context("embedding tensor is not 2-D")?;
-        let embeddings = embedding_buf(&map, &tensor, rows * dim)?;
+            .ok_or_else(|| invalid_model_artifact("embedding tensor is not 2-D"))?;
+        let embeddings = embedding_buf(&map, &tensor, rows * dim)
+            .map_err(|error| invalid_model_artifact(format!("{error:#}")))?;
 
         let weights = match safet.tensor("weights") {
-            Ok(t) => Some(decode_f32s(&t)?),
+            Ok(t) => Some(
+                decode_f32s(&t).map_err(|error| invalid_model_artifact(format!("{error:#}")))?,
+            ),
             Err(_) => None,
         };
         let mapping = match safet.tensor("mapping") {
-            Ok(t) => Some(decode_mapping(&t, rows)?),
+            Ok(t) => Some(
+                decode_mapping(&t, rows)
+                    .map_err(|error| invalid_model_artifact(format!("{error:#}")))?,
+            ),
             Err(_) => None,
         };
 
@@ -242,15 +254,15 @@ impl EmbeddingModel {
             .unwrap_or(0);
         match &mapping {
             Some(m) if m.len() < id_space => {
-                return Err(anyhow!(
+                return Err(invalid_model_artifact(format!(
                     "mapping tensor covers {} entries but token ids reach {id_space}",
                     m.len()
-                ));
+                )));
             }
             None if id_space > rows => {
-                return Err(anyhow!(
+                return Err(invalid_model_artifact(format!(
                     "token ids reach {id_space} but the embedding table only has {rows} rows"
-                ));
+                )));
             }
             _ => {}
         }
@@ -585,6 +597,27 @@ fn decode_mapping(tensor: &safetensors::tensor::TensorView<'_>, rows: usize) -> 
     }
 }
 
+#[derive(Debug)]
+struct InvalidModelArtifact(String);
+
+impl std::fmt::Display for InvalidModelArtifact {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for InvalidModelArtifact {}
+
+fn invalid_model_artifact(message: impl Into<String>) -> anyhow::Error {
+    anyhow::Error::new(InvalidModelArtifact(message.into()))
+}
+
+fn is_invalid_model_artifact(error: &anyhow::Error) -> bool {
+    error
+        .chain()
+        .any(|cause| cause.is::<InvalidModelArtifact>())
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ModelOrigin {
     Local,
@@ -609,6 +642,9 @@ where
     match EmbeddingModel::from_files(files, id.to_string()) {
         Ok(model) => Ok(model),
         Err(initial_error) => {
+            if !is_invalid_model_artifact(&initial_error) {
+                return Err(initial_error);
+            }
             let Some(refreshed) = refresh().with_context(|| {
                 format!("cached model was invalid ({initial_error:#}); forced download also failed")
             })?
@@ -801,6 +837,27 @@ mod tests {
 
         assert!(attempted_refresh);
         assert_eq!(model.encode_one("alpha").len(), 2);
+    }
+
+    #[test]
+    fn io_failure_does_not_refresh_cached_model() {
+        let cached = tempfile::tempdir().unwrap();
+        let mut cached_files = write_model(cached.path(), &["alpha"], 2, None);
+        cached_files.origin = ModelOrigin::Hub;
+        let model_bytes = std::fs::read(&cached_files.model).unwrap();
+        std::fs::remove_file(&cached_files.tokenizer).unwrap();
+
+        let error = load_model_with_refresh("test", &cached_files, || {
+            panic!("environmental I/O failures must not refresh the model")
+        })
+        .map(|_| ())
+        .unwrap_err();
+
+        assert!(
+            format!("{error:#}").contains("failed to read tokenizer.json"),
+            "{error:#}"
+        );
+        assert_eq!(std::fs::read(&cached_files.model).unwrap(), model_bytes);
     }
 
     #[test]
