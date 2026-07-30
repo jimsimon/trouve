@@ -1055,7 +1055,16 @@ impl LlamaManager {
                 });
                 Ok(format!("http://127.0.0.1:{port}/v1"))
             }
-            Err(e) => Err(e),
+            Err(error) => {
+                if activating_local_model {
+                    let adaptive_title = self.adaptive_title.lock().unwrap().clone();
+                    if let Some(title_model) = adaptive_title.and_then(|manager| manager.upgrade())
+                    {
+                        title_model.local_model_stopped().await;
+                    }
+                }
+                Err(error)
+            }
         }
     }
 

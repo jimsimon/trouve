@@ -18,8 +18,9 @@ use trouve_protocol::{TitleModelLoadBehavior, TitleModelResourcePolicy, TitleMod
 
 const AUTO_PRELOAD_AVAILABLE_RAM: u64 = 4 * 1024 * 1024 * 1024;
 const IDLE_RELEASE: std::time::Duration = std::time::Duration::from_secs(120);
-// This covers only prompt evaluation and decoding. The engine has a larger
-// end-to-end budget so a cold sidecar start cannot race this timeout.
+const STARTUP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+// This covers only prompt evaluation and decoding. Startup has its own budget
+// so a cold load cannot consume time reserved for generating the title.
 const GENERATION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(12);
 const DOWNLOAD_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 const STAGE_RUNTIME: u8 = 1;
@@ -254,7 +255,9 @@ impl TitleModelManager {
         if behavior == TitleModelLoadBehavior::Off {
             bail!("the session naming model is disabled");
         }
-        let base_url = self.ensure_running().await?;
+        let base_url = tokio::time::timeout(STARTUP_TIMEOUT, self.ensure_running())
+            .await
+            .context("session title model startup timed out")??;
         // Once a sidecar has been started, on-demand policies must release it
         // even if the HTTP request times out or its output is rejected.
         self.schedule_idle_release();

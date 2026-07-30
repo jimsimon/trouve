@@ -41,10 +41,10 @@ const COMPACTION_THRESHOLD: f64 = 0.8;
 /// End-to-end budget for refreshing one GitHub host. This bounds how long a
 /// stalled GraphQL request can retain the shared dashboard-cache lock.
 const GITHUB_DASHBOARD_REFRESH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
-// Leave room beyond title_model's decoding timeout for a cold sidecar start
-// and request handoff. Matching these budgets caused valid model requests to
-// be canceled at the outer boundary and silently replaced by heuristics.
-const SESSION_TITLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+// The title model independently bounds a cold sidecar start and decoding.
+// Leave a little handoff margin beyond those combined budgets so this outer
+// timeout does not silently replace a valid model request with heuristics.
+const SESSION_TITLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(45);
 #[cfg(not(test))]
 const MODEL_CATALOG_VALIDATION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 #[cfg(test)]

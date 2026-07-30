@@ -42,7 +42,7 @@ const SERVER_EVENT_FRESH_WINDOW: std::time::Duration = std::time::Duration::from
 /// arrives to provide a natural boundary.
 const SERVER_REPLAY_IDLE_FLUSH: std::time::Duration = std::time::Duration::from_millis(250);
 /// Session creation must not wait indefinitely for the optional title sidecar.
-const SESSION_TITLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(18);
+const SESSION_TITLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(48);
 /// Render only this many transcript rows when a thread is first opened.
 /// Slint virtualizes delegates, but giving its ListView the complete model
 /// still makes it estimate and settle every historical row before reaching
