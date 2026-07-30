@@ -6,6 +6,7 @@ import {
     Button, CheckBox, ComboBox, LineEdit, ListView, ScrollView, TextEdit
 } from "std-widgets.slint";
 import { ConnectivityBanner } from "connectivity-banner.slint";
+import { ModelOptionItem, ModelOptionsForm } from "model-options.slint";
 import { ScrollKeys } from "scroll-keys.slint";
 import { Theme } from "theme.slint";
 
@@ -26,6 +27,8 @@ export struct AutomationItem {
     // Edit round-trip.
     prompt: string,
     workspace-index: int,
+    mode-index: int,
+    model-index: int,
     kind: string,       // "hourly" / "daily" / "weekly"
     minute-text: string,
     permission-index: int, // 0 Ask, 1 Allow-list, 2 Yolo
@@ -84,6 +87,12 @@ export component AutomationsScreen inherits Rectangle {
     // Workspace picker (parallel arrays).
     in property <[string]> workspace-names;
     in property <[string]> workspace-ids;
+    in property <[string]> modes;
+    in property <[int]> mode-model-indices;
+    in property <[string]> models;
+    in property <int> default-mode-index: 0;
+    in property <int> default-model-index: 0;
+    in property <[ModelOptionItem]> model-options;
     // Offline/disconnected with nothing usable: adding/editing/running
     // automations is disabled and the banner explains why (see
     // AppWindow.connectivity-*).
@@ -98,6 +107,8 @@ export component AutomationsScreen inherits Rectangle {
     in-out property <string> form-name: "";
     in-out property <string> form-prompt: "";
     in-out property <int> form-workspace-index: 0;
+    in-out property <int> form-mode-index: 0;
+    in-out property <int> form-model-index: 0;
     // 0 hourly, 1 daily, 2 weekly.
     in-out property <int> form-kind-index: 1;
     in-out property <string> form-minute: "0";
@@ -116,10 +127,16 @@ export component AutomationsScreen inherits Rectangle {
 
     callback close();
     callback refresh();
+    callback form-opened(/* automation id, empty for new */ string, /* model */ int);
+    callback model-changed(int);
+    callback model-option-choice-changed(int, int);
+    callback model-option-bool-changed(int, bool);
+    callback model-option-text-changed(int, string);
     // days is "0,2,4" (Monday-first indices).
     callback saved(/* id */ string, /* name */ string, /* prompt */ string,
                    /* workspace-id */ string, /* kind */ string,
                    /* minute */ string, /* time */ string, /* days */ string,
+                   /* mode-index */ int, /* model-index */ int,
                    /* permission-index */ int,
                    /* enabled */ bool);
     callback toggled(/* id */ string, /* enabled */ bool);
@@ -143,6 +160,8 @@ export component AutomationsScreen inherits Rectangle {
         root.form-name = "";
         root.form-prompt = "";
         root.form-workspace-index = 0;
+        root.form-mode-index = root.default-mode-index;
+        root.form-model-index = root.default-model-index;
         root.form-kind-index = 1;
         root.form-minute = "0";
         root.form-time = "09:00";
@@ -157,6 +176,7 @@ export component AutomationsScreen inherits Rectangle {
         root.form-day-6 = false;
         root.form-enabled = true;
         root.form-open = true;
+        root.form-opened("", root.form-model-index);
     }
 
     VerticalLayout {
@@ -344,6 +364,8 @@ export component AutomationsScreen inherits Rectangle {
                                                 root.form-name = item.name;
                                                 root.form-prompt = item.prompt;
                                                 root.form-workspace-index = item.workspace-index;
+                                                root.form-mode-index = item.mode-index;
+                                                root.form-model-index = item.model-index;
                                                 root.form-kind-index = item.kind == "hourly" ? 0
                                                     : item.kind == "daily" ? 1 : 2;
                                                 root.form-minute = item.minute-text;
@@ -361,6 +383,7 @@ export component AutomationsScreen inherits Rectangle {
                                                 root.form-day-6 = item.days[6];
                                                 root.form-enabled = item.enabled;
                                                 root.form-open = true;
+                                                root.form-opened(item.id, root.form-model-index);
                                             }
                                         }
                                         Button {
@@ -418,6 +441,61 @@ export component AutomationsScreen inherits Rectangle {
                                         current-index <=> root.form-workspace-index;
                                         horizontal-stretch: 1;
                                         enabled: !root.blocked;
+                                    }
+                                }
+
+                                HorizontalLayout {
+                                    spacing: 8px;
+                                    VerticalLayout {
+                                        spacing: 4px;
+                                        horizontal-stretch: 1;
+                                        Text {
+                                            text: "Agent mode";
+                                            color: Theme.c.text-mid;
+                                            font-size: Theme.fs(12px);
+                                        }
+                                        ComboBox {
+                                            model: root.modes;
+                                            current-index <=> root.form-mode-index;
+                                            enabled: !root.blocked;
+                                            selected => {
+                                                if (root.form-mode-index >= 0
+                                                    && root.form-mode-index < root.mode-model-indices.length
+                                                    && root.mode-model-indices[root.form-mode-index] >= 0) {
+                                                    root.form-model-index = root.mode-model-indices[root.form-mode-index];
+                                                    root.model-changed(root.form-model-index);
+                                                }
+                                            }
+                                        }
+                                    }
+                                    VerticalLayout {
+                                        spacing: 4px;
+                                        horizontal-stretch: 1;
+                                        Text {
+                                            text: "Model";
+                                            color: Theme.c.text-mid;
+                                            font-size: Theme.fs(12px);
+                                        }
+                                        ComboBox {
+                                            model: root.models;
+                                            current-index <=> root.form-model-index;
+                                            enabled: !root.blocked;
+                                            selected => { root.model-changed(self.current-index); }
+                                        }
+                                    }
+                                }
+
+                                if root.model-options.length > 0: ModelOptionsForm {
+                                    options: root.model-options;
+                                    interactive: !root.blocked;
+                                    choice-changed(option, choice) => {
+                                        root.model-option-choice-changed(option, choice);
+                                    }
+                                    bool-changed(option, value) => {
+                                        root.model-option-bool-changed(option, value);
+                                    }
+                                    text-changed(option, value) => {
+                                        root.model-option-text-changed(option, value);
                                     }
                                 }
 
@@ -545,6 +623,7 @@ export component AutomationsScreen inherits Rectangle {
                                                 root.workspace-ids[root.form-workspace-index],
                                                 root.kind-name(), root.form-minute,
                                                 root.form-time, root.days-csv(),
+                                                root.form-mode-index, root.form-model-index,
                                                 root.form-permission-index,
                                                 root.form-enabled);
                                         }
@@ -616,6 +695,8 @@ export component AutomationsScreen inherits Rectangle {
                                                 root.form-name = t.name;
                                                 root.form-prompt = t.prompt;
                                                 root.form-workspace-index = 0;
+                                                root.form-mode-index = root.default-mode-index;
+                                                root.form-model-index = root.default-model-index;
                                                 root.form-kind-index = t.kind == "hourly" ? 0
                                                     : t.kind == "daily" ? 1 : 2;
                                                 root.form-minute = t.minute-text;
@@ -631,6 +712,7 @@ export component AutomationsScreen inherits Rectangle {
                                                 root.form-day-6 = t.days[6];
                                                 root.form-enabled = true;
                                                 root.form-open = true;
+                                                root.form-opened("", root.form-model-index);
                                             }
                                         }
                                     }
