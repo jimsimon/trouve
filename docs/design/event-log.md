@@ -45,6 +45,9 @@ session stream.
 - Resumption: clients send `Last-Event-ID: <cursor>` (or `?after=<cursor>`);
   the server replays every persisted event after that cursor, then continues
   live. Replay and live delivery are indistinguishable to the client.
+- Snapshot endpoints that fold session events return their replay boundary;
+  `Team.snapshot_cursor` is the latest session event represented by that
+  snapshot, so clients begin following strictly after it.
 - The server never skips cursors within a scope; a gap means data loss and
   is a bug.
 
@@ -92,6 +95,14 @@ Session scope:
 - `checkpoint.created` `{checkpoint_id, turn, thread_id, ref}`
 - `checkpoint.restored` `{checkpoint_id, direction}` (undo/redo)
 - `worktree.created` / `worktree.removed` `{path, branch}`
+- `team.created` `{team}` — complete initial team snapshot, including roster
+  and finite automatic-turn budget
+- `team.message_posted` `{message}` — one canonical shared-timeline message;
+  resolved mentions carry stable member ids as well as display handles
+- `team.member_updated` `{member}` — a member's queue/run state or aggregate
+  usage changed
+- `team.status_changed` `{status, turns_used}` — lifecycle or automatic-turn
+  budget changed; reaching the budget pauses the team
 
 Server scope:
 
