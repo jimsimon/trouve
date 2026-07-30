@@ -121,7 +121,7 @@ pub use requests::*;
 // 1.17: code-review repository/job snapshots expose semantic-router model and
 // thinking settings; enabled policies require an explicit review model so
 // unattended review never relies on the engine's built-in model (additive).
-// 1.18: code-review repositories and jobs expose coordinator thinking,
+// 1.19: code-review repositories and jobs expose coordinator thinking,
 // repository reviewer overrides can select a thinking setting, and canonical
 // settings accept fixed token budgets advertised by older models (additive).
 pub const PROTOCOL_VERSION: &str = "1.19";

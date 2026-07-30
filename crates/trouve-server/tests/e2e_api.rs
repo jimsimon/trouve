@@ -4332,6 +4332,7 @@ async fn code_review_job_overview_loads_task_content_separately() {
     assert_eq!(overview["job"]["model"], "provider/model");
     assert_eq!(overview["job"]["router_model"], "provider/router");
     assert_eq!(overview["job"]["router_thinking_level"], "low");
+    assert_eq!(overview["job"]["coordinator_thinking_level"], "medium");
     assert_eq!(
         overview["routing_decisions"][0]["reviewer_id"],
         "correctness"

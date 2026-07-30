@@ -75,6 +75,9 @@ export function defaultThinkingSelection(
 ): string {
   const options = thinkingOptions(model);
   if (thinkingSelectionIsValid(model, configured)) return configured ?? "";
+  if (options.budget && options.defaultValue) {
+    return options.defaultValue;
+  }
   if (options.defaultValue && options.values.includes(options.defaultValue)) {
     return options.defaultValue;
   }

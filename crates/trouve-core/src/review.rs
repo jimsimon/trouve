@@ -1555,8 +1555,8 @@ impl Engine {
     fn normalize_reviewer_overrides(
         &self,
         overrides: &[ReviewerOverride],
+        catalog: &[ReviewerProfile],
     ) -> Result<Vec<ReviewerOverride>, EngineError> {
-        let catalog = self.code_review_reviewer_catalog()?;
         let known: HashSet<_> = catalog
             .iter()
             .map(|reviewer| reviewer.id.as_str())
@@ -1887,6 +1887,7 @@ impl Engine {
         self.resolve_code_review_reviewers(&reviewer_ids)?;
         self.resolve_code_review_reviewers(&included_reviewer_ids)?;
         self.resolve_code_review_reviewers(&excluded_reviewer_ids)?;
+        let reviewer_catalog = self.code_review_reviewer_catalog()?;
         let excluded = excluded_reviewer_ids.iter().collect::<HashSet<_>>();
         if let Some(overlap) = included_reviewer_ids
             .iter()
@@ -1898,8 +1899,7 @@ impl Engine {
         }
         if request.mode != CodeReviewMode::Off
             && routing_mode != CodeReviewRoutingMode::Core
-            && self
-                .code_review_reviewer_catalog()?
+            && reviewer_catalog
                 .iter()
                 .all(|reviewer| excluded.contains(&reviewer.id))
         {
@@ -1917,13 +1917,18 @@ impl Engine {
                     .map(|repository| repository.reviewer_overrides.clone())
             })
             .unwrap_or_default();
-        let reviewer_overrides = self.normalize_reviewer_overrides(&reviewer_overrides)?;
-        let reviewer_catalog = self.code_review_reviewer_catalog()?;
+        let reviewer_overrides =
+            self.normalize_reviewer_overrides(&reviewer_overrides, &reviewer_catalog)?;
         for reviewer_override in &reviewer_overrides {
             let reviewer = reviewer_catalog
                 .iter()
                 .find(|reviewer| reviewer.id == reviewer_override.reviewer_id)
-                .expect("normalized reviewer override has a catalog entry");
+                .ok_or_else(|| {
+                    EngineError::BadRequest(format!(
+                        "unknown reviewer id {:?}",
+                        reviewer_override.reviewer_id
+                    ))
+                })?;
             self.validate_code_review_thinking_level(
                 &format!("reviewer {:?}", reviewer_override.reviewer_id),
                 reviewer_override.thinking_level.as_deref(),

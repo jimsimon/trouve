@@ -48,17 +48,19 @@ test("fixed thinking budgets follow advertised numeric bounds", () => {
           type: "integer",
           minimum: 1024,
           maximum: 32768,
+          default: 4096,
         },
       },
     },
   };
   assert.deepEqual(thinkingOptions(model), {
     values: [],
+    defaultValue: "4096",
     budget: { minimum: 1024, maximum: 32768 },
   });
   assert.equal(thinkingSelectionIsValid(model, "16384"), true);
   assert.equal(thinkingSelectionIsValid(model, "512"), false);
-  assert.equal(defaultThinkingSelection(model), "1024");
+  assert.equal(defaultThinkingSelection(model), "4096");
 });
 
 test("thinking labels make provider tokens readable", () => {

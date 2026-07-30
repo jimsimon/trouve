@@ -1709,6 +1709,7 @@ function RepositoryEditor({
     configured: string | undefined,
     model: Model | undefined,
   ): string | undefined => {
+    if (!configured || !model) return configured;
     return thinkingSelectionIsValid(model, configured) ? configured : undefined;
   };
   const reviewerPolicyInvalid =
@@ -2093,7 +2094,7 @@ function RepositoryEditor({
               disabled={busy}
               onClick={() =>
                 void persistRepository(
-                  { ...draft, mode: "off" },
+                  { ...repository, mode: "off" },
                   "Reviews disabled",
                 )
               }
@@ -2674,7 +2675,7 @@ function ReviewModeSettings({
                 onClick={async () => {
                   setBusy(true);
                   try {
-                    await resetMode("review");
+                    await resetMode(mode.id);
                     flash("Review mode reset to built-in defaults");
                     onChanged();
                   } catch (cause) {
@@ -2998,6 +2999,7 @@ function ProviderSettings({
             options={defaultThinkingOptions}
             value={defaultThinking}
             onChange={setDefaultThinking}
+            inheritLabel="Use the model's default"
           />
           <small>
             Base reasoning setting used when a mode, persona, or repository does not specify its
