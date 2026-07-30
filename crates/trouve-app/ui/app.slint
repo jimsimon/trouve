@@ -3084,7 +3084,7 @@ export component AppWindow inherits Window {
                     border-color: Theme.c.border;
 
                     find-scope := FocusScope {
-                        key-pressed(event) => {
+                        capture-key-pressed(event) => {
                             if (event.text == Key.Escape) {
                                 root.close-chat-find();
                                 return accept;
