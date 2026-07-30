@@ -2646,6 +2646,13 @@ impl Engine {
         behavior: trouve_protocol::TitleModelLoadBehavior,
         resources: trouve_protocol::TitleModelResourcePolicy,
     ) -> Result<trouve_protocol::GitWorktreeSettings, EngineError> {
+        if resources == trouve_protocol::TitleModelResourcePolicy::GpuOnly
+            && self.hardware().await.gpus.is_empty()
+        {
+            return Err(EngineError::BadRequest(
+                "GPU-only session naming requires a detected GPU".into(),
+            ));
+        }
         let _transition = self.title_model_behavior_transition.lock().await;
         {
             let mut config = self.config.lock().unwrap();
@@ -9550,6 +9557,46 @@ mod tests {
         drop(second_reader);
         drop(first_reader);
         assert!(lock.try_write().is_ok());
+    }
+
+    #[tokio::test]
+    async fn gpu_only_title_settings_require_a_detected_gpu_before_transition() {
+        let data = tempfile::tempdir().unwrap();
+        let engine = Engine::new(
+            Store::open_in_memory().unwrap(),
+            data.path().to_path_buf(),
+            &Config::default(),
+        );
+        engine
+            .hardware
+            .set(crate::local::Hardware {
+                ram_bytes: 16 * 1024 * 1024 * 1024,
+                gpus: Vec::new(),
+            })
+            .unwrap();
+
+        let _transition = engine.title_model_behavior_transition.lock().await;
+        let error = tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            engine.set_git_worktree_settings(
+                trouve_protocol::TitleModelLoadBehavior::Always,
+                trouve_protocol::TitleModelResourcePolicy::GpuOnly,
+            ),
+        )
+        .await
+        .expect("hardware validation must run before waiting for the transition lock")
+        .unwrap_err();
+
+        assert!(matches!(error, EngineError::BadRequest(ref message)
+                if message == "GPU-only session naming requires a detected GPU"));
+        let config = engine.config.lock().unwrap();
+        assert_eq!(config.title_model_load_behavior, None);
+        assert_eq!(config.title_model_resource_policy, None);
+        drop(config);
+        assert_eq!(
+            engine.git_worktree_settings().title_model_resource_policy,
+            trouve_protocol::TitleModelResourcePolicy::CpuRamOnly
+        );
     }
 
     #[test]
