@@ -2342,7 +2342,7 @@ impl Engine {
             .strip_prefix("sha256=")
             .and_then(|value| hex::decode(value).ok())
             .ok_or_else(|| EngineError::BadRequest("invalid webhook signature".into()))?;
-        let mut mac = Hmac::<Sha256>::new_from_slice(secret.as_bytes())
+        let mut mac = <Hmac<Sha256> as hmac::KeyInit>::new_from_slice(secret.as_bytes())
             .map_err(|error| EngineError::Internal(anyhow!(error)))?;
         mac.update(body);
         mac.verify_slice(&signature)
@@ -7110,7 +7110,7 @@ mod tests {
         let engine = Arc::new(engine);
         engine.secrets.set(WEBHOOK_SECRET, "shared-secret").unwrap();
         let body = br#"{"zen":"keep it logically awesome"}"#;
-        let mut mac = Hmac::<Sha256>::new_from_slice(b"shared-secret").unwrap();
+        let mut mac = <Hmac<Sha256> as hmac::KeyInit>::new_from_slice(b"shared-secret").unwrap();
         mac.update(body);
         let signature = format!("sha256={}", hex::encode(mac.finalize().into_bytes()));
 
@@ -7180,7 +7180,7 @@ mod tests {
             }
         }))
         .unwrap();
-        let mut mac = Hmac::<Sha256>::new_from_slice(b"shared-secret").unwrap();
+        let mut mac = <Hmac<Sha256> as hmac::KeyInit>::new_from_slice(b"shared-secret").unwrap();
         mac.update(&body);
         let signature = format!("sha256={}", hex::encode(mac.finalize().into_bytes()));
 

@@ -528,7 +528,7 @@ async fn stream_to_part(
         bail!("installation cancelled");
     }
     file.flush().await?;
-    Ok((downloaded, format!("{:x}", hash.finalize())))
+    Ok((downloaded, hex::encode(hash.finalize())))
 }
 
 fn sanitize_title(raw: &str) -> Result<String> {
