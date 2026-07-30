@@ -4,6 +4,33 @@ All notable changes to this project are documented in this file. The format
 is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this
 project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [3.6.0] - 2026-07-30
+
+### Added
+
+- **Multiple interactive terminals**: sessions can open, rename, switch
+  between, and close multiple terminal tabs, with scrollback search,
+  selection and copy, bracketed paste, IME-friendly input, terminal mouse
+  tracking, cursor modes, and visual bell support.
+- **Complete review model controls**: the review dashboard now configures
+  coordinator, semantic router, and per-persona models and thinking settings,
+  including adaptive levels and model-specific token budgets. Repository
+  policies can also be disabled without discarding their preconfigured
+  settings.
+
+### Changed
+
+- **Consistent model metadata**: models.dev is now the canonical source for
+  provider identity, model metadata, and option schemas across the desktop and
+  review dashboard. Live provider and CLI discovery overlays account
+  availability, while a refreshable cache and bundled snapshot preserve
+  offline setup and selection.
+- **Clearer agent activity**: Codex commentary is displayed in the thinking
+  stream separately from final answers, with raw reasoning retained and
+  duplicate summaries suppressed.
+- **More recognizable inspection tabs**: inspection tabs now include icons for
+  faster navigation.
+
 ## [3.5.0] - 2026-07-28
 
 ### Added
@@ -578,6 +605,7 @@ semble ([BENCHMARKS.md](BENCHMARKS.md)):
 - Incremental reindex (1 file touched): 0.86 s vs ~3 min (212x)
 - Warm query: 0.55 s vs 7.2 s (13x)
 
+[3.6.0]: https://github.com/jimsimon/trouve/compare/v3.5.0...v3.6.0
 [3.5.0]: https://github.com/jimsimon/trouve/compare/v3.4.2...v3.5.0
 [3.4.2]: https://github.com/jimsimon/trouve/compare/v3.4.1...v3.4.2
 [3.4.1]: https://github.com/jimsimon/trouve/compare/v3.4.0...v3.4.1
