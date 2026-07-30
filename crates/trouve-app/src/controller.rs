@@ -15,10 +15,10 @@ use tokio::sync::mpsc;
 use trouve_client_core::client::ProtocolClient;
 use trouve_client_core::viewmodel::ThreadViewModel;
 use trouve_protocol::{
-    AddLocalModelRequest, AgentMode, ApprovalDecision, CompleteLoginRequest, CreateSessionRequest,
-    CreateThreadRequest, DirEntry, EventEnvelope, ModelInfo, PermissionMode, Session, Thread,
-    TodoStatus, UpdateSessionRequest, UpdateThreadRequest, UpsertModeRequest,
-    UpsertProviderRequest, Workspace,
+    AddLocalModelRequest, AgentMode, ApprovalDecision, CommandAction, CommandKind,
+    CompleteLoginRequest, CreateSessionRequest, CreateThreadRequest, DirEntry, EventEnvelope,
+    ModelInfo, PermissionMode, Session, Thread, TodoStatus, UpdateSessionRequest,
+    UpdateThreadRequest, UpsertModeRequest, UpsertProviderRequest, Workspace,
 };
 
 use crate::render;
@@ -466,6 +466,9 @@ pub enum UiCommand {
     SetDefaultModel(usize, Option<String>),
     /// Set the global default permission mode (0 ask/1 allow-list/2 yolo).
     SetDefaultPermission(i32),
+    /// Enable or disable Trouve's compiled-in skills globally. User and
+    /// workspace skills remain available.
+    BuiltinSkillsToggled(bool),
     /// Create/update a user-level mode (a built-in id customizes it).
     /// Fields: id, display name, system prompt, comma-separated allowed
     /// tools, read-only, permission index (-1 global default/0 ask/
@@ -1530,8 +1533,8 @@ impl Controller {
         self.modes = infos.iter().map(|i| i.mode.clone()).collect();
         self.mode_origins = infos.into_iter().map(|i| i.origin).collect();
         self.models = self.client.list_models().await.unwrap_or_default();
-        if let Ok(providers) = self.client.list_providers().await {
-            self.default_thinking_level = providers.default_thinking_level;
+        if let Ok(response) = self.client.list_providers().await {
+            self.default_thinking_level = response.default_thinking_level;
         }
         let mode_names = self
             .modes
@@ -1617,16 +1620,20 @@ impl Controller {
         }
         let blocked = self.connectivity_blocked();
         let warning = if blocked {
-            "You're offline and no local models are available — prompts are \
-             disabled until the connection returns. To work offline in the \
-             future, set up a model under Settings → Local Models."
+            "You're offline and no local models are available — model prompts \
+             are unavailable until the connection returns, but Trouve slash \
+             commands still work. To work offline in the future, set up a \
+             model under Settings → Local Models."
         } else if self.offline {
             "You're offline — only local models are available until the \
              connection returns."
         } else {
             ""
         };
-        ui::set_connectivity(&self.ui, blocked, warning.into(), false);
+        // Keep the composer available while only model connectivity is
+        // missing: Trouve-owned action commands still work. The command
+        // dispatcher rejects ordinary prompts until a model is runnable.
+        ui::set_connectivity(&self.ui, false, warning.into(), false);
     }
 
     /// Show a transient connectivity notice that clears itself after a few
@@ -2169,6 +2176,44 @@ impl Controller {
             .map(|t| t.id.clone())
     }
 
+    /// Parse a slash invocation only when the current thread's authoritative
+    /// catalog marks it as a deterministic Trouve action.
+    fn action_invocation(&self, text: &str) -> Option<(String, String)> {
+        let invocation = text.trim().strip_prefix('/')?;
+        let name_end = invocation
+            .find(char::is_whitespace)
+            .unwrap_or(invocation.len());
+        let name = &invocation[..name_end];
+        let thread_id = self.current_thread_id()?;
+        self.vms
+            .get(&thread_id)?
+            .commands
+            .iter()
+            .find(|command| command.name == name && command.kind == CommandKind::Action)?;
+        Some((name.to_string(), invocation[name_end..].trim().to_string()))
+    }
+
+    async fn apply_command_action(&mut self, action: CommandAction) -> Result<()> {
+        match action {
+            CommandAction::None => {}
+            CommandAction::SwitchThread { thread_id } => {
+                let Some(session_index) = self.current_session else {
+                    return Ok(());
+                };
+                if let Some(session_id) = self.current_session_id() {
+                    self.resume.session_threads.insert(session_id, thread_id);
+                }
+                self.reload_session(session_index).await?;
+            }
+            CommandAction::OpenTerminal => {
+                self.right_tab = TERMINAL_TAB;
+                ui::set_right_tab(&self.ui, TERMINAL_TAB);
+                self.ensure_terminal().await;
+            }
+        }
+        Ok(())
+    }
+
     /// The question request behind a wizard row: its request id and the
     /// questions it poses.
     fn question_at(&self, row: usize) -> Option<(String, Vec<trouve_protocol::Question>)> {
@@ -2217,10 +2262,20 @@ impl Controller {
     }
 
     async fn select_session(&mut self, index: usize) -> Result<()> {
+        self.select_session_with_reload(index, false).await
+    }
+
+    async fn reload_session(&mut self, index: usize) -> Result<()> {
+        self.select_session_with_reload(index, true).await
+    }
+
+    async fn select_session_with_reload(&mut self, index: usize, force_reload: bool) -> Result<()> {
         if index >= self.sessions.len() {
             return Ok(());
         }
-        if self.current_session_id().as_deref() == Some(self.sessions[index].id.as_str()) {
+        if !force_reload
+            && self.current_session_id().as_deref() == Some(self.sessions[index].id.as_str())
+        {
             if self.unread_sessions.remove(&self.sessions[index].id)
                 | self.error_sessions.remove(&self.sessions[index].id)
             {
@@ -2805,7 +2860,14 @@ impl Controller {
             &self.ui,
             vm.commands
                 .iter()
-                .map(|c| (c.name.clone(), c.description.clone()))
+                .map(|command| {
+                    let detail = if command.usage.is_empty() {
+                        command.description.clone()
+                    } else {
+                        format!("{} — {}", command.usage, command.description)
+                    };
+                    (command.name.clone(), detail)
+                })
                 .collect(),
         );
         ui::set_chat(&self.ui, rows, thread_id.clone(), scroll);
@@ -4001,6 +4063,14 @@ impl Controller {
 
     async fn refresh_settings(&mut self) {
         self.refresh_title_model().await;
+        match self.client.skills_settings().await {
+            Ok(settings) => {
+                ui::set_builtin_skills_enabled(&self.ui, settings.builtin_skills_enabled)
+            }
+            Err(e) => {
+                ui::set_settings_status(&self.ui, format!("failed to load skill settings: {e:#}"));
+            }
+        }
         if let Ok(gh) = self.client.github_integration().await {
             self.apply_github_integration(gh);
             self.push_github_integration();
@@ -4784,8 +4854,13 @@ impl Controller {
                 "you're offline with no local models"
             };
             match &command {
-                UiCommand::SendMessage(_)
-                | UiCommand::StartNewChat { .. }
+                UiCommand::SendMessage(text)
+                    if self.server_unreachable || self.action_invocation(text).is_none() =>
+                {
+                    self.error(&format!("Can't do that right now — {reason}."));
+                    return Ok(());
+                }
+                UiCommand::StartNewChat { .. }
                 | UiCommand::PrFixClicked { .. }
                 | UiCommand::QueueEdit { .. }
                 | UiCommand::QueueDelete(_)
@@ -5094,6 +5169,39 @@ impl Controller {
             }
             UiCommand::SendMessage(text) => {
                 if let Some(thread_id) = self.current_thread_id() {
+                    if let Some((name, arguments)) = self.action_invocation(&text) {
+                        if !self.pending_attachments.is_empty() {
+                            self.error(
+                                "Attachments cannot be sent with a Trouve action command; remove them or send a model prompt.",
+                            );
+                            return Ok(());
+                        }
+                        let result = self
+                            .client
+                            .execute_command(&thread_id, &name, &arguments)
+                            .await?;
+                        let refresh_thread =
+                            matches!(result.name.as_str(), "mode" | "model" | "permissions");
+                        let refresh_session = result.name == "rename";
+                        let refresh_diff = matches!(result.name.as_str(), "undo" | "redo");
+                        self.apply_command_action(result.action).await?;
+                        if refresh_thread
+                            && let (Some(session_index), Some(thread_id)) =
+                                (self.current_session, self.current_thread_id())
+                        {
+                            if let Some(session_id) = self.current_session_id() {
+                                self.resume.session_threads.insert(session_id, thread_id);
+                            }
+                            self.reload_session(session_index).await?;
+                        }
+                        if refresh_session {
+                            self.reload_sessions().await?;
+                        }
+                        if refresh_diff {
+                            self.refresh_diff().await?;
+                        }
+                        return Ok(());
+                    }
                     let uploads = std::mem::take(&mut self.pending_attachments);
                     self.push_attachments();
                     if let Err(e) = self
@@ -6417,6 +6525,23 @@ impl Controller {
                         Err(e) => {
                             ui::set_settings_status(&self.ui, format!("{e:#}"));
                         }
+                    }
+                }
+            }
+            UiCommand::BuiltinSkillsToggled(enabled) => {
+                match self.client.set_builtin_skills_enabled(enabled).await {
+                    Ok(()) => ui::set_settings_status(
+                        &self.ui,
+                        if enabled {
+                            "Trouve built-in skills enabled".into()
+                        } else {
+                            "Trouve built-in skills disabled; user and workspace skills remain enabled"
+                                .into()
+                        },
+                    ),
+                    Err(e) => {
+                        ui::set_settings_status(&self.ui, format!("saving skill settings: {e:#}"));
+                        self.refresh_settings().await;
                     }
                 }
             }

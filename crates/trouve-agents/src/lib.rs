@@ -3,11 +3,13 @@
 //! trouve's session worktrees.
 //!
 //! Unlike a `trouve_providers::Provider` (raw model inference inside
-//! trouve's own agent loop), an [`AgentBackend`] owns the whole turn: the
-//! vendor harness plans, calls its own tools, and edits files. Trouve
-//! translates its event stream into the trouve protocol and bridges its
-//! approval requests through the engine's permission layer. Subscription
-//! auth stays inside the vendor binary — we never touch vendor OAuth tokens.
+//! trouve's own agent loop), an [`AgentBackend`] owns the vendor-side turn,
+//! conversation state, and optimized native execution tools. Trouve still
+//! owns the user-facing control plane: native tool events are normalized,
+//! permissions route through Trouve, and Trouve-only capabilities are mounted
+//! through a thread-scoped MCP bridge. Subscription auth stays inside the
+//! vendor binary — Trouve only stages the minimum credential file an isolated
+//! process needs.
 
 pub mod claude;
 pub mod codex;
@@ -17,6 +19,7 @@ mod login;
 mod route;
 
 use std::collections::VecDeque;
+use std::fmt;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -66,11 +69,13 @@ pub struct BackendTurn {
     /// rejects reported tool use; adapters also disable vendor built-ins
     /// where their protocol supports it.
     pub tool_free: bool,
-    /// When set, the vendor agent runs with its built-in tools disabled and
-    /// trouve's ToolExecutor bridged in over MCP (Claude Code only, v1).
+    /// Thread-scoped Trouve MCP surface for capabilities the vendor harness
+    /// does not own (semantic search, skills, interactions, todos, subagents,
+    /// and user MCP).
     pub mcp_bridge: Option<McpBridgeConfig>,
-    /// User-configured MCP servers (user/workspace/worktree scopes, already
-    /// merged and env-expanded by the engine) to mount alongside the bridge.
+    /// Direct vendor MCP mounts are adapter-only escape hatches. Normal engine
+    /// turns leave this empty because user MCP is resolved and executed by
+    /// Trouve's `ToolExecutor` through the bridge.
     pub mcp_servers: Vec<McpServerLaunch>,
 }
 
@@ -107,20 +112,32 @@ pub struct McpServerLaunch {
 }
 
 /// Streamable-HTTP MCP server the vendor agent connects to in order to
-/// reach trouve (the engine's internal per-thread MCP endpoint). Always
-/// used for approval prompting in Ask mode; optionally also replaces the
-/// vendor's built-in tools with trouve's.
-#[derive(Debug, Clone)]
+/// reach trouve (the engine's internal per-thread MCP endpoint). It provides
+/// the provider-independent supplemental capability set and, for Claude,
+/// the permission-prompt target.
+#[derive(Clone)]
 pub struct McpBridgeConfig {
-    /// Full endpoint URL, thread-scoped, with the tool/approval surface
-    /// selected via query parameters.
+    /// Thread-scoped endpoint URL, with non-secret capability selectors in
+    /// its query parameters.
     pub url: String,
-    /// When true the bridge serves trouve's ToolExecutor tools and the
-    /// vendor's built-ins are disabled; when false it only serves the
-    /// approval-prompt gate.
-    pub bridge_tools: bool,
-    /// Vendor built-in tools to disable while the bridge supplies tools.
-    pub disallowed_tools: Vec<String>,
+    /// Static headers sent with every bridge request. Credentials belong
+    /// here rather than in the URL, where vendor logs and diagnostics may
+    /// record them.
+    pub headers: Vec<(String, String)>,
+}
+
+impl fmt::Debug for McpBridgeConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let headers: Vec<(&str, &str)> = self
+            .headers
+            .iter()
+            .map(|(name, _)| (name.as_str(), "<redacted>"))
+            .collect();
+        f.debug_struct("McpBridgeConfig")
+            .field("url", &self.url)
+            .field("headers", &headers)
+            .finish()
+    }
 }
 
 /// One event from a backend turn, in trouve-shaped vocabulary.
@@ -249,9 +266,9 @@ pub trait AgentBackend: Send + Sync {
     /// vendor can't be asked (not installed, not logged in, query failed).
     fn models(&self) -> Vec<ModelInfo>;
 
-    /// Models as reported by the vendor right now (authoritative: vendors
-    /// evolve their catalogs faster than we ship). Implementations should
-    /// cache; the default falls back to the static snapshot.
+    /// Models as reported by the vendor right now (vendors evolve their
+    /// catalogs faster than we ship). Implementations should cache; the
+    /// default falls back to the static snapshot.
     async fn list_models(&self) -> Vec<ModelInfo> {
         self.models()
     }

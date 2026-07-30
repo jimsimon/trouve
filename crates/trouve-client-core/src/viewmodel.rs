@@ -17,6 +17,12 @@ pub enum ChatItem {
         /// at `GET /v1/attachments/{id}`).
         attachments: Vec<trouve_protocol::Attachment>,
     },
+    /// Output of a deterministic Trouve slash command.
+    Command {
+        name: String,
+        arguments: String,
+        output: String,
+    },
     /// Streaming or final assistant text (grows in place from deltas).
     Assistant {
         turn: u64,
@@ -97,8 +103,9 @@ pub struct ThreadViewModel {
     /// How long each finished turn took, in milliseconds — shown in the
     /// agent card header next to the token summary.
     pub turn_duration_ms: HashMap<u64, u64>,
-    /// Slash commands / skills the vendor harness accepts in prompts
-    /// (latest announcement wins) — prompt-box completions.
+    /// Trouve-owned slash commands / skills (latest announcement wins) —
+    /// prompt-box completions. Legacy vendor announcements are accepted when
+    /// replaying older logs.
     pub commands: Vec<trouve_protocol::CommandInfo>,
     /// Prompts waiting their turn, in run order (latest announcement wins).
     pub queue: Vec<trouve_protocol::QueuedPrompt>,
@@ -163,6 +170,23 @@ impl ThreadViewModel {
             Event::CommandsUpdated { commands } => {
                 self.commands = commands.clone();
                 None
+            }
+            Event::CommandCatalogUpdated { commands } => {
+                self.commands = commands.clone();
+                None
+            }
+            Event::CommandExecuted {
+                name,
+                arguments,
+                output,
+            } => {
+                self.finish_thinking();
+                self.items.push(ChatItem::Command {
+                    name: name.clone(),
+                    arguments: arguments.clone(),
+                    output: output.clone(),
+                });
+                Some(self.items.len() - 1)
             }
             Event::QueueUpdated { prompts } => {
                 self.queue = prompts.clone();
@@ -659,6 +683,45 @@ mod tests {
                 status: ToolCallStatus::AwaitingApproval,
                 ..
             }
+        ));
+    }
+
+    #[test]
+    fn core_command_catalog_replaces_vendor_replay_data() {
+        let mut vm = ThreadViewModel::new();
+        vm.apply(&env(Event::CommandsUpdated {
+            commands: vec![trouve_protocol::CommandInfo {
+                name: "vendor-command".into(),
+                description: String::new(),
+                kind: trouve_protocol::CommandKind::Prompt,
+                usage: "/vendor-command".into(),
+            }],
+        }));
+        vm.apply(&env(Event::CommandCatalogUpdated {
+            commands: vec![trouve_protocol::CommandInfo {
+                name: "review".into(),
+                description: "Review changes".into(),
+                kind: trouve_protocol::CommandKind::Prompt,
+                usage: "/review".into(),
+            }],
+        }));
+
+        assert_eq!(vm.commands.len(), 1);
+        assert_eq!(vm.commands[0].name, "review");
+    }
+
+    #[test]
+    fn command_output_folds_into_replayable_chat_item() {
+        let mut vm = ThreadViewModel::new();
+        let changed = vm.apply(&env(Event::CommandExecuted {
+            name: "status".into(),
+            arguments: String::new(),
+            output: "Ready".into(),
+        }));
+        assert_eq!(changed, Some(0));
+        assert!(matches!(
+            vm.items.first(),
+            Some(ChatItem::Command { name, output, .. }) if name == "status" && output == "Ready"
         ));
     }
 

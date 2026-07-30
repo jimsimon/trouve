@@ -123,7 +123,10 @@ pub use requests::*;
 // unattended review never relies on the engine's built-in model (additive).
 // 1.18: terminal tabs — plural GET/POST /v1/sessions/{id}/terminals list and
 // create independent PTYs while the singular compatibility endpoint remains.
-pub const PROTOCOL_VERSION: &str = "1.18";
+// 1.19: provider-neutral command and skill catalogs, typed prompt/action
+// commands, command execution events and endpoints, and configurable built-in
+// skill enablement (all additive).
+pub const PROTOCOL_VERSION: &str = "1.19";
 pub const EVENT_CURSOR_HEADER: &str = "x-trouve-event-cursor";
 
 pub type WorkspaceId = String;

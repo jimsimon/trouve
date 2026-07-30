@@ -17,6 +17,7 @@
 //!   answered with `{ decision: "accept" | "decline" }`
 
 use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, Ordering};
@@ -25,7 +26,7 @@ use futures::StreamExt;
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin};
-use tokio::sync::{Mutex, oneshot};
+use tokio::sync::{Mutex, OnceCell, oneshot};
 use trouve_protocol::{ModelInfo, Usage};
 use trouve_providers::codex::completed_raw_reasoning_text;
 
@@ -39,7 +40,7 @@ use crate::{
 pub struct CodexBackend {
     id: String,
     command: String,
-    server: Mutex<Option<Arc<AppServer>>>,
+    server: Arc<Mutex<Option<Arc<AppServer>>>>,
     /// `model/list` result, cached for [`MODELS_TTL`].
     models_cache: Mutex<Option<(std::time::Instant, Vec<ModelInfo>)>>,
     /// Real context windows by model name, learned from
@@ -49,6 +50,31 @@ pub struct CodexBackend {
 
 /// How long a fetched vendor model list stays fresh.
 const MODELS_TTL: std::time::Duration = std::time::Duration::from_secs(300);
+/// A shared credential operation is normally only a read or atomic rename.
+/// If an interactive login owns the lock, callers yield instead of occupying
+/// Tokio's blocking pool until the user finishes the browser flow.
+const AUTH_LOCK_WAIT: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// Product-level capabilities Trouve suppresses when the running Codex
+/// app-server advertises them. The dynamic feature catalog is the schema
+/// authority: older CLIs never receive config keys they do not understand.
+const PRODUCT_SURFACE_FEATURES: &[&str] = &[
+    "apps",
+    "browser_use",
+    "browser_use_external",
+    "computer_use",
+    "current_time_reminder",
+    "goals",
+    "hooks",
+    "image_generation",
+    "memories",
+    "multi_agent",
+    "plugins",
+    "remote_plugin",
+    "skill_mcp_dependency_install",
+    "tool_suggest",
+    "workspace_dependencies",
+];
 
 /// Codex's two sandbox spellings: `thread/start` uses the kebab-case mode,
 /// while `turn/start` uses the camel-case policy discriminator.
@@ -74,7 +100,7 @@ impl CodexBackend {
         Self {
             id: id.into(),
             command: command.unwrap_or_else(|| "codex".into()),
-            server: Mutex::new(None),
+            server: Arc::new(Mutex::new(None)),
             models_cache: Mutex::new(None),
             observed_windows: Arc::new(std::sync::Mutex::new(HashMap::new())),
         }
@@ -161,9 +187,7 @@ impl AgentBackend for CodexBackend {
     }
 
     fn status(&self) -> BackendStatus {
-        let auth = dirs::home_dir()
-            .map(|h| h.join(".codex").join("auth.json").exists())
-            .unwrap_or(false);
+        let auth = codex_auth_path().is_some_and(|path| path.exists());
         BackendStatus {
             installed: binary_on_path(&self.command),
             has_credentials: auth,
@@ -190,10 +214,47 @@ impl AgentBackend for CodexBackend {
     }
 
     async fn start_login(&self) -> Result<BackendLogin, BackendError> {
-        spawn_codex_login(&self.command).await
+        // The isolated app-server and Trouve's own login flow both publish to
+        // the user's shared auth.json. Serialize the whole login so an
+        // app-server refresh cannot race the vendor CLI's final write.
+        let auth_lock = match codex_auth_path() {
+            Some(source) => Some(acquire_auth_lock(source).await?),
+            None => None,
+        };
+        let BackendLogin {
+            verification_url,
+            user_code,
+            callback_sender,
+            done,
+        } = spawn_codex_login(&self.command).await?;
+        let server = self.server.clone();
+        Ok(BackendLogin {
+            verification_url,
+            user_code,
+            callback_sender,
+            done: Box::pin(async move {
+                let result = done.await;
+                // Release before evicting the server: AppServer::drop syncs
+                // refreshed credentials through this same lock.
+                drop(auth_lock);
+                if result.is_ok() {
+                    // AppServer snapshots auth into an isolated CODEX_HOME.
+                    // Force the next request to create a fresh snapshot after
+                    // login rather than retaining a pre-login process.
+                    *server.lock().await = None;
+                }
+                result
+            }),
+        })
     }
 
     async fn run_turn(&self, turn: BackendTurn) -> Result<BackendEventStream, BackendError> {
+        if turn.mcp_bridge.is_some() && !turn.mcp_servers.is_empty() {
+            return Err(BackendError::Protocol(
+                "optimized Codex turns mount user MCP only through Trouve's capability bridge"
+                    .into(),
+            ));
+        }
         let server = self.server().await?;
 
         // Effort comes from the thread's model options; `@effort` model ids
@@ -215,11 +276,21 @@ impl AgentBackend for CodexBackend {
             json!({ "type": sandbox_policy_type })
         };
 
-        // Per-thread config overrides: request raw reasoning from models that
-        // expose it and mount trouve/user MCP servers. Both thread/start and
-        // thread/resume accept `config`, and resumed threads re-spawn their
-        // MCP servers from it.
-        let config_override = codex_config_override(&turn);
+        // Per-thread config overrides request raw reasoning, mount Trouve's
+        // supplemental bridge, and suppress overlapping product features
+        // advertised by this exact app-server version.
+        let supported_features = if turn.mcp_bridge.is_some() {
+            server.supported_features().await
+        } else {
+            HashSet::new()
+        };
+        let mut config_override = codex_config_override(&turn);
+        if let Some(mcp_config) = mcp_config_override(&turn, &supported_features)
+            && let (Some(config), Some(mcp)) =
+                (config_override.as_object_mut(), mcp_config.as_object())
+        {
+            config.extend(mcp.clone());
+        }
         let with_config = |mut params: Value| {
             params["config"] = config_override.clone();
             params
@@ -231,6 +302,7 @@ impl AgentBackend for CodexBackend {
             "approvalPolicy": approval_policy,
             "sandbox": sandbox,
             "serviceName": "trouve",
+            "developerInstructions": turn.instructions,
         }));
         if !model_name.is_empty() {
             start_params["model"] = json!(model_name);
@@ -239,7 +311,13 @@ impl AgentBackend for CodexBackend {
         let codex_thread_id = match &turn.session {
             Some(sid) => {
                 let resumed = server
-                    .request("thread/resume", with_config(json!({ "threadId": sid })))
+                    .request(
+                        "thread/resume",
+                        with_config(json!({
+                            "threadId": sid,
+                            "developerInstructions": turn.instructions,
+                        })),
+                    )
                     .await;
                 match resumed {
                     Ok(v) => thread_id_of(&v)?,
@@ -267,16 +345,7 @@ impl AgentBackend for CodexBackend {
         server.interrupt_active_turn(&codex_thread_id).await?;
         let route = server.subscribe(&codex_thread_id).await;
 
-        // Mode instructions (which include the search-tool guidance when
-        // the bridge is mounted) ride along in the first user message of a
-        // fresh vendor session (app-server owns the system prompt).
-        let text = match (&turn.instructions, fresh_session) {
-            (Some(instr), true) => format!(
-                "<mode-instructions>\n{instr}\n</mode-instructions>\n\n{}",
-                turn.prompt
-            ),
-            _ => turn.prompt.clone(),
-        };
+        let text = turn.prompt.clone();
 
         // Images ride as localImage items (app-server reads the file
         // itself); the engine already turned non-image uploads into path
@@ -326,10 +395,24 @@ impl AgentBackend for CodexBackend {
     }
 }
 
-/// Codex config overrides enabling raw reasoning when available and mounting
-/// the trouve MCP bridge plus the user's configured MCP servers as per-thread
-/// MCP servers (same shape as `mcp_servers` in codex's config.toml).
+/// Codex config overrides enabling raw reasoning when available.
 fn codex_config_override(turn: &crate::BackendTurn) -> Value {
+    let mut config = json!({ "show_raw_agent_reasoning": true });
+    if let Some(mcp_config) = mcp_config_override(turn, &HashSet::new())
+        && let (Some(config), Some(mcp)) = (config.as_object_mut(), mcp_config.as_object())
+    {
+        config.extend(mcp.clone());
+    }
+    config
+}
+
+/// Per-thread MCP mounts in Codex's config.toml shape. When the Trouve bridge
+/// is present, overlapping ambient product capabilities stand down while
+/// Codex's optimized shell, patch, image, and web tools remain enabled.
+fn mcp_config_override(
+    turn: &crate::BackendTurn,
+    supported_features: &HashSet<String>,
+) -> Option<Value> {
     let env_map = |env: &[(String, String)]| -> serde_json::Map<String, Value> {
         env.iter()
             .map(|(k, v)| (k.clone(), Value::String(v.clone())))
@@ -347,15 +430,57 @@ fn codex_config_override(turn: &crate::BackendTurn) -> Value {
         );
     }
     if let Some(bridge) = &turn.mcp_bridge {
+        let http_headers: serde_json::Map<String, Value> = bridge
+            .headers
+            .iter()
+            .map(|(name, value)| (name.clone(), Value::String(value.clone())))
+            .collect();
         // Streamable-HTTP server (`url` instead of `command` selects the
         // transport in codex's mcp_servers config shape).
-        servers.insert("trouve".into(), json!({ "url": bridge.url }));
+        servers.insert(
+            "trouve".into(),
+            json!({
+                "url": bridge.url,
+                "http_headers": http_headers,
+                // ToolExecutor already classifies and gates every call. Do
+                // not wrap it in Codex's separate MCP approval heuristic.
+                "default_tools_approval_mode": "approve",
+            }),
+        );
     }
-    let mut config = json!({ "show_raw_agent_reasoning": true });
-    if !servers.is_empty() {
-        config["mcp_servers"] = Value::Object(servers);
+    if servers.is_empty() {
+        return None;
     }
-    config
+    let mut config = json!({ "mcp_servers": servers });
+    if turn.mcp_bridge.is_some() {
+        let features: serde_json::Map<String, Value> = PRODUCT_SURFACE_FEATURES
+            .iter()
+            .filter(|name| supported_features.contains(**name))
+            .map(|name| ((*name).to_string(), Value::Bool(false)))
+            .collect();
+        if !features.is_empty() {
+            config["features"] = Value::Object(features);
+        }
+    }
+    Some(config)
+}
+
+fn parse_supported_features(result: &Value) -> HashSet<String> {
+    result
+        .get("data")
+        .or_else(|| result.get("features"))
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|feature| {
+            feature
+                .get("name")
+                .or_else(|| feature.get("key"))
+                .or_else(|| feature.get("feature"))
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        })
+        .collect()
 }
 
 /// Split a `<model>@<effort>` id into its parts. Threads created before the
@@ -734,6 +859,9 @@ fn turn_stream(
             };
             let _ = tx.send(Err(BackendError::Protocol(reason.into()))).await;
         }
+        // OAuth refreshes are rare; preserve any rotated credentials once per
+        // turn instead of reading both auth files after every JSON-RPC reply.
+        server.sync_auth().await;
         server.unsubscribe(&codex_thread_id, &route_tx).await;
     })
 }
@@ -1070,6 +1198,204 @@ async fn read_stdout<R: AsyncRead + Unpin>(
     close_transport(&pending, &routes, &buffered, &closed).await;
 }
 
+/// Keeps Codex's refreshed subscription credentials while the rest of its
+/// home remains isolated. A baseline comparison prevents an old app-server
+/// from overwriting a newer login performed by another process.
+///
+/// The adjacent lock file is stable across atomic auth.json replacements, so
+/// every Trouve app-server and Trouve-initiated login shares one writer lock.
+/// A direct vendor CLI does not participate in that lock; the second source
+/// read immediately before publication detects and preserves such a write
+/// whenever it overlaps staging.
+struct AuthSync {
+    source: PathBuf,
+    isolated: PathBuf,
+    baseline: std::sync::Mutex<Option<Vec<u8>>>,
+}
+
+struct AuthFileLock {
+    _file: std::fs::File,
+}
+
+impl AuthFileLock {
+    fn open(source: &Path) -> std::io::Result<std::fs::File> {
+        let parent = source.parent().ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "Codex auth path has no parent directory",
+            )
+        })?;
+        std::fs::create_dir_all(parent)?;
+        let mut name = source
+            .file_name()
+            .ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "Codex auth path has no file name",
+                )
+            })?
+            .to_os_string();
+        name.push(".trouve.lock");
+        let path = source.with_file_name(name);
+        let mut options = std::fs::OpenOptions::new();
+        options.read(true).write(true).create(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            options.mode(0o600);
+        }
+        options.open(path)
+    }
+
+    fn acquire(source: &Path) -> std::io::Result<Self> {
+        let file = Self::open(source)?;
+        file.lock()?;
+        Ok(Self { _file: file })
+    }
+
+    fn try_acquire_for(source: &Path, wait: std::time::Duration) -> std::io::Result<Option<Self>> {
+        let file = Self::open(source)?;
+        let deadline = std::time::Instant::now() + wait;
+        loop {
+            match file.try_lock() {
+                Ok(()) => return Ok(Some(Self { _file: file })),
+                Err(std::fs::TryLockError::WouldBlock) if std::time::Instant::now() < deadline => {
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                Err(std::fs::TryLockError::WouldBlock) => return Ok(None),
+                Err(std::fs::TryLockError::Error(error)) => return Err(error),
+            }
+        }
+    }
+}
+
+async fn acquire_auth_lock(source: PathBuf) -> Result<AuthFileLock, BackendError> {
+    tokio::task::spawn_blocking(move || AuthFileLock::acquire(&source))
+        .await
+        .map_err(|error| BackendError::Io(std::io::Error::other(error.to_string())))?
+        .map_err(BackendError::Io)
+}
+
+fn read_auth_or_empty(path: &Path) -> std::io::Result<Vec<u8>> {
+    match std::fs::read(path) {
+        Ok(bytes) => Ok(bytes),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
+        Err(error) => Err(error),
+    }
+}
+
+fn stage_auth_snapshot(isolated_home: &Path) -> std::io::Result<Option<AuthSync>> {
+    let Some(source) = codex_auth_path() else {
+        return Ok(None);
+    };
+    stage_auth_snapshot_from(source, isolated_home)
+}
+
+fn stage_auth_snapshot_from(
+    source: PathBuf,
+    isolated_home: &Path,
+) -> std::io::Result<Option<AuthSync>> {
+    let Some(_lock) = AuthFileLock::try_acquire_for(&source, AUTH_LOCK_WAIT)? else {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::WouldBlock,
+            "Codex credentials are being updated (usually by an interactive login); retry shortly",
+        ));
+    };
+    let baseline = match std::fs::read(&source) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    let isolated = isolated_home.join("auth.json");
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.mode(0o600);
+    }
+    {
+        use std::io::Write as _;
+        let mut file = options.open(&isolated)?;
+        file.write_all(&baseline)?;
+        file.sync_all()?;
+    }
+    Ok(Some(AuthSync::new(source, isolated, baseline)))
+}
+
+impl AuthSync {
+    fn new(source: PathBuf, isolated: PathBuf, baseline: Vec<u8>) -> Self {
+        Self {
+            source,
+            isolated,
+            baseline: std::sync::Mutex::new(Some(baseline)),
+        }
+    }
+
+    fn sync(&self) -> std::io::Result<()> {
+        self.sync_with_publish_hook(|| {})
+    }
+
+    fn sync_with_publish_hook(&self, before_publish: impl FnOnce()) -> std::io::Result<()> {
+        let mut baseline = self.baseline.lock().unwrap();
+        let Some(previous) = baseline.clone() else {
+            return Ok(());
+        };
+        let isolated = std::fs::read(&self.isolated)?;
+        if isolated == previous {
+            return Ok(());
+        }
+        let Some(_lock) = AuthFileLock::try_acquire_for(&self.source, AUTH_LOCK_WAIT)? else {
+            tracing::debug!(
+                "Codex auth is busy; deferring this isolated credential refresh until a later sync"
+            );
+            return Ok(());
+        };
+        let source = read_auth_or_empty(&self.source)?;
+        if source != previous && source != isolated {
+            tracing::warn!(
+                "Codex auth changed outside the isolated app-server; preserving the newer source"
+            );
+            *baseline = None;
+            return Ok(());
+        }
+        if source != isolated {
+            let parent = self.source.parent().ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "Codex auth path has no parent directory",
+                )
+            })?;
+            let mut staged = tempfile::Builder::new()
+                .prefix(".trouve-auth-")
+                .tempfile_in(parent)?;
+            {
+                use std::io::Write as _;
+                staged.write_all(&isolated)?;
+                staged.as_file().sync_all()?;
+            }
+
+            before_publish();
+            let current = read_auth_or_empty(&self.source)?;
+            if current != source {
+                if current != isolated {
+                    tracing::warn!(
+                        "Codex auth changed while a refresh was staged; preserving the newer source"
+                    );
+                    *baseline = None;
+                    return Ok(());
+                }
+            } else {
+                staged.persist(&self.source).map_err(|error| error.error)?;
+            }
+        }
+        // Publication (or another writer's identical publication) succeeded.
+        // Keep the old baseline on every error so the next sync retries.
+        *baseline = Some(isolated);
+        Ok(())
+    }
+}
+
 struct AppServer {
     stdin: Mutex<ChildStdin>,
     next_id: AtomicI64,
@@ -1089,13 +1415,35 @@ struct AppServer {
     turn_lifecycles: TurnLifecycles,
     /// Held so the child (kill_on_drop) lives as long as the server handle.
     _child: Child,
+    /// A clean Codex home containing credentials only. Keeping the TempDir
+    /// alive prevents ambient config, skills, plugins, hooks, and MCP servers
+    /// from becoming a second capability source.
+    _isolated_home: tempfile::TempDir,
+    /// The app-server schema, discovered through its version-specific
+    /// experimental feature catalog on the first optimized turn.
+    supported_features: OnceCell<HashSet<String>>,
+    /// Syncs token rotations from the isolated home back to Codex's real
+    /// credential file without exposing any other ambient configuration.
+    auth_sync: Option<Arc<AuthSync>>,
     closed: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl AppServer {
     async fn spawn(command: &str) -> Result<Self, BackendError> {
+        let isolated_home = tempfile::Builder::new()
+            .prefix("trouve-codex-home-")
+            .tempdir()
+            .map_err(BackendError::Io)?;
+        let isolated_path = isolated_home.path().to_path_buf();
+        let auth_sync = tokio::task::spawn_blocking(move || stage_auth_snapshot(&isolated_path))
+            .await
+            .map_err(|error| BackendError::Io(std::io::Error::other(error.to_string())))?
+            .map_err(BackendError::Io)?
+            .map(Arc::new);
         let mut child = tokio::process::Command::new(command)
             .arg("app-server")
+            .arg("--strict-config")
+            .env("CODEX_HOME", isolated_home.path())
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
@@ -1117,6 +1465,9 @@ impl AppServer {
             active_turns: Arc::new(Mutex::new(HashMap::new())),
             turn_lifecycles: Arc::new(std::sync::Mutex::new(HashMap::new())),
             _child: child,
+            _isolated_home: isolated_home,
+            supported_features: OnceCell::new(),
+            auth_sync,
             closed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         };
         server.start_reader(stdout);
@@ -1135,11 +1486,35 @@ impl AppServer {
         tokio::spawn(read_stdout(stdout, pending, routes, buffered, closed));
     }
 
+    async fn supported_features(&self) -> HashSet<String> {
+        match self
+            .supported_features
+            .get_or_try_init(|| async {
+                self.request("experimentalFeature/list", json!({ "limit": 100 }))
+                    .await
+                    .map(|result| parse_supported_features(&result))
+            })
+            .await
+        {
+            Ok(features) => features.clone(),
+            Err(error) => {
+                // Old app-server schemas may not expose this method. In that
+                // case omit all speculative feature overrides; the isolated
+                // CODEX_HOME still excludes ambient skills/plugins/config.
+                tracing::debug!(
+                    "Codex feature catalog unavailable; omitting feature overrides: {error}"
+                );
+                HashSet::new()
+            }
+        }
+    }
+
     async fn handshake(&self) -> Result<(), BackendError> {
         self.request(
             "initialize",
             json!({
                 "clientInfo": { "name": "trouve", "version": env!("CARGO_PKG_VERSION") },
+                "capabilities": { "experimentalApi": true },
             }),
         )
         .await?;
@@ -1159,6 +1534,16 @@ impl AppServer {
             Err(_) => Err(BackendError::Protocol(format!(
                 "{method}: app-server closed before responding"
             ))),
+        }
+    }
+
+    async fn sync_auth(&self) {
+        if let Some(auth_sync) = self.auth_sync.clone() {
+            match tokio::task::spawn_blocking(move || auth_sync.sync()).await {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => tracing::warn!("Codex credential sync failed: {error}"),
+                Err(error) => tracing::warn!("Codex credential sync task failed: {error}"),
+            }
         }
     }
 
@@ -1303,6 +1688,23 @@ async fn remove_route(
     // still the active route; stale turn cleanup must not erase events for
     // a replacement subscription.
     buffered.lock().await.remove(thread_id);
+}
+
+impl Drop for AppServer {
+    fn drop(&mut self) {
+        if let Some(auth_sync) = &self.auth_sync
+            && let Err(error) = auth_sync.sync()
+        {
+            tracing::warn!("Codex credential sync failed during shutdown: {error}");
+        }
+    }
+}
+
+fn codex_auth_path() -> Option<std::path::PathBuf> {
+    std::env::var_os("CODEX_HOME")
+        .map(std::path::PathBuf::from)
+        .or_else(|| dirs::home_dir().map(|home| home.join(".codex")))
+        .map(|home| home.join("auth.json"))
 }
 
 #[cfg(test)]
@@ -1613,9 +2015,8 @@ mod tests {
             env: vec![("TOKEN".into(), "sekrit".into())],
         });
         turn.mcp_bridge = Some(crate::McpBridgeConfig {
-            url: "http://127.0.0.1:1/internal/threads/th_1/mcp?tools=0&approval=0".into(),
-            bridge_tools: false,
-            disallowed_tools: Vec::new(),
+            url: "http://127.0.0.1:1/internal/threads/th_1/mcp?approval=0".into(),
+            headers: vec![("Authorization".into(), "Bearer bridge-secret".into())],
         });
         let config = codex_config_override(&turn);
         let servers = &config["mcp_servers"];
@@ -1623,7 +2024,12 @@ mod tests {
         assert_eq!(servers["jira"]["env"]["TOKEN"], "sekrit");
         assert_eq!(
             servers["trouve"]["url"],
-            "http://127.0.0.1:1/internal/threads/th_1/mcp?tools=0&approval=0"
+            "http://127.0.0.1:1/internal/threads/th_1/mcp?approval=0"
+        );
+        assert_eq!(servers["trouve"]["default_tools_approval_mode"], "approve");
+        assert_eq!(
+            servers["trouve"]["http_headers"]["Authorization"],
+            "Bearer bridge-secret"
         );
         assert!(servers["trouve"]["command"].is_null());
 
@@ -1632,6 +2038,236 @@ mod tests {
         let config = codex_config_override(&turn);
         assert!(config["mcp_servers"]["jira"].is_object());
         assert!(config["mcp_servers"]["trouve"].is_null());
+    }
+
+    #[test]
+    fn optimized_config_disables_product_surface_but_keeps_native_tools() {
+        let mut turn = bare_turn();
+        turn.mcp_bridge = Some(crate::McpBridgeConfig {
+            url: "http://127.0.0.1:1/internal/threads/th_1/mcp?approval=0".into(),
+            headers: Vec::new(),
+        });
+        let supported_features = [
+            "apps",
+            "hooks",
+            "multi_agent",
+            "plugins",
+            "shell_tool",
+            "unknown_future_feature",
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect();
+
+        let config = mcp_config_override(&turn, &supported_features).unwrap();
+        assert!(config["web_search"].is_null());
+        assert_eq!(
+            config["mcp_servers"]
+                .as_object()
+                .unwrap()
+                .keys()
+                .collect::<Vec<_>>(),
+            vec!["trouve"]
+        );
+        for feature in ["apps", "hooks", "multi_agent", "plugins"] {
+            assert_eq!(
+                config["features"][feature], false,
+                "feature {feature} escaped product-surface isolation"
+            );
+        }
+        // Unsupported schema keys are omitted under --strict-config, while
+        // model-optimized native tools remain enabled by omission.
+        assert!(config["features"]["browser_use"].is_null());
+        assert!(config["features"]["shell_tool"].is_null());
+        assert!(config["features"]["unknown_future_feature"].is_null());
+        assert!(config["agents"].is_null());
+        assert!(config["experimental_request_user_input_enabled"].is_null());
+        assert_eq!(
+            config["mcp_servers"]["trouve"]["default_tools_approval_mode"],
+            "approve"
+        );
+    }
+
+    #[test]
+    fn parses_version_specific_feature_catalog_shapes() {
+        assert_eq!(
+            parse_supported_features(&json!({
+                "data": [{"name": "plugins"}, {"key": "multi_agent"}]
+            })),
+            ["plugins", "multi_agent"]
+                .into_iter()
+                .map(str::to_string)
+                .collect()
+        );
+        assert_eq!(
+            parse_supported_features(&json!({
+                "features": [{"feature": "apps"}, {"name": 42}, "bad"]
+            })),
+            ["apps"].into_iter().map(str::to_string).collect()
+        );
+    }
+
+    #[test]
+    fn auth_sync_preserves_refreshes_and_never_overwrites_newer_login() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("source-auth.json");
+        let isolated = temp.path().join("isolated-auth.json");
+        std::fs::write(&source, b"old").unwrap();
+        std::fs::write(&isolated, b"old").unwrap();
+        let sync = AuthSync::new(source.clone(), isolated.clone(), b"old".to_vec());
+
+        std::fs::write(&isolated, b"refreshed").unwrap();
+        sync.sync().unwrap();
+        assert_eq!(std::fs::read(&source).unwrap(), b"refreshed");
+
+        std::fs::write(&source, b"new-login").unwrap();
+        std::fs::write(&isolated, b"stale-refresh").unwrap();
+        sync.sync().unwrap();
+        assert_eq!(std::fs::read(&source).unwrap(), b"new-login");
+
+        // Once an external login wins, later isolated changes remain unable
+        // to overwrite it.
+        std::fs::write(&isolated, b"later-stale-refresh").unwrap();
+        sync.sync().unwrap();
+        assert_eq!(std::fs::read(&source).unwrap(), b"new-login");
+
+        std::fs::remove_file(&isolated).unwrap();
+        let missing = AuthSync::new(source, isolated, b"old".to_vec());
+        assert_eq!(
+            missing.sync().unwrap_err().kind(),
+            std::io::ErrorKind::NotFound
+        );
+    }
+
+    #[test]
+    fn auth_sync_preserves_login_interleaved_after_refresh_staging() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("auth.json");
+        let isolated = temp.path().join("isolated-auth.json");
+        std::fs::write(&source, b"old").unwrap();
+        std::fs::write(&isolated, b"refreshed").unwrap();
+        let sync = AuthSync::new(source.clone(), isolated.clone(), b"old".to_vec());
+
+        sync.sync_with_publish_hook(|| {
+            // Simulate a separately launched vendor CLI, which cannot know
+            // about Trouve's lock file, completing after the refresh was
+            // staged but before its atomic publication.
+            std::fs::write(&source, b"new-login").unwrap();
+        })
+        .unwrap();
+        assert_eq!(std::fs::read(&source).unwrap(), b"new-login");
+
+        std::fs::write(&isolated, b"later-stale-refresh").unwrap();
+        sync.sync().unwrap();
+        assert_eq!(std::fs::read(&source).unwrap(), b"new-login");
+    }
+
+    #[test]
+    fn auth_sync_yields_when_the_shared_auth_lock_is_busy() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("auth.json");
+        let isolated_a = temp.path().join("isolated-a.json");
+        let isolated_b = temp.path().join("isolated-b.json");
+        std::fs::write(&source, b"old").unwrap();
+        std::fs::write(&isolated_a, b"refresh-a").unwrap();
+        std::fs::write(&isolated_b, b"refresh-b").unwrap();
+        let sync_a = Arc::new(AuthSync::new(source.clone(), isolated_a, b"old".to_vec()));
+        let sync_b = Arc::new(AuthSync::new(
+            source.clone(),
+            isolated_b.clone(),
+            b"old".to_vec(),
+        ));
+
+        let (a_staged_tx, a_staged_rx) = std::sync::mpsc::channel();
+        let (release_a_tx, release_a_rx) = std::sync::mpsc::channel();
+        let a = {
+            let sync = sync_a.clone();
+            std::thread::spawn(move || {
+                sync.sync_with_publish_hook(|| {
+                    a_staged_tx.send(()).unwrap();
+                    release_a_rx.recv().unwrap();
+                })
+            })
+        };
+        a_staged_rx.recv().unwrap();
+
+        let (b_started_tx, b_started_rx) = std::sync::mpsc::channel();
+        let (b_done_tx, b_done_rx) = std::sync::mpsc::channel();
+        let b = {
+            let sync = sync_b.clone();
+            std::thread::spawn(move || {
+                b_started_tx.send(()).unwrap();
+                let result = sync.sync();
+                b_done_tx.send(()).unwrap();
+                result
+            })
+        };
+        b_started_rx.recv().unwrap();
+        b_done_rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("a pending login must not stall a competing refresh");
+        assert_eq!(std::fs::read(&source).unwrap(), b"old");
+
+        release_a_tx.send(()).unwrap();
+        a.join().unwrap().unwrap();
+        b.join().unwrap().unwrap();
+        assert_eq!(std::fs::read(&source).unwrap(), b"refresh-a");
+
+        // B kept its old baseline when it yielded. Its retry observes A's
+        // committed source and stands down instead of overwriting it.
+        std::fs::write(&isolated_b, b"later-refresh-b").unwrap();
+        sync_b.sync().unwrap();
+        assert_eq!(std::fs::read(&source).unwrap(), b"refresh-a");
+    }
+
+    #[test]
+    fn auth_snapshot_fails_fast_while_an_interactive_login_owns_the_lock() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("auth.json");
+        let isolated_home = temp.path().join("isolated-home");
+        std::fs::write(&source, b"old").unwrap();
+        std::fs::create_dir(&isolated_home).unwrap();
+        let login_lock = AuthFileLock::acquire(&source).unwrap();
+
+        let started = std::time::Instant::now();
+        let error = match stage_auth_snapshot_from(source.clone(), &isolated_home) {
+            Err(error) => error,
+            Ok(_) => panic!("snapshot unexpectedly acquired the interactive login lock"),
+        };
+        assert_eq!(error.kind(), std::io::ErrorKind::WouldBlock);
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(1),
+            "snapshot waited for an interactive login instead of yielding"
+        );
+
+        drop(login_lock);
+        let snapshot = stage_auth_snapshot_from(source, &isolated_home)
+            .unwrap()
+            .expect("snapshot should succeed after login releases the lock");
+        assert_eq!(std::fs::read(snapshot.isolated).unwrap(), b"old");
+    }
+
+    #[test]
+    fn auth_sync_retries_when_atomic_publication_does_not_complete() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("auth.json");
+        let isolated = temp.path().join("isolated-auth.json");
+        std::fs::write(&source, b"old").unwrap();
+        std::fs::write(&isolated, b"refreshed").unwrap();
+        let sync = AuthSync::new(source.clone(), isolated, b"old".to_vec());
+
+        let error = sync
+            .sync_with_publish_hook(|| {
+                std::fs::remove_file(&source).unwrap();
+                std::fs::create_dir(&source).unwrap();
+            })
+            .unwrap_err();
+        assert_ne!(error.kind(), std::io::ErrorKind::NotFound);
+
+        std::fs::remove_dir(&source).unwrap();
+        std::fs::write(&source, b"old").unwrap();
+        sync.sync().unwrap();
+        assert_eq!(std::fs::read(&source).unwrap(), b"refreshed");
     }
 
     #[test]

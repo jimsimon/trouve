@@ -58,6 +58,12 @@ These are load-bearing. Do not violate them without a new ADR.
    plugin manifest, internal package pin, and release artifact uses root
    `[workspace.package].version`. Repository releases use `vX.Y.Z` tags (ADR
    0012). Protocol and storage-format compatibility versions remain separate.
+9. **Trouve owns the agent control plane.** Commands, skills, modes, rules,
+   permissions, canonical tool semantics, audit events, and presentation are
+   provider-independent (ADR 0019). Subscription adapters may retain
+   model-optimized native execution tools, but every visible operation maps
+   to Trouve's canonical taxonomy. Vendor commands, skills, plugins, and MCP
+   configuration must not become a second product surface.
 
 ## Conventions
 

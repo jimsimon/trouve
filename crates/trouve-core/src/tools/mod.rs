@@ -1,9 +1,13 @@
 //! Tools and the `ToolExecutor` chokepoint (invariant 3).
 //!
-//! The agent loop never performs side effects itself: it gates each call
-//! through the permission layer and hands execution to a `ToolExecutor`.
+//! Trouve's native agent loop never performs side effects itself: it gates
+//! each call through the permission layer and hands execution to a
+//! `ToolExecutor`. Supplemental capabilities mounted into subscription CLIs
+//! return through this same boundary. Certified vendor-native core tools are
+//! the deliberate exception recorded by ADR 0019; their adapters normalize
+//! lifecycle and approval events without re-executing the operation here.
 //! Local mode uses [`LocalToolExecutor`]; cloud isolation later swaps in a
-//! container-backed implementation without touching the loop.
+//! container-backed implementation without touching the native loop.
 
 mod diff;
 mod fs;
@@ -12,13 +16,15 @@ mod grep;
 mod patch;
 mod search;
 mod shell;
+mod skill;
 mod todo;
 mod web;
 
 pub use search::{VENDOR_SEARCH_GUIDANCE, gc_index_store_in_background, warm_index_in_background};
 
+use std::collections::HashMap;
 use std::path::{Component, Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 
 use anyhow::{Context, Result, bail};
 use serde_json::Value;
@@ -27,7 +33,7 @@ use trouve_providers::ToolSpec;
 
 /// Execution context: everything a tool may touch. All paths resolve inside
 /// the session worktree.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct ToolCtx {
     pub worktree: PathBuf,
     /// Stable owner for thread-scoped tool artifacts. Empty only in isolated
@@ -41,6 +47,22 @@ pub struct ToolCtx {
     /// Registered workspace repo root: its `.agents/.mcp.json` applies even
     /// before it is committed to the session branch.
     pub workspace_root: Option<PathBuf>,
+    /// Snapshot of the global built-in skill setting for this turn. User and
+    /// workspace skills are always available.
+    pub builtin_skills_enabled: bool,
+}
+
+impl Default for ToolCtx {
+    fn default() -> Self {
+        Self {
+            worktree: PathBuf::new(),
+            thread_id: String::new(),
+            todos: Arc::new(Mutex::new(Vec::new())),
+            config_dir: None,
+            workspace_root: None,
+            builtin_skills_enabled: true,
+        }
+    }
 }
 
 impl ToolCtx {
@@ -145,6 +167,17 @@ pub trait ToolExecutor: Send + Sync {
     ) -> Result<Vec<ReviewDiffFile>, String> {
         Err("review repository diff is unavailable in this executor".into())
     }
+    /// Stage user-provided non-image attachments inside the session
+    /// worktree so provider-native file tools can read them. This controlled
+    /// filesystem mutation stays behind the same executor boundary as every
+    /// other Trouve-owned worktree write.
+    async fn stage_attachments(
+        &self,
+        _ctx: &ToolCtx,
+        _files: &[AttachmentStage],
+    ) -> Result<Vec<AttachmentStage>, String> {
+        Err("attachment staging is unavailable in this executor".into())
+    }
     /// Release any per-worktree resources (e.g. spawned MCP server
     /// processes) when a session/worktree is going away. Default no-op.
     async fn evict_worktree(&self, _worktree: &Path) {}
@@ -166,6 +199,13 @@ pub struct ReviewRepositoryDiff {
     pub base_sha: String,
 }
 
+#[derive(Debug, Clone)]
+pub struct AttachmentStage {
+    pub attachment: trouve_protocol::Attachment,
+    pub source: PathBuf,
+    pub relative_path: PathBuf,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReviewDiffFile {
     pub path: String,
@@ -178,6 +218,10 @@ pub struct LocalToolExecutor {
     tools: Vec<Arc<dyn Tool>>,
     mcp: crate::mcp::McpManager,
     jobs: Arc<shell::JobRegistry>,
+    /// Shared bare repositories are reused across review jobs. Serialize the
+    /// complete fetch/ref transaction per repository while allowing unrelated
+    /// repositories to sync concurrently.
+    review_repository_locks: Mutex<HashMap<PathBuf, Weak<tokio::sync::Mutex<()>>>>,
 }
 
 impl Default for LocalToolExecutor {
@@ -216,14 +260,27 @@ impl LocalToolExecutor {
                 Arc::new(search::FindRelated {
                     cache: search_cache,
                 }),
+                Arc::new(skill::LoadSkill),
             ],
             mcp: crate::mcp::McpManager::with_logs(logs),
             jobs,
+            review_repository_locks: Mutex::new(HashMap::new()),
         }
     }
 
     fn find(&self, name: &str) -> Option<&Arc<dyn Tool>> {
         self.tools.iter().find(|t| t.name() == name)
+    }
+
+    fn review_repository_lock(&self, path: &Path) -> Arc<tokio::sync::Mutex<()>> {
+        let mut locks = self.review_repository_locks.lock().unwrap();
+        locks.retain(|_, lock| lock.strong_count() > 0);
+        if let Some(lock) = locks.get(path).and_then(Weak::upgrade) {
+            return lock;
+        }
+        let lock = Arc::new(tokio::sync::Mutex::new(()));
+        locks.insert(path.to_path_buf(), Arc::downgrade(&lock));
+        lock
     }
 }
 
@@ -289,6 +346,66 @@ impl ToolExecutor for LocalToolExecutor {
         }
     }
 
+    async fn stage_attachments(
+        &self,
+        ctx: &ToolCtx,
+        files: &[AttachmentStage],
+    ) -> Result<Vec<AttachmentStage>, String> {
+        if files.is_empty() {
+            return Ok(Vec::new());
+        }
+        let relative_dir = Path::new(".trouve").join("attachments");
+        let attachment_dir = ctx
+            .resolve(&relative_dir.to_string_lossy())
+            .map_err(|error| error.to_string())?;
+        tokio::fs::create_dir_all(&attachment_dir)
+            .await
+            .map_err(|error| {
+                format!(
+                    "cannot create attachment directory {}: {error}",
+                    attachment_dir.display()
+                )
+            })?;
+        let ignore_path = ctx
+            .resolve(".trouve/.gitignore")
+            .map_err(|error| error.to_string())?;
+        if let Err(error) = tokio::fs::write(&ignore_path, "*\n").await {
+            tracing::warn!(
+                "cannot gitignore staged attachments at {}: {error}",
+                ignore_path.display()
+            );
+        }
+
+        let mut staged = Vec::new();
+        for file in files {
+            if !file.relative_path.starts_with(&relative_dir) {
+                tracing::warn!(
+                    "refusing attachment destination outside {}: {}",
+                    relative_dir.display(),
+                    file.relative_path.display()
+                );
+                continue;
+            }
+            let destination = match ctx.resolve(&file.relative_path.to_string_lossy()) {
+                Ok(destination) => destination,
+                Err(error) => {
+                    tracing::warn!(
+                        "cannot resolve attachment destination {}: {error}",
+                        file.relative_path.display()
+                    );
+                    continue;
+                }
+            };
+            match tokio::fs::copy(&file.source, destination).await {
+                Ok(_) => staged.push(file.clone()),
+                Err(error) => {
+                    tracing::warn!("cannot stage attachment {}: {error}", file.attachment.name)
+                }
+            }
+        }
+        Ok(staged)
+    }
+
     async fn sync_review_repository(
         &self,
         request: &ReviewRepositorySync,
@@ -296,6 +413,8 @@ impl ToolExecutor for LocalToolExecutor {
         use base64::Engine as _;
 
         let repository_path = request.root.join(&request.repository);
+        let repository_lock = self.review_repository_lock(&repository_path);
+        let _repository_guard = repository_lock.lock().await;
         let parent = repository_path
             .parent()
             .ok_or_else(|| "invalid review repository path".to_string())?;
@@ -344,7 +463,11 @@ impl ToolExecutor for LocalToolExecutor {
         }
 
         // Retries and duplicate requests for an immutable revision can reuse
-        // objects already fetched into the shared review repository.
+        // objects already fetched into the shared review repository. Anchor
+        // both objects before returning so later git maintenance cannot prune
+        // commits that arrived only through a now-expired FETCH_HEAD.
+        let base_ref = "refs/remotes/origin/trouve-base";
+        let pull_ref = format!("refs/remotes/origin/trouve-pr-{}", request.pull_number);
         let base_present = run(vec![
             "cat-file".into(),
             "-e".into(),
@@ -360,16 +483,27 @@ impl ToolExecutor for LocalToolExecutor {
         .await
         .is_ok();
         if base_present && head_present {
+            run(vec![
+                "update-ref".into(),
+                base_ref.into(),
+                request.base_sha.clone(),
+            ])
+            .await?;
+            run(vec![
+                "update-ref".into(),
+                pull_ref.clone(),
+                request.head_sha.clone(),
+            ])
+            .await?;
             return Ok(repository_path);
         }
 
-        let pull_ref = format!("refs/remotes/origin/trouve-pr-{}", request.pull_number);
         run(vec![
             "fetch".into(),
             "--force".into(),
             "--no-tags".into(),
             "origin".into(),
-            format!("+{}:refs/remotes/origin/trouve-base", request.base_sha),
+            format!("+{}:{base_ref}", request.base_sha),
             format!("+refs/pull/{}/head:{pull_ref}", request.pull_number),
         ])
         .await?;
@@ -472,5 +606,88 @@ mod tests {
         };
         let res = exec.execute(&ctx, "nope", &serde_json::json!({})).await;
         assert_eq!(res.status, ToolStatus::Error);
+    }
+
+    #[test]
+    fn review_repository_locks_are_shared_only_within_one_repository() {
+        let executor = LocalToolExecutor::default();
+        let first = executor.review_repository_lock(Path::new("/reviews/owner/one"));
+        let same = executor.review_repository_lock(Path::new("/reviews/owner/one"));
+        let other = executor.review_repository_lock(Path::new("/reviews/owner/two"));
+
+        assert!(Arc::ptr_eq(&first, &same));
+        assert!(!Arc::ptr_eq(&first, &other));
+    }
+
+    #[tokio::test]
+    async fn review_repository_reuse_anchors_existing_commits() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("reviews");
+        let repository = root.join("owner/repo");
+        let git_config = temp.path().join("empty-gitconfig");
+        std::fs::create_dir_all(&repository).unwrap();
+        std::fs::write(&git_config, "").unwrap();
+        let git = |args: &[&str]| {
+            let output = std::process::Command::new("git")
+                .args(args)
+                .current_dir(&repository)
+                .env("GIT_CONFIG_GLOBAL", &git_config)
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .env_remove("GIT_CONFIG_COUNT")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "git {}: {}",
+                args.join(" "),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            String::from_utf8_lossy(&output.stdout).trim().to_string()
+        };
+        git(&["init"]);
+        git(&[
+            "-c",
+            "user.name=Trouve Test",
+            "-c",
+            "user.email=trouve@example.invalid",
+            "commit",
+            "--allow-empty",
+            "-m",
+            "base",
+        ]);
+        let base_sha = git(&["rev-parse", "HEAD"]);
+        git(&[
+            "-c",
+            "user.name=Trouve Test",
+            "-c",
+            "user.email=trouve@example.invalid",
+            "commit",
+            "--allow-empty",
+            "-m",
+            "head",
+        ]);
+        let head_sha = git(&["rev-parse", "HEAD"]);
+
+        let synced = LocalToolExecutor::default()
+            .sync_review_repository(&ReviewRepositorySync {
+                root,
+                repository: "owner/repo".into(),
+                pull_number: 42,
+                base_sha: base_sha.clone(),
+                head_sha: head_sha.clone(),
+                token: "unused-on-reuse".into(),
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(synced, repository);
+        assert_eq!(
+            git(&["rev-parse", "refs/remotes/origin/trouve-base"]),
+            base_sha
+        );
+        assert_eq!(
+            git(&["rev-parse", "refs/remotes/origin/trouve-pr-42"]),
+            head_sha
+        );
     }
 }

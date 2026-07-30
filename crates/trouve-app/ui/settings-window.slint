@@ -18,6 +18,7 @@ export enum SectionId {
     providers,
     modes-models,
     git-worktrees,
+    skills,
     mcp-servers,
     integrations,
     appearance,
@@ -243,33 +244,16 @@ component DownloadBar inherits Rectangle {
     }
 }
 
-// An On/Off pill with a wrapping description beside it (the style the
-// Appearance section's "Reduce motion" established).
+// A keyboard-accessible On/Off switch with a wrapping description beside it.
 component ToggleRow inherits HorizontalLayout {
     in-out property <bool> on;
     in property <string> label;
     callback toggled(bool);
     spacing: 10px;
-    Rectangle {
-        width: 44px;
-        height: Theme.fs(26px);
-        background: root.on ? Theme.c.accent-bg : Theme.c.control-bg;
-        border-radius: 6px;
-        border-width: 1px;
-        border-color: root.on ? Theme.c.primary-border : Theme.c.border;
-        TouchArea {
-            clicked => {
-                root.on = !root.on;
-                root.toggled(root.on);
-            }
-        }
-        Text {
-            text: root.on ? "On" : "Off";
-            color: root.on ? Theme.c.text-hi : Theme.c.text-soft;
-            font-size: Theme.fs(12px);
-            horizontal-alignment: center;
-            vertical-alignment: center;
-        }
+    Switch {
+        checked <=> root.on;
+        text: root.on ? "On" : "Off";
+        toggled => { root.toggled(self.checked); }
     }
     Text {
         text: root.label;
@@ -350,6 +334,7 @@ export component SettingsScreen inherits Rectangle {
     in property <string> settings-status: "";
     in property <string> login-provider-id: "";
     in property <bool> login-code-required: false;
+    in-out property <bool> builtin-skills-enabled: true;
 
     // General frontend behavior preferences.
     in-out property <bool> prevent-sleep-while-running: true;
@@ -447,6 +432,7 @@ export component SettingsScreen inherits Rectangle {
     callback default-model-picked(/* model-index */ int, /* thinking-level */ string);
     // 0 ask, 1 allow-list, 2 yolo.
     callback default-permission-picked(int);
+    callback builtin-skills-toggled(bool);
     // Mode CRUD. mode-deleted covers both "Remove" (custom modes) and
     // "Reset to defaults" (customized built-ins) — both drop the user file.
     callback mode-saved(/* id */ string, /* display-name */ string,
@@ -578,6 +564,7 @@ export component SettingsScreen inherits Rectangle {
         { id: SectionId.providers, name: "Providers" },
         { id: SectionId.modes-models, name: "Modes & Models" },
         { id: SectionId.git-worktrees, name: "Git & Worktrees" },
+        { id: SectionId.skills, name: "Skills" },
         { id: SectionId.mcp-servers, name: "MCP Servers" },
         { id: SectionId.integrations, name: "Integrations" },
         { id: SectionId.appearance, name: "Appearance" },
@@ -1570,6 +1557,59 @@ export component SettingsScreen inherits Rectangle {
                                         }
                                     }
                                 }
+                            }
+
+                            if root.settings-status != "": Text {
+                                text: root.settings-status;
+                                color: Theme.c.accent-tint;
+                                font-size: Theme.fs(12px);
+                                wrap: word-wrap;
+                            }
+                        }
+
+                        // ---------------- skills ----------------
+                        if root.section == SectionId.skills: VerticalLayout {
+                            spacing: 12px;
+
+                            Text {
+                                text: "Skills";
+                                color: Theme.c.text-hi;
+                                font-size: Theme.fs(16px);
+                                font-weight: 700;
+                            }
+                            Text {
+                                text: "Skills are reusable instruction workflows shared across API, local, and subscription providers. Trouve resolves user and workspace skills independently of its built-in baseline.";
+                                color: Theme.c.text-soft;
+                                font-size: Theme.fs(11px);
+                                wrap: word-wrap;
+                            }
+
+                            ToggleRow {
+                                on <=> root.builtin-skills-enabled;
+                                label: "Enable Trouve's built-in skills — advertise them to models, include their slash completions, and allow them to be loaded or explicitly invoked.";
+                                toggled(on) => { root.builtin-skills-toggled(on); }
+                            }
+
+                            Rectangle {
+                                background: Theme.c.surface;
+                                border-radius: 6px;
+                                details := VerticalLayout {
+                                    padding: 12px;
+                                    spacing: 6px;
+                                    Text {
+                                        text: "User and workspace skills stay enabled";
+                                        color: Theme.c.text-hi;
+                                        font-size: Theme.fs(13px);
+                                        font-weight: 700;
+                                    }
+                                    Text {
+                                        text: "Turning off built-ins does not hide skills from ~/.config/trouve/skills or .agents/skills. Existing slash catalogs update immediately; a turn already in progress may retain built-in instructions injected when it started.";
+                                        color: Theme.c.text-soft;
+                                        font-size: Theme.fs(11px);
+                                        wrap: word-wrap;
+                                    }
+                                }
+                                height: details.preferred-height;
                             }
 
                             if root.settings-status != "": Text {

@@ -1061,6 +1061,10 @@ pub fn set_git_worktree_settings(ui: &Ui, settings: trouve_protocol::GitWorktree
     });
 }
 
+pub fn set_builtin_skills_enabled(ui: &Ui, enabled: bool) {
+    let _ = ui.upgrade_in_event_loop(move |ui| ui.set_settings_builtin_skills_enabled(enabled));
+}
+
 pub fn set_diff(ui: &Ui, rows: Vec<trouve_slint_diff_view::RowData>, raw: String) {
     let _ = ui.upgrade_in_event_loop(move |ui| {
         let items: Vec<DiffRow> = rows

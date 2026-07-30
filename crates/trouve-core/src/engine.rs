@@ -5,6 +5,7 @@
 //! serialized per session (threads share the session worktree, ADR 0003).
 
 use std::collections::{HashMap, HashSet};
+use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Instant;
@@ -13,7 +14,8 @@ use anyhow::{Context, Result, anyhow, bail};
 use futures::{FutureExt, StreamExt};
 use trouve_agents::{AgentBackend, BackendEvent, BackendPermission, BackendTurn};
 use trouve_protocol::{
-    AgentMode, ApprovalDecision, BranchList, CreateSessionRequest, CreateThreadRequest, Event,
+    AgentMode, ApprovalDecision, BranchList, CommandAction, CommandInfo, CommandResult,
+    CreateSessionRequest, CreateThreadRequest, Event, ExecuteCommandRequest, PermissionMode,
     ProviderInfo, ProvidersResponse, RestoreDirection, Scope, Session, Thread, ToolStatus,
     TurnAccepted, UpdateSessionRequest, UpdateThreadRequest, UpsertProviderRequest, Usage,
     Workspace,
@@ -23,7 +25,7 @@ use trouve_providers::{Message, Provider, ProviderEvent, ToolSpec};
 use crate::config::{Config, ProviderConfig};
 use crate::permissions::{ApprovalHub, Gate, QuestionHub, allow_key, gate};
 use crate::store::{CheckpointRow, Store};
-use crate::tools::{LocalToolExecutor, ToolCtx, ToolExecutor};
+use crate::tools::{AttachmentStage, LocalToolExecutor, ToolCtx, ToolExecutor};
 use crate::{context, git, modes, new_id};
 
 /// Safety valve: maximum provider round-trips within a single turn.
@@ -88,6 +90,140 @@ struct ProviderTurnCapacity {
 struct ProviderBackoff {
     until: Option<Instant>,
     delay: std::time::Duration,
+}
+
+#[derive(Debug)]
+struct BridgeEchoCall {
+    turn: u64,
+    canonical_call_id: String,
+    tool: String,
+    args: serde_json::Value,
+    vendor_call_id: Option<String>,
+}
+
+/// Trusted correlation state between the MCP request Trouve executes and the
+/// lifecycle echo a vendor harness reports for that same call. Vendor event
+/// names and arguments alone are not authority to suppress cards or approve.
+#[derive(Default)]
+struct BridgeEchoTracker {
+    calls: Mutex<HashMap<String, Vec<BridgeEchoCall>>>,
+    changed: tokio::sync::Notify,
+}
+
+struct BridgeEchoTurn<'a> {
+    tracker: &'a BridgeEchoTracker,
+    thread_id: String,
+    turn: u64,
+}
+
+impl Drop for BridgeEchoTurn<'_> {
+    fn drop(&mut self) {
+        let mut calls = self.tracker.calls.lock().unwrap();
+        if calls
+            .get(&self.thread_id)
+            .is_some_and(|entries| entries.iter().all(|entry| entry.turn == self.turn))
+        {
+            calls.remove(&self.thread_id);
+        } else if let Some(entries) = calls.get_mut(&self.thread_id) {
+            entries.retain(|entry| entry.turn != self.turn);
+            if entries.is_empty() {
+                calls.remove(&self.thread_id);
+            }
+        }
+    }
+}
+
+impl BridgeEchoTracker {
+    fn begin_turn(&self, thread_id: &str, turn: u64) -> BridgeEchoTurn<'_> {
+        self.calls
+            .lock()
+            .unwrap()
+            .insert(thread_id.to_string(), Vec::new());
+        BridgeEchoTurn {
+            tracker: self,
+            thread_id: thread_id.to_string(),
+            turn,
+        }
+    }
+
+    fn register(
+        &self,
+        thread_id: &str,
+        turn: u64,
+        canonical_call_id: &str,
+        tool: &str,
+        args: &serde_json::Value,
+    ) {
+        self.calls
+            .lock()
+            .unwrap()
+            .entry(thread_id.to_string())
+            .or_default()
+            .push(BridgeEchoCall {
+                turn,
+                canonical_call_id: canonical_call_id.to_string(),
+                tool: tool.to_string(),
+                args: args.clone(),
+                vendor_call_id: None,
+            });
+        self.changed.notify_waiters();
+    }
+
+    fn try_claim(
+        &self,
+        thread_id: &str,
+        turn: u64,
+        vendor_call_id: &str,
+        tool: &str,
+        args: &serde_json::Value,
+    ) -> Option<String> {
+        let (tool, args) = trouve_bridge_echo_payload(tool, args)?;
+        self.calls
+            .lock()
+            .unwrap()
+            .get_mut(thread_id)?
+            .iter_mut()
+            .find(|entry| {
+                entry.turn == turn
+                    && entry.tool == tool
+                    && entry.args == args
+                    && entry
+                        .vendor_call_id
+                        .as_deref()
+                        .is_none_or(|claimed| claimed == vendor_call_id)
+            })
+            .map(|entry| {
+                entry.vendor_call_id = Some(vendor_call_id.to_string());
+                entry.canonical_call_id.clone()
+            })
+    }
+
+    async fn claim(
+        &self,
+        thread_id: &str,
+        turn: u64,
+        vendor_call_id: &str,
+        tool: &str,
+        args: &serde_json::Value,
+    ) -> Option<String> {
+        // Vendor-native calls can never correlate with an MCP request and
+        // must not pay the bridge dispatch grace period.
+        trouve_bridge_echo_payload(tool, args)?;
+        // Some harnesses announce a tool immediately before dispatching its
+        // HTTP MCP request. Give that independently-running request a brief
+        // chance to establish trusted state, without indefinitely stalling
+        // an unmatched vendor-native event.
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            let changed = self.changed.notified();
+            if let Some(call_id) = self.try_claim(thread_id, turn, vendor_call_id, tool, args) {
+                return Some(call_id);
+            }
+            if tokio::time::timeout_at(deadline, changed).await.is_err() {
+                return None;
+            }
+        }
+    }
 }
 
 /// Capacity shared by interactive desktop turns, spawned agents, and
@@ -336,6 +472,81 @@ fn normalize_thinking_option(
 type GithubDashboardCacheHandle = Arc<tokio::sync::Mutex<crate::github::GitHubDashboardCache>>;
 type GithubDashboardRefresh = (String, String, GithubDashboardCacheHandle);
 
+fn require_no_command_arguments(
+    spec: &crate::commands::CommandSpec,
+    arguments: &str,
+) -> Result<(), EngineError> {
+    if arguments.is_empty() {
+        Ok(())
+    } else {
+        Err(EngineError::BadRequest(format!("usage: {}", spec.usage)))
+    }
+}
+
+fn single_command_argument<'a>(
+    spec: &crate::commands::CommandSpec,
+    arguments: &'a str,
+) -> Result<&'a str, EngineError> {
+    let mut parts = arguments.split_whitespace();
+    let Some(value) = parts.next() else {
+        return Err(EngineError::BadRequest(format!("usage: {}", spec.usage)));
+    };
+    if parts.next().is_some() {
+        return Err(EngineError::BadRequest(format!("usage: {}", spec.usage)));
+    }
+    Ok(value)
+}
+
+fn permission_name(mode: PermissionMode) -> &'static str {
+    match mode {
+        PermissionMode::Ask => "ask",
+        PermissionMode::AllowList => "allow-list",
+        PermissionMode::Yolo => "yolo",
+    }
+}
+
+fn command_preview(text: &str, max_chars: usize) -> String {
+    let flattened = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    let mut preview: String = flattened.chars().take(max_chars).collect();
+    if flattened.chars().count() > max_chars {
+        preview.push('…');
+    }
+    preview
+}
+
+fn truncate_command_output(mut output: String) -> String {
+    const MAX_COMMAND_OUTPUT_BYTES: usize = 64 * 1024;
+    if output.len() <= MAX_COMMAND_OUTPUT_BYTES {
+        return output;
+    }
+    let mut end = MAX_COMMAND_OUTPUT_BYTES;
+    while !output.is_char_boundary(end) {
+        end -= 1;
+    }
+    output.truncate(end);
+    output.push_str("\n\n_Output truncated by Trouve._");
+    output
+}
+
+fn fenced_block(language: &str, body: &str) -> String {
+    // CommonMark closes a fenced block with a run at least as long as the
+    // opening fence. Repository content is arbitrary, so keep ours longer
+    // than every backtick run it encloses.
+    let longest = body
+        .split(|character| character != '`')
+        .map(str::len)
+        .max()
+        .unwrap_or(0);
+    let fence = "`".repeat(longest.max(3) + 1);
+    format!("{fence}{language}\n{body}\n{fence}")
+}
+
+#[derive(Clone)]
+struct BridgedToolCatalog {
+    revision: u64,
+    specs: Vec<ToolSpec>,
+}
+
 pub struct Engine {
     pub(crate) store: Store,
     pub(crate) data_dir: PathBuf,
@@ -356,7 +567,15 @@ pub struct Engine {
     pub(crate) executor: Arc<dyn ToolExecutor>,
     approvals: Arc<ApprovalHub>,
     questions: Arc<QuestionHub>,
+    bridge_echoes: BridgeEchoTracker,
     turn_scheduler: TurnScheduler,
+    /// Last command catalog emitted per thread. Catalogs are recomputed
+    /// before turns so edited skills converge, but identical durable events
+    /// are suppressed for the lifetime of this engine.
+    command_catalogs: Mutex<HashMap<String, Vec<CommandInfo>>>,
+    /// Catalog prepared while constructing a vendor bridge URL. The matching
+    /// tools/list request reuses it instead of repeating MCP discovery.
+    bridged_tool_catalogs: Mutex<HashMap<String, BridgedToolCatalog>>,
     /// Per-session worktree access. Read-only turns share a read guard;
     /// mutating turns, checkpoint restoration, and settings changes take the
     /// write guard. This lets review/plan work fan out without weakening the
@@ -436,7 +655,7 @@ pub struct Engine {
     /// This server's reachable base URL (e.g. "http://127.0.0.1:7433"), set
     /// once the listener binds; the MCP tool bridge dials back through it.
     base_url: RwLock<Option<String>>,
-    /// Ephemeral credential appended only to internal MCP bridge URLs.
+    /// Ephemeral credential sent only in internal MCP bridge headers.
     bridge_token: RwLock<Option<String>>,
     /// Warm the search index on session creation and GC the shared index
     /// store on archive/delete. Off by default so tests never touch the
@@ -539,6 +758,36 @@ fn resolved_cli_command(kind: &str, command: Option<String>, data_dir: &Path) ->
 /// Config kinds handled by the [`AgentBackend`] seam rather than a Provider.
 fn is_backend_kind(kind: &str) -> bool {
     matches!(kind, "codex-app-server" | "cursor-cli" | "claude-cli")
+}
+
+/// Instruction loading is a read-only harness primitive, like asking the
+/// user a question or searching the transcript. A mode may restrict
+/// executable workspace tools, but must not advertise skills the model is
+/// then unable to load.
+fn mode_allows_tool(mode: &AgentMode, name: &str) -> bool {
+    name == "load_skill"
+        || mode.allowed_tools.is_empty()
+        || mode.allowed_tools.iter().any(|allowed| allowed == name)
+}
+
+/// Stable-enough cache key for one process lifetime. Vendor harnesses cache
+/// MCP catalogs; changing this value in the bridge URL forces an adapter to
+/// remount when mode policy or a user MCP schema changes.
+fn tool_catalog_revision(specs: &[ToolSpec]) -> u64 {
+    let mut rows: Vec<_> = specs
+        .iter()
+        .map(|spec| {
+            (
+                spec.name.as_str(),
+                spec.description.as_str(),
+                spec.parameters.to_string(),
+            )
+        })
+        .collect();
+    rows.sort_unstable_by(|a, b| a.0.cmp(b.0));
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    rows.hash(&mut hasher);
+    hasher.finish()
 }
 
 /// Config kinds whose auth lives in a vendor CLI.
@@ -729,7 +978,10 @@ impl Engine {
             executor: Arc::new(LocalToolExecutor::with_mcp_logs(mcp_logs.clone())),
             approvals: Arc::new(ApprovalHub::default()),
             questions: Arc::new(QuestionHub::default()),
+            bridge_echoes: BridgeEchoTracker::default(),
             turn_scheduler: TurnScheduler::new(),
+            command_catalogs: Mutex::new(HashMap::new()),
+            bridged_tool_catalogs: Mutex::new(HashMap::new()),
             session_locks: Mutex::new(HashMap::new()),
             active_threads: Mutex::new(std::collections::HashMap::new()),
             session_activity_publication: Mutex::new(()),
@@ -865,15 +1117,15 @@ impl Engine {
         });
     }
 
-    /// Record the server's reachable base URL (enables the MCP tool bridge
-    /// for backends configured with `tool_bridge = true`).
+    /// Record the server's reachable base URL (enables the supplemental MCP
+    /// capability bridge for subscription CLI backends).
     pub fn set_base_url(&self, url: &str) {
         *self.base_url.write().unwrap() = Some(url.trim_end_matches('/').to_string());
     }
 
-    /// Set the server-generated credential vendor children must present to
-    /// the internal MCP bridge. `None` keeps in-process open test routers
-    /// backwards-compatible.
+    /// Set the server-generated bearer credential vendor children must
+    /// present to the internal MCP bridge. `None` keeps in-process open test
+    /// routers backwards-compatible.
     pub fn set_bridge_token(&self, token: Option<String>) {
         *self.bridge_token.write().unwrap() = token;
     }
@@ -2691,6 +2943,90 @@ impl Engine {
         }
     }
 
+    /// Current global skill settings. Built-in skills default to enabled;
+    /// user and workspace skills are not governed by this switch.
+    pub fn skills_settings(&self) -> trouve_protocol::SkillsSettings {
+        trouve_protocol::SkillsSettings {
+            builtin_skills_enabled: self.builtin_skills_enabled(),
+        }
+    }
+
+    /// Enable or disable Trouve's compiled-in skills. Existing thread
+    /// catalogs are republished in the background. Future prompt construction
+    /// and skill lookups use the new value immediately; an already running
+    /// turn may retain instructions injected when it started.
+    pub fn set_builtin_skills_enabled(self: &Arc<Self>, enabled: bool) -> Result<(), EngineError> {
+        {
+            let mut config = self.config.lock().unwrap();
+            if config.builtin_skills_enabled() == enabled {
+                return Ok(());
+            }
+            config.builtin_skills_enabled = Some(enabled);
+            self.persist_config(&config);
+        }
+
+        // Persisting the preference is the request's critical path. Existing
+        // threads receive refreshed completion catalogs in the background;
+        // one damaged session must not prevent every other thread updating.
+        let engine = Arc::clone(self);
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            let _task = runtime.spawn_blocking(move || engine.republish_command_catalogs());
+        } else if let Err(error) = std::thread::Builder::new()
+            .name("trouve-skill-catalogs".into())
+            .spawn(move || engine.republish_command_catalogs())
+        {
+            tracing::warn!("failed to start skill catalog refresh: {error}");
+        }
+        Ok(())
+    }
+
+    fn republish_command_catalogs(&self) {
+        let sessions = match self.store.list_sessions(None) {
+            Ok(sessions) => sessions,
+            Err(error) => {
+                tracing::warn!("failed to list sessions for skill catalog refresh: {error}");
+                return;
+            }
+        };
+        for session in sessions {
+            let workspace = match self.store.workspace(&session.workspace_id) {
+                Ok(Some(workspace)) => workspace,
+                Ok(None) => continue,
+                Err(error) => {
+                    tracing::warn!(
+                        session_id = %session.id,
+                        "failed to load workspace for skill catalog refresh: {error}"
+                    );
+                    continue;
+                }
+            };
+            let threads = match self.store.list_threads(&session.id) {
+                Ok(threads) => threads,
+                Err(error) => {
+                    tracing::warn!(
+                        session_id = %session.id,
+                        "failed to list threads for skill catalog refresh: {error}"
+                    );
+                    continue;
+                }
+            };
+            for thread in threads {
+                if let Err(error) =
+                    self.emit_command_catalog(&thread.id, Path::new(&workspace.path))
+                {
+                    tracing::warn!(
+                        thread_id = %thread.id,
+                        "failed to refresh skill command catalog: {error}"
+                    );
+                }
+            }
+        }
+    }
+
+    fn builtin_skills_enabled(&self) -> bool {
+        self.config.lock().unwrap().builtin_skills_enabled()
+    }
+
     pub(crate) fn persist_config(&self, config: &Config) {
         if let Some(path) = &self.config_file
             && let Err(e) = config.save_to(path)
@@ -4180,6 +4516,12 @@ impl Engine {
             // filesystem work. A database error must leave the session and
             // its worktree consistently intact.
             let attachment_paths = self.store.session_attachment_paths(id)?;
+            let thread_ids: Vec<String> = self
+                .store
+                .list_threads(id)?
+                .into_iter()
+                .map(|thread| thread.id)
+                .collect();
             self.terminals.remove_session(id);
             if let Err(error) = self.store.delete_session(id) {
                 // Restore terminal access when the database transaction left
@@ -4189,6 +4531,7 @@ impl Engine {
                 }
                 return Err(error.into());
             }
+            self.evict_thread_catalogs(&thread_ids);
             self.executor
                 .evict_worktree(Path::new(&session.worktree_path))
                 .await;
@@ -4224,6 +4567,19 @@ impl Engine {
 
         self.deleting_sessions.lock().unwrap().remove(id);
         result
+    }
+
+    fn evict_thread_catalogs(&self, thread_ids: &[String]) {
+        {
+            let mut catalogs = self.command_catalogs.lock().unwrap();
+            for thread_id in thread_ids {
+                catalogs.remove(thread_id);
+            }
+        }
+        let mut catalogs = self.bridged_tool_catalogs.lock().unwrap();
+        for thread_id in thread_ids {
+            catalogs.remove(thread_id);
+        }
     }
 
     // --- threads ------------------------------------------------------------
@@ -4280,7 +4636,483 @@ impl Engine {
                 session_id: session.id,
             },
         )?;
+        self.emit_command_catalog(&thread.id, Path::new(&ws.path))?;
         Ok(thread)
+    }
+
+    fn command_catalog(&self, workspace_root: &Path) -> Vec<CommandInfo> {
+        crate::commands::catalog(crate::skills::command_catalog(
+            self.config_dir.as_deref(),
+            Some(workspace_root),
+            self.builtin_skills_enabled(),
+        ))
+    }
+
+    fn emit_command_catalog(&self, thread_id: &str, workspace_root: &Path) -> Result<()> {
+        let commands = self.command_catalog(workspace_root);
+        if self.command_catalogs.lock().unwrap().get(thread_id) == Some(&commands) {
+            return Ok(());
+        }
+        self.store.append_event(
+            Scope::Thread(thread_id.to_string()),
+            Event::CommandCatalogUpdated {
+                commands: commands.clone(),
+            },
+        )?;
+        self.command_catalogs
+            .lock()
+            .unwrap()
+            .insert(thread_id.to_string(), commands);
+        Ok(())
+    }
+
+    /// Execute one Trouve-owned slash command. Prompt commands never enter
+    /// this path; clients send those through `send_message` so skills start a
+    /// normal model turn.
+    pub async fn execute_command(
+        self: &Arc<Self>,
+        thread_id: &str,
+        req: ExecuteCommandRequest,
+    ) -> Result<CommandResult, EngineError> {
+        let name = req.name.trim().trim_start_matches('/');
+        let Some(spec) = crate::commands::action_spec(name) else {
+            return Err(EngineError::BadRequest(format!(
+                "unknown action command: /{name}"
+            )));
+        };
+        let arguments = req.arguments.trim().to_string();
+        let thread = self.get_thread(thread_id)?;
+        let session = self.get_session(&thread.session_id)?;
+        let workspace = self
+            .store
+            .workspace(&session.workspace_id)?
+            .ok_or_else(|| EngineError::NotFound(format!("workspace {}", session.workspace_id)))?;
+        let workspace_root = Path::new(&workspace.path);
+
+        let (output, action) = match name {
+            "help" => {
+                let catalog = self.command_catalog(workspace_root);
+                let target = arguments.trim_start_matches('/');
+                if target.is_empty() {
+                    let mut output = String::from(
+                        "## Trouve commands\n\n| Command | Description |\n| --- | --- |\n",
+                    );
+                    for command in catalog {
+                        output.push_str(&format!(
+                            "| `{}` | {} |\n",
+                            command.usage.replace('|', "\\|"),
+                            command.description.replace('|', "\\|")
+                        ));
+                    }
+                    (output, CommandAction::None)
+                } else {
+                    let command = catalog
+                        .iter()
+                        .find(|command| command.name == target)
+                        .ok_or_else(|| {
+                            EngineError::BadRequest(format!("unknown command: /{target}"))
+                        })?;
+                    (
+                        format!(
+                            "## `{}`\n\n{}\n\nKind: **{}**",
+                            command.usage,
+                            command.description,
+                            match command.kind {
+                                trouve_protocol::CommandKind::Prompt => "model prompt",
+                                trouve_protocol::CommandKind::Action => "Trouve action",
+                            }
+                        ),
+                        CommandAction::None,
+                    )
+                }
+            }
+            "status" => {
+                require_no_command_arguments(spec, &arguments)?;
+                let providers = self.list_providers();
+                let provider_id = thread.model.split_once('/').map_or("", |(id, _)| id);
+                let provider = providers
+                    .providers
+                    .iter()
+                    .find(|provider| provider.id == provider_id);
+                let provider_line = provider.map_or_else(
+                    || "not configured".to_string(),
+                    |provider| format!("{} / {}", provider.kind, provider.auth),
+                );
+                let turn = if self.turn_cancels.lock().unwrap().contains_key(thread_id) {
+                    "running"
+                } else {
+                    "idle"
+                };
+                (
+                    format!(
+                        "## Status\n\n- Session: **{}** (`{}`)\n- Thread: `{}`\n- Mode: `{}`\n- Model: `{}`\n- Permissions: `{}`\n- Provider: {}\n- Current turn: **{}**\n- Session activity: **{}**",
+                        session.title,
+                        session.id,
+                        thread.id,
+                        thread.mode,
+                        thread.model,
+                        permission_name(thread.permission_mode),
+                        provider_line,
+                        turn,
+                        if session.active { "active" } else { "idle" }
+                    ),
+                    CommandAction::None,
+                )
+            }
+            "skills" => {
+                let skills = crate::skills::discover(
+                    self.config_dir.as_deref(),
+                    Some(workspace_root),
+                    self.builtin_skills_enabled(),
+                );
+                if arguments.is_empty() {
+                    let mut output = String::from(
+                        "## Available skills\n\n| Skill | Origin | Invocation | Description |\n| --- | --- | --- | --- |\n",
+                    );
+                    for skill in skills {
+                        let invocation = if skill.user_invocable {
+                            if skill.argument_hint.is_empty() {
+                                format!("/{}", skill.name)
+                            } else {
+                                format!("/{} {}", skill.name, skill.argument_hint)
+                            }
+                        } else {
+                            "model only".into()
+                        };
+                        output.push_str(&format!(
+                            "| `{}` | {} | `{}` | {} |\n",
+                            skill.name,
+                            skill.origin,
+                            invocation.replace('|', "\\|"),
+                            skill.description.replace('|', "\\|")
+                        ));
+                    }
+                    (output, CommandAction::None)
+                } else {
+                    let target = single_command_argument(spec, &arguments)?;
+                    let skill = skills
+                        .iter()
+                        .find(|skill| skill.name == target)
+                        .ok_or_else(|| {
+                            EngineError::BadRequest(format!("unknown skill: {target}"))
+                        })?;
+                    let invocation = if skill.user_invocable {
+                        if skill.argument_hint.is_empty() {
+                            format!("/{}", skill.name)
+                        } else {
+                            format!("/{} {}", skill.name, skill.argument_hint)
+                        }
+                    } else {
+                        "Not user-invocable".into()
+                    };
+                    (
+                        format!(
+                            "## `{}`\n\n{}\n\n- Origin: **{}**\n- Invocation: `{}`\n- Automatic model invocation: **{}**",
+                            skill.name,
+                            skill.description,
+                            skill.origin,
+                            invocation,
+                            if skill.disable_model_invocation {
+                                "disabled"
+                            } else {
+                                "enabled"
+                            }
+                        ),
+                        CommandAction::None,
+                    )
+                }
+            }
+            "mode" => {
+                let modes = self.list_modes(Some(&session.workspace_id))?;
+                if arguments.is_empty() {
+                    let mut output = format!("## Modes\n\nCurrent: `{}`\n", thread.mode);
+                    for mode in modes {
+                        let marker = if mode.id == thread.mode {
+                            " **(current)**"
+                        } else {
+                            ""
+                        };
+                        output.push_str(&format!(
+                            "\n- `{}` — {}{}",
+                            mode.id, mode.display_name, marker
+                        ));
+                    }
+                    (output, CommandAction::None)
+                } else {
+                    let mode = single_command_argument(spec, &arguments)?;
+                    let updated = self.update_thread(
+                        thread_id,
+                        &UpdateThreadRequest {
+                            mode: Some(mode.to_string()),
+                            ..Default::default()
+                        },
+                    )?;
+                    (
+                        format!("Mode changed to `{}`.", updated.mode),
+                        CommandAction::None,
+                    )
+                }
+            }
+            "model" => {
+                if arguments.is_empty() {
+                    let models = self.list_models().await;
+                    let mut output = format!("## Models\n\nCurrent: `{}`\n", thread.model);
+                    for model in models {
+                        let marker = if model.id == thread.model {
+                            " **(current)**"
+                        } else {
+                            ""
+                        };
+                        output.push_str(&format!(
+                            "\n- `{}` — {} ({} token context){}",
+                            model.id, model.display_name, model.context_window, marker
+                        ));
+                    }
+                    (output, CommandAction::None)
+                } else {
+                    let model = single_command_argument(spec, &arguments)?;
+                    let updated = self.update_thread(
+                        thread_id,
+                        &UpdateThreadRequest {
+                            model: Some(model.to_string()),
+                            ..Default::default()
+                        },
+                    )?;
+                    (
+                        format!("Model changed to `{}`.", updated.model),
+                        CommandAction::None,
+                    )
+                }
+            }
+            "permissions" => {
+                if arguments.is_empty() {
+                    (
+                        format!(
+                            "Current permission policy: `{}`.\n\nAvailable: `ask`, `allow-list`, `yolo`.",
+                            permission_name(thread.permission_mode)
+                        ),
+                        CommandAction::None,
+                    )
+                } else {
+                    let value = single_command_argument(spec, &arguments)?;
+                    let permission_mode = match value {
+                        "ask" => PermissionMode::Ask,
+                        "allow-list" | "allow_list" => PermissionMode::AllowList,
+                        "yolo" => PermissionMode::Yolo,
+                        _ => {
+                            return Err(EngineError::BadRequest(format!("usage: {}", spec.usage)));
+                        }
+                    };
+                    let updated = self.update_thread(
+                        thread_id,
+                        &UpdateThreadRequest {
+                            permission_mode: Some(permission_mode),
+                            ..Default::default()
+                        },
+                    )?;
+                    (
+                        format!(
+                            "Permission policy changed to `{}`.",
+                            permission_name(updated.permission_mode)
+                        ),
+                        CommandAction::None,
+                    )
+                }
+            }
+            "undo" => {
+                require_no_command_arguments(spec, &arguments)?;
+                self.undo(&session.id).await?;
+                (
+                    "Restored the previous checkpoint.".into(),
+                    CommandAction::None,
+                )
+            }
+            "redo" => {
+                require_no_command_arguments(spec, &arguments)?;
+                self.redo(&session.id).await?;
+                ("Restored the next checkpoint.".into(), CommandAction::None)
+            }
+            "cancel" => {
+                require_no_command_arguments(spec, &arguments)?;
+                self.cancel_turn(thread_id)?;
+                (
+                    "Cancellation requested for the current turn.".into(),
+                    CommandAction::None,
+                )
+            }
+            "new" => {
+                require_no_command_arguments(spec, &arguments)?;
+                let created = self.create_thread(CreateThreadRequest {
+                    session_id: session.id.clone(),
+                    mode: Some(thread.mode.clone()),
+                    model: Some(thread.model.clone()),
+                    model_options: thread.model_options.clone(),
+                    permission_mode: Some(thread.permission_mode),
+                })?;
+                (
+                    format!("Created thread `{}`.", created.id),
+                    CommandAction::SwitchThread {
+                        thread_id: created.id,
+                    },
+                )
+            }
+            "tools" => {
+                require_no_command_arguments(spec, &arguments)?;
+                let mut tools = self.bridged_tool_specs(thread_id).await?;
+                tools.sort_by(|left, right| left.name.cmp(&right.name));
+                let mut output = String::from(
+                    "## Available Trouve tools\n\n| Tool | Description |\n| --- | --- |\n",
+                );
+                for tool in tools {
+                    output.push_str(&format!(
+                        "| `{}` | {} |\n",
+                        tool.name,
+                        tool.description.replace('|', "\\|").replace('\n', " ")
+                    ));
+                }
+                (output, CommandAction::None)
+            }
+            "mcp" => {
+                require_no_command_arguments(spec, &arguments)?;
+                let servers = self.session_mcp_servers(&session.id)?;
+                let mut output = String::from(
+                    "## Session MCP servers\n\n| Server | Scope | Health | Detail |\n| --- | --- | --- | --- |\n",
+                );
+                if servers.is_empty() {
+                    output.push_str("| _None configured_ | | | |\n");
+                } else {
+                    for server in servers {
+                        output.push_str(&format!(
+                            "| `{}` | {} | {} | {} |\n",
+                            server.name,
+                            server.scope,
+                            server.health,
+                            server.detail.replace('|', "\\|").replace('\n', " ")
+                        ));
+                    }
+                }
+                (output, CommandAction::None)
+            }
+            "usage" => {
+                require_no_command_arguments(spec, &arguments)?;
+                let usage = self.thread_usage(thread_id)?;
+                (
+                    format!(
+                        "## Thread usage\n\n- Turns: {}\n- Input tokens: {}\n- Cached input tokens: {}\n- Output tokens: {}\n- Cost: ${:.4}",
+                        usage.turns,
+                        usage.input_tokens,
+                        usage.cached_input_tokens,
+                        usage.output_tokens,
+                        usage.cost_usd
+                    ),
+                    CommandAction::None,
+                )
+            }
+            "diff" => {
+                require_no_command_arguments(spec, &arguments)?;
+                let diff = self.session_diff(&session.id).await?;
+                let output = if diff.trim().is_empty() {
+                    "No changes against the session base revision.".into()
+                } else {
+                    format!(
+                        "## Session diff\n\n{}",
+                        fenced_block("diff", diff.trim_end())
+                    )
+                };
+                (output, CommandAction::None)
+            }
+            "files" => {
+                require_no_command_arguments(spec, &arguments)?;
+                let paths = self.session_list_paths(&session.id).await?;
+                let total = paths.len();
+                let mut output = String::from("## Session files\n");
+                for path in paths.into_iter().take(500) {
+                    output.push_str(&format!("\n- `{}`", path.replace('`', "\\`")));
+                }
+                if total > 500 {
+                    output.push_str(&format!("\n\n_Showing 500 of {total} paths._"));
+                }
+                (output, CommandAction::None)
+            }
+            "queue" => {
+                require_no_command_arguments(spec, &arguments)?;
+                let prompts = self.list_queued_prompts(thread_id)?;
+                let mut output = String::from("## Prompt queue\n");
+                if prompts.is_empty() {
+                    output.push_str("\nThe queue is empty.");
+                } else {
+                    for (index, prompt) in prompts.iter().enumerate() {
+                        let preview = command_preview(&prompt.content, 160);
+                        output.push_str(&format!("\n{}. {}", index + 1, preview));
+                    }
+                }
+                (output, CommandAction::None)
+            }
+            "instructions" => {
+                require_no_command_arguments(spec, &arguments)?;
+                let all_modes =
+                    modes::resolve_modes(self.config_dir.as_deref(), Some(workspace_root));
+                let mode = modes::find_mode(&all_modes, &thread.mode)
+                    .cloned()
+                    .unwrap_or_else(modes::fallback_mode);
+                let instructions = context::system_prompt(
+                    &mode,
+                    self.config_dir.as_deref(),
+                    workspace_root,
+                    self.builtin_skills_enabled(),
+                );
+                (
+                    format!(
+                        "## Effective instructions\n\n{}",
+                        fenced_block("text", instructions.trim_end())
+                    ),
+                    CommandAction::None,
+                )
+            }
+            "rename" => {
+                if arguments.is_empty() {
+                    return Err(EngineError::BadRequest(format!("usage: {}", spec.usage)));
+                }
+                let updated = self.update_session(
+                    &session.id,
+                    &UpdateSessionRequest {
+                        title: Some(arguments.clone()),
+                        archived: None,
+                    },
+                )?;
+                (
+                    format!("Session renamed to **{}**.", updated.title),
+                    CommandAction::None,
+                )
+            }
+            "terminal" => {
+                require_no_command_arguments(spec, &arguments)?;
+                (
+                    "Opening the integrated terminal for this session.".into(),
+                    CommandAction::OpenTerminal,
+                )
+            }
+            _ => {
+                return Err(EngineError::Internal(anyhow!(
+                    "action command registry and executor diverged: /{name}"
+                )));
+            }
+        };
+
+        let output = truncate_command_output(output);
+        self.store.append_event(
+            Scope::Thread(thread_id.to_string()),
+            Event::CommandExecuted {
+                name: name.to_string(),
+                arguments: arguments.clone(),
+                output: output.clone(),
+            },
+        )?;
+        Ok(CommandResult {
+            name: name.to_string(),
+            output,
+            action,
+        })
     }
 
     pub fn get_thread(&self, id: &str) -> Result<Thread, EngineError> {
@@ -4558,7 +5390,8 @@ impl Engine {
         uploads: Vec<trouve_protocol::AttachmentUpload>,
         tools_enabled: bool,
     ) -> Result<TurnAccepted, EngineError> {
-        self.get_thread(thread_id)?; // 404 for unknown threads
+        let thread = self.get_thread(thread_id)?; // 404 for unknown threads
+        self.validate_prompt_content(&thread, &content)?;
         let attachments = self.save_attachments(thread_id, uploads)?;
         self.store
             .enqueue_prompt_with_tools(thread_id, &content, &attachments, tools_enabled)?;
@@ -4569,6 +5402,38 @@ impl Engine {
             turn: turn.unwrap_or(0),
             queued: turn.is_none(),
         })
+    }
+
+    fn validate_prompt_content(&self, thread: &Thread, content: &str) -> Result<(), EngineError> {
+        if let Some(after_slash) = content.trim().strip_prefix('/') {
+            let name_end = after_slash
+                .find(char::is_whitespace)
+                .unwrap_or(after_slash.len());
+            let name = &after_slash[..name_end];
+            if crate::commands::action_spec(name).is_some() {
+                return Err(EngineError::BadRequest(format!(
+                    "/{name} is a Trouve action command; use the thread command endpoint"
+                )));
+            }
+            // Validate explicit skill syntax before the prompt becomes
+            // durable. Otherwise `/skill missing` would fail only inside the
+            // dispatcher and remain queued for the next retry.
+            let session = self.get_session(&thread.session_id)?;
+            let workspace = self
+                .store
+                .workspace(&session.workspace_id)?
+                .ok_or_else(|| {
+                    EngineError::NotFound(format!("workspace {}", session.workspace_id))
+                })?;
+            crate::skills::expand_invocation(
+                self.config_dir.as_deref(),
+                Some(Path::new(&workspace.path)),
+                content,
+                self.builtin_skills_enabled(),
+            )
+            .map_err(|error| EngineError::BadRequest(error.to_string()))?;
+        }
+        Ok(())
     }
 
     /// Decode and persist prompt uploads under `data_dir/attachments`,
@@ -4687,6 +5552,8 @@ impl Engine {
             .store
             .queued_prompt_thread(prompt_id)?
             .ok_or_else(|| EngineError::NotFound(format!("queued prompt {prompt_id}")))?;
+        let thread = self.get_thread(&thread_id)?;
+        self.validate_prompt_content(&thread, content)?;
         if !self.store.update_queued_prompt(prompt_id, content)? {
             return Err(EngineError::NotFound(format!("queued prompt {prompt_id}")));
         }
@@ -5074,12 +5941,24 @@ impl Engine {
             todos: Arc::new(Mutex::new(thread.todos.clone())),
             config_dir: self.config_dir.clone(),
             workspace_root: Some(PathBuf::from(&ws.path)),
+            builtin_skills_enabled: self.builtin_skills_enabled(),
         };
 
         let all_modes = modes::resolve_modes(self.config_dir.as_deref(), Some(Path::new(&ws.path)));
         let mode = modes::find_mode(&all_modes, &thread.mode)
             .cloned()
             .unwrap_or_else(modes::fallback_mode);
+        // Skills can be installed or edited while a thread is idle. Publish
+        // the current core-owned catalog before every turn so all providers
+        // and reconnecting clients converge on the same completion surface.
+        self.emit_command_catalog(&thread.id, Path::new(&ws.path))?;
+        let model_content = crate::skills::expand_invocation(
+            self.config_dir.as_deref(),
+            Some(Path::new(&ws.path)),
+            &content,
+            self.builtin_skills_enabled(),
+        )?
+        .unwrap_or_else(|| content.clone());
         let background = self.store.is_code_review_thread(&thread.id)?;
         let turn_capacity = self
             .turn_scheduler
@@ -5129,10 +6008,12 @@ impl Engine {
                     thread,
                     turn,
                     &mode,
+                    &ctx,
                     &backend_id,
                     backend,
                     model_name,
                     content,
+                    model_content,
                     attachments,
                     concurrent_child,
                     cancel,
@@ -5188,8 +6069,8 @@ impl Engine {
         // absolute paths (the sandbox), so a data-dir path the model can't
         // open is useless — a worktree-relative copy is reachable.
         let resolved = self.resolve_attachments(&attachments);
-        let materialized = materialize_attachments(&worktree, &resolved);
-        let content = annotate_attachments(content, &materialized);
+        let materialized = materialize_attachments(self.executor.as_ref(), &ctx, &resolved).await;
+        let content = annotate_attachments(model_content, &materialized);
         self.store
             .append_message(&thread.id, &serde_json::to_value(Message::User(content))?)?;
         if !self.store.finish_queued_prompt(&prompt.id)? {
@@ -5205,7 +6086,7 @@ impl Engine {
                 .specs(&ctx)
                 .await
                 .into_iter()
-                .filter(|s| mode.allowed_tools.is_empty() || mode.allowed_tools.contains(&s.name))
+                .filter(|s| mode_allows_tool(&mode, &s.name))
                 .collect()
         } else {
             Vec::new()
@@ -5218,9 +6099,7 @@ impl Engine {
         // spawn grandchildren (also enforced at execution). They also respect
         // the mode's tool policy, so restrictive/read-only modes that don't
         // list them can't create branches or child agents.
-        let spawn_allowed = |name: &str| {
-            mode.allowed_tools.is_empty() || mode.allowed_tools.iter().any(|t| t == name)
-        };
+        let spawn_allowed = |name: &str| mode_allows_tool(&mode, name);
         if tools_enabled && self.store.spawn_parent(&thread.id)?.is_none() {
             if spawn_allowed("spawn_thread") {
                 specs.push(spawn_thread_spec());
@@ -5233,7 +6112,12 @@ impl Engine {
             }
         }
 
-        let system = context::system_prompt(&mode, self.config_dir.as_deref(), Path::new(&ws.path));
+        let system = context::system_prompt(
+            &mode,
+            self.config_dir.as_deref(),
+            Path::new(&ws.path),
+            self.builtin_skills_enabled(),
+        );
         let live_models = provider.list_models().await;
         let known_models = provider.models();
         let pricing_model = live_models
@@ -5523,74 +6407,55 @@ impl Engine {
         Some((backend_id.to_string(), backend, model_name.to_string()))
     }
 
-    /// MCP tool-bridge config for a backend turn. Claude Code always gets
-    /// the bridge (it carries the approval-prompt gate for Ask mode, and
-    /// optionally — `tool_bridge = true` — trouve's tools in place of
-    /// Claude's built-ins). Codex gets it too, for trouve's semantic search
-    /// and question tools; its approvals stay native app-server RPCs.
-    fn mcp_bridge_for(
+    /// MCP config for the provider-independent capabilities that supplement a
+    /// subscription CLI's optimized native tools. User MCP servers also flow
+    /// through this endpoint so their execution stays inside ToolExecutor.
+    async fn mcp_bridge_for(
         &self,
         model: &str,
         thread_id: &str,
-    ) -> Option<trouve_agents::McpBridgeConfig> {
-        let backend_id = model.split_once('/')?.0;
-        let (kind, bridge_tools) = {
+    ) -> Result<Option<trouve_agents::McpBridgeConfig>> {
+        let Some((backend_id, _)) = model.split_once('/') else {
+            return Ok(None);
+        };
+        let kind = {
             let config = self.config.lock().unwrap();
-            let pc = config.providers.get(backend_id)?;
-            (pc.kind.clone(), pc.tool_bridge.unwrap_or(false))
+            let Some(pc) = config.providers.get(backend_id) else {
+                return Ok(None);
+            };
+            pc.kind.clone()
         };
-        if kind != "claude-cli" && kind != "codex-app-server" {
-            return None;
+        if !matches!(
+            kind.as_str(),
+            "claude-cli" | "codex-app-server" | "cursor-cli"
+        ) {
+            return Ok(None);
         }
-        // Full tool bridging (vendor built-ins stand down) is Claude-only.
-        let bridge_tools = bridge_tools && kind == "claude-cli";
-        let Some(base_url) = self.base_url.read().unwrap().clone() else {
-            tracing::warn!(
-                "MCP bridge wanted for {backend_id} but the server base URL is unknown; \
-                 running without it (approvals will fail in ask mode)"
-            );
-            return None;
-        };
-        // Codex approvals are native RPCs; serving Claude's permission-gate
-        // tool would only tempt the model to call it.
-        let approval = if kind == "codex-app-server" { 0 } else { 1 };
-        let mut url = format!(
-            "{}/internal/threads/{}/mcp?tools={}&approval={}",
+        let base_url = self.base_url.read().unwrap().clone().ok_or_else(|| {
+            anyhow!(
+                "Trouve's capability bridge is required for {backend_id}, but the server base URL \
+                 is unavailable; refusing to start a CLI turn without the shared control plane"
+            )
+        })?;
+        // Codex and Cursor own their approval protocol. Claude uses the
+        // bridge as its headless permission-prompt target.
+        let approval = (kind == "claude-cli") as u8;
+        let (revision, _) = self.refresh_bridged_tool_catalog(thread_id).await?;
+        let url = format!(
+            "{}/internal/threads/{}/mcp?approval={}&catalog_revision={revision:016x}",
             base_url.trim_end_matches('/'),
             thread_id,
-            bridge_tools as u8,
             approval,
         );
-        if let Some(token) = self.bridge_token.read().unwrap().as_deref() {
-            url.push_str("&bridge_token=");
-            url.push_str(token);
-        }
-        Some(trouve_agents::McpBridgeConfig {
-            url,
-            bridge_tools,
-            // Claude built-ins stand down; trouve's executor is the tool
-            // source (reads included, for full permission fidelity).
-            disallowed_tools: if bridge_tools {
-                [
-                    "Bash",
-                    "Edit",
-                    "Write",
-                    "MultiEdit",
-                    "NotebookEdit",
-                    "WebFetch",
-                    "WebSearch",
-                    "Read",
-                    "Glob",
-                    "Grep",
-                    "Task",
-                ]
-                .iter()
-                .map(|s| s.to_string())
-                .collect()
-            } else {
-                Vec::new()
-            },
-        })
+        let headers = self
+            .bridge_token
+            .read()
+            .unwrap()
+            .as_ref()
+            .map(|token| ("Authorization".into(), format!("Bearer {token}")))
+            .into_iter()
+            .collect();
+        Ok(Some(trouve_agents::McpBridgeConfig { url, headers }))
     }
 
     // --- bridged tools (MCP tool bridge, Phase 6) -----------------------------
@@ -5598,22 +6463,75 @@ impl Engine {
     /// Tool specs for a thread, as exposed to a bridged vendor agent
     /// (filtered by the thread's mode, same as native turns).
     pub async fn bridged_tool_specs(&self, thread_id: &str) -> Result<Vec<ToolSpec>, EngineError> {
+        self.build_bridged_tool_specs(thread_id).await
+    }
+
+    /// Reuse the catalog prepared for the bridge URL when its revision
+    /// matches. A missing/stale entry is rebuilt so direct callers and
+    /// restarted servers remain self-healing.
+    pub async fn bridged_tool_specs_for_revision(
+        &self,
+        thread_id: &str,
+        revision: Option<u64>,
+    ) -> Result<Vec<ToolSpec>, EngineError> {
+        if let Some(revision) = revision
+            && let Some(catalog) = self
+                .bridged_tool_catalogs
+                .lock()
+                .unwrap()
+                .get(thread_id)
+                .filter(|catalog| catalog.revision == revision)
+                .cloned()
+        {
+            return Ok(catalog.specs);
+        }
+        let (_, specs) = self.refresh_bridged_tool_catalog(thread_id).await?;
+        Ok(specs)
+    }
+
+    async fn refresh_bridged_tool_catalog(
+        &self,
+        thread_id: &str,
+    ) -> Result<(u64, Vec<ToolSpec>), EngineError> {
+        let specs = self.build_bridged_tool_specs(thread_id).await?;
+        let revision = tool_catalog_revision(&specs);
+        self.bridged_tool_catalogs.lock().unwrap().insert(
+            thread_id.to_string(),
+            BridgedToolCatalog {
+                revision,
+                specs: specs.clone(),
+            },
+        );
+        Ok((revision, specs))
+    }
+
+    async fn build_bridged_tool_specs(
+        &self,
+        thread_id: &str,
+    ) -> Result<Vec<ToolSpec>, EngineError> {
         let (_, _, mode, ctx) = self.bridged_context(thread_id)?;
         let mut specs: Vec<ToolSpec> = self
             .executor
             .specs(&ctx)
             .await
             .into_iter()
-            .filter(|s| mode.allowed_tools.is_empty() || mode.allowed_tools.contains(&s.name))
+            .filter(|s| mode_allows_tool(&mode, &s.name))
             .collect();
         // Engine-served, always available (see handle_tool_call).
         specs.push(ask_question_spec());
         specs.push(search_transcript_spec());
         // Spawn tools: top-level agents only, same as native turns.
+        let spawn_allowed = |name: &str| mode_allows_tool(&mode, name);
         if self.store.spawn_parent(thread_id)?.is_none() {
-            specs.push(spawn_thread_spec());
-            specs.push(spawn_session_spec());
-            specs.push(spawn_output_spec());
+            if spawn_allowed("spawn_thread") {
+                specs.push(spawn_thread_spec());
+            }
+            if spawn_allowed("spawn_session") {
+                specs.push(spawn_session_spec());
+            }
+            if spawn_allowed("spawn_thread") || spawn_allowed("spawn_session") {
+                specs.push(spawn_output_spec());
+            }
         }
         Ok(specs)
     }
@@ -5625,7 +6543,7 @@ impl Engine {
         thread_id: &str,
         name: &str,
         arguments: &serde_json::Value,
-    ) -> Result<String, EngineError> {
+    ) -> Result<(String, Vec<trouve_providers::ToolImage>), EngineError> {
         let (session, thread, mode, ctx) = self.bridged_context(thread_id)?;
         let turn = self.store.last_turn(thread_id)?;
         let call = trouve_providers::ToolCallRequest {
@@ -5633,10 +6551,12 @@ impl Engine {
             name: name.to_string(),
             arguments: arguments.clone(),
         };
-        // Bridged responses are text-only (MCP content blocks could carry
-        // images, but no bridged vendor consumes them yet); the summary the
-        // engine leaves in place of "_images" still tells the model the
-        // image was read.
+        // Register before execution can block on approval. Only this trusted
+        // MCP path can make a later vendor lifecycle echo suppressible.
+        self.bridge_echoes
+            .register(thread_id, turn, &call.id, name, arguments);
+        // Image payloads stay out of the persisted text result and return as
+        // native MCP image content blocks alongside the compact summary.
         // Share the running turn's cancellation token when there is one, so a
         // cancel also unblocks a bridged tool's approval wait.
         let cancel = self
@@ -5646,11 +6566,11 @@ impl Engine {
             .get(thread_id)
             .cloned()
             .unwrap_or_default();
-        let (content, _images) = self
+        let (content, images) = self
             .handle_tool_call(&session, &thread, turn, &mode, &ctx, &call, &cancel)
             .await
             .map_err(EngineError::Internal)?;
-        Ok(content)
+        Ok((content, images))
     }
 
     /// Gate a vendor-side tool call (Claude Code's `--permission-prompt-tool`
@@ -5675,14 +6595,16 @@ impl Engine {
         let synthetic = matched.is_none();
         let call_id = matched.unwrap_or_else(|| new_id("appr"));
         if synthetic {
+            let (display_tool, mut display_args) = normalize_vendor_tool_call(tool, args);
+            annotate_edit_lines(Path::new(&session.worktree_path), &mut display_args);
             self.store
                 .append_event(
                     scope.clone(),
                     Event::ToolRequested {
                         turn,
                         call_id: call_id.clone(),
-                        tool: tool.to_string(),
-                        args: args.clone(),
+                        tool: display_tool,
+                        args: display_args,
                         requires_approval: true,
                     },
                 )
@@ -5723,6 +6645,11 @@ impl Engine {
         tool: &str,
         args: &serde_json::Value,
     ) -> Option<String> {
+        // Tool cards persist Trouve's canonical display vocabulary. Approval
+        // callbacks carry the provider's raw vocabulary, so normalize before
+        // matching or two in-flight calls of the same operation can attach
+        // the prompt to the wrong card.
+        let (tool, args) = normalize_vendor_tool_call(tool, args);
         let events = self
             .store
             .events_after(&Scope::Thread(thread_id.to_string()), 0)
@@ -5737,7 +6664,7 @@ impl Engine {
                     tool: name,
                     args: a,
                     ..
-                } if *t == turn && name == tool => {
+                } if *t == turn && name == &tool => {
                     open.push((call_id.clone(), a.clone()));
                 }
                 Event::ToolCompleted { call_id, .. } => {
@@ -5766,9 +6693,10 @@ impl Engine {
             }
             v
         };
+        let args = strip(&args);
         open.iter()
             .rev()
-            .find(|(_, a)| strip(a) == *args)
+            .find(|(_, a)| strip(a) == args)
             .or(open.last())
             .map(|(id, _)| id.clone())
     }
@@ -5835,10 +6763,17 @@ impl Engine {
         args: Option<&serde_json::Value>,
     ) -> Result<Option<Vec<trouve_protocol::TodoItem>>> {
         let base = tool.rsplit("__").next().unwrap_or(tool);
-        if status != ToolStatus::Ok || !matches!(base, "todo_write" | "TodoWrite") {
+        if status != ToolStatus::Ok || canonical_vendor_tool(base) != "todo_write" {
             return Ok(None);
         }
-        let result_todos = result.get("todos").and_then(Self::parse_todo_snapshot);
+        let snapshot = |value: &serde_json::Value| {
+            Self::parse_todo_snapshot(value).or_else(|| {
+                ["todos", "items", "plan"]
+                    .iter()
+                    .find_map(|field| value.get(*field).and_then(Self::parse_todo_snapshot))
+            })
+        };
+        let result_todos = snapshot(result);
         let (mut todos, merge) = match result_todos {
             // Native trouve tools return the authoritative full snapshot,
             // including after a merge update.
@@ -5850,7 +6785,7 @@ impl Engine {
                 let Some(args) = args else {
                     return Ok(None);
                 };
-                let Some(todos) = args.get("todos").and_then(Self::parse_todo_snapshot) else {
+                let Some(todos) = snapshot(args) else {
                     return Ok(None);
                 };
                 (
@@ -5900,53 +6835,15 @@ impl Engine {
             todos: Arc::new(Mutex::new(thread.todos.clone())),
             config_dir: self.config_dir.clone(),
             workspace_root: Some(PathBuf::from(&ws.path)),
+            builtin_skills_enabled: self.builtin_skills_enabled(),
         };
         Ok((session, thread, mode, ctx))
     }
 
-    /// User-configured MCP servers for a session's worktree, flattened for
-    /// a vendor agent CLI: scopes merged (user < workspace < worktree),
-    /// disabled entries dropped, env `${VAR}` references expanded. The name
-    /// "trouve" is reserved for the bridge and skipped.
-    fn mcp_servers_for(
-        &self,
-        session: &Session,
-    ) -> Result<Vec<trouve_agents::McpServerLaunch>, EngineError> {
-        let workspace_root = self
-            .store
-            .workspace(&session.workspace_id)?
-            .map(|ws| PathBuf::from(ws.path));
-        // Only trusted (user-config) servers are handed to the vendor CLI:
-        // it would otherwise spawn a cloned repo's command with the expanded
-        // environment, same RCE/exfiltration risk as the native path.
-        let configs = crate::mcp::trusted_configs(
-            self.config_dir.as_deref(),
-            workspace_root.as_deref(),
-            Path::new(&session.worktree_path),
-        );
-        Ok(configs
-            .into_iter()
-            .filter(|(name, _)| name != "trouve")
-            .map(|(name, config)| trouve_agents::McpServerLaunch {
-                name,
-                command: config.command,
-                args: config.args,
-                env: config
-                    .env
-                    .iter()
-                    .map(|(k, v)| (k.clone(), crate::mcp::expand_env(v)))
-                    .collect(),
-            })
-            .collect())
-    }
-
-    /// Run one turn through an external agent backend. The vendor harness
-    /// plans, calls tools, and edits the worktree; we persist its events,
-    /// gate its approval requests through our permission layer, and keep the
-    /// checkpoint/usage flow identical to native turns. Compaction and the
-    /// system prompt are the vendor's job (the mode prompt rides along as
-    /// appended instructions); the local transcript is kept for rendering
-    /// and history, not as the model's context.
+    /// Run one turn through an external agent backend. The vendor retains
+    /// inference, conversation state, and its optimized core tools. Trouve
+    /// supplies the shared control-plane capabilities over MCP and normalizes
+    /// all native lifecycle events into its canonical event stream.
     #[allow(clippy::too_many_arguments)]
     async fn run_backend_turn(
         &self,
@@ -5954,9 +6851,11 @@ impl Engine {
         thread: &Thread,
         turn: u64,
         mode: &AgentMode,
+        ctx: &ToolCtx,
         backend_id: &str,
         backend: Arc<dyn AgentBackend>,
         model_name: String,
+        display_content: String,
         content: String,
         attachments: Vec<trouve_protocol::Attachment>,
         concurrent_child: bool,
@@ -5965,6 +6864,19 @@ impl Engine {
         tools_enabled: bool,
     ) -> Result<()> {
         let scope = Scope::Thread(thread.id.clone());
+        let workspace = self
+            .store
+            .workspace(&session.workspace_id)?
+            .context("workspace vanished")?;
+        let mcp_bridge = if tools_enabled {
+            self.mcp_bridge_for(&thread.model, &thread.id).await?
+        } else {
+            None
+        };
+        // Keep contexts from the retired full-replacement mode out of this
+        // optimized-native contract. Bump the namespace whenever provider
+        // surface isolation changes enough to require a fresh vendor context.
+        let backend_session_key = format!("{backend_id}#trouve-native-v1");
         // Vendor sessions are per (thread, backend): each vendor keeps its
         // own history, and switching models away and back resumes it.
         // Vendors can't read our transcript, so whatever part of the
@@ -5975,7 +6887,9 @@ impl Engine {
         // repair turns therefore start fresh; their prompt carries the
         // malformed output explicitly, so they do not need vendor history.
         let (resume, handoff, seen_after) = if tools_enabled {
-            let resume = self.store.backend_session(&thread.id, backend_id)?;
+            let resume = self
+                .store
+                .backend_session_exact(&thread.id, &backend_session_key)?;
             let payloads = self.store.messages(&thread.id)?;
             let unseen = match &resume {
                 // A compaction can shrink the transcript below the watermark;
@@ -6008,7 +6922,7 @@ impl Engine {
             scope.clone(),
             Event::UserMessage {
                 turn,
-                content: content.clone(),
+                content: display_content,
                 attachments: attachments.clone(),
             },
         )?;
@@ -6019,7 +6933,10 @@ impl Engine {
         let (images, files): (Vec<_>, Vec<_>) = resolved
             .into_iter()
             .partition(|(a, _)| a.mime.starts_with("image/"));
-        let content = annotate_attachments(content, &files);
+        // Stage non-image uploads inside the worktree so native CLI tools
+        // never receive an unreadable data-dir path.
+        let materialized_files = materialize_attachments(self.executor.as_ref(), ctx, &files).await;
+        let content = annotate_attachments(content, &materialized_files);
         let turn_attachments: Vec<trouve_agents::TurnAttachment> = images
             .into_iter()
             .map(|(a, path)| trouve_agents::TurnAttachment {
@@ -6046,13 +6963,15 @@ impl Engine {
             }
         };
 
-        let mcp_bridge = tools_enabled
-            .then(|| self.mcp_bridge_for(&thread.model, &thread.id))
-            .flatten();
         // Vendor agents get the mode prompt plus, when the bridge serves
         // trouve's search tools, guidance to prefer them over built-ins
         // (MCP instructions alone are too weak a signal).
-        let mut instructions = mode.system_prompt.trim().to_string();
+        let mut instructions = context::system_prompt(
+            mode,
+            self.config_dir.as_deref(),
+            Path::new(&workspace.path),
+            self.builtin_skills_enabled(),
+        );
         if mcp_bridge.is_some() {
             if !instructions.is_empty() {
                 instructions.push_str("\n\n");
@@ -6083,13 +7002,13 @@ impl Engine {
             permission,
             tool_free: !tools_enabled,
             mcp_bridge,
-            mcp_servers: if tools_enabled {
-                self.mcp_servers_for(session)?
-            } else {
-                Vec::new()
-            },
+            // User MCP servers are already part of LocalToolExecutor's specs
+            // and execution path. Mounting them directly in a vendor would
+            // create a second, ungated side-effect path.
+            mcp_servers: Vec::new(),
         };
 
+        let _bridge_echo_turn = self.bridge_echoes.begin_turn(&thread.id, turn);
         let mut stream = backend
             .run_turn(backend_turn)
             .await
@@ -6106,6 +7025,10 @@ impl Engine {
         // Remember their names until completion so their result can update
         // the same persisted snapshot as trouve's bridged/native tool.
         let mut tool_calls = HashMap::<String, (String, serde_json::Value)>::new();
+        // Supplemental MCP calls already emitted their canonical card from
+        // ToolExecutor. Vendor harnesses echo that lifecycle with a different
+        // call id; suppress only those echoes while retaining native calls.
+        let mut ignored_bridge_call_ids = HashSet::<String>::new();
         // Creation tools sometimes stream their final PR URL before the
         // completion payload. Buffer output only for calls whose request is
         // demonstrably creating a PR; list/view output must never associate
@@ -6152,8 +7075,11 @@ impl Engine {
                 BackendEvent::SessionStarted { session_id } => {
                     if tools_enabled {
                         flush_backend_event_batch(&self.store, &scope, &mut persisted).await?;
-                        self.store
-                            .set_backend_session(&thread.id, backend_id, &session_id)?;
+                        self.store.set_backend_session(
+                            &thread.id,
+                            &backend_session_key,
+                            &session_id,
+                        )?;
                     }
                 }
                 BackendEvent::TextDelta(delta) => {
@@ -6176,37 +7102,54 @@ impl Engine {
                 BackendEvent::ToolStarted {
                     call_id,
                     tool,
-                    mut args,
+                    args,
                 } => {
                     if !tools_enabled {
                         flush_backend_event_batch(&self.store, &scope, &mut persisted).await?;
                         bail!("backend requested tool {tool} during a tool-free turn");
                     }
-                    tool_calls.insert(call_id.clone(), (tool.clone(), args.clone()));
                     if !segment.is_empty() {
                         persisted.push(Event::AssistantMessage {
                             turn,
                             content: std::mem::take(&mut segment),
                         });
                     }
+                    if self
+                        .bridge_echoes
+                        .claim(&thread.id, turn, &call_id, &tool, &args)
+                        .await
+                        .is_some()
+                    {
+                        // The MCP request itself already produced the one
+                        // canonical ToolExecutor card. Vendor lifecycle
+                        // notifications have a different call id; only an
+                        // exact trusted correlation suppresses the echo.
+                        ignored_bridge_call_ids.insert(call_id);
+                        continue;
+                    }
+                    tool_calls.insert(call_id.clone(), (tool.clone(), args.clone()));
+                    let (display_tool, mut display_args) = normalize_vendor_tool_call(&tool, &args);
                     // Snippet edits carry no position; the worktree file is
                     // still un-edited at announcement time, so resolve line
                     // hints now for the UI's diff gutter.
-                    annotate_edit_lines(Path::new(&session.worktree_path), &mut args);
+                    annotate_edit_lines(Path::new(&session.worktree_path), &mut display_args);
                     if seen_tool_cards.insert(call_id.clone())
                         && !self.tool_card_exists(&thread.id, turn, &call_id)
                     {
                         persisted.push(Event::ToolRequested {
                             turn,
                             call_id: call_id.clone(),
-                            tool,
-                            args,
+                            tool: display_tool,
+                            args: display_args,
                             requires_approval: false,
                         });
                     }
                     persisted.push(Event::ToolStarted { call_id });
                 }
                 BackendEvent::ToolOutput { call_id, chunk } => {
+                    if ignored_bridge_call_ids.contains(&call_id) {
+                        continue;
+                    }
                     if let Some((_, owner, repo)) = &github_repository
                         && let Some((tool, args)) = tool_calls.get(&call_id)
                         && requests_pull_request_creation(tool, args, owner, repo)
@@ -6263,10 +7206,14 @@ impl Engine {
                     } else {
                         github_creation_output.remove(&call_id);
                     }
+                    let normalized_result = tool_calls
+                        .get(&call_id)
+                        .map(|(tool, _)| normalize_vendor_tool_result(tool, &result))
+                        .unwrap_or(result);
                     persisted.push(Event::ToolCompleted {
                         call_id,
                         status,
-                        result,
+                        result: normalized_result,
                     });
                     if let Some(todos) = todos {
                         persisted.push(Event::TodosUpdated { todos });
@@ -6281,6 +7228,20 @@ impl Engine {
                     if !tools_enabled {
                         flush_backend_event_batch(&self.store, &scope, &mut persisted).await?;
                         bail!("backend requested approval for {tool} during a tool-free turn");
+                    }
+                    if ignored_bridge_call_ids.contains(&call_id)
+                        || self
+                            .bridge_echoes
+                            .claim(&thread.id, turn, &call_id, &tool, &args)
+                            .await
+                            .is_some()
+                    {
+                        // ToolExecutor already applied the canonical gate.
+                        // Approve only the correlated transport-level echo,
+                        // never a vendor event that merely claims this shape.
+                        ignored_bridge_call_ids.insert(call_id);
+                        let _ = responder.send(true);
+                        continue;
                     }
                     if !segment.is_empty() {
                         persisted.push(Event::AssistantMessage {
@@ -6380,7 +7341,7 @@ impl Engine {
         )?;
         if tools_enabled {
             self.store
-                .mark_backend_seen(&thread.id, backend_id, seen_after)?;
+                .mark_backend_seen(&thread.id, &backend_session_key, seen_after)?;
         }
 
         // Vendors report one usage per turn, so the totals already reflect
@@ -6467,14 +7428,14 @@ impl Engine {
                 // card. Without a synthetic card the Approve/Deny UI has
                 // nowhere to attach and the turn hangs forever.
                 if !self.tool_card_exists(&thread.id, turn, call_id) {
-                    let mut display_args = args.clone();
+                    let (display_tool, mut display_args) = normalize_vendor_tool_call(tool, args);
                     annotate_edit_lines(Path::new(&session.worktree_path), &mut display_args);
                     self.store.append_event(
                         scope.clone(),
                         Event::ToolRequested {
                             turn,
                             call_id: call_id.to_string(),
-                            tool: tool.to_string(),
+                            tool: display_tool,
                             args: display_args,
                             requires_approval: true,
                         },
@@ -6709,8 +7670,7 @@ impl Engine {
         }
 
         let known = self.executor.tool_mutates(&call.name);
-        let allowed_by_mode =
-            mode.allowed_tools.is_empty() || mode.allowed_tools.contains(&call.name);
+        let allowed_by_mode = mode_allows_tool(mode, &call.name);
         let mutates = known.unwrap_or(true);
         let key = allow_key(&call.name, &call.arguments);
         let decision = if known.is_none() || !allowed_by_mode {
@@ -7437,38 +8397,58 @@ fn ceil_char_boundary(s: &str, mut at: usize) -> usize {
     at
 }
 
-/// Copy prompt attachments into the session worktree (under a gitignored
-/// `.trouve/attachments/` dir) so the native file tools — which only open
-/// worktree-relative paths — can read them. Returns each attachment paired
-/// with its worktree-relative path. Failures drop that attachment with a
-/// warning rather than failing the turn.
-fn materialize_attachments(
-    worktree: &Path,
+/// Stage prompt attachments through [`ToolExecutor`] under the worktree's
+/// gitignored `.trouve/attachments/` directory. Returns each attachment
+/// paired with its worktree-relative path. Failures drop affected files with
+/// a warning rather than failing the turn.
+async fn materialize_attachments(
+    executor: &dyn ToolExecutor,
+    ctx: &ToolCtx,
     files: &[(trouve_protocol::Attachment, PathBuf)],
 ) -> Vec<(trouve_protocol::Attachment, PathBuf)> {
     if files.is_empty() {
         return Vec::new();
     }
     let rel_dir = Path::new(".trouve").join("attachments");
-    let abs_dir = worktree.join(&rel_dir);
-    if let Err(e) = std::fs::create_dir_all(&abs_dir) {
-        tracing::warn!("cannot stage attachments in {}: {e}", abs_dir.display());
-        return Vec::new();
-    }
-    // Keep the staged files out of the user's diffs/commits.
-    let _ = std::fs::write(worktree.join(".trouve").join(".gitignore"), "*\n");
-    let mut out = Vec::new();
-    for (meta, src) in files {
-        // Prefix with the id so distinct attachments with the same filename
-        // don't collide.
-        let file_name = format!("{}-{}", meta.id, meta.name);
-        let rel = rel_dir.join(&file_name);
-        match std::fs::copy(src, worktree.join(&rel)) {
-            Ok(_) => out.push((meta.clone(), rel)),
-            Err(e) => tracing::warn!("cannot stage attachment {}: {e}", meta.name),
+    let requests: Vec<AttachmentStage> = files
+        .iter()
+        .map(|(attachment, source)| {
+            // Prefix with the id so distinct attachments with the same
+            // filename don't collide. Upload metadata is protocol input, so
+            // flatten separators/control characters rather than trusting a
+            // basename.
+            let safe_name: String = attachment
+                .name
+                .chars()
+                .take(160)
+                .map(|character| {
+                    if character.is_ascii_alphanumeric() || matches!(character, '.' | '-' | '_') {
+                        character
+                    } else {
+                        '_'
+                    }
+                })
+                .collect();
+            AttachmentStage {
+                attachment: attachment.clone(),
+                source: source.clone(),
+                relative_path: rel_dir.join(format!("{}-{safe_name}", attachment.id)),
+            }
+        })
+        .collect();
+    match executor.stage_attachments(ctx, &requests).await {
+        Ok(staged) => staged
+            .into_iter()
+            .map(|file| (file.attachment, file.relative_path))
+            .collect(),
+        Err(error) => {
+            tracing::warn!(
+                "cannot stage attachments in {}: {error}",
+                ctx.worktree.display()
+            );
+            Vec::new()
         }
     }
-    out
 }
 
 fn annotate_attachments(
@@ -7486,6 +8466,282 @@ fn annotate_attachments(
         out.push_str(&format!("\n- {} ({}): {}", a.name, a.mime, path.display()));
     }
     out
+}
+
+/// Extract the canonical MCP tool and arguments from a vendor lifecycle echo.
+/// This only parses the envelope; callers must still correlate it against
+/// [`BridgeEchoTracker`] state established by the trusted MCP execution path.
+fn trouve_bridge_echo_payload(
+    tool: &str,
+    args: &serde_json::Value,
+) -> Option<(String, serde_json::Value)> {
+    if let Some(name) = tool
+        .strip_prefix("mcp__trouve__")
+        .filter(|name| !name.is_empty())
+    {
+        return Some((name.to_string(), args.clone()));
+    }
+    if tool != "mcpToolCall"
+        || args
+            .get("server")
+            .or_else(|| args.get("serverName"))
+            .and_then(serde_json::Value::as_str)
+            != Some("trouve")
+    {
+        return None;
+    }
+    let name = args
+        .get("tool")
+        .or_else(|| args.get("toolName"))
+        .and_then(serde_json::Value::as_str)?;
+    let arguments = args
+        .get("arguments")
+        .cloned()
+        .unwrap_or_else(|| serde_json::json!({}));
+    let arguments = arguments
+        .as_str()
+        .and_then(|encoded| serde_json::from_str(encoded).ok())
+        .unwrap_or(arguments);
+    Some((name.to_string(), arguments))
+}
+
+/// Map provider-native vocabulary onto Trouve's canonical operation families.
+fn canonical_vendor_tool(tool: &str) -> &str {
+    match tool {
+        "Bash" | "bash" | "execute" | "commandExecution" | "shell_command" | "exec_command" => {
+            "shell"
+        }
+        "Read" | "read" => "read_file",
+        "Write" | "write" => "write_file",
+        "Edit" | "edit" => "edit_file",
+        "MultiEdit" | "NotebookEdit" | "fileChange" => "apply_patch",
+        "delete" | "Delete" => "delete_file",
+        "Glob" | "glob_search" => "glob",
+        "Grep" | "codeSearch" => "grep",
+        "WebFetch" | "webFetch" => "web_fetch",
+        "WebSearch" | "webSearch" => "web_search",
+        "imageView" | "ViewImage" => "view_image",
+        "TodoWrite" | "createPlan" | "updatePlan" => "todo_write",
+        "Task" | "Agent" | "collabAgentToolCall" => "spawn_thread",
+        other => other,
+    }
+}
+
+/// Canonicalize the fields clients use for labels, diffs, file navigation,
+/// and approval cards while keeping execution in the provider's native
+/// dialect. Unknown calls retain their raw object unchanged.
+fn normalize_vendor_tool_call(tool: &str, args: &serde_json::Value) -> (String, serde_json::Value) {
+    use serde_json::{Map, Value};
+
+    let canonical = canonical_vendor_tool(tool);
+    let Some(source) = args.as_object() else {
+        return (canonical.to_string(), args.clone());
+    };
+    let known = matches!(
+        canonical,
+        "shell"
+            | "read_file"
+            | "write_file"
+            | "edit_file"
+            | "apply_patch"
+            | "delete_file"
+            | "glob"
+            | "grep"
+            | "search"
+            | "web_fetch"
+            | "web_search"
+            | "view_image"
+            | "todo_write"
+            | "spawn_thread"
+    );
+    if !known {
+        return (canonical.to_string(), args.clone());
+    }
+
+    let mut out = Map::new();
+    let mut copy_first = |target: &str, aliases: &[&str]| {
+        if let Some(value) = aliases.iter().find_map(|name| source.get(*name)) {
+            out.insert(target.to_string(), value.clone());
+        }
+    };
+    match canonical {
+        "shell" => {
+            copy_first("command", &["command", "cmd", "commandLine"]);
+            copy_first("timeout_ms", &["timeout_ms", "timeoutMs"]);
+        }
+        "read_file" => {
+            copy_first(
+                "path",
+                &["path", "file_path", "filePath", "abs_path", "target_file"],
+            );
+            copy_first("offset", &["offset", "start_line", "startLine", "start"]);
+            copy_first("limit", &["limit"]);
+            copy_first("end_line", &["end_line", "endLine", "end"]);
+        }
+        "write_file" => {
+            copy_first(
+                "path",
+                &["path", "file_path", "filePath", "abs_path", "target_file"],
+            );
+            copy_first("content", &["content", "contents", "file_text", "fileText"]);
+        }
+        "edit_file" => {
+            copy_first(
+                "path",
+                &["path", "file_path", "filePath", "abs_path", "target_file"],
+            );
+            copy_first(
+                "old_string",
+                &["old_string", "oldText", "old_text", "old_str"],
+            );
+            copy_first(
+                "new_string",
+                &["new_string", "newText", "new_text", "new_str"],
+            );
+            copy_first("replace_all", &["replace_all", "replaceAll"]);
+            copy_first("edits", &["edits"]);
+        }
+        "apply_patch" => {
+            copy_first(
+                "path",
+                &["path", "file_path", "filePath", "abs_path", "target_file"],
+            );
+            copy_first(
+                "input",
+                &["input", "patch", "diff", "unified_diff", "unifiedDiff"],
+            );
+            copy_first("changes", &["changes"]);
+            copy_first("edits", &["edits"]);
+        }
+        "delete_file" | "view_image" => copy_first(
+            "path",
+            &["path", "file_path", "filePath", "abs_path", "target_file"],
+        ),
+        "glob" => {
+            copy_first("pattern", &["pattern", "glob", "query"]);
+            copy_first("path", &["path", "directory", "cwd"]);
+        }
+        "grep" => {
+            copy_first("pattern", &["pattern", "query", "regex"]);
+            copy_first("path", &["path", "directory", "cwd"]);
+        }
+        "search" => {
+            copy_first("query", &["query", "pattern"]);
+            copy_first("path", &["path", "directory", "cwd"]);
+        }
+        "web_fetch" => {
+            copy_first("url", &["url", "uri"]);
+            copy_first("prompt", &["prompt", "query"]);
+        }
+        "web_search" => copy_first("query", &["query", "searchQuery", "pattern"]),
+        "todo_write" => copy_first("todos", &["todos", "items", "plan"]),
+        "spawn_thread" => {
+            copy_first("prompt", &["prompt", "description", "task"]);
+            copy_first("model", &["model"]);
+        }
+        _ => {}
+    }
+    let matched_payload = !out.is_empty();
+    // ACP titles are useful when the native payload omits a structured
+    // command/query, and line hints are added by the engine after this step.
+    if let Some(title) = source.get("title") {
+        out.insert("title".into(), title.clone());
+    }
+    (
+        canonical.to_string(),
+        if !matched_payload {
+            Value::Object(source.clone())
+        } else {
+            Value::Object(out)
+        },
+    )
+}
+
+/// Normalize the result fields clients render or audit while leaving the
+/// provider's model-facing result untouched. Unknown shapes remain lossless.
+fn normalize_vendor_tool_result(tool: &str, result: &serde_json::Value) -> serde_json::Value {
+    use serde_json::{Map, Value};
+
+    let canonical = canonical_vendor_tool(tool);
+    let value = result.get("rawOutput").unwrap_or(result);
+    let text_blocks = |value: &Value| -> Option<String> {
+        let blocks = value.as_array()?;
+        let texts: Option<Vec<&str>> = blocks
+            .iter()
+            .map(|block| {
+                (block.get("type").and_then(Value::as_str) == Some("text"))
+                    .then(|| block.get("text").and_then(Value::as_str))
+                    .flatten()
+            })
+            .collect();
+        texts
+            .filter(|texts| !texts.is_empty())
+            .map(|texts| texts.join("\n"))
+    };
+    let content = |value: &Value, keys: &[&str]| -> Option<String> {
+        value
+            .as_str()
+            .map(str::to_string)
+            .or_else(|| text_blocks(value))
+            .or_else(|| {
+                let object = value.as_object()?;
+                keys.iter().find_map(|key| {
+                    let candidate = object.get(*key)?;
+                    candidate
+                        .as_str()
+                        .map(str::to_string)
+                        .or_else(|| text_blocks(candidate))
+                })
+            })
+    };
+
+    match canonical {
+        "shell" => {
+            let stdout = content(
+                value,
+                &["stdout", "output", "aggregatedOutput", "text", "content"],
+            );
+            let stderr = value.as_object().and_then(|object| {
+                object
+                    .get("stderr")
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+            });
+            let exit_code = value.as_object().and_then(|object| {
+                ["exit_code", "exitCode"]
+                    .iter()
+                    .find_map(|key| object.get(*key).and_then(Value::as_i64))
+            });
+            if stdout.is_none() && stderr.is_none() && exit_code.is_none() {
+                return result.clone();
+            }
+            let mut out = Map::new();
+            if let Some(stdout) = stdout {
+                out.insert("stdout".into(), Value::String(stdout));
+            }
+            if let Some(stderr) = stderr {
+                out.insert("stderr".into(), Value::String(stderr));
+            }
+            if let Some(exit_code) = exit_code {
+                out.insert("exit_code".into(), Value::Number(exit_code.into()));
+            }
+            if value.get("truncated").and_then(Value::as_bool) == Some(true) {
+                out.insert("truncated".into(), Value::Bool(true));
+            }
+            Value::Object(out)
+        }
+        "read_file" | "web_fetch" | "web_search" => {
+            let Some(content) = content(value, &["content", "output", "text"]) else {
+                return result.clone();
+            };
+            let mut out = Map::from_iter([("content".into(), Value::String(content))]);
+            if value.get("truncated").and_then(Value::as_bool) == Some(true) {
+                out.insert("truncated".into(), Value::Bool(true));
+            }
+            Value::Object(out)
+        }
+        _ => result.clone(),
+    }
 }
 
 /// Remove the `_images` vision payload from a tool result, leaving a small
@@ -8550,6 +9806,191 @@ fn expand_provider_template(
 mod tests {
     use super::*;
 
+    #[test]
+    fn fenced_blocks_outgrow_backticks_in_repository_content() {
+        let block = fenced_block("diff", "before\n``````\nafter");
+        assert!(block.starts_with("```````diff\n"));
+        assert!(block.ends_with("\n```````"));
+    }
+
+    #[test]
+    fn unchanged_command_catalog_is_not_reemitted() {
+        let data = tempfile::tempdir().unwrap();
+        let store = Store::open_in_memory().unwrap();
+        let engine = Engine::new(store.clone(), data.path().into(), &Config::default())
+            .with_config_dir(None);
+
+        engine
+            .emit_command_catalog("th_catalog", data.path())
+            .unwrap();
+        engine
+            .emit_command_catalog("th_catalog", data.path())
+            .unwrap();
+
+        let events = store
+            .events_after(&Scope::Thread("th_catalog".into()), 0)
+            .unwrap();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event.event, Event::CommandCatalogUpdated { .. }))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn thread_catalogs_are_evicted_with_their_session() {
+        let data = tempfile::tempdir().unwrap();
+        let store = Store::open_in_memory().unwrap();
+        let engine =
+            Engine::new(store, data.path().into(), &Config::default()).with_config_dir(None);
+        engine
+            .command_catalogs
+            .lock()
+            .unwrap()
+            .insert("th_deleted".into(), Vec::new());
+        engine
+            .command_catalogs
+            .lock()
+            .unwrap()
+            .insert("th_kept".into(), Vec::new());
+        engine.bridged_tool_catalogs.lock().unwrap().insert(
+            "th_deleted".into(),
+            BridgedToolCatalog {
+                revision: 1,
+                specs: Vec::new(),
+            },
+        );
+        engine.bridged_tool_catalogs.lock().unwrap().insert(
+            "th_kept".into(),
+            BridgedToolCatalog {
+                revision: 2,
+                specs: Vec::new(),
+            },
+        );
+
+        engine.evict_thread_catalogs(&["th_deleted".into()]);
+
+        assert!(
+            !engine
+                .command_catalogs
+                .lock()
+                .unwrap()
+                .contains_key("th_deleted")
+        );
+        assert!(
+            !engine
+                .bridged_tool_catalogs
+                .lock()
+                .unwrap()
+                .contains_key("th_deleted")
+        );
+        assert!(
+            engine
+                .command_catalogs
+                .lock()
+                .unwrap()
+                .contains_key("th_kept")
+        );
+        assert!(
+            engine
+                .bridged_tool_catalogs
+                .lock()
+                .unwrap()
+                .contains_key("th_kept")
+        );
+    }
+
+    struct CountingCatalogExecutor {
+        spec_calls: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    #[async_trait::async_trait]
+    impl ToolExecutor for CountingCatalogExecutor {
+        async fn specs(&self, _ctx: &ToolCtx) -> Vec<ToolSpec> {
+            self.spec_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            vec![ToolSpec {
+                name: "search".into(),
+                description: "Search".into(),
+                parameters: serde_json::json!({"type": "object"}),
+            }]
+        }
+
+        fn tool_mutates(&self, _name: &str) -> Option<bool> {
+            Some(false)
+        }
+
+        async fn execute(
+            &self,
+            _ctx: &ToolCtx,
+            _name: &str,
+            _args: &serde_json::Value,
+        ) -> crate::tools::ToolResult {
+            crate::tools::ToolResult::error("unused")
+        }
+    }
+
+    #[tokio::test]
+    async fn bridge_tool_list_reuses_the_catalog_named_by_its_url() {
+        let data = tempfile::tempdir().unwrap();
+        let store = Store::open_in_memory().unwrap();
+        let workspace = Workspace {
+            id: "ws_catalog".into(),
+            name: "catalog".into(),
+            path: data.path().to_string_lossy().into_owned(),
+        };
+        store.insert_workspace(&workspace).unwrap();
+        let session = Session {
+            id: "se_catalog".into(),
+            workspace_id: workspace.id.clone(),
+            title: "catalog".into(),
+            branch: "catalog".into(),
+            worktree_path: workspace.path.clone(),
+            base_ref: "main".into(),
+            archived: false,
+            active: false,
+            created_at: chrono::Utc::now(),
+        };
+        store.insert_session(&session).unwrap();
+        let thread = Thread {
+            id: "th_catalog".into(),
+            session_id: session.id,
+            mode: "code".into(),
+            model: "claude/test".into(),
+            model_options: serde_json::Map::new(),
+            permission_mode: PermissionMode::Ask,
+            created_at: chrono::Utc::now(),
+            spawned: false,
+            todos: Vec::new(),
+        };
+        store
+            .insert_thread(&thread, &serde_json::Map::new())
+            .unwrap();
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let engine = Engine::new(store, data.path().into(), &Config::default())
+            .with_config_dir(None)
+            .with_executor(Arc::new(CountingCatalogExecutor {
+                spec_calls: calls.clone(),
+            }));
+
+        let (revision, prepared) = engine
+            .refresh_bridged_tool_catalog(&thread.id)
+            .await
+            .unwrap();
+        let listed = engine
+            .bridged_tool_specs_for_revision(&thread.id, Some(revision))
+            .await
+            .unwrap();
+
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(
+            tool_catalog_revision(&prepared),
+            tool_catalog_revision(&listed)
+        );
+    }
+
     struct BlockingProviderSecretStore {
         values: Mutex<HashMap<String, String>>,
         delete_started: std::sync::Barrier,
@@ -9152,6 +10593,30 @@ mod tests {
         assert_eq!(
             store.thread(&thread.id).unwrap().unwrap().todos,
             vendor_todos
+        );
+
+        // Cursor's native plan tools use `plan` instead of `todos`. When
+        // they provide structured items, persist them through the same
+        // thread snapshot and UI event contract.
+        let cursor_args = serde_json::json!({"plan": [
+            {"content": "Inspect", "status": "completed"},
+            {"content": "Implement", "status": "in_progress"}
+        ]});
+        let cursor_todos = engine
+            .persist_todos_from_result(
+                &thread.id,
+                "updatePlan",
+                ToolStatus::Ok,
+                &serde_json::json!("Plan updated"),
+                Some(&cursor_args),
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(cursor_todos.len(), 2);
+        assert_eq!(cursor_todos[0].id, "vendor:Inspect");
+        assert_eq!(
+            cursor_todos[1].status,
+            trouve_protocol::TodoStatus::InProgress
         );
     }
 
