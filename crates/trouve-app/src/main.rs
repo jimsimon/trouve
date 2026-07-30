@@ -163,6 +163,7 @@ fn install_window_event_handling(
             )
             && let Some(window) = weak.upgrade()
             && window.get_center_screen() == 0
+            && window.get_right_tab() != 4
         {
             window.invoke_open_chat_find();
             return EventResult::PreventDefault;

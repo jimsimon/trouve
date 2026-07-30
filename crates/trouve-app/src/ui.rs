@@ -2,7 +2,7 @@
 //! Slint models. Every function here is safe to call from any thread — the
 //! conversion happens inside `upgrade_in_event_loop`.
 
-use slint::{Model, ModelRc, SharedString, VecModel};
+use slint::{ComponentHandle as _, Model, ModelRc, SharedString, VecModel};
 
 use crate::render::ChatRowData;
 use crate::{
@@ -12,6 +12,10 @@ use crate::{
 };
 
 type Ui = slint::Weak<AppWindow>;
+
+thread_local! {
+    static CHAT_FIND_REFRESH_TIMER: slint::Timer = slint::Timer::default();
+}
 
 /// Plain-data mirror of the `NavRow` Slint struct.
 #[derive(Debug, Clone, Default)]
@@ -526,11 +530,29 @@ fn refresh_chat_find_matches_now(
 }
 
 fn restore_chat_find_state(ui: &AppWindow, thread_key: &str) {
+    CHAT_FIND_REFRESH_TIMER.with(slint::Timer::stop);
     let state = chat_find_state_for(thread_key);
     ui.set_chat_find_open(state.open);
     ui.set_chat_find_query(state.query.as_str().into());
     ui.set_chat_find_case_sensitive(state.case_sensitive);
     refresh_chat_find_matches_now(ui, &state.query, state.active_row, false);
+}
+
+fn schedule_chat_find_refresh(ui: &AppWindow, thread_key: String) {
+    let weak = ui.as_weak();
+    CHAT_FIND_REFRESH_TIMER.with(|timer| {
+        timer.start(
+            slint::TimerMode::SingleShot,
+            std::time::Duration::from_millis(100),
+            move || {
+                let Some(ui) = weak.upgrade() else { return };
+                if ui.get_chat_find_open() && ui.get_chat_thread_key().as_str() == thread_key {
+                    refresh_chat_find_now(&ui, false);
+                    save_chat_find_state(&ui, &thread_key);
+                }
+            },
+        );
+    });
 }
 
 /// Recompute in-transcript find matches after the user edits the query.
@@ -606,8 +628,7 @@ pub fn set_chat(ui: &Ui, rows: Vec<ChatRowData>, thread_key: String, scroll_to_e
         if thread_changed {
             restore_chat_find_state(&ui, &thread_key);
         } else if ui.get_chat_find_open() {
-            refresh_chat_find_now(&ui, false);
-            save_chat_find_state(&ui, &thread_key);
+            schedule_chat_find_refresh(&ui, thread_key.clone());
         }
         if scroll_to_end || (was_at_bottom && !ui.get_chat_restoring()) {
             // At the tail, the bottom edge is the user's anchor: keep it
