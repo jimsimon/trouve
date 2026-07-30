@@ -1781,6 +1781,23 @@ impl Controller {
             self.save_workspace_order();
         }
         self.sessions = self.client.list_sessions().await?;
+        // Archived/deleted sessions and sessions in closed workspaces have no
+        // live backend PTYs. Discard their cached grids as well so reopening
+        // them attaches to fresh tabs instead of reviving an exited view.
+        let open_workspaces: HashSet<String> = self
+            .workspaces
+            .iter()
+            .map(|workspace| workspace.id.clone())
+            .collect();
+        let terminal_sessions: HashSet<String> = self
+            .sessions
+            .iter()
+            .filter(|session| !session.archived && open_workspaces.contains(&session.workspace_id))
+            .map(|session| session.id.clone())
+            .collect();
+        let terminal_state_count = self.terms.len();
+        self.terms.retain(|id, _| terminal_sessions.contains(id));
+        let terminal_state_changed = self.terms.len() != terminal_state_count;
         let live_session_ids: HashSet<&str> = self
             .sessions
             .iter()
