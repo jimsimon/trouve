@@ -144,6 +144,7 @@ CREATE TABLE IF NOT EXISTS code_review_repositories (
   private INTEGER NOT NULL DEFAULT 0,
   mode TEXT NOT NULL DEFAULT 'off',
   model TEXT,
+  coordinator_thinking_level TEXT,
   router_model TEXT,
   router_thinking_level TEXT,
   prompt TEXT NOT NULL DEFAULT '',
@@ -179,6 +180,7 @@ CREATE TABLE IF NOT EXISTS code_review_jobs (
   trigger TEXT NOT NULL,
   status TEXT NOT NULL,
   model TEXT,
+  coordinator_thinking_level TEXT,
   router_model TEXT,
   router_thinking_level TEXT,
   prompt TEXT NOT NULL DEFAULT '',
@@ -361,6 +363,7 @@ const MIGRATIONS: &[&str] = &[
     "ALTER TABLE code_review_repositories ADD COLUMN reviewer_overrides TEXT NOT NULL DEFAULT '[]'",
     "ALTER TABLE code_review_repositories ADD COLUMN router_model TEXT",
     "ALTER TABLE code_review_repositories ADD COLUMN router_thinking_level TEXT",
+    "ALTER TABLE code_review_repositories ADD COLUMN coordinator_thinking_level TEXT",
     "ALTER TABLE code_review_jobs ADD COLUMN identities TEXT NOT NULL DEFAULT '[]'",
     "ALTER TABLE code_review_jobs ADD COLUMN config_hash TEXT NOT NULL DEFAULT ''",
     "ALTER TABLE code_review_jobs ADD COLUMN review_base_sha TEXT NOT NULL DEFAULT ''",
@@ -393,6 +396,7 @@ const MIGRATIONS: &[&str] = &[
     "ALTER TABLE code_review_jobs ADD COLUMN excluded_reviewer_ids TEXT NOT NULL DEFAULT '[]'",
     "ALTER TABLE code_review_jobs ADD COLUMN router_model TEXT",
     "ALTER TABLE code_review_jobs ADD COLUMN router_thinking_level TEXT",
+    "ALTER TABLE code_review_jobs ADD COLUMN coordinator_thinking_level TEXT",
     "DROP INDEX IF EXISTS code_review_routing_decisions_job",
     "ALTER TABLE code_review_pr_state ADD COLUMN last_reviewed_head_sha TEXT NOT NULL DEFAULT ''",
     "ALTER TABLE code_review_pr_state ADD COLUMN last_reviewed_base_sha TEXT NOT NULL DEFAULT ''",
@@ -658,6 +662,7 @@ fn row_to_code_review_repository(
         .unwrap_or_default(),
         router_model: r.get(12)?,
         router_thinking_level: r.get(13)?,
+        coordinator_thinking_level: r.get(14)?,
     })
 }
 
@@ -677,6 +682,7 @@ pub struct NewCodeReviewJob {
     pub trigger: String,
     pub retry_of: Option<String>,
     pub model: Option<String>,
+    pub coordinator_thinking_level: Option<String>,
     pub router_model: Option<String>,
     pub router_thinking_level: Option<String>,
     pub prompt: String,
@@ -749,6 +755,7 @@ fn row_to_code_review_job(r: &rusqlite::Row<'_>) -> rusqlite::Result<CodeReviewJ
             retry_of: r.get(24)?,
             retried_by: r.get(25)?,
             model: r.get(11)?,
+            coordinator_thinking_level: r.get(49)?,
             router_model: r.get(47)?,
             router_thinking_level: r.get(48)?,
             reviewer_ids: reviewers
@@ -803,7 +810,8 @@ const CODE_REVIEW_JOB_COLUMNS: &str = "id, installation_id, repository, pull_num
      completed_reviewers, total_reviewers, candidate_issue_count, issue_count, fixed_issue_count, summary, \
      prompt_for_agents, publication_claimed, preparation_elapsed_ms, reviewer_elapsed_ms, \
      coordinator_elapsed_ms, publication_elapsed_ms, routing_mode, semantic_routing, \
-     included_reviewer_ids, excluded_reviewer_ids, router_model, router_thinking_level";
+     included_reviewer_ids, excluded_reviewer_ids, router_model, router_thinking_level, \
+     coordinator_thinking_level";
 
 #[derive(Debug, Clone)]
 pub struct NewCodeReviewTask {
@@ -2650,7 +2658,7 @@ impl Store {
             "SELECT repository, installation_id, private, mode, model, prompt,
                     identity_ids, routing_mode, semantic_routing,
                     included_reviewer_ids, excluded_reviewer_ids, reviewer_overrides,
-                    router_model, router_thinking_level
+                    router_model, router_thinking_level, coordinator_thinking_level
              FROM code_review_repositories ORDER BY repository",
         )?;
         let rows = stmt.query_map([], row_to_code_review_repository)?;
@@ -2690,11 +2698,12 @@ impl Store {
                     (repository, installation_id, private, mode, model, prompt,
                      identity_ids, routing_mode, semantic_routing,
                      included_reviewer_ids, excluded_reviewer_ids,
-                     reviewer_overrides, router_model, router_thinking_level, updated_at)
+                     reviewer_overrides, router_model, router_thinking_level,
+                     coordinator_thinking_level, updated_at)
              VALUES (?1, ?2, 0, ?3, ?4, ?5,
-                     COALESCE(?6, ?15), COALESCE(?7, 'auto'),
+                     COALESCE(?6, ?16), COALESCE(?7, 'auto'),
                      COALESCE(?8, 1), COALESCE(?9, '[]'),
-                     COALESCE(?10, '[]'), COALESCE(?11, '[]'), ?12, ?13, ?14)
+                     COALESCE(?10, '[]'), COALESCE(?11, '[]'), ?12, ?13, ?14, ?15)
              ON CONFLICT(repository) DO UPDATE SET
                installation_id = excluded.installation_id,
                mode = excluded.mode,
@@ -2711,6 +2720,7 @@ impl Store {
                    COALESCE(?11, code_review_repositories.reviewer_overrides),
                router_model = excluded.router_model,
                router_thinking_level = excluded.router_thinking_level,
+               coordinator_thinking_level = excluded.coordinator_thinking_level,
                updated_at = excluded.updated_at",
             params![
                 request.repository,
@@ -2726,6 +2736,7 @@ impl Store {
                 reviewer_overrides,
                 request.router_model,
                 request.router_thinking_level,
+                request.coordinator_thinking_level,
                 chrono::Utc::now().to_rfc3339(),
                 default_reviewer_ids,
             ],
@@ -2750,10 +2761,10 @@ impl Store {
                      identities, config_hash, created_at, review_base_sha, review_scope,
                      retry_of, total_reviewers, routing_mode, semantic_routing,
                      included_reviewer_ids, excluded_reviewer_ids, router_model,
-                     router_thinking_level)
+                     router_thinking_level, coordinator_thinking_level)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, 'queued',
                      ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20,
-                     ?21, ?22, ?23, ?24, ?25, ?26)",
+                     ?21, ?22, ?23, ?24, ?25, ?26, ?27)",
             params![
                 id,
                 new_job.dedupe_key,
@@ -2781,6 +2792,7 @@ impl Store {
                 excluded_reviewer_ids,
                 new_job.router_model,
                 new_job.router_thinking_level,
+                new_job.coordinator_thinking_level,
             ],
         )?;
         if inserted == 0 {
@@ -4361,13 +4373,15 @@ impl Store {
                      status, model, prompt, identities, config_hash, created_at,
                      review_base_sha, review_scope, retry_of, total_reviewers,
                      routing_mode, semantic_routing, included_reviewer_ids,
-                     excluded_reviewer_ids, router_model, router_thinking_level)
+                     excluded_reviewer_ids, router_model, router_thinking_level,
+                     coordinator_thinking_level)
              SELECT ?2, ?3, installation_id, repository, pull_number,
                     pull_title, pull_url, head_sha, base_ref, head_ref, 'retry',
                     'queued', model, prompt, identities, config_hash, ?4,
                     review_base_sha, review_scope, id, total_reviewers,
                     routing_mode, semantic_routing, included_reviewer_ids,
-                    excluded_reviewer_ids, router_model, router_thinking_level
+                    excluded_reviewer_ids, router_model, router_thinking_level,
+                    coordinator_thinking_level
              FROM code_review_jobs WHERE id = ?1",
             params![id, new_id, format!("retry:{id}:{new_id}"), now],
         )?;
@@ -6083,6 +6097,7 @@ mod tests {
                 repository: "acme/widgets".into(),
                 mode: trouve_protocol::CodeReviewMode::Automatic,
                 model: Some("openai/gpt-5".into()),
+                coordinator_thinking_level: Some("high".into()),
                 router_model: Some("anthropic/router".into()),
                 router_thinking_level: Some("low".into()),
                 prompt: "focus on concurrency".into(),
@@ -6094,6 +6109,7 @@ mod tests {
                 reviewer_overrides: Some(vec![trouve_protocol::ReviewerOverride {
                     reviewer_id: "security".into(),
                     model: Some("anthropic/security".into()),
+                    thinking_level: Some("medium".into()),
                     prompt_mode: trouve_protocol::ReviewerPromptMode::Append,
                     prompt: "Focus on tenant boundaries.".into(),
                 }]),
@@ -6102,9 +6118,17 @@ mod tests {
         let configured = store.list_code_review_repositories().unwrap().remove(0);
         assert_eq!(configured.mode, trouve_protocol::CodeReviewMode::Automatic);
         assert_eq!(configured.model.as_deref(), Some("openai/gpt-5"));
+        assert_eq!(
+            configured.coordinator_thinking_level.as_deref(),
+            Some("high")
+        );
         assert_eq!(configured.router_model.as_deref(), Some("anthropic/router"));
         assert_eq!(configured.router_thinking_level.as_deref(), Some("low"));
         assert_eq!(configured.reviewer_overrides.len(), 1);
+        assert_eq!(
+            configured.reviewer_overrides[0].thinking_level.as_deref(),
+            Some("medium")
+        );
 
         assert_eq!(
             store
@@ -6148,6 +6172,7 @@ mod tests {
             trigger: "automatic".into(),
             retry_of: None,
             model: configured.model,
+            coordinator_thinking_level: configured.coordinator_thinking_level,
             router_model: configured.router_model,
             router_thinking_level: configured.router_thinking_level,
             prompt: configured.prompt,
@@ -6161,6 +6186,7 @@ mod tests {
         let queued = store.enqueue_code_review_job(&new_job).unwrap().unwrap();
         assert_eq!(queued.status, "queued");
         assert_eq!(queued.reviewer_ids, configured.reviewer_ids);
+        assert_eq!(queued.coordinator_thinking_level.as_deref(), Some("high"));
         assert_eq!(queued.router_model.as_deref(), Some("anthropic/router"));
         assert_eq!(queued.router_thinking_level.as_deref(), Some("low"));
         assert!(store.enqueue_code_review_job(&new_job).unwrap().is_none());
@@ -6366,6 +6392,7 @@ mod tests {
                     trigger: "automatic".into(),
                     retry_of: None,
                     model: None,
+                    coordinator_thinking_level: None,
                     router_model: None,
                     router_thinking_level: None,
                     prompt: String::new(),
@@ -6438,6 +6465,7 @@ mod tests {
                 repository: "acme/widgets".into(),
                 mode: trouve_protocol::CodeReviewMode::Automatic,
                 model: None,
+                coordinator_thinking_level: None,
                 router_model: None,
                 router_thinking_level: None,
                 prompt: String::new(),
@@ -6449,6 +6477,7 @@ mod tests {
                 reviewer_overrides: Some(vec![trouve_protocol::ReviewerOverride {
                     reviewer_id: reviewer.id.clone(),
                     model: Some("anthropic/domain".into()),
+                    thinking_level: Some("low".into()),
                     prompt_mode: trouve_protocol::ReviewerPromptMode::Replace,
                     prompt: "Use repository-specific invariants.".into(),
                 }]),
@@ -6460,6 +6489,7 @@ mod tests {
                 repository: "acme/unrelated".into(),
                 mode: trouve_protocol::CodeReviewMode::Off,
                 model: None,
+                coordinator_thinking_level: None,
                 router_model: None,
                 router_thinking_level: None,
                 prompt: String::new(),
@@ -6531,6 +6561,7 @@ mod tests {
                 trigger: "automatic".into(),
                 retry_of: None,
                 model: Some("provider/default".into()),
+                coordinator_thinking_level: Some("medium".into()),
                 router_model: Some("provider/router".into()),
                 router_thinking_level: Some("low".into()),
                 prompt: "Review it".into(),
@@ -6762,6 +6793,10 @@ mod tests {
 
         let replacement = store.retry_code_review_job(&queued.id).unwrap().unwrap();
         assert_eq!(replacement.retry_of.as_deref(), Some(queued.id.as_str()));
+        assert_eq!(
+            replacement.coordinator_thinking_level.as_deref(),
+            Some("medium")
+        );
         assert_eq!(replacement.router_model.as_deref(), Some("provider/router"));
         assert_eq!(replacement.router_thinking_level.as_deref(), Some("low"));
         let jobs = store.list_code_review_jobs(10).unwrap();
@@ -6840,6 +6875,7 @@ mod tests {
                 trigger: "automatic".into(),
                 retry_of: None,
                 model: Some("provider/default".into()),
+                coordinator_thinking_level: None,
                 router_model: None,
                 router_thinking_level: None,
                 prompt: "Review it".into(),
@@ -7010,6 +7046,7 @@ mod tests {
                 trigger: "automatic".into(),
                 retry_of: None,
                 model: Some("provider/default".into()),
+                coordinator_thinking_level: None,
                 router_model: None,
                 router_thinking_level: None,
                 prompt: "Review it".into(),
@@ -7101,6 +7138,7 @@ mod tests {
                 trigger: "automatic".into(),
                 retry_of: None,
                 model: None,
+                coordinator_thinking_level: None,
                 router_model: None,
                 router_thinking_level: None,
                 prompt: String::new(),
@@ -7161,6 +7199,7 @@ mod tests {
                     trigger: "automatic".into(),
                     retry_of: None,
                     model: None,
+                    coordinator_thinking_level: None,
                     router_model: None,
                     router_thinking_level: None,
                     prompt: String::new(),

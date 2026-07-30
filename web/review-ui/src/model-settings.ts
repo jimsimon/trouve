@@ -6,6 +6,10 @@ export interface ModelWithOptions {
 export interface ThinkingOptions {
   values: string[];
   defaultValue?: string;
+  budget?: {
+    minimum: number;
+    maximum?: number;
+  };
 }
 
 const THINKING_KEYS = [
@@ -36,7 +40,33 @@ export function thinkingOptions(model?: ModelWithOptions): ThinkingOptions {
       defaultValue: typeof property.default === "string" ? property.default : undefined,
     };
   }
+  const budget = object(properties.thinking_budget_tokens);
+  if (budget?.type === "integer" || budget?.type === "number") {
+    const minimum = typeof budget.minimum === "number" ? budget.minimum : 1;
+    const maximum = typeof budget.maximum === "number" ? budget.maximum : undefined;
+    return {
+      values: [],
+      ...(typeof budget.default === "number"
+        ? { defaultValue: String(budget.default) }
+        : {}),
+      budget: { minimum, maximum },
+    };
+  }
   return { values: [] };
+}
+
+export function thinkingSelectionIsValid(
+  model: ModelWithOptions | undefined,
+  configured?: string,
+): boolean {
+  if (!configured) return false;
+  const options = thinkingOptions(model);
+  if (options.values.includes(configured)) return true;
+  if (!options.budget) return false;
+  const value = Number(configured);
+  return Number.isInteger(value)
+    && value >= options.budget.minimum
+    && (options.budget.maximum === undefined || value <= options.budget.maximum);
 }
 
 export function defaultThinkingSelection(
@@ -44,14 +74,19 @@ export function defaultThinkingSelection(
   configured?: string,
 ): string {
   const options = thinkingOptions(model);
-  if (configured && options.values.includes(configured)) return configured;
+  if (thinkingSelectionIsValid(model, configured)) return configured ?? "";
+  if (options.budget && options.defaultValue) {
+    return options.defaultValue;
+  }
   if (options.defaultValue && options.values.includes(options.defaultValue)) {
     return options.defaultValue;
   }
+  if (options.budget) return String(options.budget.minimum);
   return options.values[0] ?? "";
 }
 
 export function thinkingLevelLabel(value: string): string {
+  if (/^\d+$/.test(value)) return `${Number(value).toLocaleString()} tokens`;
   const labels: Record<string, string> = {
     off: "Off",
     on: "On",

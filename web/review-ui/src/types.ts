@@ -35,6 +35,7 @@ export interface GithubAppStatus {
 export interface ReviewerOverride {
   reviewer_id: string;
   model?: string;
+  thinking_level?: string;
   prompt_mode: "inherit" | "append" | "replace";
   prompt: string;
 }
@@ -54,6 +55,7 @@ export interface Repository {
   private: boolean;
   mode: ReviewMode;
   model?: string;
+  coordinator_thinking_level?: string;
   router_model?: string;
   router_thinking_level?: string;
   prompt: string;
@@ -88,6 +90,7 @@ export interface ReviewJob {
   retry_of?: string;
   retried_by?: string;
   model?: string;
+  coordinator_thinking_level?: string;
   router_model?: string;
   router_thinking_level?: string;
   reviewer_ids: string[];
@@ -347,6 +350,22 @@ export interface Model {
   id: string;
   display_name: string;
   options_schema?: unknown;
+}
+
+export interface AgentMode {
+  id: string;
+  display_name: string;
+  system_prompt: string;
+  allowed_tools: string[];
+  read_only: boolean;
+  default_permission_mode?: string;
+  default_model?: string;
+  default_thinking_level?: string;
+}
+
+export interface ModeInfo {
+  mode: AgentMode;
+  origin: "builtin" | "customized" | "custom" | "workspace";
 }
 
 export interface LoginStarted {

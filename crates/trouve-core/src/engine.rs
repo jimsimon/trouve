@@ -298,6 +298,20 @@ pub(crate) fn advertised_thinking_levels(model: &trouve_protocol::ModelInfo) -> 
         .unwrap_or_default()
 }
 
+pub(crate) fn advertised_thinking_budget(
+    model: &trouve_protocol::ModelInfo,
+) -> Option<(u64, Option<u64>)> {
+    let property = model
+        .options_schema
+        .pointer("/properties/thinking_budget_tokens")?;
+    matches!(property["type"].as_str(), Some("integer" | "number")).then(|| {
+        (
+            property["minimum"].as_u64().unwrap_or(1),
+            property["maximum"].as_u64(),
+        )
+    })
+}
+
 /// Resolve the canonical inherited `thinking_level` key through a model's
 /// advertised options schema. Unknown/unsupported levels fall back to the
 /// model's schema default; models without an enum thinking knob drop the
@@ -311,6 +325,28 @@ fn normalize_thinking_option(
     };
     let property = model.and_then(thinking_option_property);
     let Some((key, property, values)) = property else {
+        if let Some(model) = model
+            && let Some((minimum, maximum)) = advertised_thinking_budget(model)
+        {
+            let selected = canonical
+                .as_str()
+                .and_then(|value| value.parse::<u64>().ok())
+                .filter(|value| *value >= minimum && maximum.is_none_or(|max| *value <= max))
+                .or_else(|| {
+                    model
+                        .options_schema
+                        .pointer("/properties/thinking_budget_tokens/default")
+                        .and_then(serde_json::Value::as_u64)
+                });
+            options.remove("thinking_level");
+            if let Some(selected) = selected {
+                options.insert(
+                    "thinking_budget_tokens".into(),
+                    serde_json::Value::Number(selected.into()),
+                );
+            }
+            return;
+        }
         options.remove("thinking_level");
         return;
     };
@@ -9399,8 +9435,31 @@ mod tests {
             Some(&serde_json::json!("medium"))
         );
 
-        // No thinking enum means the inherited option is not sent.
+        let fixed_model = trouve_protocol::ModelInfo {
+            id: "anthropic/claude-fixed".into(),
+            display_name: "Claude fixed".into(),
+            options_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "thinking_budget_tokens": {
+                        "type": "integer",
+                        "minimum": 1024,
+                        "maximum": 32768
+                    }
+                }
+            }),
+            ..model.clone()
+        };
         options.remove("reasoning_effort");
+        options.insert("thinking_level".into(), serde_json::json!("16384"));
+        normalize_thinking_option(&mut options, Some(&fixed_model));
+        assert_eq!(
+            options.get("thinking_budget_tokens"),
+            Some(&serde_json::json!(16384))
+        );
+
+        // No thinking enum means the inherited option is not sent.
+        options.remove("thinking_budget_tokens");
         options.insert("thinking_level".into(), serde_json::json!("high"));
         normalize_thinking_option(&mut options, None);
         assert!(options.is_empty());

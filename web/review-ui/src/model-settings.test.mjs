@@ -5,6 +5,7 @@ import {
   defaultThinkingSelection,
   thinkingLevelLabel,
   thinkingOptions,
+  thinkingSelectionIsValid,
 } from "./model-settings.ts";
 
 test("thinking options follow the model-advertised schema key", () => {
@@ -36,6 +37,30 @@ test("models without an advertised thinking enum have no thinking selector", () 
     options_schema: { properties: { temperature: { type: "number" } } },
   }), { values: [] });
   assert.equal(defaultThinkingSelection(undefined, "high"), "");
+});
+
+test("fixed thinking budgets follow advertised numeric bounds", () => {
+  const model = {
+    id: "anthropic/claude-haiku-4-5",
+    options_schema: {
+      properties: {
+        thinking_budget_tokens: {
+          type: "integer",
+          minimum: 1024,
+          maximum: 32768,
+          default: 4096,
+        },
+      },
+    },
+  };
+  assert.deepEqual(thinkingOptions(model), {
+    values: [],
+    defaultValue: "4096",
+    budget: { minimum: 1024, maximum: 32768 },
+  });
+  assert.equal(thinkingSelectionIsValid(model, "16384"), true);
+  assert.equal(thinkingSelectionIsValid(model, "512"), false);
+  assert.equal(defaultThinkingSelection(model), "4096");
 });
 
 test("thinking labels make provider tokens readable", () => {

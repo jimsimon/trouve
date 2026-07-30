@@ -42,8 +42,9 @@ pub struct AgentMode {
     /// None falls back to the global default model.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default_model: Option<String>,
-    /// Preferred thinking level for threads started in this mode. The value
-    /// is a model-advertised enum token (for example "medium" or "high").
+    /// Preferred thinking setting for threads started in this mode. The value
+    /// is a model-advertised enum token (for example "medium" or "high") or
+    /// a decimal token budget for fixed-thinking models.
     /// None falls back to the global default thinking level.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default_thinking_level: Option<String>,
@@ -761,8 +762,8 @@ pub struct ReviewerProfile {
     pub prompt: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
-    /// Preferred thinking level for this reviewer. None inherits the review
-    /// mode's default, then the global default.
+    /// Preferred thinking level or fixed token budget for this reviewer. None
+    /// inherits the review mode's default, then the global default.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default_thinking_level: Option<String>,
     #[serde(default)]
@@ -818,6 +819,10 @@ pub struct ReviewerOverride {
     /// turn may inherit the repository/default model.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
+    /// Preferred thinking level or fixed token budget. Absent means inherit
+    /// the reviewer profile, which in turn inherits the review mode default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thinking_level: Option<String>,
     #[serde(default)]
     pub prompt_mode: ReviewerPromptMode,
     #[serde(default, skip_serializing_if = "String::is_empty")]
@@ -838,12 +843,16 @@ pub struct CodeReviewRepository {
     /// reviewers without an override. Required while reviews are enabled.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
+    /// Preferred thinking level or fixed token budget for the final
+    /// coordinator/editor. Absent inherits the review mode's default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub coordinator_thinking_level: Option<String>,
     /// Provider-qualified model used by semantic persona triage. Absent
     /// inherits `model`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub router_model: Option<String>,
-    /// Preferred thinking level for semantic persona triage. Absent inherits
-    /// the review mode's thinking default.
+    /// Preferred thinking level or fixed token budget for semantic persona
+    /// triage. Absent inherits the review mode's default.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub router_thinking_level: Option<String>,
     /// Extra repository-specific review instructions.
@@ -880,6 +889,8 @@ pub struct UpdateCodeReviewRepositoryRequest {
     pub mode: CodeReviewMode,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub coordinator_thinking_level: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub router_model: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1149,6 +1160,9 @@ pub struct CodeReviewJob {
     pub retried_by: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
+    /// Thinking level snapshotted for the final coordinator/editor.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub coordinator_thinking_level: Option<String>,
     /// Model snapshotted for semantic persona triage. Absent inherits
     /// `model`; legacy jobs may omit both and are rejected before dispatch.
     #[serde(default, skip_serializing_if = "Option::is_none")]

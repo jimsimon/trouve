@@ -6,6 +6,7 @@ import type {
   LoginStarted,
   LoginStatus,
   Model,
+  ModeInfo,
   Provider,
   ProvidersResponse,
   Repository,
@@ -94,6 +95,7 @@ export const saveRepository = (repository: Repository): Promise<Repository> =>
       repository: repository.repository,
       mode: repository.mode,
       model: repository.model || null,
+      coordinator_thinking_level: repository.coordinator_thinking_level || null,
       router_model: repository.router_model || null,
       router_thinking_level: repository.router_thinking_level || null,
       prompt: repository.prompt,
@@ -130,6 +132,22 @@ export const refreshReviews = (): Promise<void> =>
   api("/code-review/refresh", { method: "POST", body: "{}" });
 export const getProviders = (): Promise<ProvidersResponse> => api("/providers");
 export const getModels = (): Promise<Model[]> => api("/models");
+export const getModeInfos = (): Promise<ModeInfo[]> => api("/mode-infos");
+export const saveMode = (mode: ModeInfo["mode"]): Promise<void> =>
+  api(`/modes/${encodeURIComponent(mode.id)}`, {
+    method: "PUT",
+    body: JSON.stringify({
+      display_name: mode.display_name,
+      system_prompt: mode.system_prompt,
+      allowed_tools: mode.allowed_tools,
+      read_only: mode.read_only,
+      default_permission_mode: mode.default_permission_mode ?? null,
+      default_model: mode.default_model ?? null,
+      default_thinking_level: mode.default_thinking_level ?? null,
+    }),
+  });
+export const resetMode = (id: string): Promise<void> =>
+  api(`/modes/${encodeURIComponent(id)}`, { method: "DELETE" });
 export const saveDefaultModel = (
   model: string,
   defaultThinkingLevel?: string,

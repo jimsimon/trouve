@@ -7,7 +7,7 @@
       "name": "MIT",
       "identifier": "MIT"
     },
-    "version": "1.18"
+    "version": "1.19"
   },
   "paths": {
     "/v1/approvals": {
@@ -3986,7 +3986,7 @@
               "string",
               "null"
             ],
-            "description": "Preferred thinking level for threads started in this mode. The value\nis a model-advertised enum token (for example \"medium\" or \"high\").\nNone falls back to the global default thinking level."
+            "description": "Preferred thinking setting for threads started in this mode. The value\nis a model-advertised enum token (for example \"medium\" or \"high\") or\na decimal token budget for fixed-thinking models.\nNone falls back to the global default thinking level."
           },
           "display_name": {
             "type": "string"
@@ -4627,6 +4627,13 @@
             "format": "int64",
             "minimum": 0
           },
+          "coordinator_thinking_level": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Thinking level snapshotted for the final coordinator/editor."
+          },
           "created_at": {
             "type": "string",
             "format": "date-time"
@@ -5109,6 +5116,13 @@
           "repository"
         ],
         "properties": {
+          "coordinator_thinking_level": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Preferred thinking level or fixed token budget for the final\ncoordinator/editor. Absent inherits the review mode's default."
+          },
           "excluded_reviewer_ids": {
             "type": "array",
             "items": {
@@ -5174,7 +5188,7 @@
               "string",
               "null"
             ],
-            "description": "Preferred thinking level for semantic persona triage. Absent inherits\nthe review mode's thinking default."
+            "description": "Preferred thinking level or fixed token budget for semantic persona\ntriage. Absent inherits the review mode's default."
           },
           "routing_mode": {
             "$ref": "#/components/schemas/CodeReviewRoutingMode",
@@ -8196,6 +8210,13 @@
           },
           "reviewer_id": {
             "type": "string"
+          },
+          "thinking_level": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Preferred thinking level or fixed token budget. Absent means inherit\nthe reviewer profile, which in turn inherits the review mode default."
           }
         }
       },
@@ -8216,7 +8237,7 @@
               "string",
               "null"
             ],
-            "description": "Preferred thinking level for this reviewer. None inherits the review\nmode's default, then the global default."
+            "description": "Preferred thinking level or fixed token budget for this reviewer. None\ninherits the review mode's default, then the global default."
           },
           "id": {
             "type": "string"
@@ -8738,6 +8759,12 @@
           "mode"
         ],
         "properties": {
+          "coordinator_thinking_level": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "excluded_reviewer_ids": {
             "type": [
               "array",
