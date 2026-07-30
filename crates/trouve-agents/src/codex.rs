@@ -28,10 +28,11 @@ use tokio::process::{Child, ChildStdin};
 use tokio::sync::{Mutex, oneshot};
 use trouve_protocol::{ModelInfo, Usage};
 use trouve_providers::codex::completed_raw_reasoning_text;
+use trouve_providers::models_dev::{ModelsDevCatalog, OptionsDialect};
 
 use crate::{
     AgentBackend, BackendError, BackendEvent, BackendEventStream, BackendLogin, BackendPermission,
-    BackendStatus, BackendTurn, async_stream, binary_on_path, format_reset, model,
+    BackendStatus, BackendTurn, async_stream, binary_on_path, format_reset,
     route::{ROUTE_EVENT_BUDGET, RouteReceiver, RouteSendError, RouteSender, route_channel},
     spawn_codex_login,
 };
@@ -40,11 +41,10 @@ pub struct CodexBackend {
     id: String,
     command: String,
     server: Mutex<Option<Arc<AppServer>>>,
-    /// `model/list` result, cached for [`MODELS_TTL`].
-    models_cache: Mutex<Option<(std::time::Instant, Vec<ModelInfo>)>>,
-    /// Real context windows by model name, learned from
-    /// `thread/tokenUsage/updated` (`model/list` doesn't report them).
-    observed_windows: Arc<std::sync::Mutex<HashMap<String, u64>>>,
+    catalog: Arc<ModelsDevCatalog>,
+    /// Account-visible ids from `model/list`, cached for [`MODELS_TTL`].
+    /// Model metadata is rebuilt from `catalog` on every read.
+    models_cache: Mutex<Option<(std::time::Instant, Vec<String>)>>,
 }
 
 /// How long a fetched vendor model list stays fresh.
@@ -75,24 +75,37 @@ impl CodexBackend {
             id: id.into(),
             command: command.unwrap_or_else(|| "codex".into()),
             server: Mutex::new(None),
+            catalog: Arc::new(ModelsDevCatalog::embedded()),
             models_cache: Mutex::new(None),
-            observed_windows: Arc::new(std::sync::Mutex::new(HashMap::new())),
         }
     }
 
-    /// Replace catalog context windows with real values observed from live
-    /// turns, matched on the model name after the backend prefix.
-    fn apply_observed_windows(&self, models: &mut [ModelInfo]) {
-        let observed = self.observed_windows.lock().unwrap();
-        if observed.is_empty() {
-            return;
+    pub fn with_catalog(mut self, catalog: Arc<ModelsDevCatalog>) -> Self {
+        self.catalog = catalog;
+        self
+    }
+
+    fn without_usage_pricing(mut models: Vec<ModelInfo>) -> Vec<ModelInfo> {
+        for model in &mut models {
+            // Codex runs against the user's ChatGPT subscription rather than
+            // OpenAI's per-token API billing.
+            model.input_price_per_mtok = None;
+            model.output_price_per_mtok = None;
         }
-        for m in models {
-            let name = m.id.rsplit_once('/').map_or(m.id.as_str(), |(_, n)| n);
-            if let Some(n) = observed.get(name) {
-                m.context_window = *n;
-            }
-        }
+        models
+    }
+
+    fn catalog_models_for_ids<I, S>(&self, ids: I) -> Vec<ModelInfo>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        Self::without_usage_pricing(self.catalog.provider_models_for_ids(
+            "openai",
+            &self.id,
+            ids,
+            OptionsDialect::CodexCli,
+        ))
     }
 
     async fn server(&self) -> Result<Arc<AppServer>, BackendError> {
@@ -116,23 +129,24 @@ impl AgentBackend for CodexBackend {
     }
 
     fn models(&self) -> Vec<ModelInfo> {
-        // The app-server is the catalog authority. In particular it does
-        // not expose context windows in `model/list`, so there is no honest
-        // offline model record to synthesize here.
-        Vec::new()
+        // The app-server cannot be consulted offline, so the refreshable
+        // models.dev roster is the last-known availability fallback.
+        Self::without_usage_pricing(self.catalog.provider_models(
+            "openai",
+            &self.id,
+            OptionsDialect::CodexCli,
+        ))
     }
 
     async fn list_models(&self) -> Vec<ModelInfo> {
         let stale = {
             let cache = self.models_cache.lock().await;
-            if let Some((at, models)) = cache.as_ref()
+            if let Some((at, ids)) = cache.as_ref()
                 && at.elapsed() < MODELS_TTL
             {
-                let mut models = models.clone();
-                self.apply_observed_windows(&mut models);
-                return models;
+                return self.catalog_models_for_ids(ids);
             }
-            cache.as_ref().map(|(_, models)| models.clone())
+            cache.as_ref().map(|(_, ids)| ids.clone())
         };
         let fetched = async {
             let server = self.server().await?;
@@ -141,21 +155,21 @@ impl AgentBackend for CodexBackend {
         .await;
         match fetched {
             Ok(result) => {
-                let mut models = parse_model_list(&self.id, &result);
-                if models.is_empty() {
-                    let mut models = stale.unwrap_or_default();
-                    self.apply_observed_windows(&mut models);
-                    return models;
-                }
-                *self.models_cache.lock().await = Some((std::time::Instant::now(), models.clone()));
-                self.apply_observed_windows(&mut models);
-                models
+                let Some(ids) = parse_available_model_ids(&result) else {
+                    return stale
+                        .as_ref()
+                        .map(|ids| self.catalog_models_for_ids(ids))
+                        .unwrap_or_else(|| self.models());
+                };
+                *self.models_cache.lock().await = Some((std::time::Instant::now(), ids.clone()));
+                self.catalog_models_for_ids(&ids)
             }
             Err(e) => {
-                tracing::debug!("codex model/list failed: {e}; using stale live list");
-                let mut models = stale.unwrap_or_default();
-                self.apply_observed_windows(&mut models);
-                models
+                tracing::debug!("codex model/list failed: {e}; using stale/models.dev list");
+                stale
+                    .as_ref()
+                    .map(|ids| self.catalog_models_for_ids(ids))
+                    .unwrap_or_else(|| self.models())
             }
         }
     }
@@ -319,8 +333,6 @@ impl AgentBackend for CodexBackend {
             codex_turn_id,
             route,
             fresh_session,
-            model_name.to_string(),
-            self.observed_windows.clone(),
         );
         Ok(stream.boxed())
     }
@@ -393,51 +405,17 @@ fn agent_message_delta(
     }
 }
 
-/// Map a `model/list` result to ModelInfos: one entry per model, with the
-/// supported reasoning efforts as a `reasoning_effort` options schema
-/// (rendered as the client's thinking dropdown).
-fn parse_model_list(backend_id: &str, result: &Value) -> Vec<ModelInfo> {
-    let Some(data) = result["data"].as_array() else {
-        return Vec::new();
-    };
-    let mut out = Vec::new();
-    for entry in data {
-        if entry["hidden"].as_bool() == Some(true) {
-            continue;
-        }
-        let Some(id) = entry["id"].as_str() else {
-            continue;
-        };
-        let display = entry["displayName"].as_str().unwrap_or(id);
-        let default_effort = entry["defaultReasoningEffort"].as_str().unwrap_or("");
-        let efforts: Vec<&str> = entry["supportedReasoningEfforts"]
-            .as_array()
-            .map(|list| {
-                list.iter()
-                    .filter_map(|e| e["reasoningEffort"].as_str())
-                    .collect()
-            })
-            .unwrap_or_default();
-        // `model/list` deliberately has no context-window field. A live
-        // `thread/tokenUsage/updated` notification fills this in after the
-        // first turn; zero means unknown until then.
-        let mut info = model(backend_id, id, display, 0);
-        if efforts.len() > 1 {
-            info.options_schema = json!({
-                "type": "object",
-                "properties": {
-                    "reasoning_effort": {
-                        "type": "string",
-                        "enum": efforts,
-                        "default": default_effort,
-                        "description": "How much thinking the model does before answering"
-                    }
-                }
-            });
-        }
-        out.push(info);
-    }
-    out
+/// Extract the account-visible ids from `model/list`. Display names,
+/// capabilities, defaults, context limits, and option schemas deliberately do
+/// not cross this boundary; models.dev owns those fields.
+fn parse_available_model_ids(result: &Value) -> Option<Vec<String>> {
+    let data = result["data"].as_array()?;
+    Some(
+        data.iter()
+            .filter(|entry| entry["hidden"].as_bool() != Some(true))
+            .filter_map(|entry| entry["id"].as_str().map(String::from))
+            .collect(),
+    )
 }
 
 fn thread_id_of(result: &Value) -> Result<String, BackendError> {
@@ -462,8 +440,6 @@ fn turn_stream(
     codex_turn_id: String,
     route: RouteSubscription,
     fresh_session: bool,
-    model_name: String,
-    observed_windows: Arc<std::sync::Mutex<HashMap<String, u64>>>,
 ) -> impl futures::Stream<Item = Result<BackendEvent, BackendError>> {
     async_stream(move |tx| async move {
         let RouteSubscription {
@@ -592,10 +568,6 @@ fn turn_stream(
                             usage.output_tokens += u.output_tokens;
                             if let Some(n) = u.context_window {
                                 usage.context_window = Some(n);
-                                observed_windows
-                                    .lock()
-                                    .unwrap()
-                                    .insert(model_name.clone(), n);
                             }
                         }
                         "turn/completed" => {
@@ -1702,23 +1674,25 @@ mod tests {
     }
 
     #[test]
-    fn observed_windows_fill_unknown_live_sizes() {
-        let backend = CodexBackend::new("codex", None);
-        let result = json!({ "data": [{
-            "id": "gpt-5.6",
-            "displayName": "GPT-5.6",
-            "hidden": false,
-        }]});
-        let mut models = parse_model_list("codex", &result);
-        assert_eq!(models[0].context_window, 0);
-
-        backend
-            .observed_windows
-            .lock()
-            .unwrap()
-            .insert("gpt-5.6".into(), 1_050_000);
-        backend.apply_observed_windows(&mut models);
-        assert_eq!(models[0].context_window, 1_050_000);
+    fn model_list_only_contributes_visible_ids() {
+        let result = json!({ "data": [
+            {
+                "id": "gpt-5.6",
+                "displayName": "Vendor Override",
+                "hidden": false,
+                "supportedReasoningEfforts": [{"reasoningEffort": "vendor-only"}],
+            },
+            { "id": "secret", "hidden": true },
+        ]});
+        assert_eq!(
+            parse_available_model_ids(&result),
+            Some(vec!["gpt-5.6".into()])
+        );
+        assert_eq!(parse_available_model_ids(&json!({})), None);
+        assert_eq!(
+            parse_available_model_ids(&json!({"data": []})),
+            Some(vec![])
+        );
     }
 
     #[test]
@@ -1730,31 +1704,20 @@ mod tests {
     }
 
     #[test]
-    fn maps_model_list_efforts_into_options_schema() {
-        let result = json!({ "data": [
-            {
-                "id": "gpt-5.5",
-                "displayName": "GPT-5.5",
-                "hidden": false,
-                "defaultReasoningEffort": "medium",
-                "supportedReasoningEfforts": [
-                    { "reasoningEffort": "low" },
-                    { "reasoningEffort": "medium" },
-                    { "reasoningEffort": "high" },
-                ],
-            },
-            { "id": "secret", "displayName": "Hidden", "hidden": true },
-        ]});
-        let models = parse_model_list("codex", &result);
-        let ids: Vec<&str> = models.iter().map(|m| m.id.as_str()).collect();
-        assert_eq!(ids, vec!["codex/gpt-5.5"]);
-        assert_eq!(models[0].context_window, 0);
+    fn models_dev_owns_codex_metadata_and_settings() {
+        let backend = CodexBackend::new("codex", None);
+        let models = backend.catalog_models_for_ids(["gpt-5.6", "vendor-only"]);
+        assert_eq!(models.len(), 1);
+        assert_eq!(models[0].id, "codex/gpt-5.6");
+        assert_eq!(models[0].display_name, "GPT-5.6");
+        assert_eq!(models[0].context_window, 1_050_000);
+        assert_eq!(models[0].input_price_per_mtok, None);
         assert_eq!(
             models[0]
                 .options_schema
                 .pointer("/properties/reasoning_effort/enum")
                 .unwrap(),
-            &json!(["low", "medium", "high"])
+            &json!(["none", "low", "medium", "high", "xhigh", "max"])
         );
         assert_eq!(
             models[0]

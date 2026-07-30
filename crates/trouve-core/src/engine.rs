@@ -340,8 +340,8 @@ pub struct Engine {
     pub(crate) store: Store,
     pub(crate) data_dir: PathBuf,
     config_dir: Option<PathBuf>,
-    /// Public model metadata catalog shared by API providers and CLI
-    /// backends. Live vendor listings still own availability.
+    /// Canonical provider/model metadata and option-schema catalog shared by
+    /// API providers and CLI backends. Live sources contribute availability.
     model_catalog: Arc<trouve_providers::models_dev::ModelsDevCatalog>,
     providers: RwLock<HashMap<String, Arc<dyn Provider>>>,
     /// Providers registered programmatically (`with_provider`); preserved
@@ -655,7 +655,9 @@ fn build_all_backends(
         // whatever is on PATH (distro packages lag behind vendor releases).
         let command = resolved_cli_command(&pc.kind, pc.command.clone(), data_dir);
         let backend: Arc<dyn AgentBackend> = match pc.kind.as_str() {
-            "codex-app-server" => Arc::new(trouve_agents::codex::CodexBackend::new(id, command)),
+            "codex-app-server" => Arc::new(
+                trouve_agents::codex::CodexBackend::new(id, command).with_catalog(catalog.clone()),
+            ),
             "cursor-cli" => {
                 // Same precedence as native providers: inline key > env var >
                 // key saved through settings (secret store). Subscription
@@ -670,9 +672,10 @@ fn build_all_backends(
                             .ok()
                             .flatten()
                     });
-                Arc::new(trouve_agents::cursor::CursorBackend::new(
-                    id, command, api_key,
-                ))
+                Arc::new(
+                    trouve_agents::cursor::CursorBackend::new(id, command, api_key)
+                        .with_catalog(catalog.clone()),
+                )
             }
             "claude-cli" => Arc::new(
                 trouve_agents::claude::ClaudeBackend::new(id, command)
@@ -947,11 +950,11 @@ impl Engine {
         ids
     }
 
-    /// All models available right now: native provider models plus, for each
-    /// agent backend that is installed and logged in, the vendor-reported
-    /// catalog (cached inside the backend). Backends without credentials are
-    /// skipped entirely — their models can't run, so listing them only
-    /// clutters the picker.
+    /// All models available right now. Catalog-covered providers and backends
+    /// use live account-visible ids over canonical models.dev metadata;
+    /// uncatalogued custom, Cursor-only, and local models come from explicit
+    /// adapters. Backends without credentials are skipped entirely — their
+    /// models cannot run, so listing them only clutters the picker.
     ///
     /// While the server is offline, only models that can actually run are
     /// listed: the built-in local provider and loopback endpoints (Ollama

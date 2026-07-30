@@ -268,8 +268,8 @@ impl AgentBackend for ClaudeBackend {
 
     fn models(&self) -> Vec<ModelInfo> {
         // The same catalog as the per-use Anthropic API provider, so both
-        // surface the same list. Claude Code accepts full model ids; the
-        // subscription bills nothing per token, so pricing is dropped.
+        // surface the same metadata. Claude Code accepts full model ids; the
+        // subscription bills nothing per token, so only pricing is dropped.
         self.catalog
             .provider_models(
                 "anthropic",
@@ -278,7 +278,6 @@ impl AgentBackend for ClaudeBackend {
             )
             .into_iter()
             .map(|mut m| {
-                m.display_name = format!("{} (Claude Code)", m.display_name);
                 m.input_price_per_mtok = None;
                 m.output_price_per_mtok = None;
                 m
@@ -1053,6 +1052,20 @@ mod tests {
             .map(|arg| arg.to_string_lossy().into_owned())
             .collect();
         assert_eq!(args, ["--effort", "xhigh"]);
+    }
+
+    #[test]
+    fn models_dev_owns_claude_code_display_metadata() {
+        let backend = ClaudeBackend::new("claude-code", None);
+        let model = backend
+            .models()
+            .into_iter()
+            .find(|model| model.id == "claude-code/claude-fable-5")
+            .unwrap();
+        assert_eq!(model.display_name, "Claude Fable 5");
+        assert_eq!(model.context_window, 1_000_000);
+        assert_eq!(model.input_price_per_mtok, None);
+        assert_eq!(model.output_price_per_mtok, None);
     }
 
     #[test]

@@ -110,9 +110,9 @@ impl OpenAiCompatProvider {
         request
     }
 
-    /// Fetch the gateway's `/models` list (the OpenAI-standard endpoint,
-    /// also served by OpenRouter-style gateways with richer metadata:
-    /// display name, context length, pricing, tool support).
+    /// Fetch the gateway's `/models` list. Catalog-covered providers use it
+    /// only as an account-availability overlay; custom gateways and local
+    /// runtimes retain their explicit live-metadata adapters.
     async fn fetch_models(&self) -> Result<Vec<trouve_protocol::ModelInfo>, ProviderError> {
         let key = self.token.bearer().await?;
         let req = self.authed(self.client.get(format!("{}/models", self.base_url)), &key);
@@ -127,11 +127,16 @@ impl OpenAiCompatProvider {
             .json()
             .await
             .map_err(|e| ProviderError::Request(e.to_string()))?;
+        if !body["data"].is_array() {
+            return Err(ProviderError::Api(
+                "models response is missing its data array".into(),
+            ));
+        }
         let catalog_provider = self.catalog_provider_id();
-        let models = if catalog_provider.as_deref() == Some("openai") {
-            parse_openai_models(&self.id, &body, &self.catalog)
+        let models = if let Some(catalog_provider) = catalog_provider {
+            parse_catalog_models(&self.id, &body, &catalog_provider, &self.catalog)
         } else {
-            parse_gateway_models(&self.id, &body, catalog_provider.as_deref(), &self.catalog)
+            parse_gateway_models(&self.id, &body)
         };
         Ok(self.enrich_from_native_api(models, &key).await)
     }
@@ -141,6 +146,27 @@ impl OpenAiCompatProvider {
             self.catalog
                 .provider_for_endpoint(&self.id, &self.base_url, "openai-compat")
         })
+    }
+
+    /// Rebuild catalog-covered cache entries from their available ids so a
+    /// models.dev refresh is visible immediately even while the live
+    /// availability TTL remains valid.
+    fn canonicalize_models(
+        &self,
+        models: Vec<trouve_protocol::ModelInfo>,
+    ) -> Vec<trouve_protocol::ModelInfo> {
+        let Some(catalog_provider) = self.catalog_provider_id() else {
+            return models;
+        };
+        let prefix = format!("{}/", self.id);
+        self.catalog.provider_models_for_ids(
+            &catalog_provider,
+            &self.id,
+            models
+                .iter()
+                .map(|model| model.id.strip_prefix(&prefix).unwrap_or(model.id.as_str())),
+            OptionsDialect::OpenAi,
+        )
     }
 
     /// OpenAI-compatible endpoints intentionally expose only a lowest-common-
@@ -314,18 +340,12 @@ impl OpenAiCompatProvider {
     }
 }
 
-/// Map a gateway `/models` response to ModelInfos. OpenRouter-style
-/// entries carry display name, context length, pricing (USD per token, as
-/// strings), and a `supported_parameters` capability list; plain
-/// OpenAI-shaped gateways return bare ids, for which context is unknown.
-/// Models that declare no tool support are dropped — trouve's agent loop
-/// needs tools.
-fn parse_gateway_models(
-    provider_id: &str,
-    body: &Value,
-    catalog_provider_id: Option<&str>,
-    catalog: &ModelsDevCatalog,
-) -> Vec<trouve_protocol::ModelInfo> {
+/// Explicit metadata adapter for a custom gateway or local runtime that has no
+/// models.dev identity. Rich OpenRouter-style entries carry display name,
+/// context length, pricing, and tool support; plain OpenAI-shaped gateways
+/// return bare ids. Models that declare no tool support are dropped because
+/// trouve's agent loop requires tools.
+fn parse_gateway_models(provider_id: &str, body: &Value) -> Vec<trouve_protocol::ModelInfo> {
     let Some(data) = body["data"].as_array() else {
         return Vec::new();
     };
@@ -352,62 +372,43 @@ fn parse_gateway_models(
                     .or_else(|| entry["pricing"][k].as_f64())
                     .map(|value| value * 1e6)
             };
-            let fallback = catalog_provider_id.and_then(|catalog_provider| {
-                catalog.model(catalog_provider, provider_id, name, OptionsDialect::OpenAi)
-            });
-            let supports_tools = reported_tools
-                .or_else(|| fallback.as_ref().map(|model| model.supports_tools))
-                // The protocol cannot represent unknown tool capability yet;
-                // preserve generic OpenAI-compatible gateways until it can.
-                .unwrap_or(true);
+            // The protocol cannot represent unknown tool capability yet;
+            // preserve generic OpenAI-compatible gateways until it can.
+            let supports_tools = reported_tools.unwrap_or(true);
             supports_tools.then(|| trouve_protocol::ModelInfo {
                 id: format!("{provider_id}/{name}"),
                 display_name: entry["name"]
                     .as_str()
                     .map(String::from)
-                    .or_else(|| fallback.as_ref().map(|model| model.display_name.clone()))
                     .unwrap_or_else(|| name.to_string()),
-                context_window: if window > 0 {
-                    window
-                } else {
-                    fallback.as_ref().map_or(0, |model| model.context_window)
-                },
+                context_window: window,
                 supports_tools,
-                input_price_per_mtok: price("prompt").or_else(|| {
-                    fallback
-                        .as_ref()
-                        .and_then(|model| model.input_price_per_mtok)
-                }),
-                output_price_per_mtok: price("completion").or_else(|| {
-                    fallback
-                        .as_ref()
-                        .and_then(|model| model.output_price_per_mtok)
-                }),
-                options_schema: fallback
-                    .map(|model| model.options_schema)
-                    .unwrap_or_else(|| serde_json::json!({})),
+                input_price_per_mtok: price("prompt"),
+                output_price_per_mtok: price("completion"),
+                options_schema: serde_json::json!({}),
             })
         })
         .collect()
 }
 
-/// OpenAI's `/v1/models` response exposes availability but not model
-/// capabilities. Intersect it with our documented metadata overlay so stale
-/// fallback entries disappear while non-chat/embedding/image models do not
-/// leak into the agent picker.
-fn parse_openai_models(
+/// Intersect a catalog-covered provider's live ids with models.dev. All
+/// metadata and option schemas come from the catalog regardless of richer
+/// fields a vendor happens to include in its availability response.
+fn parse_catalog_models(
     provider_id: &str,
     body: &Value,
+    catalog_provider: &str,
     catalog: &ModelsDevCatalog,
 ) -> Vec<trouve_protocol::ModelInfo> {
     let Some(data) = body["data"].as_array() else {
         return Vec::new();
     };
-    data.iter()
-        .filter_map(|entry| entry["id"].as_str())
-        .filter_map(|id| catalog.model("openai", provider_id, id, OptionsDialect::OpenAi))
-        .filter(|model| model.supports_tools)
-        .collect()
+    catalog.provider_models_for_ids(
+        catalog_provider,
+        provider_id,
+        data.iter().filter_map(|entry| entry["id"].as_str()),
+        OptionsDialect::OpenAi,
+    )
 }
 
 fn apply_ollama_metadata(model: &mut trouve_protocol::ModelInfo, body: &Value) {
@@ -504,7 +505,7 @@ impl Provider for OpenAiCompatProvider {
         if let Some((at, models)) = cache.as_ref()
             && at.elapsed() < MODELS_TTL
         {
-            return models.clone();
+            return self.canonicalize_models(models.clone());
         }
         let stale = cache.as_ref().map(|(_, models)| models.clone());
         let fetched = tokio::time::timeout(MODELS_REQUEST_TIMEOUT, self.fetch_models())
@@ -517,17 +518,18 @@ impl Provider for OpenAiCompatProvider {
             })
             .and_then(|result| result);
         match fetched {
-            Ok(models) if !models.is_empty() => {
+            Ok(models) => {
                 *cache = Some((std::time::Instant::now(), models.clone()));
-                models
+                self.canonicalize_models(models)
             }
-            Ok(_) => stale.unwrap_or_else(|| self.models()),
             Err(e) => {
                 tracing::debug!(
                     "{} model list failed: {e}; using stale/models.dev list",
                     self.id
                 );
-                stale.unwrap_or_else(|| self.models())
+                stale
+                    .map(|models| self.canonicalize_models(models))
+                    .unwrap_or_else(|| self.models())
             }
         }
     }
@@ -731,15 +733,15 @@ mod tests {
     }
 
     #[test]
-    fn parses_openrouter_style_gateway_models() {
-        // Kilo Code / OpenRouter shape: rich metadata, string prices per
-        // token, capability list.
+    fn catalog_provider_uses_live_ids_and_models_dev_metadata() {
+        // The live record deliberately disagrees with models.dev. Only its id
+        // is an availability signal.
         let body = json!({ "data": [
             {
                 "id": "anthropic/claude-sonnet-4.5",
-                "name": "Claude Sonnet 4.5",
-                "context_length": 1_000_000,
-                "pricing": { "prompt": "0.000003", "completion": "0.000015" },
+                "name": "Vendor override",
+                "context_length": 8_192,
+                "pricing": { "prompt": "0.000099", "completion": "0.000099" },
                 "supported_parameters": ["max_tokens", "tools", "temperature"],
             },
             {
@@ -750,14 +752,35 @@ mod tests {
             },
         ]});
         let catalog = ModelsDevCatalog::embedded();
-        let models = parse_gateway_models("kilocode", &body, Some("kilo"), &catalog);
-        assert_eq!(models.len(), 1, "tool-less models are dropped");
+        let models = parse_catalog_models("kilocode", &body, "kilo", &catalog);
+        assert_eq!(models.len(), 1, "unknown models are dropped");
         let m = &models[0];
         assert_eq!(m.id, "kilocode/anthropic/claude-sonnet-4.5");
-        assert_eq!(m.display_name, "Claude Sonnet 4.5");
+        assert_eq!(m.display_name, "Anthropic: Claude Sonnet 4.5");
         assert_eq!(m.context_window, 1_000_000);
         assert_eq!(m.input_price_per_mtok, Some(3.0));
         assert_eq!(m.output_price_per_mtok, Some(15.0));
+        assert_eq!(
+            m.options_schema
+                .pointer("/properties/reasoning_effort/default"),
+            Some(&json!("medium"))
+        );
+    }
+
+    #[test]
+    fn custom_gateway_keeps_explicit_live_metadata_adapter() {
+        let body = json!({ "data": [{
+            "id": "custom-chat",
+            "name": "Custom Chat",
+            "context_length": 65_536,
+            "pricing": { "prompt": "0.000002", "completion": "0.000004" },
+            "supported_parameters": ["tools"],
+        }]});
+        let models = parse_gateway_models("custom", &body);
+        assert_eq!(models.len(), 1);
+        assert_eq!(models[0].display_name, "Custom Chat");
+        assert_eq!(models[0].context_window, 65_536);
+        assert_eq!(models[0].input_price_per_mtok, Some(2.0));
     }
 
     #[test]
@@ -765,8 +788,7 @@ mod tests {
         // Plain gateways (ollama, vllm) return ids only. Preserve the model
         // but do not invent a context window.
         let body = json!({ "data": [ { "id": "qwen2.5-coder:7b" } ] });
-        let catalog = ModelsDevCatalog::embedded();
-        let models = parse_gateway_models("ollama", &body, None, &catalog);
+        let models = parse_gateway_models("ollama", &body);
         assert_eq!(models.len(), 1);
         assert_eq!(models[0].id, "ollama/qwen2.5-coder:7b");
         assert_eq!(models[0].context_window, 0);
@@ -780,8 +802,7 @@ mod tests {
             { "id": "groq-model", "context_window": 131_072 },
             { "id": "vllm-model", "max_model_len": 65_536 },
         ] });
-        let catalog = ModelsDevCatalog::embedded();
-        let models = parse_gateway_models("custom", &body, None, &catalog);
+        let models = parse_gateway_models("custom", &body);
         assert_eq!(models[0].context_window, 131_072);
         assert_eq!(models[1].context_window, 65_536);
     }
@@ -813,9 +834,8 @@ mod tests {
 
     #[test]
     fn applies_lm_studio_effective_context() {
-        let catalog = ModelsDevCatalog::embedded();
         let body = json!({ "data": [{ "id": "qwen", }] });
-        let mut models = parse_gateway_models("lmstudio", &body, None, &catalog);
+        let mut models = parse_gateway_models("lmstudio", &body);
         apply_lm_studio_metadata(
             &mut models,
             "lmstudio",
@@ -838,7 +858,7 @@ mod tests {
             {"id": "gpt-5.6-terra"}
         ]});
         let catalog = ModelsDevCatalog::embedded();
-        let models = parse_openai_models("openai", &body, &catalog);
+        let models = parse_catalog_models("openai", &body, "openai", &catalog);
         assert_eq!(models.len(), 2);
         assert_eq!(models[0].id, "openai/gpt-5.6");
         assert_eq!(models[0].context_window, 1_050_000);
