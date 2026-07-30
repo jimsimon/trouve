@@ -8170,12 +8170,13 @@ fn session_title_fallback(prompt: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        ServerReplayBuffer, SubscriptionRefresh, SubscriptionRefreshState, approval_pill,
-        attention_badge, check_pill, classify_pr, download_progress,
-        format_pr_dashboard_refresh_status, human_age, human_rate, merge_pill, model_health_view,
-        pr_badge, preferred_model_index, preferred_thinking_index, project_session_prs,
-        provider_login_requires_code, reconcile_pr_group_order, reconcile_workspace_order,
-        reorder_id, should_open_chat_at_tail, thinking_property,
+        ChatWindow, ServerReplayBuffer, SubscriptionRefresh, SubscriptionRefreshState,
+        approval_pill, attention_badge, check_pill, classify_pr, download_progress,
+        format_pr_dashboard_refresh_status, human_age, human_rate, is_web_url, merge_pill,
+        model_health_view, pr_badge, preferred_model_index, preferred_thinking_index,
+        project_session_prs, provider_login_requires_code, reconcile_pr_group_order,
+        reconcile_workspace_order, reorder_id, session_title_fallback, should_open_chat_at_tail,
+        thinking_property,
     };
     use chrono::{Duration, TimeZone, Utc};
     use trouve_protocol::{
