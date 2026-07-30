@@ -61,6 +61,7 @@ trouve-client-core = { path = "crates/trouve-client-core", version = "3.5.0" }
 trouve-slint-code-view = { path = "crates/trouve-slint-code-view", version = "3.5.0" }
 trouve-slint-diff-view = { path = "crates/trouve-slint-diff-view", version = "3.5.0" }
 trouve-slint-markdown = { path = "crates/trouve-slint-markdown", version = "3.5.0" }
+trouve-slint-media-view = { path = "crates/trouve-slint-media-view", version = "3.5.0" }
 trouve-slint-terminal = { path = "crates/trouve-slint-terminal", version = "3.5.0" }
 
 [profile.release]
