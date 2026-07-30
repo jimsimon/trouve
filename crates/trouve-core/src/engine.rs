@@ -5396,7 +5396,7 @@ impl Engine {
 
             for call in tool_calls {
                 let (result_content, images) = self
-                    .handle_tool_call(&session, thread, turn, &mode, &ctx, &call, &cancel)
+                    .handle_tool_call(&session, thread, turn, &mode, &ctx, &call, &cancel, false)
                     .await?;
                 self.store.append_message(
                     &thread.id,
@@ -5634,10 +5634,11 @@ impl Engine {
         // second identical one; the vendor's own tool_result completes the
         // same card in place afterwards. ask_question keeps a fresh id — it
         // draws no card, and its id doubles as the question request id.
-        let call_id = (name != "ask_question")
+        let vendor_call_id = (name != "ask_question")
             .then(|| self.open_bridged_card(thread_id, turn, name, arguments))
-            .flatten()
-            .unwrap_or_else(|| new_id("call"));
+            .flatten();
+        let vendor_announced = vendor_call_id.is_some();
+        let call_id = vendor_call_id.unwrap_or_else(|| new_id("call"));
         let call = trouve_providers::ToolCallRequest {
             id: call_id,
             name: name.to_string(),
@@ -5657,7 +5658,16 @@ impl Engine {
             .cloned()
             .unwrap_or_default();
         let (content, _images) = self
-            .handle_tool_call(&session, &thread, turn, &mode, &ctx, &call, &cancel)
+            .handle_tool_call(
+                &session,
+                &thread,
+                turn,
+                &mode,
+                &ctx,
+                &call,
+                &cancel,
+                vendor_announced,
+            )
             .await
             .map_err(EngineError::Internal)?;
         Ok(content)
@@ -6664,6 +6674,7 @@ impl Engine {
         ctx: &ToolCtx,
         call: &trouve_providers::ToolCallRequest,
         cancel: &tokio_util::sync::CancellationToken,
+        vendor_announced: bool,
     ) -> Result<(String, Vec<trouve_providers::ToolImage>)> {
         let scope = Scope::Thread(thread.id.clone());
         let call_id = if call.id.is_empty() {
@@ -6727,14 +6738,16 @@ impl Engine {
             } else {
                 ToolStatus::Ok
             };
-            self.store.append_event(
-                scope,
-                Event::ToolCompleted {
-                    call_id,
-                    status,
-                    result: result.clone(),
-                },
-            )?;
+            if !vendor_announced {
+                self.store.append_event(
+                    scope,
+                    Event::ToolCompleted {
+                        call_id,
+                        status,
+                        result: result.clone(),
+                    },
+                )?;
+            }
             return Ok((result.to_string(), Vec::new()));
         }
 
@@ -6778,16 +6791,18 @@ impl Engine {
 
         let decision = match decision {
             Gate::Deny => {
-                self.store.append_event(
-                    scope.clone(),
-                    Event::ToolCompleted {
-                        call_id: call_id.clone(),
-                        status: ToolStatus::Denied,
-                        result: serde_json::json!({
-                            "error": "tool not permitted in this mode"
-                        }),
-                    },
-                )?;
+                if !vendor_announced {
+                    self.store.append_event(
+                        scope.clone(),
+                        Event::ToolCompleted {
+                            call_id: call_id.clone(),
+                            status: ToolStatus::Denied,
+                            result: serde_json::json!({
+                                "error": "tool not permitted in this mode"
+                            }),
+                        },
+                    )?;
+                }
                 return Ok((
                     "Tool call denied: not permitted in this mode.".into(),
                     Vec::new(),
@@ -6828,23 +6843,27 @@ impl Engine {
         };
 
         if decision == ApprovalDecision::Deny {
-            self.store.append_event(
-                scope.clone(),
-                Event::ToolCompleted {
-                    call_id: call_id.clone(),
-                    status: ToolStatus::Denied,
-                    result: serde_json::json!({"error": "denied by user"}),
-                },
-            )?;
+            if !vendor_announced {
+                self.store.append_event(
+                    scope.clone(),
+                    Event::ToolCompleted {
+                        call_id: call_id.clone(),
+                        status: ToolStatus::Denied,
+                        result: serde_json::json!({"error": "denied by user"}),
+                    },
+                )?;
+            }
             return Ok(("Tool call denied by the user.".into(), Vec::new()));
         }
 
-        self.store.append_event(
-            scope.clone(),
-            Event::ToolStarted {
-                call_id: call_id.clone(),
-            },
-        )?;
+        if !vendor_announced {
+            self.store.append_event(
+                scope.clone(),
+                Event::ToolStarted {
+                    call_id: call_id.clone(),
+                },
+            )?;
+        }
         let mut outcome = self
             .executor
             .execute(ctx, &call.name, &call.arguments)
@@ -6875,14 +6894,16 @@ impl Engine {
             numbers.extend(pr_numbers_in_value(&outcome.result, host, owner, repo));
             self.record_session_pr_numbers(&session.id, &repository, numbers, &mut recorded_prs)?;
         }
-        self.store.append_event(
-            scope.clone(),
-            Event::ToolCompleted {
-                call_id,
-                status: outcome.status,
-                result: outcome.result.clone(),
-            },
-        )?;
+        if !vendor_announced {
+            self.store.append_event(
+                scope.clone(),
+                Event::ToolCompleted {
+                    call_id,
+                    status: outcome.status,
+                    result: outcome.result.clone(),
+                },
+            )?;
+        }
         if let Some(todos) = todos {
             self.store
                 .append_event(scope, Event::TodosUpdated { todos })?;
@@ -7871,14 +7892,22 @@ fn open_bridged_card_in<'a>(
                 ..
             } if *t == turn => {
                 let (tool, args) = if tool == "mcpToolCall" {
+                    if args.get("server").and_then(serde_json::Value::as_str) != Some("trouve") {
+                        continue;
+                    }
                     (
-                        args.get("tool").and_then(|v| v.as_str()).unwrap_or(tool),
+                        args.get("tool")
+                            .and_then(serde_json::Value::as_str)
+                            .unwrap_or(""),
                         args.get("arguments").unwrap_or(args),
                     )
                 } else {
-                    (tool.as_str(), args)
+                    let Some(tool) = tool.strip_prefix("mcp__trouve__") else {
+                        continue;
+                    };
+                    (tool, args)
                 };
-                if tool.rsplit("__").next() == Some(name) && args == arguments {
+                if tool == name && args == arguments {
                     open.push(call_id.clone());
                 }
             }
@@ -8871,6 +8900,35 @@ mod tests {
             open_bridged_card_in(codex.iter(), 1, "search", &args),
             Some("item_7".into())
         );
+
+        let other_claude_server = [Event::ToolRequested {
+            turn: 3,
+            call_id: "toolu_other".into(),
+            tool: "mcp__other__search".into(),
+            args: args.clone(),
+            requires_approval: false,
+        }];
+        assert_eq!(
+            open_bridged_card_in(other_claude_server.iter(), 3, "search", &args),
+            None
+        );
+        let other_codex_server = [Event::ToolRequested {
+            turn: 1,
+            call_id: "item_other".into(),
+            tool: "mcpToolCall".into(),
+            args: serde_json::json!({
+                "id": "item_other",
+                "type": "mcpToolCall",
+                "server": "other",
+                "tool": "search",
+                "arguments": args,
+            }),
+            requires_approval: false,
+        }];
+        assert_eq!(
+            open_bridged_card_in(other_codex_server.iter(), 1, "search", &args),
+            None
+        );
     }
 
     #[test]
@@ -9248,6 +9306,7 @@ mod tests {
                 &ctx,
                 &call,
                 &tokio_util::sync::CancellationToken::new(),
+                false,
             )
             .await
             .unwrap();
@@ -9266,6 +9325,32 @@ mod tests {
             Event::TodosUpdated { todos }
                 if todos.len() == 1 && todos[0].id == "one"
         )));
+
+        let mut bridged_call = call.clone();
+        bridged_call.id = "call_bridged".into();
+        engine
+            .handle_tool_call(
+                &session,
+                &thread,
+                1,
+                &modes::fallback_mode(),
+                &ctx,
+                &bridged_call,
+                &tokio_util::sync::CancellationToken::new(),
+                true,
+            )
+            .await
+            .unwrap();
+        let events = store
+            .events_after(&Scope::Thread(thread.id.clone()), 0)
+            .unwrap();
+        assert!(!events.iter().any(|env| {
+            matches!(
+                &env.event,
+                Event::ToolStarted { call_id } | Event::ToolCompleted { call_id, .. }
+                    if call_id == "call_bridged"
+            )
+        }));
 
         // Vendor-native TodoWrite completions can be an acknowledgement
         // rather than the updated list. Fall back to the paired start args,
