@@ -1753,6 +1753,7 @@ export component AppWindow inherits Window {
     in-out property <bool> chat-find-case-sensitive: false;
     in property <[int]> chat-find-matches;
     in-out property <int> chat-find-active: -1;
+    private property <int> chat-find-focus-generation: 0;
     out property <int> chat-find-active-row:
         root.chat-find-active >= 0
             && root.chat-find-active < root.chat-find-matches.length
@@ -1762,8 +1763,7 @@ export component AppWindow inherits Window {
         if (root.center-screen == 0) {
             root.chat-find-open = true;
             root.chat-find-changed(root.chat-find-query);
-            chat-find-input.focus();
-            chat-find-input.select-all();
+            root.chat-find-focus-generation += 1;
         }
     }
     public function close-chat-find() {
@@ -3075,8 +3075,7 @@ export component AppWindow inherits Window {
 
                 // Browser-style transcript find. The native Ctrl/Cmd+F
                 // handler opens this bar and focuses/selects the query.
-                Rectangle {
-                    visible: root.chat-find-open && root.center-screen == 0;
+                if root.chat-find-open && root.center-screen == 0: Rectangle {
                     height: Theme.fs(30px);
                     background: Theme.c.raised-bg;
                     border-radius: 6px;
@@ -3102,7 +3101,17 @@ export component AppWindow inherits Window {
                                 font-size: Theme.fs(12px);
                                 placeholder-text: "Find in chat…";
                                 accessible-label: "Find in chat";
+                                private property <int> focus-generation:
+                                    root.chat-find-focus-generation;
                                 text <=> root.chat-find-query;
+                                init => {
+                                    self.focus();
+                                    self.select-all();
+                                }
+                                changed focus-generation => {
+                                    self.focus();
+                                    self.select-all();
+                                }
                                 edited => {
                                     root.chat-find-changed(self.text);
                                 }
