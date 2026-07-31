@@ -1,4 +1,5 @@
 import type {
+  CodeReviewSettings,
   Dashboard,
   EventEnvelope,
   JobDetail,
@@ -59,6 +60,15 @@ export async function getDashboard(): Promise<DashboardSnapshot> {
   return { dashboard, cursor };
 }
 
+export const getReviewSettings = (): Promise<CodeReviewSettings> =>
+  api("/config/code-review");
+export const saveReviewSettings = (
+  settings: CodeReviewSettings,
+): Promise<CodeReviewSettings> =>
+  api("/config/code-review", {
+    method: "PUT",
+    body: JSON.stringify(settings),
+  });
 export const getJob = (id: string): Promise<JobDetail> =>
   api(`/code-review/jobs/${encodeURIComponent(id)}?include_task_content=false`);
 export const getTask = (jobId: string, taskId: string): Promise<ReviewTask> =>

@@ -376,6 +376,10 @@ pub enum Event {
     GitWorktreeSettingsUpdated {
         settings: crate::GitWorktreeSettings,
     },
+    /// The persisted automated code-review execution deadlines changed.
+    /// Carries a full replacement snapshot for replay and reconnect.
+    #[serde(rename = "settings.code_review_updated")]
+    CodeReviewSettingsUpdated { settings: crate::CodeReviewSettings },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
@@ -481,6 +485,22 @@ mod tests {
             value["settings"]["title_model_resource_policy"],
             "cpu_ram_only"
         );
+    }
+
+    #[test]
+    fn code_review_settings_event_uses_namespaced_tag() {
+        let event = Event::CodeReviewSettingsUpdated {
+            settings: crate::CodeReviewSettings {
+                total_timeout_seconds: 900,
+                reviewer_timeout_seconds: 600,
+                coordinator_timeout_seconds: 300,
+            },
+        };
+        let value = serde_json::to_value(event).unwrap();
+        assert_eq!(value["type"], "settings.code_review_updated");
+        assert_eq!(value["settings"]["total_timeout_seconds"], 900);
+        assert_eq!(value["settings"]["reviewer_timeout_seconds"], 600);
+        assert_eq!(value["settings"]["coordinator_timeout_seconds"], 300);
     }
 
     #[test]

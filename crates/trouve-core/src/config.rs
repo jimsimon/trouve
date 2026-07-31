@@ -71,6 +71,18 @@ pub struct Config {
     /// private key and webhook secret live in the secret store, never here.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub github_review_app: Option<GithubReviewAppConfig>,
+    /// Whole automated code-review job deadline. Unset uses the built-in
+    /// default (or the environment override when present).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub code_review_timeout_seconds: Option<u64>,
+    /// Per-reviewer-batch deadline. Unset uses the built-in default (or the
+    /// environment override when present).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub code_review_reviewer_timeout_seconds: Option<u64>,
+    /// Final review editor deadline. Unset uses the built-in default (or the
+    /// environment override when present).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub code_review_coordinator_timeout_seconds: Option<u64>,
     /// Set when the on-disk config failed to parse and we fell back to
     /// defaults. Never serialized; `save_to` refuses to persist in this
     /// state so a parse error can't pave over the user's real config.
@@ -257,6 +269,9 @@ mod tests {
         cfg.title_model_load_behavior = Some(trouve_protocol::TitleModelLoadBehavior::OnDemand);
         cfg.title_model_resource_policy =
             Some(trouve_protocol::TitleModelResourcePolicy::GpuCpuRam);
+        cfg.code_review_timeout_seconds = Some(1_200);
+        cfg.code_review_reviewer_timeout_seconds = Some(720);
+        cfg.code_review_coordinator_timeout_seconds = Some(360);
         cfg.save_to(&path).unwrap();
         let cfg = Config::load_from(&path);
         assert_eq!(
@@ -267,5 +282,8 @@ mod tests {
             cfg.title_model_resource_policy,
             Some(trouve_protocol::TitleModelResourcePolicy::GpuCpuRam)
         );
+        assert_eq!(cfg.code_review_timeout_seconds, Some(1_200));
+        assert_eq!(cfg.code_review_reviewer_timeout_seconds, Some(720));
+        assert_eq!(cfg.code_review_coordinator_timeout_seconds, Some(360));
     }
 }

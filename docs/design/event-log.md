@@ -106,6 +106,9 @@ Server scope:
 - `settings.git_worktrees_updated` `{settings}` — full replacement snapshot
   after the session-title model's load policy, installation progress, or
   runtime state changes
+- `settings.code_review_updated` `{settings}` — full replacement snapshot
+  after the automated-review total, reviewer, or final-editor deadline
+  changes
 
 Code-review-job scope:
 

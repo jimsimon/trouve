@@ -18,6 +18,7 @@ import {
   getModeInfos,
   getModels,
   getProviders,
+  getReviewSettings,
   getStats,
   getTask,
   installCli,
@@ -33,6 +34,7 @@ import {
   saveMode,
   saveProvider,
   saveRepository,
+  saveReviewSettings,
   saveReviewer,
   startLogin,
   submitLoginCode,
@@ -59,8 +61,15 @@ import {
   reviewTaskSummary,
   type ReviewOutputField,
 } from "./review-output";
+import {
+  TIMEOUT_MINUTES_INPUT_MIN,
+  TIMEOUT_MINUTES_INPUT_STEP,
+  reviewSettingsFromMinutes,
+  timeoutMinutes,
+} from "./review-settings";
 import { jobStatusClass, safeExternalUrl } from "./security";
 import type {
+  CodeReviewSettings,
   Dashboard,
   DurationStats,
   EventEnvelope,
@@ -301,6 +310,7 @@ function App() {
   const [route, setRoute] = useState(routeFromHash);
   const [dashboard, setDashboard] = useState<Dashboard | null>(null);
   const [providers, setProviders] = useState<ProvidersResponse | null>(null);
+  const [reviewSettings, setReviewSettings] = useState<CodeReviewSettings | null>(null);
   const [models, setModels] = useState<Model[]>([]);
   const [modeInfos, setModeInfos] = useState<ModeInfo[]>([]);
   const [dashboardError, setDashboardError] = useState("");
@@ -351,6 +361,7 @@ function App() {
   const loadConfiguration = async (): Promise<void> => {
     const results = await Promise.allSettled([
       getProviders().then(setProviders),
+      getReviewSettings().then(setReviewSettings),
       getModels().then(setModels),
       getModeInfos().then(setModeInfos),
     ]);
@@ -429,6 +440,7 @@ function App() {
         <SettingsPage
           app={dashboard.app}
           providers={providers}
+          reviewSettings={reviewSettings}
           models={models}
           reviewModeInfo={modeInfos.find(({ mode }) => mode.id === "review")}
           onChanged={() => {
@@ -1565,17 +1577,17 @@ function JobDetailPane({
                 )}
                 <OutputBlock
                   title="Assistant output"
-                  value={selectedTask.output}
+                  value={selectedTask.output ?? ""}
                   followTail={selectedTask.status === "running"}
                 />
                 <OutputBlock
                   title="Reasoning"
-                  value={selectedTask.thinking}
+                  value={selectedTask.thinking ?? ""}
                   followTail={selectedTask.status === "running"}
                 />
                 <OutputBlock
                   title="Tool output"
-                  value={selectedTask.tool_output}
+                  value={selectedTask.tool_output ?? ""}
                   followTail={selectedTask.status === "running"}
                 />
                 {selectedTask.prompt && (
@@ -2653,12 +2665,14 @@ function StatsChart({
 function SettingsPage({
   app,
   providers,
+  reviewSettings,
   models,
   reviewModeInfo,
   onChanged,
 }: {
   app: GithubAppStatus;
   providers: ProvidersResponse | null;
+  reviewSettings: CodeReviewSettings | null;
   models: Model[];
   reviewModeInfo?: ModeInfo;
   onChanged: () => void;
@@ -2677,10 +2691,115 @@ function SettingsPage({
         globalThinking={providers?.default_thinking_level}
         onChanged={onChanged}
       />
+      <ReviewTimeoutSettings settings={reviewSettings} onChanged={onChanged} />
       <div class="settings-grid">
         <GithubAppSettings app={app} onChanged={onChanged} />
         <ProviderSettings providers={providers} models={models} onChanged={onChanged} />
       </div>
+    </section>
+  );
+}
+
+function ReviewTimeoutSettings({
+  settings,
+  onChanged,
+}: {
+  settings: CodeReviewSettings | null;
+  onChanged: () => void;
+}) {
+  const [total, setTotal] = useState(settings ? timeoutMinutes(settings.total_timeout_seconds) : "");
+  const [reviewer, setReviewer] = useState(
+    settings ? timeoutMinutes(settings.reviewer_timeout_seconds) : "",
+  );
+  const [coordinator, setCoordinator] = useState(
+    settings ? timeoutMinutes(settings.coordinator_timeout_seconds) : "",
+  );
+  const [busy, setBusy] = useState(false);
+  const [message, flash] = useFlash();
+  useEffect(() => {
+    if (!settings) return;
+    setTotal(timeoutMinutes(settings.total_timeout_seconds));
+    setReviewer(timeoutMinutes(settings.reviewer_timeout_seconds));
+    setCoordinator(timeoutMinutes(settings.coordinator_timeout_seconds));
+  }, [
+    settings?.total_timeout_seconds,
+    settings?.reviewer_timeout_seconds,
+    settings?.coordinator_timeout_seconds,
+  ]);
+
+  return (
+    <section class="panel settings-card review-timeout-settings">
+      <PanelTitle
+        title="Review timeouts"
+        subtitle="Deadlines for unattended review jobs. New jobs snapshot these values when they start."
+      />
+      {settings ? (
+        <form
+          onSubmit={async (event) => {
+            event.preventDefault();
+            setBusy(true);
+            try {
+              await saveReviewSettings(reviewSettingsFromMinutes(total, reviewer, coordinator));
+              flash("Review timeouts saved");
+              onChanged();
+            } catch (cause) {
+              flash(cause instanceof Error ? cause.message : String(cause));
+            } finally {
+              setBusy(false);
+            }
+          }}
+        >
+          <div class="form-grid">
+            <label>
+              Total review timeout (minutes)
+              <input
+                type="number"
+                min={TIMEOUT_MINUTES_INPUT_MIN}
+                step={TIMEOUT_MINUTES_INPUT_STEP}
+                required
+                value={total}
+                onInput={(event) => setTotal(event.currentTarget.value)}
+              />
+              <small>Outer deadline covering preparation through publication.</small>
+            </label>
+            <label>
+              Reviewer timeout (minutes)
+              <input
+                type="number"
+                min={TIMEOUT_MINUTES_INPUT_MIN}
+                step={TIMEOUT_MINUTES_INPUT_STEP}
+                required
+                value={reviewer}
+                onInput={(event) => setReviewer(event.currentTarget.value)}
+              />
+              <small>Maximum time for one persona batch, including JSON repair.</small>
+            </label>
+            <label>
+              Final editor timeout (minutes)
+              <input
+                type="number"
+                min={TIMEOUT_MINUTES_INPUT_MIN}
+                step={TIMEOUT_MINUTES_INPUT_STEP}
+                required
+                value={coordinator}
+                onInput={(event) => setCoordinator(event.currentTarget.value)}
+              />
+              <small>Maximum time for candidate validation and final selection.</small>
+            </label>
+          </div>
+          <p class="field-help">
+            Environment timeout variables take precedence over these persisted values.
+          </p>
+          <div class="action-row">
+            <button type="submit" disabled={busy}>
+              {busy ? "Saving…" : "Save review timeouts"}
+            </button>
+            {message && <span role="status">{message}</span>}
+          </div>
+        </form>
+      ) : (
+        <p class="muted">Review timeout configuration is unavailable.</p>
+      )}
     </section>
   );
 }

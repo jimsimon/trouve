@@ -23,21 +23,22 @@ use trouve_core::engine::EngineError;
 use trouve_protocol::{
     AddLocalModelRequest, AgentMode, Automation, BranchList, CliInfo, CliInstallStatus, CliList,
     CodeReviewDashboard, CodeReviewJob, CodeReviewJobDetail, CodeReviewJobList,
-    CodeReviewRepository, CodeReviewStats, CodeReviewStatsRange, CodeReviewTask,
-    CompleteLoginRequest, ConfigureGithubAppRequest, CreatePrRequest, CreateSessionRequest,
-    CreateThreadRequest, DirEntry, EVENT_CURSOR_HEADER, ErrorBody, FileContent,
-    GenerateSessionTitleRequest, GeneratedSessionTitle, GitWorktreeSettings, GithubAppStatus,
-    GithubIntegration, GithubPrList, KnownProvider, LocalSearchResult, LocalStatus, LoginStarted,
-    LoginStatus, McpLogs, McpServerInfo, MergePrRequest, ModeInfo, ModelInfo, OpenTerminalRequest,
-    PROTOCOL_VERSION, PrInfo, ProviderInfo, ProvidersResponse, QueuedPrompt,
-    RegisterWorkspaceRequest, ReorderQueueRequest, RequestCodeReviewRequest,
+    CodeReviewRepository, CodeReviewSettings, CodeReviewStats, CodeReviewStatsRange,
+    CodeReviewTask, CompleteLoginRequest, ConfigureGithubAppRequest, CreatePrRequest,
+    CreateSessionRequest, CreateThreadRequest, DirEntry, EVENT_CURSOR_HEADER, ErrorBody,
+    FileContent, GenerateSessionTitleRequest, GeneratedSessionTitle, GitWorktreeSettings,
+    GithubAppStatus, GithubIntegration, GithubPrList, KnownProvider, LocalSearchResult,
+    LocalStatus, LoginStarted, LoginStatus, McpLogs, McpServerInfo, MergePrRequest, ModeInfo,
+    ModelInfo, OpenTerminalRequest, PROTOCOL_VERSION, PrInfo, ProviderInfo, ProvidersResponse,
+    QueuedPrompt, RegisterWorkspaceRequest, ReorderQueueRequest, RequestCodeReviewRequest,
     ResolveApprovalRequest, ResolveQuestionRequest, ReviewerProfile, Scope, SendMessageRequest,
-    ServerInfo, Session, SessionDiff, SetDefaultModelRequest, SetDefaultPermissionModeRequest,
-    SetGitWorktreeSettingsRequest, SetLocalEnabledRequest, SubscriptionHealth, TerminalInfo,
-    TerminalInputRequest, TerminalResizeRequest, Thread, TurnAccepted,
-    UpdateCodeReviewRepositoryRequest, UpdateQueuedPromptRequest, UpdateSessionRequest,
-    UpdateThreadRequest, UpsertAutomationRequest, UpsertMcpServerRequest, UpsertModeRequest,
-    UpsertProviderRequest, UpsertReviewerProfileRequest, UsageSummary, Workspace,
+    ServerInfo, Session, SessionDiff, SetCodeReviewSettingsRequest, SetDefaultModelRequest,
+    SetDefaultPermissionModeRequest, SetGitWorktreeSettingsRequest, SetLocalEnabledRequest,
+    SubscriptionHealth, TerminalInfo, TerminalInputRequest, TerminalResizeRequest, Thread,
+    TurnAccepted, UpdateCodeReviewRepositoryRequest, UpdateQueuedPromptRequest,
+    UpdateSessionRequest, UpdateThreadRequest, UpsertAutomationRequest, UpsertMcpServerRequest,
+    UpsertModeRequest, UpsertProviderRequest, UpsertReviewerProfileRequest, UsageSummary,
+    Workspace,
 };
 use utoipa::OpenApi;
 
@@ -139,6 +140,8 @@ impl IntoResponse for ApiError {
         restart_local_server,
         set_default_model,
         set_default_permission_mode,
+        get_code_review_settings,
+        set_code_review_settings,
         get_git_worktree_settings,
         set_git_worktree_settings,
         install_title_model,
@@ -231,6 +234,8 @@ impl IntoResponse for ApiError {
         UpsertProviderRequest,
         SetDefaultModelRequest,
         SetDefaultPermissionModeRequest,
+        CodeReviewSettings,
+        SetCodeReviewSettingsRequest,
         trouve_protocol::TitleModelLoadBehavior,
         trouve_protocol::TitleModelStatus,
         GitWorktreeSettings,
@@ -600,6 +605,10 @@ pub fn build_router(engine: Arc<Engine>) -> Router {
         .route(
             "/v1/config/default-model",
             axum::routing::put(set_default_model),
+        )
+        .route(
+            "/v1/config/code-review",
+            get(get_code_review_settings).put(set_code_review_settings),
         )
         .route(
             "/v1/config/default-permission-mode",
@@ -1533,6 +1542,31 @@ async fn set_default_permission_mode(
 ) -> Result<StatusCode, ApiError> {
     engine.set_default_permission_mode(req.permission_mode)?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+#[utoipa::path(get, path = "/v1/config/code-review",
+    responses((status = 200, body = CodeReviewSettings,
+        headers(("x-trouve-event-cursor" = u64, description = "Server event cursor for this snapshot")))))]
+async fn get_code_review_settings(
+    State(engine): State<Arc<Engine>>,
+) -> Result<impl IntoResponse, ApiError> {
+    let (cursor, settings) = engine.code_review_settings_snapshot()?;
+    Ok(([(EVENT_CURSOR_HEADER, cursor.to_string())], Json(settings)))
+}
+
+#[utoipa::path(put, path = "/v1/config/code-review",
+    request_body = SetCodeReviewSettingsRequest,
+    responses(
+        (status = 200, body = CodeReviewSettings,
+            headers(("x-trouve-event-cursor" = u64, description = "Server event cursor for this snapshot"))),
+        (status = 400, body = ErrorBody)
+    ))]
+async fn set_code_review_settings(
+    State(engine): State<Arc<Engine>>,
+    Json(req): Json<SetCodeReviewSettingsRequest>,
+) -> Result<impl IntoResponse, ApiError> {
+    let (cursor, settings) = engine.set_code_review_settings(req)?;
+    Ok(([(EVENT_CURSOR_HEADER, cursor.to_string())], Json(settings)))
 }
 
 #[utoipa::path(get, path = "/v1/config/git-worktrees",

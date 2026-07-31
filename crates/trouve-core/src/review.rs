@@ -20,10 +20,10 @@ use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
 use trouve_protocol::{
     CodeReviewDashboard, CodeReviewMode, CodeReviewRepository, CodeReviewRoutingDecision,
-    CodeReviewRoutingMode, CodeReviewRoutingReason, CodeReviewRoutingSource,
+    CodeReviewRoutingMode, CodeReviewRoutingReason, CodeReviewRoutingSource, CodeReviewSettings,
     ConfigureGithubAppRequest, CreateSessionRequest, CreateThreadRequest, Event, GithubAppStatus,
     PermissionMode, ReviewerOverride, ReviewerProfile, ReviewerPromptMode, Scope,
-    UpdateCodeReviewRepositoryRequest, UpsertReviewerProfileRequest,
+    SetCodeReviewSettingsRequest, UpdateCodeReviewRepositoryRequest, UpsertReviewerProfileRequest,
 };
 
 use crate::config::GithubReviewAppConfig;
@@ -41,6 +41,10 @@ const DEFAULT_RECONCILE_INTERVAL: Duration = Duration::from_secs(60);
 const JOB_IDLE_INTERVAL: Duration = Duration::from_secs(5);
 const REVIEW_TIMEOUT_ENV: &str = "TROUVE_CODE_REVIEW_TIMEOUT_SECONDS";
 const DEFAULT_REVIEW_TIMEOUT: Duration = Duration::from_secs(15 * 60);
+const REVIEWER_TIMEOUT_ENV: &str = "TROUVE_CODE_REVIEW_REVIEWER_TIMEOUT_SECONDS";
+const DEFAULT_REVIEWER_TIMEOUT: Duration = Duration::from_secs(10 * 60);
+const REVIEW_COORDINATOR_TIMEOUT_ENV: &str = "TROUVE_CODE_REVIEW_COORDINATOR_TIMEOUT_SECONDS";
+const DEFAULT_REVIEW_COORDINATOR_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 const REVIEW_JOB_CONCURRENCY_ENV: &str = "TROUVE_CODE_REVIEW_JOB_CONCURRENCY";
 const DEFAULT_REVIEW_JOB_CONCURRENCY: usize = 2;
 const REVIEW_TASK_CONCURRENCY_ENV: &str = "TROUVE_CODE_REVIEW_TASK_CONCURRENCY";
@@ -113,9 +117,9 @@ fn parse_code_review_timeout(value: &str) -> Option<Duration> {
         .map(Duration::from_secs)
 }
 
-fn code_review_timeout() -> Duration {
+fn code_review_timeout(configured: Duration) -> Duration {
     let Ok(value) = std::env::var(REVIEW_TIMEOUT_ENV) else {
-        return DEFAULT_REVIEW_TIMEOUT;
+        return configured;
     };
     match parse_code_review_timeout(&value) {
         Some(timeout) => timeout,
@@ -123,10 +127,46 @@ fn code_review_timeout() -> Duration {
             tracing::warn!(
                 variable = REVIEW_TIMEOUT_ENV,
                 value,
-                default_seconds = DEFAULT_REVIEW_TIMEOUT.as_secs(),
-                "invalid code-review timeout; using the default"
+                configured_seconds = configured.as_secs(),
+                "invalid code-review timeout; using the configured value"
             );
-            DEFAULT_REVIEW_TIMEOUT
+            configured
+        }
+    }
+}
+
+fn code_review_coordinator_timeout(configured: Duration) -> Duration {
+    let Ok(value) = std::env::var(REVIEW_COORDINATOR_TIMEOUT_ENV) else {
+        return configured;
+    };
+    match parse_code_review_timeout(&value) {
+        Some(timeout) => timeout,
+        None => {
+            tracing::warn!(
+                variable = REVIEW_COORDINATOR_TIMEOUT_ENV,
+                value,
+                configured_seconds = configured.as_secs(),
+                "invalid code-review coordinator timeout; using the configured value"
+            );
+            configured
+        }
+    }
+}
+
+fn code_review_reviewer_timeout(configured: Duration) -> Duration {
+    let Ok(value) = std::env::var(REVIEWER_TIMEOUT_ENV) else {
+        return configured;
+    };
+    match parse_code_review_timeout(&value) {
+        Some(timeout) => timeout,
+        None => {
+            tracing::warn!(
+                variable = REVIEWER_TIMEOUT_ENV,
+                value,
+                configured_seconds = configured.as_secs(),
+                "invalid code-review reviewer timeout; using the configured value"
+            );
+            configured
         }
     }
 }
@@ -1257,6 +1297,88 @@ impl Engine {
             jobs: self.store.list_code_review_jobs(100)?,
         };
         Ok((cursor, dashboard))
+    }
+
+    pub fn code_review_settings(&self) -> CodeReviewSettings {
+        let config = self.config.lock().unwrap();
+        CodeReviewSettings {
+            total_timeout_seconds: config
+                .code_review_timeout_seconds
+                .filter(|seconds| *seconds > 0)
+                .unwrap_or(DEFAULT_REVIEW_TIMEOUT.as_secs()),
+            reviewer_timeout_seconds: config
+                .code_review_reviewer_timeout_seconds
+                .filter(|seconds| *seconds > 0)
+                .unwrap_or(DEFAULT_REVIEWER_TIMEOUT.as_secs()),
+            coordinator_timeout_seconds: config
+                .code_review_coordinator_timeout_seconds
+                .filter(|seconds| *seconds > 0)
+                .unwrap_or(DEFAULT_REVIEW_COORDINATOR_TIMEOUT.as_secs()),
+        }
+    }
+
+    fn effective_code_review_settings(&self) -> CodeReviewSettings {
+        let configured = self.code_review_settings();
+        CodeReviewSettings {
+            total_timeout_seconds: code_review_timeout(Duration::from_secs(
+                configured.total_timeout_seconds,
+            ))
+            .as_secs(),
+            reviewer_timeout_seconds: code_review_reviewer_timeout(Duration::from_secs(
+                configured.reviewer_timeout_seconds,
+            ))
+            .as_secs(),
+            coordinator_timeout_seconds: code_review_coordinator_timeout(Duration::from_secs(
+                configured.coordinator_timeout_seconds,
+            ))
+            .as_secs(),
+        }
+    }
+
+    pub fn code_review_settings_snapshot(&self) -> Result<(u64, CodeReviewSettings), EngineError> {
+        let cursor = self.store.latest_event_cursor(&Scope::Server)?;
+        Ok((cursor, self.code_review_settings()))
+    }
+
+    pub fn set_code_review_settings(
+        &self,
+        request: SetCodeReviewSettingsRequest,
+    ) -> Result<(u64, CodeReviewSettings), EngineError> {
+        if request.total_timeout_seconds == 0
+            || request.reviewer_timeout_seconds == 0
+            || request.coordinator_timeout_seconds == 0
+        {
+            return Err(EngineError::BadRequest(
+                "code-review timeouts must be positive".into(),
+            ));
+        }
+        if request.reviewer_timeout_seconds > request.total_timeout_seconds {
+            return Err(EngineError::BadRequest(
+                "reviewer timeout cannot exceed the total review timeout".into(),
+            ));
+        }
+        if request.coordinator_timeout_seconds > request.total_timeout_seconds {
+            return Err(EngineError::BadRequest(
+                "final editor timeout cannot exceed the total review timeout".into(),
+            ));
+        }
+        let settings = CodeReviewSettings {
+            total_timeout_seconds: request.total_timeout_seconds,
+            reviewer_timeout_seconds: request.reviewer_timeout_seconds,
+            coordinator_timeout_seconds: request.coordinator_timeout_seconds,
+        };
+        {
+            let mut config = self.config.lock().unwrap();
+            config.code_review_timeout_seconds = Some(settings.total_timeout_seconds);
+            config.code_review_reviewer_timeout_seconds = Some(settings.reviewer_timeout_seconds);
+            config.code_review_coordinator_timeout_seconds =
+                Some(settings.coordinator_timeout_seconds);
+            self.persist_config(&config);
+        }
+        let envelope = self
+            .store
+            .append_event(Scope::Server, Event::CodeReviewSettingsUpdated { settings })?;
+        Ok((envelope.cursor, settings))
     }
 
     pub fn code_review_job_detail(
@@ -2652,10 +2774,11 @@ impl Engine {
         let _ = self.emit_code_review_updated(Some(job_id.clone()));
         self.sync_code_review_projection(&record.job).await;
         let active_threads = Arc::new(Mutex::new(HashSet::new()));
-        let review_timeout = code_review_timeout();
+        let review_settings = self.effective_code_review_settings();
+        let review_timeout = Duration::from_secs(review_settings.total_timeout_seconds);
         let result = tokio::time::timeout(
             review_timeout,
-            self.execute_code_review(&record, &cancel, &active_threads),
+            self.execute_code_review(&record, &cancel, &active_threads, &review_settings),
         )
         .await;
         if result.is_err() {
@@ -2763,6 +2886,7 @@ impl Engine {
         record: &CodeReviewJobRecord,
         superseded: &CancellationToken,
         active_threads: &Arc<Mutex<HashSet<String>>>,
+        review_settings: &CodeReviewSettings,
     ) -> Result<String> {
         let preparation_started = Instant::now();
         let mut job = record.job.clone();
@@ -3036,6 +3160,7 @@ impl Engine {
             REVIEW_TASK_CONCURRENCY_ENV,
             DEFAULT_REVIEW_TASK_CONCURRENCY,
         );
+        let reviewer_timeout = Duration::from_secs(review_settings.reviewer_timeout_seconds);
         let executed_results = stream::iter(planned.into_iter().map(
             |(reviewer, batch_index, prompt, applies, skip_reason, existing_task)| {
                 let engine = self.clone();
@@ -3089,14 +3214,18 @@ impl Engine {
                             )?
                             .ok_or_else(|| anyhow!("review task was cancelled before dispatch"))?;
                         engine.emit_code_review_task(&job.id, task.clone())?;
+                        let timeout_label =
+                            format!("reviewer {} batch {}", reviewer.name, batch_index + 1);
                         let (turn, parsed) = engine
-                            .run_parsed_code_review_turn(
+                            .run_timed_parsed_code_review_turn(
                                 &job,
                                 &task.id,
                                 &thread.id,
                                 prompt,
                                 &superseded,
                                 &active_threads,
+                                reviewer_timeout,
+                                &timeout_label,
                             )
                             .await?;
                         let candidates = parsed
@@ -3218,14 +3347,18 @@ impl Engine {
                 )?
                 .ok_or_else(|| anyhow!("coordinator task was cancelled before dispatch"))?;
             self.emit_code_review_task(&job.id, task.clone())?;
+            let coordinator_timeout =
+                Duration::from_secs(review_settings.coordinator_timeout_seconds);
             let turn = self
-                .run_parsed_code_review_turn(
+                .run_timed_parsed_code_review_turn(
                     &job,
                     &task.id,
                     &coordinator.id,
                     prompt,
                     superseded,
                     active_threads,
+                    coordinator_timeout,
+                    "final review editor",
                 )
                 .await;
             let turn = match turn {
@@ -3437,6 +3570,50 @@ impl Engine {
             )
         })?;
         Ok((turn, parsed))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn run_timed_parsed_code_review_turn(
+        self: &Arc<Self>,
+        job: &trouve_protocol::CodeReviewJob,
+        task_id: &str,
+        thread_id: &str,
+        prompt: String,
+        superseded: &CancellationToken,
+        active_threads: &Arc<Mutex<HashSet<String>>>,
+        timeout: Duration,
+        timeout_label: &str,
+    ) -> Result<(ReviewTurnResult, ReviewOutput)> {
+        match tokio::time::timeout(
+            timeout,
+            self.run_parsed_code_review_turn(
+                job,
+                task_id,
+                thread_id,
+                prompt,
+                superseded,
+                active_threads,
+            ),
+        )
+        .await
+        {
+            Ok(result) => result,
+            Err(_) => {
+                active_threads.lock().unwrap().remove(thread_id);
+                if let Err(error) = self.cancel_turn(thread_id) {
+                    tracing::warn!(
+                        job_id = %job.id,
+                        thread_id,
+                        %error,
+                        "failed to cancel timed-out code-review task"
+                    );
+                }
+                bail!(
+                    "{timeout_label} timed out after {}",
+                    compact_elapsed(timeout.as_millis().try_into().unwrap_or(u64::MAX))
+                )
+            }
+        }
     }
 
     async fn run_semantic_routing_turn(
@@ -6711,6 +6888,11 @@ mod tests {
     fn review_duration_settings_must_be_positive_seconds() {
         assert_eq!(DEFAULT_RECONCILE_INTERVAL, Duration::from_secs(60));
         assert_eq!(DEFAULT_REVIEW_TIMEOUT, Duration::from_secs(15 * 60));
+        assert_eq!(DEFAULT_REVIEWER_TIMEOUT, Duration::from_secs(10 * 60));
+        assert_eq!(
+            DEFAULT_REVIEW_COORDINATOR_TIMEOUT,
+            Duration::from_secs(5 * 60)
+        );
         assert_eq!(
             parse_code_review_poll_interval(" 15 "),
             Some(Duration::from_secs(15))
@@ -6723,6 +6905,60 @@ mod tests {
             assert_eq!(parse_code_review_poll_interval(value), None);
             assert_eq!(parse_code_review_timeout(value), None);
         }
+    }
+
+    #[test]
+    fn code_review_settings_are_validated_and_published() {
+        let data = tempfile::tempdir().unwrap();
+        let engine = Engine::new(
+            crate::store::Store::open_in_memory().unwrap(),
+            data.path().to_path_buf(),
+            &crate::config::Config::default(),
+        );
+        assert_eq!(
+            engine.code_review_settings(),
+            CodeReviewSettings {
+                total_timeout_seconds: 15 * 60,
+                reviewer_timeout_seconds: 10 * 60,
+                coordinator_timeout_seconds: 5 * 60,
+            }
+        );
+
+        let error = engine
+            .set_code_review_settings(SetCodeReviewSettingsRequest {
+                total_timeout_seconds: 900,
+                reviewer_timeout_seconds: 901,
+                coordinator_timeout_seconds: 300,
+            })
+            .unwrap_err();
+        assert!(error.to_string().contains("reviewer timeout cannot exceed"));
+
+        let expected = CodeReviewSettings {
+            total_timeout_seconds: 1_200,
+            reviewer_timeout_seconds: 720,
+            coordinator_timeout_seconds: 360,
+        };
+        let (cursor, saved) = engine
+            .set_code_review_settings(SetCodeReviewSettingsRequest {
+                total_timeout_seconds: expected.total_timeout_seconds,
+                reviewer_timeout_seconds: expected.reviewer_timeout_seconds,
+                coordinator_timeout_seconds: expected.coordinator_timeout_seconds,
+            })
+            .unwrap();
+        assert_eq!(saved, expected);
+        assert_eq!(engine.code_review_settings(), expected);
+        assert!(cursor > 0);
+        assert!(
+            engine
+                .store()
+                .events_after(&Scope::Server, 0)
+                .unwrap()
+                .iter()
+                .any(|envelope| matches!(
+                    envelope.event,
+                    Event::CodeReviewSettingsUpdated { settings } if settings == expected
+                ))
+        );
     }
 
     #[test]

@@ -8,9 +8,10 @@ export const LIVE_OUTPUT_OMITTED_MARKER =
   "[Showing the latest output; earlier content was omitted to keep this page responsive.]\n\n";
 
 export function boundReviewOutput(
-  value: string,
+  value: string | null | undefined,
   maximum = LIVE_OUTPUT_MAX_CHARS,
 ): string {
+  value ??= "";
   if (value.length <= maximum) return value;
   if (maximum <= LIVE_OUTPUT_OMITTED_MARKER.length) {
     return LIVE_OUTPUT_OMITTED_MARKER.slice(0, maximum);
@@ -22,10 +23,11 @@ export function boundReviewOutput(
 }
 
 export function appendBoundedReviewOutput(
-  current: string,
+  current: string | null | undefined,
   addition: string,
   maximum = LIVE_OUTPUT_MAX_CHARS,
 ): string {
+  current ??= "";
   const wasTruncated = current.startsWith(LIVE_OUTPUT_OMITTED_MARKER);
   const retained = wasTruncated
     ? current.slice(LIVE_OUTPUT_OMITTED_MARKER.length)
