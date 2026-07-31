@@ -1414,6 +1414,27 @@ pub struct CodeReviewStats {
     pub repositories: Vec<CodeReviewRepositoryStats>,
 }
 
+/// Persisted execution deadlines for automated code reviews.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct CodeReviewSettings {
+    /// Whole-job deadline, including preparation, reviewers, final editing,
+    /// and publication.
+    pub total_timeout_seconds: u64,
+    /// Deadline for one reviewer persona batch.
+    pub reviewer_timeout_seconds: u64,
+    /// Deadline for the final review editor.
+    pub coordinator_timeout_seconds: u64,
+}
+
+/// Replace the persisted automated code-review execution deadlines
+/// (`PUT /v1/config/code-review`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct SetCodeReviewSettingsRequest {
+    pub total_timeout_seconds: u64,
+    pub reviewer_timeout_seconds: u64,
+    pub coordinator_timeout_seconds: u64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct CodeReviewDashboard {
     pub app: GithubAppStatus,

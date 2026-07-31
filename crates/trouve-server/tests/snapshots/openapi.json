@@ -7,7 +7,7 @@
       "name": "MIT",
       "identifier": "MIT"
     },
-    "version": "1.21"
+    "version": "1.22"
   },
   "paths": {
     "/v1/approvals": {
@@ -1072,6 +1072,80 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/CodeReviewStats"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/config/code-review": {
+      "get": {
+        "tags": [],
+        "operationId": "get_code_review_settings",
+        "responses": {
+          "200": {
+            "description": "",
+            "headers": {
+              "x-trouve-event-cursor": {
+                "schema": {
+                  "type": "integer",
+                  "format": "int64",
+                  "minimum": 0
+                },
+                "description": "Server event cursor for this snapshot"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CodeReviewSettings"
+                }
+              }
+            }
+          }
+        }
+      },
+      "put": {
+        "tags": [],
+        "operationId": "set_code_review_settings",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SetCodeReviewSettingsRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "",
+            "headers": {
+              "x-trouve-event-cursor": {
+                "schema": {
+                  "type": "integer",
+                  "format": "int64",
+                  "minimum": 0
+                },
+                "description": "Server event cursor for this snapshot"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CodeReviewSettings"
                 }
               }
             }
@@ -5315,6 +5389,35 @@
           "thorough"
         ]
       },
+      "CodeReviewSettings": {
+        "type": "object",
+        "description": "Persisted execution deadlines for automated code reviews.",
+        "required": [
+          "total_timeout_seconds",
+          "reviewer_timeout_seconds",
+          "coordinator_timeout_seconds"
+        ],
+        "properties": {
+          "coordinator_timeout_seconds": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Deadline for the final review editor.",
+            "minimum": 0
+          },
+          "reviewer_timeout_seconds": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Deadline for one reviewer persona batch.",
+            "minimum": 0
+          },
+          "total_timeout_seconds": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Whole-job deadline, including preparation, reviewers, final editing,\nand publication.",
+            "minimum": 0
+          }
+        }
+      },
       "CodeReviewStats": {
         "type": "object",
         "required": [
@@ -6915,6 +7018,25 @@
                 ]
               }
             }
+          },
+          {
+            "type": "object",
+            "description": "The persisted automated code-review execution deadlines changed.\nCarries a full replacement snapshot for replay and reconnect.",
+            "required": [
+              "settings",
+              "type"
+            ],
+            "properties": {
+              "settings": {
+                "$ref": "#/components/schemas/CodeReviewSettings"
+              },
+              "type": {
+                "type": "string",
+                "enum": [
+                  "settings.code_review_updated"
+                ]
+              }
+            }
           }
         ],
         "description": "Every event type in the log. Serialized with a `type` tag using\ndot-namespaced names, per the event-log design doc."
@@ -8417,6 +8539,32 @@
         "properties": {
           "diff": {
             "type": "string"
+          }
+        }
+      },
+      "SetCodeReviewSettingsRequest": {
+        "type": "object",
+        "description": "Replace the persisted automated code-review execution deadlines\n(`PUT /v1/config/code-review`).",
+        "required": [
+          "total_timeout_seconds",
+          "reviewer_timeout_seconds",
+          "coordinator_timeout_seconds"
+        ],
+        "properties": {
+          "coordinator_timeout_seconds": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "reviewer_timeout_seconds": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "total_timeout_seconds": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
           }
         }
       },

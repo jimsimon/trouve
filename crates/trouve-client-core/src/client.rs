@@ -528,6 +528,36 @@ impl ProtocolClient {
         .await
     }
 
+    pub async fn code_review_settings(&self) -> Result<(u64, CodeReviewSettings)> {
+        let path = "/config/code-review";
+        let response = self
+            .http
+            .get(format!("{}{path}", self.base))
+            .send()
+            .await
+            .with_context(|| format!("GET {path}"))?;
+        decode_cursor_response(response, path).await
+    }
+
+    pub async fn set_code_review_settings(
+        &self,
+        settings: CodeReviewSettings,
+    ) -> Result<(u64, CodeReviewSettings)> {
+        let path = "/config/code-review";
+        let response = self
+            .http
+            .put(format!("{}{path}", self.base))
+            .json(&SetCodeReviewSettingsRequest {
+                total_timeout_seconds: settings.total_timeout_seconds,
+                reviewer_timeout_seconds: settings.reviewer_timeout_seconds,
+                coordinator_timeout_seconds: settings.coordinator_timeout_seconds,
+            })
+            .send()
+            .await
+            .with_context(|| format!("PUT {path}"))?;
+        decode_cursor_response(response, path).await
+    }
+
     pub async fn git_worktree_settings(&self) -> Result<(u64, GitWorktreeSettings)> {
         let path = "/config/git-worktrees";
         let response = self

@@ -3029,6 +3029,89 @@ async fn session_title_settings_and_fallback() {
     );
 }
 
+#[tokio::test]
+async fn code_review_timeout_settings_persist_and_publish() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Store::open(&tmp.path().join("db/trouve.db")).unwrap();
+    let config_file = tmp.path().join("config.toml");
+    let engine = Arc::new(
+        Engine::new(store, tmp.path().join("data"), &Config::default())
+            .with_config_dir(None)
+            .with_config_file(Some(config_file.clone())),
+    );
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let router = trouve_server::build_router(engine.clone());
+    tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+    let base = format!("http://{addr}/v1");
+    let client = reqwest::Client::new();
+
+    let response = client
+        .get(format!("{base}/config/code-review"))
+        .send()
+        .await
+        .unwrap();
+    assert!(
+        response
+            .headers()
+            .contains_key(trouve_protocol::EVENT_CURSOR_HEADER)
+    );
+    let settings: serde_json::Value = response.json().await.unwrap();
+    assert_eq!(settings["total_timeout_seconds"], 900);
+    assert_eq!(settings["reviewer_timeout_seconds"], 600);
+    assert_eq!(settings["coordinator_timeout_seconds"], 300);
+
+    let response = client
+        .put(format!("{base}/config/code-review"))
+        .json(&serde_json::json!({
+            "total_timeout_seconds": 1_200,
+            "reviewer_timeout_seconds": 720,
+            "coordinator_timeout_seconds": 360
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    assert!(
+        response
+            .headers()
+            .contains_key(trouve_protocol::EVENT_CURSOR_HEADER)
+    );
+    let settings: serde_json::Value = response.json().await.unwrap();
+    assert_eq!(settings["total_timeout_seconds"], 1_200);
+    assert_eq!(settings["reviewer_timeout_seconds"], 720);
+    assert_eq!(settings["coordinator_timeout_seconds"], 360);
+
+    let invalid = client
+        .put(format!("{base}/config/code-review"))
+        .json(&serde_json::json!({
+            "total_timeout_seconds": 600,
+            "reviewer_timeout_seconds": 601,
+            "coordinator_timeout_seconds": 300
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(invalid.status(), reqwest::StatusCode::BAD_REQUEST);
+
+    let persisted = std::fs::read_to_string(&config_file).unwrap();
+    assert!(persisted.contains("code_review_timeout_seconds = 1200"));
+    assert!(persisted.contains("code_review_reviewer_timeout_seconds = 720"));
+    assert!(persisted.contains("code_review_coordinator_timeout_seconds = 360"));
+    assert!(
+        engine
+            .store()
+            .events_after(&trouve_protocol::Scope::Server, 0)
+            .unwrap()
+            .iter()
+            .any(|envelope| matches!(
+                envelope.event,
+                trouve_protocol::Event::CodeReviewSettingsUpdated { .. }
+            ))
+    );
+}
+
 /// GitHub Enterprise hosts: the integration always lists github.com
 /// first, added hosts get their own entry (persisted to config),
 /// duplicates and bad hostnames are rejected, and removal works —

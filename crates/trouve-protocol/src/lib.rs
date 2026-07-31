@@ -130,7 +130,10 @@ pub use requests::*;
 // 1.21: the code-review dashboard response includes the server event cursor
 // for its snapshot so clients can resume SSE without replaying retained
 // code-review update history (additive).
-pub const PROTOCOL_VERSION: &str = "1.21";
+// 1.22: persisted automated code-review total, reviewer, and final-editor
+// deadlines; GET/PUT /v1/config/code-review; and the
+// settings.code_review_updated replacement-snapshot event (additive).
+pub const PROTOCOL_VERSION: &str = "1.22";
 pub const EVENT_CURSOR_HEADER: &str = "x-trouve-event-cursor";
 
 pub type WorkspaceId = String;

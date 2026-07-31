@@ -153,6 +153,12 @@ export interface ReviewTask {
   elapsed_ms: number;
 }
 
+export interface CodeReviewSettings {
+  total_timeout_seconds: number;
+  reviewer_timeout_seconds: number;
+  coordinator_timeout_seconds: number;
+}
+
 export interface PersonaResult {
   reviewer_id: string;
   reviewer_name: string;
@@ -390,4 +396,5 @@ export interface EventEnvelope {
   task?: ReviewTask;
   progress?: Progress;
   routing_decisions?: RoutingDecision[];
+  settings?: CodeReviewSettings;
 }
