@@ -257,12 +257,17 @@ const TERM_FRAME_INTERVAL: std::time::Duration = std::time::Duration::from_milli
 const APP_UPDATE_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(6 * 60 * 60);
 
 fn should_start_runtime_update_check(
+    development_build: bool,
     automatic_updates: bool,
     updater_enabled: bool,
     update_busy: bool,
     update_already_available: bool,
 ) -> bool {
-    automatic_updates && updater_enabled && !update_busy && !update_already_available
+    !development_build
+        && automatic_updates
+        && updater_enabled
+        && !update_busy
+        && !update_already_available
 }
 #[derive(Debug)]
 pub enum UiCommand {
@@ -1283,17 +1288,19 @@ pub async fn run(
     // A long-running app can discover a release without waiting for its next
     // launch, but runtime detection is check-only. AppUpdateChecked only
     // exposes the explicit Install and restart button; it never installs.
-    tokio::spawn({
-        let tx = ctl.tx.clone();
-        async move {
-            loop {
-                tokio::time::sleep(APP_UPDATE_POLL_INTERVAL).await;
-                if tx.send(UiCommand::AppUpdatePoll).is_err() {
-                    break;
+    if !crate::DEVELOPMENT_BUILD {
+        tokio::spawn({
+            let tx = ctl.tx.clone();
+            async move {
+                loop {
+                    tokio::time::sleep(APP_UPDATE_POLL_INTERVAL).await;
+                    if tx.send(UiCommand::AppUpdatePoll).is_err() {
+                        break;
+                    }
                 }
             }
-        }
-    });
+        });
+    }
 
     // One shared account refresh keeps the dashboard, sidebar PR indicators,
     // and right-panel PR data current. One-second ticks also drive the live
@@ -5060,7 +5067,7 @@ impl Controller {
                 self.refresh_prs();
             }
             UiCommand::AppUpdateButtonClicked => {
-                if !self.app_update_busy {
+                if !crate::DEVELOPMENT_BUILD && !self.app_update_busy {
                     if let Some(release) = self.available_app_update.clone() {
                         self.start_app_update_install(release);
                     } else {
@@ -5070,6 +5077,7 @@ impl Controller {
             }
             UiCommand::AppUpdatePoll => {
                 if should_start_runtime_update_check(
+                    crate::DEVELOPMENT_BUILD,
                     self.automatic_updates,
                     trouve_update::auto_update_enabled(),
                     self.app_update_busy,
@@ -7356,7 +7364,7 @@ impl Controller {
                 self.automatic_updates = prefs.automatic_updates;
                 if automatic_updates_changed {
                     ui::set_app_update_available(&self.ui, false);
-                    if cfg!(debug_assertions) {
+                    if crate::DEVELOPMENT_BUILD {
                         ui::set_app_update(
                             &self.ui,
                             "Self-update is disabled in development builds.".into(),
@@ -8994,15 +9002,24 @@ mod tests {
     }
 
     #[test]
-    fn runtime_update_polling_only_checks_when_idle_and_enabled() {
-        assert!(should_start_runtime_update_check(true, true, false, false));
-        assert!(!should_start_runtime_update_check(
-            false, true, false, false
+    fn runtime_update_polling_only_checks_in_release_when_idle_and_enabled() {
+        assert!(should_start_runtime_update_check(
+            false, true, true, false, false
         ));
         assert!(!should_start_runtime_update_check(
-            true, false, false, false
+            true, true, true, false, false
         ));
-        assert!(!should_start_runtime_update_check(true, true, true, false));
-        assert!(!should_start_runtime_update_check(true, true, false, true));
+        assert!(!should_start_runtime_update_check(
+            false, false, true, false, false
+        ));
+        assert!(!should_start_runtime_update_check(
+            false, true, false, false, false
+        ));
+        assert!(!should_start_runtime_update_check(
+            false, true, true, true, false
+        ));
+        assert!(!should_start_runtime_update_check(
+            false, true, true, false, true
+        ));
     }
 }

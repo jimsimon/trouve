@@ -118,7 +118,8 @@ struct GithubAsset {
     browser_download_url: String,
 }
 
-/// Whether automatic update behavior is enabled for this process.
+/// Whether automatic update behavior is enabled for this process. Development
+/// builds are always disabled, even when no environment override is present.
 pub fn auto_update_enabled() -> bool {
     !cfg!(debug_assertions)
         && std::env::var_os(DISABLE_AUTO_UPDATE_ENV)
@@ -545,6 +546,12 @@ fn make_executable(path: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(debug_assertions)]
+    #[test]
+    fn development_builds_disable_automatic_updates() {
+        assert!(!auto_update_enabled());
+    }
 
     fn asset(name: &str) -> GithubAsset {
         GithubAsset {

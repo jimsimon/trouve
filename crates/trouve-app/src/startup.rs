@@ -27,6 +27,15 @@ pub fn configure(window: &StartupWindow) {
 }
 
 pub fn begin(window: slint::Weak<StartupWindow>) {
+    if crate::DEVELOPMENT_BUILD {
+        continue_to_app(
+            &window,
+            "Self-update is disabled in development builds.".into(),
+            "",
+        );
+        return;
+    }
+
     set_stage(
         &window,
         "Checking for updates…",

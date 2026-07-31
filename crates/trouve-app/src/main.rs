@@ -16,6 +16,10 @@ slint::include_modules!();
 use controller::UiCommand;
 use slint::{ComponentHandle, Model};
 
+/// Development builds run directly from the workspace and must never contact
+/// the release updater or replace their executable.
+pub(crate) const DEVELOPMENT_BUILD: bool = cfg!(debug_assertions);
+
 fn provider_fields_valid(mut fields: impl Iterator<Item = ProviderConfigFieldItem>) -> bool {
     fields.all(|field| !field.required || !field.value.is_empty() || field.has_saved_value)
 }
@@ -223,20 +227,21 @@ fn main() -> anyhow::Result<()> {
     startup_window.set_current_version(env!("CARGO_PKG_VERSION").into());
     startup::configure(&startup_window);
     let general_preferences = winstate::load_general();
-    let run_update_preflight = restarted_version.is_none()
+    let run_update_preflight = !DEVELOPMENT_BUILD
+        && restarted_version.is_none()
         && general_preferences.automatic_updates
         && trouve_update::auto_update_enabled();
     window.set_settings_app_version(env!("CARGO_PKG_VERSION").into());
     window.set_automatic_updates(general_preferences.automatic_updates);
-    let (initial_update_status, initial_update_action) = if let Some(version) = restarted_version {
-        (
-            format!("Version {version} was installed successfully."),
-            "Check again".to_string(),
-        )
-    } else if cfg!(debug_assertions) {
+    let (initial_update_status, initial_update_action) = if DEVELOPMENT_BUILD {
         (
             "Self-update is disabled in development builds.".to_string(),
             String::new(),
+        )
+    } else if let Some(version) = restarted_version {
+        (
+            format!("Version {version} was installed successfully."),
+            "Check again".to_string(),
         )
     } else if !trouve_update::auto_update_enabled() {
         (
