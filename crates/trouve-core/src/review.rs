@@ -1237,12 +1237,26 @@ impl Engine {
     }
 
     pub fn code_review_dashboard(&self) -> Result<CodeReviewDashboard, EngineError> {
-        Ok(CodeReviewDashboard {
+        Ok(self.code_review_dashboard_snapshot()?.1)
+    }
+
+    /// Current code-review dashboard paired with the server cursor it is at
+    /// least as fresh as. Read the cursor first so a concurrent review update
+    /// can only make the returned dashboard newer than the cursor, never
+    /// older.
+    pub fn code_review_dashboard_snapshot(
+        &self,
+    ) -> Result<(u64, CodeReviewDashboard), EngineError> {
+        let cursor = self
+            .store
+            .latest_event_cursor(&trouve_protocol::Scope::Server)?;
+        let dashboard = CodeReviewDashboard {
             app: self.github_app_status()?,
             reviewers: self.code_review_reviewer_catalog()?,
             repositories: self.store.list_code_review_repositories()?,
             jobs: self.store.list_code_review_jobs(100)?,
-        })
+        };
+        Ok((cursor, dashboard))
     }
 
     pub fn code_review_job_detail(

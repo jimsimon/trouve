@@ -7,7 +7,7 @@
       "name": "MIT",
       "identifier": "MIT"
     },
-    "version": "1.20"
+    "version": "1.21"
   },
   "paths": {
     "/v1/approvals": {
@@ -452,6 +452,16 @@
         "responses": {
           "200": {
             "description": "",
+            "headers": {
+              "x-trouve-event-cursor": {
+                "schema": {
+                  "type": "integer",
+                  "format": "int64",
+                  "minimum": 0
+                },
+                "description": "Server event cursor for this snapshot"
+              }
+            },
             "content": {
               "application/json": {
                 "schema": {
