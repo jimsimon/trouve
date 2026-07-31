@@ -124,7 +124,10 @@ pub use requests::*;
 // 1.19: code-review repositories and jobs expose coordinator thinking,
 // repository reviewer overrides can select a thinking setting, and canonical
 // settings accept fixed token budgets advertised by older models (additive).
-pub const PROTOCOL_VERSION: &str = "1.19";
+// 1.20: Git & Worktrees settings expose a persisted session-title compute
+// resource policy spanning adaptive, mixed GPU/CPU, GPU-only, and CPU-only
+// placement (additive).
+pub const PROTOCOL_VERSION: &str = "1.20";
 pub const EVENT_CURSOR_HEADER: &str = "x-trouve-event-cursor";
 
 pub type WorkspaceId = String;

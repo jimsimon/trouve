@@ -542,6 +542,7 @@ impl ProtocolClient {
     pub async fn set_git_worktree_settings(
         &self,
         title_model_load_behavior: TitleModelLoadBehavior,
+        title_model_resource_policy: TitleModelResourcePolicy,
     ) -> Result<(u64, GitWorktreeSettings)> {
         let path = "/config/git-worktrees";
         let response = self
@@ -549,6 +550,7 @@ impl ProtocolClient {
             .put(format!("{}{path}", self.base))
             .json(&SetGitWorktreeSettingsRequest {
                 title_model_load_behavior,
+                title_model_resource_policy,
             })
             .send()
             .await

@@ -121,20 +121,21 @@ pub const CATALOG: &[CatalogEntry] = &[
 /// Dedicated session-title model. It is intentionally absent from the local
 /// coding-model catalog: the title sidecar has its own lifecycle and never
 /// appears in thread model pickers.
-pub const TITLE_MODEL_ID: &str = "qwen2.5-title-0.5b";
+pub const TITLE_MODEL_ID: &str = "qwen3-title-0.6b";
 pub const TITLE_MODEL_CONTEXT: u64 = 1_024;
 pub const TITLE_MODEL_SHA256: &str =
-    "74a4da8c9fdbcd15bd1f6d01d621410d31c6fc00986f5eb687824e7b93d7a9db";
+    "9465e63a22add5354d9bb4b99e90117043c7124007664907259bd16d043bb031";
 pub const TITLE_MODEL_LICENSE: &str = "Apache-2.0";
+pub(crate) const LEGACY_TITLE_MODEL_FILES: &[&str] = &["qwen2.5-0.5b-instruct-q4_k_m.gguf"];
 
 pub fn title_model_entry() -> ModelEntry {
     ModelEntry {
         id: TITLE_MODEL_ID.into(),
         display_name: "Session naming model".into(),
-        repo: "Qwen/Qwen2.5-0.5B-Instruct-GGUF".into(),
-        file: "qwen2.5-0.5b-instruct-q4_k_m.gguf".into(),
-        size_bytes: 491_400_032,
-        params: "0.5B".into(),
+        repo: "Qwen/Qwen3-0.6B-GGUF".into(),
+        file: "Qwen3-0.6B-Q8_0.gguf".into(),
+        size_bytes: 639_446_688,
+        params: "0.6B".into(),
         notes: format!("Dedicated session-title model ({TITLE_MODEL_LICENSE})"),
         custom: false,
     }
@@ -564,15 +565,14 @@ fn urlencoding_encode(s: &str) -> String {
     out
 }
 
-/// The llama-server binary to run: trouve-managed install first, PATH as
-/// a fallback.
+/// The active trouve-managed llama-server binary.
+///
+/// Local inference deliberately does not fall back to `PATH`: trouve relies
+/// on the version and platform package it installed when selecting supported
+/// flags and backends.
 pub fn runtime_bin(data_dir: &Path) -> Option<PathBuf> {
-    let managed =
-        trouve_agents::install::managed_bin(data_dir, trouve_agents::install::CliId::LlamaServer);
-    if managed.exists() {
-        return Some(managed);
-    }
-    trouve_agents::install::find_on_path("llama-server")
+    trouve_agents::install::installed(data_dir, trouve_agents::install::CliId::LlamaServer)
+        .map(|install| PathBuf::from(install.bin))
 }
 
 // --- hardware probe ----------------------------------------------------------
@@ -805,6 +805,34 @@ pub enum ServerState {
     Running(String),
 }
 
+fn effective_title_resources(
+    configured: trouve_protocol::TitleModelResourcePolicy,
+    local_model_active: bool,
+) -> trouve_protocol::TitleModelResourcePolicy {
+    match configured {
+        trouve_protocol::TitleModelResourcePolicy::Adaptive if local_model_active => {
+            trouve_protocol::TitleModelResourcePolicy::CpuRamOnly
+        }
+        trouve_protocol::TitleModelResourcePolicy::Adaptive => {
+            trouve_protocol::TitleModelResourcePolicy::GpuCpuRam
+        }
+        policy => policy,
+    }
+}
+
+fn title_resource_args(
+    resources: trouve_protocol::TitleModelResourcePolicy,
+) -> &'static [&'static str] {
+    match resources {
+        trouve_protocol::TitleModelResourcePolicy::CpuRamOnly => &["-ngl", "0", "--device", "none"],
+        trouve_protocol::TitleModelResourcePolicy::GpuOnly => &["-ngl", "all", "--fit", "off"],
+        trouve_protocol::TitleModelResourcePolicy::GpuCpuRam => &[],
+        trouve_protocol::TitleModelResourcePolicy::Adaptive => {
+            unreachable!("adaptive title resources must be resolved before launch")
+        }
+    }
+}
+
 /// Owns the single llama-server sidecar. One model is loaded at a time;
 /// asking for a different model stops the old server and starts a new one.
 pub struct LlamaManager {
@@ -819,7 +847,15 @@ pub struct LlamaManager {
     /// A fixed context for special-purpose sidecars; coding models use an
     /// adaptive context derived from model metadata and available hardware.
     context: Option<u64>,
-    cpu_only: bool,
+    /// Present only for the dedicated title sidecar.
+    title_resources: Option<std::sync::RwLock<trouve_protocol::TitleModelResourcePolicy>>,
+    /// Adaptive title placement avoids the GPU while the local coding-model
+    /// sidecar is loading or running.
+    adaptive_peer: Option<std::sync::Weak<LlamaManager>>,
+    /// The coding-model manager uses this to evict an adaptive title sidecar
+    /// from the GPU before beginning a local-model load.
+    adaptive_title:
+        std::sync::Mutex<Option<std::sync::Weak<crate::title_model::TitleModelManager>>>,
 }
 
 /// Restores an honest stopped state if a caller cancels `ensure` while the
@@ -842,21 +878,32 @@ impl LlamaManager {
     /// run that ended without cleanup (crash/SIGKILL) — leaked servers keep
     /// multi-GB VRAM allocations alive and starve the next load.
     pub fn new(data_dir: &Path) -> Self {
-        Self::configured(data_dir, "llama-server.pids", None, false)
+        Self::configured(data_dir, "llama-server.pids", None, None, None)
     }
 
-    /// Independent short-context, CPU-first sidecar used only for session
-    /// title generation.
-    pub fn title(data_dir: &Path) -> Self {
+    /// Independent short-context sidecar used only for session title
+    /// generation.
+    pub fn title(
+        data_dir: &Path,
+        resources: trouve_protocol::TitleModelResourcePolicy,
+        local_model: std::sync::Weak<LlamaManager>,
+    ) -> Self {
         Self::configured(
             data_dir,
             "title-llama-server.pids",
             Some(TITLE_MODEL_CONTEXT),
-            true,
+            Some(resources),
+            Some(local_model),
         )
     }
 
-    fn configured(data_dir: &Path, pidfile: &str, context: Option<u64>, cpu_only: bool) -> Self {
+    fn configured(
+        data_dir: &Path,
+        pidfile: &str,
+        context: Option<u64>,
+        title_resources: Option<trouve_protocol::TitleModelResourcePolicy>,
+        adaptive_peer: Option<std::sync::Weak<LlamaManager>>,
+    ) -> Self {
         let pids = data_dir.join(pidfile);
         Self::reap_stale(&pids, data_dir);
         Self {
@@ -866,7 +913,22 @@ impl LlamaManager {
             effective_contexts: std::sync::Mutex::new(std::collections::HashMap::new()),
             hardware: std::sync::OnceLock::new(),
             context,
-            cpu_only,
+            title_resources: title_resources.map(std::sync::RwLock::new),
+            adaptive_peer,
+            adaptive_title: std::sync::Mutex::new(None),
+        }
+    }
+
+    pub(crate) fn set_adaptive_title(
+        &self,
+        title_model: std::sync::Weak<crate::title_model::TitleModelManager>,
+    ) {
+        *self.adaptive_title.lock().unwrap() = Some(title_model);
+    }
+
+    pub fn set_title_resources(&self, resources: trouve_protocol::TitleModelResourcePolicy) {
+        if let Some(current) = &self.title_resources {
+            *current.write().unwrap() = resources;
         }
     }
 
@@ -953,6 +1015,8 @@ impl LlamaManager {
         log_path: &Path,
     ) -> Result<String> {
         let mut inner = self.inner.lock().await;
+        let activating_local_model =
+            self.title_resources.is_none() && self.state() == ServerState::Stopped;
         if let Some(running) = inner.as_mut() {
             // try_wait: a crashed server should be restarted, not reused.
             if running.model_id == model_id && running.child.try_wait()?.is_none() {
@@ -968,6 +1032,12 @@ impl LlamaManager {
             manager: self,
             armed: true,
         };
+        if activating_local_model {
+            let adaptive_title = self.adaptive_title.lock().unwrap().clone();
+            if let Some(title_model) = adaptive_title.and_then(|manager| manager.upgrade()) {
+                title_model.yield_to_local_model().await;
+            }
+        }
         match self.spawn_and_wait(bin, gguf, log_path).await {
             Ok((port, child, context_window)) => {
                 if context_window > 0 {
@@ -985,7 +1055,16 @@ impl LlamaManager {
                 });
                 Ok(format!("http://127.0.0.1:{port}/v1"))
             }
-            Err(e) => Err(e),
+            Err(error) => {
+                if activating_local_model {
+                    let adaptive_title = self.adaptive_title.lock().unwrap().clone();
+                    if let Some(title_model) = adaptive_title.and_then(|manager| manager.upgrade())
+                    {
+                        title_model.local_model_stopped().await;
+                    }
+                }
+                Err(error)
+            }
         }
     }
 
@@ -1029,10 +1108,42 @@ impl LlamaManager {
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::from(log))
             .kill_on_drop(true);
-        if self.cpu_only {
-            // The title helper is intentionally small enough for CPU use and
-            // must not compete with a coding model for VRAM.
-            cmd.args(["-ngl", "0"]);
+        if let Some(resources) = &self.title_resources {
+            // Title generation is serialized, so a single slot keeps the
+            // shared prompt prefix hot without provisioning unused parallel
+            // slots.
+            cmd.args(["-np", "1", "--cache-prompt", "--no-ui"]);
+
+            let configured = *resources.read().unwrap();
+            let local_model_active = self
+                .adaptive_peer
+                .as_ref()
+                .and_then(std::sync::Weak::upgrade)
+                .is_some_and(|manager| manager.state() != ServerState::Stopped);
+            let effective = effective_title_resources(configured, local_model_active);
+            match effective {
+                trouve_protocol::TitleModelResourcePolicy::CpuRamOnly => {
+                    // `-ngl 0` prevents layer offload; `--device none` also
+                    // disables backend operations that can otherwise still
+                    // touch Vulkan, Metal, or another accelerator.
+                }
+                trouve_protocol::TitleModelResourcePolicy::GpuOnly => {
+                    let hardware = self.hardware.get_or_init(probe_hardware);
+                    if hardware.gpus.is_empty() {
+                        bail!("GPU-only session naming requires a detected GPU");
+                    }
+                    // Disable llama.cpp's fit adjustment so an undersized GPU
+                    // fails instead of silently spilling model layers to RAM.
+                }
+                trouve_protocol::TitleModelResourcePolicy::GpuCpuRam => {
+                    // llama.cpp's defaults auto-fit layers to currently free
+                    // VRAM and spill the remainder to CPU/system RAM.
+                }
+                trouve_protocol::TitleModelResourcePolicy::Adaptive => {
+                    unreachable!("adaptive title resources are resolved above")
+                }
+            }
+            cmd.args(title_resource_args(effective));
         }
         // The release tarballs carry their shared libraries next to the
         // binary; rpath usually covers it, but belt and braces.
@@ -1380,6 +1491,31 @@ mod tests {
     }
 
     #[test]
+    fn adaptive_title_resources_avoid_an_active_local_model() {
+        use trouve_protocol::TitleModelResourcePolicy::{Adaptive, CpuRamOnly, GpuCpuRam};
+
+        assert_eq!(effective_title_resources(Adaptive, false), GpuCpuRam);
+        assert_eq!(effective_title_resources(Adaptive, true), CpuRamOnly);
+        assert_eq!(effective_title_resources(GpuCpuRam, true), GpuCpuRam);
+        assert_eq!(effective_title_resources(CpuRamOnly, false), CpuRamOnly);
+    }
+
+    #[test]
+    fn title_resource_arguments_enforce_strict_modes() {
+        use trouve_protocol::TitleModelResourcePolicy::{CpuRamOnly, GpuCpuRam, GpuOnly};
+
+        assert_eq!(
+            title_resource_args(CpuRamOnly),
+            ["-ngl", "0", "--device", "none"]
+        );
+        assert_eq!(
+            title_resource_args(GpuOnly),
+            ["-ngl", "all", "--fit", "off"]
+        );
+        assert!(title_resource_args(GpuCpuRam).is_empty());
+    }
+
+    #[test]
     fn launched_context_is_the_fallback_for_unusable_props() {
         const LAUNCHED: u64 = 32_768;
         for props in [
@@ -1431,6 +1567,38 @@ mod tests {
         let custom = entries.iter().find(|e| e.id == "my-model").unwrap();
         assert!(custom.custom);
         assert_eq!(entries.len(), CATALOG.len() + 1);
+    }
+
+    #[test]
+    fn runtime_bin_requires_an_active_managed_install() {
+        let tmp = tempfile::tempdir().unwrap();
+        let stable = trouve_agents::install::managed_bin(
+            tmp.path(),
+            trouve_agents::install::CliId::LlamaServer,
+        );
+        std::fs::create_dir_all(stable.parent().unwrap()).unwrap();
+        std::fs::write(&stable, b"unregistered llama-server").unwrap();
+
+        // A binary at the conventional location is not enough: only the
+        // managed install record is authoritative.
+        assert_eq!(runtime_bin(tmp.path()), None);
+
+        let version_dir = tmp.path().join("cli/llama-server/b123");
+        std::fs::create_dir_all(&version_dir).unwrap();
+        let binary = version_dir.join("llama-server");
+        std::fs::write(&binary, b"managed llama-server").unwrap();
+        let record = trouve_agents::install::InstalledCli {
+            version: "b123".into(),
+            bin: binary.to_string_lossy().into_owned(),
+        };
+        std::fs::create_dir_all(tmp.path().join("cli/llama-server")).unwrap();
+        std::fs::write(
+            tmp.path().join("cli/llama-server/installed.json"),
+            serde_json::to_vec(&record).unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(runtime_bin(tmp.path()), Some(binary));
     }
 
     #[test]

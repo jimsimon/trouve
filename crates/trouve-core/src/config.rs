@@ -52,6 +52,10 @@ pub struct Config {
     /// adaptive loading.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub title_model_load_behavior: Option<trouve_protocol::TitleModelLoadBehavior>,
+    /// Compute resources available to the dedicated session-title model.
+    /// Unset preserves the historical CPU-only behavior.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title_model_resource_policy: Option<trouve_protocol::TitleModelResourcePolicy>,
     /// Client id of a GitHub OAuth app (with device flow enabled) for
     /// "Sign in with GitHub" on github.com. Unset uses the built-in shared
     /// Trouve app (`github::DEFAULT_CLIENT_ID`); set it to route sign-in
@@ -251,11 +255,17 @@ mod tests {
         assert_eq!(cfg.default_thinking_level.as_deref(), Some("high"));
         let mut cfg = cfg;
         cfg.title_model_load_behavior = Some(trouve_protocol::TitleModelLoadBehavior::OnDemand);
+        cfg.title_model_resource_policy =
+            Some(trouve_protocol::TitleModelResourcePolicy::GpuCpuRam);
         cfg.save_to(&path).unwrap();
         let cfg = Config::load_from(&path);
         assert_eq!(
             cfg.title_model_load_behavior,
             Some(trouve_protocol::TitleModelLoadBehavior::OnDemand)
+        );
+        assert_eq!(
+            cfg.title_model_resource_policy,
+            Some(trouve_protocol::TitleModelResourcePolicy::GpuCpuRam)
         );
     }
 }

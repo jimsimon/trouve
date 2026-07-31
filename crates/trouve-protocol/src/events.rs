@@ -462,6 +462,7 @@ mod tests {
         let event = Event::GitWorktreeSettingsUpdated {
             settings: crate::GitWorktreeSettings {
                 title_model_load_behavior: crate::TitleModelLoadBehavior::Off,
+                title_model_resource_policy: crate::TitleModelResourcePolicy::CpuRamOnly,
                 title_model: crate::TitleModelStatus {
                     state: "stopped".into(),
                     detail: "Built-in naming heuristics are active.".into(),
@@ -476,6 +477,10 @@ mod tests {
         let value = serde_json::to_value(event).unwrap();
         assert_eq!(value["type"], "settings.git_worktrees_updated");
         assert_eq!(value["settings"]["title_model_load_behavior"], "off");
+        assert_eq!(
+            value["settings"]["title_model_resource_policy"],
+            "cpu_ram_only"
+        );
     }
 
     #[test]

@@ -1240,8 +1240,30 @@ fn main() -> anyhow::Result<()> {
     }
     {
         let tx = tx.clone();
+        let weak = window.as_weak();
         window.on_title_model_load_picked(move |index| {
-            let _ = tx.send(UiCommand::SetTitleModelLoadBehavior(index));
+            let resource_index = weak
+                .upgrade()
+                .map(|ui| ui.get_settings_title_model_resource_index())
+                .unwrap_or(3);
+            let _ = tx.send(UiCommand::SetTitleModelSettings {
+                load_index: index,
+                resource_index,
+            });
+        });
+    }
+    {
+        let tx = tx.clone();
+        let weak = window.as_weak();
+        window.on_title_model_resource_picked(move |index| {
+            let load_index = weak
+                .upgrade()
+                .map(|ui| ui.get_settings_title_model_load_index())
+                .unwrap_or(0);
+            let _ = tx.send(UiCommand::SetTitleModelSettings {
+                load_index,
+                resource_index: index,
+            });
         });
     }
     {

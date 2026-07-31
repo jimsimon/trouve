@@ -2963,11 +2963,15 @@ async fn session_title_settings_and_fallback() {
     );
     let settings: serde_json::Value = response.json().await.unwrap();
     assert_eq!(settings["title_model_load_behavior"], "auto");
+    assert_eq!(settings["title_model_resource_policy"], "cpu_ram_only");
     assert_eq!(settings["title_model"]["state"], "not_installed");
 
     let response = client
         .put(format!("{base}/config/git-worktrees"))
-        .json(&serde_json::json!({"title_model_load_behavior": "off"}))
+        .json(&serde_json::json!({
+            "title_model_load_behavior": "off",
+            "title_model_resource_policy": "gpu_cpu_ram"
+        }))
         .send()
         .await
         .unwrap();
@@ -2978,6 +2982,7 @@ async fn session_title_settings_and_fallback() {
     );
     let settings: serde_json::Value = response.json().await.unwrap();
     assert_eq!(settings["title_model_load_behavior"], "off");
+    assert_eq!(settings["title_model_resource_policy"], "gpu_cpu_ram");
     let response = client
         .delete(format!("{base}/config/git-worktrees/title-model/install"))
         .send()
@@ -2988,6 +2993,11 @@ async fn session_title_settings_and_fallback() {
         std::fs::read_to_string(&config_file)
             .unwrap()
             .contains("title_model_load_behavior = \"off\"")
+    );
+    assert!(
+        std::fs::read_to_string(&config_file)
+            .unwrap()
+            .contains("title_model_resource_policy = \"gpu_cpu_ram\"")
     );
     assert!(
         engine
