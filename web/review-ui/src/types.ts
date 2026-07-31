@@ -1,6 +1,6 @@
 export type ReviewMode = "off" | "manual" | "automatic";
 export type ReviewScope = "incremental" | "full";
-export type RoutingMode = "core" | "auto" | "thorough";
+export type RoutingMode = "manual" | "additive" | "automatic";
 export type RoutingSource =
   | "core"
   | "baseline"

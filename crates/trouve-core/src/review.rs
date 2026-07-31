@@ -1639,10 +1639,10 @@ impl Engine {
         repository: &CodeReviewRepository,
     ) -> Result<Vec<ReviewerProfile>, EngineError> {
         let reviewers = match repository.routing_mode {
-            CodeReviewRoutingMode::Core => {
+            CodeReviewRoutingMode::Manual => {
                 self.resolve_code_review_reviewers(&repository.reviewer_ids)?
             }
-            CodeReviewRoutingMode::Auto | CodeReviewRoutingMode::Thorough => {
+            CodeReviewRoutingMode::Additive => {
                 let excluded = repository
                     .excluded_reviewer_ids
                     .iter()
@@ -1653,6 +1653,7 @@ impl Engine {
                     .filter(|reviewer| !excluded.contains(reviewer.id.as_str()))
                     .collect()
             }
+            CodeReviewRoutingMode::Automatic => self.code_review_reviewer_catalog()?,
         };
         Ok(apply_reviewer_overrides(
             reviewers,
@@ -1666,8 +1667,18 @@ impl Engine {
     ) -> Result<String, EngineError> {
         let reviewer_config = serde_json::to_string(reviewers)
             .map_err(|error| EngineError::Internal(error.into()))?;
-        let mut included_reviewer_ids = repository.included_reviewer_ids.clone();
-        let mut excluded_reviewer_ids = repository.excluded_reviewer_ids.clone();
+        let mut included_reviewer_ids =
+            if repository.routing_mode == CodeReviewRoutingMode::Additive {
+                repository.included_reviewer_ids.clone()
+            } else {
+                Vec::new()
+            };
+        let mut excluded_reviewer_ids =
+            if repository.routing_mode == CodeReviewRoutingMode::Additive {
+                repository.excluded_reviewer_ids.clone()
+            } else {
+                Vec::new()
+            };
         included_reviewer_ids.sort();
         excluded_reviewer_ids.sort();
         let routing_config = serde_json::to_string(&(
@@ -2012,12 +2023,22 @@ impl Engine {
                     .map(|repository| repository.excluded_reviewer_ids.clone())
             })
             .unwrap_or_default();
+        let included_reviewer_ids = if routing_mode == CodeReviewRoutingMode::Automatic {
+            Vec::new()
+        } else {
+            included_reviewer_ids
+        };
+        let excluded_reviewer_ids = if routing_mode == CodeReviewRoutingMode::Automatic {
+            Vec::new()
+        } else {
+            excluded_reviewer_ids
+        };
         if request.mode != CodeReviewMode::Off
-            && routing_mode == CodeReviewRoutingMode::Core
+            && routing_mode == CodeReviewRoutingMode::Manual
             && reviewer_ids.is_empty()
         {
             return Err(EngineError::BadRequest(
-                "an enabled Core repository must select at least one reviewer".into(),
+                "an enabled Manual repository must select at least one reviewer".into(),
             ));
         }
         self.resolve_code_review_reviewers(&reviewer_ids)?;
@@ -2034,13 +2055,13 @@ impl Engine {
             )));
         }
         if request.mode != CodeReviewMode::Off
-            && routing_mode != CodeReviewRoutingMode::Core
+            && routing_mode != CodeReviewRoutingMode::Manual
             && reviewer_catalog
                 .iter()
                 .all(|reviewer| excluded.contains(&reviewer.id))
         {
             return Err(EngineError::BadRequest(
-                "an enabled Auto or Thorough repository cannot exclude every reviewer".into(),
+                "an enabled Additive or Automatic repository cannot exclude every reviewer".into(),
             ));
         }
         let reviewer_overrides = request
@@ -2999,20 +3020,23 @@ impl Engine {
         };
         let mut routing_decisions = self.store.code_review_routing_decisions(&job.id)?;
         if routing_decisions.is_empty() && !reviewers.is_empty() && !batches.is_empty() {
-            let semantic =
-                if job.routing_mode == CodeReviewRoutingMode::Auto && job.semantic_routing {
-                    self.semantic_routing_for_batches(
-                        &job,
-                        &session.id,
-                        &reviewers,
-                        &batches,
-                        superseded,
-                        active_threads,
-                    )
-                    .await?
-                } else {
-                    HashMap::new()
-                };
+            let semantic = if matches!(
+                job.routing_mode,
+                CodeReviewRoutingMode::Additive | CodeReviewRoutingMode::Automatic
+            ) && job.semantic_routing
+            {
+                self.semantic_routing_for_batches(
+                    &job,
+                    &session.id,
+                    &reviewers,
+                    &batches,
+                    superseded,
+                    active_threads,
+                )
+                .await?
+            } else {
+                HashMap::new()
+            };
             let proposed = build_routing_decisions(&job, &reviewers, &batches, &semantic);
             routing_decisions = self
                 .store
@@ -5254,26 +5278,24 @@ fn non_semantic_routing_reasons(
     batch: &ReviewBatch,
 ) -> Vec<CodeReviewRoutingReason> {
     match job.routing_mode {
-        CodeReviewRoutingMode::Core => vec![CodeReviewRoutingReason {
+        CodeReviewRoutingMode::Manual => vec![CodeReviewRoutingReason {
             source: CodeReviewRoutingSource::Core,
-            detail: "selected by the repository's Core reviewer set".into(),
+            detail: "selected by the repository's Manual persona set".into(),
         }],
-        CodeReviewRoutingMode::Thorough => vec![CodeReviewRoutingReason {
-            source: CodeReviewRoutingSource::Thorough,
-            detail: "selected because Thorough mode runs the complete reviewer catalog".into(),
-        }],
-        CodeReviewRoutingMode::Auto => {
+        CodeReviewRoutingMode::Additive | CodeReviewRoutingMode::Automatic => {
             let mut reasons = Vec::new();
             if crate::reviewers::AUTO_BASELINE_REVIEWER_IDS.contains(&reviewer.id.as_str()) {
                 reasons.push(CodeReviewRoutingReason {
                     source: CodeReviewRoutingSource::Baseline,
-                    detail: "part of Auto mode's always-on correctness baseline".into(),
+                    detail: "part of automatic selection's correctness baseline".into(),
                 });
             }
-            if job.included_reviewer_ids.contains(&reviewer.id) {
+            if job.routing_mode == CodeReviewRoutingMode::Additive
+                && job.included_reviewer_ids.contains(&reviewer.id)
+            {
                 reasons.push(CodeReviewRoutingReason {
                     source: CodeReviewRoutingSource::Included,
-                    detail: "always included by this repository's review policy".into(),
+                    detail: "part of this repository's Additive core persona set".into(),
                 });
             }
             reasons.extend(
@@ -5961,7 +5983,7 @@ mod tests {
                     .into_iter()
                     .take(1)
                     .collect(),
-                routing_mode: CodeReviewRoutingMode::Core,
+                routing_mode: CodeReviewRoutingMode::Manual,
                 semantic_routing: false,
                 included_reviewer_ids: Vec::new(),
                 excluded_reviewer_ids: Vec::new(),
@@ -7199,7 +7221,7 @@ mod tests {
             router_thinking_level: Some("low".into()),
             prompt: "Review it".into(),
             reviewer_ids: crate::reviewers::default_reviewer_ids(),
-            routing_mode: CodeReviewRoutingMode::Auto,
+            routing_mode: CodeReviewRoutingMode::Additive,
             semantic_routing: true,
             included_reviewer_ids: vec!["reliability".into(), "performance".into()],
             excluded_reviewer_ids: vec!["operations".into(), "accessibility".into()],
@@ -7330,7 +7352,7 @@ mod tests {
                 router_thinking_level: level.map(str::to_owned),
                 prompt: String::new(),
                 reviewer_ids: Some(crate::reviewers::default_reviewer_ids()),
-                routing_mode: Some(CodeReviewRoutingMode::Auto),
+                routing_mode: Some(CodeReviewRoutingMode::Additive),
                 semantic_routing: Some(true),
                 included_reviewer_ids: Some(Vec::new()),
                 excluded_reviewer_ids: Some(Vec::new()),
@@ -7459,7 +7481,7 @@ mod tests {
             router_thinking_level: None,
             prompt: String::new(),
             reviewer_ids: Some(crate::reviewers::default_reviewer_ids()),
-            routing_mode: Some(CodeReviewRoutingMode::Core),
+            routing_mode: Some(CodeReviewRoutingMode::Manual),
             semantic_routing: Some(true),
             included_reviewer_ids: Some(Vec::new()),
             excluded_reviewer_ids: Some(Vec::new()),
@@ -7503,12 +7525,21 @@ mod tests {
             .into_iter()
             .map(|reviewer| reviewer.id)
             .collect::<Vec<_>>();
-        for routing_mode in [CodeReviewRoutingMode::Auto, CodeReviewRoutingMode::Thorough] {
-            let mut invalid = request();
-            invalid.routing_mode = Some(routing_mode);
-            invalid.excluded_reviewer_ids = Some(catalog_ids.clone());
-            rejected(&engine, invalid, "cannot exclude every reviewer").await;
-        }
+        let mut invalid = request();
+        invalid.routing_mode = Some(CodeReviewRoutingMode::Additive);
+        invalid.excluded_reviewer_ids = Some(catalog_ids);
+        rejected(&engine, invalid, "cannot exclude every reviewer").await;
+
+        let mut automatic = request();
+        automatic.routing_mode = Some(CodeReviewRoutingMode::Automatic);
+        automatic.included_reviewer_ids = Some(vec!["reliability".into()]);
+        automatic.excluded_reviewer_ids = Some(vec!["operations".into()]);
+        let automatic = engine
+            .update_code_review_repository(&automatic)
+            .await
+            .unwrap();
+        assert!(automatic.included_reviewer_ids.is_empty());
+        assert!(automatic.excluded_reviewer_ids.is_empty());
     }
 
     #[test]
@@ -7713,10 +7744,10 @@ mod tests {
     }
 
     #[test]
-    fn automatic_routing_combines_baseline_diff_semantic_and_repository_signals() {
+    fn additive_routing_combines_core_diff_semantic_and_baseline_signals() {
         let store = crate::store::Store::open_in_memory().unwrap();
         let mut job = enqueue_test_review_job(&store, "acme/widgets#42:auto-routing");
-        job.routing_mode = CodeReviewRoutingMode::Auto;
+        job.routing_mode = CodeReviewRoutingMode::Additive;
         job.semantic_routing = true;
         job.included_reviewer_ids = vec!["reliability".into()];
         let reviewers = crate::reviewers::built_in_reviewers()
@@ -7775,7 +7806,7 @@ mod tests {
     }
 
     #[test]
-    fn core_and_thorough_routing_select_the_snapshotted_catalog() {
+    fn manual_routing_selects_the_snapshotted_catalog() {
         let reviewers = crate::reviewers::built_in_reviewers()
             .into_iter()
             .take(3)
@@ -7784,24 +7815,51 @@ mod tests {
             paths: vec!["README.md".into()],
             diff: "+Documentation only.\n".into(),
         }];
-        for mode in [CodeReviewRoutingMode::Core, CodeReviewRoutingMode::Thorough] {
-            let store = crate::store::Store::open_in_memory().unwrap();
-            let mut job = enqueue_test_review_job(&store, "acme/widgets#42:fixed-routing");
-            job.routing_mode = mode;
-            let decisions = build_routing_decisions(&job, &reviewers, &batches, &HashMap::new());
-            assert_eq!(decisions.len(), reviewers.len());
-            assert!(decisions.iter().all(|decision| decision.selected));
-            let source = match mode {
-                CodeReviewRoutingMode::Core => CodeReviewRoutingSource::Core,
-                CodeReviewRoutingMode::Thorough => CodeReviewRoutingSource::Thorough,
-                CodeReviewRoutingMode::Auto => unreachable!(),
-            };
-            assert!(
-                decisions
-                    .iter()
-                    .all(|decision| decision.reasons[0].source == source)
-            );
-        }
+        let store = crate::store::Store::open_in_memory().unwrap();
+        let mut job = enqueue_test_review_job(&store, "acme/widgets#42:manual-routing");
+        job.routing_mode = CodeReviewRoutingMode::Manual;
+        let decisions = build_routing_decisions(&job, &reviewers, &batches, &HashMap::new());
+        assert_eq!(decisions.len(), reviewers.len());
+        assert!(decisions.iter().all(|decision| decision.selected));
+        assert!(
+            decisions
+                .iter()
+                .all(|decision| { decision.reasons[0].source == CodeReviewRoutingSource::Core })
+        );
+    }
+
+    #[test]
+    fn automatic_routing_ignores_additive_core_personas() {
+        let reviewers = crate::reviewers::built_in_reviewers()
+            .into_iter()
+            .filter(|reviewer| ["correctness", "reliability"].contains(&reviewer.id.as_str()))
+            .collect::<Vec<_>>();
+        let batches = vec![ReviewBatch {
+            paths: vec!["README.md".into()],
+            diff: "+Documentation only.\n".into(),
+        }];
+        let store = crate::store::Store::open_in_memory().unwrap();
+        let mut job = enqueue_test_review_job(&store, "acme/widgets#42:automatic-routing");
+        job.routing_mode = CodeReviewRoutingMode::Automatic;
+        job.included_reviewer_ids = vec!["reliability".into()];
+
+        let decisions = build_routing_decisions(&job, &reviewers, &batches, &HashMap::new());
+        let correctness = decisions
+            .iter()
+            .find(|decision| decision.reviewer_id == "correctness")
+            .unwrap();
+        let reliability = decisions
+            .iter()
+            .find(|decision| decision.reviewer_id == "reliability")
+            .unwrap();
+        assert!(correctness.selected);
+        assert!(!reliability.selected);
+        assert!(
+            reliability
+                .reasons
+                .iter()
+                .all(|reason| reason.source != CodeReviewRoutingSource::Included)
+        );
     }
 
     #[test]
@@ -7863,7 +7921,7 @@ mod tests {
     fn automatic_routing_keeps_a_fallback_when_no_signal_matches() {
         let store = crate::store::Store::open_in_memory().unwrap();
         let mut job = enqueue_test_review_job(&store, "acme/widgets#42:routing-fallback");
-        job.routing_mode = CodeReviewRoutingMode::Auto;
+        job.routing_mode = CodeReviewRoutingMode::Additive;
         let reviewers = vec![ReviewerProfile {
             id: "custom:domain".into(),
             name: "Domain invariants".into(),

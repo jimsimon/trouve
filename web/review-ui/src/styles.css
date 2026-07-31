@@ -237,11 +237,11 @@ legend { color: var(--muted); font-size: 11px; }
 .repository-editor form { display: flex; flex-direction: column; gap: 13px; padding: 4px 14px 15px; }
 .semantic-routing { margin: 3px 0 12px; padding: 10px; border-radius: 7px; background: var(--surface-2); }
 .routing-personas { display: grid; grid-template-columns: repeat(auto-fill, minmax(280px, 1fr)); gap: 7px; }
-.routing-persona { display: grid; grid-template-columns: minmax(0, 1fr) 125px; gap: 10px; align-items: center; padding: 9px; border-radius: 7px; background: var(--surface-2); }
+.routing-persona { display: grid; grid-template-columns: auto minmax(0, 1fr); gap: 10px; align-items: center; padding: 9px; border-radius: 7px; background: var(--surface-2); }
 .routing-persona > span { display: flex; min-width: 0; flex-direction: column; }
 .routing-persona strong, .routing-persona small { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .routing-persona small { margin-top: 2px; color: var(--muted); }
-.routing-persona select { padding: 7px 8px; }
+.routing-persona.field-disabled { background: color-mix(in srgb, var(--surface-2), transparent 25%); }
 .field-help { margin: 0 0 10px; color: var(--muted); font-size: 12px; }
 .persona-execution-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(330px, 1fr)); gap: 8px; }
 .persona-execution { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 9px; padding: 10px; border-radius: 7px; background: var(--surface-2); }
