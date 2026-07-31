@@ -1,6 +1,6 @@
 //! Command-line interface (port of `semble/cli.py`).
 //!
-//! `trouve-search search|find-related|stats|clear|savings`, with the bare
+//! `trouve-search search|find-related|stats|clear|savings|update`, with the bare
 //! `trouve-search [--content ...]` invocation starting the MCP stdio server,
 //! matching upstream dispatch behaviour.
 
@@ -121,6 +121,12 @@ enum CliCommand {
         path: String,
         #[command(flatten)]
         content: ContentArgs,
+    },
+    /// Check for and install the latest stable release.
+    Update {
+        /// Report whether an update exists without installing it.
+        #[arg(long)]
+        check: bool,
     },
     /// Internal debug helpers used by the parity harness.
     #[command(hide = true)]
@@ -302,8 +308,80 @@ pub fn main() -> ExitCode {
             ExitCode::SUCCESS
         }
         Some(CliCommand::Stats { path, content }) => run_stats(&path, &content.resolve()),
+        Some(CliCommand::Update { check }) => run_update(check),
         Some(CliCommand::Debug { command }) => run_debug(command),
     }
+}
+
+fn run_update(check_only: bool) -> ExitCode {
+    let runtime = match tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(runtime) => runtime,
+        Err(error) => {
+            eprintln!("could not start update runtime: {error}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let result = runtime.block_on(async {
+        let check = trouve_update::check(
+            trouve_update::Component::Search,
+            env!("CARGO_PKG_VERSION"),
+        )
+        .await?;
+        let Some(release) = check.update else {
+            println!("trouve-search {} is up to date.", check.current);
+            return Ok::<(), anyhow::Error>(());
+        };
+        if check_only {
+            println!(
+                "trouve-search {} is available (current {}).",
+                release.version, check.current
+            );
+            return Ok::<(), anyhow::Error>(());
+        }
+        trouve_update::install_release(&release).await?;
+        println!(
+            "Updated trouve-search from {} to {}. Restart running MCP or daemon processes to use it.",
+            check.current, release.version
+        );
+        Ok::<(), anyhow::Error>(())
+    });
+    match result {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(error) => {
+            eprintln!("update failed: {error:#}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// Replace the on-disk search binary in the background. The active MCP
+/// process keeps serving its compiled version; new clients naturally select
+/// the new version's daemon identity after the replacement.
+pub(crate) fn spawn_auto_update() {
+    if !trouve_update::auto_update_enabled() {
+        return;
+    }
+    std::thread::spawn(|| {
+        let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+        else {
+            return;
+        };
+        if let Ok(trouve_update::UpdateStatus::Updated { from, to }) =
+            runtime.block_on(trouve_update::install_latest(
+                trouve_update::Component::Search,
+                env!("CARGO_PKG_VERSION"),
+            ))
+        {
+            eprintln!(
+                "trouve-search {to} installed over {from}; new processes will use the update"
+            );
+        }
+    });
 }
 
 fn run_debug(command: DebugCommand) -> ExitCode {

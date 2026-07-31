@@ -31,11 +31,13 @@ pub fn serve_default(content: &[ContentType]) -> ExitCode {
     if unix::daemon_enabled() {
         return unix::proxy_stdio(content);
     }
+    crate::cli::spawn_auto_update();
     crate::mcp::serve(content)
 }
 
 /// Run the shared daemon in the foreground (the `daemon` subcommand).
 pub fn run_daemon(content: &[ContentType]) -> ExitCode {
+    crate::cli::spawn_auto_update();
     #[cfg(unix)]
     {
         unix::run_daemon(content)
