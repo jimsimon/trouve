@@ -4,6 +4,31 @@ All notable changes to this project are documented in this file. The format
 is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this
 project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [3.7.0] - 2026-07-31
+
+### Added
+
+- **Configurable session-naming resources**: desktop settings now control
+  CPU/GPU placement for the managed local naming model, coordinate resources
+  with the coding sidecar, and validate GPU-only configurations before use.
+- **Explicit review persona selection**: repository review policies now offer
+  Manual, Additive, and Automatic persona modes, making fixed selections,
+  always-included personas, and fully automatic routing distinct.
+
+### Changed
+
+- **Higher-quality session titles**: the managed title model, prompting,
+  startup bounds, and output validation produce concise titles more reliably.
+- **Responsive review dashboards**: cursor-based event resumption, coalesced
+  refreshes, bounded live output, and SSE-driven updates prevent long-running
+  reviews from accumulating unbounded browser rendering work.
+
+### Fixed
+
+- **Bounded code review tasks**: configurable reviewer and coordinator
+  deadlines cancel stalled provider sessions and surface them as task
+  failures, while proxy discovery and streamed output remain robust.
+
 ## [3.6.0] - 2026-07-30
 
 ### Added
@@ -605,6 +630,7 @@ semble ([BENCHMARKS.md](BENCHMARKS.md)):
 - Incremental reindex (1 file touched): 0.86 s vs ~3 min (212x)
 - Warm query: 0.55 s vs 7.2 s (13x)
 
+[3.7.0]: https://github.com/jimsimon/trouve/compare/v3.6.0...v3.7.0
 [3.6.0]: https://github.com/jimsimon/trouve/compare/v3.5.0...v3.6.0
 [3.5.0]: https://github.com/jimsimon/trouve/compare/v3.4.2...v3.5.0
 [3.4.2]: https://github.com/jimsimon/trouve/compare/v3.4.1...v3.4.2
