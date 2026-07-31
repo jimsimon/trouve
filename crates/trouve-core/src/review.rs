@@ -42,9 +42,9 @@ const JOB_IDLE_INTERVAL: Duration = Duration::from_secs(5);
 const REVIEW_TIMEOUT_ENV: &str = "TROUVE_CODE_REVIEW_TIMEOUT_SECONDS";
 const DEFAULT_REVIEW_TIMEOUT: Duration = Duration::from_secs(15 * 60);
 const REVIEWER_TIMEOUT_ENV: &str = "TROUVE_CODE_REVIEW_REVIEWER_TIMEOUT_SECONDS";
-const DEFAULT_REVIEWER_TIMEOUT: Duration = Duration::from_secs(5 * 60);
+const DEFAULT_REVIEWER_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 const REVIEW_COORDINATOR_TIMEOUT_ENV: &str = "TROUVE_CODE_REVIEW_COORDINATOR_TIMEOUT_SECONDS";
-const DEFAULT_REVIEW_COORDINATOR_TIMEOUT: Duration = Duration::from_secs(3 * 60);
+const DEFAULT_REVIEW_COORDINATOR_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 const REVIEW_JOB_CONCURRENCY_ENV: &str = "TROUVE_CODE_REVIEW_JOB_CONCURRENCY";
 const DEFAULT_REVIEW_JOB_CONCURRENCY: usize = 2;
 const REVIEW_TASK_CONCURRENCY_ENV: &str = "TROUVE_CODE_REVIEW_TASK_CONCURRENCY";
@@ -6801,10 +6801,10 @@ mod tests {
     fn review_duration_settings_must_be_positive_seconds() {
         assert_eq!(DEFAULT_RECONCILE_INTERVAL, Duration::from_secs(60));
         assert_eq!(DEFAULT_REVIEW_TIMEOUT, Duration::from_secs(15 * 60));
-        assert_eq!(DEFAULT_REVIEWER_TIMEOUT, Duration::from_secs(5 * 60));
+        assert_eq!(DEFAULT_REVIEWER_TIMEOUT, Duration::from_secs(10 * 60));
         assert_eq!(
             DEFAULT_REVIEW_COORDINATOR_TIMEOUT,
-            Duration::from_secs(3 * 60)
+            Duration::from_secs(5 * 60)
         );
         assert_eq!(
             parse_code_review_poll_interval(" 15 "),
