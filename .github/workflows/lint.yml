@@ -54,6 +54,9 @@ jobs:
           node-version: 24
           cache: npm
           cache-dependency-path: npm/package-lock.json
+      - name: review UI tests
+        working-directory: web/review-ui
+        run: npm test
       # npm/ is an npm workspace; one install links the local packages
       # (search-plugin -> search-core) and installs all dev dependencies.
       - name: npm typecheck

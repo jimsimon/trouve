@@ -8,6 +8,9 @@
     "dev": "vite --host 0.0.0.0",
     "test": "node --test src/*.test.mjs"
   },
+  "engines": {
+    "node": ">=22.18.0"
+  },
   "dependencies": {
     "chart.js": "^4.5.0",
     "preact": "^10.27.2"
