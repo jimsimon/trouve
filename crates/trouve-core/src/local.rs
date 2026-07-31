@@ -122,7 +122,7 @@ pub const CATALOG: &[CatalogEntry] = &[
 /// coding-model catalog: the title sidecar has its own lifecycle and never
 /// appears in thread model pickers.
 pub const TITLE_MODEL_ID: &str = "qwen3-title-0.6b";
-pub const TITLE_MODEL_CONTEXT: u64 = 1_024;
+pub const TITLE_MODEL_CONTEXT: u64 = 2_048;
 pub const TITLE_MODEL_SHA256: &str =
     "9465e63a22add5354d9bb4b99e90117043c7124007664907259bd16d043bb031";
 pub const TITLE_MODEL_LICENSE: &str = "Apache-2.0";
