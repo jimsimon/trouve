@@ -351,6 +351,9 @@ pub enum UiCommand {
     },
     SendMessage(String),
     CancelTurn,
+    /// One-second UI clock tick while the visible thread is running. This
+    /// refreshes elapsed waiting labels even when the model emits no events.
+    ActivityTick,
     /// The "@" mention popup opened (or is filtering): refresh the worktree
     /// path list feeding it. Throttled per session by the controller.
     RefreshAtFiles,
@@ -5093,6 +5096,15 @@ impl Controller {
                         self.restoring_thread = Some(thread_id);
                         ui::restore_chat_position(&self.ui, local_row, offset.max(0.0));
                     }
+                }
+            }
+            UiCommand::ActivityTick => {
+                let running = self
+                    .current_thread_id()
+                    .and_then(|thread_id| self.vms.get(&thread_id))
+                    .is_some_and(|vm| vm.turn_running);
+                if running {
+                    self.render_chat(false);
                 }
             }
             UiCommand::SendMessage(text) => {

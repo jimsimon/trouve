@@ -1538,6 +1538,7 @@ fn main() -> anyhow::Result<()> {
     let weak = window.as_weak();
     let focused = window_focused.clone();
     let deferred_quit = quit_when_idle.clone();
+    let activity_tx = tx.clone();
     std::thread::spawn(move || {
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
@@ -1585,6 +1586,9 @@ fn main() -> anyhow::Result<()> {
             std::time::Duration::from_secs(1),
             move || {
                 let Some(window) = weak.upgrade() else { return };
+                if window.get_composer_turn_running() {
+                    let _ = activity_tx.send(UiCommand::ActivityTick);
+                }
                 let w = window.window();
                 let mut next = last.borrow().unwrap_or_default();
                 next.maximized = w.is_maximized();

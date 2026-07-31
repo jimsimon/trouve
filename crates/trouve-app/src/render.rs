@@ -379,28 +379,99 @@ fn tool_activity_label(tool: &str, args: &serde_json::Value) -> String {
         .unwrap_or_else(|| format!("Using {}…", tool_display_name(tool)))
 }
 
-fn running_activity_label(vm: &ThreadViewModel) -> String {
-    if vm.thinking {
-        return "Thinking…".into();
-    }
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RunningActivity {
+    label: String,
+    detail: String,
+}
 
-    // Ignore a stale unfinished card from a previous turn. Real folded
-    // state always has a running turn marker; scanning everything remains a
-    // useful fallback for lightweight render fixtures.
-    let start = vm
+fn compact_running_elapsed(seconds: i64) -> String {
+    let seconds = seconds.max(0);
+    let hours = seconds / 3_600;
+    let minutes = (seconds % 3_600) / 60;
+    let seconds = seconds % 60;
+    if hours > 0 {
+        format!("{hours}h {minutes}m {seconds}s")
+    } else if minutes > 0 {
+        format!("{minutes}m {seconds}s")
+    } else {
+        format!("{seconds}s")
+    }
+}
+
+fn running_model_name(vm: &ThreadViewModel, turn: Option<u64>) -> &str {
+    turn.and_then(|turn| vm.turn_models.get(&turn))
+        .filter(|model| !model.is_empty())
+        .map(|model| {
+            model
+                .split_once('/')
+                .map_or(model.as_str(), |(_, name)| name)
+        })
+        .unwrap_or("model")
+}
+
+fn running_activity_at(
+    vm: &ThreadViewModel,
+    now: chrono::DateTime<chrono::Utc>,
+) -> RunningActivity {
+    // Ignore stale cards from previous turns. Everything after the newest
+    // running marker belongs to the live turn, including its user prompt.
+    let running = vm
         .items
         .iter()
-        .rposition(|item| {
-            matches!(
-                item,
-                ChatItem::TurnStatus {
-                    state: TurnState::Running,
-                    ..
-                }
-            )
-        })
-        .map_or(0, |i| i + 1);
-    let active = vm.items[start..].iter().rev().find_map(|item| match item {
+        .enumerate()
+        .rev()
+        .find_map(|(index, item)| match item {
+            ChatItem::TurnStatus {
+                turn,
+                state: TurnState::Running,
+            } => Some((*turn, index + 1)),
+            _ => None,
+        });
+    let (turn, start) = running.map_or((None, 0), |(turn, start)| (Some(turn), start));
+    let current = &vm.items[start..];
+    let model = running_model_name(vm, turn);
+
+    if vm.compacting {
+        return RunningActivity {
+            label: "Compacting context…".into(),
+            detail: "Preparing a shorter conversation history before contacting the model.".into(),
+        };
+    }
+
+    if current
+        .iter()
+        .any(|item| matches!(item, ChatItem::Questions { answers: None, .. }))
+    {
+        return RunningActivity {
+            label: "Waiting for your answer…".into(),
+            detail: "The agent will continue after you answer or skip its questions.".into(),
+        };
+    }
+
+    if current.iter().any(|item| {
+        matches!(
+            item,
+            ChatItem::ToolCall {
+                status: ToolCallStatus::AwaitingApproval,
+                ..
+            }
+        )
+    }) {
+        return RunningActivity {
+            label: "Waiting for approval…".into(),
+            detail: "The agent will continue after the pending tool request is resolved.".into(),
+        };
+    }
+
+    if vm.thinking {
+        return RunningActivity {
+            label: "Thinking…".into(),
+            detail: format!("{model} is streaming its reasoning."),
+        };
+    }
+
+    let active = current.iter().rev().find_map(|item| match item {
         ChatItem::ToolCall {
             tool,
             args,
@@ -409,11 +480,61 @@ fn running_activity_label(vm: &ThreadViewModel) -> String {
         } => Some((tool.as_str(), args)),
         _ => None,
     });
-    let Some((tool, args)) = active else {
-        return "Processing…".into();
-    };
+    if let Some((tool, args)) = active {
+        return RunningActivity {
+            label: tool_activity_label(tool, args),
+            detail: String::new(),
+        };
+    }
 
-    tool_activity_label(tool, args)
+    let model_has_responded = current.iter().any(|item| {
+        matches!(
+            item,
+            ChatItem::Assistant { .. }
+                | ChatItem::Thinking { .. }
+                | ChatItem::ToolCall { .. }
+                | ChatItem::Questions { .. }
+        )
+    });
+    if model_has_responded {
+        return RunningActivity {
+            label: format!("Waiting for {model}…"),
+            detail: "The model is between visible response or tool events.".into(),
+        };
+    }
+
+    let elapsed = turn
+        .and_then(|turn| vm.turn_started_at.get(&turn))
+        .map(|started| now.signed_duration_since(*started).num_seconds().max(0));
+    match elapsed {
+        Some(seconds) if seconds < 2 => RunningActivity {
+            label: format!("Starting {model}…"),
+            detail: "Preparing the model request.".into(),
+        },
+        Some(seconds) if seconds < 120 => RunningActivity {
+            label: format!(
+                "Waiting for first response from {model} · {}",
+                compact_running_elapsed(seconds)
+            ),
+            detail: "The turn is running, but no model output has arrived yet.".into(),
+        },
+        Some(seconds) => RunningActivity {
+            label: format!(
+                "Still waiting for {model} · {}",
+                compact_running_elapsed(seconds)
+            ),
+            detail: "No model output has arrived yet. You can keep waiting or cancel and retry."
+                .into(),
+        },
+        None => RunningActivity {
+            label: format!("Starting {model}…"),
+            detail: "Preparing the model request.".into(),
+        },
+    }
+}
+
+fn running_activity(vm: &ThreadViewModel) -> RunningActivity {
+    running_activity_at(vm, chrono::Utc::now())
 }
 
 /// Flatten a thread's chat items into rows. Returns the rows plus a parallel
@@ -687,9 +808,11 @@ pub fn chat_rows(
         }
     }
     if vm.turn_running {
+        let running = running_activity(vm);
         let mut activity = ChatRowData {
             kind: 5,
-            text: running_activity_label(vm),
+            text: running.label,
+            detail: running.detail,
             ..Default::default()
         };
         // Nest the activity row at the bottom of the Agent card being
@@ -2173,7 +2296,7 @@ mod tests {
             &HashMap::new(),
         );
         assert_eq!(rows.last().unwrap().kind, 5);
-        assert_eq!(rows.last().unwrap().text, "Processing…");
+        assert_eq!(rows.last().unwrap().text, "Starting model…");
         vm.thinking = true;
         let (rows, _) = chat_rows(
             &vm,
@@ -2251,7 +2374,7 @@ mod tests {
                 turn_running: true,
                 ..Default::default()
             };
-            running_activity_label(&vm)
+            running_activity(&vm).label
         };
 
         let cases = [
@@ -2313,7 +2436,54 @@ mod tests {
             turn_running: true,
             ..Default::default()
         };
-        assert_eq!(running_activity_label(&vm), "Processing…");
+        assert_eq!(running_activity(&vm).label, "Waiting for approval…");
+    }
+
+    #[test]
+    fn silent_model_wait_reports_phase_and_elapsed_time() {
+        let started = chrono::Utc::now();
+        let mut vm = ThreadViewModel {
+            items: vec![
+                ChatItem::TurnStatus {
+                    turn: 2,
+                    state: TurnState::Running,
+                },
+                ChatItem::User {
+                    turn: 2,
+                    content: "hello".into(),
+                    attachments: vec![],
+                },
+            ],
+            turn_running: true,
+            ..Default::default()
+        };
+        vm.turn_models.insert(2, "codex/gpt-5.6-sol".into());
+        vm.turn_started_at.insert(2, started);
+
+        let starting = running_activity_at(&vm, started + chrono::Duration::seconds(1));
+        assert_eq!(starting.label, "Starting gpt-5.6-sol…");
+        assert_eq!(starting.detail, "Preparing the model request.");
+
+        let waiting = running_activity_at(&vm, started + chrono::Duration::seconds(42));
+        assert_eq!(
+            waiting.label,
+            "Waiting for first response from gpt-5.6-sol · 42s"
+        );
+        assert!(waiting.detail.contains("no model output"));
+
+        let slow = running_activity_at(&vm, started + chrono::Duration::seconds(188));
+        assert_eq!(slow.label, "Still waiting for gpt-5.6-sol · 3m 8s");
+        assert!(slow.detail.contains("cancel and retry"));
+
+        vm.items.push(ChatItem::Assistant {
+            turn: 2,
+            content: "I’m working on it.".into(),
+            complete: true,
+        });
+        assert_eq!(
+            running_activity_at(&vm, started + chrono::Duration::seconds(190)).label,
+            "Waiting for gpt-5.6-sol…"
+        );
     }
 
     #[test]
