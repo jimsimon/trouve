@@ -192,12 +192,16 @@ pub struct General {
     /// Hold an OS idle-sleep inhibitor while at least one agent is active.
     #[serde(default = "default_true")]
     pub prevent_sleep_while_running: bool,
+    /// Check for, install, and restart into desktop updates at startup.
+    #[serde(default = "default_true")]
+    pub automatic_updates: bool,
 }
 
 impl Default for General {
     fn default() -> Self {
         Self {
             prevent_sleep_while_running: true,
+            automatic_updates: true,
         }
     }
 }
@@ -317,10 +321,16 @@ mod tests {
     use super::*;
 
     #[test]
-    fn general_sleep_prevention_defaults_to_enabled() {
-        assert!(General::default().prevent_sleep_while_running);
+    fn general_preferences_default_to_enabled() {
+        let defaults = General::default();
+        assert!(defaults.prevent_sleep_while_running);
+        assert!(defaults.automatic_updates);
         let restored: General = serde_json::from_str("{}").unwrap();
         assert!(restored.prevent_sleep_while_running);
+        assert!(restored.automatic_updates);
+
+        let disabled: General = serde_json::from_str(r#"{"automatic_updates":false}"#).unwrap();
+        assert!(!disabled.automatic_updates);
     }
 
     #[test]

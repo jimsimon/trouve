@@ -348,12 +348,19 @@ export component SettingsScreen inherits Rectangle {
     // Allow list / Yolo (index i maps to permission-index i - 1).
     property <[string]> mode-permission-names: ["Global default", "Ask", "Allow list", "Yolo"];
     in property <string> settings-status: "";
+    // Release-train version and desktop self-update state.
+    in property <string> app-version: "";
+    in property <string> app-update-status: "";
+    in property <string> app-update-action: "";
+    in property <bool> app-update-busy: false;
     in property <string> login-provider-id: "";
     in property <bool> login-code-required: false;
 
     // General frontend behavior preferences.
     in-out property <bool> prevent-sleep-while-running: true;
     callback prevent-sleep-while-running-toggled(bool);
+    in-out property <bool> automatic-updates: true;
+    callback automatic-updates-toggled(bool);
 
     // Git & Worktrees: lifecycle for the optional session-naming model.
     // 0 adaptive, 1 keep ready, 2 load when needed, 3 rules only.
@@ -474,6 +481,7 @@ export component SettingsScreen inherits Rectangle {
     callback cli-install(/* id */ string);
     callback cli-cancel(/* id */ string);
     callback cli-uninstall(/* id */ string);
+    callback app-update();
     callback theme-picked(int);
     callback font-size-picked(int);
     callback font-picked(int);
@@ -702,6 +710,43 @@ export component SettingsScreen inherits Rectangle {
                                 color: Theme.c.text-soft;
                                 font-size: Theme.fs(11px);
                                 wrap: word-wrap;
+                            }
+
+                            Text {
+                                text: "Updates";
+                                color: Theme.c.text-hi;
+                                font-size: Theme.fs(13px);
+                                font-weight: 600;
+                            }
+
+                            CheckBox {
+                                text: "Automatically download and install updates at startup";
+                                checked <=> root.automatic-updates;
+                                toggled => {
+                                    root.automatic-updates-toggled(root.automatic-updates);
+                                }
+                            }
+
+                            Text {
+                                text: "Startup updates install before the main window. Updates found while trouve is open wait for an explicit Install and restart click.";
+                                color: Theme.c.text-soft;
+                                font-size: Theme.fs(11px);
+                                wrap: word-wrap;
+                            }
+
+                            if root.app-update-status != "": Text {
+                                text: root.app-update-status;
+                                color: Theme.c.text-dim;
+                                font-size: Theme.fs(12px);
+                                wrap: word-wrap;
+                            }
+                            if root.app-update-action != "": HorizontalLayout {
+                                alignment: start;
+                                Button {
+                                    text: root.app-update-action;
+                                    enabled: !root.app-update-busy;
+                                    clicked => { root.app-update(); }
+                                }
                             }
                         }
 
@@ -2665,6 +2710,11 @@ export component SettingsScreen inherits Rectangle {
                             Text {
                                 text: "trouve — a protocol-first AI coding harness.";
                                 color: Theme.c.text-dim;
+                                font-size: Theme.fs(12px);
+                            }
+                            Text {
+                                text: "Version " + root.app-version;
+                                color: Theme.c.text;
                                 font-size: Theme.fs(12px);
                             }
                             AboutSlint { }

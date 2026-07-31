@@ -254,6 +254,16 @@ fn project_session_prs<'a>(
 /// Terminal scrollback the client-side screen model keeps, in lines.
 const TERM_SCROLLBACK: usize = 5000;
 const TERM_FRAME_INTERVAL: std::time::Duration = std::time::Duration::from_millis(16);
+const APP_UPDATE_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(6 * 60 * 60);
+
+fn should_start_runtime_update_check(
+    automatic_updates: bool,
+    updater_enabled: bool,
+    update_busy: bool,
+    update_already_available: bool,
+) -> bool {
+    automatic_updates && updater_enabled && !update_busy && !update_already_available
+}
 #[derive(Debug)]
 pub enum UiCommand {
     // Left nav.
@@ -299,6 +309,14 @@ pub enum UiCommand {
     },
     OpenSettings,
     CloseSettings,
+    /// Explicit General → update button click. Checks when no update is
+    /// cached; otherwise installs the cached release and restarts. Runtime
+    /// update detection must never synthesize this command.
+    AppUpdateButtonClicked,
+    /// Periodic check-only detection while the main window is running.
+    AppUpdatePoll,
+    AppUpdateChecked(std::result::Result<trouve_update::UpdateCheck, String>),
+    AppUpdateInstalled(std::result::Result<String, String>),
     /// Theme / font changed: re-render everything with baked colors
     /// (syntax-highlight segments, inline-code tints). The palette itself
     /// was already swapped on the UI thread.
@@ -894,6 +912,11 @@ struct Controller {
     /// How to respawn the locally spawned server when its process dies
     /// (`None` when connected to an external server via TROUVE_SERVER_URL).
     embedded_server: Option<EmbeddedServer>,
+    /// Newer desktop release resolved by the background check, if any.
+    available_app_update: Option<trouve_update::Release>,
+    app_update_busy: bool,
+    /// User preference gating automatic desktop update installation.
+    automatic_updates: bool,
     /// Local models: true while a poller is scheduled for an in-flight
     /// download/install, plus the last seen downloaded-model count (a
     /// change means the model catalog changed → reload pickers).
@@ -1127,6 +1150,7 @@ pub async fn run(
         Some((info, handle)) => (Some(info), Some(handle)),
         None => (None, None),
     };
+    let general_preferences = crate::winstate::load_general();
 
     let mut ctl = Controller {
         ui,
@@ -1149,7 +1173,7 @@ pub async fn run(
         download_rates: HashMap::new(),
         busy_sessions: HashSet::new(),
         sleep_inhibitor: crate::sleep::SleepInhibitor::default(),
-        prevent_sleep_while_running: crate::winstate::load_general().prevent_sleep_while_running,
+        prevent_sleep_while_running: general_preferences.prevent_sleep_while_running,
         offline: false,
         connectivity_notice_seq: 0,
         server_unreachable: false,
@@ -1157,6 +1181,9 @@ pub async fn run(
         last_respawn: None,
         server_url,
         embedded_server,
+        available_app_update: None,
+        app_update_busy: false,
+        automatic_updates: general_preferences.automatic_updates,
         local_polling: false,
         local_downloaded: None,
         local_search: Vec::new(),
@@ -1247,6 +1274,21 @@ pub async fn run(
             loop {
                 tick.tick().await;
                 if tx.send(UiCommand::RefreshDiff).is_err() {
+                    break;
+                }
+            }
+        }
+    });
+
+    // A long-running app can discover a release without waiting for its next
+    // launch, but runtime detection is check-only. AppUpdateChecked only
+    // exposes the explicit Install and restart button; it never installs.
+    tokio::spawn({
+        let tx = ctl.tx.clone();
+        async move {
+            loop {
+                tokio::time::sleep(APP_UPDATE_POLL_INTERVAL).await;
+                if tx.send(UiCommand::AppUpdatePoll).is_err() {
                     break;
                 }
             }
@@ -1360,6 +1402,58 @@ fn watch_embedded_server(
 impl Controller {
     fn error(&self, text: &str) {
         ui::set_error(&self.ui, text);
+    }
+
+    fn start_app_update_check(&mut self) {
+        if self.app_update_busy {
+            return;
+        }
+        self.app_update_busy = true;
+        ui::set_app_update_available(&self.ui, false);
+        ui::set_app_update(
+            &self.ui,
+            "Checking for updates…".into(),
+            String::new(),
+            true,
+        );
+        let tx = self.tx.clone();
+        tokio::spawn(async move {
+            let result =
+                trouve_update::check(trouve_update::Component::Desktop, env!("CARGO_PKG_VERSION"))
+                    .await
+                    .map_err(|error| format!("{error:#}"));
+            let _ = tx.send(UiCommand::AppUpdateChecked(result));
+        });
+    }
+
+    /// Install only after an explicit click on the runtime update button.
+    fn start_app_update_install(&mut self, release: trouve_update::Release) {
+        if self.app_update_busy {
+            return;
+        }
+        self.app_update_busy = true;
+        ui::set_app_update_available(&self.ui, false);
+        ui::set_app_update(
+            &self.ui,
+            format!("Downloading and verifying version {}…", release.version),
+            String::new(),
+            true,
+        );
+        let tx = self.tx.clone();
+        tokio::spawn(async move {
+            let version = release.version.to_string();
+            let result = trouve_update::install_release(&release)
+                .await
+                .map(|()| version)
+                .map_err(|error| format!("{error:#}"));
+            let _ = tx.send(UiCommand::AppUpdateInstalled(result));
+        });
+    }
+
+    fn restart_after_update(&self, version: &str) -> Result<()> {
+        crate::startup::restart_updated_app(version)?;
+        ui::quit(&self.ui);
+        Ok(())
     }
 
     async fn bootstrap(&mut self, register_workspace: Option<std::path::PathBuf>) -> Result<()> {
@@ -4965,6 +5059,103 @@ impl Controller {
                 // reflects it immediately. No-op when unconfigured.
                 self.refresh_prs();
             }
+            UiCommand::AppUpdateButtonClicked => {
+                if !self.app_update_busy {
+                    if let Some(release) = self.available_app_update.clone() {
+                        self.start_app_update_install(release);
+                    } else {
+                        self.start_app_update_check();
+                    }
+                }
+            }
+            UiCommand::AppUpdatePoll => {
+                if should_start_runtime_update_check(
+                    self.automatic_updates,
+                    trouve_update::auto_update_enabled(),
+                    self.app_update_busy,
+                    self.available_app_update.is_some(),
+                ) {
+                    self.start_app_update_check();
+                }
+            }
+            UiCommand::AppUpdateChecked(result) => {
+                self.app_update_busy = false;
+                match result {
+                    Ok(check) => {
+                        if let Some(release) = check.update {
+                            self.available_app_update = Some(release.clone());
+                            ui::set_app_update_available(&self.ui, true);
+                            ui::set_app_update(
+                                &self.ui,
+                                format!(
+                                    "Version {} is available. The download is verified before installation.",
+                                    release.version
+                                ),
+                                "Install and restart".into(),
+                                false,
+                            );
+                        } else {
+                            self.available_app_update = None;
+                            ui::set_app_update_available(&self.ui, false);
+                            ui::set_app_update(
+                                &self.ui,
+                                format!("Version {} is up to date.", check.current),
+                                "Check again".into(),
+                                false,
+                            );
+                        }
+                    }
+                    Err(error) => {
+                        self.available_app_update = None;
+                        ui::set_app_update_available(&self.ui, false);
+                        ui::set_app_update(
+                            &self.ui,
+                            format!("Update check failed: {error}"),
+                            "Try again".into(),
+                            false,
+                        );
+                    }
+                }
+            }
+            UiCommand::AppUpdateInstalled(result) => match result {
+                Ok(version) => {
+                    self.available_app_update = None;
+                    ui::set_app_update_available(&self.ui, false);
+                    ui::set_app_update(
+                        &self.ui,
+                        format!("Version {version} is installed. Restarting…"),
+                        String::new(),
+                        true,
+                    );
+                    if let Err(error) = self.restart_after_update(&version) {
+                        self.app_update_busy = false;
+                        ui::set_app_update(
+                            &self.ui,
+                            format!(
+                                "Version {version} is installed, but the app could not restart: \
+                                 {error:#}. Close and reopen trouve to finish."
+                            ),
+                            String::new(),
+                            false,
+                        );
+                    }
+                }
+                Err(error) => {
+                    self.app_update_busy = false;
+                    ui::set_app_update_available(&self.ui, true);
+                    let version = self
+                        .available_app_update
+                        .as_ref()
+                        .map(|release| release.version.to_string())
+                        .unwrap_or_else(|| "the new version".into());
+                    ui::set_app_update(
+                        &self.ui,
+                        format!("Could not install {version}: {error}"),
+                        "Try installation again".into(),
+                        false,
+                    );
+                }
+            },
             UiCommand::AppearanceChanged => {
                 // Chat rows bake syntax-highlight and inline-code colors at
                 // conversion time; drop the diff cache and re-fold so they
@@ -7161,6 +7352,41 @@ impl Controller {
             UiCommand::GeneralPrefsChanged(prefs) => {
                 self.prevent_sleep_while_running = prefs.prevent_sleep_while_running;
                 self.sync_sleep_inhibitor();
+                let automatic_updates_changed = self.automatic_updates != prefs.automatic_updates;
+                self.automatic_updates = prefs.automatic_updates;
+                if automatic_updates_changed {
+                    ui::set_app_update_available(&self.ui, false);
+                    if cfg!(debug_assertions) {
+                        ui::set_app_update(
+                            &self.ui,
+                            "Self-update is disabled in development builds.".into(),
+                            String::new(),
+                            false,
+                        );
+                    } else if !self.automatic_updates {
+                        self.available_app_update = None;
+                        ui::set_app_update(
+                            &self.ui,
+                            "Automatic updates are off. You can still check manually.".into(),
+                            "Check for updates".into(),
+                            false,
+                        );
+                    } else if !trouve_update::auto_update_enabled() {
+                        ui::set_app_update(
+                            &self.ui,
+                            "Automatic updates are disabled by TROUVE_DISABLE_AUTO_UPDATE.".into(),
+                            "Check for updates".into(),
+                            false,
+                        );
+                    } else {
+                        ui::set_app_update(
+                            &self.ui,
+                            "Automatic updates will run the next time trouve starts.".into(),
+                            "Check now".into(),
+                            false,
+                        );
+                    }
+                }
             }
             UiCommand::NotifyPrefsChanged(prefs) => self.notify = prefs,
             UiCommand::WindowFocusChanged(focused) => {
@@ -8095,7 +8321,7 @@ mod tests {
         format_pr_dashboard_refresh_status, human_age, human_rate, is_web_url, merge_pill,
         model_health_view, pr_badge, project_session_prs, provider_login_requires_code,
         reconcile_pr_group_order, reconcile_workspace_order, reorder_id, session_title_fallback,
-        should_open_chat_at_tail, thinking_property,
+        should_open_chat_at_tail, should_start_runtime_update_check, thinking_property,
     };
     use chrono::{Duration, TimeZone, Utc};
     use trouve_protocol::{
@@ -8765,5 +8991,18 @@ mod tests {
                 )
                 .is_some()
         );
+    }
+
+    #[test]
+    fn runtime_update_polling_only_checks_when_idle_and_enabled() {
+        assert!(should_start_runtime_update_check(true, true, false, false));
+        assert!(!should_start_runtime_update_check(
+            false, true, false, false
+        ));
+        assert!(!should_start_runtime_update_check(
+            true, false, false, false
+        ));
+        assert!(!should_start_runtime_update_check(true, true, true, false));
+        assert!(!should_start_runtime_update_check(true, true, false, true));
     }
 }

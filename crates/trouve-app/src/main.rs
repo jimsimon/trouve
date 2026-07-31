@@ -6,6 +6,7 @@ mod notify;
 mod opener;
 mod render;
 mod sleep;
+mod startup;
 mod theme;
 mod ui;
 mod winstate;
@@ -216,7 +217,43 @@ fn main() -> anyhow::Result<()> {
     // created.
     slint::set_xdg_app_id("trouve")?;
 
+    let restarted_version = startup::take_restarted_version();
     let window = AppWindow::new()?;
+    let startup_window = StartupWindow::new()?;
+    startup_window.set_current_version(env!("CARGO_PKG_VERSION").into());
+    startup::configure(&startup_window);
+    let general_preferences = winstate::load_general();
+    let run_update_preflight = restarted_version.is_none()
+        && general_preferences.automatic_updates
+        && trouve_update::auto_update_enabled();
+    window.set_settings_app_version(env!("CARGO_PKG_VERSION").into());
+    window.set_automatic_updates(general_preferences.automatic_updates);
+    let (initial_update_status, initial_update_action) = if let Some(version) = restarted_version {
+        (
+            format!("Version {version} was installed successfully."),
+            "Check again".to_string(),
+        )
+    } else if cfg!(debug_assertions) {
+        (
+            "Self-update is disabled in development builds.".to_string(),
+            String::new(),
+        )
+    } else if !trouve_update::auto_update_enabled() {
+        (
+            "Automatic updates are disabled by TROUVE_DISABLE_AUTO_UPDATE.".to_string(),
+            "Check for updates".to_string(),
+        )
+    } else if general_preferences.automatic_updates {
+        ("Checking for updates…".to_string(), String::new())
+    } else {
+        (
+            "Automatic updates are off. You can still check manually.".to_string(),
+            "Check for updates".to_string(),
+        )
+    };
+    window.set_settings_app_update_status(initial_update_status.clone().into());
+    window.set_settings_app_update_action(initial_update_action.clone().into());
+    window.set_settings_app_update_busy(run_update_preflight);
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<UiCommand>();
     let quit_when_idle = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
 
@@ -332,16 +369,28 @@ fn main() -> anyhow::Result<()> {
 
     // --- general settings: restore, wire the toggles -------------------------
     {
-        let prefs = winstate::load_general();
-        window.set_prevent_sleep_while_running(prefs.prevent_sleep_while_running);
-        let prefs = std::rc::Rc::new(std::cell::RefCell::new(prefs));
-        let tx_prefs = tx.clone();
-        window.on_prevent_sleep_while_running_toggled(move |on| {
-            let mut prefs = prefs.borrow_mut();
-            prefs.prevent_sleep_while_running = on;
-            winstate::save_general(&prefs);
-            let _ = tx_prefs.send(UiCommand::GeneralPrefsChanged(prefs.clone()));
-        });
+        window.set_prevent_sleep_while_running(general_preferences.prevent_sleep_while_running);
+        let prefs = std::rc::Rc::new(std::cell::RefCell::new(general_preferences));
+        {
+            let prefs = prefs.clone();
+            let tx_prefs = tx.clone();
+            window.on_prevent_sleep_while_running_toggled(move |on| {
+                let mut prefs = prefs.borrow_mut();
+                prefs.prevent_sleep_while_running = on;
+                winstate::save_general(&prefs);
+                let _ = tx_prefs.send(UiCommand::GeneralPrefsChanged(prefs.clone()));
+            });
+        }
+        {
+            let prefs = prefs.clone();
+            let tx_prefs = tx.clone();
+            window.on_automatic_updates_toggled(move |on| {
+                let mut prefs = prefs.borrow_mut();
+                prefs.automatic_updates = on;
+                winstate::save_general(&prefs);
+                let _ = tx_prefs.send(UiCommand::GeneralPrefsChanged(prefs.clone()));
+            });
+        }
     }
 
     // --- notifications: restore, wire the toggles ----------------------------
@@ -1298,6 +1347,12 @@ fn main() -> anyhow::Result<()> {
     }
     {
         let tx = tx.clone();
+        window.on_app_update(move || {
+            let _ = tx.send(UiCommand::AppUpdateButtonClicked);
+        });
+    }
+    {
+        let tx = tx.clone();
         window.on_local_refresh(move || {
             let _ = tx.send(UiCommand::RefreshLocal);
         });
@@ -1534,23 +1589,57 @@ fn main() -> anyhow::Result<()> {
         });
     }
 
-    // Controller (and spawned server) live on a background tokio runtime.
-    let weak = window.as_weak();
+    // The main window and its controller do not start until the updater has
+    // handed off from the splash. This keeps server/session startup out of a
+    // process that is about to replace and restart itself.
+    let app_weak = window.as_weak();
+    let startup_weak = startup_window.as_weak();
+    let controller_rx = std::rc::Rc::new(std::cell::RefCell::new(Some(rx)));
+    let controller_tx = tx.clone();
     let focused = window_focused.clone();
     let deferred_quit = quit_when_idle.clone();
-    std::thread::spawn(move || {
-        let runtime = tokio::runtime::Builder::new_multi_thread()
-            .enable_all()
-            .build()
-            .expect("tokio runtime");
-        runtime.block_on(controller::run(
-            weak,
-            tx,
-            rx,
-            focused,
-            deferred_quit,
-            workspace_arg(),
-        ));
+    let register_workspace = workspace_arg();
+    let main_window_shown = std::rc::Rc::new(std::cell::Cell::new(false));
+    let main_window_shown_on_handoff = main_window_shown.clone();
+    startup_window.on_continue_startup(move |status, action| {
+        let Some(rx) = controller_rx.borrow_mut().take() else {
+            return;
+        };
+        let Some(app) = app_weak.upgrade() else {
+            return;
+        };
+        app.set_settings_app_update_status(status);
+        app.set_settings_app_update_action(action);
+        app.set_settings_app_update_busy(false);
+        if let Err(error) = app.show() {
+            tracing::error!("failed to show the main window: {error}");
+            let _ = slint::quit_event_loop();
+            return;
+        }
+        main_window_shown_on_handoff.set(true);
+        if let Some(startup) = startup_weak.upgrade() {
+            let _ = startup.hide();
+        }
+
+        let weak = app.as_weak();
+        let tx = controller_tx.clone();
+        let focused = focused.clone();
+        let deferred_quit = deferred_quit.clone();
+        let register_workspace = register_workspace.clone();
+        std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+                .expect("tokio runtime");
+            runtime.block_on(controller::run(
+                weak,
+                tx,
+                rx,
+                focused,
+                deferred_quit,
+                register_workspace,
+            ));
+        });
     });
 
     // Restore the last window geometry (position picks the monitor too);
@@ -1580,10 +1669,14 @@ fn main() -> anyhow::Result<()> {
     {
         let weak = window.as_weak();
         let last = std::cell::RefCell::new(restored);
+        let main_window_shown = main_window_shown.clone();
         geometry_timer.start(
             slint::TimerMode::Repeated,
             std::time::Duration::from_secs(1),
             move || {
+                if !main_window_shown.get() {
+                    return;
+                }
                 let Some(window) = weak.upgrade() else { return };
                 let w = window.window();
                 let mut next = last.borrow().unwrap_or_default();
@@ -1607,7 +1700,14 @@ fn main() -> anyhow::Result<()> {
         );
     }
 
-    window.run()?;
+    if run_update_preflight {
+        startup_window.show()?;
+        startup::begin(startup_window.as_weak());
+    } else {
+        startup_window
+            .invoke_continue_startup(initial_update_status.into(), initial_update_action.into());
+    }
+    slint::run_event_loop()?;
     Ok(())
 }
 

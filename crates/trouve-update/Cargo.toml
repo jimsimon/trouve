@@ -1,0 +1,24 @@
+[package]
+name = "trouve-update"
+version.workspace = true
+edition.workspace = true
+description = "Checksummed self-update support for trouve release binaries."
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+flate2.workspace = true
+futures.workspace = true
+hex.workspace = true
+reqwest.workspace = true
+rustls.workspace = true
+semver.workspace = true
+serde.workspace = true
+sha2.workspace = true
+self-replace.workspace = true
+tar.workspace = true
+tempfile.workspace = true
+tokio.workspace = true
+zip.workspace = true

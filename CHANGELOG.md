@@ -4,6 +4,20 @@ All notable changes to this project are documented in this file. The format
 is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this
 project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **Checksummed self-updates**: the desktop app, standalone server, and search
+  binary can discover stable repository releases, verify their exact target
+  archive against `SHA256SUMS`, and atomically install it. The desktop applies
+  updates in a startup window with live download, verification, installation,
+  and restart progress before the main screen appears. A persisted opt-out and
+  manual update action live under Settings → General. Checks made while the app
+  is running only show an Update indicator and require an explicit install and
+  restart click. Long-running services defer activation until their next
+  restart.
+
 ## [3.7.0] - 2026-07-31
 
 ### Added

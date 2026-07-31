@@ -1,0 +1,105 @@
+// Pre-main-window update preflight. Rust owns the update lifecycle and pushes
+// stage/progress text; this surface stays deliberately small and focused.
+
+import { Button, ProgressIndicator } from "std-widgets.slint";
+import { Theme } from "theme.slint";
+
+export component StartupWindow inherits Window {
+    preferred-width: 480px;
+    preferred-height: 330px;
+    min-width: 420px;
+    min-height: 300px;
+    title: "Starting Trouve";
+    icon: @image-url("assets/trouve.png");
+    background: Theme.c.win-bg;
+    default-font-size: Theme.fs(13px);
+
+    in property <string> current-version: "";
+    in-out property <string> status: "Checking for updates…";
+    in-out property <string> detail: "";
+    // Negative means indeterminate; otherwise normalized to 0…1.
+    in-out property <float> progress: -1;
+    in-out property <bool> failed: false;
+    in property <string> continuation-status: "";
+    in property <string> continuation-action: "Try again";
+
+    callback retry();
+    callback continue-startup(/* settings status */ string, /* action */ string);
+
+    VerticalLayout {
+        padding: 30px;
+        spacing: 14px;
+        alignment: center;
+
+        Image {
+            source: @image-url("assets/trouve.png");
+            width: 76px;
+            height: 76px;
+            image-fit: contain;
+            horizontal-alignment: center;
+        }
+
+        Text {
+            text: "trouve";
+            color: Theme.c.text-hi;
+            font-size: Theme.fs(25px);
+            font-weight: 700;
+            horizontal-alignment: center;
+        }
+
+        Text {
+            text: root.status;
+            color: root.failed ? Theme.c.err-soft : Theme.c.text;
+            font-size: Theme.fs(14px);
+            font-weight: 600;
+            horizontal-alignment: center;
+            wrap: word-wrap;
+        }
+
+        Text {
+            text: root.detail;
+            color: Theme.c.text-dim;
+            font-size: Theme.fs(12px);
+            horizontal-alignment: center;
+            wrap: word-wrap;
+            min-height: Theme.fs(18px);
+        }
+
+        ProgressIndicator {
+            progress: max(0, min(1, root.progress));
+            indeterminate: root.progress < 0;
+            visible: !root.failed;
+        }
+
+        if root.failed: HorizontalLayout {
+            alignment: center;
+            spacing: 10px;
+            Button {
+                text: "Retry";
+                clicked => {
+                    // Hide both actions immediately so repeated clicks cannot
+                    // launch overlapping update attempts before Rust posts
+                    // the next checking stage.
+                    root.failed = false;
+                    root.status = "Checking for updates…";
+                    root.detail = "Contacting the stable release channel";
+                    root.progress = -1;
+                    root.retry();
+                }
+            }
+            Button {
+                text: "Open trouve";
+                clicked => {
+                    root.continue-startup(root.continuation-status, root.continuation-action);
+                }
+            }
+        }
+
+        Text {
+            text: "Version " + root.current-version;
+            color: Theme.c.text-soft;
+            font-size: Theme.fs(11px);
+            horizontal-alignment: center;
+        }
+    }
+}

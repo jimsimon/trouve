@@ -35,6 +35,7 @@ safetensors = "0.8"
 serde.workspace = true
 serde_json.workspace = true
 tokenizers = { version = "0.23", default-features = false, features = ["onig"] }
+tokio.workspace = true
 tree-sitter = "0.26.10"
 tree-sitter-bash = "0.25.1"
 tree-sitter-c = "0.24.2"
@@ -85,6 +86,7 @@ tree-sitter-typescript = "0.23.2"
 tree-sitter-xml = "0.7.0"
 tree-sitter-yaml = "0.7.2"
 tree-sitter-zig = "1.1.2"
+trouve-update.workspace = true
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2.186"
