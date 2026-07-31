@@ -135,7 +135,10 @@ pub use requests::*;
 // settings.code_review_updated replacement-snapshot event (additive).
 // 1.23: automated code-review timeout schemas advertise their existing
 // positive-seconds constraint (additive).
-pub const PROTOCOL_VERSION: &str = "1.23";
+// 2.0: persona routing becomes persona selection with Manual/Additive/
+// Automatic policies; Automatic replaces Thorough's run-everything semantics
+// with fully routed selection (breaking).
+pub const PROTOCOL_VERSION: &str = "2.0";
 pub const EVENT_CURSOR_HEADER: &str = "x-trouve-event-cursor";
 
 pub type WorkspaceId = String;

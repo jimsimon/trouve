@@ -4196,7 +4196,7 @@ async fn code_review_dashboard_and_repository_policy_round_trip() {
             "router_thinking_level": "low",
             "prompt": "focus on concurrency",
             "reviewer_ids": ["correctness", custom_id],
-            "routing_mode": "auto",
+            "routing_mode": "additive",
             "semantic_routing": true,
             "included_reviewer_ids": [custom_id, "reliability"],
             "excluded_reviewer_ids": ["operations"],
@@ -4247,7 +4247,7 @@ async fn code_review_dashboard_and_repository_policy_round_trip() {
         dashboard["repositories"][0]["reviewer_ids"],
         serde_json::json!(["correctness", custom_id])
     );
-    assert_eq!(dashboard["repositories"][0]["routing_mode"], "auto");
+    assert_eq!(dashboard["repositories"][0]["routing_mode"], "additive");
     assert_eq!(dashboard["repositories"][0]["semantic_routing"], true);
     assert_eq!(
         dashboard["repositories"][0]["included_reviewer_ids"],
@@ -4347,7 +4347,7 @@ async fn code_review_job_overview_loads_task_content_separately() {
             router_thinking_level: Some("low".into()),
             prompt: "Review it".into(),
             reviewers: Vec::new(),
-            routing_mode: trouve_protocol::CodeReviewRoutingMode::Core,
+            routing_mode: trouve_protocol::CodeReviewRoutingMode::Manual,
             semantic_routing: false,
             included_reviewer_ids: Vec::new(),
             excluded_reviewer_ids: Vec::new(),
@@ -4367,7 +4367,7 @@ async fn code_review_job_overview_loads_task_content_separately() {
                 selected: true,
                 reasons: vec![trouve_protocol::CodeReviewRoutingReason {
                     source: trouve_protocol::CodeReviewRoutingSource::Core,
-                    detail: "selected by the repository's Core reviewer set".into(),
+                    detail: "selected by the repository's Manual persona set".into(),
                 }],
             }],
         )
@@ -4426,7 +4426,7 @@ async fn code_review_job_overview_loads_task_content_separately() {
     assert_eq!(overview["tasks"][0]["id"], task.id);
     assert_eq!(overview["tasks"][0]["status"], "running");
     assert_eq!(overview["event_cursor"], snapshot_event.cursor);
-    assert_eq!(overview["job"]["routing_mode"], "core");
+    assert_eq!(overview["job"]["routing_mode"], "manual");
     assert_eq!(overview["job"]["model"], "provider/model");
     assert_eq!(overview["job"]["router_model"], "provider/router");
     assert_eq!(overview["job"]["router_thinking_level"], "low");

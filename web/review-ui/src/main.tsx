@@ -189,12 +189,12 @@ function taskAttemptLabel(tasks: ReviewTask[], task: ReviewTask): string {
 
 function routingModeLabel(mode: Repository["routing_mode"]): string {
   switch (mode) {
-    case "auto":
-      return "Auto";
-    case "thorough":
-      return "Thorough";
+    case "additive":
+      return "Additive";
+    case "automatic":
+      return "Automatic";
     default:
-      return "Core";
+      return "Manual";
   }
 }
 
@@ -203,17 +203,17 @@ function routingReasonLabel(
 ): string {
   switch (source) {
     case "core":
-      return "Core selection";
+      return "Manual selection";
     case "baseline":
-      return "Auto baseline";
+      return "Automatic baseline";
     case "deterministic":
       return "Diff signal";
     case "semantic":
       return "Semantic triage";
     case "included":
-      return "Always include";
+      return "Additive core";
     case "thorough":
-      return "Thorough mode";
+      return "Legacy thorough mode";
     default:
       return source;
   }
@@ -1222,12 +1222,12 @@ function JobDetailPane({
           <dd>{job.scope}</dd>
         </div>
         <div>
-          <dt>Persona routing</dt>
+          <dt>Persona selection mode</dt>
           <dd>{routingModeLabel(job.routing_mode)}</dd>
         </div>
         <div>
           <dt>Semantic triage</dt>
-          <dd>{job.routing_mode === "auto" && job.semantic_routing ? "Enabled" : "Off"}</dd>
+          <dd>{job.routing_mode !== "manual" && job.semantic_routing ? "Enabled" : "Off"}</dd>
         </div>
         <div>
           <dt>Router model</dt>
@@ -1311,7 +1311,7 @@ function JobDetailPane({
           onToggle={(event) => setRoutingOpen(event.currentTarget.open)}
         >
           <summary>
-            <strong>Persona routing</strong>
+            <strong>Persona selection</strong>
             <span>
               {routingDecisions.filter((decision) => decision.selected).length} of{" "}
               {routingDecisions.length} persona-batch candidates selected
@@ -1790,29 +1790,25 @@ function RepositoryEditor({
       setBusy(false);
     }
   };
-  const toggleReviewer = (id: string): void => {
-    setDraft((current) => ({
-      ...current,
-      reviewer_ids: current.reviewer_ids.includes(id)
-        ? current.reviewer_ids.filter((reviewer) => reviewer !== id)
-        : [...current.reviewer_ids, id],
-    }));
-  };
-  const setRoutingOverride = (
-    id: string,
-    value: "automatic" | "included" | "excluded",
-  ): void => {
-    setDraft((current) => ({
-      ...current,
-      included_reviewer_ids:
-        value === "included"
-          ? [...(current.included_reviewer_ids ?? []).filter((reviewer) => reviewer !== id), id]
-          : (current.included_reviewer_ids ?? []).filter((reviewer) => reviewer !== id),
-      excluded_reviewer_ids:
-        value === "excluded"
-          ? [...(current.excluded_reviewer_ids ?? []).filter((reviewer) => reviewer !== id), id]
-          : (current.excluded_reviewer_ids ?? []).filter((reviewer) => reviewer !== id),
-    }));
+  const togglePersona = (id: string): void => {
+    setDraft((current) => {
+      if (current.routing_mode === "automatic") return current;
+      if (current.routing_mode === "manual") {
+        return {
+          ...current,
+          reviewer_ids: current.reviewer_ids.includes(id)
+            ? current.reviewer_ids.filter((reviewer) => reviewer !== id)
+            : [...current.reviewer_ids, id],
+        };
+      }
+      const included = current.included_reviewer_ids ?? [];
+      return {
+        ...current,
+        included_reviewer_ids: included.includes(id)
+          ? included.filter((reviewer) => reviewer !== id)
+          : [...included, id],
+      };
+    });
   };
   const updateReviewerOverride = (
     id: string,
@@ -1838,7 +1834,6 @@ function RepositoryEditor({
       return { ...current, reviewer_overrides: retained };
     });
   };
-  const excludedReviewerIds = draft.excluded_reviewer_ids ?? [];
   const effectiveCoordinatorModel = models.find((model) => model.id === draft.model);
   const coordinatorThinking = thinkingOptions(effectiveCoordinatorModel);
   const effectiveRouterModel = models.find(
@@ -1854,17 +1849,13 @@ function RepositoryEditor({
   };
   const reviewerPolicyInvalid =
     draft.mode !== "off" &&
-    (draft.routing_mode === "core"
+    (draft.routing_mode === "manual"
       ? draft.reviewer_ids.length === 0
-      : reviewers.length === 0 ||
-        reviewers.every((reviewer) => excludedReviewerIds.includes(reviewer.id)));
+      : reviewers.length === 0);
   const reviewModelInvalid = draft.mode !== "off" && !draft.model;
-  const semanticRouterEnabled =
-    draft.routing_mode === "auto" && draft.semantic_routing;
+  const semanticRouterConfigEnabled = draft.routing_mode !== "manual";
   const semanticRouterRequirement =
-    draft.routing_mode !== "auto"
-      ? "Choose Auto persona routing to configure it."
-      : "Enable Semantic triage to configure it.";
+    "Choose Additive or Automatic persona selection to configure it.";
   return (
     <details class="repository-editor">
       <summary>
@@ -1873,7 +1864,7 @@ function RepositoryEditor({
           <small>
             {repository.private ? "private" : "public"} · installation {repository.installation_id}
             {" · "}
-            {routingModeLabel(repository.routing_mode)} routing
+            {routingModeLabel(repository.routing_mode)} persona selection
           </small>
         </span>
         <StatusPill status={repository.mode === "off" ? "disabled" : repository.mode} />
@@ -1903,26 +1894,31 @@ function RepositoryEditor({
             </small>
           </label>
           <label>
-            Persona routing
+            Persona selection mode
             <select
               value={draft.routing_mode}
-              onChange={(event) =>
+              onChange={(event) => {
+                const routingMode = event.currentTarget.value as Repository["routing_mode"];
                 setDraft({
                   ...draft,
-                  routing_mode: event.currentTarget.value as Repository["routing_mode"],
-                })
-              }
+                  routing_mode: routingMode,
+                  semantic_routing: routingMode !== "manual",
+                  included_reviewer_ids:
+                    routingMode === "automatic" ? [] : draft.included_reviewer_ids,
+                  excluded_reviewer_ids: [],
+                });
+              }}
             >
-              <option value="core">Core · fixed reviewer set</option>
-              <option value="auto">Auto · route from each diff</option>
-              <option value="thorough">Thorough · run every persona</option>
+              <option value="manual">Manual</option>
+              <option value="additive">Additive</option>
+              <option value="automatic">Automatic</option>
             </select>
             <small>
-              {draft.routing_mode === "core"
-                ? "Runs exactly the checked personas on every diff batch."
-                : draft.routing_mode === "thorough"
-                  ? "Runs the full catalog on every batch except personas marked Never run."
-                  : "Always runs the safety baseline, then adds personas using diff signals and optional semantic triage."}
+              {draft.routing_mode === "manual"
+                ? "Runs exactly the personas enabled below; semantic routing is disabled."
+                : draft.routing_mode === "additive"
+                  ? "Always runs the enabled core personas, then adds personas using diff signals and semantic triage."
+                  : "Selects personas using diff signals and semantic triage, with no manually enabled core personas."}
             </small>
           </label>
           <label>
@@ -2000,11 +1996,11 @@ function RepositoryEditor({
               configured in Review mode settings.
             </small>
           </label>
-          <label class={semanticRouterEnabled ? undefined : "field-disabled"}>
+          <label class={semanticRouterConfigEnabled ? undefined : "field-disabled"}>
             Semantic router model
             <select
               value={draft.router_model ?? ""}
-              disabled={!semanticRouterEnabled}
+              disabled={!semanticRouterConfigEnabled}
               onChange={(event) => {
                 const routerModel = event.currentTarget.value || undefined;
                 const selectedRouterModel = models.find(
@@ -2029,10 +2025,10 @@ function RepositoryEditor({
             </select>
             <small>
               Runs the lightweight, tool-free triage pass that may add relevant personas.
-              {!semanticRouterEnabled && ` ${semanticRouterRequirement}`}
+              {!semanticRouterConfigEnabled && ` ${semanticRouterRequirement}`}
             </small>
           </label>
-          <label class={semanticRouterEnabled ? undefined : "field-disabled"}>
+          <label class={semanticRouterConfigEnabled ? undefined : "field-disabled"}>
             {routerThinking.budget
               ? "Semantic router thinking budget (tokens)"
               : "Semantic router thinking"}
@@ -2040,7 +2036,7 @@ function RepositoryEditor({
               options={routerThinking}
               value={draft.router_thinking_level ?? ""}
               inheritLabel="Inherit review default"
-              disabled={!semanticRouterEnabled}
+              disabled={!semanticRouterConfigEnabled}
               onChange={(value) =>
                 setDraft({
                   ...draft,
@@ -2051,7 +2047,7 @@ function RepositoryEditor({
             <small>
               Controls reasoning for semantic triage. Inherit review default follows the Review
               mode setting.
-              {!semanticRouterEnabled && ` ${semanticRouterRequirement}`}
+              {!semanticRouterConfigEnabled && ` ${semanticRouterRequirement}`}
             </small>
           </label>
         </div>
@@ -2067,77 +2063,66 @@ function RepositoryEditor({
             reviews.
           </small>
         </label>
-        {draft.routing_mode === "core" ? (
-          <fieldset>
-            <legend>Reviewer personas · exact set</legend>
-            <div class="check-grid">
-              {reviewers.map((reviewer) => (
-                <label class="checkbox" key={reviewer.id}>
+        <fieldset>
+          <legend>Persona selection</legend>
+          <label
+            class={`checkbox semantic-routing ${
+              draft.routing_mode === "manual" ? "field-disabled" : ""
+            }`}
+          >
+            <input
+              type="checkbox"
+              checked={draft.routing_mode !== "manual" && draft.semantic_routing}
+              disabled={draft.routing_mode === "manual"}
+              onChange={(event) =>
+                setDraft({ ...draft, semantic_routing: event.currentTarget.checked })
+              }
+            />
+            <span>
+              <strong>Semantic triage</strong>
+              <small>
+                Run one lightweight, tool-free routing pass per batch. It may add relevant
+                personas but cannot remove baseline, deterministic, or enabled core personas.
+              </small>
+            </span>
+          </label>
+          <div class="routing-personas">
+            {reviewers.map((reviewer) => {
+              const checked =
+                draft.routing_mode === "manual"
+                  ? draft.reviewer_ids.includes(reviewer.id)
+                  : draft.routing_mode === "additive"
+                    ? (draft.included_reviewer_ids ?? []).includes(reviewer.id)
+                    : false;
+              const disabled = draft.routing_mode === "automatic";
+              return (
+                <label
+                  class={`routing-persona checkbox ${disabled ? "field-disabled" : ""}`}
+                  key={reviewer.id}
+                >
                   <input
                     type="checkbox"
-                    checked={draft.reviewer_ids.includes(reviewer.id)}
-                    onChange={() => toggleReviewer(reviewer.id)}
+                    checked={checked}
+                    disabled={disabled}
+                    onChange={() => togglePersona(reviewer.id)}
                   />
                   <span>
                     <strong>{reviewer.name}</strong>
-                    <small>{reviewer.model || "inherits review model"}</small>
+                    <small>
+                      {draft.routing_mode === "manual"
+                        ? "Runs exactly when enabled"
+                        : draft.routing_mode === "additive"
+                          ? "Always runs when enabled"
+                          : "Selected automatically"}
+                      {" · "}
+                      {reviewer.model || "inherits review model"}
+                    </small>
                   </span>
                 </label>
-              ))}
-            </div>
-          </fieldset>
-        ) : (
-          <fieldset>
-            <legend>Persona routing overrides</legend>
-            {draft.routing_mode === "auto" && (
-              <label class="checkbox semantic-routing">
-                <input
-                  type="checkbox"
-                  checked={draft.semantic_routing}
-                  onChange={(event) =>
-                    setDraft({ ...draft, semantic_routing: event.currentTarget.checked })
-                  }
-                />
-                <span>
-                  <strong>Semantic triage</strong>
-                  <small>
-                    Run one lightweight, tool-free pass per batch. It may add reviewers but can
-                    never remove baseline or deterministically selected reviewers.
-                  </small>
-                </span>
-              </label>
-            )}
-            <div class="routing-personas">
-              {reviewers.map((reviewer) => {
-                const included = (draft.included_reviewer_ids ?? []).includes(reviewer.id);
-                const excluded = excludedReviewerIds.includes(reviewer.id);
-                return (
-                  <label class="routing-persona" key={reviewer.id}>
-                    <span>
-                      <strong>{reviewer.name}</strong>
-                      <small>{reviewer.model || "inherits review model"}</small>
-                    </span>
-                    <select
-                      value={included ? "included" : excluded ? "excluded" : "automatic"}
-                      onChange={(event) =>
-                        setRoutingOverride(
-                          reviewer.id,
-                          event.currentTarget.value as "automatic" | "included" | "excluded",
-                        )
-                      }
-                    >
-                      <option value="automatic">
-                        {draft.routing_mode === "thorough" ? "Run" : "Automatic"}
-                      </option>
-                      <option value="included">Always run</option>
-                      <option value="excluded">Never run</option>
-                    </select>
-                  </label>
-                );
-              })}
-            </div>
-          </fieldset>
-        )}
+              );
+            })}
+          </div>
+        </fieldset>
         <fieldset>
           <legend>Persona models and thinking</legend>
           <p class="field-help">

@@ -823,13 +823,17 @@ pub enum ReviewerPromptMode {
 #[serde(rename_all = "snake_case")]
 pub enum CodeReviewRoutingMode {
     /// Run exactly the repository's manually selected `reviewer_ids`.
-    Core,
-    /// Keep the baseline reviewers and add relevant personas from deterministic
-    /// and optional semantic routing.
+    #[serde(alias = "core")]
+    Manual,
+    /// Always run `included_reviewer_ids`, then add relevant personas through
+    /// deterministic and semantic routing.
     #[default]
-    Auto,
-    /// Run every available persona except explicit repository exclusions.
-    Thorough,
+    #[serde(alias = "auto")]
+    Additive,
+    /// Select every persona through deterministic and semantic routing, with
+    /// no manually selected core set.
+    #[serde(alias = "thorough")]
+    Automatic,
 }
 
 /// Repository-specific changes layered over a reusable reviewer profile.
@@ -882,19 +886,18 @@ pub struct CodeReviewRepository {
     /// Ordered reviewer profiles run for each revision.
     #[serde(default)]
     pub reviewer_ids: Vec<String>,
-    /// Persona-routing policy. Core uses `reviewer_ids`; Auto and Thorough
-    /// consider the complete reviewer catalog plus the controls below.
+    /// Persona-selection policy. Manual uses `reviewer_ids`; Additive and
+    /// Automatic consider the complete reviewer catalog.
     #[serde(default)]
     pub routing_mode: CodeReviewRoutingMode,
-    /// Whether Auto mode may run one tool-free semantic router pass per diff
-    /// batch. Semantic choices can only add personas.
+    /// Whether Additive or Automatic mode may run one tool-free semantic
+    /// router pass per diff batch. Semantic choices can only add personas.
     #[serde(default)]
     pub semantic_routing: bool,
-    /// Personas that Auto mode always runs. Custom personas can be opted into
-    /// automatic routing through this list.
+    /// Personas that Additive mode always runs.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub included_reviewer_ids: Vec<String>,
-    /// Personas Auto and Thorough modes never run.
+    /// Legacy forced exclusions retained for backward compatibility.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub excluded_reviewer_ids: Vec<String>,
     /// Per-reviewer repository overrides. Entries may be retained while a
@@ -1192,8 +1195,9 @@ pub struct CodeReviewJob {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub router_thinking_level: Option<String>,
     /// Reviewer profiles are snapshotted internally; their stable ids are
-    /// exposed here for history and diagnostics. Auto/Thorough jobs snapshot
-    /// the candidate catalog; routing decisions record which personas ran.
+    /// exposed here for history and diagnostics. Additive/Automatic jobs
+    /// snapshot the candidate catalog; routing decisions record which
+    /// personas ran.
     #[serde(default)]
     pub reviewer_ids: Vec<String>,
     #[serde(default)]
@@ -1976,5 +1980,23 @@ mod tests {
             request.title_model_resource_policy,
             TitleModelResourcePolicy::CpuRamOnly
         );
+    }
+
+    #[test]
+    fn persona_selection_modes_accept_legacy_names_and_serialize_canonically() {
+        for (legacy, mode, canonical) in [
+            ("core", CodeReviewRoutingMode::Manual, "manual"),
+            ("auto", CodeReviewRoutingMode::Additive, "additive"),
+            ("thorough", CodeReviewRoutingMode::Automatic, "automatic"),
+        ] {
+            assert_eq!(
+                serde_json::from_value::<CodeReviewRoutingMode>(serde_json::json!(legacy)).unwrap(),
+                mode
+            );
+            assert_eq!(
+                serde_json::to_value(mode).unwrap(),
+                serde_json::json!(canonical)
+            );
+        }
     }
 }

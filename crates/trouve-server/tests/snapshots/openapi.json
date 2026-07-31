@@ -7,7 +7,7 @@
       "name": "MIT",
       "identifier": "MIT"
     },
-    "version": "1.23"
+    "version": "2.0"
   },
   "paths": {
     "/v1/approvals": {
@@ -4831,7 +4831,7 @@
             "items": {
               "type": "string"
             },
-            "description": "Reviewer profiles are snapshotted internally; their stable ids are\nexposed here for history and diagnostics. Auto/Thorough jobs snapshot\nthe candidate catalog; routing decisions record which personas ran."
+            "description": "Reviewer profiles are snapshotted internally; their stable ids are\nexposed here for history and diagnostics. Additive/Automatic jobs\nsnapshot the candidate catalog; routing decisions record which\npersonas ran."
           },
           "router_model": {
             "type": [
@@ -5212,14 +5212,14 @@
             "items": {
               "type": "string"
             },
-            "description": "Personas Auto and Thorough modes never run."
+            "description": "Legacy forced exclusions retained for backward compatibility."
           },
           "included_reviewer_ids": {
             "type": "array",
             "items": {
               "type": "string"
             },
-            "description": "Personas that Auto mode always runs. Custom personas can be opted into\nautomatic routing through this list."
+            "description": "Personas that Additive mode always runs."
           },
           "installation_id": {
             "type": "integer",
@@ -5276,11 +5276,11 @@
           },
           "routing_mode": {
             "$ref": "#/components/schemas/CodeReviewRoutingMode",
-            "description": "Persona-routing policy. Core uses `reviewer_ids`; Auto and Thorough\nconsider the complete reviewer catalog plus the controls below."
+            "description": "Persona-selection policy. Manual uses `reviewer_ids`; Additive and\nAutomatic consider the complete reviewer catalog."
           },
           "semantic_routing": {
             "type": "boolean",
-            "description": "Whether Auto mode may run one tool-free semantic router pass per diff\nbatch. Semantic choices can only add personas."
+            "description": "Whether Additive or Automatic mode may run one tool-free semantic\nrouter pass per diff batch. Semantic choices can only add personas."
           }
         }
       },
@@ -5358,9 +5358,9 @@
         "type": "string",
         "description": "How a repository chooses reviewer personas for each diff batch.",
         "enum": [
-          "core",
-          "auto",
-          "thorough"
+          "manual",
+          "additive",
+          "automatic"
         ]
       },
       "CodeReviewRoutingReason": {

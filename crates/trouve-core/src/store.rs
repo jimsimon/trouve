@@ -149,7 +149,7 @@ CREATE TABLE IF NOT EXISTS code_review_repositories (
   router_thinking_level TEXT,
   prompt TEXT NOT NULL DEFAULT '',
   identity_ids TEXT NOT NULL DEFAULT '["correctness","security","concurrency","api-compatibility","testing"]',
-  routing_mode TEXT NOT NULL DEFAULT 'auto',
+  routing_mode TEXT NOT NULL DEFAULT 'additive',
   semantic_routing INTEGER NOT NULL DEFAULT 1,
   included_reviewer_ids TEXT NOT NULL DEFAULT '[]',
   excluded_reviewer_ids TEXT NOT NULL DEFAULT '[]',
@@ -217,7 +217,7 @@ CREATE TABLE IF NOT EXISTS code_review_jobs (
   reviewer_elapsed_ms INTEGER NOT NULL DEFAULT 0,
   coordinator_elapsed_ms INTEGER NOT NULL DEFAULT 0,
   publication_elapsed_ms INTEGER NOT NULL DEFAULT 0,
-  routing_mode TEXT NOT NULL DEFAULT 'auto',
+  routing_mode TEXT NOT NULL DEFAULT 'additive',
   semantic_routing INTEGER NOT NULL DEFAULT 1,
   included_reviewer_ids TEXT NOT NULL DEFAULT '[]',
   excluded_reviewer_ids TEXT NOT NULL DEFAULT '[]'
@@ -572,17 +572,17 @@ fn code_review_mode_str(value: trouve_protocol::CodeReviewMode) -> &'static str 
 
 fn code_review_routing_mode_from(value: &str) -> trouve_protocol::CodeReviewRoutingMode {
     match value {
-        "auto" => trouve_protocol::CodeReviewRoutingMode::Auto,
-        "thorough" => trouve_protocol::CodeReviewRoutingMode::Thorough,
-        _ => trouve_protocol::CodeReviewRoutingMode::Core,
+        "additive" | "auto" => trouve_protocol::CodeReviewRoutingMode::Additive,
+        "automatic" | "thorough" => trouve_protocol::CodeReviewRoutingMode::Automatic,
+        _ => trouve_protocol::CodeReviewRoutingMode::Manual,
     }
 }
 
 fn code_review_routing_mode_str(value: trouve_protocol::CodeReviewRoutingMode) -> &'static str {
     match value {
-        trouve_protocol::CodeReviewRoutingMode::Core => "core",
-        trouve_protocol::CodeReviewRoutingMode::Auto => "auto",
-        trouve_protocol::CodeReviewRoutingMode::Thorough => "thorough",
+        trouve_protocol::CodeReviewRoutingMode::Manual => "manual",
+        trouve_protocol::CodeReviewRoutingMode::Additive => "additive",
+        trouve_protocol::CodeReviewRoutingMode::Automatic => "automatic",
     }
 }
 
@@ -2592,7 +2592,7 @@ impl Store {
                     || excluded.len() != before_excluded
                     || overrides.len() != before_overrides;
                 if changed
-                    && routing_mode != "core"
+                    && !matches!(routing_mode.as_str(), "core" | "manual")
                     && built_in_ids
                         .iter()
                         .all(|reviewer_id| excluded.contains(reviewer_id))
@@ -2701,7 +2701,7 @@ impl Store {
                      reviewer_overrides, router_model, router_thinking_level,
                      coordinator_thinking_level, updated_at)
              VALUES (?1, ?2, 0, ?3, ?4, ?5,
-                     COALESCE(?6, ?16), COALESCE(?7, 'auto'),
+                     COALESCE(?6, ?16), COALESCE(?7, 'additive'),
                      COALESCE(?8, 1), COALESCE(?9, '[]'),
                      COALESCE(?10, '[]'), COALESCE(?11, '[]'), ?12, ?13, ?14, ?15)
              ON CONFLICT(repository) DO UPDATE SET
@@ -6102,7 +6102,7 @@ mod tests {
                 router_thinking_level: Some("low".into()),
                 prompt: "focus on concurrency".into(),
                 reviewer_ids: Some(crate::reviewers::default_reviewer_ids()),
-                routing_mode: Some(trouve_protocol::CodeReviewRoutingMode::Auto),
+                routing_mode: Some(trouve_protocol::CodeReviewRoutingMode::Additive),
                 semantic_routing: Some(true),
                 included_reviewer_ids: Some(vec!["reliability".into()]),
                 excluded_reviewer_ids: Some(vec!["operations".into()]),
@@ -6397,7 +6397,7 @@ mod tests {
                     router_thinking_level: None,
                     prompt: String::new(),
                     reviewers: Vec::new(),
-                    routing_mode: trouve_protocol::CodeReviewRoutingMode::Core,
+                    routing_mode: trouve_protocol::CodeReviewRoutingMode::Manual,
                     semantic_routing: false,
                     included_reviewer_ids: Vec::new(),
                     excluded_reviewer_ids: Vec::new(),
@@ -6470,7 +6470,7 @@ mod tests {
                 router_thinking_level: None,
                 prompt: String::new(),
                 reviewer_ids: Some(vec![reviewer.id.clone()]),
-                routing_mode: Some(trouve_protocol::CodeReviewRoutingMode::Auto),
+                routing_mode: Some(trouve_protocol::CodeReviewRoutingMode::Additive),
                 semantic_routing: Some(true),
                 included_reviewer_ids: Some(vec![reviewer.id.clone()]),
                 excluded_reviewer_ids: Some(excluded_built_ins),
@@ -6494,7 +6494,7 @@ mod tests {
                 router_thinking_level: None,
                 prompt: String::new(),
                 reviewer_ids: Some(crate::reviewers::default_reviewer_ids()),
-                routing_mode: Some(trouve_protocol::CodeReviewRoutingMode::Auto),
+                routing_mode: Some(trouve_protocol::CodeReviewRoutingMode::Additive),
                 semantic_routing: Some(true),
                 included_reviewer_ids: Some(Vec::new()),
                 excluded_reviewer_ids: Some(unrelated_exclusions.clone()),
@@ -6566,7 +6566,7 @@ mod tests {
                 router_thinking_level: Some("low".into()),
                 prompt: "Review it".into(),
                 reviewers,
-                routing_mode: trouve_protocol::CodeReviewRoutingMode::Core,
+                routing_mode: trouve_protocol::CodeReviewRoutingMode::Manual,
                 semantic_routing: false,
                 included_reviewer_ids: Vec::new(),
                 excluded_reviewer_ids: Vec::new(),
@@ -6583,7 +6583,7 @@ mod tests {
             selected: true,
             reasons: vec![trouve_protocol::CodeReviewRoutingReason {
                 source: trouve_protocol::CodeReviewRoutingSource::Core,
-                detail: "selected by the repository's Core reviewer set".into(),
+                detail: "selected by the repository's Manual persona set".into(),
             }],
         }];
         assert_eq!(
@@ -6880,7 +6880,7 @@ mod tests {
                 router_thinking_level: None,
                 prompt: "Review it".into(),
                 reviewers: vec![reviewer.clone()],
-                routing_mode: trouve_protocol::CodeReviewRoutingMode::Core,
+                routing_mode: trouve_protocol::CodeReviewRoutingMode::Manual,
                 semantic_routing: false,
                 included_reviewer_ids: Vec::new(),
                 excluded_reviewer_ids: Vec::new(),
@@ -7051,7 +7051,7 @@ mod tests {
                 router_thinking_level: None,
                 prompt: "Review it".into(),
                 reviewers: vec![reviewer.clone()],
-                routing_mode: trouve_protocol::CodeReviewRoutingMode::Core,
+                routing_mode: trouve_protocol::CodeReviewRoutingMode::Manual,
                 semantic_routing: false,
                 included_reviewer_ids: Vec::new(),
                 excluded_reviewer_ids: Vec::new(),
@@ -7143,7 +7143,7 @@ mod tests {
                 router_thinking_level: None,
                 prompt: String::new(),
                 reviewers: Vec::new(),
-                routing_mode: trouve_protocol::CodeReviewRoutingMode::Core,
+                routing_mode: trouve_protocol::CodeReviewRoutingMode::Manual,
                 semantic_routing: false,
                 included_reviewer_ids: Vec::new(),
                 excluded_reviewer_ids: Vec::new(),
@@ -7204,7 +7204,7 @@ mod tests {
                     router_thinking_level: None,
                     prompt: String::new(),
                     reviewers: Vec::new(),
-                    routing_mode: trouve_protocol::CodeReviewRoutingMode::Core,
+                    routing_mode: trouve_protocol::CodeReviewRoutingMode::Manual,
                     semantic_routing: false,
                     included_reviewer_ids: Vec::new(),
                     excluded_reviewer_ids: Vec::new(),
