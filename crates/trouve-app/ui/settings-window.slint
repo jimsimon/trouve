@@ -665,6 +665,13 @@ export component SettingsScreen inherits Rectangle {
             // ---------------- section content ----------------
             Rectangle {
                 width: 640px;
+                // Keep the pane constrained to the space below the header.
+                // Without an explicit cross-axis constraint, a tall active
+                // section can give this layout its content height and put the
+                // bottom settings outside the window instead of overflowing
+                // the ScrollView.
+                height: 100%;
+                clip: true;
                 ScrollKeys {
                     target-y <=> body.viewport-y;
                     page: body.visible-height;
