@@ -25,6 +25,13 @@ const GENERATION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1
 const DOWNLOAD_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 const STAGE_RUNTIME: u8 = 1;
 const STAGE_MODEL: u8 = 2;
+const MAX_TITLE_WORDS: usize = 7;
+const MAX_TITLE_CHARS: usize = 80;
+const MAX_UTF8_BYTES_PER_CHAR: usize = 4;
+// The title model uses byte fallback for text that is not represented by a
+// single vocabulary token. Reserve one token per possible UTF-8 byte, plus
+// one for the stop token, so every title accepted by the validator can finish.
+const MAX_TITLE_TOKENS: usize = MAX_TITLE_CHARS * MAX_UTF8_BYTES_PER_CHAR + 1;
 const TITLE_SYSTEM_PROMPT: &str = "Create a concise navigation title naming the core software \
 task. Prefer 3 to 5 words; use up to 7 only when needed for clarity. Keep the distinctive feature \
 or subsystem name. Abstract the task into a useful topic or action; never copy incidental details \
@@ -273,13 +280,13 @@ impl TitleModelManager {
                     "top_k": 20,
                     "presence_penalty": 1.5,
                     "seed": 0,
-                    // Sized above the 7-word validator ceiling so a valid
-                    // title is never cut off at the token budget.
-                    "max_tokens": 20,
+                    // Sized above the validator's character ceiling so a
+                    // valid title is never cut off at the token budget.
+                    "max_tokens": MAX_TITLE_TOKENS,
                     // Every request shares the instructions and examples, so
                     // retaining their KV prefix reduces subsequent prefill.
                     "cache_prompt": true,
-                    // Avoid spending the tiny output budget on Qwen3's
+                    // Avoid spending the output budget on Qwen3's
                     // reasoning trace. `/no_think` remains in the prompt as a
                     // model-level fallback for runtimes that ignore kwargs.
                     "chat_template_kwargs": {
@@ -677,7 +684,9 @@ fn sanitize_title(raw: &str) -> Result<String> {
         .trim_end_matches(['.', '!', '?', ':', ';'])
         .trim();
     let words = line.split_whitespace().count();
-    if !(2..=7).contains(&words) || line.chars().count() > 80 || line.contains(['<', '>', '{', '}'])
+    if !(2..=MAX_TITLE_WORDS).contains(&words)
+        || line.chars().count() > MAX_TITLE_CHARS
+        || line.contains(['<', '>', '{', '}'])
     {
         bail!("session title model returned an invalid title");
     }
@@ -693,7 +702,9 @@ mod tests {
 
     use trouve_protocol::{TitleModelLoadBehavior, TitleModelResourcePolicy};
 
-    use super::{TitleModelManager, install_progress_key, sanitize_title};
+    use super::{
+        MAX_TITLE_CHARS, MAX_TITLE_TOKENS, TitleModelManager, install_progress_key, sanitize_title,
+    };
 
     #[test]
     fn sanitizes_constrained_model_output() {
@@ -710,6 +721,17 @@ mod tests {
             sanitize_title("Avoid GPU resource contention during local session naming").is_err()
         );
         assert!(sanitize_title("<tool_call>bad title</tool_call>").is_err());
+    }
+
+    #[test]
+    fn output_budget_covers_maximum_length_non_ascii_title() {
+        let title = format!("{} {}", "\u{10000}".repeat(39), "\u{10000}".repeat(40));
+
+        assert_eq!(title.chars().count(), MAX_TITLE_CHARS);
+        assert!(sanitize_title(&title).is_ok());
+        // Byte fallback needs at most one token per UTF-8 byte; the strict
+        // inequality leaves room for the model to emit its stop token.
+        assert!(MAX_TITLE_TOKENS > title.len());
     }
 
     #[test]
