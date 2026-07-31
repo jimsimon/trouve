@@ -311,6 +311,8 @@ impl TitleModelManager {
                     // wording in the title-quality corpus.
                     "presence_penalty": 0.0,
                     "seed": 0,
+                    // Sized above the 7-word validator ceiling so a valid
+                    // title is never cut off at the token budget.
                     "max_tokens": 20,
                     // Every request shares the instructions and examples, so
                     // retaining their KV prefix reduces subsequent prefill.
@@ -331,6 +333,15 @@ impl TitleModelManager {
         })
         .await
         .context("session title generation timed out")??;
+        // A truncated title can still look like 2-7 whole words, so reject it
+        // here instead of letting sanitize_title accept a cut-off last word.
+        if response
+            .pointer("/choices/0/finish_reason")
+            .and_then(serde_json::Value::as_str)
+            == Some("length")
+        {
+            bail!("session title generation hit the token limit");
+        }
         let raw = response
             .pointer("/choices/0/message/content")
             .and_then(serde_json::Value::as_str)
